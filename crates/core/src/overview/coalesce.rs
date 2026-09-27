@@ -1242,3 +1242,225 @@ mod tests {
         assert!(out.is_empty(), "zero-diagonal chain fails the gate");
     }
 }
+
+/// Golden differential for the chain builder (#570 / #579 review).
+///
+/// #570 rewrote the chain builder's internals (borrowed coordinate runs, a
+/// sorted incidence list instead of a node `HashMap`, position-indexed
+/// priorities) with the claim that output is unchanged. This pins that claim:
+/// 1500 seeded hostile cases (shared endpoints of degree 2 to 4+, duplicate
+/// and reversed-duplicate lines, zero-length and one-vertex lines, closed
+/// self-touching rings, repeated vertices, MultiLineStrings, antimeridian
+/// coordinates, NaN/inf/-0.0, mixed groups and sort keys, shuffled indices,
+/// every junction/snap/budget/gate setting) digest to the value the
+/// pre-#570 builder produced. The same generator was also run for 40,000
+/// cases (up to 20,000 lines each) against the pre-#570 code directly, with
+/// identical results. A change to this digest is an output change.
+#[cfg(test)]
+mod golden_digest {
+    use super::*;
+    use geo::{Coord, MultiLineString};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn f(&mut self) -> f64 {
+            (self.next() as f64) / ((1u64 << 31) as f64)
+        }
+    }
+
+    fn pt(r: &mut Lcg, grid: u64, scale: f64, mode: u64) -> Coord<f64> {
+        let base = Coord {
+            x: (r.below(grid) as f64) * scale,
+            y: (r.below(grid) as f64) * scale,
+        };
+        match mode {
+            // antimeridian: x near +180 or -180
+            1 => Coord {
+                x: if r.below(2) == 0 {
+                    179.9 + base.x * 1e-3
+                } else {
+                    -179.9 - base.x * 1e-3
+                },
+                y: base.y * 1e-3,
+            },
+            // jittered: exercises the snap phase
+            2 => Coord {
+                x: base.x + (r.f() - 0.5) * scale * 0.3,
+                y: base.y + (r.f() - 0.5) * scale * 0.3,
+            },
+            // non-finite sprinkled in
+            3 if r.below(30) == 0 => Coord {
+                x: [f64::NAN, f64::INFINITY, -0.0][r.below(3) as usize],
+                y: base.y,
+            },
+            _ => base,
+        }
+    }
+
+    fn gen_geoms(r: &mut Lcg, n: usize, scale: f64, mode: u64) -> Vec<Geometry<f64>> {
+        let grid = 2 + r.below(12);
+        let mut out: Vec<Geometry<f64>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let k = r.below(20);
+            let g = match k {
+                0 => {
+                    let p = pt(r, grid, scale, mode);
+                    Geometry::LineString(LineString::new(vec![p, p]))
+                }
+                1 if !out.is_empty() => out[r.below(out.len() as u64) as usize].clone(),
+                2 if !out.is_empty() => match &out[r.below(out.len() as u64) as usize] {
+                    Geometry::LineString(ls) => {
+                        let mut c = ls.0.clone();
+                        c.reverse();
+                        Geometry::LineString(LineString::new(c))
+                    }
+                    g => g.clone(),
+                },
+                3 => {
+                    let a = pt(r, grid, scale, mode);
+                    let b = pt(r, grid, scale, mode);
+                    let c = pt(r, grid, scale, mode);
+                    Geometry::LineString(LineString::new(vec![a, b, c, a]))
+                }
+                4 => Geometry::MultiLineString(MultiLineString::new(vec![LineString::new(vec![
+                    pt(r, grid, scale, mode),
+                    pt(r, grid, scale, mode),
+                ])])),
+                5 => Geometry::LineString(LineString::new(vec![pt(r, grid, scale, mode)])),
+                6 => {
+                    let a = pt(r, grid, scale, mode);
+                    let b = pt(r, grid, scale, mode);
+                    let c = pt(r, grid, scale, mode);
+                    Geometry::LineString(LineString::new(vec![a, a, b, b, c, c]))
+                }
+                7 => Geometry::LineString(LineString::new(vec![])),
+                _ => {
+                    let nv = 2 + r.below(4) as usize;
+                    let mut v = vec![pt(r, grid, scale, mode)];
+                    for _ in 1..nv - 1 {
+                        v.push(Coord {
+                            x: v[0].x + r.f() * scale,
+                            y: v[0].y + r.f() * scale,
+                        });
+                    }
+                    v.push(pt(r, grid, scale, mode));
+                    Geometry::LineString(LineString::new(v))
+                }
+            };
+            out.push(g);
+        }
+        out
+    }
+
+    /// One seeded case: returns the coalesced output and how many chains
+    /// merged two or more lines.
+    fn run_case(seed: u64) -> (Vec<CoalescedLine>, usize) {
+        let mut r = Lcg(seed ^ 0x9E37_79B9_7F4A_7C15);
+        let big = seed.is_multiple_of(97);
+        let n = 1 + r.below(if big { 2000 } else { 150 }) as usize;
+        let mode = r.below(4);
+        let scale = [1.0, 10.0, 1000.0, 0.001][r.below(4) as usize];
+        let geoms = gen_geoms(&mut r, n, scale, mode);
+        let ngroups = 1 + r.below(3) as u32;
+        let mut idx: Vec<usize> = (0..n).map(|i| i * 3 + 7).collect();
+        if r.below(2) == 0 {
+            for i in (1..n).rev() {
+                let j = r.below(i as u64 + 1) as usize;
+                idx.swap(i, j);
+            }
+        }
+        let sks: Vec<Option<f64>> = (0..n)
+            .map(|_| match r.below(4) {
+                0 => None,
+                1 => Some(1.0),
+                _ => Some(r.below(5) as f64),
+            })
+            .collect();
+        let groups: Vec<u32> = (0..n).map(|_| r.below(ngroups as u64) as u32).collect();
+        let lines: Vec<CoalesceInput<'_>> = (0..n)
+            .map(|i| CoalesceInput {
+                index: idx[i],
+                geom: &geoms[i],
+                sort_key: sks[i],
+                group: groups[i],
+            })
+            .collect();
+        let snap = [0.0, 0.5, 1.0, 3.0][r.below(4) as usize];
+        let junction = [0.0, 0.0, 20.0, 45.0, 90.0, 180.0][r.below(6) as usize];
+        let budget = if r.below(3) == 0 {
+            Some((1 + r.below(20) as usize, 0.5 + r.f()))
+        } else {
+            None
+        };
+        let gsd = [0.0, 1e-6, 0.5, 5.0, 100.0, 5000.0][r.below(6) as usize];
+        let crs = if mode == 1 || r.below(2) == 0 {
+            Crs::Epsg4326
+        } else {
+            Crs::Epsg3857
+        };
+        let mut cfg = AssignConfig::default();
+        if r.below(3) == 0 {
+            cfg.line_visibility = 0.0;
+        }
+        if r.below(3) == 0 {
+            cfg.line_thinning = 0.0;
+        }
+        let params = CoalesceParams {
+            snap_gsd_factor: snap,
+            junction_angle_deg: junction,
+            budget,
+        };
+        let out = coalesce_level_lines(&lines, gsd, crs, &cfg, &params);
+        let merged = out.iter().filter(|c| c.count > 1).count();
+        (out, merged)
+    }
+
+    /// FNV-1a over every rep, count and coordinate bit pattern.
+    fn digest(out: &[CoalescedLine]) -> u64 {
+        use geo::coords_iter::CoordsIter;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        eat(out.len() as u64);
+        for c in out {
+            eat(c.rep as u64);
+            eat(c.count as u64);
+            eat(c.geom.coords_count() as u64);
+            for p in c.geom.coords_iter() {
+                eat(p.x.to_bits());
+                eat(p.y.to_bits());
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn hostile_cases_match_the_pre_570_chain_builder() {
+        let mut h: u64 = 0;
+        let mut merged = 0;
+        for seed in 0..1500 {
+            let (out, m) = run_case(seed);
+            merged += m;
+            h = h.rotate_left(7) ^ digest(&out);
+        }
+        assert_eq!(merged, 8349, "the generator must keep exercising joins");
+        assert_eq!(
+            h, 0x98cb_5976_7524_9af4,
+            "chain builder output changed against the pre-#570 golden digest"
+        );
+    }
+}
