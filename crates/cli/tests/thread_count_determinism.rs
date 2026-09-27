@@ -451,13 +451,21 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
 /// runs the line thinning grid and the coalesce tables.
 ///
 /// Each runs twice: at the default density budget, and at `--drop-rate 6`, which
-/// makes the budget **bind** (#565). Without that arm a fixture this size can sit
-/// under budget at every level, in which case `apply_density_budget` returns its
-/// input untouched and the super-cell partition and its priority sorts never run
-/// — and that is the half of the phase #565 rewrote, from a materialized
-/// priority table to priorities derived per comparison. The `assert_ne!` at the
-/// end keeps the arm honest: if a future default stops binding, the arm goes
-/// vacuous and this fails rather than passing in silence.
+/// makes the budget bind harder and at more levels (#565). The density budget
+/// is the half of the phase #565 rewrote, from a materialized priority table to
+/// priorities derived per comparison, and it only runs its super-cell partition
+/// and priority sorts at a level where it **binds**; at a level under budget,
+/// `apply_density_budget` admits every candidate and never compares two of them.
+///
+/// So the test checks that the budget binds, and it cannot check that by
+/// comparing plan bytes: the plan's fingerprint records the `density` option,
+/// so two runs that differ only in `--drop-rate` always write different bytes,
+/// even when both assign every feature identically. Instead it reads the
+/// per-level feature counts out of each plan ([`plan_level_counts`]) and
+/// requires every arm's counts to differ from an unbudgeted
+/// (`--no-density-drop`) run's, and the two arms' counts to differ from each
+/// other. If a fixture or default change stops the budget binding, this fails
+/// rather than passing with the budget code never run.
 #[test]
 fn convert_plan_is_byte_identical_across_thread_counts() {
     for (name, max_zoom) in [
@@ -560,11 +568,74 @@ fn convert_plan_is_byte_identical_across_thread_counts() {
             per_arm.push(baseline.expect("each arm runs at least one thread count").1);
         }
 
+        // The budget must actually bind in both arms (see the doc comment for
+        // why plan bytes cannot answer this).
+        let unbudgeted = dir.path().join("unbudgeted.plan");
+        let max_zoom_arg = max_zoom.to_string();
+        let status = Command::new(tylertoo_bin())
+            .args([
+                "tiles",
+                fixture.to_str().unwrap(),
+                "--min-zoom",
+                "0",
+                "--max-zoom",
+                &max_zoom_arg,
+                "--save-plan",
+                unbudgeted.to_str().unwrap(),
+                "--plan-only",
+                "--no-density-drop",
+            ])
+            .env("RAYON_NUM_THREADS", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("run tylertoo tiles --no-density-drop: {e}"));
+        assert!(
+            status.status.success(),
+            "[{name}] --no-density-drop --plan-only exited with {}: {}",
+            status.status,
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let unbudgeted_counts =
+            plan_level_counts(&std::fs::read(&unbudgeted).expect("read unbudgeted plan"));
+        let arm_counts: Vec<Vec<usize>> = per_arm.iter().map(|p| plan_level_counts(p)).collect();
+        for (arm, counts) in ["default", "bound"].iter().zip(&arm_counts) {
+            assert_ne!(
+                counts, &unbudgeted_counts,
+                "[{name}/{arm}] the density budget did not bind at any level (per-level counts \
+                 equal the --no-density-drop run's), so this arm never runs the super-cell \
+                 partition or its priority sorts (#565) — raise the drop rate or pick a denser \
+                 fixture"
+            );
+        }
         assert_ne!(
-            per_arm[0], per_arm[1],
-            "[{name}] --drop-rate 6 produced the same plan as the default, so the density \
-             budget does not bind on this fixture and the `bound` arm is vacuous — raise the \
-             drop rate or pick a denser fixture (#565)"
+            arm_counts[0], arm_counts[1],
+            "[{name}] --drop-rate 6 assigned the same per-level counts as the default, so the \
+             `bound` arm adds no coverage (#565)"
         );
     }
+}
+
+/// The per-level feature counts recorded in a saved convert plan.
+///
+/// The plan stores its scalars as JSON in the Arrow IPC schema metadata
+/// (`plan_state::PlanMeta`), uncompressed, so the `"counts":[...]` array can be
+/// read straight out of the bytes without an Arrow reader in this crate. The
+/// IPC file repeats the schema in its footer; the first occurrence is used.
+fn plan_level_counts(plan: &[u8]) -> Vec<usize> {
+    const KEY: &[u8] = b"\"counts\":[";
+    let start = plan
+        .windows(KEY.len())
+        .position(|w| w == KEY)
+        .expect("plan has no \"counts\" array in its metadata")
+        + KEY.len();
+    let len = plan[start..]
+        .iter()
+        .position(|&b| b == b']')
+        .expect("unterminated \"counts\" array");
+    let text = std::str::from_utf8(&plan[start..start + len]).expect("counts are ASCII");
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split(',')
+        .map(|c| c.parse().expect("count is an integer"))
+        .collect()
 }
