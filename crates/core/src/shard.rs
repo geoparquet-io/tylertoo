@@ -109,18 +109,31 @@ pub(crate) const MAX_SHARD_PIVOT_ZOOM: u8 = 10;
 ///
 /// Two pivot tiles therefore covers every `--tile-buffer` up to **512** tile
 /// pixels — two full tile widths, against a default of 8 and a tippecanoe
-/// default of 5.
-/// [`ExportError::TileBufferTooWideForShard`](crate::overview::export::ExportError::TileBufferTooWideForShard)
-/// refuses anything past it rather than silently dropping tiles, so the bound
-/// is enforced, not merely assumed.
+/// default of 5. Since #433 every export, sharded or not, is capped at
+/// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) (one
+/// tile width) by
+/// [`ExportError::TileBufferTooWide`](crate::overview::export::ExportError::TileBufferTooWide),
+/// and the compile-time check below keeps that cap within this margin, so
+/// the bound is enforced, not merely assumed.
 ///
 /// The cost of the margin is bounded and small: a couple more row groups read
 /// per shard, on an input whose row groups are Hilbert-compact.
 pub(crate) const SHARD_READ_MARGIN_TILES: f64 = 2.0;
 
-/// The largest `--tile-buffer` (in tile pixels) a sharded build may use, given
-/// [`SHARD_READ_MARGIN_TILES`]. See that constant for the derivation.
-pub(crate) const MAX_SHARD_TILE_BUFFER_PX: u32 = 512;
+/// The largest `--tile-buffer` (in tile pixels) the read-pruning margin
+/// [`SHARD_READ_MARGIN_TILES`] covers. See that constant for the derivation.
+///
+/// Not a user-facing cap of its own any more (#433): the universal
+/// [`MAX_TILE_BUFFER_PX`](crate::overview::export::MAX_TILE_BUFFER_PX) is
+/// the one that is enforced, and this assertion is what ties the two —
+/// raise the universal cap past the margin and the build fails here rather
+/// than a shard silently missing geometry.
+pub(crate) const MAX_SHARD_TILE_BUFFER_PX: u32 =
+    (SHARD_READ_MARGIN_TILES * crate::overview::export::NOMINAL_TILE_PIXELS) as u32;
+const _: () = assert!(
+    crate::overview::export::MAX_TILE_BUFFER_PX <= MAX_SHARD_TILE_BUFFER_PX,
+    "the universal --tile-buffer cap must stay within the shard read-pruning margin"
+);
 
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]

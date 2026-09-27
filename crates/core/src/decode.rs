@@ -551,6 +551,17 @@ fn decode_tile_features(
             continue;
         }
         let extent = layer.extent.unwrap_or(4096);
+        // #433: `tile_local_to_lonlat` divides the tile width by the extent,
+        // so a layer declaring 0 would turn every coordinate into ±inf (NaN
+        // at the origin) and write that straight into the parquet. The MVT
+        // spec leaves the field's range implicit; zero is never a resolution.
+        if extent == 0 {
+            return Err(DecodeError::InvalidArchive(format!(
+                "tile z{}/{}/{} layer {:?} declares extent 0; a layer's extent is its \
+                 tile-local coordinate resolution and must be positive",
+                tile.z, tile.x, tile.y, layer.name
+            )));
+        }
         for feature in &layer.features {
             let parts = parse_command_stream(&feature.geometry).map_err(|reason| {
                 DecodeError::Geometry {
