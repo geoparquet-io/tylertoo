@@ -210,7 +210,8 @@ class TestExportPmtilesApi:
         """#427: spill_dir is validated before any work, naming the flag."""
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = Path(tmpdir) / "no-such-dir"
-            with pytest.raises(RuntimeError, match="spill-dir .* not an existing directory"):
+            pattern = r"spill-dir .* not an existing directory"
+            with pytest.raises(RuntimeError, match=pattern):
                 tylertoo.export_pmtiles(
                     "/nonexistent.parquet",
                     str(Path(tmpdir) / "out.pmtiles"),
