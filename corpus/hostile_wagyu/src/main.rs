@@ -1,7 +1,7 @@
 //! wagyu-rs runner for the #205 hostile-geometry evaluation.
 //!
-//! Reads the case dump the in-tree harness writes
-//! (`target/hostile_geometry_eval/cases.jsonl`), clips every polygon case with
+//! Reads the case dump the in-tree harness's `full_scorecard` writes
+//! (`target/hostile_geometry_eval/cases-full.jsonl`), clips every polygon case with
 //! wagyu-rs in two integer coordinate spaces, and writes
 //! `target/hostile_geometry_eval/wagyu_results.jsonl` beside it. The harness
 //! then scores those results with the SAME oracles it applies to the in-tree
@@ -86,23 +86,39 @@ impl Space {
     }
 }
 
+/// Largest scaled coordinate the runner will hand wagyu. `as i64` saturates
+/// past i64::MAX, and wagyu's edge arithmetic multiplies coordinates, so
+/// anything near the i64 range would be scored on harness-made input rather
+/// than the fixture (the 1e15° `huge-coordinates` case). 2^40 is far beyond
+/// any real tile-space coordinate (a z0 tile on the world grid is 2^32).
+const COORD_LIMIT: f64 = (1u64 << 40) as f64;
+
+fn to_i64(q: [f64; 2]) -> Result<Point<i64>, String> {
+    let ok = |v: f64| v.is_finite() && v.abs() <= COORD_LIMIT;
+    if ok(q[0]) && ok(q[1]) {
+        Ok(Point::new(q[0].round() as i64, q[1].round() as i64))
+    } else {
+        Err(format!(
+            "scaled coordinate ({}, {}) outside the runner's i64 range (±2^40)",
+            q[0], q[1]
+        ))
+    }
+}
+
 fn run_i64(case: &Case, space: &Space) -> Result<Vec<Vec<Vec<[f64; 2]>>>, String> {
     let mut w: Wagyu<i64> = Wagyu::new();
     for poly in &case.polygons {
         for ring in poly {
             let pts: Vec<Point<i64>> = open_ring(ring)
-                .map(|p| {
-                    let q = space.fwd(p);
-                    Point::new(q[0].round() as i64, q[1].round() as i64)
-                })
-                .collect();
+                .map(|p| to_i64(space.fwd(p)))
+                .collect::<Result<_, _>>()?;
             w.add_ring(&pts, PolygonType::Subject);
         }
     }
     let b: Vec<Point<i64>> = clip_box_f64(&case.bounds, space)
         .into_iter()
-        .map(|p| Point::new(p.x.round() as i64, p.y.round() as i64))
-        .collect();
+        .map(|p| to_i64([p.x, p.y]))
+        .collect::<Result<_, _>>()?;
     w.add_ring(&b, PolygonType::Clip);
     let mp = w
         .execute(
@@ -151,11 +167,11 @@ fn main() {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/hostile_geometry_eval")
         });
-    let cases_path = dir.join("cases.jsonl");
+    let cases_path = dir.join("cases-full.jsonl");
     let out_path = dir.join("wagyu_results.jsonl");
     let reader = BufReader::new(File::open(&cases_path).unwrap_or_else(|e| {
         panic!(
-            "{}: {e}. Run `cargo test -p tylertoo-core --test hostile_geometry_eval` first.",
+            "{}: {e}. Run `cargo test --release -p tylertoo-core --test hostile_geometry_eval full_scorecard` first.",
             cases_path.display()
         )
     }));
@@ -214,6 +230,9 @@ fn main() {
             };
             serde_json::to_writer(&mut out, &outcome).expect("write outcome");
             out.write_all(b"\n").expect("write newline");
+            // Per line, so an interrupted run leaves whole lines behind (the
+            // harness skips and reports a torn last line).
+            out.flush().expect("flush outcome");
         }
         n += 1;
     }

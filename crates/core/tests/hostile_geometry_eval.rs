@@ -33,8 +33,10 @@
 //!   out of process by `corpus/hostile_wagyu` (its dead `geo 0.32` dependency
 //!   cannot resolve beside our geo 0.33 — see that crate's Cargo.toml). This
 //!   harness dumps the polygon cases to `target/hostile_geometry_eval/
-//!   cases.jsonl`; when `wagyu_results.jsonl` is present beside it, those
-//!   results are scored with the same oracles and land in the same table.
+//!   cases-full.jsonl` (`full_scorecard`; the smoke test writes
+//!   `cases-smoke.jsonl`); when `wagyu_results.jsonl` is present beside it,
+//!   `full_scorecard` scores those results with the same oracles and they
+//!   land in the same table.
 //!
 //! # Oracles, per (case × engine)
 //!
@@ -50,12 +52,13 @@
 //! perf comparison.
 //!
 //! Run:
-//!   cargo test -p tylertoo-core --test hostile_geometry_eval -- --nocapture
+//!   cargo test -p tylertoo-core --test hostile_geometry_eval \
+//!       smoke_scorecard -- --nocapture
 //!   cargo test --release -p tylertoo-core --test hostile_geometry_eval \
 //!       full_scorecard -- --nocapture
 //! then, for the wagyu columns,
 //!   cargo run --release --manifest-path corpus/hostile_wagyu/Cargo.toml
-//! and re-run the test to fold them in.
+//! and re-run `full_scorecard` to fold them in.
 
 #[cfg(not(feature = "dhat-heap"))]
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -114,9 +117,16 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Serializes the sweeps: the allocation counters are process-global, and
+/// plain `cargo test` runs this binary's tests on parallel threads.
+static SWEEP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Peak heap growth (bytes above the level at entry) while `f` runs. The
-/// counters are process-global, so this is exact only when nothing else
-/// allocates concurrently; the tests below run their sweeps sequentially.
+/// counters are process-global, so this is exact only while `SWEEP_LOCK` is
+/// held by the caller and nothing else allocates concurrently; the other
+/// test in this binary (`corpus_is_present_and_parsed`) only parses
+/// fixtures, so its allocations can at most inflate one measurement, never
+/// deflate it.
 fn measure_peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let base = CURRENT.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
@@ -998,18 +1008,19 @@ fn unsigned_area(g: &Geometry<f64>) -> f64 {
 /// How far outside the buffered bounds the output reaches, in MVT units of
 /// this tile (0 when every vertex is inside).
 fn excursion_mvt(g: &Geometry<f64>, c: &Case) -> f64 {
+    // A tile's latitude span shrinks by ~cos(lat) while its longitude span
+    // does not, so each axis gets its own unit.
     let b = &c.bounds;
-    let unit = c.tile.width() / 4096.0;
-    let worst = g
-        .coords_iter()
+    let unit_x = c.tile.width() / 4096.0;
+    let unit_y = c.tile.height() / 4096.0;
+    g.coords_iter()
         .map(|p| {
-            (b.lng_min - p.x)
-                .max(p.x - b.lng_max)
-                .max(b.lat_min - p.y)
-                .max(p.y - b.lat_max)
+            ((b.lng_min - p.x) / unit_x)
+                .max((p.x - b.lng_max) / unit_x)
+                .max((b.lat_min - p.y) / unit_y)
+                .max((p.y - b.lat_max) / unit_y)
         })
-        .fold(0.0_f64, f64::max);
-    worst / unit
+        .fold(0.0_f64, f64::max)
 }
 
 /// `geo::Validation` is quadratic on a ring's self-intersection check; past
@@ -1388,8 +1399,11 @@ fn geometry_from_dump(polys: Vec<Vec<Vec<[f64; 2]>>>) -> Option<Geometry<f64>> {
     }
 }
 
-fn write_case_dump(fixtures: &[Fixture], cases: &[Case]) {
-    let path = out_dir().join("cases.jsonl");
+/// One dump file per test (`cases-smoke.jsonl`, `cases-full.jsonl`): the
+/// two sweeps run on parallel threads under plain `cargo test`, and a shared
+/// file would interleave.
+fn write_case_dump(fixtures: &[Fixture], cases: &[Case], dump_name: &str) {
+    let path = out_dir().join(dump_name);
     let mut f = std::io::BufWriter::new(fs::File::create(&path).unwrap());
     for c in cases {
         let g = &fixtures[c.fixture].geom;
@@ -1410,15 +1424,25 @@ fn write_case_dump(fixtures: &[Fixture], cases: &[Case]) {
     }
 }
 
-fn read_wagyu_results() -> Option<Vec<WagyuOutcome>> {
+/// The runner's results, plus the number of lines that did not parse (a run
+/// interrupted mid-write leaves a truncated last line; it is reported, not
+/// fatal).
+fn read_wagyu_results() -> Option<(Vec<WagyuOutcome>, usize)> {
     let path = out_dir().join("wagyu_results.jsonl");
     let text = fs::read_to_string(path).ok()?;
-    Some(
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("wagyu_results.jsonl line"))
-            .collect(),
-    )
+    let mut bad = 0usize;
+    let results = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| match serde_json::from_str(l) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                bad += 1;
+                None
+            }
+        })
+        .collect();
+    Some((results, bad))
 }
 
 // ============================================================================
@@ -1432,13 +1456,23 @@ struct Run {
     board: Scoreboard,
     input_status: BTreeMap<String, String>,
     engines_seen: Vec<String>,
+    /// wagyu fold-in bookkeeping: (matched, unmatched ids, unparseable lines),
+    /// `None` when no results file was read.
+    wagyu_fold: Option<(usize, usize, usize)>,
 }
 
+/// `dump_name` is this sweep's case-dump file; `fold_wagyu` reads
+/// `wagyu_results.jsonl` (written by `corpus/hostile_wagyu` from the FULL
+/// dump) and scores it — only the full sweep does, since the smoke sweep's
+/// ids are a different (smaller) case set.
 fn sweep(
     fixtures: Vec<Fixture>,
     skipped: BTreeMap<String, CorpusSkip>,
     tiles_per_zoom: impl Fn(Tier) -> usize,
+    dump_name: &str,
+    fold_wagyu: bool,
 ) -> Run {
+    let _serial = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cases = cases_for(&fixtures, tiles_per_zoom);
     let mut board = Scoreboard {
         tallies: BTreeMap::new(),
@@ -1506,13 +1540,18 @@ fn sweep(
         }
     }
 
-    write_case_dump(&fixtures, &cases);
+    write_case_dump(&fixtures, &cases, dump_name);
 
-    if let Some(results) = read_wagyu_results() {
+    let mut wagyu_fold = None;
+    if !fold_wagyu {
+        // Smoke sweep: nothing to fold.
+    } else if let Some((results, bad_lines)) = read_wagyu_results() {
         let by_id: BTreeMap<&str, &Case> = cases.iter().map(|c| (c.id.as_str(), c)).collect();
         let mut matched = 0usize;
+        let mut unmatched = 0usize;
         for r in results {
             let Some(c) = by_id.get(r.id.as_str()) else {
+                unmatched += 1;
                 continue;
             };
             matched += 1;
@@ -1538,7 +1577,11 @@ fn sweep(
             v.peak_bytes = None;
             score(&mut board, &r.engine, f.tier, c, &inputs[c.fixture], &v);
         }
-        eprintln!("hostile_geometry_eval: folded in {matched} wagyu outcomes");
+        eprintln!(
+            "hostile_geometry_eval: folded in {matched} wagyu outcomes \
+             ({unmatched} unmatched ids, {bad_lines} unparseable lines)"
+        );
+        wagyu_fold = Some((matched, unmatched, bad_lines));
     } else {
         eprintln!(
             "hostile_geometry_eval: no wagyu_results.jsonl — run \
@@ -1554,6 +1597,7 @@ fn sweep(
         board,
         input_status,
         engines_seen,
+        wagyu_fold,
     }
 }
 
@@ -1584,6 +1628,18 @@ fn scorecard(run: &Run, title: &str) -> String {
         run.cases.len(),
         run.skipped.len(),
     );
+    match run.wagyu_fold {
+        Some((matched, 0, 0)) => {
+            let _ = writeln!(s, "wagyu-rs results folded in: {matched} outcomes.\n");
+        }
+        Some((matched, unmatched, bad)) => {
+            let _ = writeln!(
+                s,
+                "wagyu-rs results folded in: {matched} outcomes; **{unmatched} outcomes had ids not in this sweep and {bad} lines did not parse** — the runner's input was a different or truncated dump; re-run it on `cases-full.jsonl`.\n"
+            );
+        }
+        None => {}
+    }
 
     for tier in [Tier::Corpus, Tier::Synthetic, Tier::Real] {
         let any = run.board.tallies.values().any(|m| m.contains_key(&tier));
@@ -1792,7 +1848,7 @@ fn assert_production_invariants(run: &Run) {
 fn smoke_scorecard_and_production_invariants() {
     let (mut fixtures, skipped) = load_corpus();
     fixtures.extend(synthetic_suite());
-    let run = sweep(fixtures, skipped, |_| 12);
+    let run = sweep(fixtures, skipped, |_| 12, "cases-smoke.jsonl", false);
     let md = scorecard(&run, "Smoke (corpus + synthetic, ≤12 tiles per zoom)");
     fs::write(out_dir().join("SCORECARD-smoke.md"), &md).unwrap();
     println!("{md}");
@@ -1840,10 +1896,16 @@ fn full_scorecard() {
     let (mut fixtures, skipped) = load_corpus();
     fixtures.extend(synthetic_suite());
     fixtures.extend(real_suite());
-    let run = sweep(fixtures, skipped, |tier| match tier {
-        Tier::Real => 4,
-        _ => 24,
-    });
+    let run = sweep(
+        fixtures,
+        skipped,
+        |tier| match tier {
+            Tier::Real => 4,
+            _ => 24,
+        },
+        "cases-full.jsonl",
+        true,
+    );
     let md = scorecard(
         &run,
         "Full (corpus + synthetic ≤24 tiles per zoom, real ≤4)",

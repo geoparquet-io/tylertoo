@@ -34,8 +34,9 @@ exterior-only fast-path bbox, below).
 - **Oracles**, per case × engine: caught panic; *drops* (empty where the
   i_overlay reference has area) and *phantoms* (the reverse); *past buffer*
   (largest distance any output vertex lies outside the buffered bounds, in
-  MVT units of that tile — 0.5 is where it stops quantizing onto the
-  boundary); `geo::Validation` on the output (outputs over 20k vertices are
+  MVT units of that tile, per axis — the tile's height, not its width, for
+  the latitude terms, since a Mercator tile's latitude span shrinks by
+  ~cos(lat); 0.5 is where it stops quantizing onto the boundary); `geo::Validation` on the output (outputs over 20k vertices are
   *unchecked*: geo's ring self-intersection check is quadratic);
   *self-crossing* via the production sweep (`clip::geometry_is_simple`);
   *mixed winding* (exteriors disagree, or a hole matches its exterior — the
@@ -45,8 +46,12 @@ exterior-only fast-path bbox, below).
   i_overlay 4.5 — is recorded as the third opinion on valid input);
   *area>input* (a clip can never add area; checked on valid inputs only);
   vertices; wall time (single run, indicative — the bench is authoritative);
-  peak heap (counting allocator; not available for the out-of-process
-  wagyu).
+  peak heap (counting allocator; the two sweeps take a lock so they never
+  run concurrently, and the only other test in the binary just parses
+  fixtures, so a concurrent allocation can at most inflate one reading;
+  not available for the out-of-process wagyu). *Errors* are cases an engine
+  refused: for wagyu, coordinates the runner would not scale onto its
+  integer grid (past ±2^40 units, where `as i64` saturates).
 - **Corpora.** `tests/fixtures/geometry-test-data` (chrieke's
   geojson-invalid-geometry, 76 files: 35 usable geometries, 41 structurally
   broken files listed under "Inputs" — recorded, not skipped silently); a
@@ -75,12 +80,12 @@ validation cap).
 
 | engine | cases | panics | errors | drops | phantoms | past buffer >½ MVT | max excursion (MVT) | invalid (geo) | unchecked | self-crossing | mixed winding | area≠ref | max rel Δarea | area>input | vertices | time | peak heap |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| production | 1147 | 0 | 0 | 1 | 0 | 0 | 0.00 | 60 | 0 | 0 | 19 | 4 | 8.5e-1 | 0 | 7342 | 2.9 ms | 108.2 KiB |
-| production-strict | 1147 | 0 | 0 | 1 | 0 | 0 | 0.00 | 1 | 0 | 0 | 0 | 1 | 4.3e-1 | 0 | 6976 | 13.0 ms | 208.0 KiB |
+| production | 1147 | 0 | 0 | 1 | 0 | 0 | 0.00 | 60 | 0 | 0 | 19 | 4 | 8.5e-1 | 0 | 7342 | 2.7 ms | 108.2 KiB |
+| production-strict | 1147 | 0 | 0 | 1 | 0 | 0 | 0.00 | 1 | 0 | 0 | 0 | 1 | 4.3e-1 | 0 | 6976 | 12.8 ms | 208.0 KiB |
 | sh | 985 | 0 | 0 | 1 | 0 | 0 | 0.00 | 84 | 0 | 6 | 19 | 13 | 8.5e-1 | 0 | 7299 | 0.4 ms | 38.2 KiB |
-| ioverlay | 1147 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 0 | 0 | 0 | 0 | 0.0e0 | 0 | 6985 | 9.7 ms | 153.3 KiB |
-| wagyu-i64-mvt | 985 | 0 | 0 | 65 | 8 | 26 | 156678.00 | 18 | 0 | 16 | 1 | 66 | 1.3e3 | 7 | 6534 | 27.0 ms | n/a |
-| wagyu-i64-world | 985 | 0 | 0 | 65 | 8 | 102 | 157321.75 | 18 | 0 | 16 | 1 | 61 | 1.3e3 | 7 | 6533 | 26.3 ms | n/a |
+| ioverlay | 1147 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 0 | 0 | 0 | 0 | 0.0e0 | 0 | 6985 | 8.9 ms | 153.3 KiB |
+| wagyu-i64-mvt | 985 | 0 | 0 | 65 | 8 | 26 | 156678.00 | 18 | 0 | 16 | 1 | 66 | 1.3e3 | 7 | 6534 | 29.6 ms | n/a |
+| wagyu-i64-world | 985 | 0 | 3 | 65 | 8 | 102 | 157321.75 | 18 | 0 | 16 | 1 | 61 | 1.3e3 | 7 | 6533 | 27.1 ms | n/a |
 
 - `production` invalid outputs: 40× exterior ring and interior ring intersect on a line; 1× exterior and second interior ring intersect on a line; 15× exterior ring has a self-intersection; 4× interior ring not contained within the exterior
 - `production-strict` invalid outputs: 1× interior ring not contained within the exterior
@@ -89,29 +94,30 @@ validation cap).
 
 ### synthetic hostile
 
-| engine | cases | panics | errors | drops | phantoms | past buffer >½ MVT | max excursion (MVT) | invalid (geo) | unchecked | self-crossing | mixed winding | area≠ref | max rel Δarea | area>input | vertices | time | peak heap |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| production | 1121 | 0 | 0 | 0 | 44 | 0 | 0.00 | 101 | 0 | 0 | 34 | 36 | 2.8e0 | 0 | 8014 | 0.9 ms | 31.3 KiB |
+| production | 1121 | 0 | 0 | 0 | 44 | 0 | 0.00 | 101 | 0 | 0 | 34 | 36 | 2.8e0 | 0 | 8014 | 0.8 ms | 31.3 KiB |
 | production-strict | 1121 | 0 | 0 | 0 | 3 | 0 | 0.00 | 14 | 0 | 0 | 2 | 11 | 2.8e0 | 0 | 7362 | 5.2 ms | 109.7 KiB |
 | sh | 1026 | 0 | 0 | 0 | 44 | 0 | 0.00 | 144 | 0 | 7 | 34 | 55 | 2.8e0 | 0 | 8009 | 0.4 ms | 46.9 KiB |
-| ioverlay | 1121 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 0 | 0 | 0 | 0 | 0.0e0 | 1 | 7329 | 4.0 ms | 175.7 KiB |
-| wagyu-i64-mvt | 1026 | 0 | 0 | 55 | 49 | 17 | 43562.46 | 12 | 0 | 8 | 4 | 69 | 2.1e3 | 2 | 6680 | 9.9 ms | n/a |
-| wagyu-i64-world | 1026 | 0 | 0 | 29 | 49 | 17 | 43562.67 | 12 | 0 | 8 | 4 | 68 | 2.1e3 | 2 | 7446 | 9.7 ms | n/a |
+| ioverlay | 1121 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 0 | 0 | 0 | 0 | 0.0e0 | 1 | 7329 | 3.9 ms | 175.7 KiB |
+| wagyu-i64-mvt | 1026 | 0 | 41 | 55 | 8 | 17 | 43579.95 | 12 | 0 | 8 | 4 | 69 | 2.1e3 | 2 | 6475 | 9.3 ms | n/a |
+| wagyu-i64-world | 1026 | 0 | 41 | 29 | 8 | 17 | 43580.16 | 12 | 0 | 8 | 4 | 68 | 2.1e3 | 2 | 7241 | 10.6 ms | n/a |
+
+- `production` invalid outputs: 65× exterior ring and interior ring at index 0 intersect on a line; 18× exterior ring has a self-intersection; 1× interior ring at index 0 and interior ring at index 1 intersect on an area; 7× interior ring at index 0 is not contained within the polygon's exterior; 10× polygons at indices 0 and 1 overlap
 
 - `production` invalid outputs: 65× exterior and interior ring intersect on a line; 18× exterior ring has a self-intersection; 1× holes overlap; 7× interior ring not contained within the exterior; 10× overlapping parts (the input's own)
 - `production-strict` invalid outputs: 2× self-intersection; 1× holes overlap; 1× interior not contained; 10× overlapping parts
 - `wagyu-i64-mvt` / `-world` invalid outputs: 7× self-intersecting exterior (2 top-level, 5 parts) plus 1 more part; 1× overlapping parts; 2× parts touching on a line; 1× parts 0 and 7 overlap
+- `wagyu-i64-mvt` / `-world` errors: 41× the runner refused the case — the 1e15° `huge-coordinates` ring scales past ±2^40 grid units, where `as i64` would saturate and wagyu would be scored on runner-made input (the world grid also refuses 3 corpus cases of `problematic_crs_defined`, whose projected-metre coordinates land near 1e14 units at z1–z5)
 
 ### real
 
-| engine | cases | panics | errors | drops | phantoms | past buffer >½ MVT | max excursion (MVT) | invalid (geo) | unchecked | self-crossing | mixed winding | area≠ref | max rel Δarea | area>input | vertices | time | peak heap |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| production | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 1 | 5 | 0 | 0 | 0 | 5.9e-8 | 0 | 506797 | 85.5 ms | 32.5 MiB |
-| production-strict | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 5 | 0 | 0 | 0 | 1.2e-11 | 0 | 506782 | 703.5 ms | 52.0 MiB |
-| sh | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 1 | 5 | 0 | 0 | 0 | 5.9e-8 | 0 | 506799 | 15.0 ms | 14.5 MiB |
-| ioverlay | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 5 | 0 | 0 | 0 | 0.0e0 | 0 | 506372 | 485.5 ms | 53.8 MiB |
-| wagyu-i64-mvt | 21 | 0 | 0 | 0 | 0 | 0 | 0.11 | 5 | 0 | 3 | 4 | 2 | 1.3e-1 | 0 | 36316 | 9838.2 ms | n/a |
-| wagyu-i64-world | 21 | 9 | 0 | 0 | 0 | 0 | 0.01 | 0 | 0 | 0 | 0 | 0 | 1.1e-5 | 0 | 767 | 21110.3 ms | n/a |
+| sh | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 1 | 5 | 0 | 0 | 0 | 5.9e-8 | 0 | 506799 | 13.4 ms | 14.5 MiB |
+| ioverlay | 21 | 0 | 0 | 0 | 0 | 0 | 0.00 | 0 | 5 | 0 | 0 | 0 | 0.0e0 | 0 | 506372 | 460.3 ms | 53.8 MiB |
+| wagyu-i64-mvt | 21 | 0 | 0 | 0 | 0 | 0 | 0.32 | 5 | 0 | 3 | 4 | 2 | 1.3e-1 | 0 | 36316 | 9992.1 ms | n/a |
+| wagyu-i64-world | 21 | 9 | 0 | 0 | 0 | 0 | 0.01 | 0 | 0 | 0 | 0 | 0 | 1.1e-5 | 0 | 767 | 19909.5 ms | n/a |
+
+- `production` invalid outputs: 1× polygon at index 0 is invalid: exterior ring has a self-intersection
+- `sh` invalid outputs: 1× polygon at index 0 is invalid: exterior ring has a self-intersection
+- `wagyu-i64-mvt` invalid outputs: 2× polygon at index 0 is invalid: exterior ring has a self-intersection; 1× polygon at index 1 is invalid: exterior ring has a self-intersection; 1× polygons at indices 0 and 10 overlap; 1× polygons at indices 2 and 16 overlap
 
 - `production` / `sh` invalid output: 1× a part with a self-intersecting exterior — Tielt-Winge at z8, an S-H self-touching ring the sweep does not count as a proper crossing (self-crossing column: 0)
 - `wagyu-i64-mvt` invalid outputs: 3× self-intersecting exteriors, 2× overlapping parts; `wagyu-i64-world` panics: 9× `INFINITE LOOP DETECTED in vatti main loop at iteration 100001` on Antarctica
@@ -218,13 +224,15 @@ pathological shapes is why S-H stays first and i_overlay stays the fallback.
 
 ```bash
 # quick tier (corpus + synthetic; asserts the production invariants)
-cargo test -p tylertoo-core --test hostile_geometry_eval
+cargo test -p tylertoo-core \
+  --test hostile_geometry_eval smoke_scorecard
 
 # full scorecard (slow set; writes target/hostile_geometry_eval/SCORECARD.md)
 cargo test --release -p tylertoo-core \
   --test hostile_geometry_eval full_scorecard
 
-# wagyu columns, then re-run the line above to fold them in
+# wagyu columns (reads cases-full.jsonl), then re-run full_scorecard
+# above to fold them in
 cargo run --release \
   --manifest-path corpus/hostile_wagyu/Cargo.toml
 

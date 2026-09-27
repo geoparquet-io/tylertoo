@@ -20,7 +20,8 @@ lockfile.
 ## Run
 
 ```bash
-# 1. dump the cases (also scores the in-tree engines)
+# 1. dump the cases to target/hostile_geometry_eval/cases-full.jsonl
+#    (also scores the in-tree engines)
 cargo test --release -p tylertoo-core \
   --test hostile_geometry_eval full_scorecard
 
