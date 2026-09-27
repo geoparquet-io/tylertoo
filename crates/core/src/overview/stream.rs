@@ -94,7 +94,8 @@ use super::convert::{
     resolve_read_workers, resolve_reserved_column_collisions, scan_feature,
     validate_cluster_schema, validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies,
     ClassRanking, CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner,
-    LevelReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    LevelReport, PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES,
+    ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
@@ -1601,6 +1602,122 @@ struct PlanState {
     /// resolution, the density budget, carriers and cluster tables. Zero on
     /// the `--plan` path, where the artifact stands in for it.
     assign_wall: Duration,
+    /// `(points, lines, polygons)` across the scan — the per-kind tally the
+    /// plan artifact carries. Counted only when a plan is written or loaded
+    /// (it is one extra O(N) pass over the pass-1 features), `(0, 0, 0)`
+    /// otherwise; the plan-only report (#560) is its only reader.
+    kind_counts: (usize, usize, usize),
+}
+
+/// The front half of a streaming convert: the preflight, and pass 1 + the
+/// level assignment (or the `--plan` artifact that replaces them).
+struct FrontHalf {
+    preflight: Preflight,
+    plan: PlanState,
+}
+
+/// Run everything that precedes pass 2, in the order a convert runs it.
+///
+/// Factored out so the full convert and the plan-only run (#560) share ONE
+/// code path up to the point where `--save-plan` has written its artifact.
+/// That sharing is the #560 invariant's implementation: there is no separate
+/// plan-writing path that could drift from the one the fleet's full coarse job
+/// takes, so the artifact cannot differ.
+fn run_front_half(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    peak_rss_mib: &mut Option<f64>,
+) -> Result<FrontHalf, ConvertError> {
+    // A numeric sort key and a categorical class ranking would both drive
+    // `AssignFeature::sort_key` (Q1); refused before the input is opened.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+    let preflight = convert_preflight(source, options)?;
+    // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
+    // profile-derived knobs): what pass 1, the assignment and the plan's
+    // fingerprint all see.
+    let options = &preflight.options;
+    let plan = resolve_plan_state(
+        &Pass1Inputs {
+            source,
+            input_schema: &preflight.input_schema,
+            geom_idx: preflight.geom_idx,
+            acc_cols: &preflight.acc_cols,
+            selected_row_groups: preflight.selected_row_groups.as_ref(),
+            bbox_units: preflight.bbox_units.as_ref(),
+            bound_filter: preflight.bound_filter.as_ref(),
+            crs: preflight.crs,
+        },
+        options,
+        peak_rss_mib,
+    )?;
+    Ok(FrontHalf { preflight, plan })
+}
+
+/// `--plan-only` (#560): run the front half, which writes the `--save-plan`
+/// artifact, and stop — no pass 2, no output file, no writer.
+///
+/// The caller ([`super::convert::write_convert_plan_sources`]) has already
+/// normalized and validated the options and checked that `save_plan` is set.
+pub(crate) fn write_plan_streaming(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+) -> Result<PlanReport, ConvertError> {
+    let start = Instant::now();
+    let mut peak_rss_mib: Option<f64> = None;
+    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
+    let options = &preflight.options;
+    let path = options
+        .save_plan
+        .clone()
+        .expect("checked by write_convert_plan_sources");
+
+    // Exactly the partition the full convert makes at this point, so the
+    // report names the same levels a full run would write and the same #211
+    // auto-clamp warning fires.
+    let (planned, skipped) =
+        partition_emitted_levels(&plan.tables.level_specs, &plan.tables.counts);
+    if planned.is_empty() {
+        // Same gate, same point in the run: a plan whose every level is empty
+        // describes a build that would produce no tiles at all, and a fleet
+        // must not be launched against it. The artifact is on disk (it was
+        // written the moment the assignment finished) exactly as it is when a
+        // full run fails here.
+        return Err(ConvertError::NoData);
+    }
+    warn_plan_skipped_levels(&skipped, plan.num_features, planned[0].gsd, planned[0].zoom);
+    log_phase_rss("plan-only (assignment complete)", &mut peak_rss_mib);
+    log::info!(
+        "[rss] plan-only peak: {}",
+        peak_rss_mib.map_or_else(|| "unknown".to_string(), |v| format!("{v:.0} MiB"))
+    );
+
+    Ok(PlanReport {
+        plan_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        path,
+        input_rows: plan.num_rows,
+        input_features: plan.num_features,
+        kinds: plan.kind_counts,
+        levels: planned
+            .iter()
+            .map(|l| PlanLevelReport {
+                planned_level: l.orig as usize,
+                gsd: l.gsd,
+                zoom: l.zoom,
+                feature_count: l.hint,
+            })
+            .collect(),
+        skipped_empty_levels: skipped,
+        ranking: plan.ranking_provenance,
+        entry_zoom: options.entry_zoom.as_ref().map(|s| format!("{s:?}")),
+        row_groups_total: preflight.row_groups_total,
+        row_groups_read: preflight.row_groups_read,
+        pass1_secs: plan.pass1_wall.as_secs_f64(),
+        assign_secs: plan.assign_wall.as_secs_f64(),
+        duration_secs: start.elapsed().as_secs_f64(),
+        remote_fetch: super::convert::log_remote_fetch(source),
+    })
 }
 
 /// Run pass 1 + the level assignment, or load the artifact that stands in for
@@ -1753,6 +1870,7 @@ fn run_pass1_and_assign(
         pass1_stage_secs,
         pass1_wall,
         assign_wall,
+        kind_counts: kind_counts.unwrap_or_default(),
     })
 }
 
@@ -1910,6 +2028,7 @@ fn load_plan_state(
         // The load stands in for the scan; the assignment did not run at all.
         pass1_wall: t_pass1.elapsed(),
         assign_wall: Duration::ZERO,
+        kind_counts: (totals.n_points, totals.n_lines, totals.n_polygons),
     })
 }
 
@@ -1925,10 +2044,9 @@ pub(crate) fn convert_streaming_strategy(
     // and which phase produced it.
     let mut peak_rss_mib: Option<f64> = None;
 
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
-    }
-
+    // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
+    // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
+    let FrontHalf { preflight, plan } = run_front_half(source, options, &mut peak_rss_mib)?;
     let Preflight {
         options: resolved_options,
         input_schema,
@@ -1937,15 +2055,15 @@ pub(crate) fn convert_streaming_strategy(
         geom_idx,
         geom_field,
         acc_cols,
-        bbox_units,
-        bound_filter,
+        // Pass-1 inputs only: pass 2 reads the assignment's `min_levels`,
+        // where a row the bbox or the filter dropped is already UNASSIGNED.
+        bbox_units: _,
+        bound_filter: _,
         selected_row_groups,
         row_groups_total,
         row_groups_read,
-    } = convert_preflight(source, options)?;
+    } = preflight;
     let options = &resolved_options;
-
-    // --- Pass 1 + assignment, or the saved plan that replaces them. ----------
     let PlanState {
         tables:
             WinnerTables {
@@ -1966,20 +2084,8 @@ pub(crate) fn convert_streaming_strategy(
         pass1_stage_secs,
         pass1_wall,
         assign_wall,
-    } = resolve_plan_state(
-        &Pass1Inputs {
-            source,
-            input_schema: &input_schema,
-            geom_idx,
-            acc_cols: &acc_cols,
-            selected_row_groups: selected_row_groups.as_ref(),
-            bbox_units: bbox_units.as_ref(),
-            bound_filter: bound_filter.as_ref(),
-            crs,
-        },
-        options,
-        &mut peak_rss_mib,
-    )?;
+        kind_counts: _,
+    } = plan;
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.

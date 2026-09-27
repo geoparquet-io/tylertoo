@@ -1040,3 +1040,179 @@ fn a_shard_that_owns_no_rows_writes_an_empty_archive_and_the_fleet_still_merges(
         assert_eq!(head[7], 3, "{}: not PMTiles v3", a.display());
     }
 }
+
+// ---- --plan-only (#560) ----------------------------------------------------
+
+/// The #560 contract at the CLI surface: `--plan-only` writes the plan a
+/// coarse job writes — **byte for byte** — and nothing else at all, and a data
+/// shard takes that plan without knowing the difference.
+///
+/// The build this exists for throws the coarse job's tiles away (an external
+/// archive owns those zooms), so the tiles must not be the price of the plan.
+#[test]
+fn plan_only_writes_the_coarse_jobs_plan_and_no_archive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = cut_plan(dir.path(), "2", "3");
+
+    // (1) The full coarse job: tiles below the pivot, plus the plan. This is
+    // the run #560 replaces, and its plan is the oracle.
+    let coarse_plan = dir.path().join("coarse.plan");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        coarse_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "the coarse job must succeed: {out}");
+
+    // (2) The same job, plan only. Its own directory, so "wrote nothing else"
+    // is checkable by listing it.
+    let only_dir = dir.path().join("plan-only");
+    std::fs::create_dir(&only_dir).unwrap();
+    let only_plan = only_dir.join("convert.plan");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        only_plan.to_str().unwrap(),
+        "--plan-only",
+    ]);
+    assert!(ok, "--plan-only must succeed: {out}");
+    assert!(
+        out.contains("Wrote the convert plan"),
+        "the run must say what it produced: {out}"
+    );
+    assert!(
+        out.contains("--plan"),
+        "the run must point at the next fleet step: {out}"
+    );
+
+    // No archive, no intermediate overview, no checkpoint, no partial file.
+    let left: Vec<String> = std::fs::read_dir(&only_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        vec!["convert.plan".to_string()],
+        "--plan-only left more than the plan behind"
+    );
+
+    // (3) THE invariant: the artifact the fleet consumes did not move.
+    assert_eq!(
+        std::fs::read(&coarse_plan).unwrap(),
+        std::fs::read(&only_plan).unwrap(),
+        "--plan-only must write the plan a coarse job writes, byte for byte"
+    );
+
+    // (4) And a data shard accepts it, which is the only thing the plan is for.
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("shard0.pmtiles").to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        "5",
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--plan",
+        only_plan.to_str().unwrap(),
+    ]);
+    assert!(
+        ok,
+        "a data shard must accept a plan written by --plan-only: {out}"
+    );
+}
+
+/// Every misuse of `--plan-only` fails fast, before anything is read, naming
+/// the flag the operator typed.
+#[test]
+fn plan_only_misuse_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = cut_plan(dir.path(), "2", "3");
+    let plan = dir.path().join("convert.plan");
+    let out_pm = dir.path().join("out.pmtiles");
+
+    // The plan is the only output, so there must be somewhere to put it.
+    let (ok, out) = run(&["tiles", grid().to_str().unwrap(), "--plan-only"]);
+    assert!(!ok, "--plan-only without --save-plan must fail: {out}");
+    assert!(out.contains("--save-plan"), "unexpected: {out}");
+
+    // An OUTPUT path nothing would ever write is a misunderstanding, not an
+    // ignorable argument.
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        out_pm.to_str().unwrap(),
+        "--save-plan",
+        plan.to_str().unwrap(),
+        "--plan-only",
+    ]);
+    assert!(!ok, "--plan-only with an OUTPUT must fail: {out}");
+    assert!(out.contains("takes no OUTPUT"), "unexpected: {out}");
+    assert!(!out_pm.exists());
+
+    // A data shard reads a subset, so its plan would be useless to the fleet.
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        plan.to_str().unwrap(),
+        "--plan-only",
+    ]);
+    assert!(!ok, "--plan-only on a data shard must fail: {out}");
+    assert!(out.contains("data shard"), "unexpected: {out}");
+
+    // Export-side knobs cannot be honored by a run that does not export.
+    let input = grid();
+    let input = input.to_str().unwrap();
+    for knob in [
+        vec!["--report", "r.json"],
+        vec!["--keep-overview", "o.parquet"],
+        vec!["--tile-range", "21..40"],
+        vec!["--layer-name", "x"],
+        vec!["--force"],
+    ] {
+        let mut argv = vec![
+            "tiles",
+            input,
+            "--save-plan",
+            plan.to_str().unwrap(),
+            "--plan-only",
+        ];
+        argv.extend(knob.iter().copied());
+        let (ok, out) = run(&argv);
+        assert!(!ok, "--plan-only with {knob:?} must fail: {out}");
+        assert!(
+            out.contains("cannot be used with"),
+            "expected a clap conflict for {knob:?}: {out}"
+        );
+    }
+
+    // Nothing above got as far as writing a plan.
+    assert!(!plan.exists(), "a refused --plan-only run wrote a plan");
+}

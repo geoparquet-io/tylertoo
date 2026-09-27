@@ -109,6 +109,45 @@ Do **not** try to get the same effect with a shallower `--max-zoom`: the
 convert plan *is* fingerprinted on the level plan, so a coarse job run that
 way produces a plan every shard refuses.
 
+#### When the coarse tiles are thrown away: `--plan-only`
+
+Sometimes the coarse job's *tiles* are not wanted at all. In an
+**aggregate-into-fields handover build**, an archive produced outside tylertoo
+(cell aggregates with their own per-cell metrics) owns z0–z8, real polygons own
+z9–z13, and `tylertoo merge` joins them: the coarse job's zooms are replaced
+wholesale. It still has to run, because the level assignment is dataset-global
+and only it reads every row — but only for the plan.
+
+`--plan-only` is that run, with no export at all:
+
+```bash
+tylertoo tiles fields.parquet \
+    --min-zoom 0 --max-zoom 14 \
+    --shard coarse --shard-plan shards.json \
+    --save-plan convert.plan \
+    --plan-only
+```
+
+Same flags, plus one, and **no OUTPUT positional** — there is no archive, no
+intermediate overview, and nothing else left on disk. Pass 1 and the level
+assignment run exactly as before, so the plan is once again **byte-identical**
+to the one a full or level-capped coarse job writes (the parity oracle builds
+its whole fleet from a `--plan-only` plan and compares the merged archive to a
+monolithic run, tile body by tile body). What it saves is the export share of
+the coarse job's wall — the majority of it, on a large build.
+
+It requires `--save-plan` (the plan is its only output) and refuses what it
+cannot honor: an OUTPUT path, `--shard I/N` (a data shard's plan would cover
+only that shard's rows), and the export-side knobs `--report`,
+`--keep-overview`, `--tile-range`, `--layer-name`, `--max-tile-size` and
+`--force`. The run prints what the plan contains — level counts, per-kind
+feature tallies, how the cell-winner ranking resolved, the entry-zoom ladder —
+so the plan can be sanity-checked before any shard hours are committed;
+`--verbose` adds the per-level breakdown.
+
+Skip it when you want the coarse tiles: a `--shard coarse` run produces them
+*and* the plan in one pass, and #541 already makes its pass 2 cheap.
+
 ### 2. The shards (N runs, in parallel)
 
 ```bash
