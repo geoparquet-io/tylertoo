@@ -59,6 +59,19 @@ its remaining scope; the legacy pipeline's architecture notes were moved to
    v3 writer (`pmtiles_writer.rs`, streaming, deduplicating).
 5. **Defaults should look right**: default knob values are chosen from
    rendered sweeps on the corpus (see `corpus/SWEEPS.md`), not guessed.
+6. **Integer overflow is a bug, never a wrap** (#432): `[profile.release]`
+   sets `overflow-checks = true` for the workspace crates, so an unchecked
+   expression in our code that overflows aborts in release exactly as it
+   does in debug instead of writing wrong bytes. Dependencies are excluded
+   (`[profile.release.package."*"] overflow-checks = false`): a third-party
+   crate with a latent wrap that is benign for it would otherwise abort the
+   binary and surface as a `PanicException` in the Python wheel, and those
+   sites are not ours to fix or test. That is the backstop, not the policy: at untrusted-input
+   boundaries (CLI values, PMTiles/plan/GeoParquet bytes) arithmetic on
+   user-controlled numbers uses `checked_*` / `saturating_*` and returns a
+   typed error, because a panic there is still a denial of service. Shifts
+   are masked regardless of this setting, so a shift amount derived from
+   input (zoom levels) needs its own range check.
 
 ## The Overview Pipeline
 

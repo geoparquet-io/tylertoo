@@ -32,10 +32,23 @@ use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
-/// Parse human-readable memory size (e.g., "8G", "16G", "512M") to bytes.
-fn parse_memory_size(s: &str) -> Result<usize, String> {
+/// Why a suffixed size did not parse: only the overflow branch should
+/// mention the ceiling, so the caller's message is built per branch.
+#[derive(Debug, PartialEq, Eq)]
+enum SizeParseError {
+    /// Not `<integer>[K|M|G]` at all.
+    Malformed,
+    /// Well-formed, but `n * multiplier` does not fit `usize` (#432).
+    Overflow,
+}
+
+/// Parse `<integer>[K|KB|M|MB|G|GB]` (case-insensitive) to bytes.
+///
+/// The suffix multiplication is checked (#432): `99999999999999999G` used to
+/// wrap in release builds and be accepted as a small byte count.
+fn parse_suffixed_size(s: &str) -> Result<usize, SizeParseError> {
     let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if s.ends_with("G") || s.ends_with("GB") {
+    let (num_str, multiplier): (&str, usize) = if s.ends_with("G") || s.ends_with("GB") {
         (
             s.trim_end_matches("GB").trim_end_matches("G"),
             1024 * 1024 * 1024,
@@ -49,16 +62,20 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
         (s.as_str(), 1)
     };
 
-    num_str
+    let n = num_str
         .trim()
         .parse::<usize>()
-        .map(|n| n * multiplier)
-        .map_err(|_| {
-            format!(
-                "Invalid memory size: '{}'. Use format like '8G', '16G', '512M'",
-                s
-            )
-        })
+        .map_err(|_| SizeParseError::Malformed)?;
+    n.checked_mul(multiplier).ok_or(SizeParseError::Overflow)
+}
+
+/// The ceiling clause appended to an overflow error, and nothing else: a
+/// malformed value gets the format hint alone.
+fn size_ceiling_hint(err: SizeParseError) -> String {
+    match err {
+        SizeParseError::Malformed => String::new(),
+        SizeParseError::Overflow => format!(" (the value must fit in {} bytes)", usize::MAX),
+    }
 }
 
 /// Parse a human-readable byte size (e.g., "500K", "1M", "2G") as usize.
@@ -66,8 +83,11 @@ fn parse_memory_size(s: &str) -> Result<usize, String> {
 /// A plain integer with no suffix is interpreted as raw bytes, so callers that
 /// previously passed a byte count (e.g. `--tile-size-limit 500000`) keep working.
 fn parse_size_bytes(s: &str) -> Result<usize, String> {
-    parse_memory_size(s).map_err(|_| {
-        format!("Invalid size: '{s}'. Use a byte count or a suffixed size like '500K', '1M', '2G'")
+    parse_suffixed_size(s).map_err(|err| {
+        format!(
+            "Invalid size: '{s}'. Use a byte count or a suffixed size like '500K', '1M', '2G'{}",
+            size_ceiling_hint(err)
+        )
     })
 }
 
@@ -4498,6 +4518,48 @@ mod tests {
         // A plain integer is raw bytes — keeps pre-reconciliation invocations working.
         assert_eq!(parse_size_bytes("500000").unwrap(), 500_000);
         assert!(parse_size_bytes("banana").is_err());
+    }
+
+    /// #432: a size whose suffix multiplication overflows `usize` must be a
+    /// parse error, not a wrapped (silently small) byte count. Before the
+    /// fix `99999999999999999G` wrapped in release builds and was accepted.
+    #[test]
+    fn parse_size_bytes_rejects_overflow() {
+        let ceiling = format!("must fit in {} bytes", usize::MAX);
+        for s in [
+            "99999999999999999G",
+            "9223372036854775808K",
+            "18446744073709551615M",
+        ] {
+            assert_eq!(parse_suffixed_size(s), Err(SizeParseError::Overflow), "{s}");
+            // The public message (--max-tile-size / --tile-size-limit) names
+            // the ceiling on this branch instead of hiding it behind the
+            // generic format hint.
+            let err = parse_size_bytes(s).expect_err(s);
+            assert!(err.starts_with("Invalid size: "), "{s}: {err}");
+            assert!(err.contains(&ceiling), "{s}: {err}");
+        }
+        // The largest representable value still parses.
+        assert_eq!(
+            parse_size_bytes(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+    }
+
+    /// The ceiling clause is for the overflow branch only: garbage gets the
+    /// format hint, not a 20-digit number that has nothing to do with it.
+    #[test]
+    fn malformed_size_error_does_not_mention_the_ceiling() {
+        for s in ["banana", "", "1.5G", "-1M", "G"] {
+            assert_eq!(
+                parse_suffixed_size(s),
+                Err(SizeParseError::Malformed),
+                "{s:?}"
+            );
+            let err = parse_size_bytes(s).expect_err(s);
+            assert!(err.starts_with("Invalid size: "), "{s:?}: {err}");
+            assert!(!err.contains("must fit in"), "{s:?}: {err}");
+        }
     }
 
     #[test]
