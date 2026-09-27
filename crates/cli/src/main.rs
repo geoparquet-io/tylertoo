@@ -570,7 +570,10 @@ struct ExportPmtilesArgs {
     #[arg(long)]
     exclude_all_properties: bool,
 
-    /// Per-tile edge buffer, in tile pixels (feature seam continuity).
+    /// Per-tile edge buffer, in tile pixels (feature seam continuity). At
+    /// most 256 (one full tile width); wider is refused, since past that a
+    /// tile duplicates geometry from tiles it does not border and every
+    /// feature belongs to O(buffer²) tiles (#433)
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
@@ -1797,7 +1800,9 @@ struct TilesArgs {
     no_simple_clip_fastpath: bool,
 
     /// Per-tile edge buffer, in tile pixels, carried across tile seams so
-    /// features don't clip at boundaries.
+    /// features don't clip at boundaries. At most 256 (one full tile width);
+    /// wider is refused, since past that a tile duplicates geometry from tiles
+    /// it does not border and every feature belongs to O(buffer²) tiles (#433)
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
@@ -2908,6 +2913,18 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     )?;
 
     check_tiles_output(&output, args.force)?;
+
+    // #433: the export knobs that need no file are checked before the
+    // convert, which on a large input runs for minutes before the export
+    // would otherwise refuse them. The full `ExportOptions` are built after
+    // the convert (the layer name and shard range come out of it), so this
+    // is the same check on the values that are already known.
+    ExportOptions {
+        tile_buffer: args.tile_buffer,
+        ..ExportOptions::default()
+    }
+    .validate()
+    .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
