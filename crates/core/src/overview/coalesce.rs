@@ -103,32 +103,68 @@ pub const DEFAULT_COALESCE_MAX_LEVEL_ROWS: usize = 2_000_000;
 /// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`] row ceiling as a **memory** ceiling
 /// (#449).
 ///
-/// A row count does not bound memory: 2M two-point road segments retain
-/// ~180 MiB of geometry, 2M 500-vertex contour lines retain ~16 GiB. The
+/// A row count does not bound memory: 2M two-point road segments model at
+/// 168 MiB of retained geometry, 2M 500-vertex contour lines at ~15 GiB. The
 /// guard's whole purpose is the bound, so it trips on whichever comes
 /// first — `coalesce_max_level_rows` lines, or `coalesce_max_level_rows ×`
-/// this many bytes of retained line geometry
-/// ([`collected_line_bytes`]). At the default ceiling that second limb is
-/// 1 GiB, which typical line networks never approach (an OSM/Overture road
-/// segment retains ~150–250 B), so it binds only on the pathological
-/// long-geometry inputs a row count silently mis-sizes.
+/// this many bytes of *modelled* line geometry ([`collected_line_bytes`]:
+/// 56 B + 16 B per vertex). At the default ceiling that second limb is
+/// 2M × 512 B = 1.024 GB (≈977 MiB, "≈1 GB") modelled — ≈1.2 GiB resident,
+/// since the model omits allocator headers, `Vec` growth slack and the side
+/// vectors.
+///
+/// **Where the byte limb binds.** 512 B is 56 + 16 × 28.5, so on a line set
+/// averaging more than ~28 vertices per line it trips *before* the row limb:
+/// in practice, once the input's lines total more than ~57–64 million
+/// vertices while numbering under 2M (e.g. 2M lines × 29 vertices, 1M × 61,
+/// 250k × 253). Road networks split at intersections sit well under it
+/// (Overture transportation segments average ≈8 vertices, ≈190 B modelled),
+/// but **unsplit** line data does not: OSM ways, rivers and streams,
+/// admin/coastline boundaries, contours, GPS tracks. Such inputs lose
+/// coalescing where the row-only guard used to allow it — the one intended
+/// output change of #449. To restore it, raise `--coalesce-max-level-rows`
+/// (it scales both limbs: 4,000,000 allows 4M lines / 2.048 GB modelled), at
+/// the cost of that much more resident geometry plus the chain-stage peak
+/// on top (`docs/OVERVIEW_TUNING.md`, "Line coalescing").
+///
+/// (The synthetic 37-vertex lines of #569's germany-segments benchmark
+/// proxy — 648 B modelled — would trip the byte limb from ~1.58M lines up
+/// to the 2M row ceiling; at the proxy's 6M lines the row limb trips first
+/// either way. The proxy is not a typical road segment.)
 pub(crate) const COALESCE_NOMINAL_BYTES_PER_LINE: u64 = 512;
+
+/// Modelled bytes of one line's `Geometry<f64>` slot in the coalescing
+/// scratch vector.
+///
+/// **Deliberately a fixed constant, not `size_of::<Geometry<f64>>()`**: the
+/// guard's verdict decides whether the output is coalesced, so the model must
+/// not move when a `geo` upgrade changes the enum's layout — the same input
+/// and options must produce the same file across tylertoo versions. 56 is the
+/// layout at the time of #449 (the `Polygon` variant, two `Vec`s + tag);
+/// `geometry_slot_model_covers_the_real_slot` fails if a future layout grows
+/// past it, which is the cue to revisit (not silently re-derive) the model.
+pub(crate) const COALESCE_MODEL_SLOT_BYTES: u64 = 56;
+
+/// Modelled bytes per coordinate (`Coord<f64>`: two `f64`s). Fixed for the
+/// same reason as [`COALESCE_MODEL_SLOT_BYTES`].
+pub(crate) const COALESCE_MODEL_COORD_BYTES: u64 = 16;
 
 /// Retained footprint of one line geometry held in the pass-1 coalescing
 /// scratch: its `Geometry<f64>` slot in the scratch vector plus the heap
-/// coordinate run behind it (16 B per `Coord<f64>`).
+/// coordinate run behind it —
+/// [`COALESCE_MODEL_SLOT_BYTES`] + [`COALESCE_MODEL_COORD_BYTES`] × vertices.
 ///
 /// Deliberately a *model*, not a measurement: it must be a pure function of
 /// the geometry so the [`super::convert::coalesce_effective`] verdict is
-/// identical on every platform, allocator and batch size (the streaming and
-/// buffered engines are byte-identical by contract, and both evaluate it).
-/// It undercounts the true resident cost — per-allocation malloc headers, and
-/// the parallel `rows`/`sort_keys`/`groups` side vectors (~40 B per line) —
+/// identical on every platform, allocator, batch size and `geo` version (the
+/// streaming and buffered engines are byte-identical by contract, and both
+/// evaluate it). It undercounts the true resident cost — per-allocation
+/// malloc headers, `Vec` growth slack, and the parallel
+/// `rows`/`sort_keys`/`groups` side vectors (~100–120 B per line all told) —
 /// which the row limb of the ceiling covers.
 pub(crate) fn collected_line_bytes(g: &Geometry<f64>) -> u64 {
     use geo::coords_iter::CoordsIter;
-    std::mem::size_of::<Geometry<f64>>() as u64
-        + (g.coords_count() as u64) * std::mem::size_of::<geo::Coord<f64>>() as u64
+    COALESCE_MODEL_SLOT_BYTES + (g.coords_count() as u64) * COALESCE_MODEL_COORD_BYTES
 }
 
 /// One candidate line feature for a level's coalescing pass.
@@ -1092,7 +1128,7 @@ mod tests {
 
     #[test]
     fn collected_line_bytes_counts_slot_plus_coordinates() {
-        let slot = std::mem::size_of::<Geometry<f64>>() as u64;
+        let slot = 56;
         let two = ls(&[(0.0, 0.0), (1.0, 0.0)]);
         assert_eq!(collected_line_bytes(&two), slot + 2 * 16);
         let five = ls(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]);
@@ -1104,6 +1140,29 @@ mod tests {
             LineString::from(vec![(3.0, 0.0), (4.0, 0.0), (5.0, 0.0)]),
         ]));
         assert_eq!(collected_line_bytes(&mls), slot + 5 * 16);
+    }
+
+    /// The byte model is pinned to fixed constants (so the coalescing verdict
+    /// cannot drift across `geo` versions), but it must still cover the real
+    /// layout: if `Geometry<f64>` or `Coord<f64>` ever grows past the model,
+    /// revisit `COALESCE_MODEL_*_BYTES` deliberately — changing them changes
+    /// which inputs get coalesced.
+    #[test]
+    fn geometry_slot_model_covers_the_real_slot() {
+        assert!(
+            std::mem::size_of::<Geometry<f64>>() as u64 <= COALESCE_MODEL_SLOT_BYTES,
+            "Geometry<f64> is {} B, over the fixed {COALESCE_MODEL_SLOT_BYTES} B model",
+            std::mem::size_of::<Geometry<f64>>()
+        );
+        assert_eq!(
+            std::mem::size_of::<geo::Coord<f64>>() as u64,
+            COALESCE_MODEL_COORD_BYTES
+        );
+        // 512 B/line is the byte limb's per-line budget: 56 + 16 × 28.5 —
+        // the "~28 vertices/line" threshold the docs quote.
+        let per_line = |v: u64| COALESCE_MODEL_SLOT_BYTES + v * COALESCE_MODEL_COORD_BYTES;
+        assert!(per_line(28) < COALESCE_NOMINAL_BYTES_PER_LINE);
+        assert!(per_line(29) > COALESCE_NOMINAL_BYTES_PER_LINE);
     }
 
     /// The model must be monotone in coordinate count — the property the

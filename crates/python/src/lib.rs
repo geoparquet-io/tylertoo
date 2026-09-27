@@ -417,8 +417,11 @@ fn accumulate_specs(
 ///     coalesce_max_level_rows (int, optional): Per-level candidate-line
 ///         ceiling (memory guard); inputs over it skip coalescing with a
 ///         log. Two limbs: this many candidate lines, and this value x
-///         512 B of retained line geometry (1 GiB by default) — exceeding
-///         either skips coalescing. Defaults to 2_000_000.
+///         512 B of modelled line geometry (~1 GB by default, ~1.2 GiB
+///         resident) — exceeding either skips coalescing. The byte limb
+///         binds first on lines averaging over ~28 vertices (unsplit
+///         rivers, boundaries, contours); raise this to coalesce them, at a
+///         proportional memory cost. Defaults to 2_000_000.
 ///     cogp_compat (bool, optional): Emit the optional COGP compatibility
 ///         footer key. Defaults to False.
 ///     row_group_size (int, optional): Maximum output row-group size in rows

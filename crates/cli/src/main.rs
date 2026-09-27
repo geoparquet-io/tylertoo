@@ -1179,7 +1179,10 @@ struct ConvertTuningArgs {
     ///
     /// Two limbs, since a row count does not bound memory: the candidate
     /// line count, and the geometry those lines retain (this value x 512 B
-    /// — 1 GiB by default). Exceeding either skips coalescing.
+    /// of modelled geometry — ~1 GB by default, ~1.2 GiB resident).
+    /// Exceeding either skips coalescing. The byte limb binds first on lines
+    /// averaging over ~28 vertices (unsplit rivers, boundaries, contours);
+    /// raise this value to coalesce them, at a proportional memory cost.
     #[arg(
         long,
         value_name = "ROWS",

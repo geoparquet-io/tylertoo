@@ -3591,13 +3591,13 @@ impl LineScratch {
         self.feat_pos = Vec::new();
         self.geoms = Vec::new();
         log::debug!(
-            "[convert] coalescing memory guard tripped after {} candidate line(s) / {:.0} MiB \
-             of geometry (ceiling {} line(s) / {:.0} MiB): pass 1 released the line scratch \
-             and is now only counting",
+            "[convert] coalescing memory guard tripped after {} candidate line(s) / {} \
+             of modelled geometry (ceiling {} line(s) / {}): pass 1 released the line \
+             scratch and is now only counting",
             self.lines,
-            self.bytes as f64 / (1024.0 * 1024.0),
+            super::convert::human_bytes(self.bytes),
             self.max_rows,
-            self.max_bytes as f64 / (1024.0 * 1024.0),
+            super::convert::human_bytes(self.max_bytes),
         );
     }
 
@@ -3622,6 +3622,27 @@ impl LineScratch {
             rows: self.rows,
             geoms: self.geoms,
         })
+    }
+}
+
+/// Free the row-indexed coalescing class groups (and their interners) once
+/// the #449 ceiling has tripped: they only ever feed the line scratch
+/// ([`LineScratch::finish`]), which a tripped pass hands back as `None`, and
+/// [`resolve_ranking_tier`] discards them when collection has stopped — so
+/// past the trip they are 4 B/row (plus the interned class strings) of dead
+/// weight. Ranking keys (`keys`) are untouched: the ranking still needs them.
+fn release_coalesce_groups(
+    plan: &mut RankPlan,
+    explicit_groups: &mut Vec<u32>,
+    explicit_interner: &mut GroupInterner,
+) {
+    *explicit_groups = Vec::new();
+    *explicit_interner = GroupInterner::default();
+    if let RankPlan::Auto { roads, .. } = plan {
+        for cand in roads.iter_mut() {
+            cand.groups = Vec::new();
+            cand.interner = GroupInterner::default();
+        }
     }
 }
 
@@ -3886,6 +3907,13 @@ fn run_pass1_with_chunk_rows(
                     &mut point_count,
                     &mut skipped_rows,
                 )?;
+                if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
+                    release_coalesce_groups(
+                        &mut plan,
+                        &mut explicit_groups,
+                        &mut explicit_interner,
+                    );
+                }
                 num_rows += n;
                 // #305: measure the encoded geometry column's in-memory size
                 // so the pass-2 RAM-vs-spill estimate can use this input's
@@ -3900,8 +3928,9 @@ fn run_pass1_with_chunk_rows(
                     &proj,
                     &mut plan,
                     // Groups are only read off the collected scratch, so they
-                    // stop with it (a ragged tail is never indexed: a released
-                    // scratch yields `None`).
+                    // stop with it — and are freed at the trip
+                    // (`release_coalesce_groups`); a released scratch yields
+                    // `None`, so nothing ever indexes them afterwards.
                     lines.mode == LineCollect::Collect,
                     ladder_col,
                     &kept_row,
@@ -4801,7 +4830,7 @@ mod tests {
     /// module (only the items `run_pass1` itself needs are), so pull them in
     /// via the grandparent (`overview`) module directly.
     use super::super::convert::LevelPlan;
-    use super::super::testutil::write_input_with_f64;
+    use super::super::testutil::{write_input, write_input_with_f64};
 
     /// A mix of points, lines, and polygons, spread out so every row is its
     /// own coarse-level cell winner and no feature collapses during
@@ -5179,6 +5208,122 @@ mod tests {
         assert_eq!(under.num_rows, over.num_rows);
     }
 
+    /// #569 review: the row-ceiling trip under a CLASS ranking — the path
+    /// that also interns per-row coalescing groups, which stop (and are
+    /// freed) at the trip while ranking keys keep streaming. The tripped run
+    /// must still rank identically and hand back no scratch.
+    #[test]
+    fn pass1_drops_line_scratch_when_row_ceiling_trips_class_ranked() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(3, 9, 2).into_iter().map(Some).collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        // `write_input` carries a Utf8 `name` column ("f0", "f1", …): rank on
+        // it as a class column so every row interns its own group.
+        write_input(tin.path(), &geoms, false, None);
+
+        let base = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            class_ranking: Some(ClassRanking {
+                column: "name".to_string(),
+                ranks: vec![
+                    ("f4".to_string(), 3.0),
+                    ("f7".to_string(), 2.0),
+                    ("f10".to_string(), 1.0),
+                ],
+                unknown_rank: 0.0,
+            }),
+            read_batch_size: 4, // several batches: the trip lands mid-stream
+            ..Default::default()
+        };
+
+        let under = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 9,
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        let scratch = under
+            .coalesce
+            .as_ref()
+            .expect("9 lines fit a 9-line ceiling");
+        assert_eq!(scratch.geoms.len(), 9);
+        assert_eq!(
+            scratch.groups.as_ref().map(Vec::len),
+            Some(9),
+            "a class-ranked scratch carries one interned group per line"
+        );
+
+        let over = run_pass1_for_test(
+            tin.path(),
+            &ConvertOptions {
+                coalesce_max_level_rows: 8,
+                ..base.clone()
+            },
+            usize::MAX,
+        );
+        assert!(over.coalesce.is_none(), "the 8-line ceiling must trip");
+        assert_eq!(over.provenance, under.provenance, "ranking tier unchanged");
+        assert_features_eq(&under.features, &over.features);
+        assert_eq!(
+            under.line_tally, over.line_tally,
+            "the tally is exact past the trip"
+        );
+        assert_eq!(over.line_tally.0, 9);
+    }
+
+    /// #569 review: a trip in the MIDDLE of a batch, between two of its scan
+    /// chunks (`read_batch_size: 4`, `chunk_rows: 2` — the ninth line lands
+    /// in the second chunk of the third batch). The chunked run must reach
+    /// the same verdict and the same exact tally as the one-chunk-per-batch
+    /// run, and neither may hand back a scratch.
+    #[test]
+    fn pass1_ceiling_trip_mid_batch_matches_unchunked() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(3, 9, 2).into_iter().map(Some).collect();
+        let n = geoms.len();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let values: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+
+        const READ_BATCH_SIZE: usize = 4;
+        const CHUNK_ROWS: usize = 2;
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            sort_key: Some("rank".to_string()),
+            read_batch_size: READ_BATCH_SIZE,
+            coalesce_max_level_rows: 8,
+            ..Default::default()
+        };
+        assert!(
+            total_pass1_chunks(n, READ_BATCH_SIZE, CHUNK_ROWS)
+                > total_pass1_chunks(n, READ_BATCH_SIZE, usize::MAX),
+            "the fixture must split batches into several chunks"
+        );
+
+        let unchunked = run_pass1_for_test(tin.path(), &options, usize::MAX);
+        let chunked = run_pass1_for_test(tin.path(), &options, CHUNK_ROWS);
+        assert!(unchunked.coalesce.is_none() && chunked.coalesce.is_none());
+        let line_bytes: u64 = (0..9)
+            .map(|_| {
+                collected_line_bytes(&Geometry::LineString(LineString::from(vec![
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (2.0, 0.0),
+                ])))
+            })
+            .sum();
+        assert_eq!(chunked.line_tally, (9, line_bytes));
+        assert_pass1_outputs_eq(&unchunked, &chunked);
+    }
+
     /// #449: the ceiling's byte limb — a row count does not bound memory, so
     /// the guard also trips on the retained geometry bytes
     /// (`coalesce_max_level_rows × COALESCE_NOMINAL_BYTES_PER_LINE`).
@@ -5275,6 +5420,15 @@ mod tests {
     /// The guard-tripped run must not pay for a buffer it cannot use. The
     /// tripped run goes FIRST so it cannot borrow a peak from the other
     /// run's freed arena.
+    ///
+    /// What it asserts is deliberately loose: the collecting run's peak must
+    /// exceed the tripped run's by more than **40 %** of the modelled buffer
+    /// (`observed > 0.4 × modelled`) — i.e. that a large share of the
+    /// buffer is really released, not that the model matches RSS. RSS is
+    /// allocator- and machine-dependent (and real two-point lines hold ~2.4×
+    /// their modelled bytes), so the printed observed/modelled figures are
+    /// informational; any closer agreement seen on one machine is not a
+    /// checked property.
     #[test]
     #[ignore = "slow (1.2M-row fixture) + RSS sampling is machine-dependent"]
     fn pass1_line_buffer_peak_is_released_when_the_ceiling_trips() {

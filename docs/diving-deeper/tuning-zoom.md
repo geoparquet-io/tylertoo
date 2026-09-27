@@ -171,4 +171,10 @@ The chaining knobs. The junction angle controls whether chains continue through
 intersections, defaulting to 0 so junctions terminate chains and preserve network
 topology. The snap tolerance bridges endpoint gaps within a GSD multiple. The
 level-row ceiling is a memory guard that skips coalescing on datasets too large
-to hold a level's candidate lines at once.
+to hold a level's candidate lines at once. It has two limbs: the line count
+itself, and the line geometry it implies (the ceiling × 512 B, ≈1 GB modelled
+by default). The byte limb binds first on long, unsplit lines (rivers,
+boundaries, contours, whole OSM ways averaging more than ~28 vertices), so such
+inputs can skip coalescing well under 2M lines; raising the ceiling restores it
+at a proportional memory cost. See
+[Overview tuning](../OVERVIEW_TUNING.md), `--coalesce-max-level-rows`.

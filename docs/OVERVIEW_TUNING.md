@@ -1003,34 +1003,78 @@ segments are individually visible and coalescing matters least. This is the
 streaming pipeline's one deliberate `O(lines)` residual allocation.
 
 **The ceiling has two limbs**, because a row count does not bound memory
-(2M two-point road segments retain ~180 MiB; 2M 500-vertex contour lines
-retain ~16 GiB). Coalescing is skipped when **either** is exceeded:
+(modelled: 2M two-point road segments retain 168 MiB, 2M 500-vertex contour
+lines ~15 GiB). Coalescing is skipped when **either** is exceeded:
 
 | limb | default | what it counts |
 |------|---------|----------------|
 | candidate lines | `--coalesce-max-level-rows` (2,000,000) | line features in the input |
-| retained geometry | `--coalesce-max-level-rows × 512 B` (1 GiB) | one `Geometry` slot + 16 B per coordinate, per line |
+| retained geometry | `--coalesce-max-level-rows × 512 B` (1.024 GB ≈ 977 MiB, "≈1 GB") | a fixed model: 56 B slot + 16 B per vertex, per line |
 
-The byte limb scales with the flag, so raising or lowering the ceiling moves
-both. 512 B/line is deliberately generous for line networks (an OSM /
-Overture road segment retains ~150–250 B), so on road data the row limb is
-what binds and the byte limb only catches the long-geometry inputs a row
-count silently mis-sizes.
+The byte limb is a **model**, not a measurement: a pure function of the
+vertex counts, so the verdict never depends on the machine, allocator or
+`geo` version. Real resident memory runs higher — allocator headers, `Vec`
+growth slack and side vectors add ~100–120 B per line — so the default
+ceiling is ≈1 GB modelled but **≈1.2 GiB resident** when the byte limb is
+what binds (and short lines are the worst ratio: 2M two-point segments model
+at 168 MiB but measured ~400 MiB resident in the #569 review).
+
+**When the byte limb binds — and changes output.** 512 B/line is
+56 + 16 × 28.5, so the byte limb trips *before* the row limb on inputs whose
+lines average **more than ~28 vertices** — concretely, fewer than 2M lines
+that together carry more than ~57–64 million vertices (2M lines × 29
+vertices, 1M × 61, 250k × 253). Up to #449 the guard counted rows only, so
+**these inputs used to be coalesced and now are not** — the one intended
+output change of that fix:
+
+- *Not affected:* road networks split at intersections. Overture
+  transportation segments average ≈8 vertices (≈190 B modelled); the row
+  limb is what binds for them, exactly as before.
+- *Affected:* **unsplit** line data — OSM ways as whole ways, rivers and
+  streams, admin and coastline boundaries, contour lines, GPS tracks — once
+  there are enough of them to cross ≈1 GB modelled.
+
+To coalesce such an input anyway, raise `--coalesce-max-level-rows`: it
+scales both limbs together (4,000,000 → 4M lines / 2.048 GB modelled). The
+cost is that much more resident line geometry (≈1.2× the modelled figure)
+**plus** the chain-stage peak below, which is a large multiple of it — so
+size the box first, or leave coalescing off for those layers
+(`--no-coalesce-lines`). The skip warning names which limb tripped.
+
+(#569's benchmark "germany-segments proxy" used 6M synthetic 37-vertex lines
+— 648 B modelled each, so a set of them trips the byte limb from ~1.58M
+lines up to the 2M row ceiling. At 6M lines the row limb trips first, as it
+does on the real 19.2M-line germany-segments; the proxy's vertex count is not
+a claim about typical road segments.)
 
 Both limbs are pure functions of the input, so the verdict — and the output
 — is identical across machines, engines (`streaming` on or off) and
 `--read-batch-size` values. Pass 1 enforces them *while it collects*:
 the moment the running totals cross, it frees what it has buffered and
 falls back to counting (#449). Before that, an over-ceiling input paid for
-the whole buffer and then threw it away — 11.9 GiB of peak RSS on
-germany-segments (19.2M lines) for a run that emits no chains at all.
+the whole buffer and then threw it away. Measured: the real
+germany-segments input (19.2M lines) peaked at **11.9 GiB** before the fix
+(#449), for a run that emits no chains at all. The "after" figure is from
+the 6M-line synthetic proxy, not the real input: macOS peak memory
+footprint **4890 → 1157 MiB** (−76 %, byte-identical output); the real
+input's post-fix peak is an extrapolation, not a measurement.
 
 **What the guard does not bound** is the chain stage itself, on inputs that
-*are* inside the ceiling: `build_chains` copies the level's coordinate runs
-into joinable pieces and indexes every endpoint in a hash map, so a level
-peaks at several times the retained geometry (measured: 1.5M 7-vertex lines,
-168 MiB of coordinates, 1.6 GiB peak RSS — see #449). Budget for roughly
-`8 ×` the retained-geometry figure above, or pass `--no-coalesce-lines`.
+*are* inside the ceiling: `build_chains` copies every line's coordinate run
+into a joinable piece and indexes every endpoint in a hash map, per level,
+and runs twice per level (#570). Measured whole-run peaks for 1.5M 7-vertex
+lines (240 MiB of modelled retained geometry), macOS peak memory footprint:
+
+| fixture | peak, coalescing on | peak, `--no-coalesce-lines` | ratio to modelled retained |
+|---|---|---|---|
+| #569 benchmark (1.5M × 7 vertices) | 3825 MiB | — | ≈16× |
+| end-to-end chains, z0–z14 (1.5M × 7 vertices, 2000-segment strokes) | 6923 MiB | 329 MiB | ≈29× (≈27× as a delta) |
+
+So budget **≈30× the modelled retained geometry on top of the run's
+`--no-coalesce-lines` peak** for an in-ceiling line input — at the default
+ceiling's ≈1 GB that is tens of GiB — or pass `--no-coalesce-lines`.
+Shrinking this amplification is tracked in
+[#570](https://github.com/geoparquet-io/tylertoo/issues/570).
 
 ### Interactions
 
