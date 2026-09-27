@@ -1545,7 +1545,13 @@ footprints are estimated up front and the levels are built in
 (and the same `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override): when the estimate
 exceeds the budget, levels are grouped so only one wave's grids are live at a
 time — trading cross-level parallelism for a bounded peak, degrading in the
-limit to a serial per-level build rather than an OOM. A one-line
+limit to one level per wave rather than an OOM. Each level's grid is still
+built across every core (#534: the level's features are classified in
+parallel and its grid is sharded across threads), so a one-level wave is not a
+serial build. That per-level parallelism adds one transient the estimate does
+not count — the placements waiting between shard reduces — which is bounded
+per wave instead: about 2 MiB per thread across the whole wave (at least 1 MiB
+per level), freed after every reduce. A one-line
 `[assign] winner grids …` log reports the split when it happens; on a roomy
 box the plan is a single wave and nothing changes. `speed` opts out
 (unbounded grids, maximum parallelism). As with everything in this section,
