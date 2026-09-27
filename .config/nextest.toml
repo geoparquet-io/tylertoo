@@ -108,3 +108,25 @@ default-filter = "all()"
 # The slow suite's own tests run up to ~7 minutes each (#524); give real
 # hangs a generous but finite ceiling rather than none at all.
 slow-timeout = { period = "120s", terminate-after = 6 }
+
+# mutants — what cargo-mutants runs against every mutant (.cargo/mutants.toml
+# selects it). Same test set as `quick` (inherited `default-filter`, so a
+# test marked slow above leaves the mutation run too), with two changes
+# that only make sense when the question is "does anything fail?" rather
+# than "what fails?":
+#
+# - fail-fast terminates the run the moment one test fails, killing the
+#   tests still in flight instead of waiting for them. Under plain
+#   fail-fast nextest stops *scheduling* but lets stragglers finish, and
+#   the stragglers here are the 7-25s real-data pipeline tests
+#   (overview::assign/convert/plan_state), so a mutant caught in the
+#   first second still cost a full test-tier wall clock.
+# - grace-period: nextest SIGTERMs the stragglers and waits this long
+#   before SIGKILL; Rust test binaries do not catch SIGTERM, so the
+#   default 10s is pure dead time.
+#
+# Only cargo-mutants should run this profile: an ordinary `cargo nextest
+# run --profile mutants` reports a single failure and hides the rest.
+[profile.mutants]
+fail-fast = { max-fail = 1, terminate = "immediate" }
+slow-timeout = { period = "60s", terminate-after = 10, grace-period = "1s" }

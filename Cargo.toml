@@ -146,3 +146,33 @@ overflow-checks = false
 
 [profile.bench]
 inherits = "release"
+
+# Build profile for cargo-mutants (.cargo/mutants.toml sets `profile =
+# "mutants"`; nextest gets it as `--cargo-profile=mutants`). Every mutant
+# recompiles tylertoo-core and relinks its test binaries, so this profile
+# is tuned for that loop, not for debugging:
+# - no debuginfo: the core test binaries were 4.6 GB of link output
+#   under `test`, 1.1 GB here, and nobody attaches a debugger to a mutant.
+# - workspace crates stay at opt-level 0 (inherited from `test`, with
+#   overflow-checks and debug-assertions on, which is where many mutants
+#   are caught). opt-level 1 was measured too: the quick tier ran 2x
+#   faster but a real mutation's incremental rebuild got slower, and
+#   builds dominate now that a caught mutant's tests stop within a second.
+# - dependencies at opt-level 3 (`package."*"` matches non-workspace crates
+#   only): built once per sweep/shard, then every test run of every mutant
+#   is faster, since the real-data pipeline tests that bound the test
+#   phase spend most of their time in arrow/parquet/geo.
+[profile.mutants]
+inherits = "test"
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
+
+# codegen-units is NOT inherited here on purpose: 256 units is right for
+# the per-mutant incremental rebuild of the workspace, but the
+# dependencies are built once and run thousands of times, so they get
+# release-style cross-function inlining.
+[profile.mutants.package."*"]
+opt-level = 3
+codegen-units = 16

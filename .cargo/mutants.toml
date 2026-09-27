@@ -4,23 +4,70 @@
 # Keys: `cargo mutants --emit-schema=config`, or
 # https://github.com/sourcefrog/cargo-mutants/blob/main/src/config.rs.
 # The file is parsed with deny_unknown_fields: a typo fails every run.
+#
+# Per-mutant cost is what makes or breaks a sweep of ~8400 mutants, so
+# every knob below is there to shrink it; the measurements behind each one
+# are in the PR that introduced it (perf(mutants), 2026-09) and in
+# DEVELOPMENT.md.
 
 # Run each mutant's tests through nextest instead of `cargo test`, so the
-# quick/full tiers in .config/nextest.toml apply. Plain `cargo nextest run`
-# is the `quick` profile, which drops the slow end-to-end binaries
-# (convert_guard_golden, shard_merge_parity, thread_count_determinism,
-# sharded_builds, ...: 20s-7min each, ~75% of the suite's test-seconds,
-# #524). Running those once per mutant would turn a weekly sweep into a
-# multi-day one, and they gate merges elsewhere (the required Slow Tests
-# checks in ci.yml). Marking a new test slow in nextest.toml removes it
-# from mutation runs automatically; nothing to keep in sync here.
-# `cargo test` has no way to exclude an integration-test binary, which is
-# why this is a tool switch rather than an argument list.
+# tiers in .config/nextest.toml apply. `cargo test` has no way to exclude
+# an integration-test binary or to kill in-flight tests on the first
+# failure, which is why this is a tool switch rather than an argument list.
 test_tool = "nextest"
 
-# Make the tier explicit at the call site (nextest would pick `quick`
-# anyway: it mirrors `default`, and `--profile` is a nextest arg here).
-additional_cargo_test_args = ["--profile", "quick"]
+# Build with the `mutants` Cargo profile (Cargo.toml): no debuginfo,
+# dependencies optimized. Per mutant only tylertoo-core is recompiled and
+# its test binaries relinked; with debuginfo those 23 binaries totalled
+# 4.6 GB of link output, without it 1.1 GB. Optimized dependencies cost
+# one slower clean build per shard (~3 CPU-min more on a 4-vCPU runner)
+# and make every test run of every mutant faster: the real-data pipeline
+# tests that bound the test phase (overview::assign/convert/plan_state)
+# spend most of their time in arrow/parquet/geo. cargo-mutants passes
+# this to nextest as `--cargo-profile=mutants`.
+profile = "mutants"
+
+# Passed to both the build and the test invocation, so they restrict what
+# cargo *builds* per mutant, not just what nextest runs: the lib test
+# binary plus the integration binaries that have at least one test the
+# `mutants` nextest profile would execute. Without this, cargo links all
+# 17 test binaries of the crate (lib + 16 integration) for every mutant,
+# including the three slow-tier ones nextest's default-filter then skips
+# (convert_guard_golden, shard_merge_parity, stream_profile_parity) and
+# the two whose tests are all #[ignore] (debug_antarctica,
+# huge_polygon_clip). The cli crate's slow binaries (sharded_builds,
+# thread_count_determinism) are never built here: `--package
+# tylertoo-core` already excludes them.
+#
+# Derived, not hand-picked: `scripts/mutants-test-binaries.sh` prints this
+# array from `cargo nextest list --profile mutants`, and `--check` fails
+# when the tree and this file disagree. Rerun it after adding an
+# integration test binary to crates/core/tests or marking one slow in
+# .config/nextest.toml. A binary missing here is built and tested nowhere
+# in the mutation run, so the check matters.
+additional_cargo_args = [
+  "--lib",
+  "--test", "decode_errors",
+  "--test", "decode_roundtrip",
+  "--test", "hostile_geometry_eval",
+  "--test", "invalid_geometry_clipping",
+  "--test", "ioverlay_real_fixtures_test",
+  "--test", "leaf_directory_integration",
+  "--test", "line_clip_pinned",
+  "--test", "overview_hostile",
+  "--test", "overview_property_tests",
+  "--test", "pmtiles_clustered",
+  "--test", "webmercator_roundtrip",
+]
+
+# nextest profile (a nextest arg, distinct from the Cargo profile above):
+# `mutants` in .config/nextest.toml is the `quick` test set — the slow
+# end-to-end binaries (20s-7min each, ~75% of the suite's test-seconds,
+# #524) stay out, and gate merges elsewhere (the required Slow Tests
+# checks in ci.yml) — plus fail-fast that terminates in-flight tests the
+# moment one fails. Marking a new test slow in nextest.toml removes it
+# from mutation runs automatically; nothing to keep in sync here.
+additional_cargo_test_args = ["--profile", "mutants"]
 
 # Timeouts. cargo-mutants kills a mutant's test run at
 # max(minimum_test_timeout, timeout_multiplier x baseline test time) and

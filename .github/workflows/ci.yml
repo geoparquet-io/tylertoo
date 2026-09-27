@@ -327,6 +327,23 @@ jobs:
         # nextest does not run doctests.
         run: cargo test --locked --all-features --doc
 
+      - name: Check the mutation run builds every test binary it should
+        # .cargo/mutants.toml names the core test binaries cargo-mutants
+        # builds per mutant (only those with a test the run would execute,
+        # so the slow-tier and all-#[ignore] binaries are not relinked
+        # ~8400 times a sweep). A binary missing from that list is tested
+        # nowhere in the weekly sweep, so the list must follow the tree:
+        # this fails when crates/core/tests or the nextest slow set changed
+        # and the list did not. Fix: scripts/mutants-test-binaries.sh
+        # prints the current array. One lane is enough (the list is
+        # platform-independent). It lists at default features, which is
+        # what cargo-mutants builds, so tylertoo-core's tests compile once
+        # more here under that feature set (a few minutes on the warm
+        # dependency cache); feature-gated test binaries must not leak
+        # into the mutation list.
+        if: runner.os == 'Linux' && matrix.rust == 'stable'
+        run: scripts/mutants-test-binaries.sh --check
+
   # The slow end-to-end tests excluded from the `quick` nextest profile
   # (.config/nextest.toml, #457) — together, `quick` (Test job) + this job's
   # complement equal the `full` profile. They run here, beside the Test
