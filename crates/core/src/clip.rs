@@ -14,7 +14,9 @@
 //!   tile boundaries (same approach as tippecanoe's clip.cpp). This is O(n) and
 //!   specialized for rectangle clipping. For edge cases where S-H produces invalid
 //!   output (self-intersecting polygons, U-shapes that split), we fall back to
-//!   i_overlay's robust boolean operations.
+//!   i_overlay's robust boolean operations. Lines are clipped by that same
+//!   i_overlay (`ioverlay_clip::clip_multilinestring_ioverlay`, #435), so one
+//!   engine decides where the tile edge is for every geometry type.
 //!
 //! # Edge Case Handling (Issue #94)
 //!
@@ -30,8 +32,8 @@
 
 use geo::algorithm::sweep::Intersections;
 use geo::{
-    BooleanOps, BoundingRect, Coord, Geometry, Line, LineString, MultiLineString, MultiPolygon,
-    Point, Polygon, Rect,
+    BoundingRect, Coord, Geometry, Line, LineString, MultiLineString, MultiPolygon, Point, Polygon,
+    Rect,
 };
 
 use crate::ioverlay_clip;
@@ -385,10 +387,11 @@ fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
     }
 }
 
-/// Clip a linestring to bounds using BooleanOps.
+/// Clip a linestring to bounds on i_overlay (#435).
 ///
-/// IMPORTANT: Uses correct signature - `polygon.clip(&linestring, invert)`
-/// NOT `linestring.clip(&polygon)` which doesn't exist.
+/// Same engine as the polygon fallback (`ioverlay_clip`), so lines and
+/// polygons never disagree about where the tile edge is. Was
+/// `geo::BooleanOps::clip`, the i_overlay 4.x copy `geo` vendors.
 fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     if let Some(rect) = ls.bounding_rect() {
@@ -397,22 +400,9 @@ fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry
         }
     }
 
-    let clip_rect = Rect::new(
-        Coord {
-            x: bounds.lng_min,
-            y: bounds.lat_min,
-        },
-        Coord {
-            x: bounds.lng_max,
-            y: bounds.lat_max,
-        },
-    );
-    let clip_poly = clip_rect.to_polygon();
-
-    // Correct usage: polygon.clip(&multilinestring, invert)
-    // invert=false means keep the parts INSIDE the polygon
+    // Keep the parts INSIDE the bounds (not inverted).
     let mls = MultiLineString::new(vec![ls.clone()]);
-    let clipped = clip_poly.clip(&mls, false);
+    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(&mls, bounds);
 
     if clipped.0.is_empty() {
         None
@@ -432,20 +422,7 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
         }
     }
 
-    let clip_rect = Rect::new(
-        Coord {
-            x: bounds.lng_min,
-            y: bounds.lat_min,
-        },
-        Coord {
-            x: bounds.lng_max,
-            y: bounds.lat_max,
-        },
-    );
-    let clip_poly = clip_rect.to_polygon();
-
-    // Correct usage: polygon.clip(&multilinestring, invert)
-    let clipped = clip_poly.clip(mls, false);
+    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(mls, bounds);
 
     if clipped.0.is_empty() {
         None

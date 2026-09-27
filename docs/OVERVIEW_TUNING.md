@@ -1302,6 +1302,33 @@ instead.
 
 ---
 
+## Tile geometry knobs: `--tile-buffer`, `extent`
+
+Both act at export, on the tiles, not on the overview file.
+
+- **`--tile-buffer` (default 8, at most 256, tile pixels).** How far past its
+  edge a tile carries geometry, so a feature spanning a seam renders
+  continuously. The unit is the 256-pixel nominal tile, the same as
+  tippecanoe's `--buffer` (default 5). The cap is one full tile width: at 256
+  a tile already holds every feature of its eight neighbours, and past it a
+  tile would duplicate geometry from tiles it does not border. The cap is also
+  what keeps the export bounded — the buffer is what makes a feature belong to
+  more than one tile, so `--tile-buffer 100000` (≈390 tile widths) put every
+  feature in every tile and the export went O(features × tiles). A wider value
+  is refused up front, before any convert or export work runs (#433). A
+  sharded build's read-pruning margin is two pivot tiles (512 px), so this cap
+  sits inside it; see `docs/diving-deeper/sharded-builds.md`.
+- **`extent` (default 4096; Python `export_pmtiles(extent=...)`, not a CLI
+  flag).** The MVT tile-local coordinate resolution. Must be positive: `0`
+  quantizes every coordinate to the tile's origin — every line and polygon
+  degenerates and is dropped — and writes a layer that consumers divide by
+  zero on, so it is refused. The MVT spec recommends a power of two and
+  decoders assume one when they reason about coordinate precision; any other
+  positive value is accepted with a warning. `tylertoo decode` refuses an
+  archive whose layer declares `extent: 0` for the same reason.
+
+---
+
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
 These do not change *which* features or vertices survive — geometry and

@@ -666,15 +666,17 @@ fn export_zoom_ceiling_emits_only_the_coarse_half() {
     assert!(out.contains("would emit no zoom at all"), "{out}");
 }
 
-/// A `--tile-buffer` wider than a shard's read-pruning margin is refused.
+/// A `--tile-buffer` wider than the cap is refused, sharded or not.
 ///
-/// A shard prunes its input to the row groups within two pivot tiles of its
-/// range; a buffer wider than that could pull geometry into one of its tiles
-/// from a row group it never read, and the tile would come out missing
-/// geometry the monolithic run has. Silently wrong is the failure mode this
-/// prevents, so it is an error, not a warning.
+/// A shard prunes its input to the row groups within two pivot tiles (512
+/// px) of its range; a buffer wider than that could pull geometry into one
+/// of its tiles from a row group it never read, and the tile would come out
+/// missing geometry the monolithic run has (#498). Since #433 every export is
+/// capped at one tile width (256 px), which sits inside that margin, so the
+/// one cap covers both: a sharded export past it gets the same refusal as an
+/// unsharded one, and the refusal names the cap that actually applies.
 #[test]
-fn a_tile_buffer_wider_than_the_shard_margin_is_refused() {
+fn a_tile_buffer_wider_than_the_cap_is_refused_sharded_or_not() {
     let dir = tempfile::tempdir().expect("tempdir");
     let overview = dir.path().join("ov.parquet");
     let (ok, out) = run(&[
@@ -688,40 +690,70 @@ fn a_tile_buffer_wider_than_the_shard_margin_is_refused() {
     ]);
     assert!(ok, "{out}");
 
-    let (ok, out) = run(&[
-        "export-pmtiles",
-        overview.to_str().unwrap(),
-        dir.path().join("wide.pmtiles").to_str().unwrap(),
-        "--tile-range",
-        "5..12",
-        "--tile-buffer",
-        "513",
-    ]);
-    assert!(!ok, "a 513px buffer must be refused under --tile-range");
-    assert!(
-        out.contains("too wide for a sharded build") && out.contains("512"),
-        "{out}"
-    );
+    for (name, extra) in [
+        ("wide", &["--tile-range", "5..12"][..]),
+        ("unsharded", &[][..]),
+    ] {
+        let out_path = dir.path().join(format!("{name}.pmtiles"));
+        let mut argv = vec![
+            "export-pmtiles",
+            overview.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+            "--tile-buffer",
+            "257",
+        ];
+        argv.extend_from_slice(extra);
+        let (ok, out) = run(&argv);
+        assert!(!ok, "{name}: a 257px buffer must be refused");
+        assert!(
+            out.contains("--tile-buffer 257") && out.contains("256"),
+            "{name}: the refusal names the value and the cap: {out}"
+        );
+        assert!(
+            !out.contains("sharded build"),
+            "{name}: the universal cap applies, not the shard margin: {out}"
+        );
+    }
 
-    // Exactly at the bound is fine, and so is any buffer without a range.
+    // Exactly at the cap is fine, with a range or without.
     let (ok, out) = run(&[
         "export-pmtiles",
         overview.to_str().unwrap(),
-        dir.path().join("at-bound.pmtiles").to_str().unwrap(),
+        dir.path().join("at-cap.pmtiles").to_str().unwrap(),
         "--tile-range",
         "5..12",
         "--tile-buffer",
-        "512",
+        "256",
     ]);
-    assert!(ok, "512 is the bound, not past it: {out}");
+    assert!(ok, "256 is the cap, not past it: {out}");
+}
+
+/// The `tiles` facade refuses a too-wide `--tile-buffer` before the convert
+/// (#433): the export options are only built after the convert, which on a
+/// real input runs for minutes, so the knob is checked up front and nothing
+/// is written.
+#[test]
+fn tiles_refuses_a_too_wide_tile_buffer_before_converting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("wide.pmtiles");
     let (ok, out) = run(&[
-        "export-pmtiles",
-        overview.to_str().unwrap(),
-        dir.path().join("unsharded.pmtiles").to_str().unwrap(),
+        "tiles",
+        grid().to_str().unwrap(),
+        output.to_str().unwrap(),
+        "--max-zoom",
+        "4",
         "--tile-buffer",
-        "600",
+        "100000",
     ]);
-    assert!(ok, "the bound only applies to a sharded export: {out}");
+    assert!(!ok, "a 100000px buffer must be refused");
+    assert!(
+        out.contains("--tile-buffer 100000") && out.contains("256"),
+        "the refusal names the value and the cap: {out}"
+    );
+    assert!(
+        !output.exists(),
+        "refused before the convert ran, nothing written: {out}"
+    );
 }
 
 /// Per-zoom `(zoom, tile_count)` from an `export-pmtiles` summary.
