@@ -125,9 +125,10 @@ ubuntu and macOS stable. Together they cover `full`.
 
 The weekly mutation-testing job (`.github/workflows/mutation-tests.yml`,
 Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on
-`tylertoo-core` under the `quick` tier too: `.cargo/mutants.toml` sets
-`test_tool = "nextest"`, so marking a test slow in `nextest.toml` also
-drops it from every mutant's test run. The ~8200 mutants are split over
+`tylertoo-core` under the `quick` test set too: `.cargo/mutants.toml`
+sets `test_tool = "nextest"` and selects the `mutants` nextest profile,
+which inherits `quick`'s filter, so marking a test slow in `nextest.toml`
+also drops it from every mutant's test run. The ~8400 mutants are split over
 a `--shard k/n` matrix (`SHARD_COUNT` in the workflow, sized from
 measured shard durations so each shard finishes well inside its
 350-minute limit); a `report` job sums the shards' `outcomes.json` into
@@ -143,15 +144,34 @@ the realdata fixtures, a lost runner, or a shard hitting its time
 limit) opens or updates a pinned `mutation-tests` issue that lists each
 shard's outcome (failed, timed out, or cancelled early by hand). To
 verify a workflow fix without a full sweep, dispatch a subset of
-shards: `gh workflow run mutation-tests.yml -f shard_list=0,1`. To
-reproduce locally, with the submodule and fixtures in place:
+shards: `gh workflow run mutation-tests.yml -f shard_list=0,1`.
+
+Per-mutant cost is a build (tylertoo-core recompiled, its test binaries
+relinked) plus a test run, and `.cargo/mutants.toml` trims both: the
+`mutants` Cargo profile (`Cargo.toml`: no debuginfo, optimized
+dependencies), `additional_cargo_args` so cargo builds only the test
+binaries that have a test the run would execute, and the `mutants`
+nextest profile's immediate fail-fast, which kills the tests still in
+flight the moment one fails. The binary list is derived from the tree:
+after adding an integration test binary under `crates/core/tests/` or
+marking one slow in `nextest.toml`, run
+`scripts/mutants-test-binaries.sh` and paste its output into
+`.cargo/mutants.toml` (`--check` tells you whether you need to). On a
+16-core machine a mutant costs ~8 s median (~12 s before the trims); the
+sweep is sized for ~40-50 min per shard on a 4-vCPU runner.
+
+To reproduce locally, with the submodule and fixtures in place:
 
 ```bash
 cargo install cargo-mutants cargo-nextest --locked
 cargo mutants --package tylertoo-core --list   # what would be mutated
 cargo mutants --package tylertoo-core \
-  -F 'simplify'                                # one module, minutes
-cargo mutants --package tylertoo-core          # the full sweep, hours
+  -f crates/core/src/overview/simplify.rs      # one file, minutes
+cargo mutants --package tylertoo-core \
+  -F 'fn_name'                                 # one function's mutants
+cargo mutants --package tylertoo-core \
+  --in-diff <(git diff main...HEAD)            # only code this branch touched
+cargo mutants --package tylertoo-core          # the full sweep, ~1 CPU-day
 ```
 
 Every PR also gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
@@ -173,6 +193,17 @@ exits 1 on a missed mutant so it can gate a commit by choice:
 scripts/mutants-diff.sh                  # vs origin/main
 scripts/mutants-diff.sh main -- -j 2     # other base; extra cargo-mutants args
 ```
+
+The first run pays a clean build of the dependencies at `opt-level = 3`
+(a couple of minutes); every mutant after that is an incremental
+rebuild. cargo-mutants has no per-mutant test selection (it does not
+tell the test command which file it mutated), and narrowing tests to the
+mutated module by hand loses catches: in a 30-mutant sample, 11 of 28
+catches came first from a test in *another* module or an integration
+binary (`mvt.rs` zigzag mutants are caught by `decode::tests`,
+`clip.rs` ones by `invalid_geometry_clipping`), so run the whole
+`mutants` set and narrow the *mutants* with `-f`/`-F`/`--in-diff`
+instead.
 
 The nightly fuzz job (`.github/workflows/fuzz.yml`, 3 AM UTC, or
 `gh workflow run fuzz.yml`) runs every `cargo-fuzz` target in `fuzz/`
