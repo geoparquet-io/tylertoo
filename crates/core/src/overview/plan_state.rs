@@ -1104,6 +1104,9 @@ impl ConvertPlan {
             cluster_tables: self.cluster_tables,
             kinds: self.kinds,
             coalesce_scratch,
+            // The `--plan` path skips pass 1 entirely, so nothing prebuilt the
+            // chain tables; pass 2 builds them itself (#570).
+            coalesce_build: None,
             min_levels: self.min_levels,
             counts: self.counts,
             carriers: self.carriers,

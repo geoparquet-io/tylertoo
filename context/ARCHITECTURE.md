@@ -114,6 +114,19 @@ verbatim (spec §2.4).
    unbounded vs. 1-byte grid budgets; `thread_count_determinism.rs` checks the
    end-to-end artifact across thread counts, though its fixtures are below the
    sharded-build size.
+   When coalescing is on, pass 1 also runs the **chain stage** once per level
+   and keeps what it built (#570). It has to run it regardless — a level's row
+   count *is* its surviving chain count, and the level plan needs that count
+   before pass 2 starts (an empty level is omitted, §7.3, and the count is the
+   writer's row-group hint) — so pass 2 consuming those tables replaces a
+   second full run of the whole stage. On a 1.5M-line fixture the count-only
+   pass alone was 53 s of a 79 s run. The hint stays exactly what the
+   count-only pass produced (`chains.len()`, before simplification drops
+   anything), and tables for levels a zoom ceiling will not materialize are
+   dropped rather than carried; pass 2 rebuilds any level whose table is
+   missing, so the ceiling predicate is a caching decision, never a
+   correctness one. The `--plan` path skips pass 1 entirely and pass 2 builds
+   the tables itself, as before.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader thread streams batches over a bounded channel while a consumer
@@ -221,6 +234,17 @@ non-cascaded path, where an invalid candidate instead retries at
 logged at debug level). Either way the validity check is capped at 2048
 vertices on oversized candidates (#242) to avoid an O(V²) stall, and the
 canonical level is always verbatim.
+
+The chain builder itself (`overview/coalesce.rs`) is written against the same
+memory bound the #449 ceiling promises (#570): a piece BORROWS its source
+line's coordinate run until a join actually merges it, the endpoint node graph
+is a sorted `Vec` of incidences scanned in per-node runs rather than a
+`HashMap<NodeKey, Vec<_>>` with a heap `Vec` per node (up to 2N of them), and
+chain members are positions in the caller's slice so the priority lookup is a
+`Vec` index instead of a per-line `HashMap` entry built at every level in
+parallel. All three are order-preserving by construction — the sort's
+tiebreaker reproduces the map's old insertion order exactly — so the chains,
+their order and their reps are unchanged.
 
 **DIVERGENCE FROM `geo`: RDP runs iteratively, not recursively** (#575).
 `rdp_coords` in `overview/simplify.rs` replaces `geo::Simplify` with an
