@@ -13,6 +13,7 @@
 
 pub mod accumulate;
 pub mod assign;
+pub mod auto_zoom;
 pub mod check;
 pub mod cluster;
 pub mod coalesce;

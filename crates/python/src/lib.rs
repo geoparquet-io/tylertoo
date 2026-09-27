@@ -11,6 +11,7 @@ use tylertoo_core::input_set::ConvertSource;
 use tylertoo_core::overview::assign::{
     AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
 };
+use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 use tylertoo_core::overview::convert::{
@@ -29,6 +30,60 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
     s.parse::<FeatureOrder>()
         .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Extract the `max_zoom` kwarg (#444): an `int` zoom, or the string
+/// `"auto"` (any case). Parsing and resolution belong to core
+/// ([`MaxZoom`]); this only maps Python types onto it with precise errors —
+/// an out-of-range int is a `ValueError`, not pyo3's generic extraction
+/// failure.
+fn extract_max_zoom(obj: &Bound<'_, PyAny>) -> PyResult<MaxZoom> {
+    if let Ok(s) = obj.extract::<String>() {
+        return match s.parse::<MaxZoom>() {
+            Ok(MaxZoom::Auto) => Ok(MaxZoom::Auto),
+            _ => Err(PyValueError::new_err(format!(
+                "max_zoom must be an int or \"auto\", got {s:?}"
+            ))),
+        };
+    }
+    if obj.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyTypeError::new_err(
+            "max_zoom must be an int or \"auto\", got a bool",
+        ));
+    }
+    if let Ok(n) = obj.extract::<i64>() {
+        return u8::try_from(n).map(MaxZoom::Fixed).map_err(|_| {
+            PyValueError::new_err(format!(
+                "max_zoom must be between 0 and 255 (or \"auto\"), got {n}"
+            ))
+        });
+    }
+    Err(PyTypeError::new_err(format!(
+        "max_zoom must be an int or \"auto\", got {}",
+        obj.get_type().name()?
+    )))
+}
+
+/// Resolve `max_zoom="auto"` (#444) once `options` is built and every cheap
+/// check has passed ([`MaxZoom::resolve`] validates the options before
+/// reading anything). A fixed zoom returns without opening the input; for
+/// `auto` a dedicated source is opened with `open_source`, so the
+/// conversion's own source is untouched. The GIL is released while the
+/// estimate reads.
+fn resolve_max_zoom_py(
+    py: Python<'_>,
+    max_zoom: MaxZoom,
+    options: &mut ConvertOptions,
+    open_source: impl FnOnce() -> Result<ConvertSource, ConvertError> + Send,
+) -> PyResult<u8> {
+    if !max_zoom.is_auto() {
+        return Ok(max_zoom.plan_zoom());
+    }
+    py.detach(|| {
+        let source = open_source()?;
+        max_zoom.resolve(&source, options)
+    })
+    .map_err(convert_error_to_py)
 }
 
 /// Convert GeoParquet to PMTiles in one shot (overview facade).
@@ -53,7 +108,14 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///         byte-range requests.
 ///     output (str): Path to output PMTiles file.
 ///     min_zoom (int, optional): Minimum (coarsest) zoom level. Defaults to 0.
-///     max_zoom (int, optional): Maximum (finest) zoom level. Defaults to 14.
+///     max_zoom (int or "auto", optional): Maximum (finest) zoom level.
+///         Defaults to 14. Pass ``"auto"`` (#444, inspired by tippecanoe's
+///         ``-zg``) to estimate it from a bounded sample of the input's
+///         feature extents and spacing, never above 16. The chosen zoom is
+///         the archive's max zoom (the evidence is logged through Rust's
+///         logger, which is not forwarded to Python ``logging``). Raises
+///         ValueError when the input has nothing to measure or min_zoom is
+///         above 16.
 ///     layer_name (str, optional): Override the MVT layer name (defaults to
 ///         the input filename stem).
 ///     tile_size_limit (int, optional): Per-tile MVT size cap in bytes. A tile
@@ -85,14 +147,17 @@ fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"))]
+#[pyo3(
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input')"
+)]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
     py: Python<'_>,
     input: &str,
     output: &str,
     min_zoom: u8,
-    max_zoom: u8,
+    #[pyo3(from_py_with = extract_max_zoom)] max_zoom: MaxZoom,
     layer_name: Option<String>,
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
@@ -107,10 +172,18 @@ fn convert(
     let layer_name =
         layer_name.unwrap_or_else(|| tylertoo_core::input_set::derive_layer_name(input));
 
-    let options = ConvertOptions {
-        levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
+    // #444: built with `auto`'s placeholder, then resolved (a fixed zoom is
+    // its own placeholder and comes back verbatim, with no I/O).
+    let mut options = ConvertOptions {
+        levels: LevelPlan::ZoomRange {
+            min_zoom,
+            max_zoom: max_zoom.plan_zoom(),
+        },
         ..ConvertOptions::default()
     };
+    resolve_max_zoom_py(py, max_zoom, &mut options, || {
+        ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
+    })?;
 
     let export_options = ExportOptions {
         layer_name,
@@ -187,9 +260,9 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
         | ConvertError::ClassRankColumnMissing { .. }
         | ConvertError::ClassRankColumnNotString { .. }
         | ConvertError::AccumulateColumnMissing { .. }
-        | ConvertError::AccumulateColumnNotNumeric { .. } => {
-            PyErr::new::<PyValueError, _>(format!("{}", e))
-        }
+        | ConvertError::AccumulateColumnNotNumeric { .. }
+        | ConvertError::AutoZoomMinAboveCeiling { .. }
+        | ConvertError::AutoZoomNoSignal { .. } => PyErr::new::<PyValueError, _>(format!("{}", e)),
         other => PyErr::new::<PyRuntimeError, _>(format!("overview conversion failed: {}", other)),
     }
 }
@@ -319,8 +392,15 @@ fn accumulate_specs(
 ///         Defaults to "duplicating".
 ///     min_zoom (int, optional): Coarsest Web Mercator zoom of the level
 ///         range. Defaults to 0.
-///     max_zoom (int, optional): Finest (canonical) Web Mercator zoom of the
-///         level range. Defaults to 6.
+///     max_zoom (int or "auto", optional): Finest (canonical) Web Mercator
+///         zoom of the level range. Defaults to 6. Pass ``"auto"`` (#444,
+///         inspired by tippecanoe's ``-zg``) to estimate it from a bounded
+///         sample of the input's feature extents and spacing, honoring
+///         ``bbox`` and ``filter``, never above 16; ignored with ``gsds``.
+///         The chosen zoom is the finest ``zoom`` in the returned report's
+///         ``levels`` (the evidence is logged through Rust's logger, which is
+///         not forwarded to Python ``logging``). Raises ValueError when the
+///         input has nothing to measure or min_zoom is above 16.
 ///     gsds (list[float], optional): Explicit per-level GSD list in meters,
 ///         strictly decreasing coarse-to-fine. Overrides min_zoom/max_zoom.
 ///     gsd_base (float, optional): GSD tile-band base for the zoom-to-GSD
@@ -512,13 +592,14 @@ fn accumulate_specs(
 ///     ...                   max_zoom=12, cluster=True,
 ///     ...                   accumulate_attributes={"count": "sum"})
 #[pyfunction]
-#[pyo3(signature = (
+#[pyo3(
+    signature = (
     input,
     output,
     *,
     mode="duplicating",
     min_zoom=0,
-    max_zoom=6,
+    max_zoom=MaxZoom::Fixed(6),
     gsds=None,
     gsd_base=1024.0,
     sort_key=None,
@@ -559,7 +640,9 @@ fn accumulate_specs(
     in_flight_batches=0,
     read_workers=0,
     spill_dir=None,
-))]
+),
+    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, simplify_factor=1.0, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=1.0, polygon_thinning=1.0, line_visibility=2.0, polygon_visibility=2.0, drop_rate=1.65, drop_gamma=1.5, density_drop=True, cluster=False, accumulate_attributes=None, coalesce_lines=True, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
+)]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
     py: Python<'_>,
@@ -567,7 +650,7 @@ fn overview(
     output: &str,
     mode: &str,
     min_zoom: u8,
-    max_zoom: u8,
+    #[pyo3(from_py_with = extract_max_zoom)] max_zoom: MaxZoom,
     gsds: Option<Vec<f64>>,
     gsd_base: f64,
     sort_key: Option<String>,
@@ -646,7 +729,11 @@ fn overview(
     // Explicit GSD list overrides the zoom range (like the CLI's --gsd).
     let levels = match gsds {
         Some(gsds) => LevelPlan::Gsds(gsds),
-        None => LevelPlan::ZoomRange { min_zoom, max_zoom },
+        // #444: `auto`'s placeholder until it is resolved below.
+        None => LevelPlan::ZoomRange {
+            min_zoom,
+            max_zoom: max_zoom.plan_zoom(),
+        },
     };
 
     // Class ranking: column and ranks must be supplied together; the unknown
@@ -728,7 +815,7 @@ fn overview(
         AssignConfig::default().point_thinning
     });
 
-    let options = ConvertOptions {
+    let mut options = ConvertOptions {
         mode,
         levels,
         assign: AssignConfig {
@@ -807,6 +894,15 @@ fn overview(
         ));
     };
     let output_path = Path::new(output).to_path_buf();
+
+    // #444: every cheap check has passed; now estimate `auto` over a
+    // dedicated source (skipped for an explicit `gsds` ladder).
+    resolve_max_zoom_py(py, max_zoom, &mut options, || match &parsed {
+        OverviewInput::Path(p) => ConvertSource::resolve_path(p).map_err(ConvertError::from),
+        OverviewInput::List(inputs) => {
+            ConvertSource::from_input_list(inputs).map_err(ConvertError::from)
+        }
+    })?;
 
     // Release the GIL while the Rust pipeline runs.
     let report = py

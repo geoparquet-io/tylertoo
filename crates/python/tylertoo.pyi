@@ -4,7 +4,7 @@
 # signatures against the compiled module on every PR. If you change a
 # #[pyo3(signature = ...)] in crates/python/src/lib.rs, update this file.
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 __all__ = ["convert", "export_pmtiles", "overview", "validate"]
 
@@ -12,7 +12,7 @@ def convert(
     input: str,
     output: str,
     min_zoom: int = 0,
-    max_zoom: int = 14,
+    max_zoom: int | Literal["auto"] = 14,
     layer_name: str | None = None,
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
@@ -24,7 +24,7 @@ def overview(
     *,
     mode: str = "duplicating",
     min_zoom: int = 0,
-    max_zoom: int = 6,
+    max_zoom: int | Literal["auto"] = 6,
     gsds: list[float] | None = None,
     gsd_base: float = 1024.0,
     sort_key: str | None = None,

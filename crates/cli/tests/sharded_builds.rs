@@ -1331,3 +1331,104 @@ fn an_unsharded_plan_only_plan_is_not_for_a_fleet() {
     assert!(out.contains("saved WITHOUT a shard plan"), "{out}");
     assert!(!shard_out.exists(), "{out}");
 }
+
+/// #444 × #560: `--max-zoom auto` is resolved inside the options builder the
+/// full facade and `--plan-only` share, so a plan-only run and the full
+/// coarse job pick the same zoom and write the same plan, byte for byte; a
+/// data shard (which resolves `auto` the same deterministic way) accepts it.
+/// open-buildings resolves to z14, so a pivot-10 fleet fits under it.
+#[test]
+fn plan_only_with_max_zoom_auto_matches_the_coarse_jobs_plan() {
+    let Some(input) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let input = input.to_str().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = dir.path().join("shards.json");
+    let (ok, out) = run(&[
+        "shard-plan",
+        input,
+        "--shards",
+        "2",
+        "--pivot",
+        "10",
+        "-o",
+        shard_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "shard-plan failed: {out}");
+    let fleet = |extra: &[&str]| {
+        let mut args = vec![
+            "tiles",
+            input,
+            "--max-zoom",
+            "auto",
+            "--shard-plan",
+            shard_plan.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+
+    let coarse_plan = dir.path().join("coarse.plan");
+    let coarse_out = dir.path().join("coarse.pmtiles");
+    let (ok, out) = fleet(&[
+        coarse_out.to_str().unwrap(),
+        "--shard",
+        "coarse",
+        "--save-plan",
+        coarse_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "the coarse job must succeed: {out}");
+    assert!(out.contains("--max-zoom auto: chose z14"), "{out}");
+
+    let only_plan = dir.path().join("only.plan");
+    let (ok, out) = fleet(&[
+        "--shard",
+        "coarse",
+        "--save-plan",
+        only_plan.to_str().unwrap(),
+        "--plan-only",
+    ]);
+    assert!(ok, "--plan-only --max-zoom auto must succeed: {out}");
+    assert!(out.contains("--max-zoom auto: chose z14"), "{out}");
+    assert_eq!(
+        std::fs::read(&coarse_plan).unwrap(),
+        std::fs::read(&only_plan).unwrap(),
+        "--plan-only --max-zoom auto must write the coarse job's plan, byte for byte"
+    );
+
+    let shard_out = dir.path().join("shard0.pmtiles");
+    let (ok, out) = fleet(&[
+        shard_out.to_str().unwrap(),
+        "--shard",
+        "0/2",
+        "--plan",
+        only_plan.to_str().unwrap(),
+    ]);
+    assert!(ok, "a data shard must accept the auto plan: {out}");
+}
+
+/// A shard plan is bound against `auto`'s placeholder before the estimate
+/// runs, then its pivot is re-checked against the real pick: the uniform
+/// grid resolves to z0, below a pivot-3 plan, which is a clean error.
+#[test]
+fn max_zoom_auto_rechecks_the_shard_pivot_after_resolving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shard_plan = cut_plan(dir.path(), "2", "3");
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        dir.path().join("coarse.pmtiles").to_str().unwrap(),
+        "--max-zoom",
+        "auto",
+        "--shard",
+        "coarse",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        dir.path().join("coarse.plan").to_str().unwrap(),
+    ]);
+    assert!(!ok, "a pivot above the auto pick must be refused: {out}");
+    assert!(out.contains("chose z0") && out.contains("pivot"), "{out}");
+    assert!(!out.contains("panicked"), "{out}");
+}

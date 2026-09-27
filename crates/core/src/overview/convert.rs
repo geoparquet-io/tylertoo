@@ -1360,6 +1360,34 @@ pub enum ConvertError {
     /// The input has no features, or every feature was dropped from every level.
     #[error("no output rows produced (empty input or all features dropped)")]
     NoData,
+    /// `--max-zoom auto` (#444) with a `--min-zoom` above the auto ceiling
+    /// ([`super::auto_zoom::AUTO_MAX_ZOOM_CEILING`]): no zoom satisfies both.
+    #[error(
+        "--max-zoom auto cannot honor --min-zoom {min_zoom}: auto never picks a zoom \
+         above z{ceiling}. Lower --min-zoom, or pass an explicit --max-zoom"
+    )]
+    AutoZoomMinAboveCeiling {
+        /// The requested minimum zoom.
+        min_zoom: u8,
+        /// The auto ceiling it exceeds.
+        ceiling: u8,
+    },
+    /// `--max-zoom auto` (#444) found nothing to measure: fewer than two
+    /// distinct feature locations and no feature with a measurable extent.
+    /// tippecanoe's `-zg` refuses the same way ("Can't guess maxzoom (-zg)
+    /// without at least two distinct feature locations").
+    #[error(
+        "can't guess --max-zoom auto: the {sampled} sampled features (of {rows} rows read) \
+         have fewer than two distinct locations and no measurable extent. Pass an \
+         explicit --max-zoom"
+    )]
+    AutoZoomNoSignal {
+        /// Input rows the estimate read (after `--bbox`/`--filter` row-group
+        /// pruning).
+        rows: u64,
+        /// Features that survived sampling and the per-feature filters.
+        sampled: usize,
+    },
     /// A [`ConvertOptions::zoom_ceiling`] left nothing to write (#541 review):
     /// the dataset has features, but none survive at any level at or coarser
     /// than the ceiling — every such level was auto-clamped away (#211) or
@@ -1501,7 +1529,7 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// degenerates the assignment grid — every cell-winner pass would skip every
 /// feature — so nonsensical values are rejected up front with a clear error
 /// instead of producing an "everything at the canonical level" file.
-fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
+pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
     let positive = |name: &str, v: f64| {
         if !v.is_finite() || v <= 0.0 {
             return Err(ConvertError::InvalidConfig(format!(

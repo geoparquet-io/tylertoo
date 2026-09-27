@@ -62,6 +62,20 @@ gsd(z) = 40075016.69 / gsd_base / 2^z          (meters, spec §5.2)
 | `--gsd G1,G2,…` | — | meters, strictly decreasing | explicit per-level GSDs; **overrides** the zoom range and `--gsd-base` |
 | `--min-zoom` / `--max-zoom` | `0` / `6` | Web Mercator zoom | coarsest / finest (canonical) level (max **30**) |
 
+**`--max-zoom auto` (#444, inspired by tippecanoe's `-zg`).** Instead of a
+number, estimate the finest zoom from the input's own features. A bounded,
+deterministic sample (at most 200,000 rows, honoring `--bbox` and `--filter`)
+of feature bboxes is read from the geometry column, and the finest zoom is
+picked where a standard 256 px tile pixel resolves about half the smaller of
+"median feature size" (features with an extent) and "10th-percentile spacing
+between nearby features", measured in Web Mercator meters and clamped to
+`[--min-zoom, 16]`. The chosen zoom and the measurements behind it are logged
+at `info`; treat it as a starting point, the way tippecanoe users treat `-zg`.
+An input with nothing to measure (one location, or only empty geometries) is
+an error, as with `-zg`; so is a `--min-zoom` above 16. With `--gsd` the value
+is unused and nothing is estimated. See `context/ARCHITECTURE.md`'s divergence
+table for how this differs from tippecanoe's formula.
+
 **Zoom ceiling: 30 — an addressability limit, not a recommendation.** Every
 zoom tylertoo writes must fit the tile arithmetic: tile coordinates are 32-bit
 (so z31 is the hard limit) and the PMTiles Hilbert tile id needs `4^z` of

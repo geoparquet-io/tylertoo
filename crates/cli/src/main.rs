@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::{Path, PathBuf};
+use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
@@ -720,9 +721,13 @@ struct OverviewArgs {
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest / canonical) Web Mercator zoom for the level range.
+    /// Maximum (finest / canonical) Web Mercator zoom for the level range, or
+    /// `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a
+    /// bounded sample of the input's feature extents and spacing (honoring
+    /// --bbox/--filter, never above z16). The chosen zoom and its evidence are
+    /// logged; an input with nothing to measure is an error. Ignored with --gsd.
     #[arg(long, default_value = "6")]
-    max_zoom: u8,
+    max_zoom: MaxZoom,
 
     /// Explicit comma-separated GSD list (meters, strictly decreasing).
     /// Overrides --min-zoom/--max-zoom when set.
@@ -1747,9 +1752,13 @@ struct TilesArgs {
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest) Web Mercator zoom level.
+    /// Maximum (finest) Web Mercator zoom level, or `auto` (#444, inspired by
+    /// tippecanoe's `-zg`) to estimate it from a bounded sample of the input's
+    /// feature extents and spacing (honoring --bbox/--filter, never above
+    /// z16). The chosen zoom and its evidence are logged; an input with
+    /// nothing to measure is an error. Ignored with --gsd.
     #[arg(long, default_value = "14")]
-    max_zoom: u8,
+    max_zoom: MaxZoom,
 
     /// Explicit comma-separated GSD list (meters, strictly decreasing).
     /// Overrides --min-zoom/--max-zoom when set — the same semantics as
@@ -2302,6 +2311,23 @@ fn convert_produced_nothing(e: &tylertoo_core::overview::convert::ConvertError) 
     )
 }
 
+/// Resolve `--max-zoom auto` (#444) for a run whose `options` were built with
+/// [`MaxZoom::plan_zoom`] and whose cheap checks have all passed. Core owns
+/// the whole rule ([`MaxZoom::resolve`]); a `Fixed` zoom returns verbatim
+/// without opening the input. For `auto` a dedicated source is resolved, so
+/// the conversion's own source (and any column selection on it) is untouched.
+fn resolve_max_zoom(
+    max_zoom: MaxZoom,
+    spec: &InputSpec,
+    options: &mut tylertoo_core::overview::convert::ConvertOptions,
+) -> Result<u8> {
+    if !max_zoom.is_auto() {
+        return Ok(max_zoom.plan_zoom());
+    }
+    let source = resolve_convert_source(spec)?;
+    Ok(max_zoom.resolve(&source, options)?)
+}
+
 /// Resolve the level plan shared by `overview` and `tiles`: an explicit
 /// `--gsd` list (comma-separated meters, strictly decreasing) overrides the
 /// `--min-zoom`/`--max-zoom` range. Kept in one place so the two commands
@@ -2466,6 +2492,9 @@ struct ShardJob {
     pivot: u8,
     /// `ShardPlan::cut_digest_hex` — the fleet-wide identity of the cut.
     cut_digest: String,
+    /// The bound plan, kept so a `--max-zoom auto` run can re-check the
+    /// pivot once the real zoom is known (#444).
+    plan: tylertoo_core::shard::ShardPlan,
 }
 
 /// Resolve `--shard` / `--shard-plan` into a [`ShardJob`], failing fast on
@@ -2540,6 +2569,7 @@ fn resolve_shard_job(
         // construction. Set on the coarse job (which writes the plan) and on
         // every data shard (which must present the same cut).
         cut_digest: plan.cut_digest_hex(),
+        plan,
     }))
 }
 
@@ -2615,8 +2645,9 @@ fn reject_excluded_knob_columns(
     Ok(())
 }
 
-/// The convert half of `tiles`: the [`ConvertOptions`] the facade runs, and
-/// the sharded-fleet job they were derived from.
+/// The convert half of `tiles`: the [`ConvertOptions`] the facade runs, the
+/// sharded-fleet job they were derived from, and the finest zoom (`--max-zoom`,
+/// with `auto` resolved, #444).
 ///
 /// Shared by the full facade and `--plan-only` (#560). The convert plan is
 /// fingerprinted over these options, so the plan a plan-only run writes is
@@ -2630,15 +2661,23 @@ fn tiles_convert_options(
 ) -> Result<(
     tylertoo_core::overview::convert::ConvertOptions,
     Option<ShardJob>,
+    u8,
 )> {
     use tylertoo_core::overview::level::Mode;
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
+    // #444: until `--max-zoom auto` is resolved below — after every check that
+    // does not need its value, so a typo or a stale shard plan still fails in
+    // milliseconds (#371) — the plan carries `auto`'s placeholder (its
+    // ceiling, the most permissive value it can resolve to). A fixed zoom is
+    // its own placeholder, so that path is unchanged.
+    let max_zoom = args.max_zoom.plan_zoom();
+
     // Overviews for PMTiles are always duplicating (partitioning can't be
     // exported to per-tile MVT). Every other convert knob comes from the
     // shared tuning set, so `tiles` matches the two-step overview → export.
-    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
+    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, max_zoom)?;
     let mut options = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
@@ -2652,7 +2691,7 @@ fn tiles_convert_options(
         args.shard.as_deref(),
         args.shard_plan.as_deref(),
         args.min_zoom,
-        args.max_zoom,
+        max_zoom,
         args.plan_only,
     )?;
     if let Some(job) = &shard {
@@ -2678,6 +2717,27 @@ fn tiles_convert_options(
         if !args.plan_only && job.range.is_none() && args.gsd.is_none() && options.streaming {
             options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
         }
+    }
+
+    // #386/#443: the property selection is applied at convert, so an excluded
+    // column is already gone from the intermediate before export would sort
+    // or id by it — export-pmtiles rejects that pairing outright, and so must
+    // the facade, before any work is done, rather than run the whole convert
+    // and then quietly fall back. (--plan-only exports nothing.)
+    if !args.plan_only {
+        reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
+    }
+
+    // #444: every cheap check has passed; now estimate `auto` (a fixed zoom
+    // comes back verbatim, no I/O). Here, not in the callers, so a plan-only
+    // run and the full coarse job resolve — and fingerprint — the same zoom.
+    // A shard plan was bound against the placeholder, so its pivot is
+    // re-checked against the real value.
+    let max_zoom = resolve_max_zoom(args.max_zoom, spec, &mut options)?;
+    if let (Some(job), Some(plan_path)) = (&shard, args.shard_plan.as_deref()) {
+        job.plan.check_max_zoom(max_zoom, plan_path)?;
+    }
+    if let Some(job) = &shard {
         if args.plan_only {
             // The coarse job's usual line names the zooms it builds; this one
             // builds none (and its pivot may sit at --min-zoom, #560).
@@ -2688,10 +2748,10 @@ fn tiles_convert_options(
                 job.pivot
             );
         } else {
-            log_shard_job(job, args.min_zoom, args.max_zoom);
+            log_shard_job(job, args.min_zoom, max_zoom);
         }
     }
-    Ok((options, shard))
+    Ok((options, shard, max_zoom))
 }
 
 /// `tiles --plan-only` (#560): pass 1 + the level assignment, `--save-plan`,
@@ -2716,7 +2776,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     );
     let spec = resolve_io_for_planning(args.input.clone(), args.files_from.clone())?;
 
-    let (options, shard) = tiles_convert_options(&args, &spec)?;
+    let (options, shard, _max_zoom) = tiles_convert_options(&args, &spec)?;
     // A data shard reads a subset of the input, so a plan it wrote would
     // describe only that subset. Core refuses the pairing too (--shard with
     // --save-plan); named here against the flag the user actually typed.
@@ -2860,7 +2920,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tylertoo_core::input_set::derive_layer_name(&p.to_string_lossy())
     });
 
-    let (options, shard) = tiles_convert_options(&args, &spec)?;
+    let (options, shard, max_zoom) = tiles_convert_options(&args, &spec)?;
 
     // A data shard's range prunes the convert's reads as well as the export;
     // a hand-written `--tile-range` restricts the export only (the two flags
@@ -2874,13 +2934,6 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // The data shard's own range, kept past `tile_range`'s move into
     // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
     let shard_range = shard.as_ref().and_then(|job| job.range);
-
-    // #386/#443: the property selection is applied at convert, so an excluded
-    // column is already gone from the intermediate before export would sort
-    // or id by it — export-pmtiles rejects that pairing outright, and so must
-    // the facade, before any work is done, rather than run the whole convert
-    // and then quietly fall back.
-    reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
 
     // Intermediate overview file (#314): retained at --keep-overview when
     // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
@@ -2941,7 +2994,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         Err(e) if shard_range.is_some() && convert_produced_nothing(&e) => {
             let job = shard.as_ref().expect("a range implies a shard job");
             let range = shard_range.expect("checked by the guard");
-            return write_empty_shard(&output, &layer_name, job, range, args.max_zoom, &e);
+            return write_empty_shard(&output, &layer_name, job, range, max_zoom, &e);
         }
         // #541 review: the coarse job's counterpart. Its convert stops at the
         // pivot, and when every feature first appears finer than that (#211
@@ -3229,13 +3282,20 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
     };
 
-    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, args.max_zoom)?;
+    // #444: the plan is built with `auto`'s placeholder so every cheap check
+    // runs first; the estimate (which reads the input) comes last.
+    let levels = resolve_level_plan(
+        args.gsd.as_deref(),
+        args.min_zoom,
+        args.max_zoom.plan_zoom(),
+    )?;
 
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
 
-    let options = args
+    let mut options = args
         .tuning
         .build_convert_options(mode, levels, bbox, args.cogp_compat)?;
+    resolve_max_zoom(args.max_zoom, &spec, &mut options)?;
 
     let report = run_convert(&spec, &output, &options)?;
 
@@ -5143,6 +5203,35 @@ mod tests {
 
     // --- #316: tuning parity between `tiles` and the two-step chain ----------
 
+    /// `--max-zoom` parses through core's `MaxZoom` (numbers and `auto`,
+    /// any case); clap surfaces a bad value as a usage error.
+    #[test]
+    fn max_zoom_flag_parses_numbers_and_auto() {
+        assert_eq!(
+            parse_tiles(&["--max-zoom", "9"]).max_zoom,
+            MaxZoom::Fixed(9)
+        );
+        assert_eq!(parse_tiles(&["--max-zoom", "AUTO"]).max_zoom, MaxZoom::Auto);
+        assert_eq!(parse_tiles(&[]).max_zoom, MaxZoom::Fixed(14));
+    }
+
+    /// #444: a `Fixed` `--max-zoom` resolves to the exact same number with
+    /// **zero I/O** — the input does not even exist — and leaves the options
+    /// untouched: the numeric path hands core the same `u8` it always did.
+    #[test]
+    fn resolve_max_zoom_fixed_is_pure_and_does_not_touch_the_input() {
+        let spec = InputSpec::Path(PathBuf::from("/nonexistent/definitely-not-a-file.parquet"));
+        for z in [0u8, 6, 14, 30] {
+            let mut options = tylertoo_core::overview::convert::ConvertOptions::default();
+            let before = format!("{:?}", options.levels);
+            assert_eq!(
+                resolve_max_zoom(MaxZoom::Fixed(z), &spec, &mut options).unwrap(),
+                z
+            );
+            assert_eq!(format!("{:?}", options.levels), before);
+        }
+    }
+
     #[test]
     fn resolve_level_plan_gsd_overrides_zoom_range() {
         use tylertoo_core::overview::convert::LevelPlan;
@@ -5172,7 +5261,7 @@ mod tests {
 
         // --gsd on `tiles` reaches the same absolute-GSD ladder as `overview`.
         let a = parse_tiles(&["--gsd", "800,400,200"]);
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom.plan_zoom()).unwrap() {
             LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![800.0, 400.0, 200.0]),
             other => panic!("expected Gsds, got {other:?}"),
         }
@@ -5197,14 +5286,18 @@ mod tests {
         use tylertoo_core::overview::convert::LevelPlan;
 
         let a = parse_tiles(&["--min-zoom", "30", "--max-zoom", "33"]);
-        assert_eq!(a.max_zoom, 33, "the CLI must not silently clamp");
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        assert_eq!(
+            a.max_zoom,
+            MaxZoom::Fixed(33),
+            "the CLI must not silently clamp"
+        );
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom.plan_zoom()).unwrap() {
             LevelPlan::ZoomRange { max_zoom, .. } => assert_eq!(max_zoom, 33),
             other => panic!("expected ZoomRange, got {other:?}"),
         }
 
         let a = parse_tiles(&["--gsd", "0.000005"]);
-        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom).unwrap() {
+        match resolve_level_plan(a.gsd.as_deref(), a.min_zoom, a.max_zoom.plan_zoom()).unwrap() {
             LevelPlan::Gsds(gsds) => assert_eq!(gsds, vec![0.000_005]),
             other => panic!("expected Gsds, got {other:?}"),
         }

@@ -279,6 +279,36 @@ class TestOverviewIntegration:
             assert report["levels"][0]["zoom"] == 11
             assert report["levels"][-1]["zoom"] == 14
 
+    def test_overview_max_zoom_auto(self):
+        """#444: max_zoom="auto" estimates a zoom from the input instead of
+        taking a literal, and the resulting plan still resolves and writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, report = self._overview(tmpdir, min_zoom=0, max_zoom="auto")
+            # open-buildings (~30m buildings ~23m apart) pins to z14, the
+            # same value the core characterization test asserts.
+            assert report["levels"][-1]["zoom"] == 14
+
+    def test_overview_max_zoom_auto_min_zoom_above_ceiling_raises(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="min-zoom 17"),
+        ):
+            self._overview(tmpdir, min_zoom=17, max_zoom="auto")
+
+    def test_overview_max_zoom_out_of_range_int_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="between 0 and 255"),
+        ):
+            self._overview(tmpdir, max_zoom=300)
+
+    def test_overview_max_zoom_garbled_string_raises_value_error(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(ValueError, match="auto"),
+        ):
+            self._overview(tmpdir, max_zoom="not-a-zoom")
+
     def test_overview_explicit_gsds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _, report = self._overview(tmpdir, gsds=[8.0, 2.0], polygon_visibility=0.0)
