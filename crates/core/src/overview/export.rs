@@ -94,7 +94,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -344,6 +344,17 @@ pub struct ExportOptions {
     /// [`build_mvt`]). Whether that no-flag default should instead omit the
     /// id entirely is an open question (#443) this option does not decide.
     pub feature_id: Option<String>,
+    /// Directory for the export's member spill file (#427) -- the on-disk
+    /// backing the partitioning single-read pass 2 (#235) falls back to when
+    /// the buffered members would not fit the memory budget. Same name and
+    /// semantics as [`ConvertOptions::spill_dir`](super::convert::ConvertOptions::spill_dir):
+    /// the one scratch-disk knob, checked up front (it must be an existing
+    /// directory, [`ExportError::SpillDirNotDirectory`] otherwise). `None`
+    /// uses the process temp directory (`$TMPDIR`).
+    ///
+    /// The PMTiles archive itself is never spilled here: it is assembled in
+    /// place at `<output>.partial` beside the output (#459).
+    pub spill_dir: Option<PathBuf>,
 }
 
 impl Default for ExportOptions {
@@ -361,6 +372,7 @@ impl Default for ExportOptions {
             tile_range: None,
             zoom_ceiling: None,
             feature_id: None,
+            spill_dir: None,
         }
     }
 }
@@ -397,6 +409,12 @@ impl ExportOptions {
                 buffer: self.tile_buffer,
                 max: MAX_TILE_BUFFER_PX,
             });
+        }
+        // #427: fail fast on a bad spill dir, like the convert side does.
+        if let Some(dir) = &self.spill_dir {
+            if !dir.is_dir() {
+                return Err(ExportError::SpillDirNotDirectory(dir.clone()));
+            }
         }
         Ok(())
     }
@@ -724,6 +742,13 @@ pub enum ExportError {
         /// What is wrong with the value.
         reason: InvalidFeatureIdReason,
     },
+
+    /// [`ExportOptions::spill_dir`] is not an existing directory (#427).
+    /// Checked before any work, like the convert side's `--spill-dir`: the
+    /// spill is opened lazily, so an unusable directory would otherwise
+    /// only surface deep into the export.
+    #[error("spill-dir {} is not an existing directory", .0.display())]
+    SpillDirNotDirectory(PathBuf),
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -2497,7 +2522,13 @@ struct MemberStore {
 }
 
 impl MemberStore {
-    fn new(plans: &[LevelPlan], backing: SinkBacking) -> Result<Self, ExportError> {
+    /// `spill_dir` places the spill file (#427); `None` is the process temp
+    /// dir.
+    fn new(
+        plans: &[LevelPlan],
+        backing: SinkBacking,
+        spill_dir: Option<&Path>,
+    ) -> Result<Self, ExportError> {
         let shape: Vec<usize> = plans
             .iter()
             .map(|p| p.partitions.len().div_ceil(p.wave.max(1)))
@@ -2510,7 +2541,7 @@ impl MemberStore {
         let spill = match backing {
             SinkBacking::Ram => None,
             SinkBacking::Spill => {
-                let temp = NamedTempFile::new()?;
+                let temp = super::pipeline::spill_temp_file(spill_dir)?;
                 let writer = BufWriter::new(temp.reopen()?);
                 let read = temp.reopen()?;
                 Some(MemberSpill {
@@ -2658,7 +2689,7 @@ fn fill_member_store(
     let timers = ctx.timers;
     let plans = ctx.plans;
     let num_levels = plans.len();
-    let mut store = MemberStore::new(plans, backing)?;
+    let mut store = MemberStore::new(plans, backing, ctx.opts.spill_dir.as_deref())?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
     let store_ref = &mut store;
@@ -7845,6 +7876,54 @@ mod tests {
         }
     }
 
+    /// #427: a `spill_dir` that is not an existing directory fails the
+    /// export before any tile is written, with a typed error.
+    #[test]
+    fn missing_spill_dir_is_rejected_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_fixture(
+            &input,
+            &[(vec![1], vec![Geometry::Point(Point::new(0.5, 0.5))])],
+        );
+        let out = dir.path().join("out.pmtiles");
+        let opts = ExportOptions {
+            spill_dir: Some(dir.path().join("no-such-dir")),
+            ..ExportOptions::default()
+        };
+        let err = export_pmtiles(&input, &out, &opts).unwrap_err();
+        assert!(matches!(err, ExportError::SpillDirNotDirectory(_)), "{err}");
+        assert!(
+            err.to_string().contains("not an existing directory"),
+            "{err}"
+        );
+        assert!(!out.exists(), "nothing written");
+    }
+
+    /// #427: the member spill file lives under `ExportOptions::spill_dir`
+    /// when one is given, and is removed with the store.
+    #[test]
+    fn member_store_spill_lives_under_spill_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10]),
+            wave: 1,
+        }];
+        let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "one spill file under the spill dir"
+        );
+        drop(store);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "spill file removed"
+        );
+    }
+
     /// The member store's spill path: bucket flushes append segments to one
     /// temp file; `take_wave` reads a wave's segments back in append order
     /// (plus any RAM remainder), returning exactly the members pushed to it.
@@ -7856,7 +7935,7 @@ mod tests {
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill).unwrap();
+        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,

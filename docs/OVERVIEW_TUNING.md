@@ -1707,7 +1707,14 @@ compute stage and the write stage**:
   Note that `bounded` (and an `auto` that picks it) spills to the process temp
   directory, which on many Slurm and Kubernetes nodes is a tmpfs `/tmp` — RAM
   charged to the very same cgroup, so the spill does not relieve the limit.
-  Point `TMPDIR` (or `--spill-dir`) at real disk there.
+  Point `TMPDIR` (or `--spill-dir`) at real disk there. `--spill-dir` is the
+  one scratch-disk knob (#427): it places the remote-input spill, the pass-2
+  level spill files (`tylertoo-spill-*.arrow`), the `tiles` intermediate
+  overview, and — on `export-pmtiles` too, where the flag also exists — the
+  export's member spill. It must be an existing directory; both `overview`
+  and `export-pmtiles` refuse a missing one before doing any work. The
+  PMTiles archive is never spilled: it is assembled in place at
+  `OUTPUT.partial` beside the output and renamed over it at the end.
 
 The profile also governs the **pass-1 level-assignment grids** (#306). Level
 assignment builds one cell-winner grid per coarse level, concurrently across
@@ -1935,9 +1942,14 @@ writable at option-validation time — and if a plan is already sitting at that
 path, it must itself be writable, since it is about to be clobbered. `--plan`
 must be a readable convert plan (magic bytes checked, with a future format
 version named as such) — same fail-fast contract as `--spill-dir`.
-An existing plan at `--save-plan PATH` is **overwritten**, with a log line;
-that matches how `overview` treats its output. `tiles`, `pyramid`, `merge` and
-`shard-plan` instead refuse an existing output unless given `-f/--force`.
+An existing plan at `--save-plan PATH` is **overwritten**, with a log line.
+Every subcommand that writes a file — `overview`, `tiles`, `export-pmtiles`,
+`decode`, `pyramid`, `merge` and `shard-plan` — refuses an existing output
+unless given `-f/--force` (#427). The GeoParquet writers (`overview`,
+`decode`) also build their output in a uniquely named sibling
+(`OUTPUT.<random>.partial`) and rename it over `OUTPUT` only once the footer
+is written, so a run killed part-way leaves a previous output intact; a
+failed run removes the sibling, a killed one leaves it to be deleted by hand.
 Not yet exposed in the Python bindings.
 
 ---

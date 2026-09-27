@@ -791,6 +791,7 @@ fn run_pass2_levels(
                     in_flight_batches,
                     backing,
                     out_schema,
+                    options.spill_dir.as_deref(),
                 )?;
                 (result.levels, result.timers)
             } else {

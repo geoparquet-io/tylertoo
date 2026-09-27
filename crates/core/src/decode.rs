@@ -256,7 +256,10 @@ pub fn decode_pmtiles(
         .build();
     let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options)
         .map_err(|e| DecodeError::Write(e.to_string()))?;
-    let file = std::fs::File::create(output_path.as_ref())?;
+    // #427: build the output in a sibling and rename it over `output_path`
+    // only once it is complete, so an interrupted decode leaves a previous
+    // output intact.
+    let (file, pending) = crate::atomic_output::create(output_path.as_ref())?;
     let mut writer = ArrowWriter::try_new(file, encoder.target_schema(), None)?;
 
     // ---- Pass B: decode again, batch rows, stream to the writer. ----------
@@ -309,9 +312,22 @@ pub fn decode_pmtiles(
             .map_err(|e| DecodeError::Write(e.to_string()))?,
     ));
     writer.close()?;
+    #[cfg(test)]
+    if FAIL_BEFORE_PUBLISH.with(|f| f.get()) {
+        return Err(DecodeError::Write("injected failure before publish".into()));
+    }
+    pending.publish()?;
 
     report.elapsed_secs = start.elapsed().as_secs_f64();
     Ok(report)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault (#427): make `decode_pmtiles` fail after the parquet
+    /// writer has closed but before the sibling is published, the one point
+    /// a real run can only reach through an I/O failure.
+    static FAIL_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ============================================================================
@@ -1539,5 +1555,86 @@ mod tests {
         assert_eq!(Int.unify(Str), Str);
         assert_eq!(Str.unify(Float), Str);
         assert_eq!(Bool.unify(Str), Str);
+    }
+
+    // ---- #427: the destination is untouched until the decode completes. --
+
+    /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
+    const POINT_TILE: &[u8] = &[
+        0x1A, 0x11, // Tile.layers, 17 bytes
+        0x0A, 0x01, b't', // name
+        0x12, 0x07, 0x18, 0x01, 0x22, 0x03, 0x09, 0x02, 0x02, // feature: POINT, MoveTo(1,1)
+        0x28, 0x80, 0x20, // extent 4096
+        0x78, 0x02, // version 2
+    ];
+
+    fn small_archive(dir: &Path) -> std::path::PathBuf {
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        let path = dir.join("in.pmtiles");
+        let mut writer = StreamingPmtilesWriter::new(crate::Compression::Gzip).unwrap();
+        writer.set_layer_name("t");
+        for i in 0..4u32 {
+            let mut tile = POINT_TILE.to_vec();
+            tile[12] = 0x02 + 2 * (i as u8); // MoveTo x = 1 + i (zigzag)
+            writer.add_tile(5, i, 7, &tile).unwrap();
+        }
+        writer.finalize(&path).unwrap();
+        path
+    }
+
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A decode that fails after the parquet writer has already produced
+    /// row groups (the fault is injected between the writer's close and the
+    /// publish — the only post-open failure the production path can hit is
+    /// I/O, which is not provokable on demand) must leave the previous
+    /// output intact and no sibling behind (#427).
+    #[test]
+    fn interrupted_decode_leaves_previous_output_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = small_archive(dir.path());
+        let out = dir.path().join("decoded.parquet");
+        std::fs::write(&out, b"previous good decode").unwrap();
+
+        let err = FAIL_BEFORE_PUBLISH.with(|f| {
+            f.set(true);
+            let r = decode_pmtiles(&input, &out, &DecodeOptions::default());
+            f.set(false);
+            r.unwrap_err()
+        });
+        assert!(matches!(err, DecodeError::Write(_)), "{err}");
+
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous good decode");
+        assert_eq!(
+            dir_listing(dir.path()),
+            vec!["decoded.parquet".to_string(), "in.pmtiles".to_string()],
+            "no sibling left beside the output"
+        );
+    }
+
+    /// The successful path replaces the previous output wholesale, by
+    /// rename, and leaves nothing else in the directory.
+    #[test]
+    fn decode_publishes_over_previous_output_without_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = small_archive(dir.path());
+        let out = dir.path().join("decoded.parquet");
+        std::fs::write(&out, b"previous good decode").unwrap();
+
+        let report = decode_pmtiles(&input, &out, &DecodeOptions::default()).unwrap();
+        assert_eq!(report.features_written, 4);
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"PAR1");
+        assert_eq!(
+            dir_listing(dir.path()),
+            vec!["decoded.parquet".to_string(), "in.pmtiles".to_string()]
+        );
     }
 }

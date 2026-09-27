@@ -208,6 +208,8 @@ fn convert(
         // #443: not exposed on this deprecated one-shot facade; use
         // `overview()` + `export_pmtiles(..., feature_id=...)` instead.
         feature_id: None,
+        // #427: likewise; `export_pmtiles(..., spill_dir=...)`.
+        spill_dir: None,
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -991,6 +993,16 @@ fn overview(
 ///         member's; duplicate ids are not checked. Defaults to None, which
 ///         keeps the tile-local member index (unique only within a single
 ///         tile/zoom pair). Not available on ``convert()``.
+///     spill_dir (str or os.PathLike, optional): Directory for the export's
+///         member spill file (#427): the on-disk backing the partitioning
+///         single-read pass 2 falls back to when the buffered members would
+///         not fit the memory budget. The same knob as ``overview()``'s
+///         ``spill_dir``. Defaults to None (the process temp directory,
+///         ``$TMPDIR`` -- often a RAM-backed ``/tmp`` on cluster nodes;
+///         point it at real disk there). The directory must exist; a
+///         missing one raises ``RuntimeError`` before any work is done.
+///         The archive itself is never spilled here: it is assembled in
+///         place at ``<output>.partial`` beside the output.
 ///
 /// Returns:
 ///     dict: Export report with keys "mode", "min_zoom", "max_zoom", "zooms"
@@ -1017,7 +1029,7 @@ fn overview(
 ///     ...                         layer_name="admin")
 ///     >>> print(report["total_tiles"])
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None, spill_dir=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -1032,6 +1044,7 @@ fn export_pmtiles(
     feature_order: &str,
     min_zoom: Option<u8>,
     feature_id: Option<String>,
+    spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
@@ -1051,6 +1064,7 @@ fn export_pmtiles(
         tile_range: None,
         zoom_ceiling: None,
         feature_id,
+        spill_dir,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

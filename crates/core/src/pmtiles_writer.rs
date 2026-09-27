@@ -2019,19 +2019,30 @@ impl StreamingPmtilesWriter {
     }
 
     /// Create a new streaming writer with a custom temp directory.
+    ///
+    /// The spool is a `tempfile` (#427): created `O_EXCL` under a random
+    /// name (`tylertoo-spool-<random>.tmp`), private to the owner on Unix,
+    /// so two writers in the same directory can never share a file. It is
+    /// removed when the writer is finalized or dropped; a run killed
+    /// outright leaves it, like any spool.
     pub fn with_temp_dir(compression: Compression, temp_dir: PathBuf) -> std::io::Result<Self> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Generate unique temp file name with timestamp + process/thread IDs for parallel safety
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        let tid = std::thread::current().id();
-        let temp_path = temp_dir.join(format!("tylertoo-{}-{}-{:?}.tmp", timestamp, pid, tid));
-
-        let file = File::create(&temp_path)?;
+        let (file, temp_path) = tempfile::Builder::new()
+            .prefix("tylertoo-spool-")
+            .suffix(".tmp")
+            .tempfile_in(&temp_dir)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot create the tile spool in {}: {e}",
+                        temp_dir.display()
+                    ),
+                )
+            })?
+            .into_parts();
+        // The writer's own `Drop`/`finalize` remove the spool; the guard
+        // would only race them.
+        let temp_path = temp_path.keep()?;
         let temp_file = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
 
         Ok(Self::from_spool(
@@ -3093,6 +3104,47 @@ impl Drop for StreamingPmtilesWriter {
 
 #[cfg(test)]
 mod tests {
+
+    /// #427: the packed-layout spool is a `tempfile` (`O_EXCL`, private,
+    /// random name) in the requested directory, distinct per writer, and gone
+    /// once the writer is dropped.
+    #[test]
+    fn spool_files_are_unique_private_and_removed_on_drop() {
+        use super::StreamingPmtilesWriter;
+        use crate::Compression;
+        let dir = tempfile::tempdir().unwrap();
+        let a = StreamingPmtilesWriter::with_temp_dir(Compression::Gzip, dir.path().to_path_buf())
+            .unwrap();
+        let b = StreamingPmtilesWriter::with_temp_dir(Compression::Gzip, dir.path().to_path_buf())
+            .unwrap();
+        assert_ne!(a.temp_path(), b.temp_path());
+        for w in [&a, &b] {
+            assert_eq!(w.temp_path().parent().unwrap(), dir.path());
+            assert!(w.temp_path().exists());
+            let name = w.temp_path().file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with("tylertoo-spool-") && name.ends_with(".tmp"),
+                "spool name: {name}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(w.temp_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "spool must be private to the owner, got {mode:o}"
+                );
+            }
+        }
+        drop(a);
+        drop(b);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "spool files leaked: {left:?}");
+    }
 
     /// An archive whose directory outgrows the spec's 16 KiB root budget must
     /// spill into leaf directories. Writing one oversized root instead makes a

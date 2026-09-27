@@ -206,6 +206,18 @@ class TestExportPmtilesApi:
         with pytest.raises(RuntimeError):
             tylertoo.export_pmtiles("/nonexistent.parquet", "/tmp/out.pmtiles")
 
+    def test_export_pmtiles_rejects_missing_spill_dir(self):
+        """#427: spill_dir is validated before any work, naming the flag."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "no-such-dir"
+            pattern = r"spill-dir .* not an existing directory"
+            with pytest.raises(RuntimeError, match=pattern):
+                tylertoo.export_pmtiles(
+                    "/nonexistent.parquet",
+                    str(Path(tmpdir) / "out.pmtiles"),
+                    spill_dir=missing,
+                )
+
 
 class TestValidateApi:
     def test_validate_exists(self):
@@ -593,6 +605,18 @@ class TestExportPmtilesIntegration:
             for z in report["zooms"]:
                 assert z["zoom"] == z["level"] + report["min_zoom"]
                 assert z["tile_count"] > 0
+
+    def test_export_spill_dir_is_accepted(self):
+        """#427: an existing spill_dir is accepted (and left clean)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = self._make_overview(tmpdir)
+            pm = Path(tmpdir) / "out.pmtiles"
+            spill = Path(tmpdir) / "spill"
+            spill.mkdir()
+            report = tylertoo.export_pmtiles(str(ovr), str(pm), spill_dir=spill)
+            assert pm.exists()
+            assert report["total_tiles"] > 0
+            assert list(spill.iterdir()) == [], "spill files must be removed"
 
     def test_export_knobs(self):
         with tempfile.TemporaryDirectory() as tmpdir:

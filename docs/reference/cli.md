@@ -325,6 +325,7 @@ Build a multi-resolution overview GeoParquet file
 * `--bbox <XMIN,YMIN,XMAX,YMAX>` — Regional extract: only convert features whose bbox intersects this bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose GeoParquet 1.1 covering statistics don't intersect are skipped at the parquet footer level (no data pages read); inputs without covering stats degrade gracefully (all row groups read, exact per-feature filter still applies)
 * `--cogp-compat` — Emit the optional COGP compatibility footer key (partitioning mode)
 * `--report <PATH>` — Write the JSON conversion report to this path
+* `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
 
    The ladder derives coarse levels from the fine input by thinning and simplifying. That is right for a road network and wrong for a pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is their parent, and its count is their sum. Run an aggregate through the gates and a coarse level shows SOME cells and silently omits the rest, instead of showing what they sum to.
@@ -575,6 +576,8 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom (#498) — the coarse half of a sharded build, complementing --tile-range's finer half.
 
    Named a CEILING, not --max-zoom, because it is the opposite of --min-zoom here: --min-zoom only widens what the metadata DECLARES (vector_layers), while this one decides which zooms are actually emitted. Distinct from building a shallower pyramid too: the overview file still holds every level (its convert plan is the one the shards consume, and the level plan is fingerprinted), and this only decides which of them reach the archive. A partial overview kept from a `tiles --shard coarse` run holds only the levels up to its own ceiling and can only be exported with this set at or below that ceiling
+* `--spill-dir <PATH>` — Directory for the export's member spill file (#427): the on-disk backing the partitioning single-read pass 2 falls back to when the buffered members would not fit the memory budget. Same knob as `overview`/`tiles --spill-dir`. Defaults to the process temp directory ($TMPDIR), which on many Slurm and Kubernetes nodes is a RAM-backed /tmp; point this at real disk there. The directory must exist. The archive itself is never spilled here: it is assembled in place at OUTPUT.partial beside the output
+* `-f`, `--force` — Overwrite the output if it exists
 
 
 
@@ -608,6 +611,7 @@ does not reproduce A. See docs/decode.md for details.
 * `--max-zoom <MAX_ZOOM>` — Maximum zoom level to decode
 * `--layer <NAME>` — Only decode features from this MVT layer
 * `--report <PATH>` — Write the JSON decode report to this path
+* `-f`, `--force` — Overwrite the output if it exists
 
 
 

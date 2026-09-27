@@ -39,6 +39,7 @@ pub mod vector_tile {
 }
 
 pub mod archive_index;
+pub(crate) mod atomic_output;
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;
