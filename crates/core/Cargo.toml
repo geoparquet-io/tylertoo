@@ -134,6 +134,10 @@ harness = false
 name = "assign_scaling"
 harness = false
 
+[[bench]]
+name = "hostile_geometry"
+harness = false
+
 [lints]
 workspace = true
 

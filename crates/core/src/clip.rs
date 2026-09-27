@@ -362,6 +362,52 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
         && rect.min().y <= bounds.lat_max
 }
 
+/// Bounding rect over EVERY ring of a polygon.
+///
+/// `geo`'s `Polygon::bounding_rect` covers the exterior only. That is the
+/// right answer for valid input (holes lie inside the exterior), but the
+/// convert pass carries invalid input verbatim (#188), and a hole outside or
+/// across its exterior would otherwise ride the fully-inside fast path below
+/// into the tile unclipped — thousands of MVT units past the buffer (found by
+/// the #205 hostile-geometry harness). For valid polygons the result is the
+/// exterior's rect, so the fast path is byte-identical there.
+fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<Rect<f64>> {
+    let mut rect = poly.exterior().bounding_rect()?;
+    for hole in poly.interiors() {
+        if let Some(h) = hole.bounding_rect() {
+            rect = Rect::new(
+                Coord {
+                    x: rect.min().x.min(h.min().x),
+                    y: rect.min().y.min(h.min().y),
+                },
+                Coord {
+                    x: rect.max().x.max(h.max().x),
+                    y: rect.max().y.max(h.max().y),
+                },
+            );
+        }
+    }
+    Some(rect)
+}
+
+/// [`polygon_rect_all_rings`] over every part of a MultiPolygon.
+fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<Rect<f64>> {
+    let mut rects = mp.0.iter().filter_map(polygon_rect_all_rings);
+    let first = rects.next()?;
+    Some(rects.fold(first, |acc, r| {
+        Rect::new(
+            Coord {
+                x: acc.min().x.min(r.min().x),
+                y: acc.min().y.min(r.min().y),
+            },
+            Coord {
+                x: acc.max().x.max(r.max().x),
+                y: acc.max().y.max(r.max().y),
+            },
+        )
+    }))
+}
+
 /// Check if a rectangle is fully contained within the given bounds
 fn is_fully_inside(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
     rect.min().x >= bounds.lng_min
@@ -437,8 +483,10 @@ fn clip_polygon(
     assume_simple: bool,
     skip_boundary_fallback: bool,
 ) -> Option<Geometry<f64>> {
-    // Quick rejection test using bounding box
-    let poly_rect = poly.bounding_rect()?;
+    // Quick rejection test using bounding box. Over every ring, not just the
+    // exterior, so an interior ring outside its exterior cannot take the
+    // fully-inside fast path below unclipped (#205).
+    let poly_rect = polygon_rect_all_rings(poly)?;
     if !intersects_bounds(&poly_rect, bounds) {
         return None;
     }
@@ -517,8 +565,9 @@ fn clip_multipolygon(
     assume_simple: bool,
     skip_boundary_fallback: bool,
 ) -> Option<MultiPolygon<f64>> {
-    // Level 1: Quick rejection using overall MultiPolygon bbox
-    let mp_rect = mp.bounding_rect()?;
+    // Level 1: Quick rejection using overall MultiPolygon bbox (every ring,
+    // see `polygon_rect_all_rings`).
+    let mp_rect = multipolygon_rect_all_rings(mp)?;
     if !intersects_bounds(&mp_rect, bounds) {
         return None;
     }
@@ -536,7 +585,7 @@ fn clip_multipolygon(
     for poly in &mp.0 {
         // Per-polygon bbox filter: compute each polygon's bbox and check
         // intersection before calling into the clip pipeline
-        let poly_rect = match poly.bounding_rect() {
+        let poly_rect = match polygon_rect_all_rings(poly) {
             Some(r) => r,
             None => continue, // Degenerate polygon, skip
         };
@@ -709,6 +758,87 @@ pub fn polygon_to_world_rings(poly: &Polygon<f64>) -> (Vec<WorldCoord>, Vec<Vec<
 mod tests {
     use super::*;
     use geo::point;
+
+    // ========== Interior rings outside their exterior (issue #205) ==========
+
+    fn ring_square(min: f64, max: f64) -> LineString<f64> {
+        LineString::from(vec![
+            (min, min),
+            (max, min),
+            (max, max),
+            (min, max),
+            (min, min),
+        ])
+    }
+
+    fn assert_within(g: &Geometry<f64>, b: &TileBounds, what: &str) {
+        use geo::CoordsIter;
+        for c in g.coords_iter() {
+            assert!(
+                c.x >= b.lng_min && c.x <= b.lng_max && c.y >= b.lat_min && c.y <= b.lat_max,
+                "{what}: vertex ({}, {}) lies outside the clip window {b:?}",
+                c.x,
+                c.y
+            );
+        }
+    }
+
+    /// The hostile-geometry harness (#205) caught this: `geo`'s
+    /// `Polygon::bounding_rect` covers the EXTERIOR only, so a polygon whose
+    /// exterior sits inside the tile took the fully-inside fast path and
+    /// returned its interior rings verbatim — even a hole lying wholly
+    /// outside the exterior (and the tile), thousands of MVT units past the
+    /// buffer. Invalid input, but the convert pass carries it verbatim
+    /// (#188) and the tile must still stay inside its window.
+    #[test]
+    fn hole_outside_its_exterior_is_clipped_not_fast_pathed() {
+        let poly = Polygon::new(ring_square(0.0, 10.0), vec![ring_square(20.0, 25.0)]);
+        let window = TileBounds::new(-1.0, -1.0, 11.0, 11.0);
+        for (assume_simple, fast) in [(false, false), (true, false), (true, true)] {
+            let out = clip_geometry_simple(
+                &Geometry::Polygon(poly.clone()),
+                &window,
+                0.0,
+                assume_simple,
+                fast,
+            )
+            .expect("exterior overlaps the window");
+            assert_within(&out, &window, "hole outside exterior");
+            // Through the MultiPolygon path too (its own per-part fast path).
+            let out = clip_geometry_simple(
+                &Geometry::MultiPolygon(MultiPolygon::new(vec![poly.clone()])),
+                &window,
+                0.0,
+                assume_simple,
+                fast,
+            )
+            .expect("exterior overlaps the window");
+            assert_within(&out, &window, "hole outside exterior (multipolygon)");
+        }
+    }
+
+    /// Same leak with a hole that crosses its exterior: the part of the hole
+    /// past the window must be cut, not carried.
+    #[test]
+    fn hole_crossing_its_exterior_is_clipped_to_the_window() {
+        let poly = Polygon::new(ring_square(0.0, 10.0), vec![ring_square(5.0, 15.0)]);
+        let window = TileBounds::new(-1.0, -1.0, 11.0, 11.0);
+        let out = clip_geometry_simple(&Geometry::Polygon(poly), &window, 0.0, true, true)
+            .expect("exterior overlaps the window");
+        assert_within(&out, &window, "hole crossing exterior");
+    }
+
+    /// A valid polygon (holes inside the exterior) fully inside the window
+    /// still takes the fast path and comes back untouched — the fix widens
+    /// the bbox by the interiors, which changes nothing for valid input.
+    #[test]
+    fn valid_polygon_with_holes_still_takes_the_fast_path_verbatim() {
+        let poly = Polygon::new(ring_square(0.0, 10.0), vec![ring_square(2.0, 4.0)]);
+        let window = TileBounds::new(-1.0, -1.0, 11.0, 11.0);
+        let out = clip_geometry_simple(&Geometry::Polygon(poly.clone()), &window, 0.0, true, true)
+            .expect("inside the window");
+        assert_eq!(out, Geometry::Polygon(poly));
+    }
 
     // ========== MultiPolygon part-splitting clips (issue #244) ==========
 

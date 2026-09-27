@@ -510,7 +510,7 @@ therefore its band, in the same PR, with the new measurement in the comment.
 | Point clustering | Winner **keeps its own geometry** and absorbs cell losers into `point_count` | Cluster centroid is the mean position | Deliberate: anchor stays a real feature; deterministic |
 | Line continuity | Coalescing chains same-class segments into strokes *before* gates/thinning | `--coalesce`-family merges at tile encode time | Junctions terminate chains by default (junction-angle 0, from the Portland sweep) |
 | Tile-size control (export) | Single non-iterative drop pass (`--tile-size-limit`) | Iterative threshold retry loop | Overview levels are already budgeted; the valve is a backstop, not the mechanism |
-| Polygon clipping (export) | Sutherland–Hodgman f64 + i_overlay fallback | Sutherland–Hodgman integer tile coords | Same algorithm family, different coordinate space (below) |
+| Polygon clipping (export) | Sutherland–Hodgman in f64 degrees, gated: a ring the O(n) checks or the #241 sweep call non-simple, or an S-H result with a boundary bridge (unless the #239 fast path applies), goes to the direct `i_overlay` 9 instead (`clip.rs` → `ioverlay_clip.rs`); lines clip on that same `i_overlay` (#435); after tile quantization the #383 repair runs on it too. Evaluated against wagyu-rs in #205 and kept (decision record below) | Sutherland–Hodgman in integer tile coords, then a wagyu positive-fill union of every polygon after snapping (`tile.cpp`) | Same clip algorithm, different coordinate space and a different cleanup engine. Fully-inside fast path is gated on a bbox over EVERY ring (#205): `geo`'s `Polygon::bounding_rect` is exterior-only, and an interior ring outside its exterior used to ride the fast path into the tile unclipped |
 | Tile buffer axis (export, #341) | `--tile-buffer` is converted to degrees from the tile's LONGITUDE width (`tile_width x buffer_px / 256`) and that one value is applied to both axes | `--buffer` is tile pixels on both axes | Exact on x; on y the effective buffer is `buffer_px x sec(lat)` pixels, because a Mercator tile's latitude span shrinks as `cos(lat)` while its longitude span does not — 8 px at the equator, ~16 px at 60 deg, ~92 px at 85 deg. Bounded: the over-draw stays under one tile height below ~88.2 deg, outside the Mercator domain, and it errs towards carrying MORE geometry across the seam. A per-axis buffer has to be threaded through `bbox_within_buffered` and `clip_geometry_simple` as well, which moves tile bytes again, so it is deferred. Antimeridian seam continuity is separately out of scope: membership widening is clamped to the lon/lat domain and a feature at lng 179.99 does not reach tile x=0 |
 | Tile buffer cap and extent validation (export, #433) | `--tile-buffer` is capped at `MAX_TILE_BUFFER_PX` = 256 (one full tile width) and `extent` must be positive (non-power-of-two warns), both checked by `ExportOptions::validate` before any I/O; `decode` refuses a layer declaring `extent: 0` | `--buffer` has no documented upper bound; the extent is set as a power of two through `-d`/`-D`/`-m` detail bits, so zero is unreachable there | A buffer past one tile width has no output that is not reachable below it, and since the buffer is what makes a feature belong to more than one tile, an unbounded one is an `O(features × tiles)` blow-up (`--tile-buffer 100000` ≈ 390 tile widths). `extent = 0` quantizes everything to the origin and writes a layer every consumer divides by. The sharded read-pruning margin (two pivot tiles = 512 px, #498) is wider than the cap, and a `const` assertion in `shard.rs` keeps it so; `ExportError::TileBufferTooWideForShard` is retained for API compatibility but no longer raised |
 | Untileable input (#429) | Pass 1 tallies, in ONE traversal of the feature bboxes, the #188 antimeridian suspects plus two losses: features outside the declared CRS's coordinate range (`bbox_out_of_crs_range`) and features with valid lon/lat wholly outside the Web Mercator tiling domain (latitude beyond ±85.05°, `bbox_unprojectable`). Both land on `ConvertReport` (`out_of_range_features`, `unprojectable_features`), each warns once, and when together they account for **≥99%** of the input the convert FAILS with `ConvertError::AllFeaturesOutOfRange` instead of writing an empty archive | No CRS gate: GeoJSON is lon/lat by contract, so out-of-range coordinates are clamped or dropped at projection time and a wrong-CRS input yields an empty tileset with exit 0 | The counts are taken at the END OF PASS 1 rather than at the end of convert: pass 1 already holds every feature bbox, so failing there costs no second pass and leaves no half-written overview behind. The gate is a share, not exactly 100%, because a million-row wrong-CRS file with a dozen `POINT(0 0)` placeholder rows would otherwise sail through. The two losses are counted (and worded) separately because their fixes differ: a reprojection for the first, nothing at all for the second — Mercator does not reach the poles. The projected-CRS diagnosis and its `gpio convert reproject` hint are gated on coordinate MAGNITUDE (any offending coordinate above 1000 in absolute value), so one stray 0–360°-convention longitude gets neutral wording rather than an accusation about the whole file |
@@ -689,26 +689,54 @@ provenance columns for filtering), coordinates lifted through tippecanoe's
 32-bit world-coordinate transform (write_json.cpp), degenerate MVT content
 (zero-area rings, one-point linestrings, leading interior rings) dropped.
 
-## Polygon Clipping: Sutherland-Hodgman
+## Polygon Clipping: Sutherland-Hodgman + i_overlay
 
 **DIVERGENCE**: Tippecanoe uses Sutherland-Hodgman in integer tile
-coordinates (0-4096). We use the same Sutherland-Hodgman algorithm but
-operate in f64 coordinates to avoid conversion overhead.
+coordinates (0-4096), then cleans every polygon with a wagyu union. We use
+the same Sutherland-Hodgman algorithm in f64 degrees, and route to the
+direct [i_overlay](https://crates.io/crates/i_overlay) 9 only where S-H is
+known to be wrong.
 
-**Why Sutherland-Hodgman instead of a general boolean-ops engine:**
+The export clip path today (`clip::clip_geometry_simple`, called per tile
+from `overview::export`):
+
+1. **Bbox gates.** Reject when the feature's bbox misses the buffered tile;
+   return the geometry verbatim when the bbox is inside it. Both bboxes
+   cover EVERY ring — `geo`'s `Polygon::bounding_rect` is exterior-only,
+   and until #205 an interior ring outside its exterior (invalid input the
+   convert pass carries verbatim, #188) rode the fast path into the tile
+   unclipped, thousands of MVT units past the buffer.
+2. **Input validity.** O(n) degenerate/duplicate-vertex checks plus, unless
+   the feature was proven simple once per feature (`geometry_is_simple`,
+   #237), the O((n+m) log n) self-crossing sweep (#241). A ring that fails
+   goes straight to `ioverlay_clip::clip_polygon_ioverlay`
+   (`OverlayRule::Intersect`, `FillRule::EvenOdd`).
+3. **Sutherland–Hodgman** (`sutherland_hodgman::clip_polygon_sh`), exterior
+   and holes clipped ring by ring.
+4. **Output gate.** The S-H result is re-checked (step 2's cheap checks,
+   plus the sweep for non-simple features) and, unless the #239 fast path
+   applies, for edges running along the tile boundary — the U-shape bridge
+   (#94). Either sends the ORIGINAL polygon to i_overlay.
+5. **Lines** clip on the same i_overlay (`clip_multilinestring_ioverlay`,
+   #435), so one engine decides where the tile edge is for every type.
+6. **After quantization** to the MVT grid, `mvt.rs` runs the #383 cleanup:
+   exact integer checks first, and only a polygon that fails them is
+   repaired through `ioverlay_clip::repair_polygon_ioverlay`.
+
+**Why Sutherland-Hodgman first instead of a general boolean-ops engine:**
 
 - Tile clipping is always against axis-aligned rectangles
 - SH is O(n) per polygon ring; Vatti-style engines are O(n log n)
-- A 316k-coordinate polygon clips in 0.02s with SH vs 10.4s with Wagyu
-  (500x faster)
+- The 316k-vertex Antarctica ring clips in ~1 ms with SH vs ~63 ms with
+  i_overlay and ~10 s with wagyu-rs (`benches/hostile_geometry.rs`,
+  `corpus/HOSTILE_GEOMETRY.md`)
 - SH matches tippecanoe's clip.cpp approach
 
 **Known behavior difference:** SH does not split disconnected clipping
 results into separate polygons (a U-shape clipped across its opening yields
 one self-touching polygon, not two). Acceptable for tile rendering and
 matches tippecanoe. For cases SH cannot handle robustly, `ioverlay_clip.rs`
-provides an [i_overlay](https://crates.io/crates/i_overlay)-based fallback
-(`clip.rs` dispatches).
+provides the i_overlay fallback (`clip.rs` dispatches).
 
 ### When the i_overlay fallback fires — and the simple-clip fast path (#239)
 
@@ -740,6 +768,112 @@ when byte-stable output is required. The frozen-hash export anchor in
 `export.rs` is unaffected: its fixture polygon never crosses a tile boundary, so
 the fast path does not diverge there; the fast path's render-equivalence is
 guarded instead by the `clip.rs` `fastpath_*_render_equivalent` tests.
+
+## Decision Record: Clipping engine (#205, 2026-09-27)
+
+**Decision: keep the current pipeline — Sutherland–Hodgman first, the direct
+`i_overlay` 9 as the fallback, line clipper and #383 repair engine. wagyu-rs
+0.2.1 is not adopted, neither as the fallback nor as a post-quantization
+cleanup; the hybrid is moot while the challenger fails the basic oracles.**
+
+**Method.** `crates/core/tests/hostile_geometry_eval.rs` runs every candidate
+over the same inputs at three zooms per fixture with export's 8 px buffer and
+scores each (case × engine) with the same oracles: caught panics, empty
+output where the i_overlay reference has area (drops) and the reverse
+(phantoms), the largest distance any output vertex lies past the buffered
+bounds in MVT units, `geo::Validation` on the output, proper self-crossing via
+the production sweep, ring-orientation consistency, area against the
+i_overlay reference (with `geo::BooleanOps` — geo's own vendored i_overlay
+4.5 — as the third opinion on valid input), area against a valid input's own
+area, vertex count, wall time and peak heap. Corpora: the 76 files of
+chrieke/geojson-invalid-geometry (35 usable geometries; the 41 structurally
+broken files are listed, not skipped silently), a 32-shape synthetic suite
+(bowties, spikes, holes crossing or outside their exterior, degenerate and
+unclosed rings, combs and U-shapes across the tile edge, antimeridian and
+polar rings, sub-MVT-unit slivers, huge and tiny coordinates), and the
+316k-vertex Antarctica ring plus the Tielt-Winge admin polygon. 2,289 cases.
+wagyu-rs runs out of process (`corpus/hostile_wagyu`) in two integer spaces —
+the tile's 4096-unit MVT grid and tippecanoe's `2^(32-z)` world grid — because
+its dead `geo 0.32` dependency cannot resolve beside our geo 0.33
+(nlebovits/wagyu-rs#113), and because `Wagyu<f64>` snap-rounds input to
+integers, so a degrees-as-is column would score a misuse. The adapter is
+pinned by `corpus/hostile_wagyu/tests/adapter_sanity.rs`. Full tables and
+commentary: `corpus/HOSTILE_GEOMETRY.md`.
+
+**Scorecard headline** (2,289 cases; production = export's default path):
+
+| engine | panics | drops | past buffer >½ MVT (max) | invalid output | self-crossing | Antarctica clip |
+|---|--:|--:|--:|--:|--:|--:|
+| production (S-H + gated i_overlay) | 0 | 1 | 0 (0.00) | 162, all on invalid input | 0 | ~1.5 ms |
+| production-strict (fast path off) | 0 | 1 | 0 (0.00) | 15, all on invalid input | 0 | ~63 ms |
+| i_overlay 9 alone | 0 | 0 | 0 (0.00) | 0 | 0 | ~63 ms |
+| wagyu-rs 0.2.1, MVT grid | 0 | 120 | 43 (156,678) | 35 | 27 | ~10 s |
+| wagyu-rs 0.2.1, world grid | 9 (infinite-loop detector on Antarctica) | 94 | 119 (157,321) | 30 | 24 | ~20 s |
+
+The one production drop is a z21 tile lying in the lobe of a hole that
+crosses its exterior: S-H (like tippecanoe's positive fill) treats the hole
+as subtractive and emits nothing, even-odd fills it. A semantic choice on
+invalid input, not a defect. Production's "invalid" outputs are S-H results on
+invalid input — a hole clipped along the same boundary as its exterior
+("intersect on a line"), self-touching rings, an input's own overlapping parts
+passed through — that the encoder's even-odd/nonzero fill renders as the
+unclipped invalid polygon would render; none has a proper self-crossing and
+none reaches past the buffer.
+
+**What the challenger would have had to show** to displace i_overlay: no
+panics, no output past the buffer, OGC-valid output where the incumbent is
+merely render-correct, and a cost within an order of magnitude on the
+pathological tier. wagyu-rs 0.2.1 emits vertices beyond both its subject and
+its clip box, inflates a valid polygon's area 13× (`invalid_interior_not_cw`),
+produces self-crossing rings, trips its own infinite-loop detector on a real
+316k ring in tippecanoe's own clip space, and is 160–320× slower than i_overlay there (four orders of magnitude slower than S-H). Both
+correctness findings are filed upstream (nlebovits/wagyu-rs#114) with the
+reproducer.
+
+**Issue #205's three gaps, in this light.** (1) Output validity: i_overlay's
+even-odd intersection produced OGC-valid output on every one of the 2,289
+cases, so on this corpus the "renders correctly, not valid" gap did not
+materialize for the fallback; the production path's invalid outputs come from
+S-H on invalid input, by design (#239). (2) Quantization-induced invalidity:
+the #383 repair already runs on the integer grid after snapping; the
+integer-space clipper that would close the class by construction is the one
+that failed the evaluation, so #383 stays. (3) Antimeridian: the
+antimeridian and polar rings clipped identically on every engine (no engine
+splits; all smear, as pinned by `overview_hostile`), so an export-time split
+is a separate feature with no engine dependency and stays deferred per the
+#188 decision.
+
+**Production defect found and fixed here:** the fully-inside fast path in
+`clip_polygon`/`clip_multipolygon` gated on `geo`'s exterior-only
+`bounding_rect`, so a polygon whose exterior sat inside the tile came back
+verbatim with any interior ring it carried — including one wholly outside
+the exterior and the tile (4,904 MVT units past the buffer on the synthetic
+case). Fixed by gating on a bbox over every ring
+(`clip::polygon_rect_all_rings`); byte-identical for valid input, where holes
+lie inside the exterior. Regression tests in `clip.rs`
+(`hole_outside_its_exterior_is_clipped_not_fast_pathed`,
+`hole_crossing_its_exterior_is_clipped_to_the_window`,
+`valid_polygon_with_holes_still_takes_the_fast_path_verbatim`); the golden
+guard (`convert_guard_golden`) and the line-clip pins are unchanged.
+
+**Limitations noted, not fixed.** `clip::has_structural_issues` uses an
+absolute 1e-10° duplicate-vertex epsilon, so a polygon under ~1e-9° across
+(0.1 mm) is routed to i_overlay and picks up its grid rounding (4.7 % area
+on a 1e-12° square; 0.005 MVT units at z22 — invisible). i_overlay's
+float-to-integer grid is set by the joint bbox of subject and clip, so a
+sliver 1e-6 of a tile wide sees ~0.1 % area noise (sub-pixel). i_overlay
+returns empty for coordinates around 1e15 (outside the lon/lat domain; #429
+rejects such input at convert), where S-H clips them fine. `geo::Validation`
+is quadratic on a ring's self-intersection check, so the harness reports
+outputs over 20k vertices as "unchecked" rather than scoring them.
+
+**Re-run:** `cargo test -p tylertoo-core --test hostile_geometry_eval`
+(quick tier: corpus + synthetic, asserts the production invariants — no
+panics, nothing past the buffer, no area gain on valid input, no
+self-crossing on simple input); `full_scorecard` (slow set) adds the real
+fixtures and writes `target/hostile_geometry_eval/SCORECARD.md`;
+`corpus/hostile_wagyu/README.md` for the wagyu columns;
+`cargo bench -p tylertoo-core --bench hostile_geometry` for timings.
 
 ## Input Contract: gpio-Optimized GeoParquet
 
