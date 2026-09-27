@@ -54,9 +54,25 @@ pub fn is_ram_backed(_path: &Path) -> Option<bool> {
     None
 }
 
+/// Clamp a byte count to a whole-mebibyte ceiling (scratch: exercises the
+/// diff-scoped mutation job on its own PR; removed in the next commit).
+pub fn clamp_mib(bytes: u64, max_mib: u64) -> u64 {
+    let mib = bytes / (1024 * 1024);
+    if mib > max_mib {
+        max_mib
+    } else {
+        mib
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_mib_caps_at_ceiling() {
+        assert_eq!(clamp_mib(50 * 1024 * 1024, 10), 10);
+    }
 
     /// `/dev/shm` is tmpfs on essentially every Linux system — the canonical
     /// RAM-backed directory. Detection must flag it.
