@@ -67,6 +67,7 @@
 //! gating/thinning fall back to the strict [`Priority`] total order. No
 //! result depends on hash-map iteration order.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use geo::{BoundingRect, Geometry, LineString};
@@ -265,48 +266,50 @@ pub fn coalesce_level_lines(
     // --- 1+2. Build chains (grouped endpoint joins + junction continuation).
     let chains = build_chains(lines, snap_tol, params.junction_angle_deg);
 
-    // --- Priorities + sort keys of the members (the cell-winner order, Q1). --
-    let mut prio: HashMap<usize, Priority> = HashMap::with_capacity(lines.len());
-    let mut sort_keys: HashMap<usize, Option<f64>> = HashMap::with_capacity(lines.len());
-    for l in lines {
-        let feat = AssignFeature {
-            index: l.index,
-            bbox: geom_bbox(l.geom),
-            kind: FeatureKind::Line,
-            sort_key: l.sort_key,
-            entry_level: None,
-        };
-        prio.insert(l.index, Priority::new(&feat, config.sort_direction));
-        sort_keys.insert(l.index, l.sort_key);
-    }
+    // --- Priorities of the members (the cell-winner order, Q1). -------------
+    // Position-indexed, matching `RawChain::members`: two `HashMap`s with one
+    // entry per input line cost ~100 MiB at 1.5M lines, per level, in
+    // parallel across levels (#570). Sort keys are read straight off `lines`.
+    let prio: Vec<Priority> = lines
+        .iter()
+        .map(|l| {
+            let feat = AssignFeature {
+                index: l.index,
+                bbox: geom_bbox(l.geom),
+                kind: FeatureKind::Line,
+                sort_key: l.sort_key,
+                entry_level: None,
+            };
+            Priority::new(&feat, config.sort_direction)
+        })
+        .collect();
 
     // --- 3. Merge geometry + inherit the best member's attributes. ----------
-    let mut merged: Vec<CoalescedLine> = Vec::with_capacity(chains.len());
+    // `rep_pos` (the winning member's position in `lines`) rides along so the
+    // gate can read its sort key without a second lookup table.
+    let mut merged: Vec<(CoalescedLine, usize)> = Vec::with_capacity(chains.len());
     for chain in chains {
-        let rep = chain
+        let rep_pos = chain
             .members
             .iter()
             .copied()
-            .reduce(|best, m| {
-                if prio[&m].beats(&prio[&best]) {
-                    m
-                } else {
-                    best
-                }
-            })
+            .reduce(|best, m| if prio[m].beats(&prio[best]) { m } else { best })
             .expect("chain has at least one member");
-        merged.push(CoalescedLine {
-            rep,
-            count: chain.members.len() as i32,
-            geom: chain.geom,
-        });
+        merged.push((
+            CoalescedLine {
+                rep: lines[rep_pos].index,
+                count: chain.members.len() as i32,
+                geom: chain.geom,
+            },
+            rep_pos,
+        ));
     }
 
     // --- 4a. Visibility gate on the CHAIN's bbox diagonal. -------------------
     let gate = config.line_visibility * gsd_units;
     let gate_sq = gate * gate;
     let mut gated: Vec<(CoalescedLine, AssignFeature)> = Vec::with_capacity(merged.len());
-    for line in merged {
+    for (line, rep_pos) in merged {
         let bbox = geom_bbox(&line.geom);
         let (dx, dy) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
         if gate > 0.0 && dx * dx + dy * dy < gate_sq {
@@ -319,7 +322,7 @@ pub fn coalesce_level_lines(
             index: line.rep,
             bbox,
             kind: FeatureKind::Line,
-            sort_key: sort_keys[&line.rep],
+            sort_key: lines[rep_pos].sort_key,
             entry_level: None,
         };
         gated.push((line, feat));
@@ -440,17 +443,27 @@ fn geom_bbox(g: &Geometry<f64>) -> [f64; 4] {
 
 /// An assembled chain before priority/gating: its ordered members and the
 /// merged geometry.
+///
+/// Members are POSITIONS in the caller's `lines` slice, not
+/// [`CoalesceInput::index`] values: the caller's priority and sort-key
+/// tables are then plain position-indexed `Vec`s instead of two
+/// `HashMap<usize, _>`s with one entry per input line (#570).
 struct RawChain {
     members: Vec<usize>,
     geom: Geometry<f64>,
 }
 
 /// A joinable polyline piece during chaining: one or more already-merged
-/// source segments with an owned, oriented coordinate run.
-struct Piece {
-    /// Source feature indices ([`CoalesceInput::index`]) merged so far.
+/// source segments with an oriented coordinate run.
+///
+/// The run is a [`Cow`]: an unmerged piece BORROWS its source line's
+/// coordinates, so phase 1 no longer copies the whole input coordinate set
+/// before a single join happens (#570). Assembling a multi-piece walk
+/// allocates the merged run once, exactly as before.
+struct Piece<'a> {
+    /// Positions in the caller's `lines` slice, merged so far.
     members: Vec<usize>,
-    coords: Vec<geo::Coord<f64>>,
+    coords: Cow<'a, [geo::Coord<f64>]>,
     group: u32,
 }
 
@@ -487,20 +500,20 @@ fn snap_key(group: u32, c: geo::Coord<f64>, tol: f64) -> NodeKey {
 /// `junction_angle_deg > 0`, continue through junctions (degree >= 3) by
 /// repeatedly pairing the incident lines that best continue each other
 /// within that angular deviation (stroke building).
-fn build_chains(
-    lines: &[CoalesceInput<'_>],
+fn build_chains<'a>(
+    lines: &[CoalesceInput<'a>],
     snap_tol: f64,
     junction_angle_deg: f64,
 ) -> Vec<RawChain> {
     // Chainable = plain LineString with >= 2 coordinates. Everything else
     // (MultiLineString, Line, degenerate) is an unmerged singleton.
-    let mut pieces: Vec<Piece> = Vec::new();
+    let mut pieces: Vec<Piece<'a>> = Vec::new();
     let mut singles: Vec<usize> = Vec::new(); // positions in `lines`
     for (pos, l) in lines.iter().enumerate() {
         match l.geom {
             Geometry::LineString(ls) if ls.0.len() >= 2 => pieces.push(Piece {
-                members: vec![l.index],
-                coords: ls.0.clone(),
+                members: vec![pos],
+                coords: Cow::Borrowed(&ls.0[..]),
                 group: l.group,
             }),
             _ => singles.push(pos),
@@ -518,7 +531,7 @@ fn build_chains(
     let mut chains: Vec<RawChain> = pieces
         .into_iter()
         .map(|p| RawChain {
-            geom: Geometry::LineString(LineString::new(p.coords)),
+            geom: Geometry::LineString(LineString::new(p.coords.into_owned())),
             members: p.members,
         })
         .collect();
@@ -526,7 +539,7 @@ fn build_chains(
     // Non-chainable singletons pass through unmerged (original geometry).
     for pos in singles {
         chains.push(RawChain {
-            members: vec![lines[pos].index],
+            members: vec![pos],
             geom: lines[pos].geom.clone(),
         });
     }
@@ -548,27 +561,51 @@ fn build_chains(
 /// Deterministic: components are walked in ascending piece index, starting
 /// from a free end (or the lowest-index piece of a cycle); junction pairs
 /// are ordered by (deviation, incident order).
-fn join_pieces(
-    pieces: Vec<Piece>,
+fn join_pieces<'a>(
+    pieces: Vec<Piece<'a>>,
     key: impl Fn(u32, geo::Coord<f64>) -> NodeKey,
     junction_angle_deg: f64,
-) -> Vec<Piece> {
-    // Endpoint node map: node -> incident (piece idx, end).
-    let mut nodes: HashMap<NodeKey, Vec<(usize, End)>> = HashMap::new();
+) -> Vec<Piece<'a>> {
+    // Endpoint incidences, grouped into per-node runs by sorting rather than
+    // by a `HashMap<NodeKey, Vec<_>>` — which cost one heap `Vec` per node,
+    // up to 2N of them (#570).
+    //
+    // Identical grouping AND identical per-node incident order: the old map
+    // was filled in ascending piece index, pushing end 0 before end 1, so
+    // every node's list was ordered `(piece asc, end asc)`. Packing the
+    // incident as `piece << 1 | end` makes the sort tiebreaker exactly that
+    // order, and each `(piece, end)` belongs to exactly one node, so the
+    // runs partition the same way. Node processing only reads `pieces` and
+    // writes this node's own `joins` slots, so the order the runs are
+    // visited in cannot affect the result either (as before, when it was
+    // hash order).
+    debug_assert!(pieces.len() <= usize::MAX >> 1);
+    let mut incidents: Vec<(NodeKey, usize)> = Vec::with_capacity(pieces.len() * 2);
     for (pi, p) in pieces.iter().enumerate() {
         let first = p.coords[0];
         let last = p.coords[p.coords.len() - 1];
-        nodes.entry(key(p.group, first)).or_default().push((pi, 0));
-        nodes.entry(key(p.group, last)).or_default().push((pi, 1));
+        incidents.push((key(p.group, first), pi << 1));
+        incidents.push((key(p.group, last), (pi << 1) | 1));
     }
+    incidents.sort_unstable();
 
     // Joins: per piece, the (other piece, other end) connected at each end.
     let mut joins: Vec<[Option<(usize, End)>; 2]> = vec![[None, None]; pieces.len()];
-    for incidents in nodes.values() {
-        let d = incidents.len();
-        if d == 2 && incidents[0].0 != incidents[1].0 {
-            let (a, a_end) = incidents[0];
-            let (b, b_end) = incidents[1];
+    let mut run_start = 0usize;
+    while run_start < incidents.len() {
+        let mut run_end = run_start + 1;
+        while run_end < incidents.len() && incidents[run_end].0 == incidents[run_start].0 {
+            run_end += 1;
+        }
+        let run = &incidents[run_start..run_end];
+        run_start = run_end;
+
+        // `(piece, end)` of the run's k-th incident, in the old map's order.
+        let inc = |k: usize| -> (usize, End) { (run[k].1 >> 1, (run[k].1 & 1) as End) };
+        let d = run.len();
+        if d == 2 && inc(0).0 != inc(1).0 {
+            let (a, a_end) = inc(0);
+            let (b, b_end) = inc(1);
             joins[a][a_end as usize] = Some((b, b_end));
             joins[b][b_end as usize] = Some((a, a_end));
         } else if d >= 3 && junction_angle_deg > 0.0 {
@@ -576,15 +613,17 @@ fn join_pieces(
             // that continue each other within the angular threshold,
             // straightest pair first. Each node's pairing is independent of
             // every other node's (an end belongs to exactly one node), so
-            // map iteration order cannot affect the result.
-            let dirs: Vec<Option<(f64, f64)>> = incidents
-                .iter()
-                .map(|&(pi, e)| piece_direction(&pieces[pi], e))
+            // the order the nodes are visited in cannot affect the result.
+            let dirs: Vec<Option<(f64, f64)>> = (0..d)
+                .map(|k| {
+                    let (pi, e) = inc(k);
+                    piece_direction(&pieces[pi], e)
+                })
                 .collect();
             let mut cands: Vec<(f64, usize, usize)> = Vec::new();
             for i in 0..d {
                 for j in (i + 1)..d {
-                    if incidents[i].0 == incidents[j].0 {
+                    if inc(i).0 == inc(j).0 {
                         continue; // self-loops never join
                     }
                     if let (Some(a), Some(b)) = (dirs[i], dirs[j]) {
@@ -603,13 +642,14 @@ fn join_pieces(
                 }
                 used[i] = true;
                 used[j] = true;
-                let (a, a_end) = incidents[i];
-                let (b, b_end) = incidents[j];
+                let (a, a_end) = inc(i);
+                let (b, b_end) = inc(j);
                 joins[a][a_end as usize] = Some((b, b_end));
                 joins[b][b_end as usize] = Some((a, a_end));
             }
         }
     }
+    drop(incidents);
 
     // Walk components deterministically (ascending piece index).
     let mut visited = vec![false; pieces.len()];
@@ -661,8 +701,8 @@ fn join_pieces(
 
     // Assemble merged pieces. Consume the inputs by index (each appears in
     // exactly one walk), reversing where the walk entered at the far end.
-    let mut slots: Vec<Option<Piece>> = pieces.into_iter().map(Some).collect();
-    let mut out: Vec<Piece> = Vec::with_capacity(order.len());
+    let mut slots: Vec<Option<Piece<'a>>> = pieces.into_iter().map(Some).collect();
+    let mut out: Vec<Piece<'a>> = Vec::with_capacity(order.len());
     for walk in order {
         if walk.len() == 1 {
             let (pi, _) = walk[0];
@@ -676,23 +716,38 @@ fn join_pieces(
             let mut p = slots[pi].take().expect("piece consumed once");
             members.append(&mut p.members);
             group = p.group;
-            if seg_entry == 1 {
-                p.coords.reverse();
-            }
-            for c in p.coords {
-                if coords.last() == Some(&c) {
-                    continue; // exact shared node: no duplicate vertex
-                }
-                coords.push(c);
-            }
+            // Reversing in place and then appending forward is the same
+            // sequence as appending in reverse — done this way so a
+            // borrowed run never has to be cloned just to be flipped.
+            append_run(&mut coords, &p.coords, seg_entry == 1);
         }
         out.push(Piece {
             members,
-            coords,
+            coords: Cow::Owned(coords),
             group,
         });
     }
     out
+}
+
+/// Append `src` (reversed when `flip`) to `out`, dropping a vertex that
+/// exactly repeats `out`'s last one (the shared node between two joined
+/// pieces).
+fn append_run(out: &mut Vec<geo::Coord<f64>>, src: &[geo::Coord<f64>], flip: bool) {
+    let mut push = |c: geo::Coord<f64>| {
+        if out.last() != Some(&c) {
+            out.push(c);
+        }
+    };
+    if flip {
+        for &c in src.iter().rev() {
+            push(c);
+        }
+    } else {
+        for &c in src {
+            push(c);
+        }
+    }
 }
 
 #[cfg(test)]
