@@ -39,13 +39,33 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import struct
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import mapbox_vector_tile
 from pmtiles.reader import MmapSource, all_tiles
-from pmtiles.tile import Compression, TileType, deserialize_header
+from pmtiles.tile import (
+    Compression,
+    MagicNumberNotFound,
+    SpecVersionUnsupported,
+    TileType,
+    deserialize_header,
+)
+
+# What the pmtiles reader raises on malformed input: bad magic / spec byte,
+# a truncated header or directory (IndexError, struct.error), a corrupt
+# gzip block (BadGzipFile, EOFError), an undecodable varint (ValueError).
+READER_ERRORS = (
+    MagicNumberNotFound,
+    SpecVersionUnsupported,
+    gzip.BadGzipFile,
+    EOFError,
+    struct.error,
+    IndexError,
+    ValueError,
+)
 
 VALID_GEOMETRY_TYPES = frozenset(
     {
@@ -119,12 +139,15 @@ def check_header(header: dict) -> None:
 
 def check_metadata(get_bytes, header: dict, layer: str) -> dict:
     raw = get_bytes(header["metadata_offset"], header["metadata_length"])
-    if header["internal_compression"] == Compression.GZIP:
-        raw = gzip.decompress(raw)
-    elif header["internal_compression"] != Compression.NONE:
+    # pmtiles 3.8.1's deserialize_directory always gzip-decompresses, so an
+    # archive whose directories are stored uncompressed (spec-legal) cannot
+    # be walked by this reader; refuse it here rather than crash later.
+    if header["internal_compression"] != Compression.GZIP:
         raise VerifyError(
-            f"internal compression {header['internal_compression'].name} unsupported"
+            f"internal compression {header['internal_compression'].name}: the "
+            "python pmtiles reader (3.8.1) only walks gzip directories"
         )
+    raw = gzip.decompress(raw)
     try:
         meta = json.loads(raw)
     except ValueError as e:
@@ -251,6 +274,14 @@ def main() -> int:
         except VerifyError as e:
             failures.append(f"{path}: {e}")
             print(f"FAIL {path}: {e}")
+            continue
+        except READER_ERRORS as e:
+            # The pmtiles reader raises these on a malformed header,
+            # directory or compressed block; report them per archive so
+            # every archive on the command line gets a verdict.
+            msg = f"pmtiles reader error ({type(e).__name__}): {e}"
+            failures.append(f"{path}: {msg}")
+            print(f"FAIL {path}: {msg}")
             continue
         print(f"OK   {path} (layer {args.layer!r}, {path.stat().st_size} bytes)")
         print("\n".join(lines))
