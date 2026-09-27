@@ -121,3 +121,122 @@ pub(crate) fn write_input_with_f64(
     writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
     writer.close().unwrap();
 }
+
+/// Write a multi-row-group GeoParquet file with covering column stats so
+/// row-group pruning can actually bite (#102). Each row group contains one
+/// point at `(x, y)` with `id` = row-group index.
+///
+/// Shared by `overview::convert`'s bbox-pruning tests and
+/// `overview::stream`'s pruned-groups-are-never-read test (#422).
+pub(crate) fn write_multi_rg_input(path: &Path, coords: &[(f64, f64)], with_covering: bool) {
+    write_multi_rg_input_with_crs(path, coords, with_covering, None)
+}
+
+/// [`write_multi_rg_input`] with an explicit geometry CRS (#518: the
+/// EPSG:3857 probe needs a file that declares Pseudo-Mercator PROJJSON).
+pub(crate) fn write_multi_rg_input_with_crs(
+    path: &Path,
+    coords: &[(f64, f64)],
+    with_covering: bool,
+    crs_metadata: Option<geoarrow::datatypes::Metadata>,
+) {
+    use geo::Point;
+    use parquet::file::properties::WriterProperties;
+
+    let geoms: Vec<Geometry<f64>> = coords
+        .iter()
+        .map(|&(x, y)| Geometry::Point(Point::new(x, y)))
+        .collect();
+    let n = geoms.len();
+    let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+    let typ = match crs_metadata {
+        Some(md) => GeometryType::new(Arc::new(md)),
+        None => GeometryType::new(Default::default()),
+    };
+    let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+    b.extend_from_iter(geoms.iter().map(Some));
+    let geom_arr = b.finish();
+    let geom_field = geom_arr.data_type().to_field("geometry", true);
+    let fields = vec![
+        Arc::new(Field::new("id", DataType::Int64, false)),
+        Arc::new(geom_field),
+    ];
+    let columns: Vec<Arc<dyn Array>> = vec![Arc::new(id), geom_arr.to_array_ref()];
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+    let gpq_options = GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(with_covering)
+        .build();
+    let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+    let target_schema = encoder.target_schema();
+    // Row-group size = 1 to force n row groups.
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
+    let encoded = encoder.encode_record_batch(&batch).unwrap();
+    writer.write(&encoded).unwrap();
+    writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+    writer.close().unwrap();
+}
+
+/// One [`write_multi_rg_attr_input`] row: `((x, y), confidence, crop)`.
+pub(crate) type AttrRow = ((f64, f64), Option<f64>, Option<&'static str>);
+
+/// Multi-row-group input with attribute columns: one row per row group at
+/// `(x, y)` with `id` = row-group index, plus a nullable `confidence`
+/// Float64 and a nullable `crop` Utf8 column. One row per row group makes
+/// per-row-group column statistics exact, so pushdown pruning (#315) can
+/// bite.
+pub(crate) fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
+    use arrow_array::Float64Array;
+    use geo::Point;
+    use parquet::file::properties::WriterProperties;
+
+    let geoms: Vec<Geometry<f64>> = rows
+        .iter()
+        .map(|&((x, y), _, _)| Geometry::Point(Point::new(x, y)))
+        .collect();
+    let n = geoms.len();
+    let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+    let confidence = Float64Array::from(rows.iter().map(|(_, c, _)| *c).collect::<Vec<_>>());
+    let crop = StringArray::from(rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>());
+    let typ = GeometryType::new(Default::default());
+    let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+    b.extend_from_iter(geoms.iter().map(Some));
+    let geom_arr = b.finish();
+    let geom_field = geom_arr.data_type().to_field("geometry", true);
+    let fields = vec![
+        Arc::new(Field::new("id", DataType::Int64, false)),
+        Arc::new(Field::new("confidence", DataType::Float64, true)),
+        Arc::new(Field::new("crop", DataType::Utf8, true)),
+        Arc::new(geom_field),
+    ];
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(id),
+        Arc::new(confidence),
+        Arc::new(crop),
+        geom_arr.to_array_ref(),
+    ];
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+    let gpq_options = GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(true)
+        .build();
+    let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+    let target_schema = encoder.target_schema();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, target_schema, Some(props)).unwrap();
+    let encoded = encoder.encode_record_batch(&batch).unwrap();
+    writer.write(&encoded).unwrap();
+    writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+    writer.close().unwrap();
+}

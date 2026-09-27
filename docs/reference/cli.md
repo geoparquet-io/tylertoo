@@ -66,7 +66,7 @@ Generate PMTiles vector tiles (the default pipeline)
 * `--layer-name <LAYER_NAME>` — Layer name for the output tiles (default: derived from input filename)
 * `--max-tile-size <SIZE>` — Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile exceeds this limit, the export sheds features in a single non-iterative pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --tile-size-limit for parity with `export-pmtiles`. With --verbatim and no explicit value, the cap is disabled: a valve that sheds features to fit a byte budget is not verbatim either
 * `--no-simple-clip-fastpath` — Disable the simple-clip fast path (issue #239), forcing the i_overlay boundary-bridge fallback on every polygon clip. The fast path is on by default (render-equivalent on simple rings); pass this only when you need byte-stable tile output, since the fast path rotates simple rings to a different start vertex
-* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries
+* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels, carried across tile seams so features don't clip at boundaries. At most 256 (one full tile width); wider is refused, since past that a tile duplicates geometry from tiles it does not border and every feature belongs to O(buffer²) tiles (#433)
 
   Default value: `8`
 * `--partition-wave <N|auto>` — Partitions processed per band read during the export phase (the export concurrency knob). `auto` (the default) preflights a memory budget: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Pass an explicit integer to override. Wider waves keep more cores busy at proportionally more peak memory (one wave of partitions resident). The chosen width and the preflight inputs are logged at export start. Output is byte-identical for every value
@@ -543,7 +543,7 @@ Export a PMTiles archive from an overview GeoParquet file (Plan E0)
 * `--include-property <NAME>` — Keep ONLY these properties in the tiles (repeatable; tippecanoe -y), matched on the names the tiles publish. The overview file is untouched. Naming a property the file does not export is an error; the --feature-order column must stay included
 * `--exclude-property <NAME>` — Drop these properties from the tiles (repeatable; tippecanoe -x). Ignored when --include-property is given, as in tippecanoe
 * `--exclude-all-properties` — Drop every property (tippecanoe -X): geometry-only tiles. Ignored when --include-property is given, as in tippecanoe
-* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels (feature seam continuity)
+* `--tile-buffer <TILE_BUFFER>` — Per-tile edge buffer, in tile pixels (feature seam continuity). At most 256 (one full tile width); wider is refused, since past that a tile duplicates geometry from tiles it does not border and every feature belongs to O(buffer²) tiles (#433)
 
   Default value: `8`
 * `--tile-size-limit <SIZE>` — Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile exceeds it, a single non-iterative drop pass sheds features for that tile only (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to disable the cap. Aliased as --max-tile-size for parity with the `tiles` command
@@ -667,7 +667,7 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361): MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a banded aggregate or nested choropleth usually wants — with ties kept in input order so output stays deterministic.
 
-   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. The column must exist in every GeoParquet band, since each band's export reads it.
+   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. Each band's export reads the column independently: a GeoParquet band that does not have it is exported in input order with a warning naming the band's layer, not an error.
 
   Default value: `input`
 * `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory

@@ -933,9 +933,11 @@ fn overview(
 ///     layer_name (str, optional): MVT layer name written into every tile and
 ///         the archive metadata. Defaults to "overview".
 ///     tile_buffer (int, optional): Per-tile edge buffer in tile pixels
-///         (feature seam continuity). Defaults to 8.
+///         (feature seam continuity). Defaults to 8; at most 256 (one full
+///         tile width), wider raises.
 ///     extent (int, optional): MVT tile extent (tile-local resolution).
-///         Defaults to 4096.
+///         Defaults to 4096. Must be positive (0 raises); a value that is
+///         not a power of two is accepted with a warning.
 ///     tile_size_limit (int, optional): Per-tile MVT size cap in bytes. A tile
 ///         exceeding it sheds features in a single non-iterative drop pass
 ///         (largest-first for polygons/lines; a uniform spatial stride for

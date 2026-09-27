@@ -1848,6 +1848,36 @@ fn finish_merge(
     })
 }
 
+/// Fuzz hook (#424): treat `bytes` as a whole PMTiles archive and put it
+/// through everything `merge_bands` does to a `--band` input short of
+/// writing output: [`BandArchive::open`] (header, directory walk, metadata
+/// layer parse), the zoom-range and bounds queries, and a full
+/// [`BandArchive::for_each_tile`] pass reading every addressed tile body.
+///
+/// Returns the number of tiles handed out. The archive goes through a temp
+/// file because the reader is `pread`-based by design (#498). Only the
+/// `fuzz/` crate calls this; the `fuzzing` feature is never on in a normal
+/// build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
+    use std::io::Write as _;
+    let mut file = NamedTempFile::new().map_err(Error::Io)?;
+    file.write_all(bytes).map_err(Error::Io)?;
+    file.flush().map_err(Error::Io)?;
+
+    let band = BandArchive::open(file.path(), "")?;
+    let _ = band.bounds();
+    let actual = band.actual_zoom_range()?;
+    let _ = band.declared_zoom_range(actual.is_some());
+    let mut tiles = 0u64;
+    band.for_each_tile(|_z, _x, _y, _data| {
+        tiles += 1;
+        Ok(())
+    })?;
+    Ok(tiles)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

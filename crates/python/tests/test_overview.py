@@ -632,6 +632,24 @@ class TestExportPmtilesIntegration:
             assert pm.exists()
             assert report["total_tiles"] > 0
 
+    @pytest.mark.parametrize(
+        ("kwargs", "needle"),
+        [
+            ({"extent": 0}, "extent 0"),
+            ({"tile_buffer": 257}, "--tile-buffer 257"),
+            ({"tile_buffer": 100_000}, "--tile-buffer 100000"),
+        ],
+    )
+    def test_export_rejects_bad_extent_and_tile_buffer(self, kwargs, needle):
+        """#433: ``extent=0`` and a ``tile_buffer`` past the 256px cap are
+        refused before any tile is written, naming the value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ovr = self._make_overview(tmpdir)
+            pm = Path(tmpdir) / "out.pmtiles"
+            with pytest.raises(Exception, match=needle):
+                tylertoo.export_pmtiles(str(ovr), str(pm), **kwargs)
+            assert not pm.exists() or pm.stat().st_size == 0
+
     def test_export_feature_id(self):
         """#443: ``feature_id=`` reaches the export: an integer column works,
         an unknown or non-integer one is rejected before any tile."""

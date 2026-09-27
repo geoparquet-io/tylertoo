@@ -1,173 +1,383 @@
 {
   "admin": {
-    "input_features": 17465,
-    "levels": [
-      {
-        "feature_count": 40,
-        "level": 0,
-        "vertex_count": 173
-      },
-      {
-        "feature_count": 238,
-        "level": 1,
-        "vertex_count": 1094
-      },
-      {
-        "feature_count": 253,
-        "level": 2,
-        "vertex_count": 1526
-      },
-      {
-        "feature_count": 254,
-        "level": 3,
-        "vertex_count": 2394
-      },
-      {
-        "feature_count": 256,
-        "level": 4,
-        "vertex_count": 3775
-      },
-      {
-        "feature_count": 318,
-        "level": 5,
-        "vertex_count": 7348
-      },
-      {
-        "feature_count": 525,
-        "level": 6,
-        "vertex_count": 16042
-      },
-      {
-        "feature_count": 865,
-        "level": 7,
-        "vertex_count": 31531
-      },
-      {
-        "feature_count": 1428,
-        "level": 8,
-        "vertex_count": 56944
-      },
-      {
-        "feature_count": 2356,
-        "level": 9,
-        "vertex_count": 98323
-      },
-      {
-        "feature_count": 3888,
-        "level": 10,
-        "vertex_count": 170848
-      },
-      {
-        "feature_count": 6415,
-        "level": 11,
-        "vertex_count": 319805
-      },
-      {
-        "feature_count": 10585,
-        "level": 12,
-        "vertex_count": 587192
-      },
-      {
-        "feature_count": 17465,
-        "level": 13,
-        "vertex_count": 1749880
-      }
-    ],
-    "total_rows": 44886,
-    "total_vertices": 3046875
+    "convert": {
+      "input_features": 17465,
+      "levels": [
+        {
+          "feature_count": 40,
+          "level": 0,
+          "vertex_count": 173
+        },
+        {
+          "feature_count": 238,
+          "level": 1,
+          "vertex_count": 1094
+        },
+        {
+          "feature_count": 253,
+          "level": 2,
+          "vertex_count": 1526
+        },
+        {
+          "feature_count": 254,
+          "level": 3,
+          "vertex_count": 2394
+        },
+        {
+          "feature_count": 256,
+          "level": 4,
+          "vertex_count": 3775
+        },
+        {
+          "feature_count": 318,
+          "level": 5,
+          "vertex_count": 7348
+        },
+        {
+          "feature_count": 525,
+          "level": 6,
+          "vertex_count": 16042
+        },
+        {
+          "feature_count": 865,
+          "level": 7,
+          "vertex_count": 31531
+        },
+        {
+          "feature_count": 1428,
+          "level": 8,
+          "vertex_count": 56944
+        },
+        {
+          "feature_count": 2356,
+          "level": 9,
+          "vertex_count": 98323
+        },
+        {
+          "feature_count": 3888,
+          "level": 10,
+          "vertex_count": 170848
+        },
+        {
+          "feature_count": 6415,
+          "level": 11,
+          "vertex_count": 319805
+        },
+        {
+          "feature_count": 10585,
+          "level": 12,
+          "vertex_count": 587192
+        },
+        {
+          "feature_count": 17465,
+          "level": 13,
+          "vertex_count": 1749880
+        }
+      ],
+      "total_rows": 44886,
+      "total_vertices": 3046875
+    },
+    "export": {
+      "archive_bytes": 104558642,
+      "decoded_features_total": 353002,
+      "total_tile_features": 353062,
+      "total_tiles": 146924,
+      "zooms": [
+        {
+          "decoded_features": 40,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "zoom": 1
+        },
+        {
+          "decoded_features": 238,
+          "tile_count": 1,
+          "tile_feature_count": 238,
+          "zoom": 2
+        },
+        {
+          "decoded_features": 426,
+          "tile_count": 2,
+          "tile_feature_count": 427,
+          "zoom": 3
+        },
+        {
+          "decoded_features": 418,
+          "tile_count": 4,
+          "tile_feature_count": 418,
+          "zoom": 4
+        },
+        {
+          "decoded_features": 351,
+          "tile_count": 4,
+          "tile_feature_count": 351,
+          "zoom": 5
+        },
+        {
+          "decoded_features": 405,
+          "tile_count": 6,
+          "tile_feature_count": 406,
+          "zoom": 6
+        },
+        {
+          "decoded_features": 689,
+          "tile_count": 15,
+          "tile_feature_count": 689,
+          "zoom": 7
+        },
+        {
+          "decoded_features": 1199,
+          "tile_count": 42,
+          "tile_feature_count": 1200,
+          "zoom": 8
+        },
+        {
+          "decoded_features": 2209,
+          "tile_count": 138,
+          "tile_feature_count": 2211,
+          "zoom": 9
+        },
+        {
+          "decoded_features": 4143,
+          "tile_count": 487,
+          "tile_feature_count": 4145,
+          "zoom": 10
+        },
+        {
+          "decoded_features": 8541,
+          "tile_count": 1705,
+          "tile_feature_count": 8543,
+          "zoom": 11
+        },
+        {
+          "decoded_features": 22758,
+          "tile_count": 6037,
+          "tile_feature_count": 22767,
+          "zoom": 12
+        },
+        {
+          "decoded_features": 69191,
+          "tile_count": 24489,
+          "tile_feature_count": 69206,
+          "zoom": 13
+        },
+        {
+          "decoded_features": 242394,
+          "tile_count": 113993,
+          "tile_feature_count": 242421,
+          "zoom": 14
+        }
+      ]
+    }
   },
   "lines": {
-    "input_features": 1000,
-    "levels": [
-      {
-        "feature_count": 2,
-        "level": 0,
-        "vertex_count": 4
-      },
-      {
-        "feature_count": 20,
-        "level": 1,
-        "vertex_count": 42
-      },
-      {
-        "feature_count": 86,
-        "level": 2,
-        "vertex_count": 192
-      },
-      {
-        "feature_count": 204,
-        "level": 3,
-        "vertex_count": 472
-      },
-      {
-        "feature_count": 256,
-        "level": 4,
-        "vertex_count": 719
-      },
-      {
-        "feature_count": 256,
-        "level": 5,
-        "vertex_count": 967
-      },
-      {
-        "feature_count": 256,
-        "level": 6,
-        "vertex_count": 1323
-      },
-      {
-        "feature_count": 367,
-        "level": 7,
-        "vertex_count": 2213
-      },
-      {
-        "feature_count": 606,
-        "level": 8,
-        "vertex_count": 3623
-      },
-      {
-        "feature_count": 1000,
-        "level": 9,
-        "vertex_count": 5433
-      }
-    ],
-    "total_rows": 3053,
-    "total_vertices": 14988
+    "convert": {
+      "input_features": 1000,
+      "levels": [
+        {
+          "feature_count": 2,
+          "level": 0,
+          "vertex_count": 4
+        },
+        {
+          "feature_count": 20,
+          "level": 1,
+          "vertex_count": 42
+        },
+        {
+          "feature_count": 86,
+          "level": 2,
+          "vertex_count": 192
+        },
+        {
+          "feature_count": 204,
+          "level": 3,
+          "vertex_count": 472
+        },
+        {
+          "feature_count": 256,
+          "level": 4,
+          "vertex_count": 719
+        },
+        {
+          "feature_count": 256,
+          "level": 5,
+          "vertex_count": 967
+        },
+        {
+          "feature_count": 256,
+          "level": 6,
+          "vertex_count": 1323
+        },
+        {
+          "feature_count": 367,
+          "level": 7,
+          "vertex_count": 2213
+        },
+        {
+          "feature_count": 606,
+          "level": 8,
+          "vertex_count": 3623
+        },
+        {
+          "feature_count": 1000,
+          "level": 9,
+          "vertex_count": 5433
+        }
+      ],
+      "total_rows": 3053,
+      "total_vertices": 14988
+    },
+    "export": {
+      "archive_bytes": 123212,
+      "decoded_features_total": 3787,
+      "total_tile_features": 3787,
+      "total_tiles": 78,
+      "zooms": [
+        {
+          "decoded_features": 2,
+          "tile_count": 1,
+          "tile_feature_count": 2,
+          "zoom": 5
+        },
+        {
+          "decoded_features": 20,
+          "tile_count": 1,
+          "tile_feature_count": 20,
+          "zoom": 6
+        },
+        {
+          "decoded_features": 114,
+          "tile_count": 2,
+          "tile_feature_count": 114,
+          "zoom": 7
+        },
+        {
+          "decoded_features": 223,
+          "tile_count": 2,
+          "tile_feature_count": 223,
+          "zoom": 8
+        },
+        {
+          "decoded_features": 280,
+          "tile_count": 2,
+          "tile_feature_count": 280,
+          "zoom": 9
+        },
+        {
+          "decoded_features": 265,
+          "tile_count": 2,
+          "tile_feature_count": 265,
+          "zoom": 10
+        },
+        {
+          "decoded_features": 338,
+          "tile_count": 5,
+          "tile_feature_count": 338,
+          "zoom": 11
+        },
+        {
+          "decoded_features": 462,
+          "tile_count": 7,
+          "tile_feature_count": 462,
+          "zoom": 12
+        },
+        {
+          "decoded_features": 763,
+          "tile_count": 15,
+          "tile_feature_count": 763,
+          "zoom": 13
+        },
+        {
+          "decoded_features": 1320,
+          "tile_count": 41,
+          "tile_feature_count": 1320,
+          "zoom": 14
+        }
+      ]
+    }
   },
   "polygons": {
-    "input_features": 1000,
-    "levels": [
-      {
-        "feature_count": 1,
-        "level": 0,
-        "vertex_count": 4
-      },
-      {
-        "feature_count": 21,
-        "level": 1,
-        "vertex_count": 96
-      },
-      {
-        "feature_count": 167,
-        "level": 2,
-        "vertex_count": 776
-      },
-      {
-        "feature_count": 355,
-        "level": 3,
-        "vertex_count": 1887
-      },
-      {
-        "feature_count": 596,
-        "level": 4,
-        "vertex_count": 3467
-      },
-      {
-        "feature_count": 1000,
-        "level": 5,
-        "vertex_count": 6945
-      }
-    ],
-    "total_rows": 2140,
-    "total_vertices": 13175
+    "convert": {
+      "input_features": 1000,
+      "levels": [
+        {
+          "feature_count": 1,
+          "level": 0,
+          "vertex_count": 4
+        },
+        {
+          "feature_count": 21,
+          "level": 1,
+          "vertex_count": 96
+        },
+        {
+          "feature_count": 167,
+          "level": 2,
+          "vertex_count": 776
+        },
+        {
+          "feature_count": 355,
+          "level": 3,
+          "vertex_count": 1887
+        },
+        {
+          "feature_count": 596,
+          "level": 4,
+          "vertex_count": 3467
+        },
+        {
+          "feature_count": 1000,
+          "level": 5,
+          "vertex_count": 6945
+        }
+      ],
+      "total_rows": 2140,
+      "total_vertices": 13175
+    },
+    "export": {
+      "archive_bytes": 111072,
+      "decoded_features_total": 2338,
+      "total_tile_features": 2339,
+      "total_tiles": 82,
+      "zooms": [
+        {
+          "decoded_features": 2,
+          "tile_count": 2,
+          "tile_feature_count": 2,
+          "zoom": 9
+        },
+        {
+          "decoded_features": 31,
+          "tile_count": 2,
+          "tile_feature_count": 31,
+          "zoom": 10
+        },
+        {
+          "decoded_features": 171,
+          "tile_count": 2,
+          "tile_feature_count": 171,
+          "zoom": 11
+        },
+        {
+          "decoded_features": 366,
+          "tile_count": 4,
+          "tile_feature_count": 366,
+          "zoom": 12
+        },
+        {
+          "decoded_features": 640,
+          "tile_count": 20,
+          "tile_feature_count": 640,
+          "zoom": 13
+        },
+        {
+          "decoded_features": 1128,
+          "tile_count": 52,
+          "tile_feature_count": 1129,
+          "zoom": 14
+        }
+      ]
+    }
   }
 }

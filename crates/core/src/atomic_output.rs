@@ -33,7 +33,10 @@ use tempfile::TempPath;
 /// sibling and leaves the destination untouched.
 #[derive(Debug)]
 pub(crate) struct PendingOutput {
-    temp: TempPath,
+    /// `None` when the destination is written directly (an existing
+    /// non-regular file such as `/dev/null` or a FIFO, which no rename could
+    /// replace); `publish` is then a no-op.
+    temp: Option<TempPath>,
     target: PathBuf,
 }
 
@@ -45,7 +48,10 @@ pub(crate) struct PendingOutput {
 /// that is an existing symlink is written *through*: the sibling is created
 /// beside the link's resolved destination (same filesystem as the rename)
 /// and published over that destination, so the link survives and points at
-/// the new data, as it would have with `File::create`.
+/// the new data, as it would have with `File::create`. An existing
+/// destination that is not a regular file (a device like `/dev/null` or
+/// `/dev/full`, a FIFO) is opened and written directly, since a rename could
+/// never replace it and there is no previous output to protect.
 pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     let resolved;
     let target = match std::fs::symlink_metadata(target) {
@@ -60,6 +66,18 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
         }
         _ => target,
     };
+    if let Ok(m) = std::fs::metadata(target) {
+        if !m.is_file() && !m.is_dir() {
+            let file = File::create(target)?;
+            return Ok((
+                file,
+                PendingOutput {
+                    temp: None,
+                    target: target.to_path_buf(),
+                },
+            ));
+        }
+    }
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -99,7 +117,7 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     Ok((
         file,
         PendingOutput {
-            temp,
+            temp: Some(temp),
             target: target.to_path_buf(),
         },
     ))
@@ -109,7 +127,7 @@ impl PendingOutput {
     /// Where the output is being written before publish.
     #[cfg(test)]
     pub(crate) fn temp_path(&self) -> &Path {
-        &self.temp
+        self.temp.as_deref().unwrap_or(&self.target)
     }
 
     /// Rename the completed sibling over the destination, replacing whatever
@@ -119,11 +137,14 @@ impl PendingOutput {
     /// caller's point of view only if the caller published early, which is
     /// a bug there), and the destination is left as it was.
     pub(crate) fn publish(self) -> io::Result<()> {
+        let Some(temp) = self.temp else {
+            return Ok(()); // written directly, nothing to publish
+        };
         // `TempPath::persist` is a rename that keeps the guard's cleanup
         // semantics on failure (the sibling is deleted when the error is
         // dropped) and on Windows replaces an existing destination the way
         // `std::fs::rename` does on Unix.
-        self.temp.persist(&self.target).map_err(|e| {
+        temp.persist(&self.target).map_err(|e| {
             io::Error::new(
                 e.error.kind(),
                 format!(
@@ -289,6 +310,30 @@ mod tests {
             listing(dir.path()),
             vec!["link.parquet".to_string(), "real".to_string()]
         );
+    }
+
+    /// A device or FIFO destination is written directly: no sibling (there
+    /// is nothing beside `/dev/null` we may create, and no previous output to
+    /// protect), and the device's own errors surface from the write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_regular_destination_is_written_directly() {
+        let null = Path::new("/dev/null");
+        if !null.exists() {
+            return;
+        }
+        let (mut file, pending) = create(null).unwrap();
+        assert_eq!(pending.temp_path(), null, "no sibling for a device");
+        file.write_all(b"discarded").unwrap();
+        drop(file);
+        pending.publish().unwrap();
+
+        let full = Path::new("/dev/full");
+        if full.exists() {
+            let (mut file, _pending) = create(full).unwrap();
+            let err = file.write_all(b"x").unwrap_err();
+            assert!(err.to_string().contains("No space left"), "{err}");
+        }
     }
 
     #[test]

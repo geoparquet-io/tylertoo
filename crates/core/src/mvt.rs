@@ -139,7 +139,61 @@ pub fn orient_multi_polygon_for_mvt(multi: &MultiPolygon) -> MultiPolygon {
 /// (x, y) in tile-local coordinates, where (0,0) is top-left
 pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) -> (i32, i32) {
     let (x, y) = geo_to_tile_coords_unrounded(lng, lat, bounds, extent);
-    (x.round() as i32, y.round() as i32)
+    (snap_tile_coord(x), snap_tile_coord(y))
+}
+
+/// Magnitude bound on a snapped tile coordinate: every integer tile
+/// coordinate this module produces lies in `[-TILE_COORD_CLAMP,
+/// TILE_COORD_CLAMP]` (±2^24 tile units).
+///
+/// The tile-space polygon cleaner (#383, #393) and the shoelace orientation
+/// test do their arithmetic in `i64` on products of two coordinates. A plain
+/// `f64 as i32` cast saturates out-of-tile input to ±2^31, and two such
+/// values multiply to 2^62 — a difference of two products, or a sum over a
+/// ring, then overflows `i64` (#406: debug panic; release wraps to a wrong
+/// orientation or a wrong intersection verdict). Clamping the magnitude to
+/// 2^24 bounds every integer expression in this module:
+///
+/// * a coordinate difference `|a - b|` is at most 2^25;
+/// * a cross or dot product of two differences (the cleaner's
+///   `segments_meet`, `ring_is_simple`, `node_insert`, `point_in_ring`
+///   tests) is at most 2^25 · 2^25 + 2^25 · 2^25 = 2^51;
+/// * a shoelace term `x0·y1 - x1·y0` in [`ring_area2`] is at most
+///   2 · 2^24 · 2^24 = 2^49, and the sum is accumulated in `i128`, which
+///   holds 2^78 such terms — no ring length can overflow it;
+/// * a MoveTo/LineTo delta is at most 2^25, which zigzag-encodes without
+///   overflowing `i32` (the shift needs `|n| < 2^30`).
+///
+/// 2^24 is also the largest power of two at which every integer is exactly
+/// representable in `f64`, so a clamped value survives the round trip
+/// through the `f64` overlay in [`tile_rings_to_polygon`] unchanged, and it
+/// leaves three orders of magnitude of headroom over the largest tile
+/// extent plus buffer in practical use (65536 + buffer).
+///
+/// Only input outside the tile — reachable through the public
+/// [`encode_polygon`] / [`encode_multi_polygon`] / [`geo_to_tile_coords`]
+/// entry points, never from the export path, which clips first — is
+/// affected: anything within the tile plus buffer rounds exactly as before.
+pub const TILE_COORD_CLAMP: i32 = 1 << 24;
+
+/// Round one projected tile-unit coordinate to `i32`, clamped to
+/// ±[`TILE_COORD_CLAMP`].
+///
+/// Non-finite input is handled explicitly rather than left to the `as`
+/// cast's saturation rules: `+inf` (and any finite value past the clamp)
+/// snaps to `TILE_COORD_CLAMP`, `-inf` to `-TILE_COORD_CLAMP`, and `NaN`
+/// to `0` — the same value the cast produces, but chosen here so that it
+/// stays the documented behaviour whatever the cast does.
+#[inline]
+fn snap_tile_coord(v: f64) -> i32 {
+    if v.is_nan() {
+        return 0;
+    }
+    // `f64::clamp` propagates NaN (handled above) and orders ±inf
+    // correctly, so the cast below always sees a finite value within the
+    // clamp — it never saturates.
+    let c = f64::from(TILE_COORD_CLAMP);
+    v.round().clamp(-c, c) as i32
 }
 
 /// One tile's lon/lat → tile-unit transform, with the parts that depend only
@@ -194,7 +248,7 @@ impl TileProjector {
     #[inline]
     pub(crate) fn round(&self, lng: f64, lat: f64) -> (i32, i32) {
         let (x, y) = self.project(lng, lat);
-        (x.round() as i32, y.round() as i32)
+        (snap_tile_coord(x), snap_tile_coord(y))
     }
 }
 
@@ -368,10 +422,24 @@ fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
 /// Twice the shoelace area of a closed integer ring. The sign is the
 /// orientation on the stored coordinates — which is what the MVT spec keys
 /// on: exterior rings positive, interior rings negative.
+///
+/// Each term is at most 2^49 (see [`TILE_COORD_CLAMP`]); the sum is
+/// accumulated in `i128` so that no ring length can overflow it, then
+/// saturated into `±i64::MAX` — which only matters for a ring of more than
+/// 2^14 vertices all near the clamp, and even then keeps the sign and the
+/// ordering the callers use. The negative bound is `-i64::MAX`, not
+/// `i64::MIN`, because [`regroup_pinched`] takes `.abs()` of the result and
+/// `i64::MIN.abs()` overflows.
 fn ring_area2(ring: &[(i32, i32)]) -> i64 {
-    ring.windows(2)
-        .map(|w| i64::from(w[0].0) * i64::from(w[1].1) - i64::from(w[1].0) * i64::from(w[0].1))
-        .sum()
+    let sum: i128 = ring
+        .windows(2)
+        .map(|w| {
+            i128::from(
+                i64::from(w[0].0) * i64::from(w[1].1) - i64::from(w[1].0) * i64::from(w[0].1),
+            )
+        })
+        .sum();
+    sum.clamp(-i128::from(i64::MAX), i128::from(i64::MAX)) as i64
 }
 
 fn tile_rings_to_polygon(rings: &[TileRing]) -> Polygon<f64> {
@@ -391,7 +459,10 @@ fn tile_rings_to_polygon(rings: &[TileRing]) -> Polygon<f64> {
 fn requantize_ring(ring: &LineString<f64>) -> Option<TileRing> {
     let mut out: TileRing = Vec::with_capacity(ring.0.len());
     for c in &ring.0 {
-        let p = (c.x.round() as i32, c.y.round() as i32);
+        // The overlay's inputs were clamped, so its crossing points lie in
+        // the same box; snapping (rather than a bare cast) keeps that an
+        // invariant instead of an assumption.
+        let p = (snap_tile_coord(c.x), snap_tile_coord(c.y));
         if out.last() != Some(&p) {
             out.push(p);
         }
@@ -1148,6 +1219,17 @@ fn encode_tile_polygons(polys: &[Vec<TileRing>]) -> Vec<u32> {
 /// the MVT specification before encoding:
 /// - Exterior rings: clockwise in tile coordinates
 /// - Interior rings: counter-clockwise in tile coordinates
+///
+/// # Out-of-tile input
+///
+/// The polygon is expected to be clipped to the tile (plus buffer) already;
+/// this function does not clip. Vertices that project outside
+/// ±[`TILE_COORD_CLAMP`] tile units are clamped to that bound before the
+/// integer cleanup and orientation arithmetic (see the constant for the
+/// overflow argument), so extreme coordinates — including `±inf`, which
+/// clamp, and `NaN`, which snaps to 0 — never panic and never produce a
+/// geometry outside the clamp. Such a clamped ring is still a valid MVT
+/// polygon, but its shape past the clamp is not preserved.
 pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
     // Quantize first, clean in tile space (#383), then orient on the stored
     // integer coordinates — the sign the spec is defined on.
@@ -1161,6 +1243,9 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 /// the MVT specification before encoding:
 /// - Exterior rings: clockwise in tile coordinates
 /// - Interior rings: counter-clockwise in tile coordinates
+///
+/// Out-of-tile and non-finite vertices are clamped exactly as in
+/// [`encode_polygon`] (see its "Out-of-tile input" section).
 pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
     let proj = TileProjector::new(bounds, extent);
     let polys: Vec<Vec<TileRing>> = polygons
@@ -3238,5 +3323,199 @@ mod tests {
         assert_eq!(unioned.len(), 1, "no holes: {unioned:?}");
         assert_eq!(ring_area2(&unioned[0]).abs(), 2 * (1600 + 1600 - 400));
         assert!(out.contains(&c), "{out:?}");
+    }
+
+    // ------------------------------------------------------------------------
+    // #406: saturated / non-finite tile coordinates through the public API
+    // ------------------------------------------------------------------------
+
+    /// Walk MVT polygon commands and return every absolute vertex visited.
+    fn decode_absolute_vertices(cmds: &[u32]) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        let mut cursor = (0i32, 0i32);
+        let mut i = 0;
+        while i < cmds.len() {
+            let (id, count) = command_decode(cmds[i]);
+            i += 1;
+            if id == CMD_CLOSE_PATH {
+                continue;
+            }
+            for _ in 0..count {
+                cursor.0 += zigzag_decode(cmds[i]);
+                cursor.1 += zigzag_decode(cmds[i + 1]);
+                out.push(cursor);
+                i += 2;
+            }
+        }
+        out
+    }
+
+    /// A tile whose span is tiny, so ordinary-looking lon/lat lands at
+    /// ±4e9 tile units — past i32 — before rounding.
+    fn tiny_bounds() -> TileBounds {
+        TileBounds::new(0.0, 0.0, 1e-6, 1e-6)
+    }
+
+    fn assert_clamped(cmds: &[u32]) {
+        for (x, y) in decode_absolute_vertices(cmds) {
+            assert!(
+                x.abs() <= TILE_COORD_CLAMP && y.abs() <= TILE_COORD_CLAMP,
+                "vertex ({x}, {y}) outside ±{TILE_COORD_CLAMP}"
+            );
+        }
+    }
+
+    /// A ring whose every vertex saturates the i32 cast must not overflow
+    /// the i64 cleaner / shoelace arithmetic (debug panic, release wrap).
+    #[test]
+    fn encode_polygon_saturated_coordinates_do_not_overflow() {
+        let far =
+            polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
+        let cmds = encode_polygon(&far, &tiny_bounds(), 4096);
+        assert!(
+            !cmds.is_empty(),
+            "a huge ring covering the tile still encodes"
+        );
+        assert_clamped(&cmds);
+        // Orientation on the stored coordinates: the exterior must come out
+        // positive, whichever way the source ring was wound.
+        let verts = decode_absolute_vertices(&cmds);
+        let mut ring: TileRing = verts.clone();
+        ring.push(verts[0]);
+        assert!(ring_area2(&ring) > 0, "{verts:?}");
+
+        // Well past any float that rounds into i32, plus a hole.
+        let huge = Polygon::new(
+            LineString::from(vec![
+                (-1e12, -1e12),
+                (1e12, -1e12),
+                (1e12, 1e12),
+                (-1e12, 1e12),
+            ]),
+            vec![LineString::from(vec![
+                (-0.5, -0.5),
+                (-0.5, 0.5),
+                (0.5, 0.5),
+                (0.5, -0.5),
+            ])],
+        );
+        assert_clamped(&encode_polygon(&huge, &tiny_bounds(), 4096));
+        assert_clamped(&encode_polygon(&huge, &test_bounds(), 4096));
+    }
+
+    /// f64::MAX / MIN, ±inf and NaN vertices must be handled explicitly:
+    /// no panic, every emitted vertex inside the clamp.
+    #[test]
+    fn encode_polygon_non_finite_coordinates_do_not_panic() {
+        let cases: Vec<Vec<(f64, f64)>> = vec![
+            vec![
+                (f64::MAX, f64::MAX),
+                (f64::MIN, f64::MAX),
+                (f64::MIN, f64::MIN),
+                (f64::MAX, f64::MIN),
+            ],
+            vec![
+                (f64::INFINITY, 0.5),
+                (f64::NEG_INFINITY, 0.5),
+                (f64::NEG_INFINITY, -0.5),
+                (f64::INFINITY, -0.5),
+            ],
+            vec![
+                (f64::NAN, f64::NAN),
+                (1.0, f64::NAN),
+                (f64::NAN, 1.0),
+                (0.0, 0.0),
+            ],
+            vec![
+                (0.0, 0.0),
+                (f64::INFINITY, f64::NAN),
+                (1.0, 1.0),
+                (f64::NAN, f64::NEG_INFINITY),
+            ],
+        ];
+        for pts in cases {
+            let poly = Polygon::new(LineString::from(pts.clone()), vec![]);
+            for bounds in [tiny_bounds(), test_bounds()] {
+                assert_clamped(&encode_polygon(&poly, &bounds, 4096));
+                let multi = MultiPolygon::new(vec![poly.clone(), poly.clone()]);
+                assert_clamped(&encode_multi_polygon(&multi, &bounds, 4096));
+            }
+        }
+    }
+
+    /// Two saturated parts through the multipolygon path (overlap
+    /// resolution runs its own integer tests on them).
+    #[test]
+    fn encode_multi_polygon_saturated_parts_do_not_overflow() {
+        let a =
+            polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
+        let b =
+            polygon![(x: -1e12, y: 0.3), (x: 1e12, y: 0.3), (x: 1e12, y: 0.7), (x: -1e12, y: 0.7)];
+        let cmds = encode_multi_polygon(&MultiPolygon::new(vec![a, b]), &tiny_bounds(), 4096);
+        assert!(!cmds.is_empty());
+        assert_clamped(&cmds);
+    }
+
+    /// A ring winding `turns` times around the clamp box, one way or the
+    /// other. Each corner edge contributes 2^49 to the shoelace sum, so
+    /// past 2^12 turns the true sum leaves `i64`.
+    fn winding_box_ring(turns: usize, clockwise: bool) -> TileRing {
+        let c = TILE_COORD_CLAMP;
+        let mut corners = [(c, c), (-c, c), (-c, -c), (c, -c)];
+        if clockwise {
+            corners.reverse();
+        }
+        let mut ring: TileRing = corners.iter().copied().cycle().take(4 * turns).collect();
+        ring.push(ring[0]);
+        ring
+    }
+
+    /// A shoelace sum past ±2^63 saturates, and the saturated value must be
+    /// safe for the `.abs()` the regrouping code applies: `i64::MIN.abs()`
+    /// panics, so the negative bound is `-i64::MAX`.
+    #[test]
+    fn ring_area2_saturates_symmetrically() {
+        let neg = winding_box_ring(4097, true);
+        let pos = winding_box_ring(4097, false);
+        let (a, b) = (ring_area2(&neg), ring_area2(&pos));
+        assert!(a < 0 && b > 0, "sign preserved: {a} {b}");
+        assert_eq!(a.abs(), i64::MAX);
+        assert_eq!(b.abs(), i64::MAX);
+        // Ordering against a ring that does not saturate.
+        let small = winding_box_ring(2, false);
+        assert!(ring_area2(&small) < b);
+        assert!(ring_area2(&small).abs() < a.abs());
+        // Below the threshold (4096 turns is exactly 2^63) the sum is exact.
+        assert_eq!(
+            ring_area2(&winding_box_ring(4095, false)),
+            4095 * 4 * (1i64 << 49)
+        );
+    }
+
+    /// The snap itself: finite values clamp to ±[`TILE_COORD_CLAMP`], the
+    /// infinities to the matching bound, NaN to 0; in-range values are the
+    /// plain round.
+    #[test]
+    fn snap_tile_coord_bounds() {
+        let c = TILE_COORD_CLAMP;
+        assert_eq!(snap_tile_coord(0.0), 0);
+        assert_eq!(snap_tile_coord(2.5), 3);
+        assert_eq!(snap_tile_coord(-2.5), -3);
+        assert_eq!(snap_tile_coord(4096.4), 4096);
+        assert_eq!(snap_tile_coord(f64::from(c)), c);
+        assert_eq!(snap_tile_coord(f64::from(c) + 0.4), c);
+        assert_eq!(snap_tile_coord(f64::from(c) + 1.0), c);
+        assert_eq!(snap_tile_coord(-f64::from(c) - 1.0), -c);
+        assert_eq!(snap_tile_coord(1e12), c);
+        assert_eq!(snap_tile_coord(-1e12), -c);
+        assert_eq!(snap_tile_coord(f64::MAX), c);
+        assert_eq!(snap_tile_coord(f64::MIN), -c);
+        assert_eq!(snap_tile_coord(f64::INFINITY), c);
+        assert_eq!(snap_tile_coord(f64::NEG_INFINITY), -c);
+        assert_eq!(snap_tile_coord(f64::NAN), 0);
+        // The public per-coordinate entry point snaps the same way.
+        let (x, y) = geo_to_tile_coords(1e12, 0.5, &test_bounds(), 4096);
+        assert_eq!(x, c);
+        assert!(y.abs() <= c);
     }
 }

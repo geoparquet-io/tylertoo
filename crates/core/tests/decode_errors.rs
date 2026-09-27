@@ -525,3 +525,38 @@ fn a_root_full_of_empty_leaf_pointers_is_capped_by_leaf_count() {
         "expected a leaf-count error, got: {err}"
     );
 }
+
+/// [`POINT_TILE`] with the layer declaring `extent = 0` (field 5, varint 0).
+const EXTENT_ZERO_TILE: &[u8] = &[
+    0x1A, 0x10, // Tile.layers, 16 bytes
+    0x0A, 0x01, b't', // name
+    0x12, 0x07, 0x18, 0x01, 0x22, 0x03, 0x09, 0x02, 0x02, // feature: POINT, MoveTo(1,1)
+    0x28, 0x00, // extent 0
+    0x78, 0x02, // version 2
+];
+
+/// #433: a layer declaring `extent = 0` used to decode: every tile-local unit
+/// is `tile_width / extent`, so each coordinate came out as ±inf (or NaN at
+/// the origin) and went straight into the output parquet. Refused, naming
+/// the tile and the layer, before any coordinate is transformed.
+#[test]
+fn a_layer_declaring_extent_zero_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extent-zero.pmtiles");
+    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+    writer.set_layer_name("t");
+    writer.add_tile(5, 3, 7, EXTENT_ZERO_TILE).unwrap();
+    writer.finalize(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+
+    let err = decode_err(&dir, "extent-zero-copy.pmtiles", &bytes);
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m) if m.contains("extent 0")),
+        "expected an extent-0 rejection, got: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("z5/3/7") && msg.contains("\"t\""),
+        "message must name the tile and the layer, got: {msg}"
+    );
+}

@@ -369,11 +369,11 @@ pub struct OverviewWriter<W: Write + Send> {
 /// input that genuinely breaks the encoder.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
-struct EncodeFaults {
+pub(super) struct EncodeFaults {
     /// Panic inside the spawned row-group encode task.
-    row_group: bool,
+    pub(super) row_group: bool,
     /// Panic inside the spawned WKB encode task.
-    wkb: bool,
+    pub(super) wkb: bool,
 }
 
 #[cfg(test)]
@@ -548,7 +548,7 @@ impl<W: Write + Send> OverviewWriter<W> {
 
     /// Test-only: arm the encode-task fault injection (#426).
     #[cfg(test)]
-    fn set_encode_faults(&mut self, faults: EncodeFaults) {
+    pub(super) fn set_encode_faults(&mut self, faults: EncodeFaults) {
         self.encode_faults = faults;
     }
 
