@@ -359,8 +359,9 @@ pub struct PyramidArgs {
     ///
     /// Applies to every GeoParquet band alike, like `--generalize` and
     /// `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps
-    /// the order it was tiled with. The column must exist in every
-    /// GeoParquet band, since each band's export reads it.
+    /// the order it was tiled with. Each band's export reads the column
+    /// independently: a GeoParquet band that does not have it is exported in
+    /// input order with a warning naming the band's layer, not an error.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     pub feature_order: FeatureOrder,
 

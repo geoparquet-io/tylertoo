@@ -663,7 +663,7 @@ Build a multi-band pyramid: several inputs, each owning a zoom range, one archiv
 
    Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361): MVT does not define draw order, but renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. `input` emits source row order. Naming a column sorts within each tile by that property — `--feature-order level` puts high `level` on top, which is what a banded aggregate or nested choropleth usually wants — with ties kept in input order so output stays deterministic.
 
-   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. The column must exist in every GeoParquet band, since each band's export reads it.
+   Applies to every GeoParquet band alike, like `--generalize` and `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps the order it was tiled with. Each band's export reads the column independently: a GeoParquet band that does not have it is exported in input order with a warning naming the band's layer, not an error.
 
   Default value: `input`
 * `--work-dir <DIR>` — Directory for the per-band intermediates (removed on the way out). Defaults to the system temp directory
