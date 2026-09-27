@@ -1414,7 +1414,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
-        super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
     )
 }
 
@@ -1423,8 +1423,8 @@ fn convert_preflight(
 /// (test seam: mirrors [`build_writer_options_with_ceiling`]'s #509
 /// pattern). Production always calls it via `convert_preflight` with the
 /// real uncached memory probe and the real
-/// [`super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES`]; tests pass a tiny
-/// mocked memory limit (#543) or geometry-column ceiling (#563) to prove
+/// [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]; tests pass a tiny
+/// mocked memory limit (#543) or byte-array batch ceiling (#563) to prove
 /// each hard error fires from footer statistics alone — before
 /// `stage_input_pass0` or pass 1 ever runs — without needing an actually
 /// memory-starved box or an actually multi-GiB fixture.
@@ -1433,7 +1433,7 @@ fn convert_preflight_with_memory_limit(
     options: &ConvertOptions,
     memory_limit: Option<super::pipeline::MemoryLimit>,
     skip_memory_preflight: bool,
-    oversized_geometry_limit_bytes: u64,
+    byte_array_limit_bytes: u64,
 ) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
@@ -1503,24 +1503,18 @@ fn convert_preflight_with_memory_limit(
              groups (the groups whose bbox reaches this shard's tile range)"
         );
     }
-    // #563: preflight the geometry column of every row group this run will
-    // actually read (the selection above already excludes anything a
-    // `--bbox`/`--filter`/`--shard` pruning will never touch) against
-    // arrow's `BinaryArray` i32-offset ceiling — footer statistics only, no
-    // data page read — so a pathological row group fails fast with an
-    // actionable message instead of the opaque decode-time
-    // "index overflow decoding byte array" arrow error.
-    let oversized = source.oversized_geometry_row_groups(
-        geom_field.name(),
+    // #563: arrow decodes a byte-array column (WKB geometry, strings) into
+    // an array with i32 offsets, so one decoded BATCH holds at most ~2 GiB of
+    // it. Size the read batch from footer statistics so no batch reaches
+    // that (output does not depend on the batch size), and fail fast, naming
+    // the row group and column, only when a single row is too large for any
+    // batch. Covers every row group this run reads (the selection above).
+    let read_batch_cap = byte_array_read_batch_cap(
+        source,
         selected_row_groups.as_ref(),
-        oversized_geometry_limit_bytes,
+        options.read_batch_size,
+        byte_array_limit_bytes,
     )?;
-    if !oversized.is_empty() {
-        return Err(ConvertError::OversizedGeometryRowGroup {
-            offenders: oversized,
-            limit_bytes: oversized_geometry_limit_bytes,
-        });
-    }
     // #543: preflight the pass-1 feature table's memory floor from footer row
     // counts alone — no I/O beyond the footers already read above — BEFORE
     // pass 1 (or `stage_input_pass0` below) does any real work. Skipped for a
@@ -1574,8 +1568,12 @@ fn convert_preflight_with_memory_limit(
     // Coalescing schema check (Q3).
     validate_coalesce_schema(&input_schema, options)?;
 
+    let mut options = resolved.clone();
+    if let Some(rows) = read_batch_cap {
+        options.read_batch_size = rows;
+    }
     Ok(Preflight {
-        options: resolved.clone(),
+        options,
         input_schema,
         crs,
         renames,
@@ -1588,6 +1586,40 @@ fn convert_preflight_with_memory_limit(
         row_groups_total,
         row_groups_read,
     })
+}
+
+/// #563: the read batch size the input's widest byte-array column allows,
+/// when it is below `requested`; `None` to keep `requested`. Errors when the
+/// column's rows average more than `limit_bytes` each, which no batch size
+/// can decode.
+fn byte_array_read_batch_cap(
+    source: &ConvertSource,
+    selected: Option<&RowGroupSelection>,
+    requested: usize,
+    limit_bytes: u64,
+) -> Result<Option<usize>, ConvertError> {
+    let Some(widest) = source.widest_byte_array_column(selected)? else {
+        return Ok(None);
+    };
+    if widest.avg_row_bytes > limit_bytes {
+        return Err(ConvertError::ByteArrayRowTooLarge {
+            widest,
+            limit_bytes,
+        });
+    }
+    let rows = crate::input_set::byte_array_batch_rows(widest.avg_row_bytes, limit_bytes);
+    if rows >= requested.max(1) {
+        return Ok(None);
+    }
+    log::warn!(
+        "[convert] reading {rows} rows per batch instead of {requested}: column '{}' averages \
+         {} bytes per row (row group {}), and arrow cannot decode more than ~2 GiB of it in \
+         one batch",
+        widest.column,
+        widest.avg_row_bytes,
+        widest.row_group,
+    );
+    Ok(Some(rows))
 }
 
 /// The preflight-derived inputs pass 1 reads. Grouped so
@@ -5125,7 +5157,7 @@ mod tests {
             &options,
             hard_limit(1 << 40),
             false,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
         )
         .expect("10 rows must fit a 1 TiB mocked limit");
 
@@ -5138,7 +5170,7 @@ mod tests {
             &options,
             hard_limit(1),
             false,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
         ) {
             Err(
                 err @ ConvertError::Pass1MemoryFloorExceeded {
@@ -5166,7 +5198,7 @@ mod tests {
             &options,
             hard_limit(1),
             true,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
         )
         .expect("the skip hatch must downgrade the hard error");
 
@@ -5181,22 +5213,17 @@ mod tests {
             &bbox_options,
             hard_limit(1),
             false,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
         )
         .expect("a --bbox extract must never hard-error on an upper-bound row count");
     }
 
-    /// #563: a row group whose geometry column exceeds the mocked
-    /// `i32`-offset ceiling fails fast with an actionable error naming the
-    /// row group, its size, and the fix — never reaching pass 1's arrow
-    /// decode, where the real ~2 GiB ceiling instead fails with an opaque
-    /// `Parquet error: index overflow decoding byte array`.
-    ///
-    /// The ceiling is a preflight parameter (mirroring `hard_limit` above)
-    /// precisely so this can be proven with a tiny fixture instead of an
-    /// actual multi-GiB parquet file.
+    /// #563: when the geometry rows alone average more than the (mocked)
+    /// per-batch ceiling, no batch size can decode them: the preflight fails
+    /// fast from footer statistics, naming the row group and column, before
+    /// pass 1 reads a data page.
     #[test]
-    fn convert_preflight_fails_fast_on_an_oversized_geometry_row_group() {
+    fn convert_preflight_fails_fast_when_one_row_exceeds_the_batch_ceiling() {
         let geoms: Vec<Option<Geometry<f64>>> =
             mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
         let values: Vec<f64> = vec![1.0; geoms.len()];
@@ -5212,31 +5239,86 @@ mod tests {
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
-        // A generous ceiling (the real production one) fits comfortably.
-        convert_preflight_with_memory_limit(
-            &source,
-            &options,
-            hard_limit(1 << 40),
-            false,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
-        )
-        .expect("10 tiny points must fit the real ~2 GiB ceiling");
-
-        // A 1-byte mocked ceiling cannot possibly fit 10 points' WKB — this
-        // must fail from the footer's `total_uncompressed_size` alone, never
-        // having opened a data page (if this reached pass 1's decode it
-        // would simply succeed, silently defeating the test).
         match convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false, 1)
         {
-            Err(err @ ConvertError::OversizedGeometryRowGroup { .. }) => {
+            Err(err @ ConvertError::ByteArrayRowTooLarge { .. }) => {
                 let msg = err.to_string();
-                for want in ["row group 0", "GiB uncompressed", "gpio sort hilbert"] {
+                for want in ["row group 0", "column 'geometry'", "per row"] {
                     assert!(msg.contains(want), "missing {want:?}: {msg}");
                 }
             }
             Err(err) => panic!("wrong error: {err}"),
-            Ok(_) => panic!("10 points must not fit a 1-byte geometry-column ceiling"),
+            Ok(_) => panic!("rows averaging over a 1-byte ceiling must be rejected"),
         }
+    }
+
+    /// #563 review: arrow's i32 offset ceiling bounds one decoded BATCH, not
+    /// one row group. A row group whose geometry column is larger than the
+    /// ceiling but whose rows are small decodes fine in smaller batches (a
+    /// real 2.4 GiB single-row-group file converted on main at the default
+    /// batch size), so the preflight must not reject it. It must instead
+    /// lower the read batch size so no batch can reach the ceiling.
+    #[test]
+    fn convert_preflight_caps_the_batch_instead_of_rejecting_a_large_row_group() {
+        let geoms: Vec<Option<Geometry<f64>>> =
+            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
+        let values: Vec<f64> = vec![1.0; geoms.len()];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 5,
+            },
+            ..Default::default()
+        };
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+
+        // The row group's geometry column in bytes, from the footer.
+        let meta = parquet::file::serialized_reader::SerializedFileReader::new(
+            std::fs::File::open(tin.path()).unwrap(),
+        )
+        .unwrap();
+        let rg = parquet::file::reader::FileReader::metadata(&meta).row_group(0);
+        let geom_bytes = rg
+            .columns()
+            .iter()
+            .find(|c| c.column_descr().name() == "geometry")
+            .unwrap()
+            .uncompressed_size() as u64;
+        assert_eq!(rg.num_rows(), 10);
+
+        // A mocked ceiling below the row group's total but far above any one
+        // row: the preflight passes and caps the batch.
+        let limit = geom_bytes - 1;
+        let pre = convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            limit,
+        )
+        .expect("small rows in a large row group must not be rejected");
+        assert!(
+            pre.options.read_batch_size < 10,
+            "a 10-row batch would exceed the mocked ceiling; got {}",
+            pre.options.read_batch_size
+        );
+        assert!(pre.options.read_batch_size >= 1);
+
+        // The production ceiling leaves the default batch alone.
+        let pre = convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            pre.options.read_batch_size,
+            super::super::convert::DEFAULT_READ_BATCH_SIZE
+        );
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
@@ -5306,7 +5388,7 @@ mod tests {
             &options,
             hard_limit(1),
             false,
-            super::super::convert::OVERSIZED_GEOMETRY_LIMIT_BYTES,
+            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
         )
         .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }

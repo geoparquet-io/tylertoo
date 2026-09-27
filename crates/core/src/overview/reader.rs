@@ -73,6 +73,10 @@ pub struct OverviewReader {
     metadata: Arc<ParquetMetaData>,
     schema: SchemaRef,
     meta: OverviewsMeta,
+    /// Most rows one read batch may hold (#563): an overview level keeps its
+    /// source geometries, so a batch of very large ones would pass arrow's
+    /// i32 byte-array offset ceiling. Every read clamps its batch to this.
+    max_batch_rows: usize,
 }
 
 impl OverviewReader {
@@ -105,7 +109,12 @@ impl OverviewReader {
         // values, usize-wrapped) row-group reads.
         meta.validate(metadata.num_row_groups() as i64)?;
 
+        let max_batch_rows = crate::input_set::capped_batch_rows(
+            usize::MAX,
+            crate::input_set::widest_byte_array_column(&metadata, None, 0).as_ref(),
+        );
         Ok(Self {
+            max_batch_rows,
             path,
             metadata,
             schema,
@@ -358,9 +367,9 @@ impl OverviewReader {
     ) -> Result<ParquetRecordBatchReader, ReaderError> {
         let selected = self.selected_row_groups(level_idx, bbox)?;
         let file = File::open(&self.path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_row_groups(selected)
-            .build()?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?.with_row_groups(selected);
+        // The builder's default batch (1024 rows), clamped like every read.
+        let reader = builder.with_batch_size(self.batch_rows(1024)).build()?;
         Ok(reader)
     }
 
@@ -377,7 +386,7 @@ impl OverviewReader {
         let file = File::open(&self.path)?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups(selected)
-            .with_batch_size(batch_size)
+            .with_batch_size(self.batch_rows(batch_size))
             .build()?;
         Ok(reader)
     }
@@ -433,7 +442,7 @@ impl OverviewReader {
         let file = File::open(&self.path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups(row_groups)
-            .with_batch_size(batch_size);
+            .with_batch_size(self.batch_rows(batch_size));
         let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
         Ok(builder.with_projection(mask).build()?)
     }
@@ -453,7 +462,13 @@ impl OverviewReader {
         let file = File::open(&self.path)?;
         Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups((start..=end).collect())
-            .with_batch_size(batch_size))
+            .with_batch_size(self.batch_rows(batch_size)))
+    }
+
+    /// `requested` rows per batch, clamped to [`Self::max_batch_rows`]
+    /// (#563).
+    fn batch_rows(&self, requested: usize) -> usize {
+        requested.clamp(1, self.max_batch_rows)
     }
 }
 

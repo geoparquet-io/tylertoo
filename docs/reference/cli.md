@@ -248,7 +248,7 @@ Generate PMTiles vector tiles (the default pipeline)
    By default the converter streams the input twice: pass 1 builds the per-feature winner tables (level assignment + density budget) holding only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and simplifies + writes batch-by-batch. Peak memory is O(read batch + winner tables) instead of O(dataset) — e.g. Moldova (632k polygons) drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent (same level assignments, rows, and footer). This flag reverts to the original in-memory pipeline, which decodes the whole dataset once and may be marginally faster on small inputs that comfortably fit in RAM.
 * `--read-batch-size <ROWS>` — Rows per Arrow read batch in the streaming pipeline (both passes).
 
-   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows. No effect with --no-streaming.
+   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows, and lowered automatically (with a warning) when the input's rows are so large that a batch of this many would pass the ~2 GiB arrow can decode per byte-array column. No effect with --no-streaming.
 
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).
@@ -464,7 +464,7 @@ Build a multi-resolution overview GeoParquet file
    By default the converter streams the input twice: pass 1 builds the per-feature winner tables (level assignment + density budget) holding only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and simplifies + writes batch-by-batch. Peak memory is O(read batch + winner tables) instead of O(dataset) — e.g. Moldova (632k polygons) drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent (same level assignments, rows, and footer). This flag reverts to the original in-memory pipeline, which decodes the whole dataset once and may be marginally faster on small inputs that comfortably fit in RAM.
 * `--read-batch-size <ROWS>` — Rows per Arrow read batch in the streaming pipeline (both passes).
 
-   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows. No effect with --no-streaming.
+   LARGER batches amortize per-batch overhead (slightly faster) at the cost of proportionally more peak memory; SMALLER batches bound memory tighter. The default (8192) keeps per-batch transients in the tens of MB even for vertex-heavy polygon data. Capped at 1048576 rows, and lowered automatically (with a warning) when the input's rows are so large that a batch of this many would pass the ~2 GiB arrow can decode per byte-array column. No effect with --no-streaming.
 
   Default value: `8192`
 * `--profile <PROFILE>` — Memory/throughput profile for the single-read pass-2 engine (#213/#212).

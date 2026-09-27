@@ -1358,8 +1358,10 @@ struct ConvertTuningArgs {
     /// LARGER batches amortize per-batch overhead (slightly faster) at the
     /// cost of proportionally more peak memory; SMALLER batches bound memory
     /// tighter. The default (8192) keeps per-batch transients in the tens of
-    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows. No
-    /// effect with --no-streaming.
+    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows, and
+    /// lowered automatically (with a warning) when the input's rows are so
+    /// large that a batch of this many would pass the ~2 GiB arrow can
+    /// decode per byte-array column. No effect with --no-streaming.
     #[arg(
         long,
         value_name = "ROWS",

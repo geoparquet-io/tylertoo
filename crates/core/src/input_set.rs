@@ -140,20 +140,109 @@ pub struct MultiSource {
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
 
-/// One row group whose geometry column chunk's uncompressed size exceeds
-/// arrow's `BinaryArray` `i32` offset limit (#563): decoding it fails deep in
-/// arrow-rs with an opaque `Parquet error: index overflow decoding byte
-/// array` that names neither the row group nor the fix. See
-/// [`ConvertSource::oversized_geometry_row_groups`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OversizedRowGroup {
-    /// Index into the source's parts (0 for a [`ConvertSource::Single`]).
+/// arrow-rs decodes a parquet `BYTE_ARRAY` column (WKB geometry, strings)
+/// into a `BinaryArray`/`StringArray` whose offsets are `i32`, so one decoded
+/// record batch holds at most this many bytes of any one such column (#563).
+/// Past it the read fails with the opaque `Parquet error: index overflow
+/// decoding byte array`.
+///
+/// The ceiling applies per BATCH, not per row group: a batch may be a slice
+/// of one row group or straddle several. A row group larger than this reads
+/// fine in batches of fewer rows, and row groups each well under it overflow
+/// when one batch spans enough of them.
+pub const BYTE_ARRAY_BATCH_LIMIT: u64 = i32::MAX as u64;
+
+/// The byte-array column chunk with the most bytes per row among some row
+/// groups (#563): the one that decides how many rows one batch can hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidestByteArrayColumn {
+    /// Index into the source's parts (0 for a single file).
     pub part: usize,
-    /// The row group's LOCAL index within its part.
+    /// The row group's local index within its part.
     pub row_group: usize,
-    /// The geometry column chunk's uncompressed size in bytes, straight
-    /// from the footer.
-    pub uncompressed_bytes: u64,
+    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
+    pub column: String,
+    /// Decoded bytes per row, averaged over the row group, rounded up.
+    pub avg_row_bytes: u64,
+}
+
+/// The widest byte-array column chunk of `meta`'s row groups `row_groups`
+/// (`None` = all), or `None` when there is no non-empty byte-array chunk.
+///
+/// Footer-only. The per-chunk size is the larger of the chunk's
+/// `total_uncompressed_size` and, when the writer recorded it, its
+/// `unencoded_byte_array_data_bytes` size statistic: a dictionary-encoded
+/// chunk's uncompressed size counts each distinct value once, while the
+/// decoded array holds a copy per row.
+pub(crate) fn widest_byte_array_column(
+    meta: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    part: usize,
+) -> Option<WidestByteArrayColumn> {
+    let groups = meta.row_groups();
+    let all: Vec<usize>;
+    let picked: &[usize] = match row_groups {
+        Some(p) => p,
+        None => {
+            all = (0..groups.len()).collect();
+            &all
+        }
+    };
+    let mut widest: Option<WidestByteArrayColumn> = None;
+    for &gi in picked {
+        let Some(rg) = groups.get(gi) else {
+            continue;
+        };
+        let rows = rg.num_rows().max(0) as u64;
+        if rows == 0 {
+            continue;
+        }
+        for col in rg.columns() {
+            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
+                continue;
+            }
+            let bytes = col
+                .uncompressed_size()
+                .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
+                .max(0) as u64;
+            let avg_row_bytes = bytes.div_ceil(rows);
+            if widest
+                .as_ref()
+                .is_none_or(|w| avg_row_bytes > w.avg_row_bytes)
+            {
+                widest = Some(WidestByteArrayColumn {
+                    part,
+                    row_group: gi,
+                    column: col.column_path().string(),
+                    avg_row_bytes,
+                });
+            }
+        }
+    }
+    widest
+}
+
+/// Rows per batch that keep an average batch of the widest byte-array column
+/// at or under half of `limit` (#563), never below 1. The half is headroom
+/// for rows larger than their row group's average.
+pub(crate) fn byte_array_batch_rows(avg_row_bytes: u64, limit: u64) -> usize {
+    let budget = limit / 2;
+    usize::try_from(budget / avg_row_bytes.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// `requested` rows per batch, lowered when `widest` needs fewer to stay
+/// under [`BYTE_ARRAY_BATCH_LIMIT`].
+pub(crate) fn capped_batch_rows(requested: usize, widest: Option<&WidestByteArrayColumn>) -> usize {
+    match widest {
+        Some(w) => requested.min(byte_array_batch_rows(
+            w.avg_row_bytes,
+            BYTE_ARRAY_BATCH_LIMIT,
+        )),
+        None => requested,
+    }
+    .max(1)
 }
 
 /// Maps a row's position in a [`ConvertSource`]'s read stream back to the
@@ -774,59 +863,22 @@ impl ConvertSource {
             .sum())
     }
 
-    /// Row groups (among `selected`, or every row group of every part when
-    /// `None`) whose `geom_column_name` column chunk's uncompressed size
-    /// exceeds `limit_bytes` (#563).
-    ///
-    /// Footer-only: `total_uncompressed_size` is a column-chunk statistic
-    /// every part's footer already carries, so this costs no extra I/O
-    /// beyond the metadata `num_row_groups_total` and friends already parse.
-    /// It over-reports slightly against the true decoded `BinaryArray`
-    /// buffer size (the chunk's on-disk PLAIN/dictionary encoding also
-    /// counts per-value length-prefix and dictionary-index bytes the decoded
-    /// buffer omits), which only makes this preflight fire a little earlier
-    /// than the real cliff — never later.
-    ///
-    /// Matches by column NAME rather than schema index: the geometry column
-    /// is never one of the #288 reserved names, so it is never renamed, and
-    /// name lookup stays correct regardless of `restrict_columns` (#386)
-    /// narrowing the Arrow-side schema index geometry would otherwise sit at.
-    pub(crate) fn oversized_geometry_row_groups(
+    /// The widest byte-array column chunk among the `selected` row groups of
+    /// every part (`None` selection = all), footer statistics only (#563).
+    /// See [`BYTE_ARRAY_BATCH_LIMIT`].
+    pub fn widest_byte_array_column(
         &self,
-        geom_column_name: &str,
         selected: Option<&RowGroupSelection>,
-        limit_bytes: u64,
-    ) -> Result<Vec<OversizedRowGroup>, InputError> {
+    ) -> Result<Option<WidestByteArrayColumn>, InputError> {
         let metas = self.metas()?;
-        let mut hits = Vec::new();
-        for (pi, m) in metas.iter().enumerate() {
-            let groups = m.parquet.row_groups();
-            let indices: Vec<usize> = match selected.and_then(|s| s.parts().get(pi)) {
-                Some(picked) => picked.clone(),
-                None => (0..groups.len()).collect(),
-            };
-            for gi in indices {
-                let Some(rg) = groups.get(gi) else {
-                    continue;
-                };
-                let Some(col) = rg
-                    .columns()
-                    .iter()
-                    .find(|c| c.column_descr().name() == geom_column_name)
-                else {
-                    continue;
-                };
-                let bytes = col.uncompressed_size().max(0) as u64;
-                if bytes > limit_bytes {
-                    hits.push(OversizedRowGroup {
-                        part: pi,
-                        row_group: gi,
-                        uncompressed_bytes: bytes,
-                    });
-                }
-            }
-        }
-        Ok(hits)
+        Ok(metas
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, m)| {
+                let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
+                widest_byte_array_column(&m.parquet, picked, pi)
+            })
+            .max_by_key(|w| w.avg_row_bytes))
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -897,12 +949,16 @@ impl ConvertSource {
             .iter()
             .map(|m| m.reader.clone())
             .collect::<Vec<_>>();
+        // #563: never ask arrow for a batch whose byte-array column could
+        // pass its i32 offset ceiling. Output does not depend on the batch
+        // size; only the opaque overflow error does.
+        let widest = self.widest_byte_array_column(plan.row_groups)?;
         Ok(SourceStream {
             parts,
             metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
-            batch_size: plan.batch_size.max(1),
+            batch_size: capped_batch_rows(plan.batch_size.max(1), widest.as_ref()),
             part_idx: 0,
             current: None,
             done: false,
@@ -2626,16 +2682,10 @@ b.parquet
         assert_eq!(loc.locate(8), None);
     }
 
-    // --- #563: oversized-geometry-column preflight --------------------------
+    // --- #563: byte-array batch ceiling -------------------------------------
 
-    /// A tiny fixture with a `geometry` (Binary) column, one row per row
-    /// group, so each group's footer-reported uncompressed size differs.
-    /// Real 2 GiB row groups are not needed to test the MECHANISM: the check
-    /// is a plain footer-stat comparison against a caller-supplied limit, so
-    /// a small file with a tiny limit exercises exactly the same code path
-    /// arrow's real ~2 GiB `i32` offset ceiling would (see
-    /// `oversized_geometry_row_groups_ignored_test` below for the
-    /// `#[ignore]`d real-file variant).
+    /// A fixture with one `geometry` (Binary) column of `blob_sizes` zero
+    /// blobs, `max_row_group_size` rows per row group.
     fn write_geometry_fixture_with_grouping(
         path: &Path,
         blob_sizes: &[usize],
@@ -2653,90 +2703,75 @@ b.parquet
         );
     }
 
-    /// One row (one blob) per row group, so each group's footer-reported
-    /// uncompressed size differs.
-    fn write_geometry_fixture(path: &Path, blob_sizes: &[usize]) {
-        write_geometry_fixture_with_grouping(path, blob_sizes, Some(1));
-    }
-
+    /// The widest column is found per row group, respecting the selection,
+    /// and averaged over the group's rows.
     #[test]
-    fn oversized_geometry_row_groups_names_the_offending_group() {
+    fn widest_byte_array_column_names_the_row_group_and_respects_the_selection() {
         let dir = tmpdir();
         let f = dir.path().join("geo.parquet");
-        // Row group 0: small. Row group 1: the "oversized" one.
-        write_geometry_fixture(&f, &[16, 4096]);
-
+        // Row group 0: two 16-byte rows. Row group 1: two 4096-byte rows.
+        write_geometry_fixture_with_grouping(&f, &[16, 16, 4096, 4096], Some(2));
         let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-        let limit = 1024u64;
-        let hits = src
-            .oversized_geometry_row_groups("geometry", None, limit)
-            .unwrap();
 
+        let w = src.widest_byte_array_column(None).unwrap().unwrap();
+        assert_eq!((w.part, w.row_group, w.column.as_str()), (0, 1, "geometry"));
+        assert!(
+            w.avg_row_bytes >= 4096 && w.avg_row_bytes < 4096 + 64,
+            "average bytes per row, not the chunk total: {w:?}"
+        );
+
+        let only_small = RowGroupSelection::from_parts(vec![vec![0]]);
+        let w = src
+            .widest_byte_array_column(Some(&only_small))
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.row_group, 0);
+        assert!(w.avg_row_bytes < 64, "{w:?}");
+    }
+
+    /// The batch cap keeps an average batch at half the ceiling, never
+    /// drops below one row, and leaves a narrow input's batch alone.
+    #[test]
+    fn byte_array_batch_rows_budgets_half_the_ceiling() {
+        assert_eq!(byte_array_batch_rows(100, 1000), 5);
+        assert_eq!(byte_array_batch_rows(10_000, 1000), 1);
+        assert_eq!(byte_array_batch_rows(0, 1000), 500);
+        // 128 KiB rows against the real ceiling: 8191 rows (1 GiB - 1 byte).
         assert_eq!(
-            hits.len(),
-            1,
-            "only row group 1 exceeds the limit: {hits:?}"
+            byte_array_batch_rows(128 * 1024, BYTE_ARRAY_BATCH_LIMIT),
+            8191
         );
-        assert_eq!(hits[0].part, 0);
-        assert_eq!(hits[0].row_group, 1);
-        assert!(
-            hits[0].uncompressed_bytes > limit,
-            "reported size must exceed the limit: {hits:?}"
-        );
+        assert_eq!(capped_batch_rows(8192, None), 8192);
+        let wide = WidestByteArrayColumn {
+            part: 0,
+            row_group: 0,
+            column: "geometry".into(),
+            avg_row_bytes: 300_000,
+        };
+        assert_eq!(capped_batch_rows(8192, Some(&wide)), 3579);
+        assert_eq!(capped_batch_rows(100, Some(&wide)), 100);
     }
 
-    /// Nothing over the limit reports no hits.
-    #[test]
-    fn oversized_geometry_row_groups_clean_file_reports_nothing() {
-        let dir = tmpdir();
-        let f = dir.path().join("geo.parquet");
-        write_geometry_fixture(&f, &[16, 32]);
-
-        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-        let hits = src
-            .oversized_geometry_row_groups("geometry", None, 1_000_000)
-            .unwrap();
-        assert!(hits.is_empty());
-    }
-
-    /// A `selected` row-group restriction is honored: a row group pruned out
-    /// by `--bbox`/`--filter` before this check runs is never flagged, since
-    /// it will never actually be decoded.
-    #[test]
-    fn oversized_geometry_row_groups_respects_the_selection() {
-        let dir = tmpdir();
-        let f = dir.path().join("geo.parquet");
-        write_geometry_fixture(&f, &[16, 4096]);
-
-        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-        // Only row group 0 (the small one) selected — row group 1 is pruned
-        // and must not be flagged even though it is oversized.
-        let selected = RowGroupSelection::from_parts(vec![vec![0]]);
-        let hits = src
-            .oversized_geometry_row_groups("geometry", Some(&selected), 1024)
-            .unwrap();
-        assert!(
-            hits.is_empty(),
-            "the oversized group was pruned out of the selection: {hits:?}"
-        );
-    }
-
-    /// #563's real repro: a single legal-but-pathological row group whose
-    /// geometry column alone exceeds 2 GiB uncompressed. Ignored by default
-    /// (writing a multi-GB fixture is slow and disk-heavy); run explicitly
-    /// with `cargo test -- --ignored` to exercise it end to end.
+    /// #563's real failure, end to end: one row group of 9000 rows x 300 KB
+    /// (2.5 GiB of geometry). At 8192 rows per batch arrow overflows its i32
+    /// offsets; the capped stream reads every row. Ignored by default
+    /// (writes a multi-GiB fixture); run with `--ignored`.
     #[test]
     #[ignore = "writes a >2GiB parquet fixture; run explicitly with --ignored"]
-    fn oversized_geometry_row_groups_real_2gib_file() {
+    fn open_stream_reads_a_real_oversized_row_group() {
         let dir = tmpdir();
         let f = dir.path().join("huge.parquet");
-        // ~20,000 x 110KB blobs ≈ 2.1 GiB uncompressed, all in ONE row group.
-        let sizes = vec![110_000usize; 20_000];
-        write_geometry_fixture_with_grouping(&f, &sizes, None);
+        write_geometry_fixture_with_grouping(&f, &vec![300_000; 9000], None);
         let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-        let hits = src
-            .oversized_geometry_row_groups("geometry", None, i32::MAX as u64)
-            .unwrap();
-        assert_eq!(hits.len(), 1);
+        let rows: usize = src
+            .open_stream(&ReadPlan {
+                batch_size: 8192,
+                projection: None,
+                row_groups: None,
+            })
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(rows, 9000);
     }
 }
