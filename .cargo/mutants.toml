@@ -47,6 +47,7 @@ profile = "mutants"
 # in the mutation run, so the check matters.
 additional_cargo_args = [
   "--lib",
+  "--test", "accumulate_log",
   "--test", "decode_errors",
   "--test", "decode_roundtrip",
   "--test", "hostile_geometry_eval",
