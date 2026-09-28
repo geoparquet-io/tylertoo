@@ -121,7 +121,13 @@ reasonably fast — but `--lib` still includes some real-parquet I/O tests
 
 CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
 `quick`; the Slow Tests job runs exactly the set `quick` excludes, on
-ubuntu and macOS stable. Together they cover `full`.
+ubuntu and macOS stable, in three shards per OS. The shards are
+`--partition count:N/3` slices of that one set, run on separate runners
+because the set is CPU-bound; they are not different tests, and all six
+checks (`Slow Tests (<os>, shard N/3)`) must pass. Together Test and
+Slow Tests cover `full`. To reproduce one shard locally:
+`cargo nextest run --ignore-default-filter -E 'not default()'
+--partition count:2/3`.
 
 The weekly mutation-testing job (`.github/workflows/mutation-tests.yml`,
 Sundays, or `gh workflow run mutation-tests.yml`) runs `cargo mutants` on

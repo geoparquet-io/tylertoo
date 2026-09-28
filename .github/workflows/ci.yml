@@ -10,7 +10,8 @@
 #                   tippecanoe so the tippecanoe-decode golden test runs
 #                   rather than skips (#420)
 #   Slow Tests      the slow tests `quick` excludes; Test + Slow Tests
-#                   together cover the `full` tier, on ubuntu/macos stable
+#                   together cover the `full` tier, on ubuntu/macos stable,
+#                   split into three CPU shards per OS (six checks)
 #   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
@@ -344,19 +345,34 @@ jobs:
         if: runner.os == 'Linux' && matrix.rust == 'stable'
         run: scripts/mutants-test-binaries.sh --check
 
-  # The slow end-to-end tests excluded from the `quick` nextest profile
-  # (.config/nextest.toml, #457) — together, `quick` (Test job) + this job's
-  # complement equal the `full` profile. They run here, beside the Test
-  # matrix, so no other job waits on them (#524). Stable only, on both OSes:
-  # the set holds the determinism and shard-parity tests, which guard
-  # platform-sensitive behavior.
+  # Slow Tests: the slow set, split three ways per OS.
+  #
+  # What runs: the slow end-to-end tests that the `quick` nextest profile
+  # excludes, selected with `not default()` against the `default-filter` in
+  # .config/nextest.toml (#457). `quick` (the Test job) plus this set equal
+  # the `full` profile. They run beside the Test matrix, so no other job
+  # waits on them (#524). Stable only, on both OSes: the set holds the
+  # determinism and shard-parity tests, which guard platform-sensitive
+  # behavior.
+  #
+  # Shards: `--partition count:N/3` deals the same slow set out across three
+  # runners, one test at a time in a stable order. The three shards are a CPU
+  # split of one test set, not three different kinds of test: the set is
+  # CPU-bound (about 2700 test-seconds against a 4-vCPU runner), and a single
+  # runner took 13-17 min. All six checks (3 shards x 2 OSes) must pass; a
+  # test that fails in any shard fails the set.
+  #
+  # The golden-tile guard (`convert_guard_golden`, #558) lives in this set,
+  # and these six checks are the only place it gates merges. If they stop
+  # being required in branch protection, the guard stops gating.
   slow-tests:
-    name: Slow Tests (${{ matrix.os }})
+    name: Slow Tests (${{ matrix.os }}, shard ${{ matrix.shard }}/3)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -418,10 +434,13 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run slow tests
+      - name: Run slow tests (shard ${{ matrix.shard }}/3)
+        env:
+          SHARD: ${{ matrix.shard }}
         run: >-
           cargo nextest run --locked --all-features
           --ignore-default-filter -E 'not default()'
+          --partition "count:${SHARD}/3"
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.

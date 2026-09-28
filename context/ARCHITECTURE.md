@@ -670,9 +670,10 @@ cases) — a thin margin, recorded with the recipe in
 `tests/fixtures/guard/README.md`.
 
 What makes it a gate is where it runs. It is in the slow set in
-`.config/nextest.toml`, so it runs in `Slow Tests (ubuntu-latest)` and
-`Slow Tests (macos-latest)` (`ci.yml`) — both **required** checks in `main`'s
-branch protection (verified). The `Convert regression guard` job in
+`.config/nextest.toml`, so it runs in the six `Slow Tests (<os>, shard N/3)`
+checks (`ci.yml`; ubuntu-latest and macos-latest, three `--partition` shards
+each, so its tests land in whichever shard the partition deals them to). All
+six must be **required** checks in `main`'s branch protection. The `Convert regression guard` job in
 `bench.yml` is *not* a required check, so it does not gate merges and the
 golden does not run there. If the golden ever leaves the nextest slow set, or
 Slow Tests stops being required, the guard silently stops gating.
