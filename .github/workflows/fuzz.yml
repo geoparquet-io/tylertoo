@@ -109,8 +109,13 @@ jobs:
         # discovers; it is not persisted between runs (a seed worth keeping
         # is committed by hand). -timeout bounds one input, so a single slow
         # case is a reported timeout rather than a job that never ends.
+        # --target is explicit because the prebuilt cargo-fuzz from
+        # install-action is musl-linked and defaults to the triple it was
+        # built for; AddressSanitizer needs a dynamically linked libc, so a
+        # musl build fails before fuzzing starts (#620).
         run: |
-          cargo "+$NIGHTLY" fuzz run "$TARGET" -- \
+          cargo "+$NIGHTLY" fuzz run "$TARGET" \
+            --target x86_64-unknown-linux-gnu -- \
             -max_total_time="$MAX_TOTAL_TIME" \
             -timeout=60 \
             -rss_limit_mb=2048
