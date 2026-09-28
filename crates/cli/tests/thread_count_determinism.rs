@@ -125,76 +125,86 @@ fn run_tiles(
     (bytes, overview_bytes)
 }
 
-#[test]
-fn pmtiles_output_is_byte_identical_across_thread_counts() {
+/// #423 for one engine: the PMTiles archive and the kept overview must be
+/// byte-identical at `RAYON_NUM_THREADS` 1, 2 and 8. Both engines share the
+/// `assign_levels` code path #423 fixed; each engine is its own test so
+/// nextest runs them side by side.
+fn assert_pmtiles_thread_count_invariant(no_streaming: bool) {
     let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
         return;
     };
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // Both engines share the `assign_levels` code path this ticket fixes.
-    for no_streaming in [false, true] {
-        let engine = if no_streaming {
-            "no-streaming"
-        } else {
-            "streaming"
-        };
-        let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
+    let engine = if no_streaming {
+        "no-streaming"
+    } else {
+        "streaming"
+    };
+    let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
 
-        for threads in [1u32, 2, 8] {
-            let out = dir.path().join(format!("{engine}-t{threads}.pmtiles"));
-            let overview_out = dir
-                .path()
-                .join(format!("{engine}-t{threads}-overview.parquet"));
-            let (bytes, overview_bytes) = run_tiles(
-                &fixture,
-                &out,
-                &overview_out,
-                threads,
-                no_streaming,
-                14,
-                &[],
-            );
+    for threads in [1u32, 2, 8] {
+        let out = dir.path().join(format!("{engine}-t{threads}.pmtiles"));
+        let overview_out = dir
+            .path()
+            .join(format!("{engine}-t{threads}-overview.parquet"));
+        let (bytes, overview_bytes) = run_tiles(
+            &fixture,
+            &out,
+            &overview_out,
+            threads,
+            no_streaming,
+            14,
+            &[],
+        );
 
-            match &baseline {
-                None => baseline = Some((threads, bytes, overview_bytes)),
-                Some((base_threads, base_bytes, base_overview_bytes)) => {
-                    assert_eq!(
-                        base_bytes.len(),
-                        bytes.len(),
-                        "[{engine}] PMTiles size differs between RAYON_NUM_THREADS={base_threads} \
-                         ({} bytes) and RAYON_NUM_THREADS={threads} ({} bytes) — #423 \
-                         byte-determinism regression",
-                        base_bytes.len(),
-                        bytes.len()
-                    );
-                    assert!(
-                        base_bytes == &bytes,
-                        "[{engine}] PMTiles output differs between RAYON_NUM_THREADS={base_threads} \
-                         and RAYON_NUM_THREADS={threads} (same {} byte length, different content) \
-                         — #423 byte-determinism regression: a HashMap/HashSet iteration order is \
-                         probably leaking into the output again",
-                        bytes.len()
-                    );
-                    // #508: the intermediate overview's raw bytes must also be
-                    // stable across thread counts now that the writer sorts
-                    // `geometry_types` before serializing the footer.
-                    assert!(
-                        base_overview_bytes == &overview_bytes,
-                        "[{engine}] kept overview Parquet differs between \
-                         RAYON_NUM_THREADS={base_threads} ({} bytes) and RAYON_NUM_THREADS={threads} \
-                         ({} bytes) — #508 regression: the geo footer's `geometry_types` (or some \
-                         other HashMap/HashSet-backed field) is leaking nondeterministic order again",
-                        base_overview_bytes.len(),
-                        overview_bytes.len()
-                    );
-                }
+        match &baseline {
+            None => baseline = Some((threads, bytes, overview_bytes)),
+            Some((base_threads, base_bytes, base_overview_bytes)) => {
+                assert_eq!(
+                    base_bytes.len(),
+                    bytes.len(),
+                    "[{engine}] PMTiles size differs between RAYON_NUM_THREADS={base_threads} \
+                     ({} bytes) and RAYON_NUM_THREADS={threads} ({} bytes) — #423 \
+                     byte-determinism regression",
+                    base_bytes.len(),
+                    bytes.len()
+                );
+                assert!(
+                    base_bytes == &bytes,
+                    "[{engine}] PMTiles output differs between RAYON_NUM_THREADS={base_threads} \
+                     and RAYON_NUM_THREADS={threads} (same {} byte length, different content) \
+                     — #423 byte-determinism regression: a HashMap/HashSet iteration order is \
+                     probably leaking into the output again",
+                    bytes.len()
+                );
+                // #508: the intermediate overview's raw bytes must also be
+                // stable across thread counts now that the writer sorts
+                // `geometry_types` before serializing the footer.
+                assert!(
+                    base_overview_bytes == &overview_bytes,
+                    "[{engine}] kept overview Parquet differs between \
+                     RAYON_NUM_THREADS={base_threads} ({} bytes) and RAYON_NUM_THREADS={threads} \
+                     ({} bytes) — #508 regression: the geo footer's `geometry_types` (or some \
+                     other HashMap/HashSet-backed field) is leaking nondeterministic order again",
+                    base_overview_bytes.len(),
+                    overview_bytes.len()
+                );
             }
         }
     }
 }
 
-/// #460 review (S2-X1 / S3-b): the arm above is **vacuous for the parallel
+#[test]
+fn pmtiles_output_is_byte_identical_across_thread_counts_streaming() {
+    assert_pmtiles_thread_count_invariant(false);
+}
+
+#[test]
+fn pmtiles_output_is_byte_identical_across_thread_counts_no_streaming() {
+    assert_pmtiles_thread_count_invariant(true);
+}
+
+/// #460 review (S2-X1 / S3-b): the `pmtiles_output_*` arms above are **vacuous for the parallel
 /// pass-1 scan**. `open-buildings.parquet` holds 1000 rows — fewer than one
 /// pass-1 scan chunk — so every batch is a single chunk at every thread
 /// count, and the `par_iter` it is supposed to guard never has more than one
@@ -450,154 +460,220 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
 /// winner grid at coarse levels, and `road-detections` is a line layer, which
 /// runs the line thinning grid and the coalesce tables.
 ///
-/// Each runs twice: at the default density budget, and at `--drop-rate 6`, which
-/// makes the budget bind harder and at more levels (#565). The density budget
-/// is the half of the phase #565 rewrote, from a materialized priority table to
-/// priorities derived per comparison, and it only runs its super-cell partition
-/// and priority sorts at a level where it **binds**; at a level under budget,
-/// `apply_density_budget` admits every candidate and never compares two of them.
+/// Each runs twice: at the default density budget ([`DEFAULT_ARM`]), and at
+/// `--drop-rate 6` ([`BOUND_ARM`]), which makes the budget bind harder and at
+/// more levels (#565). [`density_budget_binds_in_both_plan_arms`] checks that
+/// the budget really binds in both arms.
 ///
-/// So the test checks that the budget binds, and it cannot check that by
-/// comparing plan bytes: the plan's fingerprint records the `density` option,
-/// so two runs that differ only in `--drop-rate` always write different bytes,
-/// even when both assign every feature identically. Instead it reads the
-/// per-level feature counts out of each plan ([`plan_level_counts`]) and
-/// requires every arm's counts to differ from an unbudgeted
-/// (`--no-density-drop`) run's, and the two arms' counts to differ from each
-/// other. If a fixture or default change stops the budget binding, this fails
-/// rather than passing with the budget code never run.
+/// Each (fixture, arm) pair is its own test, so nextest runs the four side by
+/// side instead of one test running all 24 invocations back to back. Within a
+/// test the three thread counts run as concurrent processes, as in
+/// [`parallel_pass1_output_is_byte_identical_across_thread_counts`]: each is a
+/// separate CLI process with its own pinned rayon pool, so running them at the
+/// same time changes nothing they compute, and every comparison below happens
+/// after all three have finished.
+fn assert_plan_thread_count_invariant(name: &str, max_zoom: u8, (arm, extra): (&str, &[&str])) {
+    let Some(fixture) = fixture::realdata(name) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let runs: Vec<(u32, Vec<u8>, Vec<u8>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = [1u32, 2, 8]
+            .into_iter()
+            .map(|threads| {
+                let (fixture, dir) = (&fixture, dir.path());
+                scope.spawn(move || {
+                    let tag = format!("{arm}-t{threads}");
+                    let out = dir.join(format!("plan-{tag}.pmtiles"));
+                    let overview_out = dir.join(format!("plan-{tag}-overview.parquet"));
+                    let plan = dir.join(format!("{tag}.plan"));
+                    let mut args: Vec<&str> = vec!["--save-plan", plan.to_str().unwrap()];
+                    args.extend_from_slice(extra);
+                    run_tiles(
+                        fixture,
+                        &out,
+                        &overview_out,
+                        threads,
+                        false,
+                        max_zoom,
+                        &args,
+                    );
+                    let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
+                    // #560: the same plan, from the run that skips the export.
+                    let only = dir.join(format!("{tag}-plan-only.plan"));
+                    let only_bytes = run_plan_only(fixture, &only, threads, max_zoom, extra);
+                    (threads, plan_bytes, only_bytes)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("tylertoo tiles run panicked"))
+            .collect()
+    });
+
+    let mut baseline: Option<(u32, Vec<u8>)> = None;
+    for (threads, plan_bytes, only_bytes) in runs {
+        assert!(
+            !plan_bytes.is_empty(),
+            "[{name}/{arm}] --save-plan wrote an empty plan at \
+             RAYON_NUM_THREADS={threads}"
+        );
+
+        // #560: the plan-only plan must match the full run's at every
+        // thread count — the artifact is the fleet's contract, and neither
+        // the thread count nor the presence of a pass 2 may show up in it.
+        assert!(
+            only_bytes == plan_bytes,
+            "[{name}/{arm}] --plan-only wrote a different plan than the full run at \
+             RAYON_NUM_THREADS={threads} — #560 regression: skipping pass 2 must not \
+             change the artifact every data shard consumes"
+        );
+
+        match &baseline {
+            None => baseline = Some((threads, plan_bytes)),
+            Some((base_threads, base_plan)) => {
+                assert_eq!(
+                    base_plan.len(),
+                    plan_bytes.len(),
+                    "[{name}/{arm}] convert plan size differs between \
+                     RAYON_NUM_THREADS={base_threads} ({} bytes) and \
+                     RAYON_NUM_THREADS={threads} ({} bytes) — #534 regression: the \
+                     parallel level assignment is not reproducing the serial one",
+                    base_plan.len(),
+                    plan_bytes.len()
+                );
+                assert!(
+                    base_plan == &plan_bytes,
+                    "[{name}/{arm}] convert plan differs between \
+                     RAYON_NUM_THREADS={base_threads} and RAYON_NUM_THREADS={threads} \
+                     (same {} byte length, different content) — #534 regression: a \
+                     feature took a different level depending on how the winner pass or \
+                     the density budget was split across threads",
+                    plan_bytes.len()
+                );
+            }
+        }
+    }
+}
+
+/// Runs `tiles --plan-only --save-plan <plan>` on `fixture` with a pinned
+/// `RAYON_NUM_THREADS` and returns the plan's bytes. No export runs, so this
+/// costs a fraction of a [`run_tiles`] call.
+fn run_plan_only(
+    fixture: &Path,
+    plan: &Path,
+    threads: u32,
+    max_zoom: u8,
+    extra: &[&str],
+) -> Vec<u8> {
+    let max_zoom_arg = max_zoom.to_string();
+    let mut args: Vec<&str> = vec![
+        "tiles",
+        fixture.to_str().unwrap(),
+        "--min-zoom",
+        "0",
+        "--max-zoom",
+        &max_zoom_arg,
+        "--save-plan",
+        plan.to_str().unwrap(),
+        "--plan-only",
+    ];
+    args.extend_from_slice(extra);
+    let output = Command::new(tylertoo_bin())
+        .args(&args)
+        .env("RAYON_NUM_THREADS", threads.to_string())
+        .output()
+        .unwrap_or_else(|e| panic!("run tylertoo tiles --plan-only {extra:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "[{}] --plan-only {extra:?} exited with {}: {}",
+        fixture.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(plan).expect("read plan-only plan");
+    assert!(
+        !bytes.is_empty(),
+        "[{}] --plan-only {extra:?} wrote an empty plan at RAYON_NUM_THREADS={threads}",
+        fixture.display()
+    );
+    bytes
+}
+
+const MADAGASCAR: (&str, u8) = ("fieldmaps-madagascar-adm4.parquet", 8);
+const ROADS: (&str, u8) = ("road-detections.parquet", 12);
+const DEFAULT_ARM: (&str, &[&str]) = ("default", &[]);
+const BOUND_ARM: (&str, &[&str]) = ("bound", &["--drop-rate", "6"]);
+
 #[test]
-fn convert_plan_is_byte_identical_across_thread_counts() {
-    for (name, max_zoom) in [
-        ("fieldmaps-madagascar-adm4.parquet", 8u8),
-        ("road-detections.parquet", 12u8),
-    ] {
+fn convert_plan_is_byte_identical_across_thread_counts_madagascar_default() {
+    assert_plan_thread_count_invariant(MADAGASCAR.0, MADAGASCAR.1, DEFAULT_ARM);
+}
+
+#[test]
+fn convert_plan_is_byte_identical_across_thread_counts_madagascar_bound() {
+    assert_plan_thread_count_invariant(MADAGASCAR.0, MADAGASCAR.1, BOUND_ARM);
+}
+
+#[test]
+fn convert_plan_is_byte_identical_across_thread_counts_roads_default() {
+    assert_plan_thread_count_invariant(ROADS.0, ROADS.1, DEFAULT_ARM);
+}
+
+#[test]
+fn convert_plan_is_byte_identical_across_thread_counts_roads_bound() {
+    assert_plan_thread_count_invariant(ROADS.0, ROADS.1, BOUND_ARM);
+}
+
+/// #565: both plan arms above must make the density budget **bind**.
+///
+/// The density budget is the half of the phase #565 rewrote, from a
+/// materialized priority table to priorities derived per comparison, and it
+/// only runs its super-cell partition and priority sorts at a level where it
+/// binds; at a level under budget, `apply_density_budget` admits every
+/// candidate and never compares two of them. An arm where the budget never
+/// binds would pass the thread-count check with the budget code never run.
+///
+/// This cannot be checked by comparing plan bytes: the plan's fingerprint
+/// records the `density` option, so two runs that differ only in
+/// `--drop-rate` always write different bytes, even when both assign every
+/// feature identically. Instead it reads the per-level feature counts out of
+/// each plan ([`plan_level_counts`]) and requires every arm's counts to
+/// differ from an unbudgeted (`--no-density-drop`) run's, and the two arms'
+/// counts to differ from each other. If a fixture or default change stops the
+/// budget binding, this fails.
+///
+/// Only the plan is needed, so every run here is `--plan-only` at
+/// `RAYON_NUM_THREADS=1`. The per-arm tests assert that the `--plan-only` plan
+/// equals the full run's (#560) and that it is the same at every thread count
+/// (#534), so these counts are the ones the full runs produce.
+#[test]
+fn density_budget_binds_in_both_plan_arms() {
+    for (name, max_zoom) in [MADAGASCAR, ROADS] {
         let Some(fixture) = fixture::realdata(name) else {
             continue;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut per_arm: Vec<Vec<u8>> = Vec::new();
 
-        for (arm, extra) in [("default", &[][..]), ("bound", &["--drop-rate", "6"][..])] {
-            let mut baseline: Option<(u32, Vec<u8>)> = None;
-
-            for threads in [1u32, 2, 8] {
-                let tag = format!("{arm}-t{threads}");
-                let out = dir.path().join(format!("plan-{tag}.pmtiles"));
-                let overview_out = dir.path().join(format!("plan-{tag}-overview.parquet"));
-                let plan = dir.path().join(format!("{tag}.plan"));
-                let mut args: Vec<&str> = vec!["--save-plan", plan.to_str().unwrap()];
-                args.extend_from_slice(extra);
-                run_tiles(
-                    &fixture,
-                    &out,
-                    &overview_out,
-                    threads,
-                    false,
-                    max_zoom,
-                    &args,
-                );
-                let plan_bytes = std::fs::read(&plan).expect("read saved convert plan");
-                assert!(
-                    !plan_bytes.is_empty(),
-                    "[{name}/{arm}] --save-plan wrote an empty plan at \
-                     RAYON_NUM_THREADS={threads}"
-                );
-
-                // #560: the same plan, from the run that skips the export. It
-                // must match the full run's at every thread count — the artifact
-                // is the fleet's contract, and neither the thread count nor the
-                // presence of a pass 2 may show up in it.
-                let only = dir.path().join(format!("{tag}-plan-only.plan"));
-                let max_zoom_arg = max_zoom.to_string();
-                let mut only_args: Vec<&str> = vec![
-                    "tiles",
-                    fixture.to_str().unwrap(),
-                    "--min-zoom",
-                    "0",
-                    "--max-zoom",
-                    &max_zoom_arg,
-                    "--save-plan",
-                    only.to_str().unwrap(),
-                    "--plan-only",
-                ];
-                only_args.extend_from_slice(extra);
-                let status = Command::new(tylertoo_bin())
-                    .args(&only_args)
-                    .env("RAYON_NUM_THREADS", threads.to_string())
-                    .output()
-                    .unwrap_or_else(|e| panic!("run tylertoo tiles --plan-only: {e}"));
-                assert!(
-                    status.status.success(),
-                    "[{name}/{arm}] --plan-only exited with {}: {}",
-                    status.status,
-                    String::from_utf8_lossy(&status.stderr)
-                );
-                assert!(
-                    std::fs::read(&only).expect("read plan-only plan") == plan_bytes,
-                    "[{name}/{arm}] --plan-only wrote a different plan than the full run at \
-                     RAYON_NUM_THREADS={threads} — #560 regression: skipping pass 2 must not \
-                     change the artifact every data shard consumes"
-                );
-
-                match &baseline {
-                    None => baseline = Some((threads, plan_bytes)),
-                    Some((base_threads, base_plan)) => {
-                        assert_eq!(
-                            base_plan.len(),
-                            plan_bytes.len(),
-                            "[{name}/{arm}] convert plan size differs between \
-                             RAYON_NUM_THREADS={base_threads} ({} bytes) and \
-                             RAYON_NUM_THREADS={threads} ({} bytes) — #534 regression: the \
-                             parallel level assignment is not reproducing the serial one",
-                            base_plan.len(),
-                            plan_bytes.len()
-                        );
-                        assert!(
-                            base_plan == &plan_bytes,
-                            "[{name}/{arm}] convert plan differs between \
-                             RAYON_NUM_THREADS={base_threads} and RAYON_NUM_THREADS={threads} \
-                             (same {} byte length, different content) — #534 regression: a \
-                             feature took a different level depending on how the winner pass or \
-                             the density budget was split across threads",
-                            plan_bytes.len()
-                        );
-                    }
-                }
-            }
-            per_arm.push(baseline.expect("each arm runs at least one thread count").1);
-        }
-
-        // The budget must actually bind in both arms (see the doc comment for
-        // why plan bytes cannot answer this).
+        let arm_counts: Vec<Vec<usize>> = [DEFAULT_ARM, BOUND_ARM]
+            .iter()
+            .map(|(arm, extra)| {
+                let plan = dir.path().join(format!("{arm}.plan"));
+                plan_level_counts(&run_plan_only(&fixture, &plan, 1, max_zoom, extra))
+            })
+            .collect();
         let unbudgeted = dir.path().join("unbudgeted.plan");
-        let max_zoom_arg = max_zoom.to_string();
-        let status = Command::new(tylertoo_bin())
-            .args([
-                "tiles",
-                fixture.to_str().unwrap(),
-                "--min-zoom",
-                "0",
-                "--max-zoom",
-                &max_zoom_arg,
-                "--save-plan",
-                unbudgeted.to_str().unwrap(),
-                "--plan-only",
-                "--no-density-drop",
-            ])
-            .env("RAYON_NUM_THREADS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("run tylertoo tiles --no-density-drop: {e}"));
-        assert!(
-            status.status.success(),
-            "[{name}] --no-density-drop --plan-only exited with {}: {}",
-            status.status,
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let unbudgeted_counts =
-            plan_level_counts(&std::fs::read(&unbudgeted).expect("read unbudgeted plan"));
-        let arm_counts: Vec<Vec<usize>> = per_arm.iter().map(|p| plan_level_counts(p)).collect();
-        for (arm, counts) in ["default", "bound"].iter().zip(&arm_counts) {
+        let unbudgeted_counts = plan_level_counts(&run_plan_only(
+            &fixture,
+            &unbudgeted,
+            1,
+            max_zoom,
+            &["--no-density-drop"],
+        ));
+
+        for ((arm, _), counts) in [DEFAULT_ARM, BOUND_ARM].iter().zip(&arm_counts) {
             assert_ne!(
                 counts, &unbudgeted_counts,
                 "[{name}/{arm}] the density budget did not bind at any level (per-level counts \
