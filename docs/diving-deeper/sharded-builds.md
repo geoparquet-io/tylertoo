@@ -126,16 +126,20 @@ and each shard — passes the same `--min-zoom 9 --max-zoom 13`:
 ```bash
 tylertoo tiles fields.parquet \
     --min-zoom 9 --max-zoom 13 --no-coalesce-lines \
+    --layer-name fields \
     --shard coarse --shard-plan shards.json \
     --save-plan convert.plan \
     --plan-only
 ```
 
-The same convert flags the fleet's shards will use, plus this one (export-only
-flags are refused), and **no OUTPUT positional** — there is no archive, no
-intermediate overview, and nothing else left on disk. A full coarse job with
-its pivot at `--min-zoom` is refused (it would have no zoom to build); a
-plan-only one builds no zoom anyway, so that shape is exactly what it accepts.
+This is the coarse job's own line with the OUTPUT positional dropped and
+`--plan-only` added. There is no archive, no intermediate overview, and nothing
+else left on disk. Export-only flags on that line (`--layer-name` above) may
+stay: they cannot change the plan, so the run ignores them and names them in
+one info line, `--plan-only: ignoring export options --layer-name`. A full
+coarse job with its pivot at `--min-zoom` is refused (it would have no zoom to
+build); a plan-only one builds no zoom anyway, so that shape is exactly what it
+accepts.
 Pass 1 and the level assignment run exactly as before, so the plan is once
 again **byte-identical** to the one a full or level-capped coarse job writes
 (the parity oracle builds its whole fleet from a `--plan-only` plan and
@@ -161,16 +165,24 @@ still applies (conservatively — it includes pass-2 buffers a plan-only run
 never allocates, but the pass-1 floor is the same, and sizing a plan-only
 box below it will fail the same way).
 
-It requires `--save-plan` (the plan is its only output) and refuses what it
-cannot honor: an OUTPUT path, `--shard I/N` (a data shard's plan would cover
-only that shard's rows), and the export-side knobs `--report`,
-`--keep-overview`, `--tile-range`, `--layer-name`, `--max-tile-size`,
-`--tile-buffer`, `--feature-order`, `--feature-id`, `--partition-wave`,
-`--no-simple-clip-fastpath` and `--force`. The run prints what the plan
-contains — level counts, per-kind feature tallies, how the cell-winner ranking
-resolved, the entry-zoom ladder — so the plan can be sanity-checked before any
-shard hours are committed; `--verbose` adds the per-level breakdown. If nothing
-survives the scan, the run fails and leaves no plan behind.
+It requires `--save-plan` (the plan is its only output) and refuses what
+contradicts a plan-only run: an OUTPUT path (nothing would write it) and
+`--shard I/N` (a data shard's plan would cover only that shard's rows). The
+export-side knobs `--layer-name`, `--max-tile-size`,
+`--no-simple-clip-fastpath`, `--tile-buffer`, `--partition-wave`,
+`--feature-order`, `--feature-id`, `--report`, `--keep-overview`,
+`--tile-range` and `--force` are tolerated and ignored (#600): none of them is
+a convert option, and the plan's fingerprint covers convert options only, so a
+plan-only run with them writes the same bytes as one without. No report or kept
+overview is written. Ignored is not unchecked: a value the full coarse job
+refuses before reading anything (a `--tile-buffer` over the cap, a malformed
+`--tile-range`, a missing `--keep-overview` directory, a `--feature-id` or
+`--feature-order` column that `--exclude-property` drops) is refused here too,
+so those mistakes surface before any shard is queued. The run prints what the
+plan contains — level counts, per-kind feature tallies, how the cell-winner
+ranking resolved, the entry-zoom ladder — so the plan can be sanity-checked
+before any shard hours are committed; `--verbose` adds the per-level breakdown.
+If nothing survives the scan, the run fails and leaves no plan behind.
 
 Skip it when you want the coarse tiles: a `--shard coarse` run produces them
 *and* the plan in one pass, and #541 already makes its pass 2 cheap.
