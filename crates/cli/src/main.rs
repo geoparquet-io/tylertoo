@@ -1878,7 +1878,10 @@ struct TilesArgs {
     /// features don't clip at boundaries. At most 256 (one full tile width);
     /// wider is refused, since past that a tile duplicates geometry from tiles
     /// it does not border and every feature belongs to O(buffer²) tiles (#433)
-    #[arg(long, default_value = "8")]
+    #[arg(
+        long,
+        default_value_t = tylertoo_core::overview::export::ExportOptions::default().tile_buffer
+    )]
     tile_buffer: u32,
 
     /// Partitions processed per band read during the export phase (the export
@@ -2828,10 +2831,10 @@ fn tiles_convert_options(
     // column is already gone from the intermediate before export would sort
     // or id by it — export-pmtiles rejects that pairing outright, and so must
     // the facade, before any work is done, rather than run the whole convert
-    // and then quietly fall back. (--plan-only exports nothing.)
-    if !args.plan_only {
-        reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
-    }
+    // and then quietly fall back. Also under --plan-only (#600): it exports
+    // nothing, but it is the fleet's preflight, and the coarse job and every
+    // data shard refuse this pairing.
+    reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
 
     // #444: every cheap check has passed; now estimate `auto` (a fixed zoom
     // comes back verbatim, no I/O). Here, not in the callers, so a plan-only
@@ -2857,6 +2860,45 @@ fn tiles_convert_options(
         }
     }
     Ok((options, shard, max_zoom))
+}
+
+/// The export knobs `tiles` can check without reading anything (#433): the
+/// `--tile-buffer` cap, the `--tile-range` syntax, and the `--keep-overview`
+/// directory. Returns the parsed `--tile-range`.
+///
+/// Shared by the full run and `--plan-only` (#600): plan-only ignores these
+/// flags, but it is the fleet's preflight, so a value the coarse job would
+/// refuse in milliseconds is refused there too, not after the plan is
+/// written and the data shards are queued.
+fn preflight_export_flags(args: &TilesArgs) -> Result<Option<tylertoo_core::shard::TileRange>> {
+    use tylertoo_core::overview::export::ExportOptions;
+
+    // The full `ExportOptions` are built after the convert (the layer name
+    // and shard range come out of it), so this is the same check on the
+    // values that are already known.
+    ExportOptions {
+        tile_buffer: args.tile_buffer,
+        ..ExportOptions::default()
+    }
+    .validate()
+    .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+
+    let tile_range = args
+        .tile_range
+        .as_deref()
+        .map(tylertoo_core::shard::TileRange::parse)
+        .transpose()?;
+
+    if let Some(path) = &args.keep_overview {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            anyhow::ensure!(
+                parent.is_dir(),
+                "--keep-overview directory {} does not exist",
+                parent.display()
+            );
+        }
+    }
+    Ok(tile_range)
 }
 
 /// The export-only flags set on a `--plan-only` run, by their CLI names in
@@ -2924,16 +2966,8 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     );
     let spec = resolve_io_for_planning(args.input.clone(), args.files_from.clone())?;
 
-    // #600: the fleet recipe is the coarse job's line plus this flag, and that
-    // line carries export-only flags. They cannot move the plan (see
-    // `ignored_export_options`), so they are tolerated, and said so once.
-    let ignored = ignored_export_options(&args);
-    if !ignored.is_empty() {
-        log::info!(
-            "--plan-only: ignoring export options {}",
-            ignored.join(", ")
-        );
-    }
+    // #600: export flags are ignored here, but not unchecked.
+    preflight_export_flags(&args)?;
 
     let (options, shard, _max_zoom) = tiles_convert_options(&args, &spec)?;
     // A data shard reads a subset of the input, so a plan it wrote would
@@ -2949,6 +2983,18 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
              --plan-only`"
         );
     }
+    // #600: the fleet recipe is the coarse job's line plus this flag, and that
+    // line carries export-only flags. They cannot move the plan (see
+    // `ignored_export_options`), so they are tolerated, and said so once,
+    // now that every refusal has run.
+    let ignored = ignored_export_options(&args);
+    if !ignored.is_empty() {
+        log::info!(
+            "--plan-only: ignoring export options {}",
+            ignored.join(", ")
+        );
+    }
+
     let save_plan = args
         .tuning
         .save_plan
@@ -3070,15 +3116,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     // #433: the export knobs that need no file are checked before the
     // convert, which on a large input runs for minutes before the export
-    // would otherwise refuse them. The full `ExportOptions` are built after
-    // the convert (the layer name and shard range come out of it), so this
-    // is the same check on the values that are already known.
-    ExportOptions {
-        tile_buffer: args.tile_buffer,
-        ..ExportOptions::default()
-    }
-    .validate()
-    .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+    // would otherwise refuse them.
+    let manual_range = preflight_export_flags(&args)?;
 
     // Derive the layer name from the input if not given: file stem for a
     // single file, last path segment for a directory or s3://gs:// prefix,
@@ -3096,10 +3135,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // A data shard's range prunes the convert's reads as well as the export;
     // a hand-written `--tile-range` restricts the export only (the two flags
     // conflict, so at most one is set).
-    let tile_range = match (&shard, &args.tile_range) {
-        (Some(job), _) => job.range,
-        (None, Some(text)) => Some(tylertoo_core::shard::TileRange::parse(text)?),
-        (None, None) => None,
+    let tile_range = match &shard {
+        Some(job) => job.range,
+        None => manual_range,
     };
 
     // The data shard's own range, kept past `tile_range`'s move into
@@ -3111,16 +3149,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // directory, removed on drop — success or failure alike.
     let (overview_path, overview_tmp): (PathBuf, Option<tempfile::NamedTempFile>) =
         match &args.keep_overview {
-            Some(path) => {
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    anyhow::ensure!(
-                        parent.is_dir(),
-                        "--keep-overview directory {} does not exist",
-                        parent.display()
-                    );
-                }
-                (path.clone(), None)
-            }
+            // Its directory was checked by `preflight_export_flags`.
+            Some(path) => (path.clone(), None),
             None => {
                 let dir = resolve_intermediate_dir(
                     args.tuning.spill_dir.as_deref(),
@@ -4773,6 +4803,13 @@ mod tests {
         assert_eq!(
             ignored_export_options(&a),
             vec!["--layer-name", "--report", "--force"]
+        );
+
+        // The clap default IS export's default, so a bare run never names
+        // --tile-buffer.
+        assert_eq!(
+            bare.tile_buffer,
+            tylertoo_core::overview::export::ExportOptions::default().tile_buffer
         );
 
         // A default typed explicitly is the same run as omitting it.

@@ -1219,9 +1219,75 @@ fn plan_only_misuse_is_refused() {
     assert!(!ok, "--plan-only on a data shard must fail: {out}");
     assert!(out.contains("data shard"), "unexpected: {out}");
 
+    // The same data-shard refusal with an export flag on the line: the
+    // "ignoring" note belongs to a run that proceeds, so a refused one does
+    // not print it (#600).
+    let (ok, out) = run(&[
+        "tiles",
+        grid().to_str().unwrap(),
+        "--shard",
+        "0/2",
+        "--shard-plan",
+        shard_plan.to_str().unwrap(),
+        "--save-plan",
+        plan.to_str().unwrap(),
+        "--plan-only",
+        "--layer-name",
+        "x",
+    ]);
+    assert!(!ok, "--plan-only on a data shard must fail: {out}");
+    assert!(
+        !out.contains("ignoring export options"),
+        "a refused run must not announce what it ignores: {out}"
+    );
+
     // Export-side knobs are NOT misuse (#600): they are tolerated no-ops, so
     // the fleet's coarse-job line plus `--plan-only` runs as-is. See
-    // `plan_only_tolerates_export_only_flags`.
+    // `plan_only_tolerates_export_only_flags`. Tolerated is not unchecked,
+    // though: a value the full coarse job refuses before reading anything is
+    // refused here too, so the plan-only run stays the fleet's preflight.
+    let missing_dir = dir.path().join("no-such-dir").join("o.parquet");
+    let input = grid();
+    let input = input.to_str().unwrap();
+    for (knob, expect) in [
+        (vec!["--tile-buffer", "999"], "256"),
+        (vec!["--tile-range", "banana"], "banana"),
+        (
+            vec!["--keep-overview", missing_dir.to_str().unwrap()],
+            "does not exist",
+        ),
+        (
+            vec!["--exclude-property", "cell_id", "--feature-id", "cell_id"],
+            "--feature-id",
+        ),
+        (
+            vec![
+                "--exclude-property",
+                "weight",
+                "--feature-order",
+                "weight:desc",
+            ],
+            "--feature-order",
+        ),
+    ] {
+        let mut argv = vec![
+            "tiles",
+            input,
+            "--max-zoom",
+            "5",
+            "--save-plan",
+            plan.to_str().unwrap(),
+            "--plan-only",
+        ];
+        argv.extend(knob.iter().copied());
+        let (ok, out) = run(&argv);
+        assert!(!ok, "--plan-only with {knob:?} must fail: {out}");
+        assert!(out.contains(expect), "{knob:?}: expected {expect:?}: {out}");
+        assert!(
+            !out.contains("ignoring export options"),
+            "{knob:?}: a refused run must not announce what it ignores: {out}"
+        );
+    }
 
     // Nothing above got as far as writing a plan.
     assert!(!plan.exists(), "a refused --plan-only run wrote a plan");
@@ -1394,6 +1460,34 @@ fn plan_only_tolerates_export_only_flags() {
         std::fs::read(&bare_plan).unwrap(),
         std::fs::read(&ranged_plan).unwrap(),
         "export-only flags must not move the plan"
+    );
+
+    // And against the FULL unsharded run with the same two flags, which
+    // actually exports with them: its plan is the one plan-only wrote.
+    let full_plan = dir.path().join("full.plan");
+    let (ok, out) = run(&[
+        "tiles",
+        &grid_s,
+        dir.path().join("full.pmtiles").to_str().unwrap(),
+        "--max-zoom",
+        "5",
+        "--save-plan",
+        full_plan.to_str().unwrap(),
+        "--tile-range",
+        "21..40",
+        "--layer-name",
+        "x",
+        "--feature-id",
+        "cell_id",
+    ]);
+    assert!(
+        ok,
+        "the full run with --tile-range/--feature-id must succeed: {out}"
+    );
+    assert_eq!(
+        std::fs::read(&full_plan).unwrap(),
+        std::fs::read(&ranged_plan).unwrap(),
+        "--plan-only must write the full run's plan with --tile-range/--feature-id"
     );
 }
 
