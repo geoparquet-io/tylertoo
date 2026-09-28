@@ -107,7 +107,7 @@ Generate PMTiles vector tiles (the default pipeline)
 
    For a fleet, pass `--shard coarse --shard-plan` as well: the data shards (`--shard I/N`) refuse a plan that does not record their shard plan's cut. Without them the plan is for an unsharded `tiles --plan` / `overview --plan` replay only. The pivot may equal --min-zoom here (the handover shape: the external archive owns every zoom below it), since a plan-only coarse job builds no zoom of its own.
 
-   Pass the same convert flags the fleet's shards will use, plus this one (export-only flags are refused): the plan is fingerprinted, so a plan-only run is byte-identical to the plan a full (or `--shard coarse`) run writes with the same options, and nothing else about the fleet changes.
+   Pass the coarse job's own line minus OUTPUT, plus this flag: the plan is fingerprinted, so a plan-only run is byte-identical to the plan a full (or `--shard coarse`) run writes with the same options, and nothing else about the fleet changes. Export-only flags on that line (--layer-name, --max-tile-size, --no-simple-clip-fastpath, --tile-buffer, --partition-wave, --feature-order, --feature-id, --report, --keep-overview, --tile-range, --force) cannot reach the plan, so they are ignored and named in one info line (#600).
 * `-v`, `--verbose` — Enable verbose output (per-level and per-zoom breakdowns)
 * `-f`, `--force` — Overwrite the output if it exists
 * `--verbatim` — Tile the input EXACTLY AS GIVEN: switch the whole generalization ladder off at every level (#345 / #360).
