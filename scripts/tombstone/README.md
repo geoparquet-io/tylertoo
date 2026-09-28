@@ -1,5 +1,11 @@
 # Tombstoning `gpq-tiles` / `gpq-tiles-core`
 
+> **Status (2026-09-28):** the crates.io half is done. `gpq-tiles` and `gpq-tiles-core`
+> 0.6.1 carry the rename notice, and 0.6.0 stays listed and un-yanked. The PyPI half was
+> skipped on purpose: the old name has few downloads, the project had not launched, and an
+> sdist-only 0.6.1 would turn `pip install gpq-tiles` into a source build. Part 2 below stays
+> as written in case that decision changes. Tracking issue #409 is closed.
+
 The project was renamed `gpq-tiles` → `tylertoo`. `tylertoo` and `tylertoo-core` are live on
 crates.io and PyPI, but the **old names still sit at 0.6.0 with no forwarding address**:
 
@@ -188,12 +194,15 @@ Caveats, all of them deliberate trade-offs — read before doing this:
 
 ## Verification
 
+The crates.io API returns an empty body to a request with no `User-Agent` header, so the
+`curl` calls below pass one with `-A`.
+
 ```bash
-curl -s https://crates.io/api/v1/crates/gpq-tiles \
+curl -s -A 'gpq-tiles-tombstone-check' https://crates.io/api/v1/crates/gpq-tiles \
   | python3 -c 'import json,sys;d=json.load(sys.stdin)["crate"];print(d["max_version"],"|",d["description"])'
 # expect: 0.6.1 | RENAMED to tylertoo — …
 
-curl -s https://crates.io/api/v1/crates/gpq-tiles-core \
+curl -s -A 'gpq-tiles-tombstone-check' https://crates.io/api/v1/crates/gpq-tiles-core \
   | python3 -c 'import json,sys;d=json.load(sys.stdin)["crate"];print(d["max_version"],"|",d["description"])'
 # expect: 0.6.1 | RENAMED to tylertoo-core — …
 
