@@ -403,10 +403,13 @@ type TileEdge = ((i32, i32), (i32, i32));
 /// with fewer than three distinct vertices. Rounding is monotone, so two
 /// corners at least one unit apart on an axis always snap to different
 /// integers there, and a square that wide keeps all four corners distinct
-/// wherever it sits. Anything narrower can snap to a segment or a point.
-/// Producers of placeholder geometry (the tiny-polygon accumulator, #407)
-/// compare against this bound rather than a copy of it.
-pub const MIN_SURVIVING_SQUARE_SIDE: f64 = 1.0;
+/// wherever it sits. A narrower square of side `s` is kept only when both
+/// axes straddle a rounding boundary, which over uniformly placed squares
+/// happens with probability `s²`: sub-unit squares thin out, they do not all
+/// vanish. The placeholder-square producers (#279 dither, #384 accumulator)
+/// floor their side at this bound so every placeholder they emit is drawn
+/// (#407).
+pub(crate) const MIN_SURVIVING_SQUARE_SIDE: f64 = 1.0;
 
 /// Snap a ring to tile units, dropping consecutive duplicates and closing it.
 /// Returns `None` when fewer than three distinct vertices remain — the ring
@@ -3652,8 +3655,9 @@ mod tests {
 
     /// #407: [`MIN_SURVIVING_SQUARE_SIDE`] is the cleaner's own bound. An
     /// axis-aligned square at least that wide keeps three distinct vertices
-    /// after the snap wherever it sits on the grid; one under it can snap
-    /// to a point or a segment and be dropped as degenerate.
+    /// after the snap wherever it sits on the grid. A narrower one of side
+    /// `s` survives at a fraction `s²` of grid offsets: the cleaner thins
+    /// sub-unit squares, it does not drop them all.
     #[test]
     fn a_square_of_the_minimum_side_survives_quantization() {
         let sq = |x: f64, y: f64, side: f64| {
@@ -3678,7 +3682,25 @@ mod tests {
             }
         }
         assert!(requantize_ring(&sq(0.6, 0.6, 0.0)).is_none());
-        assert!(requantize_ring(&sq(0.6, 0.6, min * 0.5)).is_none());
+        // Sub-unit sides: survival over a uniform grid of offsets in one
+        // unit cell is the product of the per-axis straddle chances, s².
+        let n = 200;
+        for s in [0.1, 0.25, 0.5, 0.8, 0.99] {
+            let side = min * s;
+            let mut kept = 0usize;
+            for i in 0..n {
+                for j in 0..n {
+                    let (x, y) = ((i as f64 + 0.5) / n as f64, (j as f64 + 0.5) / n as f64);
+                    kept += usize::from(requantize_ring(&sq(x, y, side)).is_some());
+                }
+            }
+            let frac = kept as f64 / (n * n) as f64;
+            assert!(
+                (frac - s * s).abs() < 0.02,
+                "side {side}: kept {frac} of offsets, expected {}",
+                s * s
+            );
+        }
     }
 
     /// The snap itself: finite values clamp to ±[`TILE_COORD_CLAMP`], the

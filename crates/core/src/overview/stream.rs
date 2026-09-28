@@ -81,7 +81,9 @@ use rayon::prelude::*;
 use crate::batch_processor::{extract_geometries_from_array, extract_geometries_opt_from_array};
 use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 
-use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
+use super::accumulate::{
+    is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
+};
 use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{collected_line_bytes, CoalesceInput};
@@ -103,7 +105,7 @@ use super::pipeline;
 use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::simplify::{
-    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step,
+    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step_at,
     validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
     Simplified, SimplifyOptions,
 };
@@ -751,12 +753,14 @@ fn streaming_carriers(
     let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
-        .map(|(l, &(gsd, zoom))| AccumulateLevel {
-            gsd_meters: gsd,
-            zoom,
-            enabled: l != finest_planned
-                && accumulator_enabled(options)
-                && level_accumulates(options.simplify.collapse, level_reprs[l]),
+        .map(|(l, &(gsd, zoom))| {
+            AccumulateLevel::new(
+                gsd,
+                zoom,
+                l != finest_planned
+                    && accumulator_enabled(options)
+                    && level_accumulates(options.simplify.collapse, level_reprs[l]),
+            )
         })
         .collect();
     if !acc_levels.iter().any(|l| l.enabled) {
@@ -787,6 +791,12 @@ fn streaming_carriers(
 /// disposition somewhere — globally via `--collapse-square`, or in a
 /// `--representation` square band.
 fn accumulator_enabled(options: &ConvertOptions) -> bool {
+    accumulator_requested(options) && options.simplify.factor > 0.0
+}
+
+/// [`accumulator_enabled`] before the #407 zero-factor check: the square
+/// disposition is on somewhere in a duplicating run.
+fn accumulator_requested(options: &ConvertOptions) -> bool {
     matches!(options.mode, Mode::Duplicating)
         && (options.simplify.collapse == CollapseMode::Square
             || options
@@ -868,6 +878,7 @@ fn build_cascade_chains(
                 .map(|f| CascadeStep {
                     gsd_meters: f.gsd,
                     repr: repr_of(f.zoom),
+                    zoom: f.zoom,
                 })
                 .collect();
             chain.reverse();
@@ -925,6 +936,7 @@ fn build_level_ctxs<'a>(
                 duplicating: inputs.duplicating,
                 verbatim,
                 gsd_m: e.gsd,
+                zoom: e.zoom,
                 repr: repr_of(e.zoom),
                 crs: inputs.crs,
                 simplify: &options.simplify,
@@ -4591,7 +4603,10 @@ fn run_pass1_with_chunk_rows(
         }
     }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
-    let want_areas = accumulator_enabled(options);
+    // #407: a zero simplify factor has no placeholder, so pass 1 collects no
+    // areas; `placeholder_has_size` says so once, here.
+    let want_areas =
+        accumulator_requested(options) && placeholder_has_size(options.simplify.factor);
     let mut areas: Vec<f32> = Vec::new();
     let mut num_rows = 0usize;
     let mut geom_bytes = 0u64;
@@ -4982,6 +4997,9 @@ pub(super) struct LevelStreamCtx<'a> {
     duplicating: bool,
     verbatim: bool,
     gsd_m: f64,
+    /// The level's recorded zoom (`None` for a `--gsd` plan): fixes the tile
+    /// unit the placeholder square is floored at (#407).
+    zoom: Option<u8>,
     /// Zoom-band representation (#317 / #279): how this level renders
     /// polygonal features (full geometry, representative points, or
     /// dithered placeholder squares for the below-tolerance ones).
@@ -5271,12 +5289,12 @@ pub(super) fn process_level_batch(
                 } else if ctx.is_carrier_row(row_offset + i) {
                     // #384: a carrier stands in for its neighbourhood's
                     // dropped area as one placeholder square.
-                    carrier_square(g, ctx.gsd_m, ctx.crs, ctx.simplify)
+                    carrier_square(g, ctx.gsd_m, ctx.zoom, ctx.crs, ctx.simplify)
                         .map_or(Simplified::Dropped, Simplified::Keep)
                 } else if !ctx.cascade_chain.is_empty() {
                     simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
                 } else {
-                    simplify_step(g, ctx.gsd_m, ctx.crs, ctx.simplify, ctx.repr)
+                    simplify_step_at(g, ctx.gsd_m, ctx.zoom, ctx.crs, ctx.simplify, ctx.repr)
                 }
             })
             .collect();
@@ -5420,6 +5438,7 @@ pub(super) fn process_batch_cascade(
             == Some(&CascadeStep {
                 gsd_meters: c.gsd_m,
                 repr: c.repr,
+                zoom: c.zoom,
             })));
     // Coalesce-table presence is uniform across buffered levels (tables are
     // built for every non-verbatim level or none); the superset selection
@@ -5528,6 +5547,7 @@ pub(super) fn process_batch_cascade(
                 let step = CascadeStep {
                     gsd_meters: ctx.gsd_m,
                     repr: ctx.repr,
+                    zoom: ctx.zoom,
                 };
                 match fold.step(g, &step, ctx.crs, ctx.simplify) {
                     FoldStep::Keep { geom, shared: s } => {
@@ -5595,6 +5615,7 @@ pub(super) fn process_batch_cascade(
                     if let Some(sq) = carrier_square(
                         geoms[pos as usize].as_ref(),
                         ctx.gsd_m,
+                        ctx.zoom,
                         ctx.crs,
                         ctx.simplify,
                     ) {
@@ -7205,6 +7226,7 @@ mod tests {
             duplicating: true,
             verbatim: true,
             gsd_m: 10.0,
+            zoom: None,
             repr: Representation::Geometry,
             crs,
             simplify: &options.simplify,
@@ -7506,7 +7528,13 @@ mod tests {
     /// Carriers for a two-level plan (1000 m accumulating, 10 m canonical)
     /// under `--collapse-square` with the given simplify factor.
     fn carriers_for_factor(factor: f64) -> Vec<Vec<usize>> {
-        let (feats, min_levels, areas) = ten_dropped_fields();
+        let (_, _, areas) = ten_dropped_fields();
+        carriers_for(factor, areas)
+    }
+
+    /// [`carriers_for_factor`] with explicit per-field areas (m²).
+    fn carriers_for(factor: f64, areas: Vec<f32>) -> Vec<Vec<usize>> {
+        let (feats, min_levels, _) = ten_dropped_fields();
         let options = ConvertOptions {
             mode: Mode::Duplicating,
             simplify: SimplifyOptions {
@@ -7542,8 +7570,8 @@ mod tests {
     }
 
     /// #407, the zero case: `--simplify-factor 0` makes the placeholder
-    /// threshold `(0 × gsd)² = 0`. The accumulator must skip the level (the
-    /// sub-unit guard) rather than let every dropped polygon cross a
+    /// threshold `(0 × gsd)² = 0`. The accumulator must not run (there is
+    /// no placeholder, as in tippecanoe at `tiny_polygon_size` 0) rather than let every dropped polygon cross a
     /// zero threshold and come back as a zero-size carrier square.
     #[test]
     fn streaming_carriers_skip_a_zero_simplify_factor() {
@@ -7555,23 +7583,25 @@ mod tests {
         );
     }
 
-    /// #407, the tiny-factor case: a factor small enough that the placeholder
-    /// square would quantize below one tile unit (here 1e-6 ⇒ a 1 mm side,
-    /// T = 1e-6 m²) must not turn every dropped polygon into a carrier — the
-    /// MVT cleaner drops the resulting rings as degenerate, so the level
-    /// would carry every feature and show none of it.
-    ///
-    /// The guard skips a level whose placeholder side is under
-    /// [`MIN_SURVIVING_SQUARE_SIDE`](crate::mvt::MIN_SURVIVING_SQUARE_SIDE)
-    /// tile units at the level's export zoom.
+    /// #407, the tiny-factor case: at 1e-6 × GSD (a 1 mm side, T = 1e-6
+    /// m²) every dropped polygon used to cross the threshold on its own and
+    /// become a carrier. The side is now floored at one tile unit at the
+    /// level's export zoom (z5 for a 1000 m GSD: 305.7 m, T ≈ 93,500 m²), so
+    /// ten 20,000 m² fields make two carriers, exactly as at the one-unit
+    /// factor itself.
     #[test]
-    fn streaming_carriers_skip_a_sub_unit_simplify_factor() {
-        let carriers = carriers_for_factor(1e-6);
-        assert!(
-            carriers[0].len() < 10,
-            "a sub-unit threshold turned every dropped polygon into a carrier: {:?}",
+    fn streaming_carriers_floor_a_sub_unit_simplify_factor() {
+        use super::super::simplify::tile_unit_meters;
+        let small = vec![20_000.0f32; 10];
+        let carriers = carriers_for(1e-6, small.clone());
+        assert_eq!(
+            carriers[0].len(),
+            2,
+            "200,000 m² over T ≈ 93,500 m² is two carriers: {:?}",
             carriers[0]
         );
+        let one_unit = tile_unit_meters(1000.0, None) / 1000.0;
+        assert_eq!(carriers, carriers_for(one_unit, small));
     }
 
     // ---- #570: the chain tables are built once, in pass 1 -------------------

@@ -588,7 +588,9 @@ the primary-reference behavior for keeping dense small-polygon layers
 changes**: squares are polygons, `geometry_types` stays `["Polygon"]`, and
 there is no spec-Q4 geometry-type opt-in involved.
 
-Two mechanisms share the threshold `T = tol²` (#384):
+Two mechanisms share the threshold `T = side²` (#384), where `side` is
+`tol` floored at one tile unit of the level's zoom (#407, see the
+divergences below):
 
 **The accumulator** covers every polygon the level does *not* carry —
 failed the visibility gate, lost its thinning cell, cut by the density
@@ -636,12 +638,24 @@ Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
 - tippecanoe places the placeholder at the ring's first vertex with side
   `tiny_polygon_size` (default 2 px); ours sits at the polygon's
   representative point with side `simplify-factor × GSD`.
-- tippecanoe's placeholder side is a fixed pixel size; ours is
-  `simplify-factor × GSD`, so a level whose square would be narrower than
-  one tile unit at its zoom (`--simplify-factor` below 0.25 with the
-  default `--gsd-base` and extent, including `--simplify-factor 0`) skips
-  the accumulator and logs it, rather than emitting squares the tile
-  encoder drops as degenerate (#407).
+- tippecanoe's placeholder side is a fixed count of tile units; ours is
+  `simplify-factor × GSD`, **floored at one tile unit** at the level's
+  zoom (#407). One unit is `40,075,016.69 m / 2^zoom / 4096`, which for a
+  `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`: a quarter of
+  the GSD at the default `--gsd-base 1024`, so the floor applies when
+  `--simplify-factor < gsd-base / 4096` (below 0.25 by default; at
+  `--gsd-base 8192` even the default 1.0 is floored to 2 × GSD). A narrower
+  square would reach the tile encoder, which keeps a square of side `s <
+  1` unit only with probability `s²`; floored, every placeholder is drawn,
+  there are fewer of them, and the log names the zooms where the floor
+  applied. On those levels a patch's leftover area (under one `T`) is
+  dithered into one more carrier with probability `leftover / T` rather
+  than dropped. The unit assumes the default 4096 extent, the only one the
+  CLI exports at; exporting at a larger extent (Python `export(extent=…)`)
+  draws floored squares over more than one unit, a smaller one draws them
+  under a unit, where they thin as described. `--simplify-factor 0` has no
+  placeholder at all: the accumulator is skipped and logged, as tippecanoe
+  skips its reduction at `tiny_polygon_size` 0.
 - the accumulator needs duplicating mode (a carrier is a second appearance
   of a feature, which partitioning's feature-once contract cannot
   represent). In partitioning mode neither mechanism applies: levels are
