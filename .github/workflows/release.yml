@@ -189,7 +189,7 @@ jobs:
         run: |
           STAGE="tylertoo-$VERSION-$TARGET"
           mkdir -p "dist/$STAGE"
-          cp "target/$TARGET/release/tylertoo" README.md LICENSE "dist/$STAGE/"
+          cp "target/$TARGET/release/tylertoo" README.md LICENSE NOTICE "dist/$STAGE/"
           tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
           rm -r "dist/${STAGE:?}"
 
@@ -203,7 +203,7 @@ jobs:
           $stage = "tylertoo-$env:VERSION-$env:TARGET"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
           Copy-Item "target/$env:TARGET/release/tylertoo.exe" "dist/$stage/"
-          Copy-Item README.md, LICENSE "dist/$stage/"
+          Copy-Item README.md, LICENSE, NOTICE "dist/$stage/"
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
           Remove-Item -Recurse "dist/$stage"
 

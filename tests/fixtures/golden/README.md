@@ -45,7 +45,7 @@ tippecanoe \
 
 | File | Source | Description |
 |------|--------|-------------|
-| `open-buildings.pmtiles` | Microsoft Open Buildings (Andorra) | ~1000 building polygons |
+| `open-buildings.pmtiles` | VIDA Google-Microsoft-OSM Open Buildings (Andorra) | ~1000 building polygons |
 | `fieldmaps-boundaries.pmtiles` | FieldMaps ADM boundaries | Administrative boundaries |
 | `road-detections.pmtiles` | Road detection data | Road linestrings |
 

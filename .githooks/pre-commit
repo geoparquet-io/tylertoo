@@ -112,3 +112,11 @@ cp README.md crates/cli/README.md
 cp README.md crates/python/README.md
 git add crates/core/README.md crates/cli/README.md crates/python/README.md 2>/dev/null || true
 echo "READMEs synced!"
+
+# Sync NOTICE to subcrates: cargo and maturin package only files inside the
+# crate directory, and Apache-2.0 section 4(d) carries NOTICE with every
+# redistribution.
+cp NOTICE crates/core/NOTICE
+cp NOTICE crates/cli/NOTICE
+cp NOTICE crates/python/NOTICE
+git add crates/core/NOTICE crates/cli/NOTICE crates/python/NOTICE 2>/dev/null || true
