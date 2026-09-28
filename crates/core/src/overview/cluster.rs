@@ -34,8 +34,9 @@
 //! in its own cell. The budget, however, can *defer* a cell winner to a finer
 //! level, leaving the cell with no present row ("orphan cell"). Orphan cells
 //! are resolved deterministically: the cell's features attach to the present
-//! point feature nearest to the orphan cell's center, found by an expanding
-//! ring search over the level grid (ties broken by [`Priority`]). This keeps
+//! point feature nearest (Euclidean) to the orphan cell's center, over every
+//! present point of the level, found by one scan over the present cells
+//! (ties broken by [`Priority`], then input position). This keeps
 //! the invariant *Σ point_count over a level's point rows = total source
 //! point count* whenever the level has at least one point row.
 //!
@@ -47,7 +48,7 @@
 //! geometry is deterministic, preserves a real feature location, and requires
 //! no geometry rewrite at coarse levels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection};
 use super::level::Crs;
@@ -119,6 +120,14 @@ pub struct ClusterEntry {
 /// `O(actual clusters)`), and the canonical (finest) level's table is always
 /// empty: every cluster there is a singleton and rows pass through verbatim
 /// (spec §2.4 value-identity).
+///
+/// The [`AssignFeature::index`] of every POINT feature must be unique. The
+/// writer applies an entry to every row that carries its index, so a shared
+/// index would stamp one cluster's `point_count` on several rows and break
+/// the spec §12.1 sum invariant. If a caller passes duplicate point indices
+/// anyway, [`build_cluster_tables`] still returns the same table on every
+/// call (the clusters of all present rows sharing an index are merged into
+/// that index's entry, #609), and [`verify_sum_invariant`] rejects it.
 pub type ClusterTables = Vec<HashMap<usize, ClusterEntry>>;
 
 /// Per-cluster running aggregate state for one [`AccumulateSpec`].
@@ -212,7 +221,7 @@ pub fn build_cluster_tables(
     // (#565). `Priority` is 32 B, so a `Vec<Priority>` here was another
     // dataset-wide table alongside the pass-1 feature table — and it bought
     // almost nothing: the two comparisons below run once per *present* point
-    // per level (the cell-winner fold) and once per orphan-cell ring candidate,
+    // per level (the cell-winner fold) and once per orphan-cell candidate,
     // not inside an O(n log n) sort, so recomputing is in the noise.
     let prio = |pos: usize| Priority::new(&features[pos], config.sort_direction);
 
@@ -286,7 +295,8 @@ pub fn build_cluster_tables(
         }
 
         // Resolve orphan cells (density-budget deferrals): nearest present
-        // feature by expanding ring search over the level grid, deterministic.
+        // feature by one scan over the present cells (see `nearest_present`),
+        // deterministic.
         if !orphan_cells.is_empty() {
             let mut orphan_keys: Vec<(i64, i64)> = orphan_cells.keys().copied().collect();
             orphan_keys.sort_unstable();
@@ -302,12 +312,23 @@ pub fn build_cluster_tables(
             }
         }
 
-        // Accumulate counts + aggregates per representative.
+        // Accumulate counts + aggregates per representative's `index` (#609).
+        //
+        // The table is keyed by `AssignFeature::index`. Point indices must be
+        // unique (see [`ClusterTables`]), and with unique indices this is the
+        // per-row table. Keying the accumulator by POSITION and then inserting
+        // by index let two present rows that share an index overwrite each
+        // other in `HashMap` iteration order, so a caller that broke the
+        // uniqueness rule got a different table on each call. Accumulating by
+        // index merges such rows into one entry instead, deterministically:
+        // values are added in `point_pos` order. The merged table is still not
+        // a valid output (the writer would stamp the merged count on every row
+        // sharing the index), and `verify_sum_invariant` rejects it.
         let mut acc: HashMap<usize, (i64, Vec<AggState>)> = HashMap::new();
         for (i, &pos) in point_pos.iter().enumerate() {
             let w = rep[i];
             let entry = acc
-                .entry(w)
+                .entry(features[w].index)
                 .or_insert_with(|| (0, vec![AggState::new(); ops.len()]));
             entry.0 += 1;
             for (s, vals) in values.iter().enumerate() {
@@ -319,12 +340,12 @@ pub fn build_cluster_tables(
 
         // Keep only non-singleton clusters (singletons pass through verbatim).
         let table = &mut tables[level];
-        for (w, (count, states)) in acc {
+        for (index, (count, states)) in acc {
             if count <= 1 {
                 continue;
             }
             table.insert(
-                features[w].index,
+                index,
                 ClusterEntry {
                     point_count: count,
                     aggregates: states
@@ -345,6 +366,9 @@ pub fn build_cluster_tables(
 /// exactly one point row of that level, so `Σ point_count` over a level's
 /// point rows equals the total source point count exactly — under any drop
 /// mechanism (cell-winner thinning, density budget, their interactions).
+/// Two present point rows sharing an [`AssignFeature::index`] at a level are
+/// a violation too: the writer applies an entry to every row carrying its
+/// index, so the rows would repeat one cluster's `point_count`.
 ///
 /// Also asserts the derived producer obligation: a clustered level MUST NOT
 /// thin its points to zero while the source contains points — there must be
@@ -369,12 +393,35 @@ pub fn verify_sum_invariant(
     for (level, table) in tables.iter().enumerate() {
         let mut sum = 0i64;
         let mut point_rows = 0usize;
+        // Indices of the table entries seen at this level, to reject a
+        // duplicate present point index (#609). Only table keys are tracked
+        // (memory O(clusters), never O(rows)). That catches every duplicate
+        // `build_cluster_tables` can leave at a clustered level: rows sharing
+        // an index are merged into one entry of point_count >= 2, so the
+        // index is always in the table. At the canonical level the table is
+        // empty and a shared index goes undetected, but every row there
+        // writes point_count 1, so the per-row sum is still exact.
+        let mut seen: HashSet<usize> = HashSet::new();
         for (f, &ml) in features.iter().zip(min_levels) {
             if f.kind != FeatureKind::Point || ml as usize > level {
                 continue;
             }
             point_rows += 1;
-            sum += table.get(&f.index).map_or(1, |e| e.point_count);
+            match table.get(&f.index) {
+                Some(e) => {
+                    if !seen.insert(f.index) {
+                        return Err(format!(
+                            "clustered level {level}: two present point rows \
+                             share feature index {}; cluster tables are keyed \
+                             by index, so each row would carry the same \
+                             point_count (point feature indices must be unique)",
+                            f.index
+                        ));
+                    }
+                    sum += e.point_count;
+                }
+                None => sum += 1,
+            }
         }
         if point_rows == 0 {
             return Err(format!(
@@ -393,13 +440,47 @@ pub fn verify_sum_invariant(
     }
     Ok(())
 }
-
-/// Deterministic nearest present point feature to the center of `cell_key`,
-/// searched over expanding Chebyshev rings of the level grid. Among the
-/// candidates of the first non-empty ring, the one with the smallest squared
-/// distance to the orphan cell's center wins; exact ties fall back to the
-/// cell-winner [`Priority`] order. `present` is non-empty (checked by caller),
-/// so the search terminates within the present cells' key bounds.
+/// Deterministic nearest present point feature to the center of `cell_key`.
+///
+/// The rule: over EVERY present cell winner, the smallest squared Euclidean
+/// distance from the feature's center to the orphan cell's center wins;
+/// exact ties fall back to the cell-winner [`Priority`] order, and a full
+/// `Priority` tie (only possible when two features share an `index`) to the
+/// smaller position. A NaN distance (a NaN center, reachable only through the
+/// public API) counts as infinitely far. The comparison is therefore a strict
+/// total order, and the answer does not depend on `HashMap` iteration order.
+///
+/// # One scan instead of rings (#610)
+///
+/// The original expanding-ring search visited every cell of rings
+/// `1..=r + 1` (about `4r²` hash lookups and one `Vec` per ring), so an orphan
+/// 64,000 cells from the nearest present cell took minutes. It also paid a
+/// full pass over `present` up front for its radius bound. This function does
+/// only that one pass, so each orphan costs `O(|present|)` whatever the gap.
+/// A cell at Chebyshev distance `r` (in cells) holds points no nearer than
+/// `(r - 0.5)` cells to the orphan center, so a cell whose lower bound already
+/// exceeds the best distance so far is skipped without computing a distance
+/// (only for keys within ±2^40, where `f64` still resolves single cells).
+///
+/// The ring search stopped after rings `r_min` and `r_min + 1`. That is not
+/// the nearest point: a point in the far corner of a ring-`r` cell is up to
+/// `sqrt(2)·(r + 0.5)` cells away, while one in a ring-`r + 2` cell can be as
+/// near as `r + 1.5`, which is smaller for every `r >= 2`. The ring limit only
+/// bounded the walk; the scan reads every present cell anyway, so it returns
+/// the true nearest, as the spec's §12.1 note ("tylertoo: the nearest") says.
+///
+/// # Saturated keys (#611)
+///
+/// A finite but huge coordinate (e.g. `1e300`) gives a grid key saturated to
+/// `i64::MAX`/`i64::MIN`, and the difference of two keys then overflows
+/// `i64` (a panic: release builds keep `overflow-checks`). Keys are now
+/// subtracted only for the pruning bound, and only when both lie within
+/// ±2^40; other cells are measured in `f64` directly. No `cell_key + offset`
+/// sums remain. Every point more than about `9.2e18`
+/// cells from the origin shares the saturated cell, and an orphan in that
+/// cell is measured from the saturated cell's center, not from its points,
+/// so the representative chosen for it has no spatial meaning; it only keeps
+/// the point counted (§12.1).
 fn nearest_present(
     cell_key: (i64, i64),
     present: &HashMap<(i64, i64), usize>,
@@ -415,73 +496,70 @@ fn nearest_present(
         let (x, y) = features[pos].center();
         let dx = x - center.0;
         let dy = y - center.1;
-        dx * dx + dy * dy
-    };
-    let better = |a: usize, b: usize| -> bool {
-        let (da, db) = (dist_sq(a), dist_sq(b));
-        if da != db {
-            da < db
+        let d = dx * dx + dy * dy;
+        if d.is_nan() {
+            f64::INFINITY
         } else {
-            Priority::new(&features[a], dir).beats(&Priority::new(&features[b], dir))
+            d
         }
     };
+    // Does `a` (at squared distance `da`) beat `b` (at `db`)?
+    let beats = |a: usize, da: f64, b: usize, db: f64| -> bool {
+        if da != db {
+            return da < db;
+        }
+        let (pa, pb) = (
+            Priority::new(&features[a], dir),
+            Priority::new(&features[b], dir),
+        );
+        if pa.beats(&pb) {
+            true
+        } else if pb.beats(&pa) {
+            false
+        } else {
+            a < b
+        }
+    };
+    // Lower bound on the squared distance from the orphan center to any
+    // point in the cell at `key`, or 0 (no pruning) where it is not safe.
+    // The exact bound is `r - 0.5` cells; `r - 1` leaves half a cell of slack
+    // for float rounding in `floor(x / cell_size)` and in the center. That
+    // slack only holds while cell indices are small enough for `f64` to
+    // resolve single cells: beyond about 2^52 neighbouring cells collapse to
+    // the same coordinate (and saturated keys say nothing about where their
+    // points are), so keys outside ±2^40 are never pruned, just measured.
+    const PRUNE_KEY_LIMIT: i64 = 1 << 40;
+    let key_ok = |(x, y): (i64, i64)| {
+        x.unsigned_abs() < PRUNE_KEY_LIMIT as u64 && y.unsigned_abs() < PRUNE_KEY_LIMIT as u64
+    };
+    let orphan_key_ok = key_ok(cell_key);
+    let lower_bound_sq = |key: (i64, i64)| -> f64 {
+        if !(orphan_key_ok && key_ok(key)) {
+            return 0.0;
+        }
+        // Both keys are within ±2^40, so the difference cannot overflow and
+        // `r - 1 < 2^41` converts to `f64` exactly.
+        let r = (key.0 - cell_key.0).abs().max((key.1 - cell_key.1).abs());
+        let lb = (r - 1) as f64 * cell_size;
+        lb * lb
+    };
 
-    // Maximum useful ring radius: the farthest present cell (Chebyshev).
-    let max_r = present
-        .keys()
-        .map(|&(x, y)| (x - cell_key.0).abs().max((y - cell_key.1).abs()))
-        .max()
-        .expect("present is non-empty");
-
-    let mut best: Option<usize> = None;
-    for r in 1..=max_r {
-        for (dx, dy) in ring_offsets(r) {
-            if let Some(&w) = present.get(&(cell_key.0 + dx, cell_key.1 + dy)) {
-                if best.is_none_or(|b| better(w, b)) {
-                    best = Some(w);
-                }
+    let mut best: Option<(usize, f64)> = None;
+    for (&key, &w) in present {
+        if let Some((_, bd)) = best {
+            // Strictly greater: a cell that could tie still competes on
+            // `Priority`. A NaN bound (infinite cell size) never skips.
+            if lower_bound_sq(key) > bd {
+                continue;
             }
         }
-        if let Some(b) = best {
-            // A feature in ring r can be nearer than one in ring r+1's cells,
-            // but never farther than ring r+2's; one extra ring guarantees the
-            // true nearest. Scan ring r+1 then stop.
-            let rr = r + 1;
-            if rr <= max_r {
-                for (dx, dy) in ring_offsets(rr) {
-                    if let Some(&w) = present.get(&(cell_key.0 + dx, cell_key.1 + dy)) {
-                        if better(w, b) {
-                            best = Some(w);
-                        }
-                    }
-                }
-            }
-            return best.expect("best set");
+        let d = dist_sq(w);
+        match best {
+            Some((b, bd)) if !beats(w, d, b, bd) => {}
+            _ => best = Some((w, d)),
         }
     }
-    // Unreachable when present is non-empty and max_r bounds the search, but
-    // fall back to a global scan for absolute safety.
-    let mut all: Vec<usize> = present.values().copied().collect();
-    all.sort_unstable();
-    all.into_iter()
-        .reduce(|a, b| if better(b, a) { b } else { a })
-        .expect("present is non-empty")
-}
-
-/// The Chebyshev ring of radius `r` around the origin (the 8r cells whose
-/// max-coordinate distance is exactly `r`), in deterministic order.
-fn ring_offsets(r: i64) -> Vec<(i64, i64)> {
-    debug_assert!(r >= 1);
-    let mut out = Vec::with_capacity((8 * r) as usize);
-    for dx in -r..=r {
-        out.push((dx, -r));
-        out.push((dx, r));
-    }
-    for dy in (-r + 1)..r {
-        out.push((-r, dy));
-        out.push((r, dy));
-    }
-    out
+    best.expect("present is non-empty").0
 }
 
 #[cfg(test)]
@@ -928,16 +1006,379 @@ mod tests {
         verify_sum_invariant(&feats, &min_levels, &tables).unwrap();
     }
 
+    /// #609: two present points sharing an `AssignFeature::index` give the
+    /// same table on every call (their clusters are merged under the shared
+    /// key, not overwritten in `HashMap` iteration order), and the verifier
+    /// rejects the table, because the writer would stamp the merged
+    /// `point_count` on both rows.
     #[test]
-    fn ring_offsets_cover_ring_exactly() {
-        for r in 1..=3i64 {
-            let ring = ring_offsets(r);
-            assert_eq!(ring.len() as i64, 8 * r);
-            assert!(ring.iter().all(|&(x, y)| x.abs().max(y.abs()) == r));
-            let mut sorted = ring.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(sorted.len(), ring.len(), "no duplicate cells");
+    fn duplicate_present_index_is_deterministic_and_rejected() {
+        // Level 0 cell = 100 m (point_thinning 1). Level 1 is canonical.
+        let gsds = [100.0, 1.0];
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        // Cell A: present point at x=10 plus two absent points.
+        // Cell B: present point at x=1010 plus one absent point.
+        // Both present points carry index 7.
+        let feats = vec![
+            point(7, 10.0, 10.0),
+            point(1, 20.0, 20.0),
+            point(2, 30.0, 30.0),
+            point(7, 1010.0, 10.0),
+            point(3, 1020.0, 20.0),
+        ];
+        let min_levels = [0u8, 1, 1, 0, 1];
+        let vals: Vec<Option<f64>> = vec![
+            Some(1.0),
+            Some(10.0),
+            Some(100.0),
+            Some(1000.0),
+            Some(10000.0),
+        ];
+        let build = || {
+            build_cluster_tables(
+                &feats,
+                &min_levels,
+                &gsds,
+                &cfg,
+                Crs::Epsg3857,
+                std::slice::from_ref(&vals),
+                &[AccumulateOp::Sum],
+            )
+        };
+        let first = build();
+        for _ in 0..200 {
+            assert_eq!(
+                build(),
+                first,
+                "cluster tables differ between identical calls"
+            );
         }
+        let err = verify_sum_invariant(&feats, &min_levels, &first).unwrap_err();
+        assert!(err.contains("share feature index 7"), "{err}");
+    }
+
+    /// #609: two present SINGLETON rows sharing an index would each be
+    /// written with the merged `point_count` of 2 (a per-row sum of 4 for 2
+    /// source points). The verifier rejects it.
+    #[test]
+    fn duplicate_present_singletons_are_rejected_by_verifier() {
+        let gsds = [100.0, 1.0];
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        let feats = vec![point(4, 10.0, 10.0), point(4, 1010.0, 10.0)];
+        let min_levels = [0u8, 0];
+        let t = build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let err = verify_sum_invariant(&feats, &min_levels, &t).unwrap_err();
+        assert!(err.contains("share feature index 4"), "{err}");
+    }
+
+    /// #611: an orphan point with a huge finite coordinate saturates its
+    /// grid key to `i64::MAX` / `i64::MIN`; resolving it must not overflow
+    /// `i64`, and it joins the only present point.
+    #[test]
+    fn huge_coordinate_orphan_does_not_overflow() {
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        let gsds = [1.0, 0.5];
+        for (x_present, x_orphan) in [(-10.0, 1e300), (10.0, -1e300), (-1e300, 1e300)] {
+            let feats = vec![point(0, x_present, 0.0), point(1, x_orphan, 0.0)];
+            let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+            assert_eq!(t[0].len(), 1, "x_present={x_present} x_orphan={x_orphan}");
+            assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
+        }
+        // Saturated keys on both axes.
+        let feats = vec![point(0, -5.0, -5.0), point(1, 1e300, -1e300)];
+        let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
+    }
+
+    /// #610: resolving an orphan `d` cells from the nearest present cell
+    /// must not cost O(d^2). At d = 8000 the old ring search did ~2.6e8
+    /// hash lookups (75 s in a debug build); the scan is O(present cells),
+    /// here one.
+    #[test]
+    fn far_orphan_resolves_without_quadratic_ring_search() {
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        let gsds = [1.0, 0.5];
+        let d = 8_000.0;
+        let feats = vec![point(0, 0.5, 0.5), point(1, d + 0.5, 0.5)];
+        let t0 = std::time::Instant::now();
+        let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let elapsed = t0.elapsed();
+        assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "orphan {d} cells away took {elapsed:?}"
+        );
+    }
+
+    /// The nearest point can lie two or more Chebyshev rings beyond the
+    /// nearest present cell: a point in the far corner of a ring-2 cell is
+    /// farther than one on the axis of a ring-4 cell. The orphan (#12, at
+    /// (0.5, 0.5)) must join #11 (distance 3.5), not #10 (distance 3.521).
+    /// The ring search, and the first version of the scan that kept its
+    /// "rings r and r + 1" candidate set, picked #10.
+    #[test]
+    fn orphan_joins_true_nearest_beyond_next_ring() {
+        let cfg = AssignConfig {
+            point_thinning: 1.0,
+            ..AssignConfig::default()
+        };
+        let feats = vec![
+            point(10, 2.99, 2.99), // cell (2, 2), ring 2
+            point(11, 4.0, 0.5),   // cell (4, 0), ring 4
+            point(12, 0.5, 0.5),   // orphan cell (0, 0)
+        ];
+        let t = build_cluster_tables(
+            &feats,
+            &[0, 0, 1],
+            &[1.0, 0.5],
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
+        assert_eq!(t[0].len(), 1, "{:?}", t[0]);
+        assert_eq!(t[0].get(&11).map(|e| e.point_count), Some(2));
+    }
+
+    /// Of two outer candidates that both beat the nearest ring's best, the
+    /// nearer wins whatever its ring order. The pre-#610 ring search
+    /// compared ring-`r + 1` cells against the ring-`r` best only, so here it
+    /// picked the LAST beater, cell (2, 0), over the nearer cell (2, -1).
+    #[test]
+    fn nearest_present_picks_nearest_of_outer_ring_candidates() {
+        let features = vec![
+            point(0, 1.99, 1.99), // cell (1, 1), ring 1, d² ≈ 4.44
+            point(1, 2.0, -0.01), // cell (2, -1), ring 2, d² ≈ 2.51
+            point(2, 2.2, 0.5),   // cell (2, 0), ring 2, d² = 2.89
+        ];
+        let present: HashMap<(i64, i64), usize> = [((1, 1), 0), ((2, -1), 1), ((2, 0), 2)]
+            .into_iter()
+            .collect();
+        let got = nearest_present((0, 0), &present, &features, SortDirection::Desc, 1.0);
+        assert_eq!(got, 1);
+    }
+
+    /// A present feature with a NaN center (reachable through the public API
+    /// only; `scan_feature` rejects non-finite coordinates) is treated as
+    /// infinitely far, so the comparison stays a strict total order and the
+    /// answer does not depend on `HashMap` iteration order. Each map built
+    /// below gets a fresh `RandomState`, so the 200 runs see many orders.
+    #[test]
+    fn nan_center_does_not_make_answer_order_dependent() {
+        let features = vec![
+            point(1, f64::NAN, 0.5), // cell (1, 1) by key, NaN center
+            point(2, 1.9, 0.5),      // cell (1, 0), d² = 1.96
+            point(3, -0.2, 0.5),     // cell (-1, 0), d² = 0.49
+        ];
+        let entries = [((1i64, 1i64), 0usize), ((1, 0), 1), ((-1, 0), 2)];
+        for _ in 0..200 {
+            let present: HashMap<(i64, i64), usize> = entries.iter().copied().collect();
+            let got = nearest_present((0, 0), &present, &features, SortDirection::Desc, 1.0);
+            assert_eq!(got, 2);
+        }
+    }
+
+    /// Deterministic generator for the randomized comparisons below
+    /// (splitmix64 over an LCG state).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, m: u64) -> u64 {
+            self.next() % m
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Exhaustive reference: the minimum over EVERY present cell winner of
+    /// (squared distance to the orphan cell center, `Priority`, position).
+    fn nearest_present_exhaustive(
+        cell_key: (i64, i64),
+        present: &HashMap<(i64, i64), usize>,
+        features: &[AssignFeature],
+        dir: SortDirection,
+        cell_size: f64,
+    ) -> usize {
+        let center = (
+            (cell_key.0 as f64 + 0.5) * cell_size,
+            (cell_key.1 as f64 + 0.5) * cell_size,
+        );
+        let d = |p: usize| {
+            let (x, y) = features[p].center();
+            let (dx, dy) = (x - center.0, y - center.1);
+            let d = dx * dx + dy * dy;
+            if d.is_nan() {
+                f64::INFINITY
+            } else {
+                d
+            }
+        };
+        let better = |a: usize, b: usize| {
+            let (da, db) = (d(a), d(b));
+            if da != db {
+                return da < db;
+            }
+            let (pa, pb) = (
+                Priority::new(&features[a], dir),
+                Priority::new(&features[b], dir),
+            );
+            if pa.beats(&pb) {
+                true
+            } else if pb.beats(&pa) {
+                false
+            } else {
+                a < b
+            }
+        };
+        let mut all: Vec<usize> = present.values().copied().collect();
+        all.sort_unstable();
+        all.into_iter()
+            .reduce(|a, b| if better(b, a) { b } else { a })
+            .expect("present is non-empty")
+    }
+
+    /// `nearest_present` agrees with the exhaustive scan on random layouts:
+    /// points anywhere inside their cells (and, every third layout, on cell
+    /// centers, for exact distance ties), spans up to 41 cells with up to 20
+    /// present cells, grid bases near 0, -1e6 and ±2^40, sort keys from
+    /// {None, 0, 1}, both sort directions, and (every fifth layout) indices
+    /// from {0, 1, 2} so `Priority` ties fully and the position decides.
+    /// The mismatch count must be 0.
+    #[test]
+    fn nearest_present_matches_exhaustive_scan() {
+        let mut rng = Rng(12_345);
+        let (mut checked, mut mismatches) = (0usize, 0usize);
+        let mut first: Option<String> = None;
+        for trial in 0..20_000u32 {
+            let lattice = trial % 3 == 0;
+            let dup = trial % 5 == 0;
+            let base: (i64, i64) = match trial % 4 {
+                0 => (0, 0),
+                1 => (-1_000_000, 777),
+                2 => (-37, -91),
+                _ => (1 << 40, -(1 << 40)),
+            };
+            let dir = if trial % 2 == 0 {
+                SortDirection::Desc
+            } else {
+                SortDirection::Asc
+            };
+            let n = 1 + rng.below(20) as usize;
+            let span = 2 + rng.below(40) as i64;
+            let mut features = Vec::new();
+            let mut present: HashMap<(i64, i64), usize> = HashMap::new();
+            for i in 0..n {
+                let cx = base.0 + rng.below(span as u64) as i64 - span / 2;
+                let cy = base.1 + rng.below(span as u64) as i64 - span / 2;
+                if present.contains_key(&(cx, cy)) {
+                    continue;
+                }
+                let (ox, oy) = if lattice {
+                    (0.5, 0.5)
+                } else {
+                    (rng.unit(), rng.unit())
+                };
+                let index = if dup { rng.below(3) as usize } else { 1000 - i };
+                let mut f = point(index, cx as f64 + ox, cy as f64 + oy);
+                f.sort_key = match rng.below(3) {
+                    0 => None,
+                    1 => Some(0.0),
+                    _ => Some(1.0),
+                };
+                present.insert((cx, cy), features.len());
+                features.push(f);
+            }
+            for _ in 0..4 {
+                let key = (
+                    base.0 + rng.below(span as u64 + 20) as i64 - span / 2 - 10,
+                    base.1 + rng.below(span as u64 + 20) as i64 - span / 2 - 10,
+                );
+                if present.contains_key(&key) {
+                    continue;
+                }
+                checked += 1;
+                let want = nearest_present_exhaustive(key, &present, &features, dir, 1.0);
+                let got = nearest_present(key, &present, &features, dir, 1.0);
+                if got != want {
+                    mismatches += 1;
+                    first.get_or_insert_with(|| {
+                        format!("orphan {key:?}: got {got}, want {want}, present {present:?}")
+                    });
+                }
+            }
+        }
+        assert!(checked > 50_000, "only {checked} orphans checked");
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches}/{checked} mismatches; first: {first:?}"
+        );
+    }
+
+    /// Keys at or near `i64::MAX` / `i64::MIN` on either axis (the #611
+    /// saturation case): no overflow, and the same answer as the exhaustive
+    /// scan. Distances there are huge but finite in `f64`.
+    #[test]
+    fn nearest_present_saturated_keys_match_exhaustive_scan() {
+        let mut rng = Rng(999);
+        let mut checked = 0usize;
+        let pick = |rng: &mut Rng| -> i64 {
+            match rng.below(6) {
+                0 => i64::MAX,
+                1 => i64::MIN,
+                2 => i64::MAX - rng.below(3) as i64,
+                3 => i64::MIN + rng.below(3) as i64,
+                4 => rng.below(7) as i64 - 3,
+                _ => -(rng.below(7) as i64),
+            }
+        };
+        for _ in 0..20_000 {
+            let mut features = Vec::new();
+            let mut present: HashMap<(i64, i64), usize> = HashMap::new();
+            for i in 0..=rng.below(6) {
+                let k = (pick(&mut rng), pick(&mut rng));
+                if present.contains_key(&k) {
+                    continue;
+                }
+                let mut f = point(50 - i as usize, k.0 as f64 + 0.5, k.1 as f64 + 0.5);
+                f.sort_key = Some(rng.below(2) as f64);
+                present.insert(k, features.len());
+                features.push(f);
+            }
+            let key = (pick(&mut rng), pick(&mut rng));
+            if present.contains_key(&key) {
+                continue;
+            }
+            let want =
+                nearest_present_exhaustive(key, &present, &features, SortDirection::Desc, 1.0);
+            let got = nearest_present(key, &present, &features, SortDirection::Desc, 1.0);
+            assert_eq!(got, want, "orphan {key:?} present {present:?}");
+            checked += 1;
+        }
+        assert!(checked > 10_000, "only {checked} orphans checked");
     }
 }

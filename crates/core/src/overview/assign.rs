@@ -172,6 +172,13 @@ pub enum SortDirection {
 #[derive(Debug, Clone, Copy)]
 pub struct AssignFeature {
     /// Opaque, caller-owned feature identifier (echoed in output).
+    ///
+    /// Level assignment does not require uniqueness, but clustering does:
+    /// point features passed to
+    /// [`build_cluster_tables`](super::cluster::build_cluster_tables) must
+    /// have unique indices, because cluster tables are keyed by `index` and
+    /// [`verify_sum_invariant`](super::cluster::verify_sum_invariant) rejects
+    /// a level where two present point rows share one.
     pub index: usize,
     /// `[xmin, ymin, xmax, ymax]` in the file CRS coordinate units.
     pub bbox: [f64; 4],
