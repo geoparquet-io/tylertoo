@@ -690,9 +690,12 @@ pub fn tylertoo_core::mvt::zigzag_decode(u32) -> i32
 pub fn tylertoo_core::mvt::zigzag_encode(i32) -> u32
 pub mod tylertoo_core::overview
 pub mod tylertoo_core::overview::accumulate
-pub struct tylertoo_core::overview::accumulate::AccumulateLevel
+#[non_exhaustive] pub struct tylertoo_core::overview::accumulate::AccumulateLevel
 pub tylertoo_core::overview::accumulate::AccumulateLevel::enabled: bool
 pub tylertoo_core::overview::accumulate::AccumulateLevel::gsd_meters: f64
+pub tylertoo_core::overview::accumulate::AccumulateLevel::zoom: core::option::Option<u8>
+impl tylertoo_core::overview::accumulate::AccumulateLevel
+pub fn tylertoo_core::overview::accumulate::AccumulateLevel::new(f64, core::option::Option<u8>, bool) -> Self
 impl core::clone::Clone for tylertoo_core::overview::accumulate::AccumulateLevel
 pub fn tylertoo_core::overview::accumulate::AccumulateLevel::clone(&self) -> tylertoo_core::overview::accumulate::AccumulateLevel
 impl core::cmp::PartialEq for tylertoo_core::overview::accumulate::AccumulateLevel
@@ -2558,13 +2561,15 @@ impl core::marker::Unpin for tylertoo_core::overview::simplify::Simplified
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::simplify::Simplified
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::simplify::Simplified
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify::Simplified
-pub struct tylertoo_core::overview::simplify::CascadeStep
+#[non_exhaustive] pub struct tylertoo_core::overview::simplify::CascadeStep
 pub tylertoo_core::overview::simplify::CascadeStep::gsd_meters: f64
 pub tylertoo_core::overview::simplify::CascadeStep::repr: tylertoo_core::overview::simplify::Representation
+pub tylertoo_core::overview::simplify::CascadeStep::zoom: core::option::Option<u8>
 impl tylertoo_core::overview::simplify::CascadeStep
 pub fn tylertoo_core::overview::simplify::CascadeStep::geom(f64) -> Self
 pub fn tylertoo_core::overview::simplify::CascadeStep::point(f64) -> Self
 pub fn tylertoo_core::overview::simplify::CascadeStep::square(f64) -> Self
+pub fn tylertoo_core::overview::simplify::CascadeStep::with_zoom(self, core::option::Option<u8>) -> Self
 impl core::clone::Clone for tylertoo_core::overview::simplify::CascadeStep
 pub fn tylertoo_core::overview::simplify::CascadeStep::clone(&self) -> tylertoo_core::overview::simplify::CascadeStep
 impl core::cmp::PartialEq for tylertoo_core::overview::simplify::CascadeStep

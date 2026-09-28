@@ -54,7 +54,9 @@ use crate::batch_processor::extract_geometries_opt_from_array;
 use crate::shard::TileRange;
 use crate::tile::MAX_ZOOM;
 
-use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
+use super::accumulate::{
+    is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
+};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
     DensityBudgetConfig, FeatureKind, SUPERCELL_GSD_FACTOR,
@@ -77,8 +79,8 @@ use super::level::{
 use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
 use super::simplify::{
-    carrier_square, simplify_cascade, simplify_for_level, simplify_step, CascadeStep, CollapseMode,
-    Representation, Simplified, SimplifyOptions,
+    carrier_square, simplify_cascade, simplify_for_level, simplify_step_at, CascadeStep,
+    CollapseMode, Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{
     LevelSpec, LevelWriteOutcome, OverviewWriter, RowGroupSizePolicy, WriterError, LEVEL_COLUMN,
@@ -2871,6 +2873,7 @@ fn build_emitted_levels(
                 .map(|li| CascadeStep {
                     gsd_meters: level_specs[li].0,
                     repr: level_reprs[li],
+                    zoom: level_specs[li].1,
                 })
                 .collect()
         } else {
@@ -2896,8 +2899,13 @@ fn build_emitted_levels(
                 // #384: a carrier is not a member — it stands in for its
                 // cell's dropped area as one placeholder square.
                 if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
-                    if let Some(sq) = carrier_square(&geometries[i], gsd_m, crs, &options.simplify)
-                    {
+                    if let Some(sq) = carrier_square(
+                        &geometries[i],
+                        gsd_m,
+                        level_specs[level].1,
+                        crs,
+                        &options.simplify,
+                    ) {
                         vertex_count += count_vertices(&sq);
                         indices.push(i);
                         geoms.push(sq);
@@ -2905,7 +2913,14 @@ fn build_emitted_levels(
                     continue;
                 }
                 let simplified = if cascade_chain.is_empty() {
-                    simplify_step(&geometries[i], gsd_m, crs, &options.simplify, repr)
+                    simplify_step_at(
+                        &geometries[i],
+                        gsd_m,
+                        level_specs[level].1,
+                        crs,
+                        &options.simplify,
+                        repr,
+                    )
                 } else {
                     simplify_cascade(&geometries[i], &cascade_chain, crs, &options.simplify)
                 };
@@ -3125,7 +3140,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         &features,
         &row_min_levels,
         &geometries,
-        &level_gsds,
+        &level_specs,
         &level_reprs,
         crs,
     );
@@ -3343,23 +3358,29 @@ fn in_memory_carriers(
     features: &[AssignFeature],
     row_min_levels: &[u8],
     geometries: &[Geometry<f64>],
-    level_gsds: &[f64],
+    level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
     crs: Crs,
 ) -> Vec<Vec<usize>> {
-    let num_levels = level_gsds.len();
+    let num_levels = level_specs.len();
     let finest = num_levels.saturating_sub(1);
+    // `placeholder_has_size` last: it logs, and only when the accumulator
+    // would otherwise run.
     let enabled = matches!(options.mode, Mode::Duplicating)
         && (options.simplify.collapse == CollapseMode::Square
-            || level_reprs.contains(&Representation::Square));
-    let acc_levels: Vec<AccumulateLevel> = level_gsds
+            || level_reprs.contains(&Representation::Square))
+        && placeholder_has_size(options.simplify.factor);
+    let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
-        .map(|(l, &gsd)| AccumulateLevel {
-            gsd_meters: gsd,
-            enabled: enabled
-                && l != finest
-                && level_accumulates(options.simplify.collapse, level_reprs[l]),
+        .map(|(l, &(gsd, zoom))| {
+            AccumulateLevel::new(
+                gsd,
+                zoom,
+                enabled
+                    && l != finest
+                    && level_accumulates(options.simplify.collapse, level_reprs[l]),
+            )
         })
         .collect();
     if !acc_levels.iter().any(|l| l.enabled) {

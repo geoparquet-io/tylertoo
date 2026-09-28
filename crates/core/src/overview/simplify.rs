@@ -63,7 +63,9 @@ use geo::{
     Point, Polygon, Rect, Validation,
 };
 
+use super::level::{zoom_for_gsd, WEBMERC_CIRCUMFERENCE_M};
 pub use super::level::{Crs, METERS_PER_DEGREE};
+use crate::mvt::{DEFAULT_EXTENT, MIN_SURVIVING_SQUARE_SIDE};
 
 /// Process-wide count of polygons that exhausted every epsilon-backoff retry
 /// (see [`simplify_polygon_impl_checked`]) and were kept at full resolution.
@@ -185,11 +187,71 @@ pub enum Simplified {
 /// `factor <= 0`), which callers and [`simplify_for_level`] treat as "no
 /// simplification".
 pub fn world_tolerance(gsd_meters: f64, crs: Crs, opts: &SimplifyOptions) -> f64 {
-    let meters = opts.factor * gsd_meters;
+    level_tolerance(gsd_meters, crs, opts.factor)
+}
+
+/// `factor × gsd`, in the geometry's coordinate units: the one tolerance
+/// formula behind [`world_tolerance`] and [`placeholder_side`] (#407).
+///
+/// `0.0` when `factor × gsd_meters <= 0` (the canonical/identity case).
+pub(crate) fn level_tolerance(gsd_meters: f64, crs: Crs, factor: f64) -> f64 {
+    let meters = factor * gsd_meters;
     if meters <= 0.0 {
         return 0.0;
     }
     crs.meters_to_units(meters)
+}
+
+/// The Web Mercator zoom the exporter renders a level at: the level's
+/// recorded `zoom` when it has one (a `--min-zoom/--max-zoom` plan), else the
+/// §5.2 inverse of its GSD rounded to the nearest zoom and floored at 0 (an
+/// explicit `--gsd` plan). The same rule as `export::zoom_for_level`.
+pub(crate) fn export_zoom(gsd_meters: f64, zoom: Option<u8>) -> f64 {
+    match zoom {
+        Some(z) => f64::from(z),
+        None => zoom_for_gsd(gsd_meters).round().max(0.0),
+    }
+}
+
+/// Length in meters of one MVT tile unit at the zoom a level renders at
+/// ([`export_zoom`]), for the default extent [`DEFAULT_EXTENT`]:
+/// `circumference / 2^z / 4096`. With a zoom-range plan that is
+/// `gsd × gsd_base / 4096`, so a quarter of the GSD at the default
+/// `--gsd-base` 1024.
+///
+/// The overview is written before any export extent is chosen, so the unit
+/// assumes the default, which is the only extent the CLI exports at. An
+/// export at a larger extent (the Python `export(extent=…)`) draws a floored
+/// placeholder over more than one unit, which is still visible; one at a
+/// smaller extent draws it under one unit, where the cleaner keeps it with
+/// probability `side²` as it did before the floor.
+pub(crate) fn tile_unit_meters(gsd_meters: f64, zoom: Option<u8>) -> f64 {
+    WEBMERC_CIRCUMFERENCE_M / export_zoom(gsd_meters, zoom).exp2() / f64::from(DEFAULT_EXTENT)
+}
+
+/// Side of a level's placeholder square in coordinate units: the level
+/// tolerance `factor × gsd`, floored at [`MIN_SURVIVING_SQUARE_SIDE`] tile
+/// units at the level's export zoom ([`tile_unit_meters`]). One value serves
+/// the `--collapse-square` dither ([`squarify_polygon`]), the accumulator
+/// threshold (`side²`) and [`carrier_square`], so the three stay
+/// interchangeable (#407).
+///
+/// `0.0` when the tolerance is `0` (`--simplify-factor 0`): there is no
+/// placeholder then, and no floor is applied.
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's placeholder is a fixed
+/// `tiny_polygon_size` in tile units (clip.cpp, `reduce_tiny_poly`); ours is
+/// `factor × gsd` with this one-unit floor, so it follows the simplify knob
+/// down to the smallest square a tile can draw and no further. Like
+/// tippecanoe (which skips the reduction at size 0), a zero factor means no
+/// placeholder at all.
+pub(crate) fn placeholder_side(gsd_meters: f64, zoom: Option<u8>, crs: Crs, factor: f64) -> f64 {
+    let tol = level_tolerance(gsd_meters, crs, factor);
+    if tol <= 0.0 {
+        return 0.0;
+    }
+    let floor = crs.meters_to_units(MIN_SURVIVING_SQUARE_SIDE * tile_unit_meters(gsd_meters, zoom));
+    tol.max(floor)
 }
 
 /// Simplify one feature's geometry for a level of the given GSD.
@@ -217,7 +279,7 @@ pub fn simplify_for_level(
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> Simplified {
-    simplify_for_level_checked(geom, gsd_meters, crs, opts).0
+    simplify_for_level_checked(geom, gsd_meters, None, crs, opts).0
 }
 
 /// Like [`simplify_for_level`], but also reports whether the returned
@@ -238,10 +300,18 @@ pub fn simplify_for_level(
 pub(super) fn simplify_for_level_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
+    zoom: Option<u8>,
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
+    // The placeholder side only matters to the square disposition; skip the
+    // zoom arithmetic otherwise.
+    let side = if opts.collapse == CollapseMode::Square {
+        placeholder_side(gsd_meters, zoom, crs, opts.factor)
+    } else {
+        tol
+    };
 
     // Canonical / identity path (spec §2.4, Q1): a zero tolerance means "this
     // is the canonical level" — return the geometry bit-identical, with no
@@ -284,7 +354,7 @@ pub(super) fn simplify_for_level_checked(
         }
 
         Geometry::Polygon(poly) => {
-            simplify_polygon_impl_checked(poly, tol, opts.collapse, opts.cascade)
+            simplify_polygon_impl_checked(poly, tol, side, opts.collapse, opts.cascade)
         }
 
         Geometry::MultiPolygon(mp) => {
@@ -304,7 +374,7 @@ pub(super) fn simplify_for_level_checked(
             let mut kept: Vec<Polygon<f64>> = Vec::with_capacity(mp.0.len());
             let mut unchanged = true;
             for p in &mp.0 {
-                match simplify_polygon_impl_checked(p, tol, part_mode, opts.cascade) {
+                match simplify_polygon_impl_checked(p, tol, side, part_mode, opts.cascade) {
                     (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
                         unchanged &= part_unchanged;
                         kept.push(poly);
@@ -383,12 +453,22 @@ impl Representation {
 /// [`Representation::Point`] step marks a zoom-band point level (#317) at
 /// which polygonal features are replaced by their representative point
 /// instead of being simplified.
+///
+/// `#[non_exhaustive]` since #407 added [`zoom`](Self::zoom): build steps
+/// with [`geom`](Self::geom) / [`point`](Self::point) /
+/// [`square`](Self::square) and [`with_zoom`](Self::with_zoom).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct CascadeStep {
     /// The step level's GSD in meters.
     pub gsd_meters: f64,
     /// The step level's feature representation (#317).
     pub repr: Representation,
+    /// The step level's recorded Web Mercator zoom, `None` when the plan has
+    /// none (an explicit `--gsd` plan). Sets the tile unit the placeholder
+    /// square is floored at (#407); `None` derives the zoom from the GSD the
+    /// way the exporter does.
+    pub zoom: Option<u8>,
 }
 
 impl CascadeStep {
@@ -397,6 +477,7 @@ impl CascadeStep {
         Self {
             gsd_meters,
             repr: Representation::Geometry,
+            zoom: None,
         }
     }
 
@@ -405,6 +486,7 @@ impl CascadeStep {
         Self {
             gsd_meters,
             repr: Representation::Point,
+            zoom: None,
         }
     }
 
@@ -413,7 +495,14 @@ impl CascadeStep {
         Self {
             gsd_meters,
             repr: Representation::Square,
+            zoom: None,
         }
+    }
+
+    /// This step with the level's recorded zoom (#407).
+    #[must_use]
+    pub fn with_zoom(self, zoom: Option<u8>) -> Self {
+        Self { zoom, ..self }
     }
 }
 
@@ -480,7 +569,21 @@ pub fn simplify_step(
     opts: &SimplifyOptions,
     repr: Representation,
 ) -> Simplified {
-    simplify_step_checked(geom, gsd_meters, crs, opts, repr).0
+    simplify_step_checked(geom, gsd_meters, None, crs, opts, repr).0
+}
+
+/// [`simplify_step`] for a level whose recorded zoom is known: the engines'
+/// entry point, so the placeholder square is floored at the tile unit of
+/// the zoom the level is exported at (#407).
+pub(crate) fn simplify_step_at(
+    geom: &Geometry<f64>,
+    gsd_meters: f64,
+    zoom: Option<u8>,
+    crs: Crs,
+    opts: &SimplifyOptions,
+    repr: Representation,
+) -> Simplified {
+    simplify_step_checked(geom, gsd_meters, zoom, crs, opts, repr).0
 }
 
 /// Like [`simplify_step`], but also reports whether the output is
@@ -496,17 +599,18 @@ pub fn simplify_step(
 pub(super) fn simplify_step_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
+    zoom: Option<u8>,
     crs: Crs,
     opts: &SimplifyOptions,
     repr: Representation,
 ) -> (Simplified, bool) {
     match repr {
-        Representation::Geometry => simplify_for_level_checked(geom, gsd_meters, crs, opts),
+        Representation::Geometry => simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts),
         Representation::Point => {
             if let Some(out) = polygonal_representative_point(geom) {
                 return (out, false);
             }
-            simplify_for_level_checked(geom, gsd_meters, crs, opts)
+            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts)
         }
         // Square (#279): normal simplification with the below-tolerance
         // disposition forced to area-dithered placeholder squares at this
@@ -516,7 +620,7 @@ pub(super) fn simplify_step_checked(
                 collapse: CollapseMode::Square,
                 ..*opts
             };
-            simplify_for_level_checked(geom, gsd_meters, crs, &opts)
+            simplify_for_level_checked(geom, gsd_meters, zoom, crs, &opts)
         }
     }
 }
@@ -655,8 +759,14 @@ impl CascadeFold {
         } else {
             canonical
         };
-        let (out, unchanged) =
-            simplify_step_checked(base.as_ref(), step.gsd_meters, crs, opts, step.repr);
+        let (out, unchanged) = simplify_step_checked(
+            base.as_ref(),
+            step.gsd_meters,
+            step.zoom,
+            crs,
+            opts,
+            step.repr,
+        );
         match out {
             Simplified::Keep(s) => {
                 let geom = if unchanged {
@@ -997,7 +1107,7 @@ fn simplify_polygon_impl(
     mode: CollapseMode,
     repair: bool,
 ) -> Simplified {
-    simplify_polygon_impl_checked(poly, tol, mode, repair).0
+    simplify_polygon_impl_checked(poly, tol, tol, mode, repair).0
 }
 
 /// Like `simplify_polygon_impl`, but also reports whether the kept
@@ -1007,14 +1117,19 @@ fn simplify_polygon_impl(
 /// `false` for every collapse, repair, or vertex-removing candidate. Feeds
 /// the cascade fold's Arc-sharing decision in
 /// [`super::stream::process_batch_cascade`].
+///
+/// `side` is the placeholder side a collapse under
+/// [`CollapseMode::Square`] emits ([`placeholder_side`]); the RDP epsilon and
+/// the gates stay at `tol`.
 fn simplify_polygon_impl_checked(
     poly: &Polygon<f64>,
     tol: f64,
+    side: f64,
     mode: CollapseMode,
     repair: bool,
 ) -> (Simplified, bool) {
     if polygon_diag(poly) < tol {
-        return (collapse_polygon(poly, mode, tol), false);
+        return (collapse_polygon(poly, mode, side), false);
     }
 
     // Gates are level properties, so they stay at `tol` even when the RDP
@@ -1047,7 +1162,7 @@ fn simplify_polygon_impl_checked(
         if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || candidate.unsigned_area() < min_area
         {
-            return (collapse_polygon(poly, mode, tol), false);
+            return (collapse_polygon(poly, mode, side), false);
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
@@ -1072,7 +1187,7 @@ fn simplify_polygon_impl_checked(
             return (Simplified::Keep(repaired), false);
         }
         // Repair left nothing above the gates (self-canceling sliver).
-        return (collapse_polygon(poly, mode, tol), false);
+        return (collapse_polygon(poly, mode, side), false);
     }
 
     // Every retry self-intersected: keep the original geometry rather than
@@ -1145,7 +1260,7 @@ fn polygon_anchor(poly: &Polygon<f64>) -> Option<Point<f64>> {
 /// is its own center, so re-dithering it at a coarser cascade step reuses
 /// the same `u` against a smaller `a/T` — survival is monotone fine→coarse,
 /// matching the cascade's drop monotonicity.
-fn dither_u01(x: f64, y: f64) -> f64 {
+pub(super) fn dither_u01(x: f64, y: f64) -> f64 {
     let mut z = x.to_bits() ^ y.to_bits().rotate_left(32);
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1188,33 +1303,37 @@ fn placeholder_square(anchor: Point<f64>, tol: f64) -> Polygon<f64> {
 }
 
 /// Area-dithered placeholder square for a below-tolerance polygon (#279):
-/// survives as a `tol × tol` square at the polygon's representative point
-/// with probability `min(1, area / tol²)` (see [`dither_u01`]).
-fn squarify_polygon(poly: &Polygon<f64>, tol: f64) -> Simplified {
+/// survives as a `side × side` square at the polygon's representative point
+/// with probability `min(1, area / side²)` (see [`dither_u01`]). `side` is
+/// the level's [`placeholder_side`]: the tolerance, floored at one tile unit
+/// (#407).
+fn squarify_polygon(poly: &Polygon<f64>, side: f64) -> Simplified {
     let Some(anchor) = polygon_anchor(poly) else {
         return Simplified::Dropped;
     };
-    let threshold = tol * tol;
+    let threshold = side * side;
     let p = if threshold > 0.0 {
         (poly.unsigned_area() / threshold).min(1.0)
     } else {
         0.0
     };
     if dither_u01(anchor.x(), anchor.y()) < p {
-        Simplified::Keep(Geometry::Polygon(placeholder_square(anchor, tol)))
+        Simplified::Keep(Geometry::Polygon(placeholder_square(anchor, side)))
     } else {
         Simplified::Dropped
     }
 }
 
 /// Placeholder square for a tiny-polygon accumulator carrier (#384): a
-/// `tol × tol` square at the polygon's representative point, `tol` being
-/// this level's simplification tolerance — the same square the
-/// [`CollapseMode::Square`] dither emits, so the two placeholders are
-/// interchangeable to a renderer. `None` for non-polygonal input.
+/// square of the level's [`placeholder_side`] at the polygon's
+/// representative point — the same square the [`CollapseMode::Square`]
+/// dither emits, so the two placeholders are interchangeable to a renderer.
+/// `zoom` is the level's recorded zoom (#407). `None` for non-polygonal
+/// input.
 pub(super) fn carrier_square(
     geom: &Geometry<f64>,
     gsd_meters: f64,
+    zoom: Option<u8>,
     crs: Crs,
     opts: &SimplifyOptions,
 ) -> Option<Geometry<f64>> {
@@ -1229,22 +1348,22 @@ pub(super) fn carrier_square(
     }?;
     Some(Geometry::Polygon(placeholder_square(
         anchor,
-        world_tolerance(gsd_meters, crs, opts),
+        placeholder_side(gsd_meters, zoom, crs, opts.factor),
     )))
 }
 
 /// Resolve a collapsed polygon per the [`CollapseMode`] (#279): drop by
 /// default, a representative [`Point`] at the polygon centroid (spec Q4,
 /// `--collapse`), or an area-dithered placeholder square
-/// (`--collapse-square`, [`squarify_polygon`]).
-fn collapse_polygon(poly: &Polygon<f64>, mode: CollapseMode, tol: f64) -> Simplified {
+/// (`--collapse-square`, [`squarify_polygon`] with the placeholder `side`).
+fn collapse_polygon(poly: &Polygon<f64>, mode: CollapseMode, side: f64) -> Simplified {
     match mode {
         CollapseMode::Drop => Simplified::Dropped,
         CollapseMode::Point => match polygon_anchor(poly) {
             Some(p) => Simplified::Keep(Geometry::Point(p)),
             None => Simplified::Dropped,
         },
-        CollapseMode::Square => squarify_polygon(poly, tol),
+        CollapseMode::Square => squarify_polygon(poly, side),
     }
 }
 
@@ -1325,6 +1444,83 @@ mod tests {
             ..opts
         };
         assert_eq!(world_tolerance(500.0, Crs::Epsg3857, &zero_factor), 0.0);
+    }
+
+    // ---- #407: placeholder side floored at one tile unit -------------------
+
+    /// The tile unit follows the zoom the exporter renders the level at: the
+    /// recorded zoom when there is one, else the §5.2 inverse of the GSD
+    /// rounded to the nearest zoom (`export::zoom_for_level`).
+    #[test]
+    fn tile_unit_follows_the_export_zoom() {
+        use super::super::level::gsd;
+        let extent = f64::from(DEFAULT_EXTENT);
+        let want = WEBMERC_CIRCUMFERENCE_M / 128.0 / extent;
+        assert!((tile_unit_meters(gsd(7), None) - want).abs() < 1e-9);
+        // The recorded zoom wins over the GSD (a non-default `--gsd-base`).
+        assert!((tile_unit_meters(123.0, Some(7)) - want).abs() < 1e-9);
+        // Default base and extent: a unit is a quarter of a GSD.
+        assert!((tile_unit_meters(gsd(9), Some(9)) - gsd(9) / 4.0).abs() < 1e-9);
+        assert_eq!(export_zoom(1e9, None), 0.0, "floored at z0");
+    }
+
+    /// The `--collapse-square` dither uses the floored side: at factor 0.1
+    /// on a z5 level (GSD 1000 m, unit 305.7 m) a collapsing 50 m field
+    /// survives as a one-unit square, with probability 2,500 / unit² rather
+    /// than 2,500 / 100², so the expected area is unchanged and every kept
+    /// square is wide enough to draw.
+    #[test]
+    fn square_dither_uses_the_floored_side() {
+        let opts = SimplifyOptions {
+            factor: 0.1,
+            collapse: CollapseMode::Square,
+            ..SimplifyOptions::default()
+        };
+        let unit = tile_unit_meters(1000.0, None);
+        let n = 4000;
+        let mut kept = 0usize;
+        for i in 0..n {
+            let (cx, cy) = (i as f64 * 1_117.3, (i % 97) as f64 * 733.1);
+            let poly = Geometry::Polygon(square(cx, cy, 25.0));
+            if let Simplified::Keep(g) = simplify_step_at(
+                &poly,
+                1000.0,
+                None,
+                Crs::Epsg3857,
+                &opts,
+                Representation::Geometry,
+            ) {
+                let r = g.bounding_rect().unwrap();
+                assert!(
+                    (r.width() - unit).abs() < 1e-6,
+                    "width {} vs unit {unit}",
+                    r.width()
+                );
+                kept += 1;
+            }
+        }
+        let p = 2_500.0 / (unit * unit);
+        let expected = p * n as f64;
+        let sd = (n as f64 * p * (1.0 - p)).sqrt();
+        assert!(
+            (kept as f64 - expected).abs() < 4.0 * sd,
+            "kept {kept} of {n}, expected {expected:.1} ± {sd:.1}"
+        );
+        // The same GSD recorded at z2 (a `--gsd-base` near 10,000): one unit
+        // there is ~2,446 m, so that is the square's side.
+        let poly = Geometry::Polygon(square(0.0, 0.0, 25.0));
+        let side = placeholder_side(1000.0, Some(2), Crs::Epsg3857, 0.1);
+        assert!((side - WEBMERC_CIRCUMFERENCE_M / 4.0 / 4096.0).abs() < 1e-9);
+        if let Simplified::Keep(g) = simplify_step_at(
+            &poly,
+            1000.0,
+            Some(2),
+            Crs::Epsg3857,
+            &opts,
+            Representation::Geometry,
+        ) {
+            assert!((g.bounding_rect().unwrap().width() - side).abs() < 1e-6);
+        }
     }
 
     // ---- tolerance scaling / monotonicity ---------------------------------
@@ -2050,26 +2246,14 @@ mod tests {
         let poly = Geometry::Polygon(square(731.0, -1911.0, 800.0));
         // Direct step vs single-step cascade must agree.
         let direct = simplify_step(&poly, 5000.0, Crs::Epsg3857, &opts, Representation::Square);
-        let steps = [CascadeStep {
-            gsd_meters: 5000.0,
-            repr: Representation::Square,
-        }];
+        let steps = [CascadeStep::square(5000.0)];
         assert_eq!(
             direct,
             simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts)
         );
         // Monotone: if dropped at the fine square step, a longer chain
         // through a coarser square step is dropped too.
-        let chain = [
-            CascadeStep {
-                gsd_meters: 5000.0,
-                repr: Representation::Square,
-            },
-            CascadeStep {
-                gsd_meters: 10_000.0,
-                repr: Representation::Square,
-            },
-        ];
+        let chain = [CascadeStep::square(5000.0), CascadeStep::square(10_000.0)];
         let coarser = simplify_cascade(&poly, &chain, Crs::Epsg3857, &opts);
         if matches!(direct, Simplified::Dropped) {
             assert_eq!(coarser, Simplified::Dropped, "drops are monotone");
@@ -2256,8 +2440,14 @@ mod tests {
         // keeps it alive must report `unchanged == true`.
         let poly = Geometry::Polygon(square(0.0, 0.0, 50.0));
         let opts = SimplifyOptions::default();
-        let (out, unchanged) =
-            simplify_step_checked(&poly, 10.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        let (out, unchanged) = simplify_step_checked(
+            &poly,
+            10.0,
+            None,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Geometry,
+        );
         assert!(unchanged, "minimal ring should report no removal");
         match out {
             Simplified::Keep(Geometry::Polygon(p)) => {
@@ -2271,8 +2461,14 @@ mod tests {
     fn simplify_step_checked_reports_removal_when_rdp_drops_vertices() {
         let line = Geometry::LineString(wiggly_line(200, 50.0));
         let opts = SimplifyOptions::default();
-        let (out, unchanged) =
-            simplify_step_checked(&line, 500.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        let (out, unchanged) = simplify_step_checked(
+            &line,
+            500.0,
+            None,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Geometry,
+        );
         assert!(!unchanged, "coarse GSD should remove vertices");
         assert!(line_len(&out) < 200);
     }
@@ -2283,8 +2479,14 @@ mod tests {
         // clone, so always "no removal" regardless of geometry.
         let line = Geometry::LineString(wiggly_line(200, 50.0));
         let opts = SimplifyOptions::default();
-        let (out, unchanged) =
-            simplify_step_checked(&line, 0.0, Crs::Epsg3857, &opts, Representation::Geometry);
+        let (out, unchanged) = simplify_step_checked(
+            &line,
+            0.0,
+            None,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Geometry,
+        );
         assert!(unchanged);
         assert_eq!(line_len(&out), 200);
     }
@@ -2298,8 +2500,14 @@ mod tests {
         // touched by `simplify_for_level`.
         let poly = Geometry::Polygon(square(0.0, 0.0, 5.0));
         let opts = SimplifyOptions::default();
-        let (first, first_unchanged) =
-            simplify_step_checked(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point);
+        let (first, first_unchanged) = simplify_step_checked(
+            &poly,
+            100.0,
+            None,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Point,
+        );
         assert!(
             !first_unchanged,
             "polygon -> point is a representation change"
@@ -2310,6 +2518,7 @@ mod tests {
         let (second, second_unchanged) = simplify_step_checked(
             &point_geom,
             200.0,
+            None,
             Crs::Epsg3857,
             &opts,
             Representation::Point,
