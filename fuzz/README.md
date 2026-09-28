@@ -39,7 +39,10 @@ leading byte.
 
 Requires a nightly toolchain and `cargo-fuzz`. CI pins the nightly to the
 one the public-api gate uses (`NIGHTLY` in `.github/workflows/fuzz.yml`);
-any recent nightly works locally.
+any recent nightly works locally. A prebuilt `cargo-fuzz` (for example
+from `cargo binstall`) may be musl-linked and default to a musl target,
+which AddressSanitizer rejects; pass `--target x86_64-unknown-linux-gnu`
+to `cargo fuzz run` if so. A `cargo install` build needs no flag.
 
 ```bash
 cargo install cargo-fuzz --locked
