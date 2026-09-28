@@ -3125,7 +3125,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         &features,
         &row_min_levels,
         &geometries,
-        &level_gsds,
+        &level_specs,
         &level_reprs,
         crs,
     );
@@ -3343,20 +3343,21 @@ fn in_memory_carriers(
     features: &[AssignFeature],
     row_min_levels: &[u8],
     geometries: &[Geometry<f64>],
-    level_gsds: &[f64],
+    level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
     crs: Crs,
 ) -> Vec<Vec<usize>> {
-    let num_levels = level_gsds.len();
+    let num_levels = level_specs.len();
     let finest = num_levels.saturating_sub(1);
     let enabled = matches!(options.mode, Mode::Duplicating)
         && (options.simplify.collapse == CollapseMode::Square
             || level_reprs.contains(&Representation::Square));
-    let acc_levels: Vec<AccumulateLevel> = level_gsds
+    let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
-        .map(|(l, &gsd)| AccumulateLevel {
+        .map(|(l, &(gsd, zoom))| AccumulateLevel {
             gsd_meters: gsd,
+            zoom,
             enabled: enabled
                 && l != finest
                 && level_accumulates(options.simplify.collapse, level_reprs[l]),

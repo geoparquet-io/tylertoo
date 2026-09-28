@@ -672,6 +672,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::mvt::TileBuilder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::mvt::TileBuilder
 pub const tylertoo_core::mvt::DEFAULT_EXTENT: u32
+pub const tylertoo_core::mvt::MIN_SURVIVING_SQUARE_SIDE: f64
 pub const tylertoo_core::mvt::TILE_COORD_CLAMP: i32
 pub fn tylertoo_core::mvt::command_decode(u32) -> (u32, u32)
 pub fn tylertoo_core::mvt::command_encode(u32, u32) -> u32
@@ -693,6 +694,7 @@ pub mod tylertoo_core::overview::accumulate
 pub struct tylertoo_core::overview::accumulate::AccumulateLevel
 pub tylertoo_core::overview::accumulate::AccumulateLevel::enabled: bool
 pub tylertoo_core::overview::accumulate::AccumulateLevel::gsd_meters: f64
+pub tylertoo_core::overview::accumulate::AccumulateLevel::zoom: core::option::Option<u8>
 impl core::clone::Clone for tylertoo_core::overview::accumulate::AccumulateLevel
 pub fn tylertoo_core::overview::accumulate::AccumulateLevel::clone(&self) -> tylertoo_core::overview::accumulate::AccumulateLevel
 impl core::cmp::PartialEq for tylertoo_core::overview::accumulate::AccumulateLevel
@@ -711,6 +713,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::accumulat
 pub const tylertoo_core::overview::accumulate::ACCUMULATE_CELL_GSD: f64
 pub fn tylertoo_core::overview::accumulate::is_carrier(&[usize], usize) -> bool
 pub fn tylertoo_core::overview::accumulate::level_accumulates(tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::simplify::Representation) -> bool
+pub fn tylertoo_core::overview::accumulate::tile_unit_meters(f64, core::option::Option<u8>) -> f64
 pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&[tylertoo_core::overview::assign::AssignFeature], &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs, f64) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
 pub mod tylertoo_core::overview::assign
 pub enum tylertoo_core::overview::assign::Crs
@@ -2604,6 +2607,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify:
 pub const tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR: f64
 pub const tylertoo_core::overview::simplify::METERS_PER_DEGREE: f64
 pub fn tylertoo_core::overview::simplify::full_resolution_fallback_count() -> u64
+pub fn tylertoo_core::overview::simplify::level_tolerance(f64, tylertoo_core::overview::level::Crs, f64) -> f64
 pub fn tylertoo_core::overview::simplify::simplify_cascade(&geo_types::geometry::Geometry<f64>, &[tylertoo_core::overview::simplify::CascadeStep], tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
 pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
 pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation) -> tylertoo_core::overview::simplify::Simplified

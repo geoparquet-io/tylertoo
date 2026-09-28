@@ -185,7 +185,17 @@ pub enum Simplified {
 /// `factor <= 0`), which callers and [`simplify_for_level`] treat as "no
 /// simplification".
 pub fn world_tolerance(gsd_meters: f64, crs: Crs, opts: &SimplifyOptions) -> f64 {
-    let meters = opts.factor * gsd_meters;
+    level_tolerance(gsd_meters, crs, opts.factor)
+}
+
+/// `factor × gsd`, in the geometry's coordinate units: the one tolerance
+/// formula behind [`world_tolerance`], the tiny-polygon accumulator's
+/// placeholder threshold and [`carrier_square`]'s side (#407), so the
+/// accumulator's `T` and the square it emits cannot drift apart.
+///
+/// `0.0` when `factor × gsd_meters <= 0` (the canonical/identity case).
+pub fn level_tolerance(gsd_meters: f64, crs: Crs, factor: f64) -> f64 {
+    let meters = factor * gsd_meters;
     if meters <= 0.0 {
         return 0.0;
     }

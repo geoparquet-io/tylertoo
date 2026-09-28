@@ -45,8 +45,9 @@
 use std::collections::HashMap;
 
 use super::assign::{gsd_to_coord_units, AssignFeature, FeatureKind};
-use super::level::Crs;
-use super::simplify::{CollapseMode, Representation};
+use super::level::{zoom_for_gsd, Crs, WEBMERC_CIRCUMFERENCE_M};
+use super::simplify::{level_tolerance, CollapseMode, Representation};
+use crate::mvt::{DEFAULT_EXTENT, MIN_SURVIVING_SQUARE_SIDE};
 
 /// Accumulation patch width in GSD multiples: 1/32 of a 1024-pixel tile.
 pub const ACCUMULATE_CELL_GSD: f64 = 32.0;
@@ -56,9 +57,47 @@ pub const ACCUMULATE_CELL_GSD: f64 = 32.0;
 pub struct AccumulateLevel {
     /// Ground sample distance in meters.
     pub gsd_meters: f64,
+    /// The level's recorded Web Mercator zoom, if the plan supplied one
+    /// (`None` for an explicit `--gsd` plan). Picks the zoom the exporter
+    /// renders the level at, and so the tile unit its placeholders must
+    /// span ([`tile_unit_meters`]).
+    pub zoom: Option<u8>,
     /// Whether this level accumulates at all ([`level_accumulates`]). The
     /// canonical level never does — every feature is already present there.
     pub enabled: bool,
+}
+
+/// Length in meters of one tile unit at the zoom the exporter renders a
+/// level at, for the default [`DEFAULT_EXTENT`].
+///
+/// The zoom is the one `export::zoom_for_level` picks: the recorded `zoom`
+/// when present, else the §5.2 inverse of the GSD rounded to the nearest
+/// zoom and floored at 0. With the default `--gsd-base` (1024) and extent
+/// (4096) that is a quarter of the GSD.
+///
+/// The extent is the export default because the accumulator runs at
+/// convert time, before any extent is chosen; exporting with a larger
+/// extent only makes units smaller, so a level this keeps stays visible.
+pub fn tile_unit_meters(gsd_meters: f64, zoom: Option<u8>) -> f64 {
+    let z = match zoom {
+        Some(z) => f64::from(z),
+        None => zoom_for_gsd(gsd_meters).round().max(0.0),
+    };
+    WEBMERC_CIRCUMFERENCE_M / z.exp2() / f64::from(DEFAULT_EXTENT)
+}
+
+/// Whether a level's placeholder square survives the MVT polygon cleaner:
+/// its side, `simplify_factor × gsd`, spans at least
+/// [`MIN_SURVIVING_SQUARE_SIDE`] tile units at the level's export zoom.
+/// Below that the cleaner drops every square as degenerate (#407), so
+/// accumulating would add carriers the tiles never show.
+///
+/// Compared in meters: the tolerance is `factor × gsd` meters in either CRS
+/// (EPSG:4326 converts it with the same equatorial factor the rest of the
+/// pipeline uses).
+fn placeholder_is_visible(level: &AccumulateLevel, simplify_factor: f64) -> bool {
+    let side_m = simplify_factor * level.gsd_meters;
+    side_m >= MIN_SURVIVING_SQUARE_SIDE * tile_unit_meters(level.gsd_meters, level.zoom)
 }
 
 /// Whether a level's effective disposition is the placeholder square, i.e.
@@ -84,6 +123,17 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
 /// feature's unsigned area in CRS units² (anything for non-polygons).
 /// `simplify_factor` is the simplify knob the placeholder threshold
 /// (`(factor × gsd)²`) derives from.
+///
+/// A level whose placeholder side would quantize below one tile unit
+/// ([`placeholder_is_visible`]) is skipped, with one `log::info` naming the
+/// skipped levels: `--simplify-factor 0`, or a factor small enough, would
+/// otherwise turn every dropped polygon into a carrier whose square the
+/// MVT cleaner then drops (#407).
+///
+/// DIVERGENCE FROM TIPPECANOE: tippecanoe's placeholder side is
+/// `tiny_polygon_size` pixels, independent of simplification, so it never
+/// meets this case. Ours is `factor × gsd` (see the module docs), which a
+/// user can shrink to nothing; we skip instead of emitting invisible squares.
 pub fn tiny_polygon_carriers(
     features: &[AssignFeature],
     min_levels: &[u8],
@@ -95,12 +145,17 @@ pub fn tiny_polygon_carriers(
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); levels.len()];
+    let mut sub_unit: Vec<usize> = Vec::new();
     for (li, level) in levels.iter().enumerate() {
         if !level.enabled {
             continue;
         }
+        if !placeholder_is_visible(level, simplify_factor) {
+            sub_unit.push(li);
+            continue;
+        }
         let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
-        let tol = simplify_factor * gsd_units;
+        let tol = level_tolerance(level.gsd_meters, crs, simplify_factor);
         let threshold = tol * tol;
         let cell = ACCUMULATE_CELL_GSD * gsd_units;
         // NaN / zero guards (a NaN compares false everywhere).
@@ -127,6 +182,11 @@ pub fn tiny_polygon_carriers(
             // the contribution instead: a polygon is worth at most one
             // placeholder, and the residual invariant (< T per patch) holds.
             let area = area.min(threshold);
+            // The patch key comes from the bbox centre. A polygon whose bbox
+            // spans the antimeridian (lng_min near -180, lng_max near 180)
+            // therefore lands in a patch near lng 0, far from where it
+            // sits. The rest of the pipeline has no wrap handling either
+            // (#342); this stays consistent with it until that lands.
             let (cx, cy) = f.center();
             let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
             let total = acc.entry(key).or_insert(0.0);
@@ -139,6 +199,14 @@ pub fn tiny_polygon_carriers(
         // `features` is in input order and `index` is monotone in it, but
         // sort anyway: the lookup is a binary search.
         out[li].sort_unstable();
+    }
+    if !sub_unit.is_empty() {
+        log::info!(
+            "[convert] tiny-polygon accumulator skipped at level(s) {sub_unit:?}: a \
+             --simplify-factor {simplify_factor} placeholder square is narrower than \
+             {MIN_SURVIVING_SQUARE_SIDE} tile unit at those zooms, so the tile encoder would \
+             drop it"
+        );
     }
     out
 }
@@ -169,10 +237,12 @@ mod tests {
         vec![
             AccumulateLevel {
                 gsd_meters: 1000.0,
+                zoom: None,
                 enabled: true,
             },
             AccumulateLevel {
                 gsd_meters: 10.0,
+                zoom: None,
                 enabled: false,
             },
         ]
@@ -309,6 +379,105 @@ mod tests {
         assert!(!level_accumulates(C::Drop, R::Geometry));
         assert!(!level_accumulates(C::Point, R::Geometry));
         assert!(!level_accumulates(C::Point, R::Point));
+    }
+
+    // ---- #407: the placeholder must survive tile quantization -----------
+
+    /// Carriers at level 0 of [`level`] for the ten-field fixture of
+    /// [`one_carrier_per_threshold_of_dropped_area`] under `factor`.
+    fn ten_fields_at(factor: f64) -> Vec<usize> {
+        let feats: Vec<AssignFeature> = (0..10)
+            .map(|i| square(i, 10.0 + i as f64 * 5.0, 10.0, 400.0))
+            .collect();
+        let min_levels = vec![1u8; 10];
+        let areas = vec![160_000.0f32; 10];
+        tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, factor)
+            .swap_remove(0)
+    }
+
+    /// `--simplify-factor 0`: the placeholder has no side at all, so the
+    /// level must not accumulate (every field would cross `T = 0`).
+    #[test]
+    fn zero_factor_accumulates_nothing() {
+        assert!(ten_fields_at(0.0).is_empty());
+    }
+
+    /// A factor so small that the square is a millimetre across: it would
+    /// quantize to a point in the tile and the MVT cleaner would drop every
+    /// one of them, so the level carries nothing instead of ten invisible
+    /// carriers.
+    #[test]
+    fn sub_unit_placeholder_skips_the_level() {
+        let out = ten_fields_at(1e-6);
+        assert!(
+            out.is_empty(),
+            "sub-unit placeholders became carriers: {out:?}"
+        );
+    }
+
+    /// The skip threshold is exactly the cleaner's: a side one hair under
+    /// [`MIN_SURVIVING_SQUARE_SIDE`] tile units skips the level, one hair over
+    /// it accumulates.
+    #[test]
+    fn skip_threshold_is_one_tile_unit_at_the_level_zoom() {
+        let lvl = level()[0];
+        let unit = tile_unit_meters(lvl.gsd_meters, lvl.zoom);
+        let edge = MIN_SURVIVING_SQUARE_SIDE * unit / lvl.gsd_meters;
+        assert!(ten_fields_at(edge * 0.999).is_empty(), "below one unit");
+        assert!(!ten_fields_at(edge * 1.001).is_empty(), "above one unit");
+    }
+
+    /// The tile unit follows the zoom the exporter renders the level at: the
+    /// recorded zoom when there is one, else the §5.2 inverse of the GSD
+    /// rounded to the nearest zoom (`export::zoom_for_level`).
+    #[test]
+    fn tile_unit_follows_the_export_zoom() {
+        use super::super::level::{gsd, WEBMERC_CIRCUMFERENCE_M};
+        use crate::mvt::DEFAULT_EXTENT;
+        let extent = f64::from(DEFAULT_EXTENT);
+        // Derived: gsd(7) inverts to z7 exactly.
+        let want = WEBMERC_CIRCUMFERENCE_M / 128.0 / extent;
+        assert!((tile_unit_meters(gsd(7), None) - want).abs() < 1e-9);
+        // Recorded zoom wins over the GSD (a non-default `--gsd-base`).
+        assert!((tile_unit_meters(123.0, Some(7)) - want).abs() < 1e-9);
+        // With the default base and extent a unit is a quarter of a GSD.
+        assert!((tile_unit_meters(gsd(9), Some(9)) - gsd(9) / 4.0).abs() < 1e-9);
+    }
+
+    /// One tolerance helper serves the accumulator's threshold and
+    /// [`carrier_square`]'s side: it equals both previous formulas
+    /// (`factor × gsd_to_coord_units(gsd)` and `meters_to_units(factor ×
+    /// gsd)`), and the carrier square is exactly that wide.
+    #[test]
+    fn accumulator_and_carrier_square_share_one_tolerance() {
+        use super::super::simplify::{carrier_square, level_tolerance, SimplifyOptions};
+        use geo::{BoundingRect, Geometry};
+        for crs in [Crs::Epsg3857, Crs::Epsg4326] {
+            for gsd_m in [0.3, 9.55, 1000.0, 39_135.76] {
+                for factor in [0.25, 1.0, 3.7] {
+                    let tol = level_tolerance(gsd_m, crs, factor);
+                    let old_acc = factor * gsd_to_coord_units(gsd_m, crs);
+                    let old_sq = crs.meters_to_units(factor * gsd_m);
+                    let ulps = 4.0 * f64::EPSILON * tol;
+                    assert!((tol - old_acc).abs() <= ulps, "{crs:?} {gsd_m} {factor}");
+                    assert!((tol - old_sq).abs() <= ulps, "{crs:?} {gsd_m} {factor}");
+                    let poly = geo::Rect::new((0.0, 0.0), (tol * 0.1, tol * 0.1)).to_polygon();
+                    let opts = SimplifyOptions {
+                        factor,
+                        ..SimplifyOptions::default()
+                    };
+                    let sq = carrier_square(&Geometry::Polygon(poly), gsd_m, crs, &opts)
+                        .and_then(|g| g.bounding_rect())
+                        .expect("a polygon has a carrier square");
+                    assert!(
+                        (sq.width() - tol).abs() <= 1e3 * ulps,
+                        "{crs:?} {gsd_m} {factor}"
+                    );
+                }
+            }
+        }
+        assert_eq!(level_tolerance(1000.0, Crs::Epsg3857, 0.0), 0.0);
+        assert_eq!(level_tolerance(0.0, Crs::Epsg3857, 1.0), 0.0);
     }
 
     #[test]

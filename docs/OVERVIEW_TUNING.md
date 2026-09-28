@@ -636,6 +636,12 @@ Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
 - tippecanoe places the placeholder at the ring's first vertex with side
   `tiny_polygon_size` (default 2 px); ours sits at the polygon's
   representative point with side `simplify-factor × GSD`.
+- tippecanoe's placeholder side is a fixed pixel size; ours is
+  `simplify-factor × GSD`, so a level whose square would be narrower than
+  one tile unit at its zoom (`--simplify-factor` below 0.25 with the
+  default `--gsd-base` and extent, including `--simplify-factor 0`) skips
+  the accumulator and logs it, rather than emitting squares the tile
+  encoder drops as degenerate (#407).
 - the accumulator needs duplicating mode (a carrier is a second appearance
   of a feature, which partitioning's feature-once contract cannot
   represent). In partitioning mode neither mechanism applies: levels are

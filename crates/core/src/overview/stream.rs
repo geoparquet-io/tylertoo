@@ -743,23 +743,24 @@ fn streaming_carriers(
     features: &[AssignFeature],
     feat_min_levels: &[u8],
     areas: Vec<f32>,
-    level_gsds: &[f64],
+    level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
     crs: Crs,
 ) -> Vec<Vec<usize>> {
-    let finest_planned = level_gsds.len().saturating_sub(1);
-    let acc_levels: Vec<AccumulateLevel> = level_gsds
+    let finest_planned = level_specs.len().saturating_sub(1);
+    let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
-        .map(|(l, &gsd)| AccumulateLevel {
+        .map(|(l, &(gsd, zoom))| AccumulateLevel {
             gsd_meters: gsd,
+            zoom,
             enabled: l != finest_planned
                 && accumulator_enabled(options)
                 && level_accumulates(options.simplify.collapse, level_reprs[l]),
         })
         .collect();
     if !acc_levels.iter().any(|l| l.enabled) {
-        return vec![Vec::new(); level_gsds.len()];
+        return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
     let carriers = tiny_polygon_carriers(
@@ -1715,7 +1716,7 @@ fn resolve_winner_tables(
         features,
         &feat_min_levels,
         areas,
-        &level_gsds,
+        &level_specs,
         &level_reprs,
         crs,
     );
@@ -7520,7 +7521,7 @@ mod tests {
             &feats,
             &min_levels,
             areas,
-            &[1000.0, 10.0],
+            &[(1000.0, None), (10.0, None)],
             &[Representation::Geometry, Representation::Geometry],
             Crs::Epsg3857,
         )
@@ -7541,8 +7542,8 @@ mod tests {
     }
 
     /// #407, the zero case: `--simplify-factor 0` makes the placeholder
-    /// threshold `(0 × gsd)² = 0`. The accumulator must skip the level (its
-    /// `threshold <= 0` guard) rather than let every dropped polygon cross a
+    /// threshold `(0 × gsd)² = 0`. The accumulator must skip the level (the
+    /// sub-unit guard) rather than let every dropped polygon cross a
     /// zero threshold and come back as a zero-size carrier square.
     #[test]
     fn streaming_carriers_skip_a_zero_simplify_factor() {
@@ -7560,12 +7561,10 @@ mod tests {
     /// MVT cleaner drops the resulting rings as degenerate, so the level
     /// would carry every feature and show none of it.
     ///
-    /// Fails today: the guard only catches `threshold <= 0`, so each 160,000
-    /// m² field crosses the 1e-6 m² threshold on its own and all ten become
-    /// carriers. Ignored until #407 lands its "skip when the side would
-    /// quantize below one tile unit" guard; un-ignore it there.
+    /// The guard skips a level whose placeholder side is under
+    /// [`MIN_SURVIVING_SQUARE_SIDE`](crate::mvt::MIN_SURVIVING_SQUARE_SIDE)
+    /// tile units at the level's export zoom.
     #[test]
-    #[ignore = "#407: a sub-unit placeholder threshold still makes every dropped polygon a carrier"]
     fn streaming_carriers_skip_a_sub_unit_simplify_factor() {
         let carriers = carriers_for_factor(1e-6);
         assert!(

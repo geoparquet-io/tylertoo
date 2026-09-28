@@ -396,6 +396,18 @@ type TileRing = Vec<(i32, i32)>;
 /// One edge of a ring, as its two endpoints.
 type TileEdge = ((i32, i32), (i32, i32));
 
+/// Smallest axis-aligned square side, in tile units, that the polygon
+/// cleaner ([`quantize_ring`] / [`requantize_ring`]) is guaranteed to keep.
+///
+/// The cleaner snaps each vertex to the integer grid and drops a ring left
+/// with fewer than three distinct vertices. Rounding is monotone, so two
+/// corners at least one unit apart on an axis always snap to different
+/// integers there, and a square that wide keeps all four corners distinct
+/// wherever it sits. Anything narrower can snap to a segment or a point.
+/// Producers of placeholder geometry (the tiny-polygon accumulator, #407)
+/// compare against this bound rather than a copy of it.
+pub const MIN_SURVIVING_SQUARE_SIDE: f64 = 1.0;
+
 /// Snap a ring to tile units, dropping consecutive duplicates and closing it.
 /// Returns `None` when fewer than three distinct vertices remain — the ring
 /// has no area at this zoom and would only encode as a degenerate polygon.
@@ -3636,6 +3648,37 @@ mod tests {
             ring_area2(&winding_box_ring(4095, false)),
             4095 * 4 * (1i64 << 49)
         );
+    }
+
+    /// #407: [`MIN_SURVIVING_SQUARE_SIDE`] is the cleaner's own bound. An
+    /// axis-aligned square at least that wide keeps three distinct vertices
+    /// after the snap wherever it sits on the grid; one under it can snap
+    /// to a point or a segment and be dropped as degenerate.
+    #[test]
+    fn a_square_of_the_minimum_side_survives_quantization() {
+        let sq = |x: f64, y: f64, side: f64| {
+            LineString::from(vec![
+                (x, y),
+                (x + side, y),
+                (x + side, y + side),
+                (x, y + side),
+                (x, y),
+            ])
+        };
+        let min = MIN_SURVIVING_SQUARE_SIDE;
+        for i in 0..40 {
+            for j in 0..40 {
+                let (x, y) = (-10.0 + i as f64 * 0.513, 7.0 + j as f64 * 0.271);
+                for side in [min, min * 1.5, min * 3.0] {
+                    assert!(
+                        requantize_ring(&sq(x, y, side)).is_some(),
+                        "side {side} at ({x}, {y}) was dropped"
+                    );
+                }
+            }
+        }
+        assert!(requantize_ring(&sq(0.6, 0.6, 0.0)).is_none());
+        assert!(requantize_ring(&sq(0.6, 0.6, min * 0.5)).is_none());
     }
 
     /// The snap itself: finite values clamp to ±[`TILE_COORD_CLAMP`], the
