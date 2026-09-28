@@ -28,9 +28,10 @@
 # (nextest has no config-level string interpolation to share one expression.)
 #
 # CI (see ci.yml): the Test matrix and Coverage jobs run `quick`; the
-# "Slow Tests" job runs only the slow set, once, on ubuntu/macos stable, via
-# `--ignore-default-filter -E 'not default()'` — unchanged by this tier
-# split, since `default()` still means the same "quick" set.
+# "Slow Tests" job runs only the slow set on ubuntu/macos stable, in three
+# shards per OS, via `--ignore-default-filter -E 'not default()'
+# --partition count:N/3`. The shards are a CPU split of that one set, not
+# different tests. `default()` still means the same "quick" set.
 #
 # `hostile_geometry_eval::full_scorecard` (#205) is the slow half of the
 # hostile-geometry clipping harness: it adds the 316k-vertex Antarctica ring
