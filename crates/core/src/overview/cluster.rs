@@ -15,7 +15,8 @@
 //! - Every source point feature is assigned exactly one representative among
 //!   the rows *present* at `L` (`min_level <= L`): itself if present, else the
 //!   best-priority present point feature in its level-`L` grid cell (the same
-//!   cell size and [`Priority`] order the cell-winner stage used).
+//!   cell size and [`Priority`](super::assign::Priority) order the cell-winner
+//!   stage used).
 //! - `point_count` of a present row at level `L` = the number of source
 //!   features it represents at that level (itself + absorbed). At the
 //!   canonical (finest) level every cluster is a singleton (`point_count = 1`).
@@ -36,9 +37,10 @@
 //! are resolved deterministically: the cell's features attach to the present
 //! point feature nearest (Euclidean) to the orphan cell's center, over every
 //! present point of the level, found by one scan over the present cells
-//! (ties broken by [`Priority`], then input position). This keeps
-//! the invariant *Σ point_count over a level's point rows = total source
-//! point count* whenever the level has at least one point row.
+//! (ties broken by [`Priority`](super::assign::Priority), then input
+//! position). This keeps the invariant *Σ point_count over a level's point
+//! rows = total source point count* whenever the level has at least one point
+//! row.
 //!
 //! # DIVERGENCE FROM SUPERCLUSTER
 //!
@@ -50,7 +52,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::assign::{AssignConfig, AssignFeature, FeatureKind, Priority, SortDirection};
+// Only the docs name `AssignFeature` (its `index` is what the cluster tables
+// key on); the code takes the column-major `FeatureTable`.
+#[cfg(doc)]
+use super::assign::AssignFeature;
+use super::assign::{AssignConfig, FeatureKind, FeatureTable, SortDirection};
 use super::level::Crs;
 
 /// Name of the mandatory cluster-size column written when clustering is
@@ -188,7 +194,7 @@ impl AggState {
 /// `min_levels <= L`. Partitioning mode is not supported (see
 /// `ConvertError::ClusterPartitioningUnsupported`).
 pub fn build_cluster_tables(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     min_levels: &[u8],
     level_gsds: &[f64],
     config: &AssignConfig,
@@ -207,11 +213,8 @@ pub fn build_cluster_tables(
     let finest = num_levels - 1;
 
     // Positions of the point features (the only clustering participants).
-    let point_pos: Vec<usize> = features
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.kind == FeatureKind::Point)
-        .map(|(p, _)| p)
+    let point_pos: Vec<usize> = (0..features.len())
+        .filter(|&p| features.kind(p) == FeatureKind::Point)
         .collect();
     if point_pos.is_empty() {
         return tables;
@@ -223,7 +226,7 @@ pub fn build_cluster_tables(
     // almost nothing: the two comparisons below run once per *present* point
     // per level (the cell-winner fold) and once per orphan-cell candidate,
     // not inside an O(n log n) sort, so recomputing is in the noise.
-    let prio = |pos: usize| Priority::new(&features[pos], config.sort_direction);
+    let prio = |pos: usize| features.priority(pos, config.sort_direction);
 
     // Thinning off (`--verbatim`, or `--point-thinning 0`) makes every cell
     // guard below fail, so no cluster table is built and every `point_count`
@@ -246,7 +249,7 @@ pub fn build_cluster_tables(
             continue;
         }
         let cell = |pos: usize| -> (i64, i64) {
-            let (cx, cy) = features[pos].center();
+            let (cx, cy) = features.center(pos);
             (
                 (cx / cell_size).floor() as i64,
                 (cy / cell_size).floor() as i64,
@@ -328,7 +331,7 @@ pub fn build_cluster_tables(
         for (i, &pos) in point_pos.iter().enumerate() {
             let w = rep[i];
             let entry = acc
-                .entry(features[w].index)
+                .entry(features.indices()[w])
                 .or_insert_with(|| (0, vec![AggState::new(); ops.len()]));
             entry.0 += 1;
             for (s, vals) in values.iter().enumerate() {
@@ -378,14 +381,13 @@ pub fn build_cluster_tables(
 /// (`min_levels` parallel to `features`). Returns a human-readable violation
 /// description; callers surface it as a conversion error.
 pub fn verify_sum_invariant(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     min_levels: &[u8],
     tables: &ClusterTables,
 ) -> Result<(), String> {
     debug_assert_eq!(features.len(), min_levels.len());
-    let total: i64 = features
-        .iter()
-        .filter(|f| f.kind == FeatureKind::Point)
+    let total: i64 = (0..features.len())
+        .filter(|&p| features.kind(p) == FeatureKind::Point)
         .count() as i64;
     if total == 0 {
         return Ok(()); // no source points: nothing to account for
@@ -402,20 +404,21 @@ pub fn verify_sum_invariant(
         // empty and a shared index goes undetected, but every row there
         // writes point_count 1, so the per-row sum is still exact.
         let mut seen: HashSet<usize> = HashSet::new();
-        for (f, &ml) in features.iter().zip(min_levels) {
-            if f.kind != FeatureKind::Point || ml as usize > level {
+        for (pos, &ml) in min_levels.iter().enumerate() {
+            if features.kind(pos) != FeatureKind::Point || ml as usize > level {
                 continue;
             }
+            let f_index = features.indices()[pos];
             point_rows += 1;
-            match table.get(&f.index) {
+            match table.get(&f_index) {
                 Some(e) => {
-                    if !seen.insert(f.index) {
+                    if !seen.insert(f_index) {
                         return Err(format!(
                             "clustered level {level}: two present point rows \
                              share feature index {}; cluster tables are keyed \
                              by index, so each row would carry the same \
                              point_count (point feature indices must be unique)",
-                            f.index
+                            f_index
                         ));
                     }
                     sum += e.point_count;
@@ -444,9 +447,10 @@ pub fn verify_sum_invariant(
 ///
 /// The rule: over EVERY present cell winner, the smallest squared Euclidean
 /// distance from the feature's center to the orphan cell's center wins;
-/// exact ties fall back to the cell-winner [`Priority`] order, and a full
-/// `Priority` tie (only possible when two features share an `index`) to the
-/// smaller position. A NaN distance (a NaN center, reachable only through the
+/// exact ties fall back to the cell-winner
+/// [`Priority`](super::assign::Priority) order, and a full `Priority` tie
+/// (only possible when two features share an `index`) to the smaller
+/// position. A NaN distance (a NaN center, reachable only through the
 /// public API) counts as infinitely far. The comparison is therefore a strict
 /// total order, and the answer does not depend on `HashMap` iteration order.
 ///
@@ -484,7 +488,7 @@ pub fn verify_sum_invariant(
 fn nearest_present(
     cell_key: (i64, i64),
     present: &HashMap<(i64, i64), usize>,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     dir: SortDirection,
     cell_size: f64,
 ) -> usize {
@@ -493,7 +497,7 @@ fn nearest_present(
         (cell_key.1 as f64 + 0.5) * cell_size,
     );
     let dist_sq = |pos: usize| -> f64 {
-        let (x, y) = features[pos].center();
+        let (x, y) = features.center(pos);
         let dx = x - center.0;
         let dy = y - center.1;
         let d = dx * dx + dy * dy;
@@ -508,10 +512,7 @@ fn nearest_present(
         if da != db {
             return da < db;
         }
-        let (pa, pb) = (
-            Priority::new(&features[a], dir),
-            Priority::new(&features[b], dir),
-        );
+        let (pa, pb) = (features.priority(a, dir), features.priority(b, dir));
         if pa.beats(&pb) {
             true
         } else if pb.beats(&pa) {
@@ -564,8 +565,17 @@ fn nearest_present(
 
 #[cfg(test)]
 mod tests {
+    use super::super::assign::AssignFeature;
+
+    /// Array-of-structs fixture → the column-major table the engine takes
+    /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
+    /// pipeline fills a [`FeatureTable`] directly from the scan, so this
+    /// conversion exists only here.
+    fn table(feats: &[AssignFeature]) -> FeatureTable {
+        feats.iter().collect()
+    }
     use super::*;
-    use crate::overview::assign::{assign_levels, SortDirection};
+    use crate::overview::assign::{assign_levels, Priority, SortDirection};
 
     fn gsd(z: u32) -> f64 {
         40_075_016.69 / 1024.0 / 2f64.powi(z as i32)
@@ -622,11 +632,18 @@ mod tests {
         }
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         assert_eq!(tables.len(), 2);
 
         // Exactly two present rows at level 0, with counts {6, 4}.
@@ -653,7 +670,7 @@ mod tests {
         let feats: Vec<AssignFeature> = (0..4).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
         let vals = vec![vec![Some(10.0), Some(30.0), None, Some(20.0)]; 4];
@@ -663,8 +680,15 @@ mod tests {
             AccumulateOp::Min,
             AccumulateOp::Mean,
         ];
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &vals, &ops);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &vals,
+            &ops,
+        );
 
         assert_eq!(tables[0].len(), 1, "one cluster at level 0");
         let entry = tables[0].values().next().unwrap();
@@ -691,7 +715,7 @@ mod tests {
         let feats: Vec<AssignFeature> = (0..3).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
         // Specs 0..3 read the source column {NaN, 1.0, +inf} as the extractor
@@ -706,8 +730,15 @@ mod tests {
             AccumulateOp::Mean,
             AccumulateOp::Mean,
         ];
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &vals, &ops);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &vals,
+            &ops,
+        );
 
         assert_eq!(tables[0].len(), 1, "one cluster at level 0");
         let entry = tables[0].values().next().unwrap();
@@ -733,11 +764,11 @@ mod tests {
         let feats: Vec<AssignFeature> = (0..3).map(|i| point(i, i as f64 * 100.0, 0.0)).collect();
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
         let vals = vec![vec![None, None, None]];
         let tables = build_cluster_tables(
-            &feats,
+            &table(&feats),
             &min_levels,
             &gsds,
             &cfg,
@@ -770,12 +801,12 @@ mod tests {
         feats[0].sort_key = Some(1.0);
         let gsds = [gsd(2), gsd(6), gsd(12)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
         let vals = vec![vec![Some(0.0), Some(0.0), Some(0.0), Some(8.0)]];
         let tables = build_cluster_tables(
-            &feats,
+            &table(&feats),
             &min_levels,
             &gsds,
             &cfg,
@@ -815,11 +846,18 @@ mod tests {
         }
         let gsds = [gsd(2), gsd(6), gsd(12)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
 
         // Level 0: one winner holding all 12.
         let l0_winners: Vec<usize> = (0..feats.len()).filter(|&i| min_levels[i] == 0).collect();
@@ -861,8 +899,15 @@ mod tests {
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
 
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
 
         // Point 1 attaches to point 0 (1 cell away) not point 2 (3 cells).
         assert_eq!(tables[0].get(&0).map(|e| e.point_count), Some(2));
@@ -895,11 +940,18 @@ mod tests {
         feats[0].sort_key = Some(1.0);
         let gsds = [gsd(2), gsd(10)];
         let cfg = AssignConfig::default();
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
 
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         // Only the two points cluster (into one 2-point cluster on feature 0).
         assert_eq!(tables[0].len(), 1);
         assert_eq!(tables[0].get(&0).map(|e| e.point_count), Some(2));
@@ -919,12 +971,19 @@ mod tests {
             sort_direction: SortDirection::Desc,
             ..Default::default()
         };
-        let assignment = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let assignment = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
         assert_eq!(min_levels[3], 0, "sort-key holder wins the coarse cell");
 
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         assert_eq!(tables[0].get(&3).map(|e| e.point_count), Some(5));
     }
 
@@ -932,7 +991,7 @@ mod tests {
     fn empty_inputs_and_no_points_are_noops() {
         let gsds = [gsd(2), gsd(6)];
         let cfg = AssignConfig::default();
-        let t = build_cluster_tables(&[], &[], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let t = build_cluster_tables(&table(&[]), &[], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
         assert!(t.iter().all(|m| m.is_empty()));
 
         let poly = AssignFeature {
@@ -942,7 +1001,7 @@ mod tests {
             sort_key: None,
             entry_level: None,
         };
-        let t = build_cluster_tables(&[poly], &[0], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let t = build_cluster_tables(&table(&[poly]), &[0], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
         assert!(t.iter().all(|m| m.is_empty()));
     }
 
@@ -963,16 +1022,30 @@ mod tests {
 
         // Orphan absorbed by nearest survivor: invariant holds.
         let min_levels = vec![0u8, 1, 0];
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
-        verify_sum_invariant(&feats, &min_levels, &tables).unwrap();
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
+        verify_sum_invariant(&table(&feats), &min_levels, &tables).unwrap();
 
         // Zero survivors at level 0 (every point deferred): build silently
         // skips the level, the verifier MUST reject it (spec §12.1).
         let all_deferred = vec![1u8, 1, 1];
-        let tables =
-            build_cluster_tables(&feats, &all_deferred, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
-        let err = verify_sum_invariant(&feats, &all_deferred, &tables).unwrap_err();
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &all_deferred,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
+        let err = verify_sum_invariant(&table(&feats), &all_deferred, &tables).unwrap_err();
         assert!(
             err.contains("no surviving point row"),
             "unexpected message: {err}"
@@ -980,10 +1053,17 @@ mod tests {
 
         // Doctored table (a lost absorption): sum rule rejects.
         let min_levels = vec![0u8, 1, 0];
-        let mut tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let mut tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         tables[0].clear(); // drop the 2-point cluster entry → sum 2, not 3
-        let err = verify_sum_invariant(&feats, &min_levels, &tables).unwrap_err();
+        let err = verify_sum_invariant(&table(&feats), &min_levels, &tables).unwrap_err();
         assert!(err.contains("sum invariant"), "unexpected message: {err}");
     }
 
@@ -1001,9 +1081,16 @@ mod tests {
         let cfg = AssignConfig::default();
         let feats = vec![poly];
         let min_levels = vec![0u8];
-        let tables =
-            build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
-        verify_sum_invariant(&feats, &min_levels, &tables).unwrap();
+        let tables = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
+        verify_sum_invariant(&table(&feats), &min_levels, &tables).unwrap();
     }
 
     /// #609: two present points sharing an `AssignFeature::index` give the
@@ -1039,7 +1126,7 @@ mod tests {
         ];
         let build = || {
             build_cluster_tables(
-                &feats,
+                &table(&feats),
                 &min_levels,
                 &gsds,
                 &cfg,
@@ -1056,7 +1143,7 @@ mod tests {
                 "cluster tables differ between identical calls"
             );
         }
-        let err = verify_sum_invariant(&feats, &min_levels, &first).unwrap_err();
+        let err = verify_sum_invariant(&table(&feats), &min_levels, &first).unwrap_err();
         assert!(err.contains("share feature index 7"), "{err}");
     }
 
@@ -1072,8 +1159,16 @@ mod tests {
         };
         let feats = vec![point(4, 10.0, 10.0), point(4, 1010.0, 10.0)];
         let min_levels = [0u8, 0];
-        let t = build_cluster_tables(&feats, &min_levels, &gsds, &cfg, Crs::Epsg3857, &[], &[]);
-        let err = verify_sum_invariant(&feats, &min_levels, &t).unwrap_err();
+        let t = build_cluster_tables(
+            &table(&feats),
+            &min_levels,
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
+        let err = verify_sum_invariant(&table(&feats), &min_levels, &t).unwrap_err();
         assert!(err.contains("share feature index 4"), "{err}");
     }
 
@@ -1089,13 +1184,29 @@ mod tests {
         let gsds = [1.0, 0.5];
         for (x_present, x_orphan) in [(-10.0, 1e300), (10.0, -1e300), (-1e300, 1e300)] {
             let feats = vec![point(0, x_present, 0.0), point(1, x_orphan, 0.0)];
-            let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+            let t = build_cluster_tables(
+                &table(&feats),
+                &[0, 1],
+                &gsds,
+                &cfg,
+                Crs::Epsg3857,
+                &[],
+                &[],
+            );
             assert_eq!(t[0].len(), 1, "x_present={x_present} x_orphan={x_orphan}");
             assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
         }
         // Saturated keys on both axes.
         let feats = vec![point(0, -5.0, -5.0), point(1, 1e300, -1e300)];
-        let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let t = build_cluster_tables(
+            &table(&feats),
+            &[0, 1],
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
     }
 
@@ -1113,7 +1224,15 @@ mod tests {
         let d = 8_000.0;
         let feats = vec![point(0, 0.5, 0.5), point(1, d + 0.5, 0.5)];
         let t0 = std::time::Instant::now();
-        let t = build_cluster_tables(&feats, &[0, 1], &gsds, &cfg, Crs::Epsg3857, &[], &[]);
+        let t = build_cluster_tables(
+            &table(&feats),
+            &[0, 1],
+            &gsds,
+            &cfg,
+            Crs::Epsg3857,
+            &[],
+            &[],
+        );
         let elapsed = t0.elapsed();
         assert_eq!(t[0].get(&0).map(|e| e.point_count), Some(2));
         assert!(
@@ -1140,7 +1259,7 @@ mod tests {
             point(12, 0.5, 0.5),   // orphan cell (0, 0)
         ];
         let t = build_cluster_tables(
-            &feats,
+            &table(&feats),
             &[0, 0, 1],
             &[1.0, 0.5],
             &cfg,
@@ -1166,7 +1285,13 @@ mod tests {
         let present: HashMap<(i64, i64), usize> = [((1, 1), 0), ((2, -1), 1), ((2, 0), 2)]
             .into_iter()
             .collect();
-        let got = nearest_present((0, 0), &present, &features, SortDirection::Desc, 1.0);
+        let got = nearest_present(
+            (0, 0),
+            &present,
+            &table(&features),
+            SortDirection::Desc,
+            1.0,
+        );
         assert_eq!(got, 1);
     }
 
@@ -1185,7 +1310,13 @@ mod tests {
         let entries = [((1i64, 1i64), 0usize), ((1, 0), 1), ((-1, 0), 2)];
         for _ in 0..200 {
             let present: HashMap<(i64, i64), usize> = entries.iter().copied().collect();
-            let got = nearest_present((0, 0), &present, &features, SortDirection::Desc, 1.0);
+            let got = nearest_present(
+                (0, 0),
+                &present,
+                &table(&features),
+                SortDirection::Desc,
+                1.0,
+            );
             assert_eq!(got, 2);
         }
     }
@@ -1220,7 +1351,7 @@ mod tests {
     fn nearest_present_exhaustive(
         cell_key: (i64, i64),
         present: &HashMap<(i64, i64), usize>,
-        features: &[AssignFeature],
+        features: &FeatureTable,
         dir: SortDirection,
         cell_size: f64,
     ) -> usize {
@@ -1229,7 +1360,7 @@ mod tests {
             (cell_key.1 as f64 + 0.5) * cell_size,
         );
         let d = |p: usize| {
-            let (x, y) = features[p].center();
+            let (x, y) = features.center(p);
             let (dx, dy) = (x - center.0, y - center.1);
             let d = dx * dx + dy * dy;
             if d.is_nan() {
@@ -1244,8 +1375,8 @@ mod tests {
                 return da < db;
             }
             let (pa, pb) = (
-                Priority::new(&features[a], dir),
-                Priority::new(&features[b], dir),
+                Priority::new(features.row(a), dir),
+                Priority::new(features.row(b), dir),
             );
             if pa.beats(&pb) {
                 true
@@ -1322,8 +1453,8 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                let want = nearest_present_exhaustive(key, &present, &features, dir, 1.0);
-                let got = nearest_present(key, &present, &features, dir, 1.0);
+                let want = nearest_present_exhaustive(key, &present, &table(&features), dir, 1.0);
+                let got = nearest_present(key, &present, &table(&features), dir, 1.0);
                 if got != want {
                     mismatches += 1;
                     first.get_or_insert_with(|| {
@@ -1373,9 +1504,14 @@ mod tests {
             if present.contains_key(&key) {
                 continue;
             }
-            let want =
-                nearest_present_exhaustive(key, &present, &features, SortDirection::Desc, 1.0);
-            let got = nearest_present(key, &present, &features, SortDirection::Desc, 1.0);
+            let want = nearest_present_exhaustive(
+                key,
+                &present,
+                &table(&features),
+                SortDirection::Desc,
+                1.0,
+            );
+            let got = nearest_present(key, &present, &table(&features), SortDirection::Desc, 1.0);
             assert_eq!(got, want, "orphan {key:?} present {present:?}");
             checked += 1;
         }

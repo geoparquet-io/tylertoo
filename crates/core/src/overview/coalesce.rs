@@ -280,7 +280,7 @@ pub fn coalesce_level_lines(
                 sort_key: l.sort_key,
                 entry_level: None,
             };
-            Priority::new(&feat, config.sort_direction)
+            Priority::new(feat.row(), config.sort_direction)
         })
         .collect();
 
@@ -334,7 +334,7 @@ pub fn coalesce_level_lines(
         if cell_size > 0.0 && !cell_size.is_nan() {
             let chain_prio: Vec<Priority> = gated
                 .iter()
-                .map(|(_, f)| Priority::new(f, config.sort_direction))
+                .map(|(_, f)| Priority::new(f.row(), config.sort_direction))
                 .collect();
             // cell -> position of the best chain so far in `gated`.
             let mut grid: HashMap<(i64, i64), usize> = HashMap::new();
@@ -371,15 +371,16 @@ pub fn coalesce_level_lines(
     // --- 4c. Per-level density budget on chains (Q2 analog). -----------------
     if let Some((max_chains, gamma)) = budget {
         if survivors.len() > max_chains {
-            let feats: Vec<AssignFeature> = survivors
+            // No priority table: `select_budget_survivors` derives each
+            // candidate's from `feats.row(pos)` (#565). `feats` is built with
+            // `index: pos` precisely so the derived priority — hash and index
+            // tie-break included — is the one the removed table held. It is a
+            // `FeatureTable` (#543) sized by the CHAIN count, not the dataset.
+            let feats: super::assign::FeatureTable = survivors
                 .iter()
                 .enumerate()
                 .map(|(pos, (_, f))| AssignFeature { index: pos, ..*f })
                 .collect();
-            // No priority table: `select_budget_survivors` derives each
-            // candidate's from `feats[pos]` (#565). `feats` is built with
-            // `index: pos` precisely so the derived priority — hash and index
-            // tie-break included — is the one the removed table held.
             let cands: Vec<usize> = (0..survivors.len()).collect();
             let mut chosen = super::assign::select_budget_survivors(
                 &cands,

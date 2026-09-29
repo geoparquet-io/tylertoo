@@ -42,6 +42,11 @@
 
 use std::time::Instant;
 
+/// Array-of-structs fixture → the column-major table the engine takes (#543).
+fn table(feats: &[AssignFeature]) -> FeatureTable {
+    feats.iter().collect()
+}
+
 /// Live-heap counter + re-armable high-water mark, behind a counting global
 /// allocator.
 ///
@@ -197,7 +202,7 @@ fn mib(bytes: u64) -> f64 {
 
 use tylertoo_core::overview::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Crs,
-    DensityBudgetConfig, FeatureKind,
+    DensityBudgetConfig, FeatureKind, FeatureTable,
 };
 
 /// Web-Mercator GSD (meters per pixel at a 256-px tile) for a zoom level.
@@ -324,11 +329,19 @@ fn main() {
             format!("{grid_mib} MiB")
         }
     );
-    let table_bytes = std::mem::size_of::<AssignFeature>() * feats.len();
+    // The column-major table the engine takes (#543), built ONCE and outside
+    // every timed and allocation-tracked window: it is the phases' input, not
+    // part of either phase, so building it inside them would charge both
+    // `_s` and both `B/ft` columns for a serial N-row conversion and a whole
+    // extra table. The array-of-structs fixture is dropped once converted so
+    // it does not sit in the peak RSS figure either.
+    let features = table(&feats);
+    drop(feats);
+    let table_bytes = features.heap_bytes();
     println!(
         "feature table: {:.0} MiB ({} B/feature){}\n",
-        mib(table_bytes as u64),
-        std::mem::size_of::<AssignFeature>(),
+        mib(table_bytes),
+        features.bytes_per_row(),
         if track_mem {
             " — ASSIGN_BENCH_TRACK_MEM: B/ft columns are exact, TIMES ARE NOT (see `Counting`)"
         } else {
@@ -369,15 +382,21 @@ fn main() {
                 // real call chain puts it too.
                 let assign_base = arm();
                 let ta = Instant::now();
-                let cw =
-                    assign_levels_bounded(&feats, &gsds, &config, Crs::Epsg3857, grid_budget, &[]);
+                let cw = assign_levels_bounded(
+                    &features,
+                    &gsds,
+                    &config,
+                    Crs::Epsg3857,
+                    grid_budget,
+                    &[],
+                );
                 let assign_s = ta.elapsed().as_secs_f64();
                 let assign_mem = added_since(assign_base);
 
                 let budget_base = arm();
                 let tb = Instant::now();
                 let out =
-                    apply_density_budget(&cw, &feats, &gsds, &config, &density, Crs::Epsg3857);
+                    apply_density_budget(&cw, &features, &gsds, &config, &density, Crs::Epsg3857);
                 let budget_s = tb.elapsed().as_secs_f64();
                 let budget_mem = added_since(budget_base);
 
@@ -428,7 +447,7 @@ fn main() {
             "process peak RSS: {:.0} MiB ({:.1} B/feature, feature table {:.0} MiB of it)",
             mib(peak),
             peak as f64 / rows as f64,
-            mib(table_bytes as u64),
+            mib(table_bytes),
         );
     }
 }

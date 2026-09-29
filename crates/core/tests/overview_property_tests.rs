@@ -49,10 +49,15 @@ use proptest::prelude::*;
 
 use tylertoo_core::overview::assign::{
     apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, Crs,
-    DensityBudgetConfig, FeatureKind, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
+    DensityBudgetConfig, FeatureKind, FeatureTable, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
 };
 use tylertoo_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
 use tylertoo_core::overview::coalesce::{coalesce_level_lines, CoalesceInput, CoalesceParams};
+
+/// Array-of-structs fixture → the column-major table the engine takes (#543).
+fn table(feats: &[AssignFeature]) -> FeatureTable {
+    feats.iter().collect()
+}
 
 /// Default proptest cases per property, overridable via `PROPTEST_CASES`.
 const DEFAULT_CASES: u32 = 64;
@@ -217,7 +222,7 @@ proptest! {
         config in assign_config(),
         crs in crs(),
     ) {
-        let out = assign_levels(&feats, &gsds, &config, crs);
+        let out = assign_levels(&table(&feats), &gsds, &config, crs);
         let num_levels = gsds.len() as u8;
 
         prop_assert_eq!(out.num_levels, num_levels);
@@ -264,11 +269,11 @@ proptest! {
         config in assign_config(),
         crs in crs(),
     ) {
-        let a = assign_levels(&feats, &gsds, &config, crs);
-        let b = assign_levels(&feats, &gsds, &config, crs);
+        let a = assign_levels(&table(&feats), &gsds, &config, crs);
+        let b = assign_levels(&table(&feats), &gsds, &config, crs);
         prop_assert_eq!(a.assignments.clone(), b.assignments.clone(), "same input must reproduce byte-identically");
 
-        let c = assign_levels(&shuffled, &gsds, &config, crs);
+        let c = assign_levels(&table(&shuffled), &gsds, &config, crs);
         prop_assert_eq!(
             min_level_map(&a),
             min_level_map(&c),
@@ -292,8 +297,8 @@ proptest! {
             polygon_visibility: config.polygon_visibility + bump,
             ..config
         };
-        let base = assign_levels(&feats, &gsds, &config, crs);
-        let gated = assign_levels(&feats, &gsds, &stricter, crs);
+        let base = assign_levels(&table(&feats), &gsds, &config, crs);
+        let gated = assign_levels(&table(&feats), &gsds, &stricter, crs);
         prop_assert!(
             gated.duplicating_at_level(0).len() <= base.duplicating_at_level(0).len(),
             "a stricter visibility gate must never yield MORE coarsest-level rows"
@@ -324,9 +329,9 @@ proptest! {
         budget in budget_config(),
         crs in crs(),
     ) {
-        let cw = assign_levels(&feats, &gsds, &config, crs);
-        let out = apply_density_budget(&cw, &feats, &gsds, &config, &budget, crs);
-        let out2 = apply_density_budget(&cw, &feats, &gsds, &config, &budget, crs);
+        let cw = assign_levels(&table(&feats), &gsds, &config, crs);
+        let out = apply_density_budget(&cw, &table(&feats), &gsds, &config, &budget, crs);
+        let out2 = apply_density_budget(&cw, &table(&feats), &gsds, &config, &budget, crs);
         prop_assert_eq!(out.assignments.clone(), out2.assignments.clone(), "budget must be deterministic");
 
         prop_assert_eq!(out.assignments.len(), feats.len());
@@ -379,10 +384,10 @@ proptest! {
         gamma in 1.0..3.0f64,
         crs in crs(),
     ) {
-        let cw = assign_levels(&feats, &gsds, &config, crs);
+        let cw = assign_levels(&table(&feats), &gsds, &config, crs);
         let mk = |drop_rate: f64| DensityBudgetConfig { enabled: true, drop_rate, gamma };
-        let loose = apply_density_budget(&cw, &feats, &gsds, &config, &mk(rate), crs);
-        let strict = apply_density_budget(&cw, &feats, &gsds, &config, &mk(rate * factor), crs);
+        let loose = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate), crs);
+        let strict = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate * factor), crs);
         for level in 0..gsds.len() as u8 {
             prop_assert!(
                 strict.duplicating_at_level(level).len() <= loose.duplicating_at_level(level).len(),
@@ -426,8 +431,8 @@ proptest! {
         ops in prop::collection::vec(accumulate_op(), 0..3),
         seed_values in prop::collection::vec(prop::option::of(-1e6..1e6f64), 0..(3 * 48)),
     ) {
-        let cw = assign_levels(&feats, &gsds, &config, crs);
-        let out = apply_density_budget(&cw, &feats, &gsds, &config, &budget, crs);
+        let cw = assign_levels(&table(&feats), &gsds, &config, crs);
+        let out = apply_density_budget(&cw, &table(&feats), &gsds, &config, &budget, crs);
         let min_levels: Vec<u8> = out.assignments.iter().map(|a| a.min_level).collect();
 
         // Per-spec value columns, parallel to features (cycled from the pool).
@@ -439,11 +444,11 @@ proptest! {
             })
             .collect();
 
-        let tables = build_cluster_tables(&feats, &min_levels, &gsds, &config, crs, &values, &ops);
+        let tables = build_cluster_tables(&table(&feats), &min_levels, &gsds, &config, crs, &values, &ops);
         prop_assert_eq!(tables.len(), gsds.len());
 
         // The §12.1 invariant must hold — a failure here is a producer bug.
-        if let Err(violation) = verify_sum_invariant(&feats, &min_levels, &tables) {
+        if let Err(violation) = verify_sum_invariant(&table(&feats), &min_levels, &tables) {
             return Err(TestCaseError::fail(format!(
                 "spec §12.1 sum invariant violated: {violation}"
             )));

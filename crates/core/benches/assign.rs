@@ -18,8 +18,13 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tylertoo_core::overview::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Crs,
-    DensityBudgetConfig, FeatureKind,
+    DensityBudgetConfig, FeatureKind, FeatureTable,
 };
+
+/// Array-of-structs fixture → the column-major table the engine takes (#543).
+fn table(feats: &[AssignFeature]) -> FeatureTable {
+    feats.iter().collect()
+}
 
 /// Web-Mercator GSD (meters per pixel at a 256-px tile) for a zoom level.
 fn gsd(z: u32) -> f64 {
@@ -91,7 +96,7 @@ fn bench_assign(c: &mut Criterion) {
     let grid_budget = 256 * 1024 * 1024; // 256 MiB, binds waves at this scale
 
     for n in [50_000usize, 200_000] {
-        let feats = fixture(n);
+        let feats = table(&fixture(n));
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &feats, |b, feats| {
             b.iter(|| {
