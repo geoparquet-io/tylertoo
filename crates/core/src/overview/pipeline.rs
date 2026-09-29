@@ -97,8 +97,8 @@ const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 /// nothing about how wide the retained property columns are, so #626 stopped
 /// pretending: [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] is now an honest
 /// allocator/`Vec` floor, and the property term is **measured at run time**
-/// from the first buffered output batches ([`SinkAutoTuner`]), which can flip
-/// an `auto` run from RAM to spill mid-pass.
+/// from every buffered output batch ([`SinkAutoTuner`]), which can flip an
+/// `auto` run from RAM to spill mid-pass.
 ///
 /// Calibration (against the #294 RSS measurements above and corpus footers):
 ///
@@ -127,21 +127,29 @@ const PARTITIONING_GEOM_FACTOR: u64 = 4;
 /// offset/validity bookkeeping, and the allocator's rounding of each buffer up
 /// to a size class.
 ///
-/// **It used to be 4 KiB and it used to mean something else** (#626). The old
-/// `SINK_ROW_OVERHEAD_BYTES` comment claimed 4 KiB "covers everything that is
-/// NOT input geometry: property columns (≤ ~80 B/row on the measured
-/// corpora)" — a constant standing in for a quantity nobody measured, and
-/// wrong in both directions. Under-estimate: the FTW beta vectors carry 17
-/// exported properties and `gpio process aggregate --breakdown` outputs carry
-/// dozens to hundreds of `count_<value>` columns, so real retained property
-/// bytes blow past any fixed allowance (134 M rows × 17 properties peaked at
-/// ~192 GiB MaxRSS even under `--profile bounded`). Over-estimate: a
-/// two-property point corpus paid a 4 KiB/row assumption — ~50× the "measured
-/// ~80 B" the comment itself cited — and spilled where RAM was fine.
+/// It is not a property allowance. Property bytes are unbounded by any
+/// constant — `gpio process aggregate --breakdown` outputs carry dozens to
+/// hundreds of `count_<value>` columns — so they are measured instead, per
+/// run, by [`SinkAutoTuner`], and a fixed stand-in for them would be wrong in
+/// one direction or the other on most inputs.
 ///
-/// 256 B is a floor for the bookkeeping this name actually describes, not a
-/// property proxy. The property term is measured instead, per run, by
-/// [`SinkAutoTuner`].
+/// **Why 256 B is not #294 again.** #294's 256 B/row (the note on
+/// [`DUPLICATING_BYTES_PER_ROW`]) was the *whole* per-row estimate — no
+/// geometry term, no property term — and it was the only guard: once the
+/// up-front choice said RAM, nothing looked again. Here 256 B sits on top of
+/// terms that are measured (pass 1's geometry weight up front; the Arrow
+/// bytes of every buffered batch at run time), and the run-time check runs
+/// for the whole pass with the bytes already buffered as a term of its
+/// projection. An up-front estimate that is too low therefore costs a late
+/// downgrade, not an unbounded sink: the flip happens no later than the
+/// moment the RAM sinks reach the budget. On a 1 M-point input with a light
+/// head and a 1.5 KB-string tail (1.2 GB limit), `auto` started in RAM on an
+/// up-front 447 MiB, downgraded as the tail arrived, and peaked at 606 MiB
+/// RSS against 601 MiB for `bounded`. Under `speed` the same input peaked at
+/// 2306 MiB, ~1.7 GiB over the ~600 MiB the run holds without a RAM sink,
+/// while the measurement (floor included) said 2280 MiB — so on that input
+/// the measurement over-counts what the sink adds to RSS, the safe
+/// direction.
 const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
@@ -150,10 +158,14 @@ const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
 /// **Headroom.** This budget is charged twice over. The pass-2 sink is what it
 /// is for, but the pass-2 read-ahead ([`READ_BUDGET_FRACTION`]) takes a slice
 /// of the same number *on top* of the sink — 10% of it, half that under an
-/// explicit `bounded` profile. Both slices are modelled, not measured, with
-/// the same per-row estimate ([`estimate_buffered_bytes`]); the 0.4 of
-/// available RAM this fraction leaves unclaimed is what absorbs the error in
-/// both, plus the in-flight batches and the rayon pool's transients.
+/// explicit `bounded` profile. The two slices are sized differently. The
+/// sink's is chosen up front from a model ([`estimate_buffered_bytes`]) and
+/// then checked against the Arrow bytes actually buffered for the whole pass
+/// ([`SinkAutoTuner`]); the read-ahead's is a model only, priced per row by
+/// [`READ_ROW_NON_GEOM_BYTES`] plus the geometry weight
+/// ([`resolve_read_shape`]). The 0.4 of available RAM this fraction leaves
+/// unclaimed absorbs the read-ahead's model error, the gap between Arrow
+/// bytes and RSS, the in-flight batches, and the rayon pool's transients.
 const AUTO_RAM_FRACTION: f64 = 0.6;
 
 /// Budget used when available RAM cannot be probed (non-Linux, or
