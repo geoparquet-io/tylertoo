@@ -94,6 +94,109 @@ proportionally more peak memory. The default preflights a budget from the core
 count and available RAM (the same container-aware probe), so the common case
 needs no tuning.
 
+## Reading a job's MaxRSS
+
+A batch scheduler's `MaxRSS` and tylertoo's own memory bound measure different
+things, and on a big job the gap between them can be enormous. A `--profile
+bounded` coarse job over 134M features — modelled at about 10 GiB, and spilling
+its pass-2 sinks by definition — finished cleanly inside a 192 GiB Slurm cgroup
+having reported `MaxRSS 201,321,784 K`, a hair under the ceiling. Nothing was
+wrong. Here is why the two numbers disagree, and how to tell a healthy run from
+one that is genuinely one row group away from the kill.
+
+**tylertoo maps no data file.** Every byte it reads or writes goes through
+ordinary `read`/`write` syscalls: the input Parquet and the intermediate
+overview through `File::open` plus the Parquet reader, the `bounded` profile's
+pass-2 spill files as Arrow IPC over a `BufWriter`/`BufReader`, and the export's
+tile data appended to `<output>.partial` and copied with `std::io::copy`. There
+is no `mmap` anywhere in tylertoo or in its dependency tree. So none of that
+data is ever *in the process's address space*, and none of it can appear in the
+process's own resident set.
+
+**But the kernel still caches it, and a cgroup is still charged for it.** Pages
+read or written through those syscalls land in the page cache. Page cache is
+charged to the cgroup that faulted it in, and it counts toward
+`memory.max_usage_in_bytes` / `memory.peak` — the figure Slurm's
+`jobacct_gather/cgroup` reports as `MaxRSS`. Writing a 40 GiB archive and
+reading a 42 GiB input twice will therefore push a cgroup's accounted peak
+toward its limit no matter how small the process actually is. That memory is
+**clean, reclaimable page cache**: under pressure the kernel drops it instead of
+invoking the OOM killer, which is exactly why the job above finished.
+
+So: a `MaxRSS` at the cgroup ceiling on a job that moves tens of gigabytes of
+file data is the expected reading, not a warning sign, and **sizing the next
+job off that number will over-provision it by an order of magnitude.** Size off
+the anonymous figure instead.
+
+!!! note "Not every MaxRSS includes page cache"
+
+    Slurm's `jobacct_gather/linux` plugin sums `/proc/<pid>/statm` over the
+    process tree instead, which counts only what is mapped — so it excludes
+    unmapped page cache and will report a number close to tylertoo's own. If
+    your `MaxRSS` roughly matches the `[rss]` log lines, you are on that plugin
+    and there is nothing to untangle. The two readings are far apart only on
+    the cgroup plugin.
+
+**Get the breakdown from the run itself.** Set `TYLERTOO_PROFILE_JSON` and every
+phase boundary records a `smaps_rollup` snapshot of the resident set, split into
+anonymous and file-backed pages:
+
+```bash
+TYLERTOO_PROFILE_JSON=profile.jsonl tylertoo tiles in.parquet out.pmtiles \
+  --profile bounded --layer-name fields
+jq '.rss_sampler.phase_smaps' profile.jsonl
+```
+
+```json
+{
+  "pass1 scan": {
+    "rss_kib": 9912320, "anonymous_kib": 9785344, "file_backed_kib": 126976,
+    "shared_clean_kib": 4, "shared_dirty_kib": 0,
+    "private_clean_kib": 126972, "private_dirty_kib": 9785344, "swap_kib": 0
+  },
+  "pass2 (output sink)": {
+    "rss_kib": 2140160, "anonymous_kib": 2013184, "file_backed_kib": 126976,
+    "shared_clean_kib": 4, "shared_dirty_kib": 0,
+    "private_clean_kib": 126972, "private_dirty_kib": 2013184, "swap_kib": 0
+  }
+}
+```
+
+Read it like this:
+
+| Field | What it means for sizing |
+|---|---|
+| `anonymous_kib` | The process's own heap and stacks. **This is the number to size a job against** — it is what the OOM killer counts and what `--profile` bounds. |
+| `file_backed_kib` | Resident pages of a *mapped* file — for tylertoo, essentially just the binary's own text and rodata, a fixed ~100 MiB. It is **not** the page cache left behind by reads and writes. |
+| `rss_kib` | The sum of the two: the same quantity the `[rss] <phase>` log lines report. |
+| `swap_kib` | Anonymous pages that were evicted. Non-zero here means the run was already over budget. |
+
+The diagnosis is then mechanical. If `anonymous_kib` stays near the modelled
+figure while the scheduler reports a ceiling-riding `MaxRSS`, the difference is
+reclaimable page cache and the job is healthy — provision for the anonymous
+figure plus headroom. If `anonymous_kib` *itself* approaches the limit, the run
+really is near the kill and the profile is not holding; that is a bug worth
+reporting with the `profile.jsonl` attached.
+
+The fields are Linux-only. Elsewhere — and on a kernel built without
+`CONFIG_PROC_PAGE_MONITOR`, or in a sandbox that hides
+`/proc/self/smaps_rollup` — `phase_smaps` is an empty object.
+
+!!! tip "Why tylertoo does not drop the cache itself"
+
+    An obvious reflex is to have tylertoo call `posix_fadvise(DONTNEED)` on the
+    files it finishes with, so the accounted peak reflects the true working set.
+    It would buy almost nothing here. The pass-2 spill files and (absent
+    `--keep-overview`) the intermediate overview are **unlinked** as soon as
+    they are consumed, and unlinking frees their cache outright — an advisory
+    hint cannot do better.
+    The input is re-read once per level, so evicting its cache between levels
+    would convert cache hits into real disk reads and slow the run down. And the
+    output archive's pages are still dirty when the last write returns;
+    `DONTNEED` does not drop dirty pages, so it would need a `sync_file_range`
+    first, buying a slower export in exchange for a cosmetically smaller number.
+    The accounting is reported rather than manipulated.
+
 ## API walkthrough
 
 ### Streaming instead of loading the dataset

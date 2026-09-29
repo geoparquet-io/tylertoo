@@ -119,6 +119,19 @@ not "the run was not profiled".
       "pre-pass2 (winner tables freed)": 28.9,
       "pass2 (output sink)": 29.9,
       "writer.finish": 29.28
+    },
+    "phase_smaps": {                // #627: anon vs file-backed split of the
+      "pass1 scan": {               // resident set AT each phase boundary,
+        "rss_kib": 32870,           // in the kernel's own KiB. Empty object
+        "anonymous_kib": 21384,     // off Linux or where smaps_rollup is
+        "file_backed_kib": 11486,   // unreadable; a field the kernel did not
+        "shared_clean_kib": 4,      // print is present-and-null.
+        "shared_dirty_kib": 0,
+        "private_clean_kib": 11482,
+        "private_dirty_kib": 21384,
+        "swap_kib": 0
+      }
+      // ... one entry per phase, same keys as phase_peaks_mib
     }
   },
   "threads": 12,                    // rayon::current_num_threads()
@@ -161,6 +174,50 @@ jobs (#543's preflight guidance and the memory-envelope docs).
 `peak_rss_mib` stays for existing consumers of the field. `rss_sampler` is
 `null` only when profiling was off, which cannot happen for a line this
 dump actually wrote (the whole dump is a no-op then).
+
+### `rss_sampler.phase_smaps`: anonymous vs file-backed (#627)
+
+Every RSS figure above is a single total. It says how big the resident set
+got, never what it was made of — so a job whose scheduler-reported `MaxRSS`
+sits on the cgroup ceiling is indistinguishable from one about to be OOM
+killed. `phase_smaps` supplies the missing half: at every phase boundary the
+sampler reads `/proc/self/smaps_rollup` and records the split, keyed by the
+phase that is *ending* (so `phase_smaps["pass1 scan"]` describes the resident
+set as pass 1 handed off). `finish` closes the last phase, so
+`writer.finish` and `finalize` get an entry too.
+
+Values are the kernel's own KiB, not MiB, so a dump can be diffed against a
+live `cat /proc/<pid>/smaps_rollup` with no arithmetic. `rss_kib`,
+`anonymous_kib`, `shared_clean_kib`, `shared_dirty_kib`, `private_clean_kib`,
+`private_dirty_kib` and `swap_kib` are the kernel's lines verbatim;
+`file_backed_kib` is derived as `rss_kib - anonymous_kib`.
+
+- **`anonymous_kib` is the number to size a job against.** It is the process's
+  own heap and stacks — what the OOM killer counts, and what `--profile`
+  bounds. #543's preflight should consume this, not `rss_kib`.
+- **`file_backed_kib` is resident pages of a *mapped* file.** tylertoo `mmap`s
+  nothing (no `mmap` appears anywhere in the crate or its dependency tree), so
+  in practice this is just the binary's own text and rodata — a fixed ~100 MiB
+  that does not grow with the dataset. It is emphatically **not** the page
+  cache that the process's `read`/`write` traffic leaves behind: cache for an
+  unmapped file is charged to the cgroup but is in no process's RSS. That
+  distinction is the whole of #627, and
+  [Reading a job's MaxRSS](diving-deeper/bounded-memory.md#reading-a-jobs-maxrss)
+  walks an operator through it.
+- **`swap_kib` non-zero means the run was already over budget**, whatever the
+  peaks say.
+
+Unlike the peaks, these are boundary *snapshots*, not maxima. A composition is
+a moment: taking per-field maxima across samples would mix moments and the
+fields would stop adding up. Keeping it to boundaries also keeps the
+background thread's 250 ms tick a single cheap RSS read, since
+`smaps_rollup` — cheap as it is next to `/proc/self/smaps` — still walks every
+mapping in the address space.
+
+Linux-only. Off Linux, on a kernel built without `CONFIG_PROC_PAGE_MONITOR`,
+or in a sandbox that hides the file, `phase_smaps` is an empty object (never
+nulls, and never absent). A field the kernel did not print is
+present-and-null rather than a misleading `0`.
 
 The four `phase_walls` phases are **disjoint** windows of one conversion, so
 `pass1 + assign + pass2 + writer_finish <= total` always holds; the
@@ -277,7 +334,9 @@ missing export line after a failed run is expected, not a profiling bug.
         "fill": 940.7,             // absent in duplicating mode (no fill)
         "levels": 880.2,
         "finalize": 815.0
-      }
+      },
+      "phase_smaps": { /* #627: per-boundary anon vs file-backed split,
+                          same shape and keys as the convert side */ }
     },
     "threads": 12                  // rayon::current_num_threads()
   }
@@ -377,7 +436,11 @@ of the level scan through `finalize`, and it reports `true_peak_mib` plus
 names as `export.phase_walls`. In duplicating mode the fill never runs, so
 `phase_peaks_mib` has no `fill` key. It is spawned only when profiling is
 on; `null` otherwise (which cannot happen for a line this dump actually
-wrote).
+wrote). It carries `phase_smaps` too, with the same shape, keys and
+platform caveats as the convert side — see
+[`rss_sampler.phase_smaps`](#rss_samplerphase_smaps-anonymous-vs-file-backed-627).
+`finalize` is the phase an export's `MaxRSS` most often lands in, and the
+sampler's closing snapshot is what gives it an entry.
 
 `export.partition_wave_width` is the resolved partition-wave **ceiling**
 (`resolve_and_log_partition_wave`'s return, `auto` or an explicit

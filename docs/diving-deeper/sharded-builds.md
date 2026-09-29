@@ -318,6 +318,17 @@ multiplier is unchanged because it is calibrated on a measured OOM, and
 re-deriving it needs a fresh billion-row run, not an argument. The pass-1
 floor itself is unchanged either way.
 
+**Size against the job's anonymous memory, not its reported `MaxRSS`.** Both
+figures above are anonymous memory — tylertoo's own heap, the thing these
+budgets bound. A scheduler's `MaxRSS` may be something else entirely: under
+Slurm's cgroup accounting it also counts the reclaimable page cache left by
+reading the input and writing the archive, which on a job that moves tens of
+gigabytes can ride the cgroup ceiling while the process itself is an order of
+magnitude smaller. Applying the ×2.5 rule to *that* number over-provisions
+wildly. [Reading a job's MaxRSS](bounded-memory.md#reading-a-jobs-maxrss)
+explains how to tell the two apart, and how to get the split out of a run with
+`TYLERTOO_PROFILE_JSON`.
+
 **The remedy is a bigger box.** Sharding does not lower this floor: the
 coarse job runs the full pass 1 over the whole input, whatever `N` is. Only a
 `--plan` replay skips pass 1 (it re-reads the saved 1-byte/row winner table
