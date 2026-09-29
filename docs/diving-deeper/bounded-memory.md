@@ -161,9 +161,11 @@ at half its usual maximum depth, so a machine with RAM to spare does not build
 the deepest read-ahead under the profile that exists to cap memory.
 
 That bound is a **model**, not a measurement. The budget is charged
-`workers × depth × read-batch-size × per_row`, where `per_row` is the same
-estimate the sink uses: a fixed ~4 KiB non-geometry term plus twice pass 1's
-measured per-row geometry bytes. An input whose non-geometry columns cost much
+`workers × depth × read-batch-size × per_row`, where `per_row` is a fixed
+~4 KiB non-geometry term plus twice pass 1's measured per-row geometry bytes.
+The read-ahead is sized before pass 2 reads a row, so unlike the pass-2 sink
+— which measures the Arrow bytes it actually buffers (#626) — it cannot
+correct itself. An input whose non-geometry columns cost much
 more than that — a very wide schema, big strings, many dictionaries — is priced
 too cheaply, and the read-ahead will exceed its nominal share. If you are
 sizing a run to the last hundred MB on a wide schema, measure rather than trust

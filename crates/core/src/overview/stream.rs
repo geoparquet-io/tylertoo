@@ -3008,8 +3008,8 @@ struct ProfileJsonContext<'a> {
     /// was off (in which case this whole dump is never written anyway).
     rss_sampler_report: Option<RssSamplerReport>,
     in_flight_batches: usize,
-    /// #626: what a buffered pass-2 row really cost, measured from the first
-    /// sampled output batches.
+    /// #626: what a buffered pass-2 row really cost, measured over every
+    /// buffered output batch of the pass.
     sink_measurement: pipeline::SinkMeasurement,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -3256,9 +3256,9 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
                 "total": cascade_steps_total,
                 "ratio": cascade_share_ratio,
             },
-            // #626: what a buffered row actually cost, measured from the
-            // first sampled output batches, against the budget `auto` sized
-            // itself with — and whether that measurement forced a mid-pass
+            // #626: what a buffered row actually cost, measured over every
+            // buffered output batch, against the budget `auto` sized itself
+            // with — and whether that measurement forced a mid-pass
             // Ram→Spill downgrade. `bytes_per_row` is null when nothing was
             // buffered (the Serial path, or a single-level ladder).
             "sink": sink_json(inputs.sink_measurement),

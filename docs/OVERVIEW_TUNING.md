@@ -1738,8 +1738,19 @@ compute stage and the write stage**:
   polygons), with a deliberate high bias toward the near-free spill path;
   calibrated constants (~8 KiB/row duplicating, ~16 KiB/row partitioning)
   are the fallback when nothing was scanned. Partitioning additionally keeps
-  its historical 2M-buffered-row spill floor. The decision (measured average,
-  estimate, budget) is logged; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
+  its historical 2M-buffered-row spill floor. That up-front estimate sees
+  geometry only — a 256 B/row allocator floor stands in for everything else —
+  so an `auto` run that starts in RAM keeps **measuring** (#626): it sums the
+  Arrow bytes of every batch it buffers (geometry plus every kept property
+  column) and, after each input batch, projects the bytes already buffered
+  plus the rows still to come at the rate so far. If that passes the budget,
+  the RAM sinks are flushed to spill files once, mid-pass — one-way, order
+  preserved, output byte-identical. The check runs for the whole pass, so a
+  light head cannot hide a heavy tail; the downgrade fires at the latest when
+  the bytes actually buffered reach the budget. The measured rate and whether
+  it downgraded are logged and reported as `pass2.sink` in
+  `TYLERTOO_PROFILE_JSON`. The up-front decision (measured average geometry,
+  estimate, budget) is logged too; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
   detected available RAM. The probe is **container-aware** (#481): cgroup v2
   (`memory.max` and `memory.high`, minimum along the cgroup path) and cgroup v1
   (`memory.limit_in_bytes`) limits are respected, the binding cgroup's
@@ -1831,9 +1842,10 @@ number:
   is additionally capped at half its usual maximum depth.
 
   That bound is a **model**, not a measurement: the budget is charged
-  `workers × depth × read_batch_size × per_row`, and `per_row` is the sink's
-  own estimate — a fixed ~4 KiB non-geometry term plus twice pass 1's measured
-  per-row geometry bytes. A schema whose non-geometry columns cost far more
+  `workers × depth × read_batch_size × per_row`, and `per_row` is a fixed
+  ~4 KiB non-geometry term plus twice pass 1's measured per-row geometry
+  bytes. The read-ahead is sized before pass 2 reads a row, so unlike the
+  sink (which measures itself since #626) it cannot measure what it holds. A schema whose non-geometry columns cost far more
   than that term is priced too cheaply and the read-ahead can exceed its
   nominal share. On a run sized to the last hundred MB, measure; on a wide
   schema, `--read-workers 1` removes the term entirely.

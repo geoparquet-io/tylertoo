@@ -108,15 +108,17 @@ not "the run was not profiled".
                                     // property column — plus a 256 B
                                     // allocator floor; null when nothing
                                     // was buffered
-      "sampled_rows": 65536,        // rows the sample covered (~1M rows or
-                                    // 64 batches, whichever came first)
-      "projected_bytes": 12275712,  // bytes_per_row x planned buffered rows
+      "sampled_rows": 65536,        // buffered rows measured: every one
+                                    // of the pass
+      "projected_bytes": 12275712,  // bytes buffered + rows still planned
+                                    // x bytes_per_row; at the end of the
+                                    // pass, what was actually buffered
       "budget_bytes": 34359738368,  // AUTO_RAM_FRACTION x available RAM; 0
                                     // under bounded/speed, which never
                                     // probe it
       "downgraded_to_spill": false  // auto flipped the RAM sinks to spill
-    }                               // mid-pass because the measured rate
-  },                                // projected past the budget
+    }                               // mid-pass because the projection
+  },                                // passed the budget
   "pass1_memory_preflight": {       // #543: the pre-scan verdict
     "verdict": "fits",              // fits | warned | exceeded_but_forced |
                                     // not_checked (a --plan replay)
@@ -160,17 +162,20 @@ died is the single most useful line in this dump. `not_checked` means a
 
 `pass2.sink` is decided **during** pass 2, by measurement rather than model.
 `bytes_per_row` is the real retained cost of one buffered output row — the
-Arrow bytes of the geometry column plus every kept property column, over the
-first ~1M rows, plus a 256-byte allocator floor. Before #626 `auto` charged a
-flat 4 KiB/row for the property columns without ever looking at them; when
-the measured rate projects past `budget_bytes`, `auto` now flushes the RAM
-sinks into spill files once mid-pass and `downgraded_to_spill` records it.
-Two known biases, both toward spilling early:
+Arrow bytes of the geometry column plus every kept property column, averaged
+over every buffered row of the pass, plus a 256-byte allocator floor. Before
+#626 `auto` charged a flat 4 KiB/row for the property columns without ever
+looking at them. Now, after each input batch, `auto` projects the bytes
+already buffered plus the rows still to come at the rate so far; when that
+passes `budget_bytes` it flushes the RAM sinks into spill files once mid-pass
+and `downgraded_to_spill` records it. The check runs for the whole pass, so a
+spatially sorted input with a sparse head and a dense tail is caught as the
+tail is buffered — at the latest when the bytes actually buffered reach the
+budget. Two known biases, both toward spilling early:
 `RecordBatch::get_array_memory_size` reports allocated capacity rather than
-live bytes, and a cascading duplicating fold can hand two levels the same
-`Arc`'d geometry array, counted once per level. The sample is also the
-*first* rows of the input, so a spatially sorted input whose dense regions
-sort late is measured on its sparse head — that bias has no fixed sign.
+live bytes, and it includes each array's fixed struct overhead, which a
+coarse level's few-row batches spread over few rows. Both are real RAM while
+the batches are held, so neither is subtracted.
 
 See `docs/diving-deeper/sharded-builds.md` for how to turn `bytes_per_row`
 into a box size.
