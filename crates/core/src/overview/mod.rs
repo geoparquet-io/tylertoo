@@ -30,6 +30,7 @@ mod plan_state;
 pub mod properties;
 pub mod reader;
 pub mod simplify;
+mod smaps;
 mod stream;
 #[cfg(test)]
 pub(crate) mod testutil;
