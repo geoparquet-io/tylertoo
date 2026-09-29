@@ -379,20 +379,23 @@ level.
 
 Until [#626](https://github.com/geoparquet-io/tylertoo/issues/626) the `auto`
 profile priced those property columns at a flat 4 KiB/row — a constant nobody
-had measured against a wide schema, and wrong in both directions. The FTW
-Global beta (134 M features, 17 exported properties) peaked at ~192 GiB
-MaxRSS and completed only because the run was forced to `--profile bounded`;
-a `gpio process aggregate --breakdown` output, carrying dozens to hundreds of
+had measured against a wide schema. The FTW Global beta (134 M features, 17
+exported properties) peaked at ~192 GiB MaxRSS under `--profile bounded`, so
+its pass-2 sink was already on disk and that figure is not the sink; it shows
+how much a wide schema weighs, not that the 4 KiB guess failed on it. A
+`gpio process aggregate --breakdown` output, carrying dozens to hundreds of
 `count_<value>` columns per feature, is further out still. In the other
 direction a two-property point corpus paid that same 4 KiB/row and spilled
 where RAM would have been fine.
 
-`auto` now **measures** it. Pass 2 samples the first ~1 M buffered output
-rows (or 64 batches, whichever comes first), sums the actual Arrow bytes of
-the geometry column plus every kept property column and divides by rows; the
-only fixed term left is a 256-byte allocator/`Vec` floor, which is all that
-name now claims to cover. When the measured rate projects the whole buffered
-set past the RAM budget, the RAM sinks are flushed into spill files mid-pass,
+`auto` now **measures** it. Pass 2 sums the actual Arrow bytes of the
+geometry column plus every kept property column for every batch it buffers,
+for the whole pass; the only fixed term added per row is a 256-byte
+allocator/`Vec` floor, which is all that name now claims to cover. After each
+input batch it projects the whole buffered set as the bytes already buffered
+plus the rows still to come at the average rate so far. When that passes the
+RAM budget — at the latest, when what is actually buffered reaches it — the
+RAM sinks are flushed into spill files mid-pass,
 once — order preserved, nothing lost, and the output byte-identical to a run
 that spilled from the start. `bounded` and `speed` are explicit instructions
 and are never second-guessed.

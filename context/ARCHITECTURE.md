@@ -208,6 +208,17 @@ verbatim (spec §2.4).
    count; remote inputs read sequentially regardless (their parts share one
    chunk cache that concurrent readers would evict).
 
+   Under `--profile auto` the sink backing is chosen up front from a
+   geometry-only estimate (`auto_backing`), then **checked for the whole
+   pass** (#626, `SinkAutoTuner`): the consumer sums the Arrow bytes of every
+   batch it buffers and, after each input batch, projects bytes already
+   buffered plus the planned rows still to come at the running rate. Past the
+   budget, every RAM sink is flushed into a spill file once (`LevelSink::
+   downgrade_to_spill`) and the rest of the pass spills. The flip is one-way
+   and preserves row order, so it changes only where rows wait, never the
+   output bytes. Because buffered bytes are a term of the projection, the
+   flip happens no later than the moment the RAM sinks reach the budget.
+
 Pass 1 and the assignment can be **persisted and replayed** (`plan_state.rs`,
 `--save-plan` / `--plan`). Two reasons:
 
