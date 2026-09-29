@@ -4324,14 +4324,16 @@ pub(super) fn warn_spill_space(
 /// [`super::stream`]'s module doc for the phase this spans).
 ///
 /// Equal to [`FeatureTable::MAX_BYTES_PER_ROW`], pinned by the
-/// `pass1_bytes_per_row_matches_the_feature_table` test below: `index` (8
-/// bytes) + `center_x` + `center_y` + `diag_sq` (8 each) + `kind` (1) +
-/// `sort_key` (8) + `entry_level` (1). It is the **worst case** on purpose:
-/// the last two columns are allocated only when the job actually has a sort
-/// key (`--sort-key`/`--class-rank`, or an auto-detected ranking) or an
-/// entry-zoom ladder (`--entry-zoom`), so a default convert carries 33 B/row,
-/// not 42 — but a preflight that under-estimates is worse than useless, so
-/// this warns against the figure a job *could* reach.
+/// `pass1_bytes_per_row_matches_the_feature_table` test below (which reads it
+/// back off the allocated capacity of a table filled the way the streaming
+/// engine fills one): `index` (8 bytes) + `center_x` + `center_y` + `diag_sq`
+/// (8 each) + `kind` (1) + `sort_key` (8) + `entry_level` (1). It is the
+/// **worst case** on purpose: the last two columns are allocated only when the
+/// job actually has a sort key (`--sort-key`/`--class-rank`, or a ranking
+/// auto-detected from the schema) or an entry-zoom ladder (`--entry-zoom`), so
+/// a convert with neither carries 33 B/row and one with only a sort key 41 —
+/// but a preflight that under-estimates is worse than useless, so this warns
+/// against the figure a job *could* reach.
 ///
 /// #543 item 2 cut this from 64. The array-of-`AssignFeature` table it
 /// replaced stored the raw `[f64; 4]` bbox (assignment wants only its center
@@ -4382,12 +4384,15 @@ pub(super) const PASS1_BYTES_PER_ROW: u64 = FeatureTable::MAX_BYTES_PER_ROW;
 /// and is what the original factor encoded.
 ///
 /// **Re-derived by #543 item 2, because the denominator moved.** Shrinking the
-/// feature table from 64 to 42 B/row takes 22 B/row out of the whole-job need
-/// and leaves every other term of it untouched — the winner grids, the per-row
-/// scan vectors and pass 2's buffers do not care how the table is laid out. So
-/// the *absolute* recommendation must fall by exactly that 22 B/row, to
-/// ≈138 B/row, and the multiple must RISE to keep saying the same thing:
-/// `138 / 42 ≈ 3.3`. Leaving it at 2.5 would have quietly cut the
+/// feature table takes at least 22 B/row out of the whole-job need (64 → 42;
+/// 31 for a job with neither optional column, 64 → 33) and leaves every other
+/// term of it untouched — the winner grids, the per-row scan vectors and pass
+/// 2's buffers do not care how the table is laid out. Which optional columns
+/// the incident job carried is not recorded, so the saving it would see is
+/// only known to be in that 22–31 B/row range. Taking the smallest saving
+/// gives the largest, i.e. most conservative, *absolute* recommendation:
+/// ≈138 B/row (160 − 22). The multiple must RISE to keep saying the same
+/// thing: `138 / 42 ≈ 3.3`. Leaving it at 2.5 would have quietly cut the
 /// recommendation from 160 to 105 B/row and stopped warning about the very
 /// job that motivated the ticket (1.58B rows under 192 GiB:
 /// `61.8 GiB × 2.5 = 155 GiB`, which "fits"). At 3.3 that job warns again —
@@ -6640,44 +6645,88 @@ mod tests {
         assert!(spill_space_check(true, 10 << 30, dir, |_| Some(1)).is_some());
     }
 
-    /// #543: [`PASS1_BYTES_PER_ROW`] must track what a *filled*
-    /// [`FeatureTable`] actually costs per row — measured off a real table,
-    /// not restated from the constant. If this fails, the table's columns
+    /// #543: [`PASS1_BYTES_PER_ROW`] must track what a filled
+    /// [`FeatureTable`] actually **allocates** per row — read off each
+    /// column's `capacity()` after the fill the streaming engine performs
+    /// (reserve from the footer count, append the scan's chunk tables, then
+    /// set the sort keys and entry levels once the scan is done), not restated
+    /// from the element widths. So capacity slack in that fill — a column
+    /// grown by doubling instead of reserved or allocated exactly — fails
+    /// here. If it fails, either the fill regressed or the table's columns
     /// changed and the #543 estimate (its incident cross-check, the preflight
     /// wording and `docs/diving-deeper/sharded-builds.md`) needs
     /// recalibrating against the new figure.
     #[test]
     fn pass1_bytes_per_row_matches_the_feature_table() {
-        const ROWS: usize = 512;
-        let mut worst = FeatureTable::with_capacity(ROWS);
-        for i in 0..ROWS {
-            worst.push(&AssignFeature {
-                index: i,
-                bbox: [0.0, 0.0, 1.0, 1.0],
-                kind: FeatureKind::Polygon,
-                sort_key: Some(i as f64),
-                entry_level: Some(1),
-            });
-        }
+        const ROWS: usize = 4_096;
+        const CHUNK: usize = 1_000; // deliberately not a divisor of ROWS
+        let fill = |sort_key: bool, entry_level: bool| {
+            let mut table = FeatureTable::new();
+            table.try_reserve_exact(ROWS).expect("reserve");
+            let mut base = 0;
+            while base < ROWS {
+                let n = CHUNK.min(ROWS - base);
+                let mut chunk = FeatureTable::with_capacity(n);
+                for i in 0..n {
+                    chunk.push(&AssignFeature {
+                        index: i,
+                        bbox: [0.0, 0.0, 1.0, 1.0],
+                        kind: FeatureKind::Polygon,
+                        sort_key: None,
+                        entry_level: None,
+                    });
+                }
+                table.append_rebased(&chunk, base);
+                base += n;
+            }
+            for pos in 0..ROWS {
+                if sort_key {
+                    table.set_sort_key(pos, Some(pos as f64));
+                }
+                if entry_level {
+                    table.set_entry_level(pos, Some(1));
+                }
+            }
+            assert_eq!(table.len(), ROWS);
+            table.allocated_bytes() as f64 / ROWS as f64
+        };
+        let worst = fill(true, true);
         assert_eq!(
-            worst.heap_bytes() / ROWS as u64,
-            PASS1_BYTES_PER_ROW,
-            "a table with both optional columns must cost PASS1_BYTES_PER_ROW"
+            worst, PASS1_BYTES_PER_ROW as f64,
+            "a table with both optional columns must allocate PASS1_BYTES_PER_ROW"
         );
         assert_eq!(PASS1_BYTES_PER_ROW, 42, "the documented #543 figure");
-        // The preflight must never under-estimate: no table can cost more.
-        let mut lean = FeatureTable::with_capacity(ROWS);
-        for i in 0..ROWS {
-            lean.push(&AssignFeature {
+        assert_eq!(
+            fill(true, false),
+            41.0,
+            "a sort key (explicit or auto-detected), no ladder"
+        );
+        assert_eq!(fill(false, false), 33.0, "no sort key, no ladder");
+        // The preflight must never under-estimate: no fill can cost more.
+        for (k, e) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(
+                fill(k, e) <= PASS1_BYTES_PER_ROW as f64,
+                "sort_key={k} entry_level={e}"
+            );
+        }
+
+        // The measurement sees slack: a table grown by `push` with no
+        // reservation allocates more than its rows occupy. Without this, the
+        // assertions above could pass by restating the element widths.
+        let mut grown = FeatureTable::new();
+        for i in 0..=ROWS {
+            grown.push(&AssignFeature {
                 index: i,
                 bbox: [0.0, 0.0, 1.0, 1.0],
-                kind: FeatureKind::Polygon,
+                kind: FeatureKind::Point,
                 sort_key: None,
                 entry_level: None,
             });
         }
-        assert!(lean.heap_bytes() / ROWS as u64 <= PASS1_BYTES_PER_ROW);
-        assert_eq!(lean.heap_bytes() / ROWS as u64, 33, "the default convert");
+        assert!(
+            grown.allocated_bytes() > grown.heap_bytes(),
+            "a push-grown table must show capacity slack"
+        );
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
@@ -6843,8 +6892,8 @@ mod tests {
     }
 
     /// #543: the hard-error message names the concrete numbers, the hard
-    /// limit, the ×2.5 need, the right remediation, and the escape hatch
-    /// verbatim.
+    /// limit, the ×[`PASS1_RECOMMENDED_FACTOR`] need, the right remediation,
+    /// and the escape hatch verbatim.
     #[test]
     fn pass1_memory_floor_message_names_numbers_doc_and_escape_hatch() {
         let rows = 1_580_000_000u64;

@@ -67,14 +67,17 @@
 //! job and ~59 GiB at the 1.58B-row global scale, stacked on the pass-1 feature
 //! table ([`FeatureTable`], `convert::PASS1_BYTES_PER_ROW` — 64 B/row when #565
 //! measured this, 33–42 B/row since #543 item 2) that is still live throughout.
-//! Every field of a [`Priority`] is a pure function of the `AssignFeature` the
-//! comparator already has to read, so [`priority_order`] derives both sides per
-//! comparison instead. Measured on the `assign_scaling` harness (8M rows, 14
-//! levels, 1 GiB grid budget), the budget's transient fell from 72.1 to 32.1
-//! B/feature — the phase's peak is now dominated by the per-level candidate list
-//! and its super-cell tags, both already allocated and freed per level. The
-//! trade is comparison cost: the budget phase is 7–16% slower (more at one
-//! thread, less at twelve) for removing ~5/8 of its footprint.
+//! Every field of a [`Priority`] is a pure function of three of the row's
+//! columns ([`FeatureTable::priority`]), so [`priority_order`] derives both
+//! sides per comparison instead. Measured on the `assign_scaling` harness (8M
+//! rows, 14 levels, 1 GiB grid budget), the budget's transient fell from 72.1
+//! to 32.1 B/feature — the phase's peak is now dominated by the per-level
+//! candidate list and its super-cell tags, both already allocated and freed per
+//! level. The trade was comparison cost: against the array-of-structs table
+//! #565 measured on, the budget phase was 7–16% slower (more at one thread,
+//! less at twelve) for removing ~5/8 of its footprint. With the column-major
+//! table the cost depends on how many columns a comparison reads; see
+//! [`priority_order`] for why it reads three and what that measured.
 //!
 //! # Parallelism & determinism
 //!
@@ -158,10 +161,12 @@ impl FeatureKind {
     }
 
     /// Inverse of [`FeatureKind::discriminant`]. Only ever called on a byte
-    /// this module wrote, so an unknown value is a bug, not input: it reads
+    /// this module wrote, so an unknown value is a bug, not input: debug
+    /// builds (and so every test) assert on it, and release builds read it
     /// back as `Point` rather than panicking in the hottest loop there is.
     #[inline]
     fn from_discriminant(d: u8) -> Self {
+        debug_assert!(d <= 2, "unknown FeatureKind discriminant {d}");
         match d {
             1 => FeatureKind::Line,
             2 => FeatureKind::Polygon,
@@ -326,16 +331,19 @@ const NO_ENTRY_LEVEL: u8 = u8::MAX;
 ///    columns pay none. Columns also let the two *optional* fields cost
 ///    nothing at all when the job does not use them: `sort_key` is allocated
 ///    only once a finite key is actually set, and `entry_level` only once a
-///    ladder value is. A convert with neither — no `--sort-key`/`--class-rank`
-///    and no `--entry-zoom`, which is the default — carries 9 B/row less.
+///    ladder value is. A convert with neither — no `--sort-key`/`--class-rank`,
+///    no ranking auto-detected from the schema (Overture road classes, places
+///    `confidence`), and no `--entry-zoom` — carries 9 B/row less.
 ///
 /// | layout | bytes/row |
 /// |---|---|
 /// | `Vec<AssignFeature>` (before #543) | 64 |
 /// | this table, sort key **and** ladder present | 42 |
-/// | this table, neither (the default) | 33 |
+/// | this table, sort key only (explicit or auto-detected) | 41 |
+/// | this table, neither | 33 |
 ///
-/// At 1.58 B rows that is 94.2 GiB → 61.8 GiB worst case, 48.5 GiB typical.
+/// At 1.58 B rows that is 94.2 GiB → 61.8 GiB worst case, 60.3 GiB with a
+/// sort key only and 48.5 GiB with neither.
 /// [`super::convert::PASS1_BYTES_PER_ROW`] pins the worst case, because a
 /// preflight must not under-estimate.
 ///
@@ -413,16 +421,44 @@ impl FeatureTable {
     /// cannot be reserved still fills correctly by growth (#543: the streaming
     /// engine pre-sizes when the footers give an exact row count, because
     /// growing by `push` costs a transient ~2× at the last doubling).
+    ///
+    /// All or nothing: when a later column fails, the columns already
+    /// reserved are shrunk back to their previous capacity. Otherwise the
+    /// fallback-to-growth path would hold several full-size columns reserved
+    /// while the rest doubled, which is the transient this reservation exists
+    /// to avoid.
     pub fn try_reserve_exact(
         &mut self,
         rows: usize,
     ) -> Result<(), std::collections::TryReserveError> {
-        self.index.try_reserve_exact(rows)?;
-        self.center_x.try_reserve_exact(rows)?;
-        self.center_y.try_reserve_exact(rows)?;
-        self.diag_sq.try_reserve_exact(rows)?;
-        self.kind.try_reserve_exact(rows)?;
-        Ok(())
+        let before = self.column_capacities();
+        let reserved = (|| {
+            self.index.try_reserve_exact(rows)?;
+            self.center_x.try_reserve_exact(rows)?;
+            self.center_y.try_reserve_exact(rows)?;
+            self.diag_sq.try_reserve_exact(rows)?;
+            self.kind.try_reserve_exact(rows)
+        })();
+        if reserved.is_err() {
+            let [index, center_x, center_y, diag_sq, kind] = before;
+            self.index.shrink_to(index);
+            self.center_x.shrink_to(center_x);
+            self.center_y.shrink_to(center_y);
+            self.diag_sq.shrink_to(diag_sq);
+            self.kind.shrink_to(kind);
+        }
+        reserved
+    }
+
+    /// Capacities of the always-present columns, in declaration order.
+    fn column_capacities(&self) -> [usize; 5] {
+        [
+            self.index.capacity(),
+            self.center_x.capacity(),
+            self.center_y.capacity(),
+            self.diag_sq.capacity(),
+            self.kind.capacity(),
+        ]
     }
 
     #[inline]
@@ -484,6 +520,23 @@ impl FeatureTable {
     #[inline]
     pub(super) fn center(&self, i: usize) -> (f64, f64) {
         (self.center_x[i], self.center_y[i])
+    }
+
+    /// Row `i`'s [`Priority`], read from the three columns it depends on
+    /// (`sort_key`, `diag_sq`, `index`) rather than through [`Self::row`],
+    /// which would also load the center, kind and entry level. Every priority
+    /// comparison — the cell-winner contest, the density budget's sorts, the
+    /// cluster stage — is a random access into the table, where each column
+    /// read is its own cache line, so the columns not read are misses not
+    /// taken. Identical to `Priority::new(self.row(i), dir)` by construction.
+    #[inline]
+    pub(super) fn priority(&self, i: usize, dir: SortDirection) -> Priority {
+        Priority::from_parts(
+            self.sort_key.get(i).copied().unwrap_or(f64::NAN),
+            self.diag_sq[i],
+            self.index[i],
+            dir,
+        )
     }
 
     #[inline]
@@ -580,9 +633,11 @@ impl FeatureTable {
         }
     }
 
-    /// Heap bytes the columns hold for `len()` rows — **measured** from the
-    /// live column lengths, with capacity slack excluded (this reports the
-    /// layout, not the allocator). Zero for an empty table.
+    /// Bytes the columns' `len()` rows occupy: each column's length times its
+    /// element width. This is the layout's cost, not an allocation figure —
+    /// capacity slack is excluded, so it cannot show a column that was grown
+    /// by doubling. [`Self::allocated_bytes`] is the allocation figure. Zero
+    /// for an empty table.
     pub fn heap_bytes(&self) -> u64 {
         let w = |len: usize, width: usize| (len * width) as u64;
         w(self.index.len(), std::mem::size_of::<usize>())
@@ -592,6 +647,21 @@ impl FeatureTable {
             + w(self.kind.len(), std::mem::size_of::<u8>())
             + w(self.sort_key.len(), std::mem::size_of::<f64>())
             + w(self.entry_level.len(), std::mem::size_of::<u8>())
+    }
+
+    /// Heap bytes the columns have **allocated**: each column's `capacity()`
+    /// times its element width. Unlike [`Self::heap_bytes`] this includes
+    /// capacity slack, so it is the figure that shows whether a fill pattern
+    /// actually costs what the layout promises.
+    pub fn allocated_bytes(&self) -> u64 {
+        let w = |cap: usize, width: usize| (cap * width) as u64;
+        w(self.index.capacity(), std::mem::size_of::<usize>())
+            + w(self.center_x.capacity(), std::mem::size_of::<f64>())
+            + w(self.center_y.capacity(), std::mem::size_of::<f64>())
+            + w(self.diag_sq.capacity(), std::mem::size_of::<f64>())
+            + w(self.kind.capacity(), std::mem::size_of::<u8>())
+            + w(self.sort_key.capacity(), std::mem::size_of::<f64>())
+            + w(self.entry_level.capacity(), std::mem::size_of::<u8>())
     }
 
     /// What this table actually costs per row: [`Self::BASE_BYTES_PER_ROW`]
@@ -817,8 +887,8 @@ const MISSING_SORT_RANK: f64 = f64::NEG_INFINITY;
 /// features with the exact order the cell-winner stage used.
 ///
 /// **Cheap to derive and NOT worth storing per feature** (#565). Every field is
-/// a pure function of `(AssignFeature, SortDirection)` — four float subtractions,
-/// two multiplies, a hash mix and a couple of compares — so callers that need a
+/// a pure function of `(sort_key, diag_sq, index, SortDirection)` — a sign
+/// flip, a couple of compares and a hash mix — so callers that need a
 /// priority for a *comparison* derive it on the spot rather than materializing a
 /// table parallel to the feature slice. `apply_density_budget` used to build exactly
 /// that table: 40 B/feature live for the whole admission fold, 2.1 GiB on a
@@ -854,6 +924,15 @@ pub(super) struct Priority {
 
 impl Priority {
     pub(super) fn new(feat: FeatureRow, dir: SortDirection) -> Self {
+        Self::from_parts(feat.sort_key, feat.diag_sq(), feat.index, dir)
+    }
+
+    /// [`Priority::new`] from the three row values a priority depends on.
+    /// [`FeatureTable::priority`] calls this directly so a comparison reads
+    /// three columns, not the six a whole [`FeatureRow`] carries; routing
+    /// both through one body keeps the two paths bit-identical.
+    #[inline]
+    fn from_parts(sort_key: f64, diag_sq: f64, index: usize, dir: SortDirection) -> Self {
         // A non-finite key is a MISSING key (#428). The extractors upstream
         // already file NaN/±inf under `None`, but `AssignFeature::sort_key`
         // is reachable from the public `assign_levels` API and from
@@ -863,10 +942,10 @@ impl Priority {
         // strict weak order, so the cell incumbent would keep the cell
         // whatever the keys say and `sort_by` would be entitled to panic.
         // Apply direction so a plain "larger wins" comparison is correct.
-        let sort_rank = if feat.sort_key.is_finite() {
+        let sort_rank = if sort_key.is_finite() {
             match dir {
-                SortDirection::Desc => feat.sort_key,
-                SortDirection::Asc => -feat.sort_key,
+                SortDirection::Desc => sort_key,
+                SortDirection::Asc => -sort_key,
             }
         } else {
             MISSING_SORT_RANK
@@ -888,13 +967,12 @@ impl Priority {
         // feature has the largest diagonal there is and must keep winning its
         // cell exactly as it did before #534 (and in `coalesce`'s
         // representative selection, which ranks by this same `Priority`).
-        let diag_sq = feat.diag_sq();
         let diag_sq = if diag_sq.is_nan() { -1.0 } else { diag_sq };
         Priority {
             sort_rank,
             diag_sq,
-            hash: stable_hash(feat.index),
-            index: feat.index,
+            hash: stable_hash(index),
+            index,
         }
     }
 
@@ -1041,8 +1119,8 @@ fn contest_cell(
 ) {
     grid.entry(key)
         .and_modify(|slot| {
-            let challenger = Priority::new(features.row(pos), dir);
-            let incumbent = Priority::new(features.row(*slot), dir);
+            let challenger = features.priority(pos, dir);
+            let incumbent = features.priority(*slot, dir);
             if challenger.beats(&incumbent) {
                 *slot = pos;
             }
@@ -2013,14 +2091,27 @@ pub fn apply_density_budget(
 /// by Q1 [`Priority`] (a strict total order).
 ///
 /// The two priorities are **derived here, per comparison**, not looked up in a
-/// precomputed table (#565). `Priority::new` is a handful of arithmetic ops on
-/// one `AssignFeature`, and the table it replaces was 40 B live per feature for
-/// the whole of `apply_density_budget` — the largest single allocation in the
+/// precomputed table (#565). `Priority` is a handful of arithmetic ops on three
+/// row values, and the table it replaces was 40 B live per feature for the
+/// whole of `apply_density_budget` — the largest single allocation in the
 /// phase and the one that made the assignment's true peak roughly 2.2× the
-/// feature table on a 55M-row job. The comparator already had to touch
-/// `features[a]` and `features[b]`'s cache lines to reach a table indexed the
-/// same way, so this trades a table probe for the arithmetic, not for an extra
-/// memory reference.
+/// feature table on a 55M-row job.
+///
+/// What the derivation costs in memory traffic depends on the table layout.
+/// When #565 made this trade the table was an array of 64-byte structs, so a
+/// row was one cache line and the derivation read no line a table probe would
+/// not have. The column-major [`FeatureTable`] (#543) spreads a row over
+/// separate columns, so each side of a comparison is one random read per
+/// column it touches. That is why this goes through
+/// [`FeatureTable::priority`], which reads the three columns a priority
+/// depends on (`sort_key`, `diag_sq`, `index`), and not through
+/// [`FeatureTable::row`], which would read six. Measured on `assign_scaling`
+/// (8M rows, 14 levels, 1 GiB grid budget, best of 3, two interleaved rounds
+/// against the array-of-structs build on one 4-core machine): through `row`
+/// the density budget was 35–44% slower at one thread and 24–26% slower at
+/// four; through `priority` it is 5–14% *faster* at one thread and 5–9% at
+/// four (9.9–10.5 s vs 11.1–11.5 s, and 3.4 s vs 3.6–3.7 s), the three
+/// columns being 24 B of reads where the struct was a 64 B line.
 ///
 /// The position fallback is what makes this a *consistent* comparator rather
 /// than one that answers `Greater` in both directions: two features can only tie
@@ -2034,8 +2125,8 @@ fn priority_order(features: &FeatureTable, dir: SortDirection, a: usize, b: usiz
     if a == b {
         return Ordering::Equal;
     }
-    let pa = Priority::new(features.row(a), dir);
-    let pb = Priority::new(features.row(b), dir);
+    let pa = features.priority(a, dir);
+    let pb = features.priority(b, dir);
     if pa.beats(&pb) {
         Ordering::Less
     } else if pb.beats(&pa) {
@@ -2380,7 +2471,11 @@ mod tests {
 
     // ---- the pass-1 feature table (#543 item 2) -----------------------------
 
-    /// #543 item 2: the table's per-row cost, **measured** off filled columns.
+    /// #543 item 2: the table's per-row **layout** cost — column lengths times
+    /// element widths ([`FeatureTable::heap_bytes`]) and the constants derived
+    /// from the widths. What a real fill *allocates* is pinned separately, off
+    /// column capacities, by `convert`'s
+    /// `pass1_bytes_per_row_matches_the_feature_table`.
     ///
     /// This is the number `convert::PASS1_BYTES_PER_ROW` preflights against and
     /// that `docs/diving-deeper/sharded-builds.md` sizes coarse jobs with, so
@@ -2409,6 +2504,82 @@ mod tests {
         // Against what the AoS table cost. Kept as an explicit assertion so a
         // future change that quietly reinflates the row shows up here.
         assert_eq!(std::mem::size_of::<AssignFeature>(), 64);
+    }
+
+    /// A reservation that cannot be satisfied leaves every column's capacity
+    /// where it was and the table fully usable: the streaming engine ignores
+    /// the error and falls back to growth, so a half-reserved table would
+    /// silently keep the transient the reservation exists to avoid. (Only the
+    /// capacity-overflow failure is reachable deterministically; it trips on
+    /// the first column, so the rollback of *earlier* columns after a real
+    /// out-of-memory on a later one is covered by construction, not here.)
+    #[test]
+    fn feature_table_failed_reserve_changes_nothing() {
+        let mut t = FeatureTable::with_capacity(4);
+        t.push(&poly(0, 0.0, 0.0, 1.0, 1.0));
+        let before = (t.column_capacities(), t.allocated_bytes());
+        assert!(t.try_reserve_exact(usize::MAX).is_err());
+        assert_eq!((t.column_capacities(), t.allocated_bytes()), before);
+        t.push(&poly(1, 0.0, 0.0, 1.0, 1.0));
+        assert_eq!(t.len(), 2);
+        assert!(t.try_reserve_exact(100).is_ok());
+        assert!(t.column_capacities().iter().all(|&c| c >= 102));
+    }
+
+    /// [`FeatureTable::priority`] reads three columns instead of materializing
+    /// a whole row, and must yield exactly the `Priority` the row path does —
+    /// every component, bit for bit — for present, missing and non-finite
+    /// keys, NaN and infinite diagonals, both directions, and a table whose
+    /// sort-key column was never allocated.
+    #[test]
+    fn feature_table_priority_matches_the_row_path() {
+        let same = |a: Priority, b: Priority| {
+            a.sort_rank.to_bits() == b.sort_rank.to_bits()
+                && a.diag_sq.to_bits() == b.diag_sq.to_bits()
+                && a.hash == b.hash
+                && a.index == b.index
+        };
+        let keyed: FeatureTable = [
+            AssignFeature {
+                sort_key: Some(3.5),
+                ..poly(7, 0.0, 0.0, 2.0, 1.0)
+            },
+            AssignFeature {
+                sort_key: None,
+                ..poly(8, 0.0, 0.0, 2.0, 1.0)
+            },
+            AssignFeature {
+                sort_key: Some(f64::NAN),
+                ..poly(9, 0.0, 0.0, 1.0, 1.0)
+            },
+            AssignFeature {
+                sort_key: Some(f64::INFINITY),
+                ..poly(10, 0.0, 0.0, 1.0, 1.0)
+            },
+            AssignFeature {
+                sort_key: Some(-0.0),
+                ..poly(11, f64::NAN, 0.0, 1.0, 1.0)
+            },
+            AssignFeature {
+                sort_key: Some(1.0),
+                ..poly(12, -1e300, 0.0, 1e300, 1.0)
+            },
+        ]
+        .iter()
+        .collect();
+        let unkeyed: FeatureTable = [poly(1, 0.0, 0.0, 3.0, 4.0), poly(2, 0.0, 0.0, 0.0, 0.0)]
+            .iter()
+            .collect();
+        for t in [&keyed, &unkeyed] {
+            for i in 0..t.len() {
+                for dir in [SortDirection::Desc, SortDirection::Asc] {
+                    assert!(
+                        same(t.priority(i, dir), Priority::new(t.row(i), dir)),
+                        "row {i} {dir:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The narrowing must be **lossless for assignment**: every value the

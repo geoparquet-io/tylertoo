@@ -15,7 +15,8 @@
 //! - Every source point feature is assigned exactly one representative among
 //!   the rows *present* at `L` (`min_level <= L`): itself if present, else the
 //!   best-priority present point feature in its level-`L` grid cell (the same
-//!   cell size and [`Priority`] order the cell-winner stage used).
+//!   cell size and [`Priority`](super::assign::Priority) order the cell-winner
+//!   stage used).
 //! - `point_count` of a present row at level `L` = the number of source
 //!   features it represents at that level (itself + absorbed). At the
 //!   canonical (finest) level every cluster is a singleton (`point_count = 1`).
@@ -36,9 +37,10 @@
 //! are resolved deterministically: the cell's features attach to the present
 //! point feature nearest (Euclidean) to the orphan cell's center, over every
 //! present point of the level, found by one scan over the present cells
-//! (ties broken by [`Priority`], then input position). This keeps
-//! the invariant *Σ point_count over a level's point rows = total source
-//! point count* whenever the level has at least one point row.
+//! (ties broken by [`Priority`](super::assign::Priority), then input
+//! position). This keeps the invariant *Σ point_count over a level's point
+//! rows = total source point count* whenever the level has at least one point
+//! row.
 //!
 //! # DIVERGENCE FROM SUPERCLUSTER
 //!
@@ -50,7 +52,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::assign::{AssignConfig, FeatureKind, FeatureTable, Priority, SortDirection};
+use super::assign::{AssignConfig, FeatureKind, FeatureTable, SortDirection};
 use super::level::Crs;
 
 /// Name of the mandatory cluster-size column written when clustering is
@@ -220,7 +222,7 @@ pub fn build_cluster_tables(
     // almost nothing: the two comparisons below run once per *present* point
     // per level (the cell-winner fold) and once per orphan-cell candidate,
     // not inside an O(n log n) sort, so recomputing is in the noise.
-    let prio = |pos: usize| Priority::new(features.row(pos), config.sort_direction);
+    let prio = |pos: usize| features.priority(pos, config.sort_direction);
 
     // Thinning off (`--verbatim`, or `--point-thinning 0`) makes every cell
     // guard below fail, so no cluster table is built and every `point_count`
@@ -441,9 +443,10 @@ pub fn verify_sum_invariant(
 ///
 /// The rule: over EVERY present cell winner, the smallest squared Euclidean
 /// distance from the feature's center to the orphan cell's center wins;
-/// exact ties fall back to the cell-winner [`Priority`] order, and a full
-/// `Priority` tie (only possible when two features share an `index`) to the
-/// smaller position. A NaN distance (a NaN center, reachable only through the
+/// exact ties fall back to the cell-winner
+/// [`Priority`](super::assign::Priority) order, and a full `Priority` tie
+/// (only possible when two features share an `index`) to the smaller
+/// position. A NaN distance (a NaN center, reachable only through the
 /// public API) counts as infinitely far. The comparison is therefore a strict
 /// total order, and the answer does not depend on `HashMap` iteration order.
 ///
@@ -505,10 +508,7 @@ fn nearest_present(
         if da != db {
             return da < db;
         }
-        let (pa, pb) = (
-            Priority::new(features.row(a), dir),
-            Priority::new(features.row(b), dir),
-        );
+        let (pa, pb) = (features.priority(a, dir), features.priority(b, dir));
         if pa.beats(&pb) {
             true
         } else if pb.beats(&pa) {
@@ -571,7 +571,7 @@ mod tests {
         feats.iter().collect()
     }
     use super::*;
-    use crate::overview::assign::{assign_levels, SortDirection};
+    use crate::overview::assign::{assign_levels, Priority, SortDirection};
 
     fn gsd(z: u32) -> f64 {
         40_075_016.69 / 1024.0 / 2f64.powi(z as i32)
