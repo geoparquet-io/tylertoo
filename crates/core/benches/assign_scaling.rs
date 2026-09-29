@@ -42,6 +42,11 @@
 
 use std::time::Instant;
 
+/// Array-of-structs fixture → the column-major table the engine takes (#543).
+fn table(feats: &[AssignFeature]) -> FeatureTable {
+    feats.iter().collect()
+}
+
 /// Live-heap counter + re-armable high-water mark, behind a counting global
 /// allocator.
 ///
@@ -197,7 +202,7 @@ fn mib(bytes: u64) -> f64 {
 
 use tylertoo_core::overview::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Crs,
-    DensityBudgetConfig, FeatureKind,
+    DensityBudgetConfig, FeatureKind, FeatureTable,
 };
 
 /// Web-Mercator GSD (meters per pixel at a 256-px tile) for a zoom level.
@@ -369,15 +374,27 @@ fn main() {
                 // real call chain puts it too.
                 let assign_base = arm();
                 let ta = Instant::now();
-                let cw =
-                    assign_levels_bounded(&feats, &gsds, &config, Crs::Epsg3857, grid_budget, &[]);
+                let cw = assign_levels_bounded(
+                    &table(&feats),
+                    &gsds,
+                    &config,
+                    Crs::Epsg3857,
+                    grid_budget,
+                    &[],
+                );
                 let assign_s = ta.elapsed().as_secs_f64();
                 let assign_mem = added_since(assign_base);
 
                 let budget_base = arm();
                 let tb = Instant::now();
-                let out =
-                    apply_density_budget(&cw, &feats, &gsds, &config, &density, Crs::Epsg3857);
+                let out = apply_density_budget(
+                    &cw,
+                    &table(&feats),
+                    &gsds,
+                    &config,
+                    &density,
+                    Crs::Epsg3857,
+                );
                 let budget_s = tb.elapsed().as_secs_f64();
                 let budget_mem = added_since(budget_base);
 

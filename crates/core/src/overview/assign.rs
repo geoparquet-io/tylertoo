@@ -64,8 +64,9 @@
 //! its super-cell tags. What it does NOT hold any more is a priority table
 //! (#565). A `Vec<Priority>` parallel to the feature slice was 40 B/feature live
 //! for the whole fold — the single largest allocation here, 2.1 GiB on a 55M-row
-//! job and ~59 GiB at the 1.58B-row global scale, stacked on the 64 B/row pass-1
-//! feature table (`convert::PASS1_BYTES_PER_ROW`) that is still live throughout.
+//! job and ~59 GiB at the 1.58B-row global scale, stacked on the pass-1 feature
+//! table ([`FeatureTable`], `convert::PASS1_BYTES_PER_ROW` — 64 B/row when #565
+//! measured this, 33–42 B/row since #543 item 2) that is still live throughout.
 //! Every field of a [`Priority`] is a pure function of the `AssignFeature` the
 //! comparator already has to read, so [`priority_order`] derives both sides per
 //! comparison instead. Measured on the `assign_scaling` harness (8M rows, 14
@@ -129,6 +130,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use rayon::prelude::*;
 
@@ -145,12 +147,25 @@ pub enum FeatureKind {
 
 impl FeatureKind {
     /// Stable discriminant so per-kind grids never collide on cell integers.
+    /// Also the on-column encoding in [`FeatureTable`].
     #[inline]
     fn discriminant(self) -> u8 {
         match self {
             FeatureKind::Point => 0,
             FeatureKind::Line => 1,
             FeatureKind::Polygon => 2,
+        }
+    }
+
+    /// Inverse of [`FeatureKind::discriminant`]. Only ever called on a byte
+    /// this module wrote, so an unknown value is a bug, not input: it reads
+    /// back as `Point` rather than panicking in the hottest loop there is.
+    #[inline]
+    fn from_discriminant(d: u8) -> Self {
+        match d {
+            1 => FeatureKind::Line,
+            2 => FeatureKind::Polygon,
+            _ => FeatureKind::Point,
         }
     }
 }
@@ -220,6 +235,416 @@ impl AssignFeature {
         let dx = xmax - xmin;
         let dy = ymax - ymin;
         dx * dx + dy * dy
+    }
+
+    /// The compact row this feature reduces to once the table has it (#543).
+    #[inline]
+    pub(super) fn row(&self) -> FeatureRow {
+        FeatureRow {
+            index: self.index,
+            center: self.center(),
+            diag_sq: self.diag_sq(),
+            sort_key: self.sort_key.unwrap_or(f64::NAN),
+            kind: self.kind,
+            entry_level: self.entry_level,
+        }
+    }
+}
+
+/// One [`FeatureTable`] row, materialized for one read.
+///
+/// The table is column-major; this is the struct-of-registers view the inner
+/// loops want. It is `Copy`, lives for the length of one placement or one
+/// priority derivation, and is **never collected into a `Vec`** — doing so
+/// would rebuild exactly the array-of-structs table #543 removed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FeatureRow {
+    pub(super) index: usize,
+    pub(super) center: (f64, f64),
+    pub(super) diag_sq: f64,
+    /// The raw sort key, with **non-finite meaning "no key"**. That is the
+    /// encoding [`Priority::new`] already collapsed `Option<f64>` into (#428:
+    /// `Some(NaN)`, `Some(±inf)` and `None` are one state), so dropping the
+    /// discriminant loses nothing — see [`FeatureTable`].
+    pub(super) sort_key: f64,
+    pub(super) kind: FeatureKind,
+    pub(super) entry_level: Option<u8>,
+}
+
+impl FeatureRow {
+    /// Bbox center — the representative point used for grid placement.
+    #[inline]
+    fn center(&self) -> (f64, f64) {
+        self.center
+    }
+
+    /// Squared bbox diagonal length, in (coordinate-unit)².
+    #[inline]
+    fn diag_sq(&self) -> f64 {
+        self.diag_sq
+    }
+}
+
+/// The `entry_level` column's "no ladder opinion" sentinel (#364/#543).
+///
+/// `u8::MAX` is free: a level index is `< num_levels`, `num_levels` is capped
+/// at [`super::convert::MAX_LEVELS`] = 255, so the finest index is at most
+/// 254 and 255 names no level. [`FeatureTable::push`] clamps an out-of-range
+/// `Some(255)` (reachable only through the public API) to 254, which every
+/// consumer already treats identically — both are `.min(finest)`-ed to the
+/// finest level, and both are "laddered" for the purpose of the grid bypass.
+const NO_ENTRY_LEVEL: u8 = u8::MAX;
+
+/// The pass-1 feature table: the **column-major** store of what level
+/// assignment needs per input row (#543 item 2).
+///
+/// # Why this shape
+///
+/// This table is resident from pass 1's scan through the whole assign phase,
+/// and it is the coarse job's irreducible memory floor: at 1.58 B rows the
+/// array-of-`AssignFeature` version measured 64 B/row ≈ 94 GiB, which is what
+/// OOM-killed a 192 GiB coarse job (#543). Three things shrink it, and none of
+/// them changes a single assignment:
+///
+/// 1. **Derived-once geometry.** Assignment never wants the bbox; it wants the
+///    bbox *center* (grid placement) and the *squared diagonal* (visibility
+///    gate + priority component 2). Both were recomputed from `[f64; 4]` on
+///    every level's pass. Computing them once at scan time and storing the
+///    results is 24 B/row instead of 32 and is **bit-identical**: the same two
+///    expressions on the same `f64` inputs, just evaluated earlier. The raw
+///    bbox is still needed by the #188/#429 tallies, which is why those now
+///    run *during* the scan (`super::convert::BboxTally`) while the bbox is in
+///    hand, rather than over a retained table afterwards.
+/// 2. **Sentinels instead of `Option`s.** `Option<f64>` costs 16 B — `f64` has
+///    no spare bit pattern for a niche, so the discriminant takes a full
+///    aligned word. [`Priority::new`] already mapped `Some(non-finite)` and
+///    `None` onto one state (#428), so a non-finite `f64` is a lossless
+///    encoding of the whole `Option`. `Option<u8>`'s 2 B become 1 via
+///    [`NO_ENTRY_LEVEL`]. This is the same trade #565 made inside `Priority`.
+/// 3. **Columns, not structs.** Array-of-structs pays alignment padding per
+///    row (the fields above sum to 42 B but `size_of` would round to 48);
+///    columns pay none. Columns also let the two *optional* fields cost
+///    nothing at all when the job does not use them: `sort_key` is allocated
+///    only once a finite key is actually set, and `entry_level` only once a
+///    ladder value is. A convert with neither — no `--sort-key`/`--class-rank`
+///    and no `--entry-zoom`, which is the default — carries 9 B/row less.
+///
+/// | layout | bytes/row |
+/// |---|---|
+/// | `Vec<AssignFeature>` (before #543) | 64 |
+/// | this table, sort key **and** ladder present | 42 |
+/// | this table, neither (the default) | 33 |
+///
+/// At 1.58 B rows that is 94.2 GiB → 61.8 GiB worst case, 48.5 GiB typical.
+/// [`super::convert::PASS1_BYTES_PER_ROW`] pins the worst case, because a
+/// preflight must not under-estimate.
+///
+/// # What was deliberately NOT narrowed
+///
+/// The four `f64` columns stay `f64`. `center_x`/`center_y` feed
+/// `(c / cell_size).floor() as i64`, and at Web Mercator magnitudes (|x| up to
+/// ~2.0e7) an `f32` ulp is ≈ 2 m — larger than the finest levels' cell sizes,
+/// so cells would merge and winners would move. `diag_sq` and `sort_key` are
+/// priority components 1 and 2 of a **strict total order**: rounding either to
+/// `f32` manufactures ties that fall through to the hash tiebreak, changing
+/// which feature wins a cell on real data. Those are winner changes, not
+/// rounding noise, and #543 asks for a smaller table, not a different
+/// assignment. Further shrinking is therefore a spill/stream question, not a
+/// width question.
+///
+/// # Invariant
+///
+/// Every column is either empty or exactly [`FeatureTable::len`] long.
+#[derive(Debug, Default, Clone)]
+pub struct FeatureTable {
+    /// Caller-owned identifier, echoed into [`FeatureAssignment::index`].
+    /// **Not** the row's position in this table: the streaming engine skips
+    /// rows (null/unusable geometry, `--bbox`/`--filter`), so this is the
+    /// input ROW index and the two diverge.
+    index: Vec<usize>,
+    center_x: Vec<f64>,
+    center_y: Vec<f64>,
+    diag_sq: Vec<f64>,
+    /// [`FeatureKind::discriminant`] per row.
+    kind: Vec<u8>,
+    /// Non-finite = no key. **Empty** = no row has one (see the type doc).
+    sort_key: Vec<f64>,
+    /// [`NO_ENTRY_LEVEL`] = no ladder opinion. **Empty** = no row has one.
+    entry_level: Vec<u8>,
+}
+
+impl FeatureTable {
+    /// Bytes per row the always-present columns cost: `index` (8) +
+    /// `center_x` + `center_y` + `diag_sq` (8 each) + `kind` (1) = **33**.
+    /// Derived from the element widths rather than written down, so it cannot
+    /// drift from the columns above.
+    pub const BASE_BYTES_PER_ROW: u64 = (std::mem::size_of::<usize>()
+        + 3 * std::mem::size_of::<f64>()
+        + std::mem::size_of::<u8>()) as u64;
+
+    /// Bytes per row with both optional columns materialized:
+    /// [`Self::BASE_BYTES_PER_ROW`] + `sort_key` (8) + `entry_level` (1) =
+    /// **42**. This is the figure [`super::convert::PASS1_BYTES_PER_ROW`]
+    /// pins, because a preflight must not under-estimate.
+    pub const MAX_BYTES_PER_ROW: u64 =
+        Self::BASE_BYTES_PER_ROW + (std::mem::size_of::<f64>() + std::mem::size_of::<u8>()) as u64;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-size the always-present columns for `rows` rows. The optional
+    /// columns stay unallocated — they are sized when (if) they are first
+    /// written.
+    pub fn with_capacity(rows: usize) -> Self {
+        Self {
+            index: Vec::with_capacity(rows),
+            center_x: Vec::with_capacity(rows),
+            center_y: Vec::with_capacity(rows),
+            diag_sq: Vec::with_capacity(rows),
+            kind: Vec::with_capacity(rows),
+            sort_key: Vec::new(),
+            entry_level: Vec::new(),
+        }
+    }
+
+    /// Reserve exactly `rows` more rows in the always-present columns, or
+    /// report the first allocation failure. Capacity only — a table that
+    /// cannot be reserved still fills correctly by growth (#543: the streaming
+    /// engine pre-sizes when the footers give an exact row count, because
+    /// growing by `push` costs a transient ~2× at the last doubling).
+    pub fn try_reserve_exact(
+        &mut self,
+        rows: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.index.try_reserve_exact(rows)?;
+        self.center_x.try_reserve_exact(rows)?;
+        self.center_y.try_reserve_exact(rows)?;
+        self.diag_sq.try_reserve_exact(rows)?;
+        self.kind.try_reserve_exact(rows)?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Append one feature, reducing its bbox to center + squared diagonal.
+    pub fn push(&mut self, feat: &AssignFeature) {
+        let (cx, cy) = feat.center();
+        self.index.push(feat.index);
+        self.center_x.push(cx);
+        self.center_y.push(cy);
+        self.diag_sq.push(feat.diag_sq());
+        self.kind.push(feat.kind.discriminant());
+        // Both optional columns stay unallocated until a row actually has a
+        // value; the column is then backfilled for the rows already pushed.
+        // A non-finite key is normalized to NaN on the way in, so "missing"
+        // has ONE representation in the column whichever door it came through
+        // (#428: `Some(NaN)`, `Some(±inf)` and `None` are one state anyway).
+        let key = feat.sort_key.filter(|k| k.is_finite());
+        if self.sort_key.is_empty() {
+            if let Some(k) = key {
+                self.sort_key = vec![f64::NAN; self.index.len() - 1];
+                self.sort_key.push(k);
+            }
+        } else {
+            self.sort_key.push(key.unwrap_or(f64::NAN));
+        }
+        if self.entry_level.is_empty() {
+            if let Some(e) = feat.entry_level {
+                self.entry_level = vec![NO_ENTRY_LEVEL; self.index.len() - 1];
+                self.entry_level.push(clamp_entry_level(e));
+            }
+        } else {
+            self.entry_level
+                .push(feat.entry_level.map_or(NO_ENTRY_LEVEL, clamp_entry_level));
+        }
+    }
+
+    /// Materialize row `i`.
+    #[inline]
+    pub(super) fn row(&self, i: usize) -> FeatureRow {
+        FeatureRow {
+            index: self.index[i],
+            center: (self.center_x[i], self.center_y[i]),
+            diag_sq: self.diag_sq[i],
+            sort_key: self.sort_key.get(i).copied().unwrap_or(f64::NAN),
+            kind: FeatureKind::from_discriminant(self.kind[i]),
+            entry_level: self.entry_level(i),
+        }
+    }
+
+    #[inline]
+    pub(super) fn center(&self, i: usize) -> (f64, f64) {
+        (self.center_x[i], self.center_y[i])
+    }
+
+    #[inline]
+    pub fn kind(&self, i: usize) -> FeatureKind {
+        FeatureKind::from_discriminant(self.kind[i])
+    }
+
+    /// Row `i`'s sort key, or `None` when it has none. A non-finite stored
+    /// key reads back as `None`: that is the state `Priority::new` already
+    /// collapsed `Some(non-finite)` into (#428).
+    #[inline]
+    pub fn sort_key(&self, i: usize) -> Option<f64> {
+        self.sort_key.get(i).copied().filter(|k| k.is_finite())
+    }
+
+    #[inline]
+    pub fn entry_level(&self, i: usize) -> Option<u8> {
+        match self.entry_level.get(i).copied() {
+            None | Some(NO_ENTRY_LEVEL) => None,
+            Some(e) => Some(e),
+        }
+    }
+
+    /// Caller-owned identifiers, in table order (see the `index` field note:
+    /// NOT positions).
+    #[inline]
+    pub fn indices(&self) -> &[usize] {
+        &self.index
+    }
+
+    /// Set (or clear) row `i`'s sort key, materializing the column on the
+    /// first finite key. The streaming engine fills this after the scan, once
+    /// the ranking tier resolves.
+    pub fn set_sort_key(&mut self, i: usize, key: Option<f64>) {
+        let Some(k) = key.filter(|k| k.is_finite()) else {
+            if !self.sort_key.is_empty() {
+                self.sort_key[i] = f64::NAN;
+            }
+            return;
+        };
+        if self.sort_key.is_empty() {
+            self.sort_key = vec![f64::NAN; self.index.len()];
+        }
+        self.sort_key[i] = k;
+    }
+
+    /// Set (or clear) row `i`'s entry level, materializing the column on the
+    /// first ladder value.
+    pub fn set_entry_level(&mut self, i: usize, entry: Option<u8>) {
+        let Some(e) = entry else {
+            if !self.entry_level.is_empty() {
+                self.entry_level[i] = NO_ENTRY_LEVEL;
+            }
+            return;
+        };
+        if self.entry_level.is_empty() {
+            self.entry_level = vec![NO_ENTRY_LEVEL; self.index.len()];
+        }
+        self.entry_level[i] = clamp_entry_level(e);
+    }
+
+    /// The `entry_level` column, or an empty slice when no row has one.
+    #[inline]
+    pub(super) fn entry_levels(&self) -> &[u8] {
+        &self.entry_level
+    }
+
+    /// Append every row of `other`, adding `index_base` to each index. Used to
+    /// merge a chunk's scan into the pass's table, rebasing chunk-local row
+    /// indices to global ones.
+    pub fn append_rebased(&mut self, other: &FeatureTable, index_base: usize) {
+        let before = self.len();
+        self.index
+            .extend(other.index.iter().map(|i| i + index_base));
+        self.center_x.extend_from_slice(&other.center_x);
+        self.center_y.extend_from_slice(&other.center_y);
+        self.diag_sq.extend_from_slice(&other.diag_sq);
+        self.kind.extend_from_slice(&other.kind);
+        if !other.sort_key.is_empty() {
+            if self.sort_key.is_empty() {
+                self.sort_key = vec![f64::NAN; before];
+            }
+            self.sort_key.extend_from_slice(&other.sort_key);
+        } else if !self.sort_key.is_empty() {
+            self.sort_key.resize(self.index.len(), f64::NAN);
+        }
+        if !other.entry_level.is_empty() {
+            if self.entry_level.is_empty() {
+                self.entry_level = vec![NO_ENTRY_LEVEL; before];
+            }
+            self.entry_level.extend_from_slice(&other.entry_level);
+        } else if !self.entry_level.is_empty() {
+            self.entry_level.resize(self.index.len(), NO_ENTRY_LEVEL);
+        }
+    }
+
+    /// Heap bytes the columns hold for `len()` rows — **measured** from the
+    /// live column lengths, with capacity slack excluded (this reports the
+    /// layout, not the allocator). Zero for an empty table.
+    pub fn heap_bytes(&self) -> u64 {
+        let w = |len: usize, width: usize| (len * width) as u64;
+        w(self.index.len(), std::mem::size_of::<usize>())
+            + w(self.center_x.len(), std::mem::size_of::<f64>())
+            + w(self.center_y.len(), std::mem::size_of::<f64>())
+            + w(self.diag_sq.len(), std::mem::size_of::<f64>())
+            + w(self.kind.len(), std::mem::size_of::<u8>())
+            + w(self.sort_key.len(), std::mem::size_of::<f64>())
+            + w(self.entry_level.len(), std::mem::size_of::<u8>())
+    }
+
+    /// What this table actually costs per row: [`Self::BASE_BYTES_PER_ROW`]
+    /// plus whichever optional columns it materialized.
+    pub fn bytes_per_row(&self) -> u64 {
+        Self::BASE_BYTES_PER_ROW
+            + if self.sort_key.is_empty() {
+                0
+            } else {
+                std::mem::size_of::<f64>() as u64
+            }
+            + if self.entry_level.is_empty() {
+                0
+            } else {
+                std::mem::size_of::<u8>() as u64
+            }
+    }
+}
+
+/// Clamp a caller-supplied entry level away from the [`NO_ENTRY_LEVEL`]
+/// sentinel. 255 names no level (the plan is capped at 255 levels, so the
+/// finest index is ≤ 254) and every consumer `.min(finest)`-es the value, so
+/// 255 and 254 are already indistinguishable downstream.
+#[inline]
+fn clamp_entry_level(e: u8) -> u8 {
+    e.min(NO_ENTRY_LEVEL - 1)
+}
+
+impl FromIterator<AssignFeature> for FeatureTable {
+    fn from_iter<I: IntoIterator<Item = AssignFeature>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let mut table = FeatureTable::with_capacity(iter.size_hint().0);
+        for feat in iter {
+            table.push(&feat);
+        }
+        table
+    }
+}
+
+impl<'a> FromIterator<&'a AssignFeature> for FeatureTable {
+    fn from_iter<I: IntoIterator<Item = &'a AssignFeature>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let mut table = FeatureTable::with_capacity(iter.size_hint().0);
+        for feat in iter {
+            table.push(feat);
+        }
+        table
+    }
+}
+
+impl From<Vec<AssignFeature>> for FeatureTable {
+    fn from(v: Vec<AssignFeature>) -> Self {
+        v.into_iter().collect()
     }
 }
 
@@ -398,7 +823,8 @@ const MISSING_SORT_RANK: f64 = f64::NEG_INFINITY;
 /// table parallel to the feature slice. `apply_density_budget` used to build exactly
 /// that table: 40 B/feature live for the whole admission fold, 2.1 GiB on a
 /// 55M-row job and ~59 GiB at the 1.58B-row global scale, on top of the
-/// 64 B/row pass-1 feature-table floor the #543 preflight already warns about.
+/// pass-1 feature-table floor the #543 preflight warns about (64 B/row when
+/// #565 measured this; 33–42 B/row since #543 item 2 made it column-major).
 ///
 /// Four words, down from five: the `Option<f64>` sort rank became an `f64` with
 /// an `-inf` sentinel ([`MISSING_SORT_RANK`]).
@@ -427,7 +853,7 @@ pub(super) struct Priority {
 }
 
 impl Priority {
-    pub(super) fn new(feat: &AssignFeature, dir: SortDirection) -> Self {
+    pub(super) fn new(feat: FeatureRow, dir: SortDirection) -> Self {
         // A non-finite key is a MISSING key (#428). The extractors upstream
         // already file NaN/±inf under `None`, but `AssignFeature::sort_key`
         // is reachable from the public `assign_levels` API and from
@@ -437,14 +863,14 @@ impl Priority {
         // strict weak order, so the cell incumbent would keep the cell
         // whatever the keys say and `sort_by` would be entitled to panic.
         // Apply direction so a plain "larger wins" comparison is correct.
-        let sort_rank = feat
-            .sort_key
-            .filter(|k| k.is_finite())
-            .map(|k| match dir {
-                SortDirection::Desc => k,
-                SortDirection::Asc => -k,
-            })
-            .unwrap_or(MISSING_SORT_RANK);
+        let sort_rank = if feat.sort_key.is_finite() {
+            match dir {
+                SortDirection::Desc => feat.sort_key,
+                SortDirection::Asc => -feat.sort_key,
+            }
+        } else {
+            MISSING_SORT_RANK
+        };
         // A NaN bbox diagonal is likewise UNRANKABLE (#534: the #428 argument
         // applied to component 2). `scan_feature` rejects non-finite
         // coordinates upstream, so the pipeline never produces one — but
@@ -525,7 +951,7 @@ enum Placement {
 /// drift.
 #[inline]
 fn place_feature(
-    feat: &AssignFeature,
+    feat: FeatureRow,
     config: &AssignConfig,
     gsd_units: f64,
     repr: Representation,
@@ -610,13 +1036,13 @@ fn contest_cell(
     grid: &mut HashMap<CellKey, usize>,
     key: CellKey,
     pos: usize,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     dir: SortDirection,
 ) {
     grid.entry(key)
         .and_modify(|slot| {
-            let challenger = Priority::new(&features[pos], dir);
-            let incumbent = Priority::new(&features[*slot], dir);
+            let challenger = Priority::new(features.row(pos), dir);
+            let incumbent = Priority::new(features.row(*slot), dir);
             if challenger.beats(&incumbent) {
                 *slot = pos;
             }
@@ -728,8 +1154,8 @@ fn shard_of(key: &CellKey, shard_mask: u64) -> usize {
 /// per shard — no doubling slack held through the reduce, and no per-shard
 /// mallocs.
 fn classify_chunk(
-    chunk: &[AssignFeature],
-    base: usize,
+    features: &FeatureTable,
+    chunk: Range<usize>,
     config: &AssignConfig,
     gsd_units: f64,
     repr: Representation,
@@ -739,13 +1165,13 @@ fn classify_chunk(
     let mut raw: Vec<(CellKey, usize)> = Vec::with_capacity(chunk.len());
     let mut wins: Vec<usize> = Vec::new();
     let mut offsets = vec![0usize; shards + 1];
-    for (off, feat) in chunk.iter().enumerate() {
-        match place_feature(feat, config, gsd_units, repr) {
+    for pos in chunk {
+        match place_feature(features.row(pos), config, gsd_units, repr) {
             Placement::Skip => {}
-            Placement::Wins => wins.push(base + off),
+            Placement::Wins => wins.push(pos),
             Placement::Cell(key) => {
                 offsets[shard_of(&key, shard_mask) + 1] += 1;
-                raw.push((key, base + off));
+                raw.push((key, pos));
             }
         }
     }
@@ -813,7 +1239,7 @@ fn classify_chunk(
 /// dataset funnels into a few hundred cells, every thread queues on the handful
 /// of shards holding them.)
 fn level_winner_positions(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     config: &AssignConfig,
     gsd_units: f64,
     repr: Representation,
@@ -830,7 +1256,7 @@ fn level_winner_positions(
 
 /// [`level_winner_positions`] with the build shape fixed by the caller.
 fn level_winner_positions_in(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     config: &AssignConfig,
     gsd_units: f64,
     repr: Representation,
@@ -856,8 +1282,8 @@ fn level_winner_positions_in(
 
     if build == WinnerBuild::Serial || features.len() <= chunk_features {
         let mut grid: HashMap<CellKey, usize> = HashMap::new();
-        for (pos, feat) in features.iter().enumerate() {
-            match place_feature(feat, config, gsd_units, repr) {
+        for pos in 0..features.len() {
+            match place_feature(features.row(pos), config, gsd_units, repr) {
                 Placement::Skip => {}
                 Placement::Wins => winners.push(pos),
                 Placement::Cell(key) => contest_cell(&mut grid, key, pos, features, dir),
@@ -873,16 +1299,26 @@ fn level_winner_positions_in(
         let mut block_start = 0usize;
         while block_start < features.len() {
             let block_end = (block_start + block_features).min(features.len());
-            let block = &features[block_start..block_end];
 
             // 1. Classify in parallel; group each chunk's placements by shard.
-            //    An indexed collect: `parts` is in chunk (= position) order.
-            let parts: Vec<ChunkPlacements> = block
-                .par_chunks(chunk_features)
-                .enumerate()
-                .map(|(ci, chunk)| {
+            //    An indexed collect over the block's chunk ranges: `parts` is
+            //    in chunk (= position) order, exactly as the `par_chunks`
+            //    over an array-of-structs slice was before #543.
+            let num_chunks = (block_end - block_start).div_ceil(chunk_features);
+            let parts: Vec<ChunkPlacements> = (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
                     let base = block_start + ci * chunk_features;
-                    classify_chunk(chunk, base, config, gsd_units, repr, shards, shard_mask)
+                    let end = (base + chunk_features).min(block_end);
+                    classify_chunk(
+                        features,
+                        base..end,
+                        config,
+                        gsd_units,
+                        repr,
+                        shards,
+                        shard_mask,
+                    )
                 })
                 .collect();
 
@@ -975,7 +1411,7 @@ const GRID_ENTRY_EST_BYTES: u64 = 96;
 /// addition are associative, so the reduce yields the same answer as the serial
 /// fold for every finite input, and the result steers the wave plan only —
 /// never output.
-fn center_extent_and_kind_counts(features: &[AssignFeature]) -> ((f64, f64), [usize; 3]) {
+fn center_extent_and_kind_counts(features: &FeatureTable) -> ((f64, f64), [usize; 3]) {
     type Acc = (f64, f64, f64, f64, [usize; 3]);
     const IDENTITY: Acc = (
         f64::INFINITY,
@@ -984,17 +1420,17 @@ fn center_extent_and_kind_counts(features: &[AssignFeature]) -> ((f64, f64), [us
         f64::NEG_INFINITY,
         [0usize; 3],
     );
-    let (min_x, min_y, max_x, max_y, counts) = features
-        .par_iter()
+    let (min_x, min_y, max_x, max_y, counts) = (0..features.len())
+        .into_par_iter()
         .fold(
             || IDENTITY,
-            |mut acc: Acc, feat| {
-                let (cx, cy) = feat.center();
+            |mut acc: Acc, pos| {
+                let (cx, cy) = features.center(pos);
                 acc.0 = acc.0.min(cx);
                 acc.1 = acc.1.min(cy);
                 acc.2 = acc.2.max(cx);
                 acc.3 = acc.3.max(cy);
-                acc.4[feat.kind.discriminant() as usize] += 1;
+                acc.4[features.kind(pos).discriminant() as usize] += 1;
                 acc
             },
         )
@@ -1152,7 +1588,7 @@ fn fold_wave_winners(min_levels: &mut [u8], wave_start: usize, winners_per_level
 /// the pre-#306 behavior). Production paths pass a RAM budget through
 /// [`assign_levels_bounded`]; the two produce identical assignments.
 pub fn assign_levels(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     level_gsds: &[f64],
     config: &AssignConfig,
     crs: Crs,
@@ -1179,7 +1615,7 @@ pub fn assign_levels(
 /// (corpus/SWEEPS.md Decision 6), polygons between the 1×GSD write gate and
 /// the 2×GSD assign gate are mostly killed by RDP anyway.
 pub fn assign_levels_banded(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     level_gsds: &[f64],
     config: &AssignConfig,
     crs: Crs,
@@ -1212,7 +1648,7 @@ pub fn assign_levels_banded(
 /// the assignment is **identical** for every budget (a feature takes the
 /// coarsest level at which it wins, a fold that is order-independent).
 pub fn assign_levels_bounded(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     level_gsds: &[f64],
     config: &AssignConfig,
     crs: Crs,
@@ -1226,9 +1662,10 @@ pub fn assign_levels_bounded(
     if num_levels_usize == 0 {
         return Assignment {
             assignments: features
+                .indices()
                 .iter()
-                .map(|f| FeatureAssignment {
-                    index: f.index,
+                .map(|&index| FeatureAssignment {
+                    index,
                     min_level: 0,
                 })
                 .collect(),
@@ -1253,15 +1690,16 @@ pub fn assign_levels_bounded(
     // (#534): each output slot has exactly one input, so there is no reduction
     // order to depend on.
     let laddered = features
+        .entry_levels()
         .par_iter()
-        .filter(|f| f.entry_level.is_some())
+        .filter(|&&e| e != NO_ENTRY_LEVEL)
         .count();
     if laddered > 0 {
         min_levels
             .par_iter_mut()
-            .zip(features.par_iter())
-            .for_each(|(slot, feat)| {
-                if let Some(entry) = feat.entry_level {
+            .zip(features.entry_levels().par_iter())
+            .for_each(|(slot, &entry)| {
+                if entry != NO_ENTRY_LEVEL {
                     *slot = entry.min(finest);
                 }
             });
@@ -1332,12 +1770,10 @@ pub fn assign_levels_bounded(
     }
 
     let assignments = features
+        .indices()
         .par_iter()
         .zip(min_levels)
-        .map(|(f, min_level)| FeatureAssignment {
-            index: f.index,
-            min_level,
-        })
+        .map(|(&index, min_level)| FeatureAssignment { index, min_level })
         .collect();
 
     Assignment {
@@ -1445,7 +1881,7 @@ impl Default for DensityBudgetConfig {
 /// budget is disabled (or degenerate) the input assignment is returned unchanged.
 pub fn apply_density_budget(
     assignment: &Assignment,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     level_gsds: &[f64],
     config: &AssignConfig,
     budget: &DensityBudgetConfig,
@@ -1479,7 +1915,7 @@ pub fn apply_density_budget(
     // it. A `Vec<Priority>` over the whole dataset — which is what this used to
     // build, in one parallel pass, and hold live across the entire admission
     // fold — was 40 B/feature: 2.1 GiB on a 55M-row job and ~59 GiB at the
-    // 1.58B-row global scale, stacked on the 64 B/row pass-1 feature table
+    // 1.58B-row global scale, stacked on the pass-1 feature table
     // (`convert::PASS1_BYTES_PER_ROW`) that is still live at this point and on
     // the cell-winner assignment being budgeted. It was the largest single
     // allocation in the phase, and every byte of it was recomputable from a
@@ -1564,12 +2000,10 @@ pub fn apply_density_budget(
 
     Assignment {
         assignments: features
+            .indices()
             .par_iter()
             .zip(admitted_at)
-            .map(|(f, min_level)| FeatureAssignment {
-                index: f.index,
-                min_level,
-            })
+            .map(|(&index, min_level)| FeatureAssignment { index, min_level })
             .collect(),
         num_levels: assignment.num_levels,
     }
@@ -1596,12 +2030,12 @@ pub fn apply_density_budget(
 /// position also makes the sort's output independent of how the input was
 /// chunked, which the parallel sorts below need (#534).
 #[inline]
-fn priority_order(features: &[AssignFeature], dir: SortDirection, a: usize, b: usize) -> Ordering {
+fn priority_order(features: &FeatureTable, dir: SortDirection, a: usize, b: usize) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    let pa = Priority::new(&features[a], dir);
-    let pb = Priority::new(&features[b], dir);
+    let pa = Priority::new(features.row(a), dir);
+    let pb = Priority::new(features.row(b), dir);
     if pa.beats(&pb) {
         Ordering::Less
     } else if pb.beats(&pa) {
@@ -1626,7 +2060,7 @@ fn priority_order(features: &[AssignFeature], dir: SortDirection, a: usize, b: u
 pub(super) fn select_budget_survivors(
     cands: &[usize],
     available: usize,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     dir: SortDirection,
     gsd_m: f64,
     crs: Crs,
@@ -1652,7 +2086,7 @@ pub(super) fn select_budget_survivors(
     let mut tagged: Vec<((i64, i64), usize)> = cands
         .par_iter()
         .map(|&i| {
-            let (cx, cy) = features[i].center();
+            let (cx, cy) = features.center(i);
             (
                 (
                     (cx / super_size).floor() as i64,
@@ -1786,6 +2220,14 @@ fn water_fill(pops: &[usize], budget: usize, alpha: f64) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Array-of-structs fixture → the column-major table the engine takes
+    /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
+    /// pipeline fills a [`FeatureTable`] directly from the scan, so this
+    /// conversion exists only here.
+    fn table(feats: &[AssignFeature]) -> FeatureTable {
+        feats.iter().collect()
+    }
     use super::*;
 
     /// GSD table from spec §5.2 for the zooms we test with.
@@ -1829,7 +2271,7 @@ mod tests {
         let mut valued = point(1, 10.0001, 10.0001);
         valued.sort_key = keys[1];
 
-        let out = assign_levels(&[nan_row, valued], &gsds, &cfg, Crs::Epsg4326);
+        let out = assign_levels(&table(&[nan_row, valued]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             out.assignments[1].min_level, 0,
             "the row with a real sort key must win the cell"
@@ -1868,7 +2310,8 @@ mod tests {
                 let mut challenger = point(1, 10.0001, 10.0001);
                 challenger.sort_key = Some(1.0);
 
-                let out = assign_levels(&[incumbent, challenger], &gsds, &cfg, Crs::Epsg4326);
+                let out =
+                    assign_levels(&table(&[incumbent, challenger]), &gsds, &cfg, Crs::Epsg4326);
                 assert_eq!(
                     out.assignments[1].min_level, 0,
                     "{label}/{dir:?}: the row with a real key must win the cell"
@@ -1910,7 +2353,7 @@ mod tests {
 
         let gsds = [gsd(2), gsd(6)];
         let out = assign_levels(
-            &[nan_ranked, ranked],
+            &table(&[nan_ranked, ranked]),
             &gsds,
             &AssignConfig::default(),
             Crs::Epsg4326,
@@ -1935,6 +2378,201 @@ mod tests {
         }
     }
 
+    // ---- the pass-1 feature table (#543 item 2) -----------------------------
+
+    /// #543 item 2: the table's per-row cost, **measured** off filled columns.
+    ///
+    /// This is the number `convert::PASS1_BYTES_PER_ROW` preflights against and
+    /// that `docs/diving-deeper/sharded-builds.md` sizes coarse jobs with, so
+    /// it is pinned here as well as there. The pre-#543 array-of-structs table
+    /// was `size_of::<AssignFeature>()` = 64 B/row.
+    #[test]
+    fn feature_table_costs_the_documented_bytes_per_row() {
+        const N: usize = 1_000;
+        let mut lean = FeatureTable::with_capacity(N);
+        let mut rich = FeatureTable::with_capacity(N);
+        for i in 0..N {
+            let f = poly(i, 0.0, 0.0, 10.0, 10.0);
+            lean.push(&f);
+            rich.push(&AssignFeature {
+                sort_key: Some(i as f64),
+                entry_level: Some(2),
+                ..f
+            });
+        }
+        assert_eq!(lean.heap_bytes() / N as u64, 33, "no sort key, no ladder");
+        assert_eq!(lean.bytes_per_row(), 33);
+        assert_eq!(rich.heap_bytes() / N as u64, 42, "both optional columns");
+        assert_eq!(rich.bytes_per_row(), FeatureTable::MAX_BYTES_PER_ROW);
+        assert_eq!(FeatureTable::BASE_BYTES_PER_ROW, 33);
+        assert_eq!(FeatureTable::MAX_BYTES_PER_ROW, 42);
+        // Against what the AoS table cost. Kept as an explicit assertion so a
+        // future change that quietly reinflates the row shows up here.
+        assert_eq!(std::mem::size_of::<AssignFeature>(), 64);
+    }
+
+    /// The narrowing must be **lossless for assignment**: every value the
+    /// engine reads off a row is exactly what it read off the `AssignFeature`
+    /// before, bit for bit — the center and the squared diagonal are the same
+    /// two expressions on the same `f64` bbox, just evaluated at scan time.
+    #[test]
+    fn feature_table_rows_match_the_struct_they_came_from() {
+        let feats = [
+            poly(0, -1.5, 2.25, 7.75, 9.0),
+            point(1, 1e7, -3.75e6),
+            AssignFeature {
+                sort_key: Some(-0.5),
+                entry_level: Some(3),
+                ..poly(2, 0.1, 0.2, 0.30000000000000004, 0.4)
+            },
+        ];
+        let t = table(&feats);
+        for (pos, f) in feats.iter().enumerate() {
+            let row = t.row(pos);
+            assert_eq!(row.index, f.index);
+            assert_eq!(row.center, f.center(), "center must be bit-identical");
+            assert_eq!(row.diag_sq, f.diag_sq(), "diag_sq must be bit-identical");
+            assert_eq!(row.kind, f.kind);
+            assert_eq!(t.sort_key(pos), f.sort_key);
+            assert_eq!(row.entry_level, f.entry_level);
+            // And the derived priority — the thing that actually decides a
+            // cell — is identical to the one the struct produced.
+            for dir in [SortDirection::Desc, SortDirection::Asc] {
+                let (a, b) = (Priority::new(row, dir), Priority::new(f.row(), dir));
+                assert!(!a.beats(&b) && !b.beats(&a), "priorities must tie exactly");
+            }
+        }
+    }
+
+    /// The `Option` discriminants are gone, replaced by sentinels. #428 already
+    /// made `Some(non-finite)` and `None` one state inside `Priority`, so the
+    /// table may collapse them too — and it must, in both directions.
+    #[test]
+    fn non_finite_sort_keys_read_back_as_missing() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let t = table(&[AssignFeature {
+                sort_key: Some(bad),
+                ..point(0, 0.0, 0.0)
+            }]);
+            assert_eq!(t.sort_key(0), None, "Some({bad}) must read back as None");
+            assert_eq!(
+                Priority::new(t.row(0), SortDirection::Desc).sort_rank,
+                MISSING_SORT_RANK
+            );
+        }
+        let t = table(&[point(0, 0.0, 0.0)]);
+        assert_eq!(t.sort_key(0), None);
+    }
+
+    /// `entry_level` uses `u8::MAX` as its "no ladder" sentinel. A real level
+    /// index can never be 255 (the plan is capped at 255 levels, so the finest
+    /// is 254), and a caller who sets 255 anyway through the public API gets
+    /// 254 — which every consumer already treats identically, since they all
+    /// `.min(finest)` it.
+    #[test]
+    fn entry_level_sentinel_cannot_swallow_a_real_ladder_value() {
+        let t = table(&[
+            AssignFeature {
+                entry_level: Some(254),
+                ..point(0, 0.0, 0.0)
+            },
+            AssignFeature {
+                entry_level: Some(255),
+                ..point(1, 0.0, 0.0)
+            },
+            point(2, 0.0, 0.0),
+        ]);
+        assert_eq!(t.entry_level(0), Some(254));
+        assert_eq!(
+            t.entry_level(1),
+            Some(254),
+            "255 clamps, it does not vanish"
+        );
+        assert_eq!(t.entry_level(2), None);
+        // Both laddered rows are exempt from the grid; the third is not.
+        let cfg = AssignConfig::default();
+        for pos in 0..2 {
+            assert!(matches!(
+                place_feature(t.row(pos), &cfg, 1.0, Representation::Geometry),
+                Placement::Skip
+            ));
+        }
+        assert!(!matches!(
+            place_feature(t.row(2), &cfg, 1.0, Representation::Geometry),
+            Placement::Skip
+        ));
+    }
+
+    /// The optional columns are allocated on first use, and the rows already
+    /// pushed are backfilled — so a table whose only sort key arrives on the
+    /// last row still answers correctly for every earlier row.
+    #[test]
+    fn optional_columns_materialize_lazily_and_backfill() {
+        let mut t = FeatureTable::with_capacity(4);
+        for i in 0..4 {
+            t.push(&point(i, i as f64, 0.0));
+        }
+        assert_eq!(t.bytes_per_row(), FeatureTable::BASE_BYTES_PER_ROW);
+        t.set_sort_key(3, Some(9.0));
+        assert_eq!(t.bytes_per_row(), FeatureTable::BASE_BYTES_PER_ROW + 8);
+        assert_eq!(t.sort_key(3), Some(9.0));
+        for pos in 0..3 {
+            assert_eq!(t.sort_key(pos), None, "row {pos} backfilled as missing");
+        }
+        t.set_entry_level(0, Some(1));
+        assert_eq!(t.bytes_per_row(), FeatureTable::MAX_BYTES_PER_ROW);
+        assert_eq!(t.entry_level(0), Some(1));
+        assert_eq!(t.entry_level(1), None);
+        // Clearing a value does not un-allocate the column, but it does read
+        // back as absent.
+        t.set_sort_key(3, None);
+        assert_eq!(t.sort_key(3), None);
+        // A push after the column exists keeps it aligned.
+        t.push(&AssignFeature {
+            sort_key: Some(2.0),
+            ..point(4, 4.0, 0.0)
+        });
+        assert_eq!(t.len(), 5);
+        assert_eq!(t.sort_key(4), Some(2.0));
+        assert_eq!(t.entry_level(4), None);
+    }
+
+    /// The streaming scan merges chunk-local tables into the pass table,
+    /// rebasing each chunk's row indices. Every column must survive that, in
+    /// order — including a chunk that has an optional column the pass table
+    /// does not yet have, and the reverse.
+    #[test]
+    fn append_rebased_merges_columns_and_rebases_indices() {
+        let mut pass = table(&[point(0, 0.0, 0.0), point(1, 1.0, 0.0)]);
+        let chunk = table(&[
+            AssignFeature {
+                sort_key: Some(5.0),
+                entry_level: Some(2),
+                ..point(0, 2.0, 0.0)
+            },
+            point(1, 3.0, 0.0),
+        ]);
+        pass.append_rebased(&chunk, 10);
+        assert_eq!(pass.len(), 4);
+        assert_eq!(pass.indices(), &[0, 1, 10, 11]);
+        assert_eq!(pass.sort_key(2), Some(5.0));
+        assert_eq!(pass.entry_level(2), Some(2));
+        for pos in [0usize, 1, 3] {
+            assert_eq!(pass.sort_key(pos), None);
+            assert_eq!(pass.entry_level(pos), None);
+        }
+        assert_eq!(pass.center(2), (2.0, 0.0));
+        // The reverse: a plain chunk appended onto a table that already has
+        // both optional columns keeps them the right length.
+        let plain = table(&[point(0, 4.0, 0.0)]);
+        pass.append_rebased(&plain, 20);
+        assert_eq!(pass.len(), 5);
+        assert_eq!(pass.indices()[4], 20);
+        assert_eq!(pass.sort_key(4), None);
+        assert_eq!(pass.entry_level(4), None);
+        assert_eq!(pass.bytes_per_row(), FeatureTable::MAX_BYTES_PER_ROW);
+    }
+
     // ---- entry-zoom ladder (#364) -------------------------------------------
 
     /// The motivating failure: nested polygons where the strongest signal
@@ -1954,7 +2592,7 @@ mod tests {
         let ring = poly(1, -2.0, -2.0, 2.0, 2.0);
 
         // Control: the gate drops the core to the canonical level.
-        let control = assign_levels(&[core, ring], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&table(&[core, ring]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             control.assignments[0].min_level, 2,
             "without a ladder the tiny core is gated out of every coarse level"
@@ -1962,7 +2600,7 @@ mod tests {
 
         // Ladder: the core enters at the coarsest level regardless of size.
         core.entry_level = Some(0);
-        let laddered = assign_levels(&[core, ring], &gsds, &cfg, Crs::Epsg4326);
+        let laddered = assign_levels(&table(&[core, ring]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             laddered.assignments[0].min_level, 0,
             "an entry level must override the visibility gate"
@@ -1978,7 +2616,7 @@ mod tests {
         let cfg = AssignConfig::default();
 
         let mut ring = poly(0, -2.0, -2.0, 2.0, 2.0);
-        let control = assign_levels(&[ring], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&table(&[ring]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(control.assignments[0].min_level, 0, "large: wins level 0");
 
         // Deliberately an INTERMEDIATE level, not the finest: on a 3-level
@@ -1986,7 +2624,7 @@ mod tests {
         // the feature fell through to canonical", so the test would pass with
         // the entry level never applied.
         ring.entry_level = Some(1);
-        let laddered = assign_levels(&[ring], &gsds, &cfg, Crs::Epsg4326);
+        let laddered = assign_levels(&table(&[ring]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             laddered.assignments[0].min_level, 1,
             "an entry level must also delay a feature the grid would admit"
@@ -2007,14 +2645,14 @@ mod tests {
         b.sort_key = Some(1.0);
 
         // Control: they contest one cell and `b` loses the coarse level.
-        let control = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
+        let control = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(control.assignments[0].min_level, 0);
         assert_eq!(control.assignments[1].min_level, 1, "b loses the cell");
 
         // With `a` on the ladder it leaves the grid, so `b` wins the cell it
         // was previously denied — and `a` still appears, by its entry level.
         a.entry_level = Some(0);
-        let laddered = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
+        let laddered = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(laddered.assignments[0].min_level, 0, "a: by ladder");
         assert_eq!(
             laddered.assignments[1].min_level, 0,
@@ -2035,7 +2673,7 @@ mod tests {
         // "dropped out of the grid and fell through to the finest level".
         laddered.entry_level = Some(1);
 
-        let out = assign_levels(&[big, laddered], &gsds, &cfg, Crs::Epsg4326);
+        let out = assign_levels(&table(&[big, laddered]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             out.assignments[0].min_level, 0,
             "the unlabelled feature is unaffected by another feature's ladder"
@@ -2057,7 +2695,7 @@ mod tests {
         far.entry_level = Some(200);
         let mut near = point(1, 6.0, 6.0);
         near.entry_level = Some(0);
-        let both = assign_levels(&[far, near], &gsds, &cfg, Crs::Epsg4326);
+        let both = assign_levels(&table(&[far, near]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             both.assignments[1].min_level, 0,
             "an in-range entry level is honoured, so the value is read"
@@ -2066,7 +2704,7 @@ mod tests {
 
         let mut p = point(0, 5.0, 5.0);
         p.entry_level = Some(200);
-        let out = assign_levels(&[p], &gsds, &cfg, Crs::Epsg4326);
+        let out = assign_levels(&table(&[p]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             out.assignments[0].min_level, 1,
             "clamped to the finest level"
@@ -2094,8 +2732,9 @@ mod tests {
             })
             .collect();
 
-        let unbounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, u64::MAX, &[]);
-        let one_wave = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, 1, &[]);
+        let unbounded =
+            assign_levels_bounded(&table(&feats), &gsds, &cfg, Crs::Epsg4326, u64::MAX, &[]);
+        let one_wave = assign_levels_bounded(&table(&feats), &gsds, &cfg, Crs::Epsg4326, 1, &[]);
         assert_eq!(
             unbounded.assignments, one_wave.assignments,
             "the wave plan is scheduling only; it must not move a feature"
@@ -2107,7 +2746,7 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_assignments() {
         let out = assign_levels(
-            &[],
+            &table(&[]),
             &[gsd(4), gsd(6)],
             &AssignConfig::default(),
             Crs::Epsg3857,
@@ -2128,7 +2767,7 @@ mod tests {
         let small = poly(1, 1000.0, 1000.0, 2000.0, 2000.0);
         let gsds = [gsd(2), gsd(6)];
         let out = assign_levels(
-            &[big, small],
+            &table(&[big, small]),
             &gsds,
             &AssignConfig::default(),
             Crs::Epsg3857,
@@ -2146,8 +2785,8 @@ mod tests {
         let b = poly(42, 100.0, 100.0, 50_100.0, 50_100.0);
         let gsds = [gsd(2), gsd(8)];
         let cfg = AssignConfig::default();
-        let out1 = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg3857);
-        let out2 = assign_levels(&[b, a], &gsds, &cfg, Crs::Epsg3857);
+        let out1 = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg3857);
+        let out2 = assign_levels(&table(&[b, a]), &gsds, &cfg, Crs::Epsg3857);
         // Find level-0 winner index in each ordering; must match.
         let w1: Vec<usize> = out1
             .assignments
@@ -2221,8 +2860,13 @@ mod tests {
                 Representation::Point,
                 Representation::Square,
             ] {
-                let serial =
-                    level_winner_positions_in(&feats, &cfg, gsd_units, repr, WinnerBuild::Serial);
+                let serial = level_winner_positions_in(
+                    &table(&feats),
+                    &cfg,
+                    gsd_units,
+                    repr,
+                    WinnerBuild::Serial,
+                );
                 assert!(!serial.is_empty(), "fixture must produce winners");
                 for chunks in [2usize, 3, 7, 16, 64, 512, 4_000] {
                     let chunk_features = feats.len().div_ceil(chunks);
@@ -2233,8 +2877,13 @@ mod tests {
                                 shards,
                                 block_chunks,
                             };
-                            let got =
-                                level_winner_positions_in(&feats, &cfg, gsd_units, repr, build);
+                            let got = level_winner_positions_in(
+                                &table(&feats),
+                                &cfg,
+                                gsd_units,
+                                repr,
+                                build,
+                            );
                             assert_eq!(
                                 got, serial,
                                 "z{z} {repr:?} {build:?}: winner set differs at {chunks} chunk(s) \
@@ -2420,7 +3069,7 @@ mod tests {
             .iter()
             .map(|&g| {
                 level_winner_positions_in(
-                    &feats,
+                    &table(&feats),
                     &cfg,
                     gsd_to_coord_units(g, Crs::Epsg3857),
                     Representation::Geometry,
@@ -2442,8 +3091,22 @@ mod tests {
                 .expect("thread pool");
             for grid in [u64::MAX, 1] {
                 let (cw, budgeted) = pool.install(|| {
-                    let cw = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, grid, &[]);
-                    let b = apply_density_budget(&cw, &feats, &gsds, &cfg, &budget, Crs::Epsg3857);
+                    let cw = assign_levels_bounded(
+                        &table(&feats),
+                        &gsds,
+                        &cfg,
+                        Crs::Epsg3857,
+                        grid,
+                        &[],
+                    );
+                    let b = apply_density_budget(
+                        &cw,
+                        &table(&feats),
+                        &gsds,
+                        &cfg,
+                        &budget,
+                        Crs::Epsg3857,
+                    );
                     (cw, b)
                 });
                 assert_eq!(
@@ -2534,8 +3197,8 @@ mod tests {
         let dir = SortDirection::Desc;
         let nan_box = poly(0, 0.0, 0.0, f64::NAN, 10.0);
         let real = poly(1, 0.0, 0.0, 1.0, 1.0);
-        let a = Priority::new(&nan_box, dir);
-        let b = Priority::new(&real, dir);
+        let a = Priority::new(nan_box.row(), dir);
+        let b = Priority::new(real.row(), dir);
         assert!(b.beats(&a), "a real diagonal must beat an unrankable one");
         assert!(
             !a.beats(&b),
@@ -2554,16 +3217,16 @@ mod tests {
         let dir = SortDirection::Desc;
         let huge = poly(0, -1.0e300, 0.0, 1.0e300, 1.0);
         let big = poly(1, 0.0, 0.0, 1.0e150, 1.0e150);
-        let hp = Priority::new(&huge, dir);
+        let hp = Priority::new(huge.row(), dir);
         assert_eq!(hp.diag_sq, f64::INFINITY, "the fixture must overflow");
-        let bp = Priority::new(&big, dir);
+        let bp = Priority::new(big.row(), dir);
         assert!(hp.beats(&bp), "+inf diagonal must beat a finite one");
         assert!(!bp.beats(&hp), "a finite diagonal must not beat +inf");
 
         // End to end: the sentinel wins the shared coarse cell.
         let small = poly(2, -5.0, 0.0, 5.0, 1.0);
         let out = assign_levels(
-            &[small, huge],
+            &table(&[small, huge]),
             &[gsd(0), gsd(20)],
             &AssignConfig::default(),
             Crs::Epsg3857,
@@ -2578,7 +3241,7 @@ mod tests {
                 if i == j {
                     continue;
                 }
-                let (pi, pj) = (Priority::new(fi, dir), Priority::new(fj, dir));
+                let (pi, pj) = (Priority::new(fi.row(), dir), Priority::new(fj.row(), dir));
                 assert_ne!(
                     pi.beats(&pj),
                     pj.beats(&pi),
@@ -2596,9 +3259,9 @@ mod tests {
     fn priority_order_breaks_exact_ties_deterministically() {
         let twins = [poly(5, 0.0, 0.0, 10.0, 10.0), poly(5, 0.0, 0.0, 10.0, 10.0)];
         let dir = SortDirection::Desc;
-        assert_eq!(priority_order(&twins, dir, 0, 1), Ordering::Less);
-        assert_eq!(priority_order(&twins, dir, 1, 0), Ordering::Greater);
-        assert_eq!(priority_order(&twins, dir, 0, 0), Ordering::Equal);
+        assert_eq!(priority_order(&table(&twins), dir, 0, 1), Ordering::Less);
+        assert_eq!(priority_order(&table(&twins), dir, 1, 0), Ordering::Greater);
+        assert_eq!(priority_order(&table(&twins), dir, 0, 0), Ordering::Equal);
     }
 
     #[test]
@@ -2609,7 +3272,12 @@ mod tests {
             .map(|i| poly(i, 0.0, 0.0, 40_000.0, 40_000.0))
             .collect();
         let gsds = [gsd(2), gsd(10)];
-        let out = assign_levels(&feats, &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let out = assign_levels(
+            &table(&feats),
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg3857,
+        );
         let at0 = out.duplicating_at_level(0);
         assert_eq!(at0.len(), 1, "one winner at coarsest level");
     }
@@ -2638,7 +3306,7 @@ mod tests {
         let gsds = [gsd(4), gsd(8), gsd(12), gsd(14)];
         let cfg = AssignConfig::default();
 
-        let baseline = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+        let baseline = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
         let levels_of = |a: &Assignment| -> Vec<(usize, u8)> {
             let mut v: Vec<(usize, u8)> = a
                 .assignments
@@ -2652,14 +3320,14 @@ mod tests {
 
         // Repeated runs must be identical (parallel merge determinism).
         for _ in 0..8 {
-            let got = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
+            let got = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
             assert_eq!(levels_of(&got), want, "assignment unstable across runs");
         }
         // Reversed input order must yield the same per-feature levels.
         let mut rev = feats.clone();
         rev.reverse();
         assert_eq!(
-            levels_of(&assign_levels(&rev, &gsds, &cfg, Crs::Epsg3857)),
+            levels_of(&assign_levels(&table(&rev), &gsds, &cfg, Crs::Epsg3857)),
             want,
             "assignment must not depend on input order",
         );
@@ -2673,7 +3341,7 @@ mod tests {
         // level 0.
         let p = point(0, 0.0, 0.0);
         let gsds = [gsd(2), gsd(6)];
-        let out = assign_levels(&[p], &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let out = assign_levels(&table(&[p]), &gsds, &AssignConfig::default(), Crs::Epsg3857);
         assert_eq!(out.assignments[0].min_level, 0);
     }
 
@@ -2691,7 +3359,12 @@ mod tests {
         let side = 4.5 * g6 / std::f64::consts::SQRT_2; // diag = side*sqrt2 = 4.5*gsd6
         let small = poly(0, 0.0, 0.0, side, side);
         let gsds = [gsd(2), gsd(4), gsd(6)];
-        let out = assign_levels(&[small], &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let out = assign_levels(
+            &table(&[small]),
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg3857,
+        );
         assert_eq!(
             out.assignments[0].min_level, 2,
             "polygon only visible at finest level"
@@ -2716,7 +3389,7 @@ mod tests {
             polygon_visibility: 4.0,
             ..AssignConfig::default()
         };
-        let out = assign_levels(&[line, polygon], &gsds, &cfg, Crs::Epsg3857);
+        let out = assign_levels(&table(&[line, polygon]), &gsds, &cfg, Crs::Epsg3857);
         // line: diag 3*gsd4 >= 2*gsd4 → eligible at level 0.
         assert_eq!(out.assignments[0].min_level, 0, "line visible at level 0");
         // polygon: diag 3*gsd4 < 4*gsd4 → gated at level 0, appears finer.
@@ -2749,7 +3422,7 @@ mod tests {
         small_key.sort_key = Some(5.0);
         let gsds = [gsd(2), gsd(8)];
         let out = assign_levels(
-            &[big_null, small_key],
+            &table(&[big_null, small_key]),
             &gsds,
             &AssignConfig::default(),
             Crs::Epsg3857,
@@ -2779,7 +3452,7 @@ mod tests {
             sort_direction: SortDirection::Desc,
             ..Default::default()
         };
-        let out_desc = assign_levels(&[a, b], &gsds, &desc, Crs::Epsg3857);
+        let out_desc = assign_levels(&table(&[a, b]), &gsds, &desc, Crs::Epsg3857);
         assert_eq!(
             out_desc.assignments[1].min_level, 0,
             "desc: larger key wins"
@@ -2789,7 +3462,7 @@ mod tests {
             sort_direction: SortDirection::Asc,
             ..Default::default()
         };
-        let out_asc = assign_levels(&[a, b], &gsds, &asc, Crs::Epsg3857);
+        let out_asc = assign_levels(&table(&[a, b]), &gsds, &asc, Crs::Epsg3857);
         assert_eq!(out_asc.assignments[0].min_level, 0, "asc: smaller key wins");
     }
 
@@ -2833,7 +3506,12 @@ mod tests {
             .map(|i| poly(i, 0.0, 0.0, 30_000.0, 30_000.0))
             .collect();
         let gsds = [gsd(2), gsd(4), gsd(6)];
-        let out = assign_levels(&feats, &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let out = assign_levels(
+            &table(&feats),
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg3857,
+        );
         let finest = out.num_levels - 1;
         assert_eq!(
             out.duplicating_at_level(finest).len(),
@@ -2856,14 +3534,14 @@ mod tests {
         let gsds = [gsd(6), gsd(8)];
         let cfg = AssignConfig::default();
 
-        let out_4326 = assign_levels(&[p0, p1], &gsds, &cfg, Crs::Epsg4326);
+        let out_4326 = assign_levels(&table(&[p0, p1]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             out_4326.duplicating_at_level(0).len(),
             2,
             "4326: points separated into two cells"
         );
 
-        let out_3857 = assign_levels(&[p0, p1], &gsds, &cfg, Crs::Epsg3857);
+        let out_3857 = assign_levels(&table(&[p0, p1]), &gsds, &cfg, Crs::Epsg3857);
         assert_eq!(
             out_3857.duplicating_at_level(0).len(),
             1,
@@ -2921,7 +3599,7 @@ mod tests {
 
         let out = apply_density_budget(
             &base,
-            &feats,
+            &table(&feats),
             &gsds,
             &AssignConfig::default(),
             &budget_cfg(true, 2.0, 1.0),
@@ -2964,7 +3642,7 @@ mod tests {
 
         let out = apply_density_budget(
             &base,
-            &feats,
+            &table(&feats),
             &gsds,
             &AssignConfig::default(),
             &budget_cfg(true, 2.0, 1.5),
@@ -3005,7 +3683,7 @@ mod tests {
 
         let out = apply_density_budget(
             &base,
-            &feats,
+            &table(&feats),
             &gsds,
             &AssignConfig::default(),
             &budget_cfg(true, 2.0, 2.0),
@@ -3021,7 +3699,7 @@ mod tests {
 
         // A global priority cut (top 320 across everything) keeps far fewer A.
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| priority_order(&feats, SortDirection::Desc, a, b));
+        order.sort_by(|&a, &b| priority_order(&table(&feats), SortDirection::Desc, a, b));
         let global_a = order.iter().take(320).filter(|&&i| i < a_n).count();
 
         assert_eq!(a_kept, a_n, "fairness keeps the entire sparse cluster");
@@ -3045,7 +3723,7 @@ mod tests {
         let base = all_at_level_zero(n, num_levels);
         let out = apply_density_budget(
             &base,
-            &feats,
+            &table(&feats),
             &gsds,
             &AssignConfig::default(),
             &DensityBudgetConfig::default(),
@@ -3065,10 +3743,15 @@ mod tests {
             .map(|i| point(i, (i % 20) as f64 * 100.0, (i / 20) as f64 * 100.0))
             .collect();
         let gsds = [gsd(2), gsd(4), gsd(6)];
-        let cw = assign_levels(&feats, &gsds, &AssignConfig::default(), Crs::Epsg3857);
+        let cw = assign_levels(
+            &table(&feats),
+            &gsds,
+            &AssignConfig::default(),
+            Crs::Epsg3857,
+        );
         let out = apply_density_budget(
             &cw,
-            &feats,
+            &table(&feats),
             &gsds,
             &AssignConfig::default(),
             &budget_cfg(false, 2.0, 1.5),
@@ -3120,7 +3803,7 @@ mod tests {
                 let mut f = poly(0, 0.0, 0.0, 10.0, 10.0);
                 f.sort_key = missing;
                 assert_eq!(
-                    Priority::new(&f, dir).sort_rank,
+                    Priority::new(f.row(), dir).sort_rank,
                     MISSING_SORT_RANK,
                     "{missing:?} must file as missing under {dir:?}"
                 );
@@ -3129,7 +3812,7 @@ mod tests {
             for key in [f64::MIN, f64::MAX, f64::MIN_POSITIVE, 0.0, -0.0] {
                 let mut present = poly(1, 0.0, 0.0, 10.0, 10.0);
                 present.sort_key = Some(key);
-                let p = Priority::new(&present, dir);
+                let p = Priority::new(present.row(), dir);
                 assert_ne!(
                     p.sort_rank, MISSING_SORT_RANK,
                     "the finite key {key:e} collided with the missing sentinel under {dir:?}"
@@ -3142,7 +3825,7 @@ mod tests {
                 // And it must out-rank a missing key, in both directions.
                 let mut absent = poly(1, 0.0, 0.0, 10.0, 10.0);
                 absent.sort_key = None;
-                let a = Priority::new(&absent, dir);
+                let a = Priority::new(absent.row(), dir);
                 assert!(p.beats(&a), "a present key must beat a missing one");
                 assert!(!a.beats(&p), "a missing key must not beat a present one");
             }
@@ -3173,8 +3856,8 @@ mod tests {
             let mut neg_zero = poly(1, 0.0, 0.0, 1.0, 1.0);
             neg_zero.sort_key = Some(-0.0);
 
-            let p = Priority::new(&pos_zero, dir);
-            let n = Priority::new(&neg_zero, dir);
+            let p = Priority::new(pos_zero.row(), dir);
+            let n = Priority::new(neg_zero.row(), dir);
             assert!(
                 p.sort_rank == n.sort_rank,
                 "signed zeros must compare equal on component 1 under {dir:?}"
@@ -3266,13 +3949,13 @@ mod tests {
         feats.push(feats[0]);
 
         for dir in [SortDirection::Desc, SortDirection::Asc] {
-            let prio: Vec<Priority> = feats.iter().map(|f| Priority::new(f, dir)).collect();
+            let prio: Vec<Priority> = feats.iter().map(|f| Priority::new(f.row(), dir)).collect();
             let mut decided = 0usize;
             let mut tied_to_position = 0usize;
             for a in 0..feats.len() {
                 for b in 0..feats.len() {
                     assert_eq!(
-                        priority_order(&feats, dir, a, b),
+                        priority_order(&table(&feats), dir, a, b),
                         table_order(&prio, a, b),
                         "derived order disagrees with the table at ({a}, {b}) under {dir:?}"
                     );
@@ -3297,7 +3980,7 @@ mod tests {
             // whole, not on individual pairs.
             let mut lazy_sorted: Vec<usize> = (0..feats.len()).collect();
             let mut table_sorted = lazy_sorted.clone();
-            lazy_sorted.sort_unstable_by(|&a, &b| priority_order(&feats, dir, a, b));
+            lazy_sorted.sort_unstable_by(|&a, &b| priority_order(&table(&feats), dir, a, b));
             table_sorted.sort_unstable_by(|&a, &b| table_order(&prio, a, b));
             assert_eq!(
                 lazy_sorted, table_sorted,
@@ -3370,10 +4053,10 @@ mod tests {
             .collect();
         let gsds: Vec<f64> = (3u32..=12).map(gsd).collect();
         let config = AssignConfig::default();
-        let cw = assign_levels(&feats, &gsds, &config, Crs::Epsg3857);
+        let cw = assign_levels(&table(&feats), &gsds, &config, Crs::Epsg3857);
         let out = apply_density_budget(
             &cw,
-            &feats,
+            &table(&feats),
             &gsds,
             &config,
             &DensityBudgetConfig::default(),
@@ -3400,7 +4083,7 @@ mod tests {
         let derived = select_budget_survivors(
             &cands,
             available,
-            &feats,
+            &table(&feats),
             config.sort_direction,
             gsds[level],
             Crs::Epsg3857,
@@ -3409,7 +4092,7 @@ mod tests {
 
         let prio: Vec<Priority> = feats
             .iter()
-            .map(|f| Priority::new(f, config.sort_direction))
+            .map(|f| Priority::new(f.row(), config.sort_direction))
             .collect();
         let super_size = gsd_to_coord_units(gsds[level], Crs::Epsg3857) * SUPERCELL_GSD_FACTOR;
         let mut cells: std::collections::BTreeMap<(i64, i64), Vec<usize>> =
@@ -3461,7 +4144,7 @@ mod tests {
         let true_extent = poly(1, 179.95, -0.05, 180.05, 0.05);
         let gsds = [gsd(2), gsd(6)];
         let out = assign_levels(
-            &[inflated, true_extent],
+            &table(&[inflated, true_extent]),
             &gsds,
             &AssignConfig::default(),
             Crs::Epsg4326,
@@ -3488,7 +4171,7 @@ mod tests {
         let local = poly(1, -0.5, -0.5, 0.5, 0.5); // genuinely at (0, 0)
         let gsds = [gsd(2), gsd(6)];
         let out = assign_levels(
-            &[antimeridian, local],
+            &table(&[antimeridian, local]),
             &gsds,
             &AssignConfig::default(),
             Crs::Epsg4326,
@@ -3586,14 +4269,15 @@ mod tests {
         let gsds = [gsd(2), gsd(5), gsd(8), gsd(11), gsd(14)];
         let cfg = AssignConfig::default();
 
-        let unbounded = assign_levels(&feats, &gsds, &cfg, Crs::Epsg3857);
-        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, 1, &[]);
+        let unbounded = assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg3857);
+        let bounded = assign_levels_bounded(&table(&feats), &gsds, &cfg, Crs::Epsg3857, 1, &[]);
         assert_eq!(unbounded.assignments, bounded.assignments);
         assert_eq!(unbounded.num_levels, bounded.num_levels);
 
         // An intermediate budget (some multi-level waves) must also match.
         let mid_budget = 200 * GRID_ENTRY_EST_BYTES;
-        let mid = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg3857, mid_budget, &[]);
+        let mid =
+            assign_levels_bounded(&table(&feats), &gsds, &cfg, Crs::Epsg3857, mid_budget, &[]);
         assert_eq!(unbounded.assignments, mid.assignments);
     }
 
@@ -3621,8 +4305,8 @@ mod tests {
             Representation::Square,
             Representation::Geometry,
         ];
-        let unbounded = assign_levels_banded(&feats, &gsds, &cfg, Crs::Epsg4326, &reprs);
-        let bounded = assign_levels_bounded(&feats, &gsds, &cfg, Crs::Epsg4326, 1, &reprs);
+        let unbounded = assign_levels_banded(&table(&feats), &gsds, &cfg, Crs::Epsg4326, &reprs);
+        let bounded = assign_levels_bounded(&table(&feats), &gsds, &cfg, Crs::Epsg4326, 1, &reprs);
         assert_eq!(unbounded.assignments, bounded.assignments);
         assert!(
             unbounded.assignments.iter().any(|a| a.min_level == 0),
@@ -3641,14 +4325,14 @@ mod tests {
         let gsds = [gsd(2), gsd(12)];
         let cfg = AssignConfig::default();
 
-        let plain = assign_levels(&[small], &gsds, &cfg, Crs::Epsg4326);
+        let plain = assign_levels(&table(&[small]), &gsds, &cfg, Crs::Epsg4326);
         assert_eq!(
             plain.assignments[0].min_level, 1,
             "precondition: gated out of the coarse level without a band"
         );
 
         let banded = assign_levels_banded(
-            &[small],
+            &table(&[small]),
             &gsds,
             &cfg,
             Crs::Epsg4326,
@@ -3669,13 +4353,13 @@ mod tests {
         let gsds = [gsd(2), gsd(6), gsd(12)];
         let cfg = AssignConfig::default();
         assert_eq!(
-            assign_levels(&feats, &gsds, &cfg, Crs::Epsg4326).assignments,
-            assign_levels_banded(&feats, &gsds, &cfg, Crs::Epsg4326, &[]).assignments
+            assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg4326).assignments,
+            assign_levels_banded(&table(&feats), &gsds, &cfg, Crs::Epsg4326, &[]).assignments
         );
         assert_eq!(
-            assign_levels(&feats, &gsds, &cfg, Crs::Epsg4326).assignments,
+            assign_levels(&table(&feats), &gsds, &cfg, Crs::Epsg4326).assignments,
             assign_levels_banded(
-                &feats,
+                &table(&feats),
                 &gsds,
                 &cfg,
                 Crs::Epsg4326,
@@ -3696,7 +4380,7 @@ mod tests {
         let gsds = [gsd(2), gsd(12)];
         let cfg = AssignConfig::default();
         let out = assign_levels_banded(
-            &[a, b],
+            &table(&[a, b]),
             &gsds,
             &cfg,
             Crs::Epsg4326,
@@ -3723,14 +4407,14 @@ mod tests {
         let gsds = [gsd(2), gsd(12)];
         let cfg = AssignConfig::default();
 
-        let plain = assign_levels(&[a, b], &gsds, &cfg, Crs::Epsg4326);
+        let plain = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg4326);
         assert!(
             plain.assignments.iter().all(|x| x.min_level == 1),
             "precondition: both gated out of the coarse level without a band"
         );
 
         let square_band = assign_levels_banded(
-            &[a, b],
+            &table(&[a, b]),
             &gsds,
             &cfg,
             Crs::Epsg4326,
@@ -3744,7 +4428,7 @@ mod tests {
         );
 
         let point_band = assign_levels_banded(
-            &[a, b],
+            &table(&[a, b]),
             &gsds,
             &cfg,
             Crs::Epsg4326,
@@ -3774,9 +4458,9 @@ mod tests {
         };
         let gsds = [gsd(2), gsd(12)];
         let cfg = AssignConfig::default();
-        let plain = assign_levels(&[line], &gsds, &cfg, Crs::Epsg4326);
+        let plain = assign_levels(&table(&[line]), &gsds, &cfg, Crs::Epsg4326);
         let banded = assign_levels_banded(
-            &[line],
+            &table(&[line]),
             &gsds,
             &cfg,
             Crs::Epsg4326,
