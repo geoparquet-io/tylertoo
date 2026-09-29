@@ -318,16 +318,21 @@ multiplier is unchanged because it is calibrated on a measured OOM, and
 re-deriving it needs a fresh billion-row run, not an argument. The pass-1
 floor itself is unchanged either way.
 
-**Size against the job's anonymous memory, not its reported `MaxRSS`.** Both
-figures above are anonymous memory — tylertoo's own heap, the thing these
-budgets bound. A scheduler's `MaxRSS` may be something else entirely: under
-Slurm's cgroup accounting it also counts the reclaimable page cache left by
-reading the input and writing the archive, which on a job that moves tens of
-gigabytes can ride the cgroup ceiling while the process itself is an order of
-magnitude smaller. Applying the ×2.5 rule to *that* number over-provisions
-wildly. [Reading a job's MaxRSS](bounded-memory.md#reading-a-jobs-maxrss)
-explains how to tell the two apart, and how to get the split out of a run with
-`TYLERTOO_PROFILE_JSON`.
+**Size against the job's own peak, not its reported `MaxRSS`.** The 64
+bytes/row floor was measured from the process's own resident set (the
+`[rss]` log line, which is almost all anonymous memory for tylertoo). The ×2.5
+multiplier was calibrated on a cgroup OOM kill, which counts whatever the
+cgroup could not reclaim at that moment. Both describe tylertoo's own memory. A
+scheduler's `MaxRSS` may be something else. Under Slurm's
+`jobacct_gather/cgroup` on cgroup v2, it is the cgroup's charge, which also
+counts the reclaimable page cache left by reading the input and writing the
+archive. On a job that moves tens of gigabytes, that charge can ride the
+cgroup ceiling while the process itself is an order of magnitude smaller, and
+applying the ×2.5 rule to it over-provisions wildly. (On cgroup v1, Slurm's
+`MaxRSS` excludes page cache and does describe the job's own memory.) Size
+from `true_peak_mib` or `true_anon_peak_mib` in a `TYLERTOO_PROFILE_JSON`
+capture. [Reading a job's MaxRSS](bounded-memory.md#reading-a-jobs-maxrss)
+explains how to tell the cases apart.
 
 **The remedy is a bigger box.** Sharding does not lower this floor: the
 coarse job runs the full pass 1 over the whole input, whatever `N` is. Only a

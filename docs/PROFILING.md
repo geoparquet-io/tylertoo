@@ -120,18 +120,33 @@ not "the run was not profiled".
       "pass2 (output sink)": 29.9,
       "writer.finish": 29.28
     },
-    "phase_smaps": {                // #627: anon vs file-backed split of the
-      "pass1 scan": {               // resident set AT each phase boundary,
-        "rss_kib": 32870,           // in the kernel's own KiB. Empty object
-        "anonymous_kib": 21384,     // off Linux or where smaps_rollup is
-        "file_backed_kib": 11486,   // unreadable; a field the kernel did not
-        "shared_clean_kib": 4,      // print is present-and-null.
-        "shared_dirty_kib": 0,
-        "private_clean_kib": 11482,
-        "private_dirty_kib": 21384,
+    "true_anon_peak_mib": 12.8,     // #627: max RssAnon over every sample
+    "phase_anon_peaks_mib": {       // #627: max RssAnon while each phase was
+      "pass1 scan": 5.0,            // current; same keys as phase_peaks_mib
+      "writer.finish": 12.8
+      // ...
+    },
+    "phase_rss_breakdown": {        // #627: /proc/self/status AT each phase
+      "pass1 scan": {               // boundary, in the kernel's own KiB;
+        "rss_kib": 42272,           // rss = anon + file + shmem exactly
+        "anon_kib": 5116,
+        "file_kib": 37156,
+        "shmem_kib": 0,
         "swap_kib": 0
       }
-      // ... one entry per phase, same keys as phase_peaks_mib
+      // ...
+    },
+    "phase_cgroup": {               // #627: cgroup v2 accounting AT each
+      "pass1 scan": {               // boundary, in the kernel's own BYTES;
+        "memory_current_bytes": …,  // {} on cgroup v1, off Linux, or where
+        "memory_peak_bytes": …,     // the files are hidden (see below for
+        "anon_bytes": …,            // what each field is)
+        "file_bytes": …,
+        "file_dirty_bytes": …,
+        "file_writeback_bytes": …,
+        "shmem_bytes": …
+      }
+      // ...
     }
   },
   "threads": 12,                    // rayon::current_num_threads()
@@ -175,52 +190,71 @@ jobs (#543's preflight guidance and the memory-envelope docs).
 `null` only when profiling was off, which cannot happen for a line this
 dump actually wrote (the whole dump is a no-op then).
 
-### `rss_sampler.phase_smaps`: anonymous vs file-backed (#627)
+### `rss_sampler`: anonymous memory and the cgroup's view (#627)
 
 Every RSS figure above is a single total. It says how big the resident set
-got, never what it was made of — so a job whose scheduler-reported `MaxRSS`
-sits on the cgroup ceiling is indistinguishable from one about to be OOM
-killed. `phase_smaps` supplies the missing half: at every phase boundary the
-sampler reads `/proc/self/smaps_rollup` and records the split, keyed by the
-phase that is *ending* (so `phase_smaps["pass1 scan"]` describes the resident
-set as pass 1 handed off). `finish` closes the last phase, so
-`writer.finish` and `finalize` get an entry too.
+got, never what it was made of, and it is not what a batch scheduler
+reports: under cgroup v2, Slurm's `MaxRSS` is the cgroup's charge, which also
+counts page cache that is in no process's resident set. So a job whose
+`MaxRSS` sits on the cgroup ceiling cannot be told apart from one about to be
+OOM-killed. Four more fields fill that gap. Their numbers in the example
+above come from a real `tiles --profile bounded` run over the `sharding-grid`
+fixture (the older fields in the example are from a different run). That run
+was on a cgroup v1 host, where `phase_cgroup` is `{}`, so the example shows
+`phase_cgroup`'s keys without values.
 
-Values are the kernel's own KiB, not MiB, so a dump can be diffed against a
-live `cat /proc/<pid>/smaps_rollup` with no arithmetic. `rss_kib`,
-`anonymous_kib`, `shared_clean_kib`, `shared_dirty_kib`, `private_clean_kib`,
-`private_dirty_kib` and `swap_kib` are the kernel's lines verbatim;
-`file_backed_kib` is derived as `rss_kib - anonymous_kib`.
+- **`true_anon_peak_mib` / `phase_anon_peaks_mib` are the numbers to size a
+  job from.** They are `RssAnon` from `/proc/self/status`: the process's
+  heap, stacks and anonymous mappings. This is the memory `--profile` bounds.
+  They are *sampled*, on the same 250 ms tick as `phase_peaks_mib`, and the
+  kernel keeps the figure as a counter, so a read costs the same at any
+  process size. Like `true_peak_mib`, they are a lower bound: a spike shorter
+  than a tick can fall between samples. `true_anon_peak_mib` is `null` off
+  Linux, where both objects are empty.
+- **`phase_rss_breakdown` is a snapshot at each phase boundary**, credited to
+  the phase that is *ending*, so `["pass1 scan"]` is the resident set as
+  pass 1 handed off. `finish` closes the last phase, so `writer.finish` and
+  `finalize` get an entry too. It is the composition at one moment, not a
+  peak, and it can sit well below the phase's peak: in that run's export
+  line, `levels` ended at 62.6 MiB anonymous after peaking at 93.4 MiB. Do
+  not size from it. The fields are the kernel's `VmRSS`, `RssAnon`,
+  `RssFile`, `RssShmem` and `VmSwap` lines verbatim, and `rss_kib` is exactly
+  `anon_kib + file_kib + shmem_kib`.
+  - `file_kib` is resident pages of *mapped* files. tylertoo maps no data
+    file (its reads and writes all go through `read`/`write`), so this is
+    the binary and its shared libraries: tens of MiB, growing as code pages
+    are first touched and then levelling off. In that run it went from
+    31 MiB at convert's `preflight` to 46 MiB at export's `finalize`. It does not grow with the
+    dataset, and it is **not** the page cache left behind by reads and
+    writes. Cache for an unmapped file is charged to the cgroup but is in no
+    process's RSS, which is why `phase_cgroup` exists.
+  - `swap_kib` non-zero means the run was already over its memory budget.
+- **`phase_cgroup` is what the cgroup is charged for**, at each phase
+  boundary, read from the process's own cgroup v2 directory
+  (`/sys/fs/cgroup<path>`, `<path>` from the `0::` line of
+  `/proc/self/cgroup`). Values are bytes, as the kernel prints them.
+  - `memory_current_bytes` (`memory.current`) is everything charged right
+    now, page cache included. `memory_peak_bytes` (`memory.peak`, kernel
+    5.19+) is its high-water mark since the cgroup was created. Under cgroup
+    v2, these are what Slurm's `jobacct_gather/cgroup` reports as `MaxRSS`.
+  - `anon_bytes` is the cgroup's anonymous memory, the cgroup-wide
+    counterpart of `RssAnon`.
+  - `file_bytes` is page cache, tmpfs included. Clean cache can be
+    reclaimed under pressure. Two parts of it cannot be reclaimed straight
+    away: `file_dirty_bytes` and `file_writeback_bytes` have to be written
+    back first, and `shmem_bytes` (tmpfs and shared memory) cannot be
+    reclaimed at all without swap. Spill files or the intermediate overview
+    in a tmpfs `TMPDIR` show up here.
 
-- **`anonymous_kib` is the number to size a job against.** It is the process's
-  own heap and stacks — what the OOM killer counts, and what `--profile`
-  bounds. #543's preflight should consume this, not `rss_kib`.
-- **`file_backed_kib` is resident pages of a *mapped* file.** tylertoo `mmap`s
-  nothing (no `mmap` appears anywhere in the crate or its dependency tree), so
-  in practice this is just the binary's own text and rodata — tens of MiB, and
-  **flat** across every phase while `anonymous_kib` moves by orders of
-  magnitude. (On a `tiles` run over the `sharding-grid` fixture it held at
-  ~44 MiB from `pass1 scan` through `finalize` while `anonymous_kib` went
-  7.7 MiB → 3.2 GiB.) It is emphatically **not** the page
-  cache that the process's `read`/`write` traffic leaves behind: cache for an
-  unmapped file is charged to the cgroup but is in no process's RSS. That
-  distinction is the whole of #627, and
-  [Reading a job's MaxRSS](diving-deeper/bounded-memory.md#reading-a-jobs-maxrss)
-  walks an operator through it.
-- **`swap_kib` non-zero means the run was already over budget**, whatever the
-  peaks say.
+  The object is empty on cgroup v1 or hybrid hosts, off Linux, in the host's
+  root cgroup (which has no `memory.current`), or wherever the files are
+  hidden. A file the kernel does not provide (`memory.peak` before 5.19, say)
+  is present-and-null, never `0`.
 
-Unlike the peaks, these are boundary *snapshots*, not maxima. A composition is
-a moment: taking per-field maxima across samples would mix moments and the
-fields would stop adding up. Keeping it to boundaries also keeps the
-background thread's 250 ms tick a single cheap RSS read, since
-`smaps_rollup` — cheap as it is next to `/proc/self/smaps` — still walks every
-mapping in the address space.
-
-Linux-only. Off Linux, on a kernel built without `CONFIG_PROC_PAGE_MONITOR`,
-or in a sandbox that hides the file, `phase_smaps` is an empty object (never
-nulls, and never absent). A field the kernel did not print is
-present-and-null rather than a misleading `0`.
+Reading `memory.stat` makes the kernel flush per-CPU statistics, so
+`phase_cgroup` is taken only at phase boundaries, not on every tick.
+[Reading a job's MaxRSS](diving-deeper/bounded-memory.md#reading-a-jobs-maxrss)
+walks an operator through putting these fields together.
 
 The four `phase_walls` phases are **disjoint** windows of one conversion, so
 `pass1 + assign + pass2 + writer_finish <= total` always holds; the
@@ -338,8 +372,10 @@ missing export line after a failed run is expected, not a profiling bug.
         "levels": 880.2,
         "finalize": 815.0
       },
-      "phase_smaps": { /* #627: per-boundary anon vs file-backed split,
-                          same shape and keys as the convert side */ }
+      "true_anon_peak_mib": 93.4,  // #627: same shape and keys as the
+      "phase_anon_peaks_mib": { /* ... */ },  // convert side
+      "phase_rss_breakdown": { /* ... */ },
+      "phase_cgroup": { /* ... */ }
     },
     "threads": 12                  // rayon::current_num_threads()
   }
@@ -439,9 +475,10 @@ of the level scan through `finalize`, and it reports `true_peak_mib` plus
 names as `export.phase_walls`. In duplicating mode the fill never runs, so
 `phase_peaks_mib` has no `fill` key. It is spawned only when profiling is
 on; `null` otherwise (which cannot happen for a line this dump actually
-wrote). It carries `phase_smaps` too, with the same shape, keys and
-platform caveats as the convert side — see
-[`rss_sampler.phase_smaps`](#rss_samplerphase_smaps-anonymous-vs-file-backed-627).
+wrote). It carries the #627 fields too (`true_anon_peak_mib`,
+`phase_anon_peaks_mib`, `phase_rss_breakdown`, `phase_cgroup`), with the same
+shape, keys and platform caveats as the convert side. See
+[`rss_sampler`: anonymous memory and the cgroup's view](#rss_sampler-anonymous-memory-and-the-cgroups-view-627).
 `finalize` is the phase an export's `MaxRSS` most often lands in, and the
 sampler's closing snapshot is what gives it an entry.
 
