@@ -197,8 +197,11 @@ live `cat /proc/<pid>/smaps_rollup` with no arithmetic. `rss_kib`,
   bounds. #543's preflight should consume this, not `rss_kib`.
 - **`file_backed_kib` is resident pages of a *mapped* file.** tylertoo `mmap`s
   nothing (no `mmap` appears anywhere in the crate or its dependency tree), so
-  in practice this is just the binary's own text and rodata — a fixed ~100 MiB
-  that does not grow with the dataset. It is emphatically **not** the page
+  in practice this is just the binary's own text and rodata — tens of MiB, and
+  **flat** across every phase while `anonymous_kib` moves by orders of
+  magnitude. (On a `tiles` run over the `sharding-grid` fixture it held at
+  ~44 MiB from `pass1 scan` through `finalize` while `anonymous_kib` went
+  7.7 MiB → 3.2 GiB.) It is emphatically **not** the page
   cache that the process's `read`/`write` traffic leaves behind: cache for an
   unmapped file is charged to the cgroup but is in no process's RSS. That
   distinction is the whole of #627, and

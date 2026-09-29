@@ -167,7 +167,7 @@ Read it like this:
 | Field | What it means for sizing |
 |---|---|
 | `anonymous_kib` | The process's own heap and stacks. **This is the number to size a job against** — it is what the OOM killer counts and what `--profile` bounds. |
-| `file_backed_kib` | Resident pages of a *mapped* file — for tylertoo, essentially just the binary's own text and rodata, a fixed ~100 MiB. It is **not** the page cache left behind by reads and writes. |
+| `file_backed_kib` | Resident pages of a *mapped* file — for tylertoo, essentially just the binary's own text and rodata. Tens of MiB, **flat**: it does not grow with the dataset. It is **not** the page cache left behind by reads and writes. |
 | `rss_kib` | The sum of the two: the same quantity the `[rss] <phase>` log lines report. |
 | `swap_kib` | Anonymous pages that were evicted. Non-zero here means the run was already over budget. |
 
