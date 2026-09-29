@@ -109,6 +109,7 @@ use super::simplify::{
     validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
     Simplified, SimplifyOptions,
 };
+use super::smaps::{read_smaps_rollup, smaps_json, SmapsRollup};
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
 /// Row-indexed winner-table sentinel for rows with no feature (null, empty,
@@ -257,6 +258,12 @@ const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// - the max RSS observed while each named phase was current
 ///   ([`RssSamplerReport::phase_peaks_mib`], attributed via [`Self::mark_phase`]).
 ///
+/// Since #627 it also records, at each phase boundary only, the
+/// `smaps_rollup` split of the resident set into anonymous and file-backed
+/// pages ([`RssSamplerReport::phase_smaps`]) — the number that says whether a
+/// ceiling-riding `MaxRSS` is this process's own memory or the kernel's
+/// reclaimable page cache. See [`super::smaps`].
+///
 /// This promotes the polling loop `peak_rss_during` (in `tests` below, #449)
 /// used to verify the pass-1 line-buffer memory model to 1% — same approach,
 /// generalized with phase attribution so the profiling path can use it too,
@@ -291,6 +298,15 @@ struct RssSamplerState {
     /// of phases, so a linear scan per sample is simpler than a `HashMap`.
     /// (The JSON object built from it is key-sorted by `serde_json`.)
     phase_peaks_mib: Vec<(String, f64)>,
+    /// #627: the `smaps_rollup` breakdown of the resident set AT the moment
+    /// each phase ended, keyed the same way as `phase_peaks_mib`.
+    ///
+    /// Unlike the peaks, these are boundary *snapshots*, not maxima: the
+    /// question they answer ("how much of this resident set is anonymous?")
+    /// is about composition, and a max taken field-by-field across samples
+    /// would mix moments and stop adding up. Taken only at boundaries, so the
+    /// background thread's 250 ms tick stays a single cheap RSS read.
+    phase_smaps: Vec<(String, SmapsRollup)>,
 }
 
 impl RssSamplerState {
@@ -309,6 +325,18 @@ impl RssSamplerState {
             None => self.phase_peaks_mib.push((current.clone(), mib)),
         }
     }
+
+    /// Record the current phase's closing `smaps_rollup` snapshot (#627),
+    /// replacing any earlier one for the same phase — a phase can be closed
+    /// more than once (`log_phase` then `enter_phase`), and the last snapshot
+    /// is the one that describes its end.
+    fn record_smaps(&mut self, rollup: SmapsRollup) {
+        let current = &self.current_phase;
+        match self.phase_smaps.iter_mut().find(|(p, _)| p == current) {
+            Some((_, slot)) => *slot = rollup,
+            None => self.phase_smaps.push((current.clone(), rollup)),
+        }
+    }
 }
 
 /// What [`RssSampler::finish`] reports: the whole-run true peak plus the max
@@ -317,6 +345,10 @@ pub(super) struct RssSamplerReport {
     pub(super) interval_ms: u64,
     pub(super) true_peak_mib: f64,
     pub(super) phase_peaks_mib: Vec<(String, f64)>,
+    /// #627: per-phase-boundary anon vs file-backed breakdown. Empty on every
+    /// platform without `/proc/self/smaps_rollup`, and on Linux when the file
+    /// is unreadable — the report then simply has no `phase_smaps` entries.
+    pub(super) phase_smaps: Vec<(String, SmapsRollup)>,
 }
 
 impl RssSampler {
@@ -346,6 +378,7 @@ impl RssSampler {
             current_phase: initial_phase.to_string(),
             true_peak_mib: 0.0,
             phase_peaks_mib: Vec::new(),
+            phase_smaps: Vec::new(),
         }));
         let state_bg = Arc::clone(&state);
         let handle = std::thread::spawn(move || loop {
@@ -380,13 +413,23 @@ impl RssSampler {
     /// Close the current phase with one sample credited to it, then
     /// attribute every sample from now on to `phase`, until the next call.
     /// The closing sample is what gives a phase shorter than the poll
-    /// interval an entry at all. Cheap (one RSS read, one mutex lock, a
-    /// short-string clone); called only at phase boundaries, never per-row.
+    /// interval an entry at all. Cheap (one RSS read, one `smaps_rollup`
+    /// read, one mutex lock, a short-string clone); called only at phase
+    /// boundaries, never per-row.
+    ///
+    /// #627: the `smaps_rollup` snapshot is taken here, credited to the phase
+    /// that is *ending* — so `phase_smaps["pass1 scan"]` describes the
+    /// resident set as pass 1 handed off, which is the composition an
+    /// operator sizing a job wants.
     pub(super) fn mark_phase(&self, phase: &str) {
         let mib = current_rss_mib();
+        let rollup = read_smaps_rollup();
         if let Ok(mut s) = self.state.lock() {
             if let Some(mib) = mib {
                 s.record(mib);
+            }
+            if let Some(rollup) = rollup {
+                s.record_smaps(rollup);
             }
             if s.current_phase != phase {
                 s.current_phase = phase.to_string();
@@ -408,14 +451,23 @@ impl RssSampler {
         if let Some(mib) = current_rss_mib() {
             self.record(mib);
         }
-        let state = self
+        // #627: the last phase's closing breakdown. Without this the final
+        // phase (`writer.finish` for convert, `finalize` for export) — the
+        // one an operator's MaxRSS most often lands in — would be the only
+        // phase with no anon/file split.
+        let closing_smaps = read_smaps_rollup();
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rollup) = closing_smaps {
+            state.record_smaps(rollup);
+        }
         RssSamplerReport {
             interval_ms: self.interval.as_millis() as u64,
             true_peak_mib: state.true_peak_mib,
             phase_peaks_mib: state.phase_peaks_mib.clone(),
+            phase_smaps: state.phase_smaps.clone(),
         }
     }
 }
@@ -3230,7 +3282,10 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
 /// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
 /// dumps (#571): the continuous background sampler's TRUE peak RSS and its
 /// per-phase maxima (a JSON object, so key-sorted: `serde_json` is built
-/// without `preserve_order`) — see `docs/PROFILING.md` for the
+/// without `preserve_order`), plus the #627 `phase_smaps` breakdown of each
+/// phase boundary's resident set into anonymous and file-backed pages (an
+/// empty object off Linux, or where `smaps_rollup` is unreadable)
+/// — see `docs/PROFILING.md` for the
 /// exact contrast with the boundary-sampled `peak_rss_mib` next to it. `null`
 /// only when the sampler never ran (profiling off), which in practice never
 /// happens here since the whole dump is a no-op then.
@@ -3242,10 +3297,16 @@ fn rss_sampler_json(report: &Option<RssSamplerReport>) -> serde_json::Value {
                 .iter()
                 .map(|(phase, mib)| (phase.clone(), serde_json::json!(mib)))
                 .collect();
+            let phase_smaps: serde_json::Map<String, serde_json::Value> = r
+                .phase_smaps
+                .iter()
+                .map(|(phase, rollup)| (phase.clone(), smaps_json(Some(rollup))))
+                .collect();
             serde_json::json!({
                 "interval_ms": r.interval_ms,
                 "true_peak_mib": r.true_peak_mib,
                 "phase_peaks_mib": phase_peaks_mib,
+                "phase_smaps": phase_smaps,
             })
         }
         None => serde_json::Value::Null,
@@ -6484,6 +6545,122 @@ mod tests {
         assert!(
             tracker.finish_sampler().is_none(),
             "profiling off must produce no sampler report"
+        );
+    }
+
+    /// #627: every phase the run entered — including the LAST one, which
+    /// only `finish` can close — carries a `smaps_rollup` breakdown of the
+    /// resident set at its boundary. Without the closing snapshot in
+    /// `finish`, `writer.finish`/`finalize` (where a job's MaxRSS most often
+    /// lands) would be the one phase with no anon/file split.
+    ///
+    /// Linux-only assertion: everywhere else `read_smaps_rollup` is `None`
+    /// by construction and the report is legitimately empty.
+    #[test]
+    fn rss_sampler_reports_a_smaps_breakdown_for_every_phase_including_the_last() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("b");
+        sampler.mark_phase("c");
+        let report = sampler.finish();
+
+        if read_smaps_rollup().is_none() {
+            assert!(
+                report.phase_smaps.is_empty(),
+                "no readable smaps_rollup must mean no breakdown at all, not partial data"
+            );
+            return;
+        }
+
+        let phases: Vec<&str> = report.phase_smaps.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            phases,
+            ["a", "b", "c"],
+            "every entered phase, in execution order, must have a boundary breakdown"
+        );
+        for (phase, rollup) in &report.phase_smaps {
+            let rss = rollup
+                .rss_kib
+                .unwrap_or_else(|| panic!("{phase}: a live rollup always prints Rss"));
+            assert!(rss > 0, "{phase}: this test process is resident");
+            assert!(
+                rollup.anonymous_kib.is_some_and(|a| a <= rss),
+                "{phase}: anonymous must be present and within Rss: {rollup:?}"
+            );
+        }
+    }
+
+    /// #627: a phase closed twice (`log_phase` then `enter_phase`, the shape
+    /// `log_phase_then_enter` uses) keeps ONE entry, holding the latest
+    /// snapshot — not a duplicate key that would collide in the JSON object.
+    #[test]
+    fn rss_sampler_smaps_keeps_one_entry_per_phase_when_a_phase_is_closed_twice() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        // `mark_phase` with the phase unchanged is exactly what a second
+        // close of the same phase looks like.
+        sampler.mark_phase("a");
+        sampler.mark_phase("a");
+        sampler.mark_phase("b");
+        let report = sampler.finish();
+
+        if read_smaps_rollup().is_none() {
+            assert!(report.phase_smaps.is_empty(), "no rollup, no breakdown");
+            return;
+        }
+        let phases: Vec<&str> = report.phase_smaps.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            phases,
+            ["a", "b"],
+            "re-closing a phase must overwrite its snapshot, not append one"
+        );
+    }
+
+    /// #627: the sampler's JSON carries the breakdown under `phase_smaps`,
+    /// keyed by phase, with the derived `file_backed_kib` alongside the raw
+    /// kernel fields — the shape `docs/PROFILING.md` documents.
+    #[test]
+    fn rss_sampler_json_carries_the_phase_smaps_breakdown() {
+        let sampler =
+            RssSampler::start_if_with_interval(true, "pass1 scan", Duration::from_secs(30))
+                .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("pass2 (output sink)");
+        let report = sampler.finish();
+        let have_rollup = !report.phase_smaps.is_empty();
+        let v = rss_sampler_json(&Some(report));
+
+        let smaps = v["phase_smaps"]
+            .as_object()
+            .expect("phase_smaps must always be an object, empty at worst");
+        if !have_rollup {
+            assert!(
+                smaps.is_empty(),
+                "no readable smaps_rollup must yield an empty object, not nulls"
+            );
+            return;
+        }
+        let pass1 = &smaps["pass1 scan"];
+        for key in [
+            "rss_kib",
+            "anonymous_kib",
+            "file_backed_kib",
+            "shared_clean_kib",
+            "shared_dirty_kib",
+            "private_clean_kib",
+            "private_dirty_kib",
+            "swap_kib",
+        ] {
+            assert!(
+                pass1
+                    .as_object()
+                    .expect("a breakdown object")
+                    .contains_key(key),
+                "phase_smaps entries must carry {key}: {v}"
+            );
+        }
+        assert!(
+            pass1["rss_kib"].as_u64().is_some_and(|r| r > 0),
+            "a live breakdown has a positive rss_kib: {v}"
         );
     }
 

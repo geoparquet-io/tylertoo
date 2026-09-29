@@ -396,6 +396,81 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
         "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
          boundary-sampled peak_rss_mib ({boundary}): {line}"
     );
+    check_phase_smaps(line, sampler, phases);
+}
+
+/// Every field a `phase_smaps` entry carries (#627). `file_backed_kib` is
+/// derived (`rss_kib - anonymous_kib`); the rest are the kernel's own
+/// `smaps_rollup` lines, in the kernel's own KiB.
+const SMAPS_FIELDS: [&str; 8] = [
+    "rss_kib",
+    "anonymous_kib",
+    "file_backed_kib",
+    "shared_clean_kib",
+    "shared_dirty_kib",
+    "private_clean_kib",
+    "private_dirty_kib",
+    "swap_kib",
+];
+
+/// #627: `rss_sampler.phase_smaps` splits each phase boundary's resident set
+/// into anonymous and file-backed pages, so a report that rode the cgroup
+/// ceiling is self-diagnosing rather than ambiguous.
+///
+/// The object is always present. Off Linux — and on a Linux without
+/// `CONFIG_PROC_PAGE_MONITOR`, or in a sandbox that hides
+/// `/proc/self/smaps_rollup` — it is legitimately empty; when it is
+/// populated it names exactly the phases the run entered, since every
+/// boundary takes a snapshot.
+fn check_phase_smaps(line: &serde_json::Value, sampler: &serde_json::Value, phases: &[&str]) {
+    let smaps = sampler["phase_smaps"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rss_sampler.phase_smaps must be an object: {line}"));
+    if smaps.is_empty() {
+        assert!(
+            !cfg!(target_os = "linux") || std::fs::read("/proc/self/smaps_rollup").is_err(),
+            "phase_smaps is empty although this Linux exposes smaps_rollup: {line}"
+        );
+        return;
+    }
+    let mut got: Vec<&str> = smaps.keys().map(String::as_str).collect();
+    let mut want = phases.to_vec();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "rss_sampler.phase_smaps must name exactly the phases the run entered: {line}"
+    );
+    for (phase, entry) in smaps {
+        let fields = entry
+            .as_object()
+            .unwrap_or_else(|| panic!("phase_smaps[{phase}] must be an object: {line}"));
+        for key in SMAPS_FIELDS {
+            assert!(
+                fields.contains_key(key),
+                "phase_smaps[{phase}] must carry {key} (present-and-null when unknown): {line}"
+            );
+        }
+        let rss = entry["rss_kib"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("phase_smaps[{phase}].rss_kib must be a number: {line}"));
+        let anon = entry["anonymous_kib"].as_u64().unwrap_or_else(|| {
+            panic!("phase_smaps[{phase}].anonymous_kib must be a number: {line}")
+        });
+        assert!(
+            rss > 0,
+            "phase_smaps[{phase}].rss_kib must be positive for a live process: {line}"
+        );
+        assert!(
+            anon <= rss,
+            "phase_smaps[{phase}]: anonymous ({anon}) cannot exceed rss ({rss}): {line}"
+        );
+        assert_eq!(
+            entry["file_backed_kib"].as_u64(),
+            Some(rss - anon),
+            "phase_smaps[{phase}].file_backed_kib must be rss_kib - anonymous_kib: {line}"
+        );
+    }
 }
 
 /// #535: the export profile line of [`profile_json_written_and_parses`]'s
