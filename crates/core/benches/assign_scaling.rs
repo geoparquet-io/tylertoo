@@ -329,11 +329,19 @@ fn main() {
             format!("{grid_mib} MiB")
         }
     );
-    let table_bytes = std::mem::size_of::<AssignFeature>() * feats.len();
+    // The column-major table the engine takes (#543), built ONCE and outside
+    // every timed and allocation-tracked window: it is the phases' input, not
+    // part of either phase, so building it inside them would charge both
+    // `_s` and both `B/ft` columns for a serial N-row conversion and a whole
+    // extra table. The array-of-structs fixture is dropped once converted so
+    // it does not sit in the peak RSS figure either.
+    let features = table(&feats);
+    drop(feats);
+    let table_bytes = features.heap_bytes();
     println!(
         "feature table: {:.0} MiB ({} B/feature){}\n",
-        mib(table_bytes as u64),
-        std::mem::size_of::<AssignFeature>(),
+        mib(table_bytes),
+        features.bytes_per_row(),
         if track_mem {
             " — ASSIGN_BENCH_TRACK_MEM: B/ft columns are exact, TIMES ARE NOT (see `Counting`)"
         } else {
@@ -375,7 +383,7 @@ fn main() {
                 let assign_base = arm();
                 let ta = Instant::now();
                 let cw = assign_levels_bounded(
-                    &table(&feats),
+                    &features,
                     &gsds,
                     &config,
                     Crs::Epsg3857,
@@ -387,14 +395,8 @@ fn main() {
 
                 let budget_base = arm();
                 let tb = Instant::now();
-                let out = apply_density_budget(
-                    &cw,
-                    &table(&feats),
-                    &gsds,
-                    &config,
-                    &density,
-                    Crs::Epsg3857,
-                );
+                let out =
+                    apply_density_budget(&cw, &features, &gsds, &config, &density, Crs::Epsg3857);
                 let budget_s = tb.elapsed().as_secs_f64();
                 let budget_mem = added_since(budget_base);
 
@@ -445,7 +447,7 @@ fn main() {
             "process peak RSS: {:.0} MiB ({:.1} B/feature, feature table {:.0} MiB of it)",
             mib(peak),
             peak as f64 / rows as f64,
-            mib(table_bytes as u64),
+            mib(table_bytes),
         );
     }
 }
