@@ -34,13 +34,24 @@
 //!   header;
 //! - trailing bytes after the geometry are ignored.
 //!
-//! After the walk passes, the reader's allocations are at most a small
-//! multiple of the value's length.
+//! After the walk passes, memory grows linearly with the value's length. The
+//! worst case is a polygon of empty rings: 4 input bytes per ring become a
+//! 32-byte ring in the reader and a 24-byte `geo` line string after
+//! conversion, about 14 bytes per input byte while both are alive.
+//!
+//! Two places run the walk: [`crate::batch_processor`] on the primary
+//! geometry column before decoding it, and the overview writer on any other
+//! `geoarrow.wkb` column, which is passed through to the output unchanged and
+//! read by the geoparquet encoder.
 //!
 //! This duplicates checks the `wkb` crate should make itself. Once a `wkb`
 //! release bounds its counts and its nesting, the walk can go.
 
 use std::fmt;
+
+use arrow_array::cast::AsArray;
+use arrow_array::Array;
+use arrow_schema::DataType;
 
 /// Deepest GeometryCollection nesting accepted. Real data nests one or two
 /// levels; the cap exists so a crafted value cannot recurse the reader, the
@@ -122,6 +133,31 @@ pub(crate) fn check_wkb_value(buf: &[u8]) -> CheckResult<u64> {
     let mut walk = Walk { buf, pos: 0 };
     walk.geometry(0)?;
     Ok(walk.pos as u64)
+}
+
+/// Run [`check_wkb_value`] over every non-null value of a WKB column stored
+/// as `Binary`, `LargeBinary` or `BinaryView`, and return the index of the
+/// first value it rejects with the reason. An array of any other type holds no
+/// WKB and passes.
+pub(crate) fn check_wkb_column(
+    array: &dyn Array,
+) -> std::result::Result<(), (usize, WkbCheckError)> {
+    fn check<'a>(
+        values: impl Iterator<Item = Option<&'a [u8]>>,
+    ) -> std::result::Result<(), (usize, WkbCheckError)> {
+        for (i, value) in values.enumerate() {
+            if let Some(bytes) = value {
+                check_wkb_value(bytes).map_err(|e| (i, e))?;
+            }
+        }
+        Ok(())
+    }
+    match array.data_type() {
+        DataType::Binary => check(array.as_binary::<i32>().iter()),
+        DataType::LargeBinary => check(array.as_binary::<i64>().iter()),
+        DataType::BinaryView => check(array.as_binary_view().iter()),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -322,34 +322,43 @@ fn empty_coordinate_geometries_skipped() {
 /// one row each. The geoarrow builder `write_input` uses cannot emit an
 /// invalid value, so hostile-WKB fixtures are written this way.
 fn write_wkb_input(path: &Path, values: &[&[u8]]) {
-    let mut md = std::collections::HashMap::new();
-    md.insert(
-        "ARROW:extension:name".to_string(),
-        "geoarrow.wkb".to_string(),
-    );
-    let geom_field = Field::new("geometry", DataType::Binary, true).with_metadata(md);
-    let schema = Arc::new(Schema::new(vec![
+    write_wkb_columns(path, values, None);
+}
+
+/// [`write_wkb_input`] plus, when `centroid` is given, a second WKB geometry
+/// column of that name, which the pipeline passes through untouched.
+fn write_wkb_columns(path: &Path, values: &[&[u8]], centroid: Option<&[&[u8]]>) {
+    let wkb_field = |name: &str| {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkb".to_string(),
+        );
+        Arc::new(Field::new(name, DataType::Binary, true).with_metadata(md))
+    };
+    let mut fields = vec![
         Arc::new(Field::new("id", DataType::Int64, false)),
-        Arc::new(geom_field),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(
-                (0..values.len() as i64).collect::<Vec<_>>(),
-            )),
-            Arc::new(BinaryArray::from_vec(values.to_vec())),
-        ],
-    )
-    .unwrap();
+        wkb_field("geometry"),
+    ];
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+        Arc::new(Int64Array::from(
+            (0..values.len() as i64).collect::<Vec<_>>(),
+        )),
+        Arc::new(BinaryArray::from_vec(values.to_vec())),
+    ];
+    let mut geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[]}"#.to_string();
+    if let Some(centroid) = centroid {
+        fields.push(wkb_field("centroid"));
+        columns.push(Arc::new(BinaryArray::from_vec(centroid.to_vec())));
+        geo.push_str(r#","centroid":{"encoding":"WKB","geometry_types":[]}"#);
+    }
+    geo.push_str("}}");
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let file = std::fs::File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
-    writer.append_key_value_metadata(KeyValue::new(
-        "geo".to_string(),
-        r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":[]}}}"#
-            .to_string(),
-    ));
+    writer.append_key_value_metadata(KeyValue::new("geo".to_string(), geo));
     writer.close().unwrap();
 }
 
@@ -378,11 +387,9 @@ fn wkb_point(x: f64, y: f64) -> Vec<u8> {
     v
 }
 
-/// #632: WKB values that aborted the process in the `wkb` crate's reader.
-/// Each must fail the conversion with an error naming the row, in both
-/// engines, and the test process must survive to check it.
-#[test]
-fn hostile_wkb_values_error_instead_of_aborting() {
+/// #632's WKB values that aborted the process in the `wkb` crate's reader,
+/// each with a name and the text its error must contain.
+fn hostile_wkb_values() -> Vec<(&'static str, Vec<u8>, &'static str)> {
     // A MultiPolygon claiming 4,294,967,295 polygons in 9 bytes: the reader
     // reserved about 206 GB for them.
     let huge_count: Vec<u8> = vec![1, 6, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
@@ -401,19 +408,23 @@ fn hostile_wkb_values_error_instead_of_aborting() {
     last[4] = 0x20;
     srid_member.extend_from_slice(&last);
 
+    vec![
+        ("huge count", huge_count, "WKB declares 4294967295 polygons"),
+        ("deep nesting", deep_nesting, "deeper than 100 levels"),
+        ("MultiPoint SRID member", srid_member, "sets the SRID flag"),
+    ]
+}
+
+/// #632: WKB values that aborted the process in the `wkb` crate's reader.
+/// Each must fail the conversion with an error naming the row, in both
+/// engines, and the test process must survive to check it.
+#[test]
+fn hostile_wkb_values_error_instead_of_aborting() {
     let good = wkb_point(10.0, 10.0);
-    for (name, bad, expect) in [
-        (
-            "huge count",
-            &huge_count,
-            "WKB declares 4294967295 polygons",
-        ),
-        ("deep nesting", &deep_nesting, "deeper than 100 levels"),
-        ("MultiPoint SRID member", &srid_member, "sets the SRID flag"),
-    ] {
+    for (name, bad, expect) in hostile_wkb_values() {
         let tin = tempfile::NamedTempFile::new().unwrap();
         let tout = tempfile::NamedTempFile::new().unwrap();
-        write_wkb_input(tin.path(), &[&good, bad, &good]);
+        write_wkb_input(tin.path(), &[&good, &bad, &good]);
         for streaming in [true, false] {
             let err = match convert_to_overviews(tin.path(), tout.path(), &opts(streaming)) {
                 Err(e) => e.to_string(),
@@ -424,6 +435,83 @@ fn hostile_wkb_values_error_instead_of_aborting() {
                 "{name}, streaming={streaming}: {err}"
             );
         }
+    }
+}
+
+/// #632: a second WKB geometry column is passed through to the output, where
+/// the geoparquet encoder reads it with the `wkb` crate. A hostile value there
+/// must fail the conversion with an error naming the column, in both engines
+/// and on both the parallel and the single-threaded encode paths.
+#[test]
+fn hostile_wkb_in_a_second_geometry_column_errors() {
+    let good = wkb_point(10.0, 10.0);
+    for (name, bad, expect) in hostile_wkb_values() {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_wkb_columns(
+            tin.path(),
+            &[&good, &good, &good],
+            Some(&[&good, &bad, &good]),
+        );
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for streaming in [true, false] {
+                let tout = tempfile::NamedTempFile::new().unwrap();
+                let result = pool
+                    .install(|| convert_to_overviews(tin.path(), tout.path(), &opts(streaming)));
+                let err = match result {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("{name}, threads={threads}, streaming={streaming}: must fail"),
+                };
+                assert!(
+                    err.contains(expect) && err.contains(r#"column "centroid""#),
+                    "{name}, threads={threads}, streaming={streaming}: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// A collection nested inside a collection with more than one member cannot
+/// be stored in a GeoArrow mixed-geometry array as is; it is flattened into
+/// its parent, so it converts and exports in both engines rather than
+/// panicking the array builder.
+#[test]
+fn nested_multi_member_collection_converts() {
+    fn wkb_polygon(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u8> {
+        let mut v = vec![1u8, 3, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0];
+        for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)] {
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
+        }
+        v
+    }
+    let mut line = vec![1u8, 2, 0, 0, 0, 3, 0, 0, 0];
+    for (x, y) in [(-170.0f64, -80.0f64), (170.0, 80.0), (-170.0, 80.0)] {
+        line.extend_from_slice(&x.to_le_bytes());
+        line.extend_from_slice(&y.to_le_bytes());
+    }
+    // GC[GC[polygon, line], polygon]
+    let mut inner = vec![1u8, 7, 0, 0, 0, 2, 0, 0, 0];
+    inner.extend_from_slice(&wkb_polygon(-170.0, -80.0, 170.0, 80.0));
+    inner.extend_from_slice(&line);
+    let mut nested = vec![1u8, 7, 0, 0, 0, 2, 0, 0, 0];
+    nested.extend_from_slice(&inner);
+    nested.extend_from_slice(&wkb_polygon(0.0, 0.0, 20.0, 20.0));
+
+    let good = wkb_point(10.0, 10.0);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_wkb_input(tin.path(), &[&good, &nested, &good]);
+    for streaming in [true, false] {
+        let tov = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), tov.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+        assert!(report.total_tiles > 0, "streaming={streaming}");
     }
 }
 

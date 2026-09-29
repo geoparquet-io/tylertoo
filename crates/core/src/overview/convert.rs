@@ -4912,7 +4912,12 @@ pub(super) fn build_level_batch(
                     .unwrap_or_default(),
             ));
             let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
-            b.extend_from_iter(geoms.iter().map(|g| Some(g.borrow())));
+            for g in geoms {
+                let g = g.borrow();
+                let flat = flatten_nested_collections(g);
+                b.push_geometry(Some(flat.as_ref().unwrap_or(g)))
+                    .map_err(|e| arrow_schema::ArrowError::InvalidArgumentError(e.to_string()))?;
+            }
             columns.push(b.finish().to_array_ref());
         } else {
             let src_col = *non_geom_iter.next().expect("non-geom column index");
@@ -4924,6 +4929,43 @@ pub(super) fn build_level_batch(
         Arc::new(source_schema.clone()),
         columns,
     )?)
+}
+
+/// A GeometryCollection that contains other collections, flattened into one
+/// collection of their non-collection members, in order; `None` for any other
+/// geometry.
+///
+/// GeoArrow's mixed-geometry array cannot hold a collection inside a
+/// collection. Its builder unwraps a nested collection with exactly one member
+/// and rejects any other, so without this a value such as
+/// `GEOMETRYCOLLECTION(GEOMETRYCOLLECTION(POLYGON(...), LINESTRING(...)),
+/// POLYGON(...))` could not be written. Flattening keeps every member and
+/// gives the same result the builder already gives for one-member nesting.
+/// The walk uses an explicit stack, so nesting depth costs no call stack.
+fn flatten_nested_collections(g: &Geometry<f64>) -> Option<Geometry<f64>> {
+    let Geometry::GeometryCollection(gc) = g else {
+        return None;
+    };
+    if !gc
+        .iter()
+        .any(|m| matches!(m, Geometry::GeometryCollection(_)))
+    {
+        return None;
+    }
+    let mut flat = Vec::new();
+    let mut stack: Vec<std::slice::Iter<'_, Geometry<f64>>> = vec![gc.0.iter()];
+    while let Some(members) = stack.last_mut() {
+        match members.next() {
+            Some(Geometry::GeometryCollection(inner)) => stack.push(inner.0.iter()),
+            Some(member) => flat.push(member.clone()),
+            None => {
+                stack.pop();
+            }
+        }
+    }
+    Some(Geometry::GeometryCollection(
+        geo::GeometryCollection::new_from(flat),
+    ))
 }
 
 // ============================================================================
@@ -6111,6 +6153,36 @@ pub(super) fn fill_level_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nested collections flatten into their parent, members in order, at
+    /// any depth; anything without a nested collection is left alone.
+    #[test]
+    fn flatten_nested_collections_keeps_every_member_in_order() {
+        use geo::{point, GeometryCollection};
+        let p = |x: f64| Geometry::Point(point!(x: x, y: 0.0));
+        let gc = |members: Vec<Geometry<f64>>| {
+            Geometry::GeometryCollection(GeometryCollection::new_from(members))
+        };
+
+        let nested = gc(vec![
+            p(0.0),
+            gc(vec![p(1.0), gc(vec![]), gc(vec![p(2.0), p(3.0)])]),
+            p(4.0),
+        ]);
+        assert_eq!(
+            flatten_nested_collections(&nested),
+            Some(gc(vec![p(0.0), p(1.0), p(2.0), p(3.0), p(4.0)]))
+        );
+
+        let mut deep = p(9.0);
+        for _ in 0..1_000 {
+            deep = gc(vec![deep]);
+        }
+        assert_eq!(flatten_nested_collections(&deep), Some(gc(vec![p(9.0)])));
+
+        assert_eq!(flatten_nested_collections(&gc(vec![p(0.0), p(1.0)])), None);
+        assert_eq!(flatten_nested_collections(&p(0.0)), None);
+    }
 
     /// #428: NaN is how plenty of sources spell nodata in a float column, and
     /// it is not a value anything can rank — `Priority::beats` returns false

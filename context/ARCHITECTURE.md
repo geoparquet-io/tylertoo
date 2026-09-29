@@ -1079,9 +1079,11 @@ crates/core/src/
 │                       # and the pass-2 reader segments (#494)
 ├── batch_processor.rs  # GeoArrow batch → geo::Geometry decoding
 ├── wkb_column.rs       # Bounds check run on every GeoParquet WKB value
-│                       # before the `wkb` crate reads it: rejects counts
-│                       # the bytes cannot hold and deep collection
-│                       # nesting, which abort the reader (#632)
+│                       # before the `wkb` crate reads it (primary column in
+│                       # batch_processor, other geometry columns in the
+│                       # overview writer): rejects counts the bytes cannot
+│                       # hold and deep collection nesting, which abort the
+│                       # reader (#632)
 ├── clip.rs             # Geometry clipping (dispatcher)
 ├── ioverlay_clip.rs    # i_overlay-based robust polygon clipping
 ├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles

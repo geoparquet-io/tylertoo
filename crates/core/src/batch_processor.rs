@@ -8,14 +8,13 @@
 
 use std::path::{Path, PathBuf};
 
-use arrow_array::cast::AsArray;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 
-use crate::wkb_column::check_wkb_value;
+use crate::wkb_column::check_wkb_column;
 use crate::{Error, Result};
 
 /// Resolve a path to a list of parquet files.
@@ -119,17 +118,17 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
         GeoArrowType::GeometryCollection(_) => visitor.visit(array.as_geometry_collection()),
         GeoArrowType::Wkb(_) => {
             let wkb = array.as_wkb::<i32>();
-            check_wkb_values(wkb.inner().iter())?;
+            check_wkb_array(wkb)?;
             visitor.visit(wkb)
         }
         GeoArrowType::LargeWkb(_) => {
             let wkb = array.as_wkb::<i64>();
-            check_wkb_values(wkb.inner().iter())?;
+            check_wkb_array(wkb)?;
             visitor.visit(wkb)
         }
         GeoArrowType::WkbView(_) => {
             let wkb = array.as_wkb_view();
-            check_wkb_values(wkb.to_array_ref().as_binary_view().iter())?;
+            check_wkb_array(wkb)?;
             visitor.visit(wkb)
         }
         GeoArrowType::Wkt(_) => visitor.visit(array.as_wkt::<i32>()),
@@ -142,35 +141,29 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
     }
 }
 
-/// Run [`check_wkb_value`] over every non-null value of a WKB column before
-/// the `wkb` crate's reader sees any of them: the reader allocates from
-/// unchecked counts and recurses without a depth limit, so a single crafted
-/// value would otherwise abort the process (see [`crate::wkb_column`]).
-fn check_wkb_values<'a>(values: impl Iterator<Item = Option<&'a [u8]>>) -> Result<()> {
-    for (i, value) in values.enumerate() {
-        if let Some(bytes) = value {
-            check_wkb_value(bytes).map_err(|e| {
-                Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
-            })?;
-        }
-    }
-    Ok(())
+/// Check every non-null value of a WKB array before the `wkb` crate's reader
+/// sees any of them: the reader allocates from unchecked counts and recurses
+/// without a depth limit, so a single crafted value would otherwise abort the
+/// process (see [`crate::wkb_column`]).
+fn check_wkb_array(wkb: &dyn GeoArrowArray) -> Result<()> {
+    check_wkb_column(wkb.to_array_ref().as_ref())
+        .map_err(|(i, e)| Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}")))
 }
 
 /// Fuzzing hook: decode one WKB value the way a GeoParquet WKB column is
 /// decoded ([`visit_geoarrow_array`] over a one-row `geoarrow.wkb` array).
 ///
-/// It also checks [`check_wkb_value`] against the `wkb` crate's reader it
-/// guards. When the walk accepts a value, the reader must accept it too and
-/// stop at the same byte; when the walk finds it malformed, the reader must
-/// reject it too. Either mismatch panics, so the fuzzer reports it. The
-/// reader is not called on the values the walk rejects for a count, the
-/// nesting cap or a MultiPoint member overrun: those are the inputs that
-/// abort it.
+/// It also checks [`crate::wkb_column::check_wkb_value`] against the `wkb`
+/// crate's reader it guards. When the walk accepts a value, the reader must
+/// accept it too and stop at the same byte; when the walk finds it malformed,
+/// the reader must reject it too. Either mismatch panics, so the fuzzer
+/// reports it. The reader is not called on the values the walk rejects for a
+/// count, the nesting cap or a MultiPoint member overrun: those are the
+/// inputs that abort it.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
-    use crate::wkb_column::WkbCheckError;
+    use crate::wkb_column::{check_wkb_value, WkbCheckError};
     use arrow_array::BinaryArray;
     use geoarrow::array::WkbArray;
     use geoarrow::datatypes::WkbType;
