@@ -983,8 +983,12 @@ fn run_pass2_levels(
     num_rows: usize,
     geom_bytes: u64,
     strategy: Pass2Strategy,
-) -> Result<(Vec<LevelStat>, Pass2Timers), ConvertError> {
+) -> Result<(Vec<LevelStat>, Pass2Timers, pipeline::SinkMeasurement), ConvertError> {
     let n = ctxs.len();
+    // #626: filled in by the buffered engine. Stays at its default for the
+    // Serial reference path and for a ladder with nothing to buffer — neither
+    // holds a sink, so there is nothing to have measured.
+    let mut sink_measurement = pipeline::SinkMeasurement::default();
     // How pass 2 reads the input: the batch chunking (identical for every
     // worker count), the resolved reader-thread count (#494), and pass 1's
     // measured geometry weight, which is what sizes the read-ahead against
@@ -1059,10 +1063,12 @@ fn run_pass2_levels(
                     read_tuning,
                     selected_row_groups,
                     in_flight_batches,
+                    options.profile,
                     backing,
                     out_schema,
                     options.spill_dir.as_deref(),
                 )?;
+                sink_measurement = result.sink;
                 (result.levels, result.timers)
             } else {
                 (Vec::new(), Pass2Timers::default())
@@ -1090,7 +1096,7 @@ fn run_pass2_levels(
             (stats, engine_timers)
         }
     };
-    Ok((level_stats, engine_timers))
+    Ok((level_stats, engine_timers, sink_measurement))
 }
 
 /// Fold every emitted level's [`LevelStat`] into the shared bookkeeping
@@ -1875,6 +1881,9 @@ struct Preflight {
     selected_row_groups: Option<RowGroupSelection>,
     row_groups_total: usize,
     row_groups_read: usize,
+    /// The #543 pass-1 memory verdict this preflight reached, carried to the
+    /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
+    pass1_memory: super::convert::Pass1MemoryReport,
 }
 
 fn convert_preflight(
@@ -1998,15 +2007,17 @@ fn convert_preflight_with_memory_limit(
     // memory floor this checks does not apply to it. With a per-feature
     // `--bbox`/`--filter` the pruned count is only an upper bound (rows that
     // fail either never become an `AssignFeature`), so it can only warn.
-    if options.plan.is_none() {
+    let pass1_memory = if options.plan.is_none() {
         let selected_rows = source.selected_row_count(selected_row_groups.as_ref())?;
         super::convert::preflight_pass1_memory(
             selected_rows.max(0) as u64,
             memory_limit,
             skip_memory_preflight,
             bbox_units.is_some() || bound_filter.is_some(),
-        )?;
-    }
+        )?
+    } else {
+        super::convert::Pass1MemoryReport::default()
+    };
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
     super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
@@ -2060,6 +2071,7 @@ fn convert_preflight_with_memory_limit(
         selected_row_groups,
         row_groups_total,
         row_groups_read,
+        pass1_memory,
     })
 }
 
@@ -2693,6 +2705,7 @@ pub(crate) fn convert_streaming_strategy(
         selected_row_groups,
         row_groups_total,
         row_groups_read,
+        pass1_memory: preflight_report,
     } = preflight;
     let options = &resolved_options;
     let PlanState {
@@ -2826,7 +2839,7 @@ pub(crate) fn convert_streaming_strategy(
     // the caller left it at IN_FLIGHT_BATCHES_AUTO) and surface it (#264).
     let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
 
-    let (level_stats, pass2_engine_timers) = run_pass2_levels(
+    let (level_stats, pass2_engine_timers, sink_measurement) = run_pass2_levels(
         &mut writer,
         &ctxs,
         &hints,
@@ -2896,6 +2909,8 @@ pub(crate) fn convert_streaming_strategy(
         peak_rss_mib,
         rss_sampler_report,
         in_flight_batches,
+        sink_measurement,
+        pass1_memory: preflight_report,
     });
 
     Ok(build_streaming_report(ConvertReportInputs {
@@ -2981,6 +2996,11 @@ struct ProfileJsonContext<'a> {
     /// was off (in which case this whole dump is never written anyway).
     rss_sampler_report: Option<RssSamplerReport>,
     in_flight_batches: usize,
+    /// #626: what a buffered pass-2 row really cost, measured from the first
+    /// sampled output batches.
+    sink_measurement: pipeline::SinkMeasurement,
+    /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
+    pass1_memory: super::convert::Pass1MemoryReport,
 }
 
 /// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] and hand it to
@@ -3009,6 +3029,8 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
         peak_rss_mib: ctx.peak_rss_mib,
         rss_sampler_report: ctx.rss_sampler_report,
         in_flight_batches: ctx.in_flight_batches,
+        sink_measurement: ctx.sink_measurement,
+        pass1_memory: ctx.pass1_memory,
     });
 }
 
@@ -3054,6 +3076,12 @@ struct ProfileJsonInputs<'a> {
     /// (moot: this whole dump is a no-op then).
     rss_sampler_report: Option<RssSamplerReport>,
     in_flight_batches: usize,
+    /// #626: the measured per-buffered-row sink cost and the `auto` verdict
+    /// that came out of it (`pass2.sink` in the dump).
+    sink_measurement: pipeline::SinkMeasurement,
+    /// #543 + #626 item 4: the pass-1 memory preflight's verdict
+    /// (`pass1_memory_preflight` in the dump).
+    pass1_memory: super::convert::Pass1MemoryReport,
 }
 
 /// Validate `TYLERTOO_PROFILE_JSON` at option-validation time (#517 S2), if
@@ -3216,7 +3244,16 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
                 "total": cascade_steps_total,
                 "ratio": cascade_share_ratio,
             },
+            // #626: what a buffered row actually cost, measured from the
+            // first sampled output batches, against the budget `auto` sized
+            // itself with — and whether that measurement forced a mid-pass
+            // Ram→Spill downgrade. `bytes_per_row` is null when nothing was
+            // buffered (the Serial path, or a single-level ladder).
+            "sink": sink_json(inputs.sink_measurement),
         },
+        // #543 + #626: the pre-scan pass-1 memory verdict. A run that was
+        // warned here and then OOM-killed leaves the warning in the record.
+        "pass1_memory_preflight": pass1_memory_json(inputs.pass1_memory),
         "levels": levels_json,
         "peak_rss_mib": inputs.peak_rss_mib,
         "rss_sampler": rss_sampler_json(&inputs.rss_sampler_report),
@@ -3225,6 +3262,32 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
         "memory_profile": inputs.options.profile,
     });
     append_profile_line(&path, &value);
+}
+
+/// Build the `pass2.sink` object (#626): the measured retained cost of a
+/// buffered output row, what it projects for the whole buffered set, the RAM
+/// budget it was judged against, and whether `auto` downgraded the sinks to
+/// spill mid-pass. `budget_bytes` is 0 for `bounded`/`speed`, which never
+/// probe it — the backing is an instruction there, not an estimate.
+fn sink_json(m: pipeline::SinkMeasurement) -> serde_json::Value {
+    serde_json::json!({
+        "bytes_per_row": m.bytes_per_row,
+        "sampled_rows": m.sampled_rows,
+        "projected_bytes": m.projected_bytes,
+        "budget_bytes": m.budget_bytes,
+        "downgraded_to_spill": m.downgraded,
+    })
+}
+
+/// Build the `pass1_memory_preflight` object (#543 / #626 item 4).
+fn pass1_memory_json(r: super::convert::Pass1MemoryReport) -> serde_json::Value {
+    serde_json::json!({
+        "verdict": r.outcome.as_str(),
+        "rows": r.rows,
+        "estimated_bytes": r.estimated_bytes,
+        "limit_bytes": r.limit_bytes,
+        "limit_source": r.limit_source,
+    })
 }
 
 /// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
