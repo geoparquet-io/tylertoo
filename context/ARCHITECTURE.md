@@ -147,15 +147,43 @@ verbatim (spec §2.4).
    levels that turn out empty, which pass 2 used to skip. Wave size changes
    the peak and the wall time, never the result.
 
+   The **pass-1 feature table is column-major** (#543 item 2). It is the
+   coarse job's irreducible floor — one row per input row, live from the scan
+   through the whole assignment — and at 1.58B rows the old
+   array-of-`AssignFeature` version was 64 B/row ≈ 94 GiB, which is what
+   OOM-killed a 192 GiB coarse job. Three things took it to 42 B/row (33 when
+   the job has neither a sort key nor an entry-zoom ladder, since those two
+   columns are allocated only on first use), and none of them changes an
+   assignment. (1) Assignment never reads a bbox: it reads the bbox *center*
+   (grid placement) and the *squared diagonal* (visibility gate, priority
+   component 2). Both are now derived once at scan time — the same two
+   expressions on the same `f64` inputs, so bit-identical — and the raw
+   `[f64; 4]` is not retained. The #188/#429 bbox tallies consequently moved
+   INTO the scan (`convert::BboxTally`), where the bbox still exists.
+   (2) Sentinels replace both `Option` discriminants: a non-finite `f64` for
+   "no sort key" (the state `Priority::new` already collapsed `Some(NaN)`,
+   `Some(±inf)` and `None` into, #428) and `u8::MAX` for "no ladder opinion"
+   (a real level index is ≤ 254, since the plan is capped at 255 levels).
+   (3) Columns pay no per-row alignment padding, where the struct rounded
+   42 B of fields up to 64. The four `f64` columns stay `f64` deliberately:
+   `f32` centers have a ~2 m ulp at Web Mercator magnitudes, which is coarser
+   than the finest levels' cells, and `f32` diagonals or sort keys manufacture
+   ties in a strict total order — both would move winners, which is a
+   different assignment, not a rounding difference. `PASS1_RECOMMENDED_FACTOR`
+   was re-derived from 2.5 to 3.3 in the same change: only the table got
+   cheaper, so the *absolute* whole-job recommendation falls by exactly the
+   22 B/row saved (160 → 138 B/row) and the multiple against the smaller floor
+   must rise to keep meaning the same thing.
+
    The density budget holds **no priority table** (#565). It used to build a
    `Vec<Priority>` parallel to the feature slice and keep it live across the
    whole coarse→fine admission fold: 40 B/feature, the largest single
    allocation in the phase, 2.1 GiB on that 55.5M-row job and ~59 GiB at the
-   1.58B-row global scale — all of it on top of the 64 B/row pass-1 feature
+   1.58B-row global scale — all of it on top of the 42 B/row pass-1 feature
    table (#543's `PASS1_BYTES_PER_ROW`), which is still live throughout.
    Every component of a priority (direction-applied sort rank, squared bbox
    diagonal, hash of the row index, the index) is a pure function of the
-   `AssignFeature` the comparator must read anyway, so both sides are derived
+   feature row the comparator must read anyway, so both sides are derived
    per comparison instead — a table probe traded for a few arithmetic ops on a
    cache line already being fetched, not for an extra memory reference.
    `Priority` itself went 40 → 32 bytes in the same change, by replacing the

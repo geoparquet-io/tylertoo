@@ -30,7 +30,7 @@ its scan through the level assignment, plus smaller transient per-row vectors
 during the scan. That is a few tens of MB for a million rows but tens of GiB
 at a billion. Before pass 1 reads a data page, convert estimates `rows × 64 B`
 from the footers and compares it to the memory figure: it warns when the
-realistic whole-job need (about 2.5× that floor) exceeds the figure, and fails
+realistic whole-job need (about 3.3× that floor) exceeds the figure, and fails
 fast only when the floor alone exceeds a hard cgroup limit (`memory.max`, or
 v1 `memory.limit_in_bytes`). See
 [sizing the coarse job's memory](sharded-builds.md#sizing-the-coarse-jobs-memory)

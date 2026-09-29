@@ -1500,16 +1500,18 @@ implementation — the two paths are equivalence-tested against each other —
 and as an escape hatch; there is no output-quality reason to use it.
 
 Residual per-feature memory in streaming mode (the "winner tables") is at
-least 64 bytes per input feature during pass 1 (typically ~64–100 with the
+least 33 bytes per input feature during pass 1 (typically ~42–80 with the
 transient per-row scan vectors) and 1 byte per feature during pass 2 — about
-40–65 MB / 0.6 MB for a 632k-feature file. The pass-1 side of that is the `AssignFeature` table: exactly
-64 bytes/row (`size_of::<AssignFeature>()`), held resident from pass 1's scan
-through the level assignment — a lower bound on the scan-time peak, and the
-coarse job's irreducible memory floor on a
+26–50 MB / 0.6 MB for a 632k-feature file. The pass-1 side of that is the
+column-major feature table, held resident from pass 1's scan through the level
+assignment: 33 bytes/row, or 42 when the run has both a sort key and an
+entry-zoom ladder (those two columns are allocated only if the job uses them).
+It is a lower bound on the scan-time peak, and the coarse job's irreducible
+memory floor on a
 [sharded build](diving-deeper/sharded-builds.md#sizing-the-coarse-jobs-memory),
 where it can reach tens of GiB at billion-row scale. tylertoo preflights this
 from footer row counts before pass 1 scans anything (#543): it warns when the
-realistic whole-job need (rows × 64 B × 2.5) exceeds the memory figure, and
+realistic whole-job need (rows × 42 B × 3.3) exceeds the memory figure, and
 hard-errors only when the floor alone exceeds a hard cgroup limit
 (`memory.max`) with no `--bbox`/`--filter` active. Set
 `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` to downgrade the error to a warning.

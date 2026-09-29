@@ -121,7 +121,7 @@ not "the run was not profiled".
     "verdict": "fits",              // fits | warned | exceeded_but_forced |
                                     // not_checked (a --plan replay)
     "rows": 1000,                   // footer-counted input rows
-    "estimated_bytes": 64000,       // rows x PASS1_BYTES_PER_ROW (64)
+    "estimated_bytes": 42000,       // rows x PASS1_BYTES_PER_ROW (42)
     "limit_bytes": 34359738368,     // the probed figure; null if unprobed
     "limit_source": "available memory (MemAvailable)"
   },
