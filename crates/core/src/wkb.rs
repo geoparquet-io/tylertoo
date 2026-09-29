@@ -124,9 +124,13 @@ const MIN_MEMBER_POINT_BYTES: u64 = 5 + 16;
 /// ignores them. Curve, surface and triangle types are rejected: geozero
 /// cannot build a `geo::Geometry` from them, and the one case it tolerates
 /// (an empty one inside a collection) it silently drops.
-fn check_wkb_bounds(wkb: &[u8]) -> std::result::Result<(), String> {
+///
+/// Returns the number of bytes the geometry occupies, which is where geozero
+/// stops reading too.
+fn check_wkb_bounds(wkb: &[u8]) -> std::result::Result<usize, String> {
     let mut cursor = Cursor { buf: wkb, pos: 0 };
-    cursor.geometry(0)
+    cursor.geometry(0)?;
+    Ok(cursor.pos)
 }
 
 struct Cursor<'a> {
@@ -544,6 +548,60 @@ mod tests {
         assert_count_rejected(&member_polygon, "rings");
         assert_count_rejected(&with_count(header(6), u32::MAX), "polygons");
         assert_count_rejected(&with_count(header(7), u32::MAX), "geometries");
+    }
+
+    /// The walk must step over exactly the bytes each geometry occupies. A
+    /// walk that mis-sizes coordinates can still pass, because geozero then
+    /// fails on the same input, so the byte count is asserted directly.
+    #[test]
+    fn test_walk_consumes_exactly_the_geometry() {
+        let point_zm = coords(header(3001), &[1.0, 2.0, 3.0, 4.0]);
+        let point_z = coords(header(1001), &[1.0, 2.0, 3.0]);
+        let point_m = coords(header(2001), &[1.0, 2.0, 3.0]);
+        let line_zm = coords(with_count(header(3002), 2), &[0.0; 8]);
+        let mut multi_line = with_count(header(5), 2);
+        for _ in 0..2 {
+            multi_line.extend(coords(with_count(header(2), 2), &[0.0, 0.0, 1.0, 1.0]));
+        }
+        let mut multi_point_zm = with_count(header(4), 2);
+        for _ in 0..2 {
+            multi_point_zm.extend(coords(header(3001), &[1.0, 2.0, 3.0, 4.0]));
+        }
+        let round_trips: Vec<Vec<u8>> = [
+            Geometry::Point(point!(x: 1.0, y: 2.0)),
+            Geometry::Polygon(polygon![
+                (x: 0.0, y: 0.0), (x: 4.0, y: 0.0), (x: 4.0, y: 4.0), (x: 0.0, y: 0.0)
+            ]),
+        ]
+        .iter()
+        .map(|g| geometry_to_wkb(g).expect("encode"))
+        .collect();
+        for bytes in [
+            point_zm,
+            point_z,
+            point_m,
+            line_zm,
+            multi_line,
+            multi_point_zm,
+        ]
+        .into_iter()
+        .chain(round_trips)
+        {
+            assert_eq!(
+                check_wkb_bounds(&bytes),
+                Ok(bytes.len()),
+                "the walk must end exactly at the end of {bytes:?}"
+            );
+        }
+    }
+
+    /// A count only slightly too large is caught by the count check itself,
+    /// not left for the truncation check or for geozero.
+    #[test]
+    fn test_a_count_one_element_too_large_is_rejected_by_the_count_check() {
+        let line = coords(with_count(header(2), 3), &[0.0, 0.0, 1.0, 1.0]);
+        let err = check_wkb_bounds(&line).expect_err("three points need 48 bytes, 32 remain");
+        assert!(err.contains("declares 3 points"), "{err}");
     }
 
     /// A count that exactly fills the remaining bytes is valid.
