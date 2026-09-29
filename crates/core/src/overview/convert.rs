@@ -4329,6 +4329,51 @@ fn env_flag_enabled(value: &str) -> bool {
 /// Sizing-guidance doc named in both the warning and the hard error.
 const MEMORY_SIZING_DOC: &str = "docs/diving-deeper/sharded-builds.md";
 
+/// What the #543 preflight concluded, for the `TYLERTOO_PROFILE_JSON` record
+/// (#626 item 4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Pass1MemoryOutcome {
+    /// The check never ran: a `--plan` replay builds no feature table, so the
+    /// floor it models does not apply.
+    #[default]
+    NotChecked,
+    /// The whole job's modelled need fits under the probed figure.
+    Fits,
+    /// Warned: the realistic need is over the figure, or the floor is over an
+    /// advisory one.
+    Warned,
+    /// The floor is over a hard limit, but [`SKIP_MEMORY_PREFLIGHT_ENV`]
+    /// downgraded the error. A verdict that actually failed the run never
+    /// reaches a profile dump — there is no run left to dump.
+    ExceededButForced,
+}
+
+impl Pass1MemoryOutcome {
+    /// How this verdict is spelled in the profile JSON.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Fits => "fits",
+            Self::Warned => "warned",
+            Self::ExceededButForced => "exceeded_but_forced",
+        }
+    }
+}
+
+/// The #543 preflight's verdict plus the numbers behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Pass1MemoryReport {
+    pub(super) outcome: Pass1MemoryOutcome,
+    /// Footer-counted input rows the verdict was formed from.
+    pub(super) rows: u64,
+    /// `rows ×` [`PASS1_BYTES_PER_ROW`].
+    pub(super) estimated_bytes: u64,
+    /// The probed figure and which term supplied it; `None` when nothing
+    /// could be probed.
+    pub(super) limit_bytes: Option<u64>,
+    pub(super) limit_source: Option<&'static str>,
+}
+
 /// Why a sharded build is not the fix — shared by the warning and the error.
 const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its coarse job \
      runs this same full pass 1. Only a `--plan` replay skips pass 1, and that plan must first \
@@ -4438,14 +4483,29 @@ fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u
 /// the environment or a real probe; production passes
 /// [`super::pipeline::probe_preflight_memory_limit`] and
 /// [`skip_memory_preflight_from_env`] via [`preflight_pass1_memory_probed`].
+///
+/// Returns the verdict on the paths that survive it (#626 item 4): the
+/// streaming driver carries it into the `TYLERTOO_PROFILE_JSON` dump, so a job
+/// that was warned about and then OOM-killed anyway leaves the warning in the
+/// machine-readable record and not only in a log nobody kept.
 pub(super) fn preflight_pass1_memory(
     rows: u64,
     limit: Option<MemoryLimit>,
     skip_on_exceed: bool,
     per_feature_filter_active: bool,
-) -> Result<(), ConvertError> {
+) -> Result<Pass1MemoryReport, ConvertError> {
+    let report = |outcome, estimated_bytes| Pass1MemoryReport {
+        outcome,
+        rows,
+        estimated_bytes,
+        limit_bytes: limit.map(|l| l.bytes),
+        limit_source: limit.map(|l| l.source.describe()),
+    };
     match pass1_memory_verdict(rows, limit, per_feature_filter_active) {
-        Pass1MemoryVerdict::Fits => Ok(()),
+        Pass1MemoryVerdict::Fits => Ok(report(
+            Pass1MemoryOutcome::Fits,
+            rows.saturating_mul(PASS1_BYTES_PER_ROW),
+        )),
         Pass1MemoryVerdict::Warn {
             estimated_bytes,
             limit,
@@ -4454,7 +4514,7 @@ pub(super) fn preflight_pass1_memory(
                 "{}",
                 pass1_memory_warn_message(rows, estimated_bytes, limit, per_feature_filter_active)
             );
-            Ok(())
+            Ok(report(Pass1MemoryOutcome::Warned, estimated_bytes))
         }
         Pass1MemoryVerdict::Exceeds {
             estimated_bytes,
@@ -4466,7 +4526,10 @@ pub(super) fn preflight_pass1_memory(
                      memory-floor error to a warning — {}",
                     pass1_memory_floor_message(&rows, &estimated_bytes, &limit_bytes),
                 );
-                Ok(())
+                Ok(report(
+                    Pass1MemoryOutcome::ExceededButForced,
+                    estimated_bytes,
+                ))
             } else {
                 Err(ConvertError::Pass1MemoryFloorExceeded {
                     rows,
@@ -4494,7 +4557,7 @@ pub(super) fn skip_memory_preflight_from_env() -> bool {
 fn preflight_pass1_memory_probed(
     source: &ConvertSource,
     options: &ConvertOptions,
-) -> Result<(), ConvertError> {
+) -> Result<Pass1MemoryReport, ConvertError> {
     let rows = u64::try_from(source.selected_row_count(None)?).unwrap_or(0);
     preflight_pass1_memory(
         rows,
@@ -6770,6 +6833,53 @@ mod tests {
         let hard = mem_limit(1_000, MemoryLimitSource::CgroupMax);
         assert!(preflight_pass1_memory(1_580_000_000, hard, false, false).is_err());
         assert!(preflight_pass1_memory(1_580_000_000, hard, true, false).is_ok());
+    }
+
+    /// #626 item 4: every surviving verdict is reported with the numbers
+    /// behind it, so the `TYLERTOO_PROFILE_JSON` dump can say what the
+    /// preflight concluded — including the case where it said "no" and
+    /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` overrode it.
+    #[test]
+    fn preflight_pass1_memory_reports_its_verdict() {
+        let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
+        let fits = preflight_pass1_memory(1_000, hard(1 << 30), false, false).unwrap();
+        assert_eq!(fits.outcome, Pass1MemoryOutcome::Fits);
+        assert_eq!(fits.rows, 1_000);
+        assert_eq!(fits.estimated_bytes, 1_000 * PASS1_BYTES_PER_ROW);
+        assert_eq!(fits.limit_bytes, Some(1 << 30));
+        assert_eq!(
+            fits.limit_source,
+            Some("cgroup hard memory limit (memory.max)")
+        );
+
+        // Floor fits, ×2.5 total does not → warned, not failed.
+        let warned = preflight_pass1_memory(10, hard(1_599), false, false).unwrap();
+        assert_eq!(warned.outcome, Pass1MemoryOutcome::Warned);
+
+        // Over a hard limit, but the hatch is set.
+        let forced = preflight_pass1_memory(1_580_000_000, hard(1_000), true, false).unwrap();
+        assert_eq!(forced.outcome, Pass1MemoryOutcome::ExceededButForced);
+        assert_eq!(forced.estimated_bytes, 1_580_000_000 * PASS1_BYTES_PER_ROW);
+
+        // Nothing probed: the preflight never invents a limit.
+        let unknown = preflight_pass1_memory(1_580_000_000, None, false, false).unwrap();
+        assert_eq!(unknown.outcome, Pass1MemoryOutcome::Fits);
+        assert_eq!(unknown.limit_bytes, None);
+        assert_eq!(unknown.limit_source, None);
+
+        // The names the dump publishes.
+        assert_eq!(Pass1MemoryOutcome::NotChecked.as_str(), "not_checked");
+        assert_eq!(Pass1MemoryOutcome::Fits.as_str(), "fits");
+        assert_eq!(Pass1MemoryOutcome::Warned.as_str(), "warned");
+        assert_eq!(
+            Pass1MemoryOutcome::ExceededButForced.as_str(),
+            "exceeded_but_forced"
+        );
+        // A `--plan` replay never runs the check at all.
+        assert_eq!(
+            Pass1MemoryReport::default().outcome,
+            Pass1MemoryOutcome::NotChecked
+        );
     }
 
     /// #543 review (S3a): only an explicit "on" value enables the hatch.

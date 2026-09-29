@@ -4244,6 +4244,8 @@ name = "tylertoo"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "clap",
  "clap-markdown",
  "dhat",
@@ -4252,6 +4254,7 @@ dependencies = [
  "indicatif",
  "log",
  "mimalloc",
+ "parquet",
  "serde_json",
  "tempfile",
  "tylertoo-core",

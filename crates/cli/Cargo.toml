@@ -61,6 +61,10 @@ mimalloc = "0.1"
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
+# Synthetic GeoParquet fixtures written by the CLI integration tests.
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
 
 [lints]
 workspace = true
