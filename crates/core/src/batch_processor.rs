@@ -8,12 +8,14 @@
 
 use std::path::{Path, PathBuf};
 
+use arrow_array::cast::AsArray;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow::datatypes::GeoArrowType;
 use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 
+use crate::wkb_column::check_wkb_value;
 use crate::{Error, Result};
 
 /// Resolve a path to a list of parquet files.
@@ -115,9 +117,21 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
         GeoArrowType::MultiPolygon(_) => visitor.visit(array.as_multi_polygon()),
         GeoArrowType::Geometry(_) => visitor.visit(array.as_geometry()),
         GeoArrowType::GeometryCollection(_) => visitor.visit(array.as_geometry_collection()),
-        GeoArrowType::Wkb(_) => visitor.visit(array.as_wkb::<i32>()),
-        GeoArrowType::LargeWkb(_) => visitor.visit(array.as_wkb::<i64>()),
-        GeoArrowType::WkbView(_) => visitor.visit(array.as_wkb_view()),
+        GeoArrowType::Wkb(_) => {
+            let wkb = array.as_wkb::<i32>();
+            check_wkb_values(wkb.inner().iter())?;
+            visitor.visit(wkb)
+        }
+        GeoArrowType::LargeWkb(_) => {
+            let wkb = array.as_wkb::<i64>();
+            check_wkb_values(wkb.inner().iter())?;
+            visitor.visit(wkb)
+        }
+        GeoArrowType::WkbView(_) => {
+            let wkb = array.as_wkb_view();
+            check_wkb_values(wkb.to_array_ref().as_binary_view().iter())?;
+            visitor.visit(wkb)
+        }
         GeoArrowType::Wkt(_) => visitor.visit(array.as_wkt::<i32>()),
         GeoArrowType::LargeWkt(_) => visitor.visit(array.as_wkt::<i64>()),
         GeoArrowType::WktView(_) => visitor.visit(array.as_wkt_view()),
@@ -126,6 +140,62 @@ pub(crate) fn visit_geoarrow_array<V: GeoArrowVisitor>(
             array.data_type()
         ))),
     }
+}
+
+/// Run [`check_wkb_value`] over every non-null value of a WKB column before
+/// the `wkb` crate's reader sees any of them: the reader allocates from
+/// unchecked counts and recurses without a depth limit, so a single crafted
+/// value would otherwise abort the process (see [`crate::wkb_column`]).
+fn check_wkb_values<'a>(values: impl Iterator<Item = Option<&'a [u8]>>) -> Result<()> {
+    for (i, value) in values.enumerate() {
+        if let Some(bytes) = value {
+            check_wkb_value(bytes).map_err(|e| {
+                Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Fuzzing hook: decode one WKB value the way a GeoParquet WKB column is
+/// decoded ([`visit_geoarrow_array`] over a one-row `geoarrow.wkb` array).
+///
+/// It also checks [`check_wkb_value`] against the `wkb` crate's reader it
+/// guards. When the walk accepts a value, the reader must accept it too and
+/// stop at the same byte; when the walk finds it malformed, the reader must
+/// reject it too. Either mismatch panics, so the fuzzer reports it. The
+/// reader is not called on the values the walk rejects for a count, the
+/// nesting cap or a MultiPoint member overrun: those are the inputs that
+/// abort it.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
+    use crate::wkb_column::WkbCheckError;
+    use arrow_array::BinaryArray;
+    use geoarrow::array::WkbArray;
+    use geoarrow::datatypes::WkbType;
+
+    let array = WkbArray::from((BinaryArray::from_vec(vec![bytes]), WkbType::default()));
+    match check_wkb_value(bytes) {
+        Ok(size) => {
+            let wkb = array
+                .value(0)
+                .expect("the walk accepted a value the wkb reader rejects");
+            assert_eq!(
+                wkb.buf().len() as u64,
+                size,
+                "the walk and the wkb reader disagree on where the geometry ends"
+            );
+        }
+        Err(WkbCheckError::Malformed(_)) => assert!(
+            array.value(0).is_err(),
+            "the walk rejected a value the wkb reader accepts"
+        ),
+        Err(_) => {}
+    }
+    let mut out = Vec::with_capacity(1);
+    extract_geometries_opt_from_array(&array, &mut out)?;
+    Ok(out.pop().flatten())
 }
 
 /// [`extract_geometries_opt_from_array`]'s visitor: one row-aligned
@@ -160,6 +230,68 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid point, a null, and #632's 9-byte MultiPolygon that claims
+    /// 4,294,967,295 polygons.
+    fn wkb_rows() -> Vec<Option<Vec<u8>>> {
+        let mut point = vec![1u8, 1, 0, 0, 0];
+        point.extend_from_slice(&1.0f64.to_le_bytes());
+        point.extend_from_slice(&2.0f64.to_le_bytes());
+        vec![
+            Some(point),
+            None,
+            Some(vec![1, 6, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]),
+        ]
+    }
+
+    fn assert_rejects_row_2(array: &dyn GeoArrowArray) {
+        let mut out = Vec::new();
+        let err = extract_geometries_opt_from_array(array, &mut out)
+            .expect_err("the hostile value must be an error, not an abort");
+        assert_eq!(
+            err.to_string(),
+            "Failed to read GeoParquet file: Invalid geometry at index 2: WKB declares \
+             4294967295 polygons at byte 5 but only 0 bytes remain (each needs at least 9)"
+        );
+    }
+
+    /// #632: every WKB column layout is checked before the `wkb` crate's
+    /// reader sees a value, and the error names the row.
+    #[test]
+    fn hostile_wkb_value_is_an_error_in_every_wkb_layout() {
+        use arrow_array::{BinaryArray, BinaryViewArray, LargeBinaryArray};
+        use geoarrow::array::{LargeWkbArray, WkbArray, WkbViewArray};
+        use geoarrow::datatypes::WkbType;
+
+        let rows = wkb_rows();
+        let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| r.as_deref()).collect();
+
+        let wkb = WkbArray::from((BinaryArray::from(refs.clone()), WkbType::default()));
+        assert_rejects_row_2(&wkb);
+        let large = LargeWkbArray::from((LargeBinaryArray::from(refs.clone()), WkbType::default()));
+        assert_rejects_row_2(&large);
+        let view = WkbViewArray::from((BinaryViewArray::from(refs), WkbType::default()));
+        assert_rejects_row_2(&view);
+    }
+
+    /// Without the hostile row, the same column decodes as before: one
+    /// geometry per row, `None` for the null.
+    #[test]
+    fn valid_wkb_column_decodes_row_aligned() {
+        use arrow_array::BinaryArray;
+        use geoarrow::array::WkbArray;
+        use geoarrow::datatypes::WkbType;
+
+        let rows = wkb_rows();
+        let refs: Vec<Option<&[u8]>> = rows[..2].iter().map(|r| r.as_deref()).collect();
+        let wkb = WkbArray::from((BinaryArray::from(refs), WkbType::default()));
+        let mut out = Vec::new();
+        extract_geometries_opt_from_array(&wkb, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![Some(Geometry::Point(geo::point!(x: 1.0, y: 2.0))), None]
+        );
+    }
 
     /// Test that resolve_parquet_files handles single files correctly.
     #[test]

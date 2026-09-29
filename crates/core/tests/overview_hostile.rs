@@ -318,14 +318,10 @@ fn empty_coordinate_geometries_skipped() {
     }
 }
 
-#[test]
-fn empty_wkb_value_errors_typed() {
-    // A zero-length WKB value is undecodable: the conversion must surface a
-    // typed error (never a panic).
-    let tin = tempfile::NamedTempFile::new().unwrap();
-    let tout = tempfile::NamedTempFile::new().unwrap();
-
-    // Hand-built GeoParquet: Binary geometry column with one empty value.
+/// Hand-built GeoParquet whose WKB geometry column holds `values` verbatim,
+/// one row each. The geoarrow builder `write_input` uses cannot emit an
+/// invalid value, so hostile-WKB fixtures are written this way.
+fn write_wkb_input(path: &Path, values: &[&[u8]]) {
     let mut md = std::collections::HashMap::new();
     md.insert(
         "ARROW:extension:name".to_string(),
@@ -339,12 +335,14 @@ fn empty_wkb_value_errors_typed() {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![0i64])),
-            Arc::new(BinaryArray::from_vec(vec![b"" as &[u8]])),
+            Arc::new(Int64Array::from(
+                (0..values.len() as i64).collect::<Vec<_>>(),
+            )),
+            Arc::new(BinaryArray::from_vec(values.to_vec())),
         ],
     )
     .unwrap();
-    let file = std::fs::File::create(tin.path()).unwrap();
+    let file = std::fs::File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.append_key_value_metadata(KeyValue::new(
@@ -353,6 +351,15 @@ fn empty_wkb_value_errors_typed() {
             .to_string(),
     ));
     writer.close().unwrap();
+}
+
+#[test]
+fn empty_wkb_value_errors_typed() {
+    // A zero-length WKB value is undecodable: the conversion must surface a
+    // typed error (never a panic).
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    write_wkb_input(tin.path(), &[b""]);
 
     for streaming in [true, false] {
         let result = convert_to_overviews(tin.path(), tout.path(), &opts(streaming));
@@ -360,6 +367,86 @@ fn empty_wkb_value_errors_typed() {
             result.is_err(),
             "streaming={streaming}: empty WKB must error"
         );
+    }
+}
+
+/// Little-endian WKB point.
+fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+    let mut v = vec![1u8, 1, 0, 0, 0];
+    v.extend_from_slice(&x.to_le_bytes());
+    v.extend_from_slice(&y.to_le_bytes());
+    v
+}
+
+/// #632: WKB values that aborted the process in the `wkb` crate's reader.
+/// Each must fail the conversion with an error naming the row, in both
+/// engines, and the test process must survive to check it.
+#[test]
+fn hostile_wkb_values_error_instead_of_aborting() {
+    // A MultiPolygon claiming 4,294,967,295 polygons in 9 bytes: the reader
+    // reserved about 206 GB for them.
+    let huge_count: Vec<u8> = vec![1, 6, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+    // A point inside 1,000 nested one-member collections: the reader
+    // recursed once per level and overflowed the stack.
+    let mut deep_nesting = Vec::new();
+    for _ in 0..1000 {
+        deep_nesting.extend_from_slice(&[1, 7, 0, 0, 0, 1, 0, 0, 0]);
+    }
+    deep_nesting.extend_from_slice(&wkb_point(1.0, 2.0));
+    // A MultiPoint whose last member sets the EWKB SRID flag: converting it
+    // read past the MultiPoint and panicked.
+    let mut srid_member = vec![1u8, 4, 0, 0, 0, 2, 0, 0, 0];
+    srid_member.extend_from_slice(&wkb_point(1.0, 2.0));
+    let mut last = wkb_point(3.0, 4.0);
+    last[4] = 0x20;
+    srid_member.extend_from_slice(&last);
+
+    let good = wkb_point(10.0, 10.0);
+    for (name, bad, expect) in [
+        (
+            "huge count",
+            &huge_count,
+            "WKB declares 4294967295 polygons",
+        ),
+        ("deep nesting", &deep_nesting, "deeper than 100 levels"),
+        ("MultiPoint SRID member", &srid_member, "sets the SRID flag"),
+    ] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_wkb_input(tin.path(), &[&good, bad, &good]);
+        for streaming in [true, false] {
+            let err = match convert_to_overviews(tin.path(), tout.path(), &opts(streaming)) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{name}, streaming={streaming}: must fail"),
+            };
+            assert!(
+                err.contains(expect) && err.contains("Invalid geometry at index 1"),
+                "{name}, streaming={streaming}: {err}"
+            );
+        }
+    }
+}
+
+/// #632's nesting cap is 100 levels: a point inside exactly 100 nested
+/// collections is accepted, and convert and export both handle it.
+#[test]
+fn wkb_at_the_nesting_cap_converts() {
+    let mut nested = Vec::new();
+    for _ in 0..100 {
+        nested.extend_from_slice(&[1, 7, 0, 0, 0, 1, 0, 0, 0]);
+    }
+    nested.extend_from_slice(&wkb_point(1.0, 2.0));
+    let good = wkb_point(10.0, 10.0);
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    write_wkb_input(tin.path(), &[&good, &nested, &good]);
+    for streaming in [true, false] {
+        let tov = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        convert_to_overviews(tin.path(), tov.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+        let report = export_pmtiles(tov.path(), tout.path(), &ExportOptions::default())
+            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+        assert!(report.total_tiles > 0, "streaming={streaming}");
     }
 }
 
