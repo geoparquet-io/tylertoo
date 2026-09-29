@@ -1504,8 +1504,9 @@ least 33 bytes per input feature during pass 1 (typically ~42–80 with the
 transient per-row scan vectors) and 1 byte per feature during pass 2 — about
 26–50 MB / 0.6 MB for a 632k-feature file. The pass-1 side of that is the
 column-major feature table, held resident from pass 1's scan through the level
-assignment: 33 bytes/row, or 42 when the run has both a sort key and an
-entry-zoom ladder (those two columns are allocated only if the job uses them).
+assignment: 33 bytes/row, 41 with a sort key (explicit, or a ranking
+auto-detected from the schema), and 42 with a sort key and an entry-zoom ladder
+(those two columns are allocated only if the job uses them).
 It is a lower bound on the scan-time peak, and the coarse job's irreducible
 memory floor on a
 [sharded build](diving-deeper/sharded-builds.md#sizing-the-coarse-jobs-memory),

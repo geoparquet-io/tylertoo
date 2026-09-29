@@ -160,7 +160,7 @@ the saving is smaller — measure your own before planning around it.
 
 **It does not lower the memory floor.** The peak is pass 1 plus the
 assignment, which is the same peak the full coarse job hits before its pass 2
-starts: the [#549 preflight](#sizing-the-coarse-jobs-memory) still runs, and the ×2.5 rule of thumb
+starts: the [#549 preflight](#sizing-the-coarse-jobs-memory) still runs, and the ×3.3 rule of thumb
 still applies (conservatively — it includes pass-2 buffers a plan-only run
 never allocates, but the pass-1 floor is the same, and sizing a plan-only
 box below it will fail the same way).
@@ -290,14 +290,20 @@ convert in time and disk, not in peak memory.
 
 The coarse job's irreducible cost is the **pass-1 feature table**: one row per
 input row, held resident from pass 1's scan through the level assignment. It
-costs **42 bytes/row** at worst, and **33** for a convert with no sort key and
-no entry-zoom ladder — the table is column-major, and those two columns are
-allocated only if the job has values for them.
+costs **42 bytes/row** at worst: **33** with no sort key and no entry-zoom
+ladder, **41** with a sort key but no ladder. The table is column-major, and
+those two columns are allocated only if the job has values for them — note
+that a sort key is not only `--sort-key`/`--class-rank`: an auto-detected
+ranking (Overture road classes, places `confidence`) fills it too, so such an
+input costs 41 even at the default options.
 
-Those figures are measured off a filled table, not estimated. The columns are
-the bbox *center* (two `f64`), the squared bbox diagonal (`f64`), the row
-index (8 bytes), the geometry kind (1 byte), and — when present — the sort key
-(`f64`) and the ladder entry level (1 byte). Assignment reads the center and
+Those figures are the column widths summed, not an RSS measurement. A column
+grown row by row can carry up to 2× its length in capacity after its last
+doubling, which is why the streaming engine pre-sizes the always-present
+columns from the footer row count and allocates the optional ones at their
+exact length. The columns are the bbox *center* (two `f64`), the squared bbox
+diagonal (`f64`), the row index (8 bytes), the geometry kind (1 byte), and —
+when present — the sort key (`f64`) and the ladder entry level (1 byte). Assignment reads the center and
 the diagonal, never the bbox they came from, so the bbox is reduced once at
 scan time and not retained.
 
@@ -327,10 +333,13 @@ buffered output also need memory, concurrently with (or right after) it.
 The multiplier moved from ×2.5 to ×3.3 when the floor shrank, and the *total*
 it recommends barely moved — that is the point. Only the feature table got
 cheaper; the winner grids, the per-row scan vectors and pass 2's buffers did
-not. So the absolute recommendation fell by exactly the 22 bytes/row the table
-saved (160 → 138 bytes/row) and the multiple rose to keep saying the same
-thing. Leaving it at ×2.5 would have quietly cut the recommendation to
-105 bytes/row and stopped warning about the very job that motivated the check.
+not. The table saves at least 22 bytes/row (64 → 42) and up to 31 (64 → 33)
+depending on which optional columns the job carries; which of those the
+incident job carried is not recorded. Taking the smallest saving puts the
+absolute recommendation at ≈138 bytes/row (160 − 22) — the most conservative
+of the possibilities — and the multiple rose to keep saying the same thing.
+Leaving it at ×2.5 would have quietly cut the recommendation to 105 bytes/row
+and stopped warning about the very job that motivated the check.
 
 Two earlier changes make the multiplier conservative rather than tight, and
 neither is folded in: #541 (the coarse job's pass 2 builds only the levels
@@ -386,14 +395,15 @@ top of the rule of thumb above for line-heavy inputs, or pass
 `--no-coalesce-lines`. Over the ceiling, coalescing is skipped and pass 1
 frees the buffer as soon as it crosses, so it adds nothing.
 
-This check does not (yet) make the coarse job's floor any smaller —
-[#543](https://github.com/geoparquet-io/tylertoo/issues/543) tracks shrinking
-it (a narrower struct-of-arrays layout, or spilling the table between scan
-and assign) — it only fails fast instead of after a long scan.
+This check does not make the coarse job's floor any smaller; it only fails
+fast instead of after a long scan. The floor itself shrank from 64 to 42
+bytes/row when [#543](https://github.com/geoparquet-io/tylertoo/issues/543)
+made the table column-major; spilling it between scan and assign is not
+done.
 
-### Wide property schemas cost more than the ×2.5 rule assumes
+### Wide property schemas cost more than the ×3.3 rule assumes
 
-The ×2.5 multiplier covers the *other* terms — the winner grids and pass 2's
+The ×3.3 multiplier covers the *other* terms — the winner grids and pass 2's
 buffered output — as a multiple of a per-ROW floor. That holds while a
 buffered row is mostly geometry. It stops holding when the schema is wide,
 because a buffered row is a whole retained feature: the geometry column **and
@@ -446,11 +456,13 @@ For sizing, then:
   [#541](https://github.com/geoparquet-io/tylertoo/issues/541) capped the
   coarse job's pass 2 at the pivot, even a full coarse job buffers less than
   it used to. The pass-1 floor is unchanged and the preflight still runs, but
-  the ×2.5 headroom is then conservative: the shards that replay the plan
+  the ×3.3 headroom is then conservative: the shards that replay the plan
   each buffer only their own slice.
 
-The pass-1 feature table itself is still neither measured per-schema nor
-spillable — that is #543 item 2, and it remains open.
+The pass-1 feature table itself holds no property columns, so the schema's
+width does not change it. It is not spillable: #543 narrowed it from 64 to
+42 bytes/row, but it stays resident from the pass-1 scan through the level
+assignment.
 
 ## Why a shard must consume the convert plan
 

@@ -151,9 +151,10 @@ verbatim (spec §2.4).
    coarse job's irreducible floor — one row per input row, live from the scan
    through the whole assignment — and at 1.58B rows the old
    array-of-`AssignFeature` version was 64 B/row ≈ 94 GiB, which is what
-   OOM-killed a 192 GiB coarse job. Three things took it to 42 B/row (33 when
-   the job has neither a sort key nor an entry-zoom ladder, since those two
-   columns are allocated only on first use), and none of them changes an
+   OOM-killed a 192 GiB coarse job. Three things took it to 42 B/row (41 with
+   a sort key but no entry-zoom ladder, 33 with neither — an auto-detected
+   ranking counts as a sort key — since those two columns are allocated only on
+   first use), and none of them changes an
    assignment. (1) Assignment never reads a bbox: it reads the bbox *center*
    (grid placement) and the *squared diagonal* (visibility gate, priority
    component 2). Both are now derived once at scan time — the same two
@@ -171,9 +172,11 @@ verbatim (spec §2.4).
    ties in a strict total order — both would move winners, which is a
    different assignment, not a rounding difference. `PASS1_RECOMMENDED_FACTOR`
    was re-derived from 2.5 to 3.3 in the same change: only the table got
-   cheaper, so the *absolute* whole-job recommendation falls by exactly the
-   22 B/row saved (160 → 138 B/row) and the multiple against the smaller floor
-   must rise to keep meaning the same thing.
+   cheaper, by at least 22 B/row (up to 31 for a job with neither optional
+   column; which the incident job had is not recorded). Taking the smallest
+   saving — the most conservative choice — the *absolute* whole-job
+   recommendation falls from 160 to 138 B/row, and the multiple against the
+   smaller floor must rise to keep meaning the same thing.
 
    The density budget holds **no priority table** (#565). It used to build a
    `Vec<Priority>` parallel to the feature slice and keep it live across the
@@ -182,10 +185,8 @@ verbatim (spec §2.4).
    1.58B-row global scale — all of it on top of the 42 B/row pass-1 feature
    table (#543's `PASS1_BYTES_PER_ROW`), which is still live throughout.
    Every component of a priority (direction-applied sort rank, squared bbox
-   diagonal, hash of the row index, the index) is a pure function of the
-   feature row the comparator must read anyway, so both sides are derived
-   per comparison instead — a table probe traded for a few arithmetic ops on a
-   cache line already being fetched, not for an extra memory reference.
+   diagonal, hash of the row index, the index) is a pure function of three of
+   the feature row's values, so both sides are derived per comparison instead.
    `Priority` itself went 40 → 32 bytes in the same change, by replacing the
    `Option<f64>` sort rank with an `f64` whose `-inf` means "missing": lossless
    (a rank is admitted only through `is_finite`, and negating a finite value
@@ -202,7 +203,19 @@ verbatim (spec §2.4).
    72.1 → 32.1 B/feature for 7–16% more wall in that phase (2–5% of the whole
    assignment), and the phase's peak is now dominated by the per-level
    candidate list and its super-cell tags, which are freed between levels.
-   Process peak RSS over the phase fell 2125 → 1811 MiB at 8M rows. The
+   Process peak RSS over the phase fell 2125 → 1811 MiB at 8M rows. Those
+   #565 figures were taken against the array-of-structs feature table, where
+   a row was one 64-byte cache line and deriving a priority read no line a
+   table probe would not have. Since #543 made the table column-major, a row
+   spans several columns and each column read is its own random access, so
+   the comparators go through `FeatureTable::priority`, which reads only
+   `sort_key`, `diag_sq` and `index` (24 B), never a whole six-column
+   `row()`. On the same harness (best of 3, two rounds interleaved with the
+   array-of-structs build on one 4-core machine), deriving through `row()`
+   made the density budget 35–44% slower at one thread and 24–26% slower at
+   four; through `priority` it is 5–14% faster at one thread and 5–9% faster
+   at four, and the cell-winner phase (whose contests use the same accessor)
+   4–8% faster. The
    comparator's semantics are unchanged, which
    is what `oracle_fixture_reproduces_main` above and
    `deriving_priority_per_comparison_orders_as_the_materialized_table_did`

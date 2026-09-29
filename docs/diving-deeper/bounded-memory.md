@@ -25,11 +25,13 @@ which on a 632k-polygon file is the difference between well under 1 GB and
 several.
 
 **Pass 1 has an O(rows) floor, checked before the scan.** The per-feature
-tables are compact, not free: pass 1 keeps a 64-byte record per input row from
-its scan through the level assignment, plus smaller transient per-row vectors
-during the scan. That is a few tens of MB for a million rows but tens of GiB
-at a billion. Before pass 1 reads a data page, convert estimates `rows × 64 B`
-from the footers and compares it to the memory figure: it warns when the
+tables are compact, not free: pass 1 keeps a column-major feature table from
+its scan through the level assignment — 33 bytes per input row, 41 when the
+job has a sort key (explicit or auto-detected), 42 when it also has an
+entry-zoom ladder — plus smaller transient per-row vectors during the scan.
+That is a few tens of MB for a million rows but tens of GiB at a billion.
+Before pass 1 reads a data page, convert estimates `rows × 42 B` (the worst
+case) from the footers and compares it to the memory figure: it warns when the
 realistic whole-job need (about 3.3× that floor) exceeds the figure, and fails
 fast only when the floor alone exceeds a hard cgroup limit (`memory.max`, or
 v1 `memory.limit_in_bytes`). See
