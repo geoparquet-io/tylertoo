@@ -167,8 +167,9 @@ own accounting:
 ```bash
 TYLERTOO_PROFILE_JSON=profile.jsonl tylertoo tiles in.parquet out.pmtiles \
   --profile bounded --layer-name fields
-jq '.rss_sampler | {true_peak_mib, true_anon_peak_mib, phase_anon_peaks_mib,
-    phase_rss_breakdown, phase_cgroup}' profile.jsonl
+# convert's line carries rss_sampler at the top level, export's under .export
+jq '(.rss_sampler // .export.rss_sampler) | {true_peak_mib, true_anon_peak_mib,
+    phase_anon_peaks_mib, phase_rss_breakdown, phase_cgroup}' profile.jsonl
 ```
 
 This is the export line of a real run over the `sharding-grid` test fixture on
