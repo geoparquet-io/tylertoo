@@ -368,6 +368,64 @@ This check does not (yet) make the coarse job's floor any smaller —
 it (a narrower struct-of-arrays layout, or spilling the table between scan
 and assign) — it only fails fast instead of after a long scan.
 
+### Wide property schemas cost more than the ×2.5 rule assumes
+
+The ×2.5 multiplier covers the *other* terms — the winner grids and pass 2's
+buffered output — as a multiple of a per-ROW floor. That holds while a
+buffered row is mostly geometry. It stops holding when the schema is wide,
+because a buffered row is a whole retained feature: the geometry column **and
+every kept property column**, as Arrow arrays, summed across every buffered
+level.
+
+Until [#626](https://github.com/geoparquet-io/tylertoo/issues/626) the `auto`
+profile priced those property columns at a flat 4 KiB/row — a constant nobody
+had measured against a wide schema, and wrong in both directions. The FTW
+Global beta (134 M features, 17 exported properties) peaked at ~192 GiB
+MaxRSS and completed only because the run was forced to `--profile bounded`;
+a `gpio process aggregate --breakdown` output, carrying dozens to hundreds of
+`count_<value>` columns per feature, is further out still. In the other
+direction a two-property point corpus paid that same 4 KiB/row and spilled
+where RAM would have been fine.
+
+`auto` now **measures** it. Pass 2 samples the first ~1 M buffered output
+rows (or 64 batches, whichever comes first), sums the actual Arrow bytes of
+the geometry column plus every kept property column and divides by rows; the
+only fixed term left is a 256-byte allocator/`Vec` floor, which is all that
+name now claims to cover. When the measured rate projects the whole buffered
+set past the RAM budget, the RAM sinks are flushed into spill files mid-pass,
+once — order preserved, nothing lost, and the output byte-identical to a run
+that spilled from the start. `bounded` and `speed` are explicit instructions
+and are never second-guessed.
+
+For sizing, then:
+
+- **Budget the coarse job at ≳ rows × 64 bytes × 2.5** as above, and read
+  that as the *geometry-dominated* case.
+- **Add the property width yourself when the schema is wide.** A run with
+  `TYLERTOO_PROFILE_JSON` set reports the measured figure as
+  `pass2.sink.bytes_per_row` (beside `sampled_rows`, `projected_bytes`,
+  `budget_bytes` and `downgraded_to_spill`), and the same number is logged at
+  info as `[convert] pass2 sink: measured N B per buffered row`. One cheap
+  run over a subset tells you what your schema costs per buffered row;
+  multiply by the buffered row count the plan expects. Dropping columns you
+  will never style on (`--include-property` / `--exclude-property`) is the
+  other lever, and it is the cheaper one — an excluded column is not even
+  decoded.
+- **Or do not buffer at all.** A plan-only coarse run (`--save-plan …
+  --plan-only`, [#560](https://github.com/geoparquet-io/tylertoo/issues/560)
+  / [#574](https://github.com/geoparquet-io/tylertoo/pull/574); see *When the
+  coarse tiles are thrown away* above) stops after pass 1 and the level
+  assignment, so it never builds a pass-2 sink at all and the property width
+  costs it nothing. Since
+  [#541](https://github.com/geoparquet-io/tylertoo/issues/541) capped the
+  coarse job's pass 2 at the pivot, even a full coarse job buffers less than
+  it used to. The pass-1 floor is unchanged and the preflight still runs, but
+  the ×2.5 headroom is then conservative: the shards that replay the plan
+  each buffer only their own slice.
+
+The pass-1 feature table itself is still neither measured per-schema nor
+spillable — that is #543 item 2, and it remains open.
+
 ## Why a shard must consume the convert plan
 
 `--shard I/N` **without `--plan` is a hard error**, and that is not a
