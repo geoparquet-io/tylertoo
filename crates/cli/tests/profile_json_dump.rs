@@ -396,79 +396,118 @@ fn check_rss_sampler(line: &serde_json::Value, holder: &serde_json::Value, phase
         "rss_sampler.true_peak_mib ({true_peak}) must not be below the \
          boundary-sampled peak_rss_mib ({boundary}): {line}"
     );
-    check_phase_smaps(line, sampler, phases);
+    check_627_breakdown(line, sampler, phases);
 }
 
-/// Every field a `phase_smaps` entry carries (#627). `file_backed_kib` is
-/// derived (`rss_kib - anonymous_kib`); the rest are the kernel's own
-/// `smaps_rollup` lines, in the kernel's own KiB.
-const SMAPS_FIELDS: [&str; 8] = [
-    "rss_kib",
-    "anonymous_kib",
-    "file_backed_kib",
-    "shared_clean_kib",
-    "shared_dirty_kib",
-    "private_clean_kib",
-    "private_dirty_kib",
-    "swap_kib",
+/// Keys of a `phase_rss_breakdown` entry (#627): the `/proc/self/status`
+/// memory counters, in the kernel's own KiB.
+const RSS_BREAKDOWN_FIELDS: [&str; 5] =
+    ["rss_kib", "anon_kib", "file_kib", "shmem_kib", "swap_kib"];
+
+/// Keys of a `phase_cgroup` entry (#627): cgroup v2 `memory.current`,
+/// `memory.peak` and the `memory.stat` lines, in the kernel's own bytes.
+const CGROUP_FIELDS: [&str; 7] = [
+    "memory_current_bytes",
+    "memory_peak_bytes",
+    "anon_bytes",
+    "file_bytes",
+    "file_dirty_bytes",
+    "file_writeback_bytes",
+    "shmem_bytes",
 ];
 
-/// #627: `rss_sampler.phase_smaps` splits each phase boundary's resident set
-/// into anonymous and file-backed pages, so a report that rode the cgroup
-/// ceiling is self-diagnosing rather than ambiguous.
+/// `obj`'s keys, sorted.
+fn sorted_keys(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<&str> {
+    let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+    got.sort_unstable();
+    got
+}
+
+/// #627: the sampled anonymous peaks, the per-boundary resident-set
+/// breakdown and the per-boundary cgroup accounting.
 ///
-/// The object is always present. Off Linux — and on a Linux without
-/// `CONFIG_PROC_PAGE_MONITOR`, or in a sandbox that hides
-/// `/proc/self/smaps_rollup` — it is legitimately empty; when it is
-/// populated it names exactly the phases the run entered, since every
-/// boundary takes a snapshot.
-fn check_phase_smaps(line: &serde_json::Value, sampler: &serde_json::Value, phases: &[&str]) {
-    let smaps = sampler["phase_smaps"]
-        .as_object()
-        .unwrap_or_else(|| panic!("rss_sampler.phase_smaps must be an object: {line}"));
-    if smaps.is_empty() {
-        assert!(
-            !cfg!(target_os = "linux") || std::fs::read("/proc/self/smaps_rollup").is_err(),
-            "phase_smaps is empty although this Linux exposes smaps_rollup: {line}"
+/// All three objects are always present. Off Linux the first two are
+/// legitimately empty (no `/proc/self/status`), and `phase_cgroup` is empty
+/// on cgroup v1, off Linux, or wherever the cgroup's memory files are
+/// hidden. When populated, each names exactly the phases the run entered.
+fn check_627_breakdown(line: &serde_json::Value, sampler: &serde_json::Value, phases: &[&str]) {
+    let mut want = phases.to_vec();
+    want.sort_unstable();
+    let object = |key: &str| {
+        sampler[key]
+            .as_object()
+            .unwrap_or_else(|| panic!("rss_sampler.{key} must be an object: {line}"))
+    };
+    let anon_peaks = object("phase_anon_peaks_mib");
+    let breakdown = object("phase_rss_breakdown");
+    let cgroup = object("phase_cgroup");
+    assert!(
+        sampler
+            .as_object()
+            .unwrap()
+            .contains_key("true_anon_peak_mib"),
+        "rss_sampler.true_anon_peak_mib must be present (null when unknown): {line}"
+    );
+
+    let linux_status = std::fs::read_to_string("/proc/self/status")
+        .is_ok_and(|s| s.lines().any(|l| l.starts_with("RssAnon:")));
+    if !linux_status {
+        assert!(anon_peaks.is_empty() && breakdown.is_empty(), "{line}");
+        assert!(sampler["true_anon_peak_mib"].is_null(), "{line}");
+    } else {
+        assert_eq!(
+            sorted_keys(anon_peaks),
+            want,
+            "phase_anon_peaks_mib: {line}"
         );
+        assert_eq!(sorted_keys(breakdown), want, "phase_rss_breakdown: {line}");
+        let true_anon = sampler["true_anon_peak_mib"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("true_anon_peak_mib must be a number here: {line}"));
+        for (phase, entry) in breakdown {
+            let fields = entry.as_object().expect("a breakdown object");
+            for key in RSS_BREAKDOWN_FIELDS {
+                assert!(
+                    fields.contains_key(key),
+                    "phase_rss_breakdown[{phase}].{key}: {line}"
+                );
+            }
+            let rss = entry["rss_kib"].as_u64().expect("rss_kib is a number");
+            let anon = entry["anon_kib"].as_u64().expect("anon_kib is a number");
+            let file = entry["file_kib"].as_u64().expect("file_kib is a number");
+            let shmem = entry["shmem_kib"].as_u64().expect("shmem_kib is a number");
+            assert_eq!(
+                anon + file + shmem,
+                rss,
+                "phase_rss_breakdown[{phase}]: the exact split must sum to rss_kib: {line}"
+            );
+            let peak = anon_peaks[phase].as_f64().expect("anon peak is a number");
+            assert!(
+                peak >= anon as f64 / 1024.0,
+                "phase_anon_peaks_mib[{phase}] ({peak}) must not be below the \
+                 boundary snapshot ({anon} KiB): {line}"
+            );
+            assert!(peak <= true_anon, "true_anon_peak_mib is the max: {line}");
+        }
+    }
+
+    if cgroup.is_empty() {
         return;
     }
-    let mut got: Vec<&str> = smaps.keys().map(String::as_str).collect();
-    let mut want = phases.to_vec();
-    got.sort_unstable();
-    want.sort_unstable();
-    assert_eq!(
-        got, want,
-        "rss_sampler.phase_smaps must name exactly the phases the run entered: {line}"
-    );
-    for (phase, entry) in smaps {
-        let fields = entry
-            .as_object()
-            .unwrap_or_else(|| panic!("phase_smaps[{phase}] must be an object: {line}"));
-        for key in SMAPS_FIELDS {
+    assert_eq!(sorted_keys(cgroup), want, "phase_cgroup: {line}");
+    for (phase, entry) in cgroup {
+        let fields = entry.as_object().expect("a cgroup object");
+        for key in CGROUP_FIELDS {
             assert!(
                 fields.contains_key(key),
-                "phase_smaps[{phase}] must carry {key} (present-and-null when unknown): {line}"
+                "phase_cgroup[{phase}].{key}: {line}"
             );
         }
-        let rss = entry["rss_kib"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("phase_smaps[{phase}].rss_kib must be a number: {line}"));
-        let anon = entry["anonymous_kib"].as_u64().unwrap_or_else(|| {
-            panic!("phase_smaps[{phase}].anonymous_kib must be a number: {line}")
-        });
         assert!(
-            rss > 0,
-            "phase_smaps[{phase}].rss_kib must be positive for a live process: {line}"
-        );
-        assert!(
-            anon <= rss,
-            "phase_smaps[{phase}]: anonymous ({anon}) cannot exceed rss ({rss}): {line}"
-        );
-        assert_eq!(
-            entry["file_backed_kib"].as_u64(),
-            Some(rss - anon),
-            "phase_smaps[{phase}].file_backed_kib must be rss_kib - anonymous_kib: {line}"
+            entry["memory_current_bytes"]
+                .as_u64()
+                .is_some_and(|b| b > 0),
+            "phase_cgroup[{phase}] exists only when memory.current was read: {line}"
         );
     }
 }

@@ -27,10 +27,10 @@ pub mod level;
 mod pipe;
 mod pipeline;
 mod plan_state;
+mod procmem;
 pub mod properties;
 pub mod reader;
 pub mod simplify;
-mod smaps;
 mod stream;
 #[cfg(test)]
 pub(crate) mod testutil;

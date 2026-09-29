@@ -545,7 +545,7 @@ fn sum_stat_keys(path: &std::path::Path, keys: &[&str]) -> Option<u64> {
 
 /// Which `/proc/self/cgroup` line to pick.
 #[derive(Clone, Copy)]
-enum CgroupSelector {
+pub(super) enum CgroupSelector {
     /// The unified-hierarchy line: `0::<path>` (empty controller list).
     V2,
     /// A v1 line whose controller list contains `memory`.
@@ -555,7 +555,10 @@ enum CgroupSelector {
 /// The cgroup path this process belongs to, per `/proc/self/cgroup`
 /// (`hierarchy-ID:controller-list:path`). `None` when the file is missing or
 /// carries no matching line.
-fn proc_self_cgroup_path(root: &std::path::Path, want: CgroupSelector) -> Option<String> {
+pub(super) fn proc_self_cgroup_path(
+    root: &std::path::Path,
+    want: CgroupSelector,
+) -> Option<String> {
     let text = std::fs::read_to_string(root.join("proc/self/cgroup")).ok()?;
     text.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
