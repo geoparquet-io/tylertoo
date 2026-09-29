@@ -14,6 +14,11 @@
 //! them cheap enough for the sampler's 250 ms tick, which is what turns a
 //! boundary snapshot into a sampled anonymous *peak*.
 //!
+//! On kernels before 6.2, each thread batches its counter updates (up to 64
+//! page events) before folding them in, so a reading can trail the truth by
+//! a few hundred KiB per thread. That is noise at the GiB scale these figures
+//! are for.
+//!
 //! `/proc/self/smaps_rollup` would add a shared/private split, but it walks
 //! every page table of the process under the mmap lock — about 55 ms for 4 GiB
 //! resident on the machine this was measured on, so seconds at the hundred-GiB

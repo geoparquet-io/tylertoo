@@ -261,8 +261,8 @@ const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 ///   ([`RssSamplerReport::phase_peaks_mib`], attributed via [`Self::mark_phase`]).
 ///
 /// Since #627 each tick also reads the process's anonymous memory from
-/// `/proc/self/status` (the kernel's `RssAnon` counter — as cheap as the RSS
-/// read), so the report carries a sampled anonymous peak per phase
+/// `/proc/self/status` (the kernel's `RssAnon` counter, so the read costs the
+/// same at any process size), so the report carries a sampled anonymous peak per phase
 /// ([`RssSamplerReport::phase_anon_peaks_mib`]) next to the RSS one. At each
 /// phase boundary it also snapshots the exact anon/file/shmem split of the
 /// resident set ([`RssSamplerReport::phase_rss_breakdown`]) and the cgroup's
@@ -470,9 +470,9 @@ impl RssSampler {
     /// attribute every sample from now on to `phase`, until the next call.
     /// The closing sample is what gives a phase shorter than the poll
     /// interval an entry at all. Cheap (one RSS read, one
-    /// `/proc/self/status` read, three small cgroup file reads, one mutex
-    /// lock, a short-string clone); called only at phase boundaries, never
-    /// per-row.
+    /// `/proc/self/status` read, `/proc/self/cgroup` plus three small cgroup
+    /// files, one mutex lock, a short-string clone); called only at phase
+    /// boundaries, never per-row.
     ///
     /// #627: the boundary snapshots are taken here, credited to the phase
     /// that is *ending* — so `phase_rss_breakdown["pass1 scan"]` describes
