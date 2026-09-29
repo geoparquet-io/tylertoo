@@ -68,7 +68,7 @@
 //! table ([`FeatureTable`], `convert::PASS1_BYTES_PER_ROW` — 64 B/row when #565
 //! measured this, 33–42 B/row since #543 item 2) that is still live throughout.
 //! Every field of a [`Priority`] is a pure function of three of the row's
-//! columns ([`FeatureTable::priority`]), so [`priority_order`] derives both
+//! columns (`FeatureTable::priority`), so [`priority_order`] derives both
 //! sides per comparison instead. Measured on the `assign_scaling` harness (8M
 //! rows, 14 levels, 1 GiB grid budget), the budget's transient fell from 72.1
 //! to 32.1 B/feature — the phase's peak is now dominated by the per-level

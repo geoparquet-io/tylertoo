@@ -52,6 +52,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+// Only the docs name `AssignFeature` (its `index` is what the cluster tables
+// key on); the code takes the column-major `FeatureTable`.
+#[cfg(doc)]
+use super::assign::AssignFeature;
 use super::assign::{AssignConfig, FeatureKind, FeatureTable, SortDirection};
 use super::level::Crs;
 
