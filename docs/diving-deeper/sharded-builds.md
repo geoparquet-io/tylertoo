@@ -303,9 +303,9 @@ doubling, which is why the streaming engine pre-sizes the always-present
 columns from the footer row count and allocates the optional ones at their
 exact length. The columns are the bbox *center* (two `f64`), the squared bbox
 diagonal (`f64`), the row index (8 bytes), the geometry kind (1 byte), and —
-when present — the sort key (`f64`) and the ladder entry level (1 byte). Assignment reads the center and
-the diagonal, never the bbox they came from, so the bbox is reduced once at
-scan time and not retained.
+when present — the sort key (`f64`) and the ladder entry level (1 byte).
+Assignment reads the center and the diagonal, never the bbox they came from,
+so the bbox is reduced once at scan time and not retained.
 
 **It used to be 64 bytes/row**, and that is the figure the field incident
 below was measured at: a 1.58B-row coarse job logged
