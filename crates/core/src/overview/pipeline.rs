@@ -83,8 +83,9 @@ pub(super) enum SinkBacking {
 const DUPLICATING_BYTES_PER_ROW: u64 = 8_192;
 const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 
-/// Measured-path per-row model (#305): `per_row = SINK_ROW_OVERHEAD_BYTES +
-/// factor(mode) × avg_geom_bytes`, where `avg_geom_bytes` is pass 1's measured
+/// Measured-path per-row model (#305): `per_row =
+/// SINK_ROW_ALLOC_OVERHEAD_BYTES + factor(mode) × avg_geom_bytes`, where
+/// `avg_geom_bytes` is pass 1's measured
 /// average in-memory Arrow byte size of the encoded geometry column per input
 /// row. Pass 1 already decodes every geometry, so the measurement is free (one
 /// buffer-size sum per batch) and replaces the one-size-fits-all constants
@@ -92,12 +93,15 @@ const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 /// dataset-dependent term (corpus range: ~30 B/row for points to ~11.5 KiB/row
 /// for fieldmaps-adm4 boundary polygons).
 ///
+/// This is the UP-FRONT estimate only. It knows the geometry weight and
+/// nothing about how wide the retained property columns are, so #626 stopped
+/// pretending: [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] is now an honest
+/// allocator/`Vec` floor, and the property term is **measured at run time**
+/// from the first buffered output batches ([`SinkAutoTuner`]), which can flip
+/// an `auto` run from RAM to spill mid-pass.
+///
 /// Calibration (against the #294 RSS measurements above and corpus footers):
 ///
-/// - `SINK_ROW_OVERHEAD_BYTES` (4 KiB) covers everything that is NOT input
-///   geometry: property columns (≤ ~80 B/row on the measured corpora), Arrow
-///   offsets/validity, and per-batch allocation slack — which dominates when
-///   geometries are tiny.
 /// - `DUPLICATING_GEOM_FACTOR` (×2): buffered duplicating rows hold
 ///   *simplified* copies (≤ input size, near-full-resolution only at the
 ///   finest buffered level), so ×2 over the encoded input size is the
@@ -115,9 +119,30 @@ const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 /// ~8 KiB/row vs 16 KiB RSS-measured (RSS deltas overcount true need via
 /// allocator slack; content is ~1 KiB/row). Like the fallback constants, the
 /// model steers only the backing choice, never output bytes.
-const SINK_ROW_OVERHEAD_BYTES: u64 = 4_096;
 const DUPLICATING_GEOM_FACTOR: u64 = 2;
 const PARTITIONING_GEOM_FACTOR: u64 = 4;
+
+/// Per-buffered-row cost that is neither geometry nor property DATA: the
+/// `Vec<RecordBatch>` slot amortized over a batch's rows, Arrow's per-array
+/// offset/validity bookkeeping, and the allocator's rounding of each buffer up
+/// to a size class.
+///
+/// **It used to be 4 KiB and it used to mean something else** (#626). The old
+/// `SINK_ROW_OVERHEAD_BYTES` comment claimed 4 KiB "covers everything that is
+/// NOT input geometry: property columns (≤ ~80 B/row on the measured
+/// corpora)" — a constant standing in for a quantity nobody measured, and
+/// wrong in both directions. Under-estimate: the FTW beta vectors carry 17
+/// exported properties and `gpio process aggregate --breakdown` outputs carry
+/// dozens to hundreds of `count_<value>` columns, so real retained property
+/// bytes blow past any fixed allowance (134 M rows × 17 properties peaked at
+/// ~192 GiB MaxRSS even under `--profile bounded`). Over-estimate: a
+/// two-property point corpus paid a 4 KiB/row assumption — ~50× the "measured
+/// ~80 B" the comment itself cited — and spilled where RAM was fine.
+///
+/// 256 B is a floor for the bookkeeping this name actually describes, not a
+/// property proxy. The property term is measured instead, per run, by
+/// [`SinkAutoTuner`].
+const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
 
 /// Fraction of *available* system RAM the estimated buffered-output set may
 /// occupy before `Auto` spills to a temp file instead of holding it in RAM.
@@ -156,7 +181,7 @@ fn estimate_buffered_bytes(mode: Mode, buffered_rows: usize, avg_geom_bytes: Opt
                 Mode::Duplicating => DUPLICATING_GEOM_FACTOR,
                 Mode::Partitioning => PARTITIONING_GEOM_FACTOR,
             };
-            SINK_ROW_OVERHEAD_BYTES.saturating_add(factor.saturating_mul(avg))
+            SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(factor.saturating_mul(avg))
         }
         _ => match mode {
             Mode::Duplicating => DUPLICATING_BYTES_PER_ROW,
@@ -710,6 +735,190 @@ pub(super) fn resolve_backing(
 }
 
 // ============================================================================
+// #626: measure the retained per-row sink cost, and downgrade Ram→Spill once
+// ============================================================================
+
+/// Output rows the sink sample runs for before its rate is frozen.
+const SINK_SAMPLE_MAX_ROWS: usize = 1_000_000;
+
+/// Output batches the sink sample runs for before its rate is frozen —
+/// whichever of the two limits is reached first. A planet-scale run uses
+/// batches far larger than 16 K rows, so in practice the row limit binds;
+/// the batch limit exists so a pathological many-tiny-batches input still
+/// stops measuring.
+const SINK_SAMPLE_MAX_BATCHES: usize = 64;
+
+/// Output rows the sample must carry before its rate may flip a live sink to
+/// spill. One batch of a real run clears this immediately; it only stops a
+/// handful of rows from a leading sparse batch deciding the run.
+const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
+
+/// What the pass-2 sink actually cost per buffered row, and what `auto` did
+/// about it. Reported into `TYLERTOO_PROFILE_JSON` (#626 item 4) so a sizing
+/// regression is visible without an RSS trace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SinkMeasurement {
+    /// Measured retained bytes per buffered output row — the sampled Arrow
+    /// array bytes (geometry + every kept property column) plus
+    /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]. `None` when nothing was buffered.
+    pub(super) bytes_per_row: Option<u64>,
+    /// Output rows the sample covered.
+    pub(super) sampled_rows: usize,
+    /// `bytes_per_row × planned buffered rows`: what the whole buffered set
+    /// would cost in RAM at the measured rate.
+    pub(super) projected_bytes: u64,
+    /// The RAM budget the projection was compared against
+    /// ([`AUTO_RAM_FRACTION`] × available RAM).
+    pub(super) budget_bytes: u64,
+    /// A one-way Ram→Spill downgrade fired mid-pass.
+    pub(super) downgraded: bool,
+}
+
+/// Runtime sink sizing for [`MemoryProfile::Auto`] (#626).
+///
+/// The up-front [`auto_backing`] choice is made before a single output row
+/// exists: it knows pass 1's geometry weight and nothing about how wide the
+/// retained property columns are. This measures the real thing — the Arrow
+/// array bytes of the batches actually handed to the sinks, which by
+/// construction are exactly the kept property columns plus the geometry
+/// column — over the first [`SINK_SAMPLE_MAX_ROWS`] rows (or
+/// [`SINK_SAMPLE_MAX_BATCHES`] batches), and, when that rate projects the
+/// whole buffered set past the budget, downgrades the Ram sinks to Spill
+/// **once**.
+///
+/// One-way and once: a sink that has spilled never comes back, so the engine
+/// cannot oscillate and no batch is ever written twice. `bounded` and `speed`
+/// are unaffected — they are explicit instructions, not estimates — but the
+/// measurement still runs for them, because the profile dump is worth the two
+/// integer adds per batch.
+///
+/// **Known biases**, both toward spilling early (the safe direction):
+/// `RecordBatch::get_array_memory_size` reports allocated buffer capacity,
+/// not live bytes, and a cascading duplicating fold (#499) can hand two
+/// levels the same `Arc`'d geometry array, which this counts once per level
+/// while RAM holds it once. The remaining bias has no sign: the sample is the
+/// FIRST rows of the input, so a spatially sorted input whose dense regions
+/// sort late is measured on its sparse head.
+struct SinkAutoTuner {
+    rows: usize,
+    bytes: u64,
+    batches: usize,
+    /// The sampling window is over; `bytes`/`rows` no longer move.
+    closed: bool,
+    /// Output rows the plan expects the buffered levels to hold in total.
+    planned_rows: usize,
+    /// [`AUTO_RAM_FRACTION`] × available RAM, captured once.
+    budget_bytes: u64,
+    /// A downgrade is still possible: `auto`, and the sinks are still Ram.
+    armed: bool,
+    downgraded: bool,
+}
+
+impl SinkAutoTuner {
+    /// A downgrade can only apply to a [`MemoryProfile::Auto`] run that
+    /// started in [`SinkBacking::Ram`], so only that case probes a budget.
+    ///
+    /// The probe is skipped outright otherwise: `available_memory_bytes`
+    /// caches process-wide on its first call, and a `bounded`/`speed` run must
+    /// not have that call moved here (#485).
+    fn new(profile: MemoryProfile, backing: SinkBacking, planned_rows: usize) -> Self {
+        let armed = matches!(profile, MemoryProfile::Auto) && matches!(backing, SinkBacking::Ram);
+        let budget_bytes = if armed {
+            auto_budget_bytes(available_memory_bytes())
+        } else {
+            0
+        };
+        Self::with_budget(armed, planned_rows, budget_bytes)
+    }
+
+    /// [`SinkAutoTuner::new`] with the RAM budget supplied instead of probed —
+    /// the seam the unit tests drive, so they never mutate the process
+    /// environment (nothing in this crate's unit tests does) and never depend
+    /// on the box they run on. A `budget_bytes` of `auto_budget_bytes(Some(n))`
+    /// is exactly what `TYLERTOO_AUTO_MEM_LIMIT_BYTES=n` produces, since the
+    /// override short-circuits the probe to `Some(n)`.
+    fn with_budget(armed: bool, planned_rows: usize, budget_bytes: u64) -> Self {
+        Self {
+            rows: 0,
+            bytes: 0,
+            batches: 0,
+            closed: false,
+            planned_rows,
+            budget_bytes,
+            armed,
+            downgraded: false,
+        }
+    }
+
+    /// Fold one output batch — the exact value about to be buffered — into the
+    /// sample, until the window closes.
+    fn observe(&mut self, batch: &RecordBatch) {
+        if self.closed {
+            return;
+        }
+        self.rows += batch.num_rows();
+        self.bytes += batch.get_array_memory_size() as u64;
+        self.batches += 1;
+        if self.rows >= SINK_SAMPLE_MAX_ROWS || self.batches >= SINK_SAMPLE_MAX_BATCHES {
+            self.closed = true;
+        }
+    }
+
+    /// Measured retained bytes per buffered output row, floor included.
+    /// `None` until at least one row has been observed.
+    fn bytes_per_row(&self) -> Option<u64> {
+        (self.rows > 0)
+            .then(|| SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(self.bytes / self.rows as u64))
+    }
+
+    /// What the whole buffered set would cost in RAM at the measured rate.
+    fn projected_bytes(&self) -> u64 {
+        self.bytes_per_row().map_or(0, |per_row| {
+            (self.planned_rows as u64).saturating_mul(per_row)
+        })
+    }
+
+    /// Whether the sample now says the Ram sinks cannot hold the run.
+    fn should_downgrade(&self) -> bool {
+        self.armed
+            && !self.downgraded
+            && self.rows >= SINK_SAMPLE_MIN_ROWS
+            && self.projected_bytes() > self.budget_bytes
+    }
+
+    /// Record that the downgrade happened (and disarm: it is one-way).
+    fn mark_downgraded(&mut self) {
+        self.downgraded = true;
+        self.armed = false;
+    }
+
+    fn report(&self) -> SinkMeasurement {
+        SinkMeasurement {
+            bytes_per_row: self.bytes_per_row(),
+            sampled_rows: self.rows,
+            projected_bytes: self.projected_bytes(),
+            budget_bytes: self.budget_bytes,
+            downgraded: self.downgraded,
+        }
+    }
+}
+
+/// Flush every still-Ram sink into a fresh spill file (#626), returning the
+/// bytes handed to the spill writers so the per-level spill accounting stays
+/// whole. Sinks that already spill are untouched.
+fn downgrade_sinks_to_spill(
+    sinks: &mut [LevelSink],
+    spill_bytes: &mut [u64],
+    out_schema: &Schema,
+    spill_dir: Option<&Path>,
+) -> Result<(), ConvertError> {
+    for (li, sink) in sinks.iter_mut().enumerate() {
+        spill_bytes[li] += sink.downgrade_to_spill(out_schema, spill_dir)?;
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Ordered input reading: one sequential reader, or several merged in order
 // ============================================================================
 
@@ -778,9 +987,23 @@ const READ_AHEAD_MAX_BATCHES: usize = 32;
 /// Assumed decoded GEOMETRY bytes per input row when pass 1 measured nothing
 /// (an empty scan, or the `--plan` path). Deliberately generous:
 /// over-estimating costs reader workers, under-estimating costs RAM. The
-/// non-geometry per-row term ([`SINK_ROW_OVERHEAD_BYTES`]) is added on top,
+/// non-geometry per-row term ([`READ_ROW_NON_GEOM_BYTES`]) is added on top,
 /// measured or not.
 const READ_ROW_BYTES_FALLBACK: u64 = 1024;
+
+/// Assumed NON-geometry bytes per resident read-batch row: every projected
+/// property column, its offsets, dictionaries and validity buffers.
+///
+/// This is the 4 KiB the sink estimate used to charge as
+/// `SINK_ROW_OVERHEAD_BYTES`, kept here at its calibrated value and renamed to
+/// say what it is for. #626 replaced the sink's copy with a measured figure,
+/// but the read-ahead cannot do the same: its size is chosen **before the
+/// first batch is read**, so there is nothing to sample. It stays a
+/// deliberately generous wide-schema proxy — pricing a read row at
+/// `2 × avg_geom` alone under-charged wide schemas by 17-232× against
+/// `get_array_memory_size()` (see [`resolve_read_shape`]) — and over-charging
+/// here costs reader workers, not correctness.
+const READ_ROW_NON_GEOM_BYTES: u64 = 4_096;
 
 /// A resolved parallel-read shape: how many workers, how deep each one's
 /// queue is, and how large a segment may be.
@@ -811,21 +1034,22 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
     // term plus the measured encoded geometry, doubled.
     //
-    // `SINK_ROW_OVERHEAD_BYTES` is not decoration. Pass 1 measures ONLY the
+    // `READ_ROW_NON_GEOM_BYTES` is not decoration. Pass 1 measures ONLY the
     // geometry column, and a read batch carries every projected column — a
     // 58-column schema's properties, offsets, dictionaries and validity
     // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
     // under-charged wide schemas by 17-232× against
     // `get_array_memory_size()`, which is how a bounded run at DEFAULTS could
-    // model 21 MiB of read-ahead and resident +370 MiB. The model is still a
-    // model — it assumes the sink's 4 KiB/row non-geometry term covers the
-    // input's too — but it is now the same model, wrong in the same direction,
-    // as the budget it is being charged against.
+    // model 21 MiB of read-ahead and resident +370 MiB.
+    //
+    // #626 note: the sink's own non-geometry term is now MEASURED, so the two
+    // models no longer share a constant. That is deliberate — the read-ahead
+    // is sized before a single batch exists, so this one stays a proxy.
     let geom_per_row = tuning
         .avg_geom_bytes
         .filter(|&b| b > 0)
         .map_or(READ_ROW_BYTES_FALLBACK, |b| b.saturating_mul(2));
-    let per_row = SINK_ROW_OVERHEAD_BYTES.saturating_add(geom_per_row).max(1);
+    let per_row = READ_ROW_NON_GEOM_BYTES.saturating_add(geom_per_row).max(1);
     let per_batch = (batch_size as u64).saturating_mul(per_row).max(1);
     let budget = (auto_budget_bytes(available_memory_bytes()) as f64 * READ_BUDGET_FRACTION) as u64;
     let affordable = (budget / per_batch).max(1) as usize;
@@ -1577,6 +1801,38 @@ impl LevelSink {
             LevelSink::Spill(s) => s.push(batch),
         }
     }
+
+    /// One-way Ram→Spill downgrade (#626): open a spill file for this level
+    /// and hand it every batch already buffered, in buffer order, before the
+    /// sink accepts anything further. Returns the bytes handed to the spill
+    /// writer (0 when the sink was already spilling, which makes this a no-op).
+    ///
+    /// No data is lost and no row moves: the `Vec` is drained front-to-back
+    /// into the same FIFO channel a spill sink has always used, so the level's
+    /// row sequence — and therefore its row-group boundaries and output bytes
+    /// — are what they would have been had the level spilled from the start.
+    fn downgrade_to_spill(
+        &mut self,
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+    ) -> Result<u64, ConvertError> {
+        if !matches!(self, LevelSink::Ram(_)) {
+            return Ok(0);
+        }
+        // Opened BEFORE the buffer is moved out: a spill file that cannot be
+        // created leaves the sink exactly as it was, still holding its rows,
+        // for the caller's error path to report against.
+        let mut state = SpillState::new(out_schema, spill_dir)?;
+        let LevelSink::Ram(buffered) = std::mem::replace(self, LevelSink::Ram(Vec::new())) else {
+            return Err(internal("sink changed backing during a downgrade"));
+        };
+        let mut bytes = 0u64;
+        for batch in buffered {
+            bytes += state.push(batch)?;
+        }
+        *self = LevelSink::Spill(state);
+        Ok(bytes)
+    }
 }
 
 /// An invariant this module owns was broken — never reachable from user input,
@@ -1783,6 +2039,9 @@ impl Drop for SpillState {
 pub(super) struct Pass2EngineResult {
     pub(super) levels: Vec<(LevelWriteOutcome, usize, usize, u64)>,
     pub(super) timers: Pass2Timers,
+    /// #626: what a buffered row really cost, and whether `auto` had to
+    /// downgrade the sinks to spill mid-pass.
+    pub(super) sink: SinkMeasurement,
 }
 
 /// Buffer + write levels `0..ctxs.len()` (all but the streamed finest level)
@@ -1799,6 +2058,7 @@ pub(super) fn run_pass2_buffered(
     read_tuning: ReadTuning,
     selected_row_groups: Option<&RowGroupSelection>,
     in_flight: usize,
+    profile: MemoryProfile,
     backing: SinkBacking,
     out_schema: &Schema,
     spill_dir: Option<&Path>,
@@ -1818,10 +2078,14 @@ pub(super) fn run_pass2_buffered(
     // Bytes handed to the spill writer, per level (previously uncounted).
     // Stays all-zero under `SinkBacking::Ram`.
     let mut spill_bytes = vec![0u64; num_levels];
+    // #626: measures what a buffered row really costs and, for `auto`, flips
+    // the sinks to spill once if the measured rate projects past the budget.
+    let mut tuner = SinkAutoTuner::new(profile, backing, hints.iter().sum());
 
     // Consumer state borrowed mutably by the consumer closure below.
     let (rows_ref, verts_ref, sinks_ref, spill_bytes_ref) =
         (&mut rows, &mut verts, &mut sinks, &mut spill_bytes);
+    let tuner_ref = &mut tuner;
     let timers_ref = &timers;
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
     scoped_pipe(
@@ -1893,8 +2157,22 @@ pub(super) fn run_pass2_buffered(
                     if let Some((out, v)) = out {
                         rows_ref[li] += out.num_rows();
                         verts_ref[li] += v;
+                        tuner_ref.observe(&out);
                         spill_bytes_ref[li] += sinks_ref[li].push(out)?;
                     }
+                }
+                if tuner_ref.should_downgrade() {
+                    log::warn!(
+                        "[convert] pass2 auto: measured {} B per buffered row over {} sampled \
+                         row(s) projects {:.1} GiB for the buffered set — past the {:.1} GiB \
+                         budget; downgrading {num_levels} RAM sink(s) to spill (#626)",
+                        tuner_ref.bytes_per_row().unwrap_or(0),
+                        tuner_ref.rows,
+                        gib(tuner_ref.projected_bytes()),
+                        gib(tuner_ref.budget_bytes),
+                    );
+                    downgrade_sinks_to_spill(sinks_ref, spill_bytes_ref, out_schema, spill_dir)?;
+                    tuner_ref.mark_downgraded();
                 }
                 if last_progress.elapsed().as_secs() >= 10 {
                     last_progress = Instant::now();
@@ -1927,6 +2205,23 @@ pub(super) fn run_pass2_buffered(
         outcomes.push(outcome);
     }
 
+    if let Some(per_row) = tuner.bytes_per_row() {
+        // #626: the number the up-front estimate could only guess at. Info
+        // level so a sizing regression is visible in an ordinary run log, not
+        // just in `TYLERTOO_PROFILE_JSON`.
+        log::info!(
+            "[convert] pass2 sink: measured {per_row} B per buffered row over {} sampled \
+             row(s) → {:.1} GiB projected for {} buffered row(s){}",
+            tuner.rows,
+            gib(tuner.projected_bytes()),
+            tuner.planned_rows,
+            if tuner.downgraded {
+                " (downgraded to spill mid-pass)"
+            } else {
+                ""
+            },
+        );
+    }
     timers.log_engine_summary(t_engine.elapsed().as_secs_f64(), rows.iter().sum());
     let levels = outcomes
         .into_iter()
@@ -1935,7 +2230,11 @@ pub(super) fn run_pass2_buffered(
         .zip(spill_bytes)
         .map(|(((outcome, r), v), s)| (outcome, r, v, s))
         .collect();
-    Ok(Pass2EngineResult { levels, timers })
+    Ok(Pass2EngineResult {
+        levels,
+        timers,
+        sink: tuner.report(),
+    })
 }
 
 /// Drain one level's sink into `writer.write_level`, timing the call into
@@ -2279,15 +2578,17 @@ mod backing_tests {
 
     #[test]
     fn measured_estimate_is_overhead_plus_geometry_margin() {
-        // per_row = 4 KiB overhead + 2× (duplicating) / 4× (partitioning) the
-        // measured average encoded-geometry bytes.
+        // per_row = the 256 B allocator floor + 2× (duplicating) / 4×
+        // (partitioning) the measured average encoded-geometry bytes. #626
+        // cut the floor from 4 KiB to 256 B: it no longer stands in for the
+        // property columns, which are measured during pass 2 instead.
         assert_eq!(
             estimate_buffered_bytes(Mode::Duplicating, 1_000, Some(1_000)),
-            6_096_000 // (4096 + 2*1000) * 1000
+            2_256_000 // (256 + 2*1000) * 1000
         );
         assert_eq!(
             estimate_buffered_bytes(Mode::Partitioning, 1_000, Some(1_000)),
-            8_096_000 // (4096 + 4*1000) * 1000
+            4_256_000 // (256 + 4*1000) * 1000
         );
         // Saturating with a measurement too.
         assert_eq!(
@@ -2364,6 +2665,252 @@ mod backing_tests {
             auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), Some(8)),
             SinkBacking::Spill
         ));
+    }
+}
+
+/// #626: the run-time sink measurement and the one-way Ram→Spill downgrade.
+///
+/// The budget is passed in rather than probed ([`SinkAutoTuner::with_budget`])
+/// so these never read `/proc`, never mutate the process environment, and
+/// never depend on the box. `auto_budget_bytes(Some(n))` is exactly the budget
+/// `TYLERTOO_AUTO_MEM_LIMIT_BYTES=n` yields.
+#[cfg(test)]
+mod sink_sample_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, BinaryArray, Float64Array};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    /// Rows per synthetic batch. Comfortably over [`SINK_SAMPLE_MIN_ROWS`], so
+    /// one batch is already a decision-grade sample.
+    const ROWS: usize = 4_096;
+
+    /// A batch of `ROWS` rows: one WKB-ish geometry column of 8-byte values
+    /// plus `props` `Float64` property columns — the shape a buffered output
+    /// batch has (geometry + every KEPT property column).
+    fn sample_batch(props: usize) -> RecordBatch {
+        let mut fields: Vec<Field> = vec![Field::new("geometry", DataType::Binary, false)];
+        let geom: ArrayRef = Arc::new(BinaryArray::from_iter_values(
+            (0..ROWS).map(|i| (i as u64).to_le_bytes()),
+        ));
+        let mut cols: Vec<ArrayRef> = vec![geom];
+        for p in 0..props {
+            fields.push(Field::new(format!("p{p}"), DataType::Float64, false));
+            cols.push(Arc::new(Float64Array::from_iter_values(
+                (0..ROWS).map(|i| i as f64),
+            )));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    /// The measured DATA term alone (floor removed), so the two shapes are
+    /// compared on what the estimate used to guess at.
+    fn measured_column_bytes_per_row(props: usize) -> u64 {
+        let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
+        tuner.observe(&sample_batch(props));
+        tuner.bytes_per_row().unwrap() - SINK_ROW_ALLOC_OVERHEAD_BYTES
+    }
+
+    /// The estimator's whole point (#626): property width is the term the
+    /// 4 KiB constant never saw. 200 float columns must measure orders of
+    /// magnitude heavier per row than the geometry column on its own.
+    #[test]
+    fn wide_properties_measure_far_heavier_than_geometry_alone() {
+        let geometry_only = measured_column_bytes_per_row(0);
+        let wide = measured_column_bytes_per_row(200);
+        assert!(
+            wide >= geometry_only.saturating_mul(100),
+            "200 float property columns measured {wide} B/row vs {geometry_only} B/row for \
+             geometry alone — under 100×, so the sample is not seeing the properties"
+        );
+    }
+
+    /// #626 case 1 (under-estimate): a wide-property run that the up-front
+    /// estimate left in RAM must trip the downgrade once the sample lands.
+    ///
+    /// The budget is the one `TYLERTOO_AUTO_MEM_LIMIT_BYTES=2_000_000_000`
+    /// produces; 200 float columns over 50 M planned buffered rows is ~80 GiB,
+    /// far past it.
+    #[test]
+    fn wide_properties_trip_the_downgrade_under_a_small_limit() {
+        let budget = auto_budget_bytes(Some(2_000_000_000));
+        let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
+        assert!(
+            !tuner.should_downgrade(),
+            "nothing sampled yet — a tuner must not decide on zero rows"
+        );
+        tuner.observe(&sample_batch(200));
+        assert!(
+            tuner.should_downgrade(),
+            "measured {:?} B/row over {} planned rows projects {} B against a {budget} B budget",
+            tuner.bytes_per_row(),
+            tuner.planned_rows,
+            tuner.projected_bytes(),
+        );
+    }
+
+    /// #626 case 2 (over-estimate): a two-property input must NOT spill under
+    /// a generous limit. Under the old 4 KiB-per-row proxy the same 50 M rows
+    /// modelled ~191 GiB and spilled; measured, they are ~1 GiB.
+    #[test]
+    fn two_properties_stay_in_ram_under_a_generous_limit() {
+        let budget = auto_budget_bytes(Some(64 * 1024 * 1024 * 1024));
+        let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
+        tuner.observe(&sample_batch(2));
+        assert!(
+            !tuner.should_downgrade(),
+            "measured {:?} B/row projects {} B — must fit the {budget} B budget",
+            tuner.bytes_per_row(),
+            tuner.projected_bytes(),
+        );
+        // And the old constant-based model is what it is being contrasted
+        // with: 4 KiB/row would have blown the same budget.
+        assert!(50_000_000u64 * 4_096 > budget);
+    }
+
+    /// `bounded` and `speed` are instructions, not estimates: the tuner still
+    /// measures (the profile dump wants the number) but can never act.
+    #[test]
+    fn explicit_profiles_are_never_downgraded() {
+        for (profile, backing) in [
+            (MemoryProfile::Speed, SinkBacking::Ram),
+            (MemoryProfile::Bounded, SinkBacking::Spill),
+        ] {
+            let mut tuner = SinkAutoTuner::new(profile, backing, usize::MAX);
+            tuner.observe(&sample_batch(200));
+            assert!(
+                tuner.bytes_per_row().is_some(),
+                "{profile:?} must still be measured for the profile dump"
+            );
+            assert!(
+                !tuner.should_downgrade(),
+                "{profile:?} must never be second-guessed by the sample"
+            );
+        }
+    }
+
+    /// The sampling window closes, and the rate stops moving with it.
+    #[test]
+    fn the_sample_window_closes_and_freezes_the_rate() {
+        let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
+        for _ in 0..SINK_SAMPLE_MAX_BATCHES {
+            tuner.observe(&sample_batch(1));
+        }
+        assert!(
+            tuner.closed,
+            "{SINK_SAMPLE_MAX_BATCHES} batches must close it"
+        );
+        let frozen = tuner.bytes_per_row();
+        // A far heavier batch after the window must not move the figure.
+        tuner.observe(&sample_batch(200));
+        assert_eq!(tuner.bytes_per_row(), frozen);
+        assert_eq!(tuner.rows, SINK_SAMPLE_MAX_BATCHES * ROWS);
+    }
+
+    /// The row-limit arm of the window (`SINK_SAMPLE_MAX_ROWS`), reached
+    /// before the batch limit.
+    #[test]
+    fn the_sample_window_also_closes_on_rows() {
+        let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
+        let big = {
+            let mut fields = vec![Field::new("geometry", DataType::Binary, false)];
+            fields.push(Field::new("p0", DataType::Float64, false));
+            let n = SINK_SAMPLE_MAX_ROWS;
+            RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                vec![
+                    Arc::new(BinaryArray::from_iter_values(
+                        (0..n).map(|i| (i as u64).to_le_bytes()),
+                    )) as ArrayRef,
+                    Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64))),
+                ],
+            )
+            .unwrap()
+        };
+        tuner.observe(&big);
+        assert!(tuner.closed);
+        assert_eq!(tuner.batches, 1);
+    }
+
+    /// The load-bearing safety property (#626 item 2): a downgrade must not
+    /// lose a row. Everything buffered before the flip, plus everything
+    /// pushed after it, must come back out of the spill file — in order.
+    #[test]
+    fn a_mid_stream_downgrade_keeps_every_buffered_row() {
+        let schema = Schema::new(vec![Field::new("p0", DataType::Float64, false)]);
+        let batch = |base: f64| {
+            RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                vec![Arc::new(Float64Array::from(vec![base, base + 1.0])) as ArrayRef],
+            )
+            .unwrap()
+        };
+        let mut sink = LevelSink::new(SinkBacking::Ram, &schema, None).unwrap();
+        for i in 0..10 {
+            sink.push(batch(i as f64 * 10.0)).unwrap();
+        }
+        let flushed = sink.downgrade_to_spill(&schema, None).unwrap();
+        assert!(flushed > 0, "the flush must account for the bytes it moved");
+        assert!(matches!(sink, LevelSink::Spill(_)), "it is one-way");
+        for i in 10..20 {
+            sink.push(batch(i as f64 * 10.0)).unwrap();
+        }
+
+        let LevelSink::Spill(state) = sink else {
+            unreachable!("just asserted")
+        };
+        let (reader, _temp) = state.into_reader(&Pass2Timers::default()).unwrap();
+        let got: Vec<f64> = reader
+            .flat_map(|b| {
+                b.unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let want: Vec<f64> = (0..20)
+            .flat_map(|i| [i as f64 * 10.0, i as f64 * 10.0 + 1.0])
+            .collect();
+        assert_eq!(got, want, "a downgrade must preserve every row, in order");
+    }
+
+    /// Downgrading an already-spilled sink is a no-op, so the one-way rule
+    /// cannot be violated by a second call.
+    #[test]
+    fn downgrading_a_spilled_sink_is_a_no_op() {
+        let schema = Schema::new(vec![Field::new("p0", DataType::Float64, false)]);
+        let mut sink = LevelSink::new(SinkBacking::Spill, &schema, None).unwrap();
+        assert_eq!(sink.downgrade_to_spill(&schema, None).unwrap(), 0);
+        assert!(matches!(sink, LevelSink::Spill(_)));
+    }
+
+    /// The reported figure is what the profile dump publishes.
+    #[test]
+    fn the_report_carries_the_measurement_and_the_verdict() {
+        let budget = auto_budget_bytes(Some(2_000_000_000));
+        let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
+        assert_eq!(
+            tuner.report(),
+            SinkMeasurement {
+                budget_bytes: budget,
+                ..SinkMeasurement::default()
+            },
+            "before any sample there is no rate and no verdict"
+        );
+        tuner.observe(&sample_batch(200));
+        tuner.mark_downgraded();
+        let report = tuner.report();
+        assert_eq!(report.sampled_rows, ROWS);
+        assert!(report.bytes_per_row.is_some_and(|b| b > 1_600));
+        assert_eq!(report.budget_bytes, budget);
+        assert!(report.downgraded);
+        assert!(
+            !tuner.should_downgrade(),
+            "a downgraded tuner is disarmed — the flip is one-way"
+        );
     }
 }
 
