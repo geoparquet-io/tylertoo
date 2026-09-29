@@ -735,22 +735,12 @@ pub(super) fn resolve_backing(
 }
 
 // ============================================================================
-// #626: measure the retained per-row sink cost, and downgrade Ram→Spill once
+// #626: measure the retained sink bytes, and downgrade Ram→Spill once
 // ============================================================================
 
-/// Output rows the sink sample runs for before its rate is frozen.
-const SINK_SAMPLE_MAX_ROWS: usize = 1_000_000;
-
-/// Output batches the sink sample runs for before its rate is frozen —
-/// whichever of the two limits is reached first. A planet-scale run uses
-/// batches far larger than 16 K rows, so in practice the row limit binds;
-/// the batch limit exists so a pathological many-tiny-batches input still
-/// stops measuring.
-const SINK_SAMPLE_MAX_BATCHES: usize = 64;
-
-/// Output rows the sample must carry before its rate may flip a live sink to
-/// spill. One batch of a real run clears this immediately; it only stops a
-/// handful of rows from a leading sparse batch deciding the run.
+/// Output rows the measurement must carry before its rate may flip a live
+/// sink to spill. One batch of a real run clears this immediately; it only
+/// stops a handful of rows from a leading sparse batch deciding the run.
 const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 
 /// What the pass-2 sink actually cost per buffered row, and what `auto` did
@@ -758,14 +748,16 @@ const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 /// regression is visible without an RSS trace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkMeasurement {
-    /// Measured retained bytes per buffered output row — the sampled Arrow
-    /// array bytes (geometry + every kept property column) plus
+    /// Measured retained bytes per buffered output row — the Arrow array
+    /// bytes (geometry + every kept property column) of every batch handed to
+    /// the sinks, averaged over the whole pass, plus
     /// [`SINK_ROW_ALLOC_OVERHEAD_BYTES`]. `None` when nothing was buffered.
     pub(super) bytes_per_row: Option<u64>,
-    /// Output rows the sample covered.
+    /// Output rows the measurement covered: every buffered row of the pass.
     pub(super) sampled_rows: usize,
-    /// `bytes_per_row × planned buffered rows`: what the whole buffered set
-    /// would cost in RAM at the measured rate.
+    /// What the whole buffered set costs in RAM: the bytes already buffered
+    /// plus the not-yet-buffered planned rows at the measured rate. At the end
+    /// of the pass it is the bytes actually buffered.
     pub(super) projected_bytes: u64,
     /// The RAM budget the projection was compared against
     /// ([`AUTO_RAM_FRACTION`] × available RAM).
@@ -781,10 +773,16 @@ pub(super) struct SinkMeasurement {
 /// retained property columns are. This measures the real thing — the Arrow
 /// array bytes of the batches actually handed to the sinks, which by
 /// construction are exactly the kept property columns plus the geometry
-/// column — over the first [`SINK_SAMPLE_MAX_ROWS`] rows (or
-/// [`SINK_SAMPLE_MAX_BATCHES`] batches), and, when that rate projects the
-/// whole buffered set past the budget, downgrades the Ram sinks to Spill
-/// **once**.
+/// column — for **every** buffered batch of the pass, and after each input
+/// batch projects the whole buffered set as *bytes already buffered + the
+/// not-yet-buffered planned rows at the running average rate*. When that
+/// passes the budget it downgrades the Ram sinks to Spill **once**.
+///
+/// The check never stops. A spatially sorted input can put its sparse rows
+/// first, so no prefix of the input can vouch for the rest; and because the
+/// bytes already buffered are a term of the projection, the downgrade fires
+/// at the latest when what the Ram sinks actually hold reaches the budget,
+/// however light the head was and however wrong the planned row count is.
 ///
 /// One-way and once: a sink that has spilled never comes back, so the engine
 /// cannot oscillate and no batch is ever written twice. `bounded` and `speed`
@@ -793,18 +791,18 @@ pub(super) struct SinkMeasurement {
 /// integer adds per batch.
 ///
 /// **Known biases**, both toward spilling early (the safe direction):
-/// `RecordBatch::get_array_memory_size` reports allocated buffer capacity,
-/// not live bytes, and a cascading duplicating fold (#499) can hand two
-/// levels the same `Arc`'d geometry array, which this counts once per level
-/// while RAM holds it once. The remaining bias has no sign: the sample is the
-/// FIRST rows of the input, so a spatially sorted input whose dense regions
-/// sort late is measured on its sparse head.
+/// `RecordBatch::get_array_memory_size` reports allocated buffer capacity, not
+/// live bytes; and it includes each array's fixed struct overhead, which a
+/// coarse level's few-row batches amortize over few rows, so the average
+/// rate reads higher than the per-row data alone. Both are real allocations
+/// while the batches sit in RAM, so neither is corrected for. The remaining
+/// bias has no sign: the remainder is projected at the average of the rows
+/// seen so far, so a heavy tail is caught as it is buffered, not before.
 struct SinkAutoTuner {
+    /// Output rows observed so far (every buffered row of the pass).
     rows: usize,
+    /// Arrow array bytes of those rows, floor excluded.
     bytes: u64,
-    batches: usize,
-    /// The sampling window is over; `bytes`/`rows` no longer move.
-    closed: bool,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
     /// [`AUTO_RAM_FRACTION`] × available RAM, captured once.
@@ -841,8 +839,6 @@ impl SinkAutoTuner {
         Self {
             rows: 0,
             bytes: 0,
-            batches: 0,
-            closed: false,
             planned_rows,
             budget_bytes,
             armed,
@@ -850,18 +846,13 @@ impl SinkAutoTuner {
         }
     }
 
-    /// Fold one output batch — the exact value about to be buffered — into the
-    /// sample, until the window closes.
+    /// Fold one output batch — the exact value about to be buffered — into
+    /// the measurement. Runs for every batch of the pass.
     fn observe(&mut self, batch: &RecordBatch) {
-        if self.closed {
-            return;
-        }
         self.rows += batch.num_rows();
-        self.bytes += batch.get_array_memory_size() as u64;
-        self.batches += 1;
-        if self.rows >= SINK_SAMPLE_MAX_ROWS || self.batches >= SINK_SAMPLE_MAX_BATCHES {
-            self.closed = true;
-        }
+        self.bytes = self
+            .bytes
+            .saturating_add(batch.get_array_memory_size() as u64);
     }
 
     /// Measured retained bytes per buffered output row, floor included.
@@ -871,14 +862,21 @@ impl SinkAutoTuner {
             .then(|| SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(self.bytes / self.rows as u64))
     }
 
-    /// What the whole buffered set would cost in RAM at the measured rate.
+    /// What the whole buffered set costs in RAM: the bytes already buffered
+    /// (floor included) plus the planned rows not yet seen at the measured
+    /// rate. Never below what is already held, even when the plan
+    /// under-counts the rows.
     fn projected_bytes(&self) -> u64 {
         self.bytes_per_row().map_or(0, |per_row| {
-            (self.planned_rows as u64).saturating_mul(per_row)
+            let held = self
+                .bytes
+                .saturating_add((self.rows as u64).saturating_mul(SINK_ROW_ALLOC_OVERHEAD_BYTES));
+            let remaining = self.planned_rows.saturating_sub(self.rows) as u64;
+            held.saturating_add(remaining.saturating_mul(per_row))
         })
     }
 
-    /// Whether the sample now says the Ram sinks cannot hold the run.
+    /// Whether the measurement now says the Ram sinks cannot hold the run.
     fn should_downgrade(&self) -> bool {
         self.armed
             && !self.downgraded
@@ -2163,7 +2161,7 @@ pub(super) fn run_pass2_buffered(
                 }
                 if tuner_ref.should_downgrade() {
                     log::warn!(
-                        "[convert] pass2 auto: measured {} B per buffered row over {} sampled \
+                        "[convert] pass2 auto: measured {} B per buffered row over {} buffered \
                          row(s) projects {:.1} GiB for the buffered set — past the {:.1} GiB \
                          budget; downgrading {num_levels} RAM sink(s) to spill (#626)",
                         tuner_ref.bytes_per_row().unwrap_or(0),
@@ -2210,8 +2208,8 @@ pub(super) fn run_pass2_buffered(
         // level so a sizing regression is visible in an ordinary run log, not
         // just in `TYLERTOO_PROFILE_JSON`.
         log::info!(
-            "[convert] pass2 sink: measured {per_row} B per buffered row over {} sampled \
-             row(s) → {:.1} GiB projected for {} buffered row(s){}",
+            "[convert] pass2 sink: measured {per_row} B per buffered row over {} buffered \
+             row(s) → {:.1} GiB for {} planned buffered row(s){}",
             tuner.rows,
             gib(tuner.projected_bytes()),
             tuner.planned_rows,
@@ -2789,47 +2787,80 @@ mod sink_sample_tests {
         }
     }
 
-    /// The sampling window closes, and the rate stops moving with it.
+    /// The measurement has no window: batches far into the pass still move
+    /// the rate, so nothing seen late is ignored.
     #[test]
-    fn the_sample_window_closes_and_freezes_the_rate() {
+    fn the_rate_keeps_moving_for_the_whole_pass() {
         let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
-        for _ in 0..SINK_SAMPLE_MAX_BATCHES {
+        for _ in 0..1_000 {
             tuner.observe(&sample_batch(1));
         }
-        assert!(
-            tuner.closed,
-            "{SINK_SAMPLE_MAX_BATCHES} batches must close it"
-        );
-        let frozen = tuner.bytes_per_row();
-        // A far heavier batch after the window must not move the figure.
+        let before = tuner.bytes_per_row().unwrap();
         tuner.observe(&sample_batch(200));
-        assert_eq!(tuner.bytes_per_row(), frozen);
-        assert_eq!(tuner.rows, SINK_SAMPLE_MAX_BATCHES * ROWS);
+        assert!(
+            tuner.bytes_per_row().unwrap() > before,
+            "a heavy batch after 1000 light ones must raise the rate"
+        );
+        assert_eq!(tuner.rows, 1_001 * ROWS);
     }
 
-    /// The row-limit arm of the window (`SINK_SAMPLE_MAX_ROWS`), reached
-    /// before the batch limit.
+    /// A spatially sorted input can put its sparse rows first. A light head
+    /// that fits the budget must not vouch for a heavy tail that does not:
+    /// the check runs for the whole pass, so the tail trips the downgrade.
     #[test]
-    fn the_sample_window_also_closes_on_rows() {
-        let mut tuner = SinkAutoTuner::with_budget(false, ROWS, 0);
-        let big = {
-            let mut fields = vec![Field::new("geometry", DataType::Binary, false)];
-            fields.push(Field::new("p0", DataType::Float64, false));
-            let n = SINK_SAMPLE_MAX_ROWS;
-            RecordBatch::try_new(
-                Arc::new(Schema::new(fields)),
-                vec![
-                    Arc::new(BinaryArray::from_iter_values(
-                        (0..n).map(|i| (i as u64).to_le_bytes()),
-                    )) as ArrayRef,
-                    Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64))),
-                ],
-            )
-            .unwrap()
-        };
-        tuner.observe(&big);
-        assert!(tuner.closed);
-        assert_eq!(tuner.batches, 1);
+    fn a_light_head_does_not_hide_a_heavy_tail() {
+        const HEAD: usize = 64;
+        const TAIL: usize = 64;
+        let planned = (HEAD + TAIL) * ROWS;
+        // Between what the light head projects (~0.15 GB) and what the heavy
+        // tail alone buffers (~0.4 GB).
+        let budget = 300_000_000;
+        let mut tuner = SinkAutoTuner::with_budget(true, planned, budget);
+        for _ in 0..HEAD {
+            tuner.observe(&sample_batch(0));
+            assert!(
+                !tuner.should_downgrade(),
+                "the light head projects {} B — under the {budget} B budget",
+                tuner.projected_bytes(),
+            );
+        }
+        let mut fired = false;
+        for _ in 0..TAIL {
+            tuner.observe(&sample_batch(200));
+            if tuner.should_downgrade() {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "a heavy tail buffering past the {budget} B budget must downgrade; last \
+             projection {} B over {} observed rows",
+            tuner.projected_bytes(),
+            tuner.rows,
+        );
+    }
+
+    /// The bytes actually buffered are a floor on the projection: when the
+    /// plan under-counts the rows, what is already held still trips the
+    /// downgrade once it crosses the budget.
+    #[test]
+    fn bytes_already_buffered_past_the_budget_always_downgrade() {
+        let budget = 10_000_000;
+        // The plan claims one batch; the run delivers many.
+        let mut tuner = SinkAutoTuner::with_budget(true, ROWS, budget);
+        let mut observed = 0u64;
+        while observed <= budget {
+            let b = sample_batch(200);
+            observed += b.get_array_memory_size() as u64;
+            tuner.observe(&b);
+        }
+        assert!(
+            tuner.should_downgrade(),
+            "{observed} B already buffered is past the {budget} B budget, but the \
+             projection says {} B",
+            tuner.projected_bytes(),
+        );
     }
 
     /// The load-bearing safety property (#626 item 2): a downgrade must not
