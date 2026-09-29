@@ -714,7 +714,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::accumulat
 pub const tylertoo_core::overview::accumulate::ACCUMULATE_CELL_GSD: f64
 pub fn tylertoo_core::overview::accumulate::is_carrier(&[usize], usize) -> bool
 pub fn tylertoo_core::overview::accumulate::level_accumulates(tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::simplify::Representation) -> bool
-pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&[tylertoo_core::overview::assign::AssignFeature], &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs, f64) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
+pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs, f64) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
 pub mod tylertoo_core::overview::assign
 pub enum tylertoo_core::overview::assign::Crs
 pub tylertoo_core::overview::assign::Crs::Epsg3857
@@ -831,7 +831,11 @@ impl core::clone::Clone for tylertoo_core::overview::assign::AssignFeature
 pub fn tylertoo_core::overview::assign::AssignFeature::clone(&self) -> tylertoo_core::overview::assign::AssignFeature
 impl core::fmt::Debug for tylertoo_core::overview::assign::AssignFeature
 pub fn tylertoo_core::overview::assign::AssignFeature::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::FromIterator<tylertoo_core::overview::assign::AssignFeature> for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::from_iter<I: core::iter::traits::collect::IntoIterator<Item = tylertoo_core::overview::assign::AssignFeature>>(I) -> Self
 impl core::marker::Copy for tylertoo_core::overview::assign::AssignFeature
+impl<'a> core::iter::traits::collect::FromIterator<&'a tylertoo_core::overview::assign::AssignFeature> for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::from_iter<I: core::iter::traits::collect::IntoIterator<Item = &'a tylertoo_core::overview::assign::AssignFeature>>(I) -> Self
 impl core::marker::Freeze for tylertoo_core::overview::assign::AssignFeature
 impl core::marker::Send for tylertoo_core::overview::assign::AssignFeature
 impl core::marker::Sync for tylertoo_core::overview::assign::AssignFeature
@@ -893,14 +897,53 @@ impl core::marker::Unpin for tylertoo_core::overview::assign::FeatureAssignment
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::assign::FeatureAssignment
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::assign::FeatureAssignment
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::assign::FeatureAssignment
+pub struct tylertoo_core::overview::assign::FeatureTable
+impl tylertoo_core::overview::assign::FeatureTable
+pub const tylertoo_core::overview::assign::FeatureTable::BASE_BYTES_PER_ROW: u64
+pub const tylertoo_core::overview::assign::FeatureTable::MAX_BYTES_PER_ROW: u64
+pub fn tylertoo_core::overview::assign::FeatureTable::allocated_bytes(&self) -> u64
+pub fn tylertoo_core::overview::assign::FeatureTable::append_rebased(&mut self, &tylertoo_core::overview::assign::FeatureTable, usize)
+pub fn tylertoo_core::overview::assign::FeatureTable::bytes_per_row(&self) -> u64
+pub fn tylertoo_core::overview::assign::FeatureTable::entry_level(&self, usize) -> core::option::Option<u8>
+pub fn tylertoo_core::overview::assign::FeatureTable::heap_bytes(&self) -> u64
+pub fn tylertoo_core::overview::assign::FeatureTable::indices(&self) -> &[usize]
+pub fn tylertoo_core::overview::assign::FeatureTable::is_empty(&self) -> bool
+pub fn tylertoo_core::overview::assign::FeatureTable::kind(&self, usize) -> tylertoo_core::overview::assign::FeatureKind
+pub fn tylertoo_core::overview::assign::FeatureTable::len(&self) -> usize
+pub fn tylertoo_core::overview::assign::FeatureTable::new() -> Self
+pub fn tylertoo_core::overview::assign::FeatureTable::push(&mut self, &tylertoo_core::overview::assign::AssignFeature)
+pub fn tylertoo_core::overview::assign::FeatureTable::set_entry_level(&mut self, usize, core::option::Option<u8>)
+pub fn tylertoo_core::overview::assign::FeatureTable::set_sort_key(&mut self, usize, core::option::Option<f64>)
+pub fn tylertoo_core::overview::assign::FeatureTable::sort_key(&self, usize) -> core::option::Option<f64>
+pub fn tylertoo_core::overview::assign::FeatureTable::try_reserve_exact(&mut self, usize) -> core::result::Result<(), alloc::collections::TryReserveError>
+pub fn tylertoo_core::overview::assign::FeatureTable::with_capacity(usize) -> Self
+impl core::clone::Clone for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::clone(&self) -> tylertoo_core::overview::assign::FeatureTable
+impl core::convert::From<alloc::vec::Vec<tylertoo_core::overview::assign::AssignFeature>> for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::from(alloc::vec::Vec<tylertoo_core::overview::assign::AssignFeature>) -> Self
+impl core::default::Default for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::default() -> tylertoo_core::overview::assign::FeatureTable
+impl core::fmt::Debug for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::collect::FromIterator<tylertoo_core::overview::assign::AssignFeature> for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::from_iter<I: core::iter::traits::collect::IntoIterator<Item = tylertoo_core::overview::assign::AssignFeature>>(I) -> Self
+impl<'a> core::iter::traits::collect::FromIterator<&'a tylertoo_core::overview::assign::AssignFeature> for tylertoo_core::overview::assign::FeatureTable
+pub fn tylertoo_core::overview::assign::FeatureTable::from_iter<I: core::iter::traits::collect::IntoIterator<Item = &'a tylertoo_core::overview::assign::AssignFeature>>(I) -> Self
+impl core::marker::Freeze for tylertoo_core::overview::assign::FeatureTable
+impl core::marker::Send for tylertoo_core::overview::assign::FeatureTable
+impl core::marker::Sync for tylertoo_core::overview::assign::FeatureTable
+impl core::marker::Unpin for tylertoo_core::overview::assign::FeatureTable
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::assign::FeatureTable
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::assign::FeatureTable
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::assign::FeatureTable
 pub const tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT: f64
 pub const tylertoo_core::overview::assign::METERS_PER_DEGREE: f64
 pub const tylertoo_core::overview::assign::MIN_DENSITY_LEVEL_FEATURES: usize
 pub const tylertoo_core::overview::assign::SUPERCELL_GSD_FACTOR: f64
-pub fn tylertoo_core::overview::assign::apply_density_budget(&tylertoo_core::overview::assign::Assignment, &[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::assign::DensityBudgetConfig, tylertoo_core::overview::level::Crs) -> tylertoo_core::overview::assign::Assignment
-pub fn tylertoo_core::overview::assign::assign_levels(&[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs) -> tylertoo_core::overview::assign::Assignment
-pub fn tylertoo_core::overview::assign::assign_levels_banded(&[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
-pub fn tylertoo_core::overview::assign::assign_levels_bounded(&[tylertoo_core::overview::assign::AssignFeature], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, u64, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
+pub fn tylertoo_core::overview::assign::apply_density_budget(&tylertoo_core::overview::assign::Assignment, &tylertoo_core::overview::assign::FeatureTable, &[f64], &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::assign::DensityBudgetConfig, tylertoo_core::overview::level::Crs) -> tylertoo_core::overview::assign::Assignment
+pub fn tylertoo_core::overview::assign::assign_levels(&tylertoo_core::overview::assign::FeatureTable, &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs) -> tylertoo_core::overview::assign::Assignment
+pub fn tylertoo_core::overview::assign::assign_levels_banded(&tylertoo_core::overview::assign::FeatureTable, &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
+pub fn tylertoo_core::overview::assign::assign_levels_bounded(&tylertoo_core::overview::assign::FeatureTable, &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, u64, &[tylertoo_core::overview::simplify::Representation]) -> tylertoo_core::overview::assign::Assignment
 pub fn tylertoo_core::overview::assign::gsd_to_coord_units(f64, tylertoo_core::overview::level::Crs) -> f64
 pub mod tylertoo_core::overview::auto_zoom
 pub enum tylertoo_core::overview::auto_zoom::MaxZoom
@@ -1082,8 +1125,8 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::cluster::ClusterEntr
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::cluster::ClusterEntry
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::cluster::ClusterEntry
 pub const tylertoo_core::overview::cluster::POINT_COUNT_COLUMN: &str
-pub fn tylertoo_core::overview::cluster::build_cluster_tables(&[tylertoo_core::overview::assign::AssignFeature], &[u8], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, &[alloc::vec::Vec<core::option::Option<f64>>], &[tylertoo_core::overview::cluster::AccumulateOp]) -> tylertoo_core::overview::cluster::ClusterTables
-pub fn tylertoo_core::overview::cluster::verify_sum_invariant(&[tylertoo_core::overview::assign::AssignFeature], &[u8], &tylertoo_core::overview::cluster::ClusterTables) -> core::result::Result<(), alloc::string::String>
+pub fn tylertoo_core::overview::cluster::build_cluster_tables(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f64], &tylertoo_core::overview::assign::AssignConfig, tylertoo_core::overview::level::Crs, &[alloc::vec::Vec<core::option::Option<f64>>], &[tylertoo_core::overview::cluster::AccumulateOp]) -> tylertoo_core::overview::cluster::ClusterTables
+pub fn tylertoo_core::overview::cluster::verify_sum_invariant(&tylertoo_core::overview::assign::FeatureTable, &[u8], &tylertoo_core::overview::cluster::ClusterTables) -> core::result::Result<(), alloc::string::String>
 pub type tylertoo_core::overview::cluster::ClusterTables = alloc::vec::Vec<std::collections::hash::map::HashMap<usize, tylertoo_core::overview::cluster::ClusterEntry>>
 pub mod tylertoo_core::overview::coalesce
 pub struct tylertoo_core::overview::coalesce::CoalesceInput<'a>
