@@ -83,6 +83,7 @@ use super::level::{
     Generalization, Level, Mode, OverviewValidationError, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY,
     SPEC_VERSION,
 };
+use crate::wkb_column::check_wkb_column;
 
 /// Name of the mandatory level column (§4.1).
 pub const LEVEL_COLUMN: &str = "level";
@@ -332,6 +333,12 @@ pub struct OverviewWriter<W: Write + Send> {
     /// bbox-covering struct columns whose name collides with the covering the
     /// encoder will generate (§4.4). See [`Self::try_new`].
     drop_indices: Vec<usize>,
+    /// Source columns holding raw WKB (`geoarrow.wkb`), with their names.
+    /// The primary geometry column arrives as a native GeoArrow array; any
+    /// other geometry column is passed through from the input, and the
+    /// geoparquet encoder parses it with the `wkb` crate's reader, so it is
+    /// checked first (#632).
+    wkb_columns: Vec<(usize, String)>,
     /// `row_group_end` recorded for each completed (non-empty) level.
     level_row_group_ends: Vec<i64>,
     /// For each completed level, the index of its declared
@@ -486,6 +493,18 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map(|(i, _)| i)
             .collect();
 
+        let wkb_columns: Vec<(usize, String)> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.metadata()
+                    .get(EXTENSION_TYPE_NAME_KEY)
+                    .is_some_and(|name| name == "geoarrow.wkb")
+            })
+            .map(|(i, f)| (i, f.name().clone()))
+            .collect();
+
         // Augment schema: retained source fields + NOT NULL Int32 `level`
         // column (§4.1).
         let mut fields: Vec<Arc<Field>> = source_schema
@@ -531,6 +550,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             augmented_schema,
             options,
             drop_indices,
+            wkb_columns,
             level_row_group_ends: Vec::new(),
             written_spec_indices: Vec::new(),
             next_level_idx: 0,
@@ -703,12 +723,21 @@ impl<W: Write + Send> OverviewWriter<W> {
 
     /// Append the NOT NULL `level` column (§4.1) — set to the level's physical
     /// index — after dropping any colliding pre-existing covering column(s)
-    /// (§4.4). Pure per-batch shaping; no encoding happens here.
+    /// (§4.4). No encoding happens here, but the passed-through WKB columns
+    /// are checked, since the encoder is the next thing to read them.
     fn augment_batch(
         &self,
         batch: &RecordBatch,
         physical_idx: usize,
     ) -> Result<RecordBatch, WriterError> {
+        for (idx, name) in &self.wkb_columns {
+            check_wkb_column(batch.column(*idx).as_ref()).map_err(|(row, e)| {
+                WriterError::GeoParquet(format!(
+                    "invalid geometry in column {name:?} (row {row} of a level-{physical_idx} \
+                     batch): {e}"
+                ))
+            })?;
+        }
         let num_rows = batch.num_rows();
         let level_array = Int32Array::from(vec![physical_idx as i32; num_rows]);
         let mut columns: Vec<_> = batch
