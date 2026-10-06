@@ -1583,6 +1583,17 @@ If pass 1 scanned nothing, it uses about 8 KiB per duplicating row or
 rows. The log reports the average, estimate, budget, and decision.
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the detected available RAM.
 
+That estimate counts geometry only, so a run that starts in RAM keeps
+measuring for the whole pass (#626). It sums the Arrow bytes of every
+buffered batch, geometry plus every kept property column, with a 256-byte
+floor per row. After each input batch, it adds the bytes already buffered to
+the rows still to come at the rate so far. If that total passes the budget,
+`auto` moves the buffered rows to spill files once and spills for the rest of
+the pass. Row order and output bytes do not change. The switch happens no
+later than the moment the buffered bytes reach the budget. The log and
+`TYLERTOO_PROFILE_JSON` (`pass2.sink`) report the measured bytes per row and
+whether it switched. `speed` and `bounded` never switch.
+
 ### Pass-1 winner grids
 
 Level assignment builds one winner grid per coarse level. Concurrent grids

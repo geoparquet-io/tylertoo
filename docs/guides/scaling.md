@@ -44,7 +44,7 @@ Pass 2 buffers each output level before writing it:
 | --- | --- |
 | `speed` | RAM |
 | `bounded` | Temporary Arrow Inter-Process Communication (IPC) files |
-| `auto` (default) | Estimates memory from feature and level counts and spills above a fraction of available RAM |
+| `auto` (default) | Estimates memory from feature and level counts and spills above a fraction of available RAM. Measures buffered rows and switches to spilling mid-pass if they outgrow it |
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
@@ -71,7 +71,9 @@ Resident batches include those in flight, each worker's read-ahead queue,
 and, under `bounded`, up to three per level in spill writers. Read-ahead gets
 10% of available RAM, so smaller machines get fewer workers. `bounded`
 halves each queue. The estimate allows about 4 KiB per row plus twice its
-measured geometry bytes. Wide schemas with large strings can exceed it.
+measured geometry bytes. Unlike the pass-2 buffers, tylertoo sizes the read-ahead
+before pass 2 reads a row, so it cannot correct itself. Wide schemas with
+large strings can exceed it.
 Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 ### Spill files
@@ -289,6 +291,25 @@ footers and compare it with available memory:
 `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` (or `true`, `yes`, `on`) turns the error
 into a warning. Off Linux, the check only runs if you set
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. A `--plan` replay skips it.
+
+**Wide property schemas need more.** The 2.5 multiplier assumes buffered rows
+are mostly geometry. A buffered row also carries every kept property column,
+so a schema with dozens or hundreds of columns can cost far more per row.
+Under `auto`, pass 2 measures this cost and spills mid-pass when it would
+exceed the budget (#626). To size a machine for it:
+
+- Run once over a subset with `TYLERTOO_PROFILE_JSON` set. It reports the
+  measured cost as `pass2.sink.bytes_per_row`, and the info log prints
+  `pass2 sink: measured N B per buffered row`. Multiply it by the buffered
+  row count the plan expects.
+- Drop columns you never style on with `--include-property` or
+  `--exclude-property`. tylertoo never decodes an excluded column.
+- Skip pass 2 in the coarse job with `--save-plan PATH --plan-only`. It stops
+  after level assignment, so property width costs it nothing. The pass-1
+  floor and the preflight still apply.
+
+The pass-1 feature table is still neither measured per schema nor spillable
+(#543).
 
 **Line coalescing needs extra memory.** tylertoo enables it by default. Below
 the coalescing ceiling, line geometry stays resident through pass 1, costing up

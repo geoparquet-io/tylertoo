@@ -102,7 +102,30 @@ not "the run was not profiled".
       "total": 26909,               // 0/0 when the fold never ran: a Serial
                                     // run, or a single-level ladder
       "ratio": 0.0606
-    }
+    },
+    "sink": {                       // #626: the MEASURED cost of a buffered
+      "bytes_per_row": 1872,        // output row — geometry + every kept
+                                    // property column — plus a 256 B
+                                    // allocator floor; null when nothing
+                                    // was buffered
+      "sampled_rows": 65536,        // buffered rows measured: every one
+                                    // of the pass
+      "projected_bytes": 12275712,  // bytes buffered + rows still planned
+                                    // x bytes_per_row; at the end of the
+                                    // pass, what was actually buffered
+      "budget_bytes": 34359738368,  // AUTO_RAM_FRACTION x available RAM; 0
+                                    // under bounded/speed, which never
+                                    // probe it
+      "downgraded_to_spill": false  // auto flipped the RAM sinks to spill
+    }                               // mid-pass because the projection
+  },                                // passed the budget
+  "pass1_memory_preflight": {       // #543: the pre-scan verdict
+    "verdict": "fits",              // fits | warned | exceeded_but_forced |
+                                    // not_checked (a --plan replay)
+    "rows": 1000,                   // footer-counted input rows
+    "estimated_bytes": 64000,       // rows x PASS1_BYTES_PER_ROW (64)
+    "limit_bytes": 34359738368,     // the probed figure; null if unprobed
+    "limit_source": "available memory (MemAvailable)"
   },
   "levels": [                       // per WRITTEN level, writer order
     { "rows": 1000, "spill_bytes": 0 }
@@ -126,6 +149,36 @@ not "the run was not profiled".
   "memory_profile": "auto"          // the resolved MemoryProfile
 }
 ```
+
+### `pass2.sink` and `pass1_memory_preflight` (#626, #543)
+
+These two are the memory-sizing pair, and they bracket the run.
+
+`pass1_memory_preflight` is decided **before any data page is read**, from
+footer row counts alone: `rows × 64 B` for the pass-1 feature table against a
+fresh, source-attributed memory probe. A `warned` verdict on a job that then
+died is the single most useful line in this dump. `not_checked` means a
+`--plan` replay, which builds no feature table.
+
+`pass2.sink` is decided **during** pass 2, by measurement rather than model.
+`bytes_per_row` is the real retained cost of one buffered output row — the
+Arrow bytes of the geometry column plus every kept property column, averaged
+over every buffered row of the pass, plus a 256-byte allocator floor. Before
+#626 `auto` charged a flat 4 KiB/row for the property columns without ever
+looking at them. Now, after each input batch, `auto` projects the bytes
+already buffered plus the rows still to come at the rate so far; when that
+passes `budget_bytes` it flushes the RAM sinks into spill files once mid-pass
+and `downgraded_to_spill` records it. The check runs for the whole pass, so a
+spatially sorted input with a sparse head and a dense tail is caught as the
+tail is buffered — at the latest when the bytes actually buffered reach the
+budget. Two known biases, both toward spilling early:
+`RecordBatch::get_array_memory_size` reports allocated capacity rather than
+live bytes, and it includes each array's fixed struct overhead, which a
+coarse level's few-row batches spread over few rows. Both are real RAM while
+the batches are held, so neither is subtracted.
+
+See `docs/guides/scaling.md` (*Sizing the coarse job's memory*) for how to turn `bytes_per_row`
+into a box size.
 
 ### `peak_rss_mib` vs `rss_sampler` (#571)
 
