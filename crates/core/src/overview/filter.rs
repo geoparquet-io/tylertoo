@@ -3,7 +3,7 @@
 //! A small SQL-WHERE-style predicate over the input's property columns,
 //! evaluated during the pass-1 scan so it composes with `--bbox` and feeds
 //! the same downstream pipeline: a row the predicate does not accept simply
-//! never produces an [`AssignFeature`], exactly like a bbox miss.
+//! never produces an `AssignFeature`, exactly like a bbox miss.
 //!
 //! # Grammar (hand-rolled recursive descent — no new dependencies)
 //!
@@ -45,7 +45,7 @@
 //! when writers truncate them, so bound-based pruning stays correct.
 //!
 //! Numeric comparisons are performed in `f64` (through the ranking path's
-//! [`extract_numeric_values`]); Int64 statistics outside the exact-`f64`
+//! `extract_numeric_values`); Int64 statistics outside the exact-`f64`
 //! range (|v| >= 2^53) are widened before pruning so rounding can never prune
 //! a matching row group. A NaN — nodata in most float columns, and a value no
 //! comparison can answer — evaluates to UNKNOWN like a null rather than to

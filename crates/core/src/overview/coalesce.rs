@@ -31,12 +31,12 @@
 //!    continue each other within that deviation of straight merge
 //!    best-pair first (stroke building).
 //! 3. The merged feature takes the attributes of its **highest-priority
-//!    member** (the same [`Priority`] order the cell-winner stage uses),
+//!    member** (the same `Priority` order the cell-winner stage uses),
 //!    and records the number of merged source segments
 //!    (`coalesced_count`, 1 for unmerged).
 //! 4. The **visibility gate** and **cell-winner thinning** then run on the
 //!    merged chains (gate on the chain's bbox diagonal; one chain per
-//!    `line_thinning × GSD` grid cell, best [`Priority`] wins).
+//!    `line_thinning × GSD` grid cell, best `Priority` wins).
 //!
 //! The canonical level is NEVER coalesced (spec §2.4 value fidelity), and
 //! coalescing is INERT in partitioning mode (merged geometries violate
@@ -64,7 +64,7 @@
 //!
 //! Segments are processed in input order; joins are a pure function of the
 //! endpoint grid; walk starts are chosen by smallest feature index; ties in
-//! gating/thinning fall back to the strict [`Priority`] total order. No
+//! gating/thinning fall back to the strict `Priority` total order. No
 //! result depends on hash-map iteration order.
 
 use std::borrow::Cow;

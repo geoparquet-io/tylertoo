@@ -27,7 +27,7 @@
 //!
 //! - **L1**, a bounded in-memory cache (insertion-order eviction) sized to the
 //!   largest row group's working set (floored at
-//!   [`remote::CHUNK_CACHE_MAX_BYTES`]), so a row group larger than the floor
+//!   `remote::CHUNK_CACHE_MAX_BYTES`), so a row group larger than the floor
 //!   does not thrash — the fix for the per-page re-fetch of an oversized column
 //!   chunk (issue #261);
 //! - **L2**, a local on-disk spill of every chunk ever fetched, so a chunk
@@ -42,7 +42,7 @@
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
-//! fail with a clear [`InputError::RemoteDisabled`] error.
+//! fail with a clear `InputError::RemoteDisabled` error.
 
 use std::fs::File;
 use std::io::Read;
@@ -252,7 +252,7 @@ impl InputSource {
     /// multi-pass streaming pipeline pays the footer fetch only once.
     ///
     /// Callers that open the same input REPEATEDLY — the pass-2 reader
-    /// segments, above all — should use [`Self::open_with_metadata`] instead:
+    /// segments, above all — should use `Self::open_with_metadata` instead:
     /// a local footer parse is cheap once and quadratic in row groups times
     /// columns when paid per reader.
     pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {

@@ -159,7 +159,7 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 /// * a cross or dot product of two differences (the cleaner's
 ///   `segments_meet`, `ring_is_simple`, `node_insert`, `point_in_ring`
 ///   tests) is at most 2^25 · 2^25 + 2^25 · 2^25 = 2^51;
-/// * a shoelace term `x0·y1 - x1·y0` in [`ring_area2`] is at most
+/// * a shoelace term `x0·y1 - x1·y0` in `ring_area2` is at most
 ///   2 · 2^24 · 2^24 = 2^49, and the sum is accumulated in `i128`, which
 ///   holds 2^78 such terms — no ring length can overflow it;
 /// * a MoveTo/LineTo delta is at most 2^25, which zigzag-encodes without
@@ -167,7 +167,7 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 ///
 /// 2^24 is also the largest power of two at which every integer is exactly
 /// representable in `f64`, so a clamped value survives the round trip
-/// through the `f64` overlay in [`tile_rings_to_polygon`] unchanged, and it
+/// through the `f64` overlay in `tile_rings_to_polygon` unchanged, and it
 /// leaves three orders of magnitude of headroom over the largest tile
 /// extent plus buffer in practical use (65536 + buffer).
 ///

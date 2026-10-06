@@ -22,7 +22,7 @@ use crate::{Error, Result};
 /// If the path is a file, returns it as a single-element vector.
 /// If the path is a directory, recursively collects all .parquet files
 /// (sorted; `.`/`_`-prefixed basenames such as `_SUCCESS` are skipped —
-/// the collection lives in [`crate::input_set::list_parquet_files`], shared
+/// the collection lives in `crate::input_set::list_parquet_files`, shared
 /// with the multi-partition [`crate::input_set::ConvertSource`]).
 pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {

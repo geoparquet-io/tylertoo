@@ -236,7 +236,7 @@ struct BboxCovering {
 /// * `geo_json` - The JSON string from the "geo" key-value metadata
 /// * `geom_column` - the column whose covering is wanted: for pruning, the
 ///   column the rest of the pipeline will actually read
-///   ([`resolve_geometry_column_name`]). `None` means the caller has no
+///   (`resolve_geometry_column_name`). `None` means the caller has no
 ///   column in hand, and then the spec-REQUIRED `primary_column` is the only
 ///   thing consulted.
 ///

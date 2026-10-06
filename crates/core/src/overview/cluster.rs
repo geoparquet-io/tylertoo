@@ -15,7 +15,7 @@
 //! - Every source point feature is assigned exactly one representative among
 //!   the rows *present* at `L` (`min_level <= L`): itself if present, else the
 //!   best-priority present point feature in its level-`L` grid cell (the same
-//!   cell size and [`Priority`] order the cell-winner stage used).
+//!   cell size and `Priority` order the cell-winner stage used).
 //! - `point_count` of a present row at level `L` = the number of source
 //!   features it represents at that level (itself + absorbed). At the
 //!   canonical (finest) level every cluster is a singleton (`point_count = 1`).
@@ -36,7 +36,7 @@
 //! are resolved deterministically: the cell's features attach to the present
 //! point feature nearest (Euclidean) to the orphan cell's center, over every
 //! present point of the level, found by one scan over the present cells
-//! (ties broken by [`Priority`], then input position). This keeps
+//! (ties broken by `Priority`, then input position). This keeps
 //! the invariant *Σ point_count over a level's point rows = total source
 //! point count* whenever the level has at least one point row.
 //!

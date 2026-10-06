@@ -58,7 +58,7 @@ impl Band {
     ///   cannot express, `=` being invalid in a zoom range.
     ///
     /// Which one a spec is in is decided by whichever of `:` and `=` closes
-    /// the zoom range, i.e. whichever comes first ([`band_separator`]).
+    /// the zoom range, i.e. whichever comes first (`band_separator`).
     ///
     /// In the `:` form the remainder is the INPUT, *unless* its last
     /// colon-separated segment is a bare layer token — no `/`, `\` or `:`.
@@ -317,7 +317,7 @@ pub enum BandSource {
 /// error case, only two classifications, and a `scheme://foo.pmtiles` input
 /// classifies as `Source` exactly like any other remote path (it will only
 /// fail later, obscurely, inside the parquet reader). [`validate_bands`]
-/// applies [`remote_archive_rejection`] up front to every band before any
+/// applies `remote_archive_rejection` up front to every band before any
 /// band is tiled; a caller that classifies bands without going through
 /// `validate_bands` first (or `build_pyramid`, which calls it) must apply
 /// `remote_archive_rejection` itself to get that check.

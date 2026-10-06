@@ -2,7 +2,7 @@
 //!
 //! # Why this module exists (vs. `crate::simplify`)
 //!
-//! The crate-level [`crate::simplify`] module simplifies in **tile-local
+//! The crate-level `crate::simplify` module simplifies in **tile-local
 //! pixel space**: every entry point transforms geometry into a
 //! `TileCoord` + `extent` (0–4096) pixel frame, runs Ramer–Douglas–Peucker
 //! (RDP), and transforms back. That is correct for MVT tile generation but
@@ -556,12 +556,12 @@ fn polygonal_representative_point(geom: &Geometry<f64>) -> Option<Simplified> {
 /// [`Representation::Geometry`] is exactly [`simplify_for_level`]. On a
 /// [`Representation::Point`] level (a zoom-band point level), polygonal
 /// geometry is replaced by its representative point
-/// ([`polygonal_representative_point`]) — unconditionally, with no
+/// (`polygonal_representative_point`) — unconditionally, with no
 /// visibility gating (a dot is always visible) — while points pass through
 /// and lines keep the normal simplification path. On a
 /// [`Representation::Square`] level (#279), simplification is normal but
 /// below-tolerance polygons emit area-dithered placeholder squares
-/// ([`squarify_polygon`]) instead of following the global [`CollapseMode`].
+/// (`squarify_polygon`) instead of following the global [`CollapseMode`].
 pub fn simplify_step(
     geom: &Geometry<f64>,
     gsd_meters: f64,
@@ -660,7 +660,7 @@ pub(super) fn simplify_step_checked(
 /// An empty chain is the identity (bit-identical clone), matching
 /// [`simplify_for_level`]'s canonical path at zero tolerance.
 ///
-/// The step rules live in [`CascadeFold`], which the pipelined engine's
+/// The step rules live in `CascadeFold`, which the pipelined engine's
 /// incremental fold (`overview::stream::process_batch_cascade`) drives too;
 /// equivalence is enforced by
 /// `overview::convert::tests::pipelined_matches_serial`.

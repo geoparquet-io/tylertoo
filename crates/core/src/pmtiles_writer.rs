@@ -1,6 +1,6 @@
 //! PMTiles v3 writer implementation.
 //!
-//! Implements the PMTiles v3 spec: https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md
+//! Implements the PMTiles v3 spec: <https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md>
 //!
 //! Key design decisions:
 //! - Uses Hilbert curve ordering for tile IDs (spatial locality)
@@ -974,9 +974,9 @@ pub(crate) fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)
 /// Whether the PMTiles archive at `path` is genuinely clustered, independent
 /// of what its header claims.
 ///
-/// Re-derives the same [`offsets_are_clustered`] predicate
-/// [`StreamingPmtilesWriter::entries_are_clustered`] uses when it stamps the
-/// header, but from the bytes actually on disk via [`read_all_entries`] —
+/// Re-derives the same `offsets_are_clustered` predicate
+/// `StreamingPmtilesWriter::entries_are_clustered` uses when it stamps the
+/// header, but from the bytes actually on disk via `read_all_entries` —
 /// so a writer bug that sets the flag wrong cannot also fool this check by
 /// sharing its assumptions. Intended for tests and tooling (a go-pmtiles
 /// `verify`-alike), not the write path itself.
@@ -1032,7 +1032,7 @@ const MAX_ROOT_DIR_BYTES: usize = 16384 - 127;
 /// directory (#459), zero-padded to the boundary.
 ///
 /// 16,384 is not a round number picked for looks. It is the initial range
-/// request every PMTiles client makes, the budget [`MAX_ROOT_DIR_BYTES`]
+/// request every PMTiles client makes, the budget `MAX_ROOT_DIR_BYTES`
 /// already sizes the root against — and, decisively, the *only* padding
 /// go-pmtiles' `verify` tolerates. `verify.go` (v1.31.2, L84-89) accepts a
 /// file whose length equals either
@@ -1496,7 +1496,7 @@ impl PmtilesWriter {
 
     /// Write the PMTiles archive to a file
     ///
-    /// Layout: [Header (127)] [Root Directory] [Metadata] [Tile Data]
+    /// Layout: [Header (127)] [Root Directory] `Metadata` [Tile Data]
     ///
     /// When deduplication is enabled, identical tiles share storage and
     /// consecutive identical tiles use run_length encoding in the directory.
@@ -2076,7 +2076,7 @@ impl StreamingPmtilesWriter {
     ///   wrong. The first append after a checkpoint overwrites the
     ///   metadata/leaf sections the prefix points at, so that append first
     ///   zeroes the prefix's magic
-    ///   ([`Self::invalidate_tail_prefix_before_append`]) and every reader
+    ///   (`Self::invalidate_tail_prefix_before_append`) and every reader
     ///   rejects the file until the next checkpoint rebuilds the prefix and
     ///   tail from the (untouched) tile data. A crash mid-level therefore
     ///   salvages back to the last checkpoint, or to nothing — not to

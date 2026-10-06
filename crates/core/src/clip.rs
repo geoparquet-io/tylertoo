@@ -28,7 +28,7 @@
 //! When S-H produces output with structural issues (detected via cheap O(n) checks),
 //! we fall back to i_overlay which handles these cases correctly.
 //!
-//! See: https://github.com/felt/tippecanoe (clipping documentation)
+//! See: <https://github.com/felt/tippecanoe> (clipping documentation)
 
 use geo::algorithm::sweep::Intersections;
 use geo::{
@@ -197,14 +197,14 @@ fn geometry_has_structural_issues(geom: &Geometry<f64>, assume_simple: bool) -> 
 /// Whether a geometry's polygon exterior rings are **simple** (free of
 /// self-intersecting edges).
 ///
-/// This runs the same self-intersection sweep as [`has_structural_issues`] (an
+/// This runs the same self-intersection sweep as `has_structural_issues` (an
 /// O((n + m) log n) Bentley–Ottmann pass, issue #241), but is meant to be called
 /// **once per feature** rather than once per clip. Threading the result into the
 /// clip pipeline as `assume_simple` lets the hot path skip that check on every
 /// tile the feature touches (issue #237, RC3): a continental admin polygon
 /// covering thousands of tiles pays the cost once instead of thousands of times.
 ///
-/// Only exterior rings are inspected, matching what [`has_structural_issues`]
+/// Only exterior rings are inspected, matching what `has_structural_issues`
 /// (and hence the S-H validity gate) actually checks. Non-polygon geometries
 /// are trivially simple for the purposes of rectangle clipping.
 pub fn geometry_is_simple(geom: &Geometry<f64>) -> bool {
@@ -732,7 +732,7 @@ fn worldcoord_bbox(coords: &[WorldCoord]) -> Option<WorldBounds> {
     Some(WorldBounds::new(x_min, y_min, x_max, y_max))
 }
 
-/// Convert a geo::Polygon<f64> to WorldCoord rings for clipping.
+/// Convert a `geo::Polygon<f64>` to WorldCoord rings for clipping.
 ///
 /// This is a convenience function for the Phase 1 migration -- it converts
 /// from the existing f64 representation to WorldCoord for clipping, then

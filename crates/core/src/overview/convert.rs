@@ -3,17 +3,17 @@
 //! [`convert_to_overviews`] wires the existing overview modules into a single
 //! GeoParquet → GeoParquet overview build. By default
 //! ([`ConvertOptions::streaming`]) it dispatches to the two-pass
-//! bounded-memory pipeline in [`super::stream`]; the in-memory reference
+//! bounded-memory pipeline in `super::stream`; the in-memory reference
 //! implementation below (`streaming: false`) proceeds as:
 //!
 //! 1. **read** the whole input GeoParquet preserving the full property schema
 //!    (the entire table is concatenated into one batch). The CRS is detected
 //!    from the `geo` metadata and mapped to [`Crs`]; non-4326/3857 inputs and
 //!    inputs that already carry a `level` column are rejected (spec Q3, §4.1).
-//! 2. **assign** every feature a coarsest level via [`assign::assign_levels`]
+//! 2. **assign** every feature a coarsest level via `assign::assign_levels`
 //!    over per-feature bbox + [`FeatureKind`] + an optional sort key.
 //! 3. **generalize + write**, coarse→fine, feeding [`OverviewWriter`]:
-//!    - `duplicating` non-canonical levels: [`simplify::simplify_for_level`]
+//!    - `duplicating` non-canonical levels: `simplify::simplify_for_level`
 //!      per feature, dropping [`Simplified::Dropped`];
 //!    - `duplicating` canonical (finest) level: original geometry **untouched**
 //!      (spec §2.4, value-identity — no simplify round-trip);
@@ -25,7 +25,7 @@
 //!    benchmark tasks.
 //!
 //! The in-memory path is the correctness-first reference: memory is
-//! `O(dataset)`. The default streaming path ([`super::stream`]) produces
+//! `O(dataset)`. The default streaming path (`super::stream`) produces
 //! equivalent output in `O(read batch + winner tables)` memory; equivalence
 //! is asserted by the `streaming_matches_*` tests below.
 
@@ -89,7 +89,7 @@ use super::writer::{
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LevelPlan {
-    /// A Web Mercator zoom range, mapped through [`gsd_for_zoom`]. `min_zoom`
+    /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
     ZoomRange {
         /// Coarsest zoom (level 0).
@@ -389,7 +389,7 @@ pub struct ConvertOptions {
     /// A null — or a NaN/infinite value, which is how a float column usually
     /// spells nodata — is a *missing* key: the feature still appears, it just
     /// loses any cell it contests to a feature that has a key
-    /// ([`extract_sort_keys`]).
+    /// (`extract_sort_keys`).
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
@@ -476,7 +476,7 @@ pub struct ConvertOptions {
     /// in-order merge re-chunks their output into exactly the batch sequence
     /// one reader would have produced. Explicit values are honoured up to
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
-    /// for remote inputs (see [`super::pipeline`]) and when `streaming` is
+    /// for remote inputs (see `super::pipeline`) and when `streaming` is
     /// `false`.
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
@@ -785,7 +785,7 @@ pub fn read_workers_ceiling() -> usize {
 /// the engine still bounds against the memory budget. Above the ceiling the
 /// value is clamped and a warning is logged.
 ///
-/// Output is byte-identical for every value — see [`super::pipeline`]'s
+/// Output is byte-identical for every value — see `super::pipeline`'s
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
 /// `crates/cli/tests/thread_count_determinism.rs`.
 pub fn resolve_read_workers(requested: usize) -> usize {
@@ -1233,7 +1233,7 @@ pub enum ConvertError {
         /// The rejected CRS identifier.
         crs: String,
     },
-    /// All but a sliver (≥99%, [`ALL_LOST_PERCENT`]) of the input cannot be
+    /// All but a sliver (≥99%, `ALL_LOST_PERCENT`) of the input cannot be
     /// tiled (#429): the coordinates fall outside the declared CRS's range,
     /// or they are valid lon/lat outside the Web Mercator tiling domain.
     /// Either way the conversion used to "succeed" into an empty tile
@@ -1457,7 +1457,7 @@ pub enum ConvertError {
         ceiling: usize,
     },
     /// The pass-1 feature table (`Vec<AssignFeature>`, held resident from
-    /// pass 1's scan through the level assignment — see [`super::stream`]'s
+    /// pass 1's scan through the level assignment — see `super::stream`'s
     /// module doc) alone exceeds the process's hard cgroup memory limit
     /// (#543), so the run would be OOM-killed. Caught from footer row counts
     /// alone, before pass 1 scans a single row, so this fails in seconds
@@ -1475,10 +1475,10 @@ pub enum ConvertError {
         /// with no per-feature filter active, every one of them becomes a
         /// feature-table entry unless its geometry is null or unusable).
         rows: u64,
-        /// `rows * `[`PASS1_BYTES_PER_ROW`].
+        /// `rows * ``PASS1_BYTES_PER_ROW`.
         estimated_bytes: u64,
         /// The hard cgroup memory limit's headroom the estimate was checked
-        /// against (NOT [`super::pipeline`]'s fractional `Auto` budget — the
+        /// against (NOT `super::pipeline`'s fractional `Auto` budget — the
         /// feature table must exist in full regardless of `MemoryProfile`).
         limit_bytes: u64,
     },
@@ -3875,7 +3875,7 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
 
 /// The "e.g. lon 180.548 (row 1041), lon 180.101 (row 2210)" suffix naming
 /// the first few out-of-range exemplars (#553), or `""` when there are none.
-/// Shared by the aggregate `log::warn!` ([`out_of_range_warning`]) and the
+/// Shared by the aggregate `log::warn!` (`out_of_range_warning`) and the
 /// CLI's `tiles` summary line, so both name where the loss came from instead
 /// of only how much was lost.
 pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
@@ -4292,7 +4292,7 @@ pub(super) fn warn_spill_space(
 /// that on top (#570). The preflight does not fold this in: the scratch
 /// size depends on the line count and vertex counts, which the footers do
 /// not carry, and a row-count-derived upper bound would warn on every small
-/// line input. `docs/diving-deeper/sharded-builds.md` gives the sizing
+/// line input. `docs/guides/sharded-builds.md` gives the sizing
 /// figure to add by hand.
 pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
 
@@ -4327,7 +4327,7 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 
 /// Sizing-guidance doc named in both the warning and the hard error.
-const MEMORY_SIZING_DOC: &str = "docs/diving-deeper/sharded-builds.md";
+const MEMORY_SIZING_DOC: &str = "docs/guides/sharded-builds.md";
 
 /// Why a sharded build is not the fix — shared by the warning and the error.
 const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its coarse job \
@@ -6695,7 +6695,7 @@ mod tests {
             "bigger box",
             "does not avoid this",
             "--plan",
-            "docs/diving-deeper/sharded-builds.md",
+            "docs/guides/sharded-builds.md",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
         }
@@ -6734,7 +6734,7 @@ mod tests {
             "≳235.4 GiB: use a bigger box",
             "does not avoid this",
             "--plan",
-            "docs/diving-deeper/sharded-builds.md",
+            "docs/guides/sharded-builds.md",
             "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");

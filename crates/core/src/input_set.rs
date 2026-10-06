@@ -416,7 +416,7 @@ impl ConvertSource {
     ///   listing: `.parquet` keys sorted by key, `_SUCCESS`/zero-byte/
     ///   hidden (`.`/`_`) names skipped, one store instance shared by all
     ///   parts; requires the `remote` feature (without it, the standard
-    ///   [`InputError::RemoteDisabled`] as before);
+    ///   `InputError::RemoteDisabled` as before);
     /// - `http(s)://` prefix → [`InputError::RemotePrefixUnsupported`]
     ///   (no generic listing API; the error points at `--files-from`);
     /// - a single resolved partition collapses to `Single`;
@@ -1142,7 +1142,7 @@ impl MultiSource {
     /// part's footer and validate compatibility against part 0 (see the
     /// module docs). `parts` must be non-empty and already ordered.
     /// Footer loads run with bounded concurrency
-    /// ([`FOOTER_LOAD_CONCURRENCY`]): a remote footer is two range
+    /// (`FOOTER_LOAD_CONCURRENCY`): a remote footer is two range
     /// requests, so hundreds of parts would otherwise serialize hundreds
     /// of round-trips — but must not open hundreds of connections at once
     /// either.

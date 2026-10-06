@@ -6,7 +6,7 @@
 //! A shard is a contiguous run of **pivot-zoom tile ids**. PMTiles orders a
 //! zoom's tiles along the Hilbert curve and a node's descendants occupy an
 //! exact contiguous id interval at every deeper zoom
-//! ([`crate::tile::node_id_range`]), so a contiguous run of pivot tiles
+//! (`crate::tile::node_id_range`), so a contiguous run of pivot tiles
 //! `[lo, hi]` names, at every zoom `z >= pivot`, one contiguous id interval
 //! too — and the N runs partition the pivot zoom, hence partition every
 //! deeper zoom. Shards are therefore disjoint **by construction**, not by
@@ -66,7 +66,7 @@
 //! error, and the coarse job — which reads the whole input anyway — is the run
 //! that writes the plan.
 //!
-//! See [`crate::overview::plan_state`] for how a shard re-addresses that
+//! See `crate::overview::plan_state` for how a shard re-addresses that
 //! global plan onto the subset of row groups it reads.
 
 use std::collections::BTreeMap;
@@ -138,7 +138,7 @@ const _: () = assert!(
 /// Everything that can go wrong cutting, reading or applying a shard plan.
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
-    /// `--pivot` outside `1..=`[`MAX_SHARD_PIVOT_ZOOM`].
+    /// `--pivot` outside `1..=``MAX_SHARD_PIVOT_ZOOM`.
     #[error(
         "--pivot {pivot} is out of range: the pivot zoom must be between 1 and \
          {MAX_SHARD_PIVOT_ZOOM}. A pivot wants to sit where the dataset has a few tiles per \
@@ -150,7 +150,7 @@ pub enum ShardError {
     },
 
     /// A tile-id range whose ids imply a pivot zoom outside
-    /// `1..=`[`MAX_SHARD_PIVOT_ZOOM`].
+    /// `1..=``MAX_SHARD_PIVOT_ZOOM`.
     ///
     /// Distinct from [`ShardError::PivotOutOfRange`] because no `--pivot` was
     /// typed here: the pivot zoom is *derived* from the two tile ids, so
@@ -520,7 +520,7 @@ impl TileRange {
     ///
     /// The interval is exact, not a bounding superset: a pivot node's
     /// descendants occupy `base(z) + h * 4^Δ ..= base(z) + (h+1) * 4^Δ - 1`
-    /// (see [`crate::tile::node_id_range`]), and a contiguous run of `h`
+    /// (see `crate::tile::node_id_range`), and a contiguous run of `h`
     /// concatenates those blocks into one contiguous interval.
     pub fn ids_at(&self, zoom: u8) -> Option<RangeInclusive<u64>> {
         if zoom < self.pivot_zoom || zoom > crate::tile::MAX_ZOOM {
@@ -567,7 +567,7 @@ impl TileRange {
         out.unwrap_or_else(|| TileBounds::new(-180.0, -90.0, 180.0, 90.0))
     }
 
-    /// [`TileRange::tile_bounds`] widened by [`SHARD_READ_MARGIN_TILES`] pivot
+    /// [`TileRange::tile_bounds`] widened by `SHARD_READ_MARGIN_TILES` pivot
     /// tiles on every side — the bbox a shard prunes its **input row groups**
     /// against.
     ///
@@ -576,7 +576,7 @@ impl TileRange {
     /// edge buffer, so a row group whose bbox only grazes the run has to be
     /// read. Over-inclusion costs a read; under-inclusion costs a tile, so the
     /// margin is deliberately far wider than the buffer it covers — see
-    /// [`SHARD_READ_MARGIN_TILES`] for the exact bound.
+    /// `SHARD_READ_MARGIN_TILES` for the exact bound.
     ///
     /// Named for what it is *for*: this is the READ bbox, not the range's
     /// extent. [`TileRange::tile_bounds`] is the exact extent, and is what an
@@ -642,7 +642,7 @@ pub struct ShardInput {
 /// library version or a re-statted file could perturb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardPlan {
-    /// Always [`SHARD_PLAN_FORMAT`]; refused otherwise.
+    /// Always `SHARD_PLAN_FORMAT`; refused otherwise.
     pub format: String,
     /// Artifact format version.
     pub version: u32,

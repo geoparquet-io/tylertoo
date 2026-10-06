@@ -42,7 +42,7 @@
 //! is a pure per-row transform, so chunk outputs are identical to a serial
 //! encode; the only cross-batch encoder state — the file-level `geo` covering
 //! (per-column bbox union + geometry-type set) — is returned by each task and
-//! folded on the writer thread **in submission order** ([`fold_geo_metadata`]),
+//! folded on the writer thread **in submission order** (`fold_geo_metadata`),
 //! so the accumulated covering is deterministic and equal to the serial
 //! accumulation. Encoded chunks drain in submission order through the same
 //! bounded FIFO discipline as row groups, so row-group boundaries and row

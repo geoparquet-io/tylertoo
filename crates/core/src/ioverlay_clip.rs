@@ -13,10 +13,10 @@
 //! # Design
 //!
 //! The workflow is:
-//! 1. Convert geo::Polygon<f64> to i_overlay's shape format (Vec<Vec<[f64; 2]>>)
+//! 1. Convert `geo::Polygon<f64>` to i_overlay's shape format (Vec<Vec<[f64; 2]>>)
 //! 2. Create a clip box from TileBounds
 //! 3. Perform Intersect operation with FillRule::EvenOdd
-//! 4. Convert the result back to geo::Geometry<f64>
+//! 4. Convert the result back to `geo::Geometry<f64>`
 //!
 //! # Why i_overlay?
 //!
