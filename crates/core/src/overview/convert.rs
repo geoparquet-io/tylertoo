@@ -4342,7 +4342,7 @@ pub(super) fn warn_spill_space(
 /// that on top (#570). The preflight does not fold this in: the scratch
 /// size depends on the line count and vertex counts, which the footers do
 /// not carry, and a row-count-derived upper bound would warn on every small
-/// line input. `docs/guides/sharded-builds.md` gives the sizing
+/// line input. `docs/guides/scaling.md` gives the sizing
 /// figure to add by hand.
 pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
 
@@ -4377,7 +4377,7 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 
 /// Sizing-guidance doc named in both the warning and the hard error.
-const MEMORY_SIZING_DOC: &str = "docs/guides/sharded-builds.md";
+const MEMORY_SIZING_DOC: &str = "docs/guides/scaling.md";
 
 /// Why a sharded build is not the fix — shared by the warning and the error.
 const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its coarse job \
@@ -6745,7 +6745,7 @@ mod tests {
             "bigger box",
             "does not avoid this",
             "--plan",
-            "docs/guides/sharded-builds.md",
+            "docs/guides/scaling.md",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
         }
@@ -6784,7 +6784,7 @@ mod tests {
             "≳235.4 GiB: use a bigger box",
             "does not avoid this",
             "--plan",
-            "docs/guides/sharded-builds.md",
+            "docs/guides/scaling.md",
             "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");

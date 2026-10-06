@@ -1372,7 +1372,7 @@ Both act at export, on the tiles, not on the overview file.
   feature in every tile and the export went O(features × tiles). A wider value
   is refused up front, before any convert or export work runs (#433). A
   sharded build's read-pruning margin is two pivot tiles (512 px), so this cap
-  sits inside it; see `docs/guides/sharded-builds.md`.
+  sits inside it; see [Scaling](guides/scaling.md#sharded-builds).
 - **`extent` (default 4096; Python `export_pmtiles(extent=...)`, not a CLI
   flag).** The MVT tile-local coordinate resolution. Must be positive: `0`
   quantizes every coordinate to the tile's origin — every line and polygon
@@ -1610,7 +1610,7 @@ transient per-row scan vectors) and 1 byte per feature during pass 2 — about
 64 bytes/row (`size_of::<AssignFeature>()`), held resident from pass 1's scan
 through the level assignment — a lower bound on the scan-time peak, and the
 coarse job's irreducible memory floor on a
-[sharded build](guides/sharded-builds.md#sizing-the-coarse-jobs-memory),
+[sharded build](guides/scaling.md#sizing-the-coarse-jobs-memory),
 where it can reach tens of GiB at billion-row scale. tylertoo preflights this
 from footer row counts before pass 1 scans anything (#543): it warns when the
 realistic whole-job need (rows × 64 B × 2.5) exceeds the memory figure, and
@@ -2079,8 +2079,8 @@ That is exactly what `tiles --shard` does, and it refuses to run without
 plan's row-group selection — it reads only the groups whose bbox reaches its
 tile range — so the fingerprint compares that one term as a subset relation
 and the plan's row-indexed tables are re-addressed onto the shard's shorter
-row stream before pass 2. See [Sharded builds across a
-fleet](guides/sharded-builds.md) for the whole recipe.
+row stream before pass 2. See
+[Scaling](guides/scaling.md#sharded-builds) for the whole recipe.
 
 Both flags require the streaming pipeline (they are its pass-1 stage), they
 are mutually exclusive, and they are available on `overview` and `tiles`.

@@ -75,11 +75,10 @@ nav:
       - Madagascar boundaries: tutorials/madagascar.md
       - Brazil fields from the cloud: tutorials/brazil.md
   - Guides:
-      - Remote and multi-file inputs: guides/remote-and-multi-file.md
-      - Sharded builds across a fleet: guides/sharded-builds.md
-      - Keeping memory bounded: guides/bounded-memory.md
+      - Scaling: guides/scaling.md
+      - Remote reads: guides/remote-reads.md
       - Coming from tippecanoe: guides/tippecanoe.md
-      - "Demo: Brazil 2025 fields": demo.md
+  - Demo: demo.md
   - Reference:
       - reference/index.md
       - CLI: reference/cli.md

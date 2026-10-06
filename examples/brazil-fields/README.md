@@ -305,7 +305,7 @@ done
 
 - To tile a whole state, remove `--bbox`, raise `--shards`, and run the shard
   jobs on separate machines. The
-  [sharded builds guide](https://geoparquet-io.github.io/tylertoo/guides/sharded-builds/)
+  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds)
   covers sizing the jobs and running them under a scheduler.
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
   explains `--filter` syntax and every generalization knob.

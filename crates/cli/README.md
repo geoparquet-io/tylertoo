@@ -52,7 +52,9 @@ The [documentation site](https://geoparquet-io.github.io/tylertoo/) has:
 - Two end-to-end tutorials:
   [a local file, from raw export to PMTiles](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/),
   and [cloud data into a sharded, two-layer archive](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
-- Guides to remote inputs, sharded builds, memory limits, and tippecanoe
+- Guides to [scaling](https://geoparquet-io.github.io/tylertoo/guides/scaling/),
+  [remote reads](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/),
+  and [coming from tippecanoe](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/)
 - The [CLI](https://geoparquet-io.github.io/tylertoo/reference/cli/),
   [Python](https://geoparquet-io.github.io/tylertoo/reference/python/), and
   [Rust](https://docs.rs/tylertoo-core) API references, generated from source

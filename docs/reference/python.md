@@ -104,14 +104,14 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `cogp_compat`: Also write the COGP compatibility footer key.
 * `row_group_size`: Most rows per output row group.
 * `full_column_stats`: Keep Parquet statistics for every column.
-* `streaming`: Read the input in batches. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
-* `read_batch_size`: Rows per read batch. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `streaming`: Read the input in batches. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
+* `read_batch_size`: Rows per read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
 * `bbox`: Keep features that intersect this lon/lat box.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
-* `profile`: Hold output in RAM, on disk, or choose per run. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
-* `in_flight_batches`: Batches processed at once; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
-* `read_workers`: Reader threads; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
-* `spill_dir`: Where a remote input is staged. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `profile`: Hold output in RAM, on disk, or choose per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>.
+* `in_flight_batches`: Batches processed at once; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
+* `read_workers`: Reader threads; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
+* `spill_dir`: Where a remote input is staged. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
 
 ###### **Returns:**
 
@@ -164,11 +164,11 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `extent`: Tile resolution in MVT units.
 * `tile_size_limit`: Largest tile in bytes; 0 or None for no limit.
 * `simple_clip_fastpath`: Clip simple polygons faster; False gives byte-stable output.
-* `partition_wave`: Partitions held in memory at once; 0 sizes it from CPUs and RAM. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `partition_wave`: Partitions held in memory at once; 0 sizes it from CPUs and RAM. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
 * `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
 * `min_zoom`: Coarsest zoom to declare when the coarsest levels are empty.
 * `feature_id`: Integer column to write as the MVT feature id.
-* `spill_dir`: Where spill files go when memory runs short. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `spill_dir`: Where spill files go when memory runs short. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
 
 ###### **Returns:**
 

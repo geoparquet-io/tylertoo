@@ -1,119 +1,25 @@
-# How tylertoo relates to tippecanoe
+# Coming from tippecanoe
 
-tylertoo takes its name from the campaign slogan "Tippecanoe and Tyler Too,"
-and the debt is real: [tippecanoe](https://github.com/felt/tippecanoe) is the
-reference implementation the tiling algorithms are measured against. Many
-readers arrive already knowing it and want to know how the two line up. This
-topic answers that as a factual comparison, not a migration guide. It maps the
-concepts you know onto tylertoo, states what each tool does that the other does
-not, and stays neutral about which to use, because the two solve overlapping but
-different problems.
+[tippecanoe](https://github.com/felt/tippecanoe) is the reference
+implementation tylertoo's tiling is measured against, so its concepts carry
+over. tylertoo applies them to stored overview levels in world space rather
+than to each tile as it is encoded. Deliberate divergences are recorded in
+`context/ARCHITECTURE.md`. Measured speed, size, and memory comparisons, with
+their method and caveats, are in
+[`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
 
-## Design decisions
+At defaults the two tools do not draw the same map. tylertoo's density budget
+thins features hard at coarse and middle zooms, while tippecanoe keeps far more
+of a contiguous polygon coverage. For admin boundaries, parcels, or a
+choropleth, use `--verbatim`, or raise `--gsd-base` and lower the thinning
+factors; see the [tuning reference](../OVERVIEW_TUNING.md).
 
-**tylertoo reads GeoParquet directly, structure and all.** tippecanoe reads
-GeoJSON, line-delimited GeoJSON, FlatGeobuf, and point CSV. A GeoParquet dataset
-tiled through tippecanoe first converts to one of those, usually GeoJSON, which
-rewrites a compact columnar file into larger text. tylertoo reads the GeoParquet
-as it is, and the throughput difference compounds from several sources rather
-than the skipped conversion alone. It decodes only the geometry column a tile
-needs instead of parsing whole text features. It uses the file's Hilbert
-ordering and bbox covering statistics to read only the row groups a tile or a
-`--bbox`/`--filter` touches, including byte ranges on remote input, where a
-GeoJSON stream carries no spatial index to skip or seek on. Both tools are
-compiled native code, so the leverage is the data path, not the language. The
-demo page carries the measured numbers.
-
-**Overviews embed levels inside the input format.** tippecanoe generalizes in
-tile space while it encodes each tile, and writes the result into tiles. tylertoo
-generalizes in world space, per level, and stores those levels in a GeoParquet
-file. This is the core format difference: a tylertoo level is a reusable,
-exact, SQL-queryable row band, where a tippecanoe tile is a rendered endpoint.
-The overview archive that results has no established equivalent.
-
-**Quality-ladder knobs mirror tippecanoe concepts.** Feature dropping, buffers,
-layer naming, zoom ranges, and simplification all have direct tylertoo
-counterparts, because tippecanoe defined the vocabulary. The numeric defaults
-differ where the mechanism is anchored differently, and those divergences are
-documented rather than incidental.
-
-**Parity sets the performance bar.** The goal for output quality is to match
-tippecanoe on a shared corpus, and the pipeline is validated against tippecanoe
-output as it changes. Where tylertoo diverges, it is a deliberate, recorded
-choice in `context/ARCHITECTURE.md`, not drift.
-
-**Decode returns tiled geometry not source data.** Both tools can turn tiles
-back into features, and in both the result is the tiled representation —
-simplified, clipped, and duplicated across tiles — never the original source.
-tylertoo's decoder follows tippecanoe-decode's model deliberately.
-
-## The measured comparison
-
-"Faster than tippecanoe" needs a number, a version and a caveat list, so
-there is a harness: `benchmarks/e2e/` pins **tippecanoe 2.79.0** by tag and
-commit, builds it from source, converts the same GeoParquet to tippecanoe's
-best input format, and holds zoom range, layer name, tile buffer and per-tile
-byte cap equal on both sides. Full method, the flag-by-flag parity mapping and
-the asymmetries that flags cannot close are in `benchmarks/e2e/README.md`;
-measured numbers are in `benchmarks/e2e/RESULTS.md`.
-
-Two things a skeptical reader should know before reading any ratio.
-
-**At defaults the two tools do not draw the same map.** tylertoo's density
-budget thins features hard at coarse and mid zooms. tippecanoe's rate-based
-dropping applies only to points at defaults; its tiny-polygon reduction still
-removes small polygons at low zooms, but on a contiguous polygon coverage it
-keeps far more and reaches every feature by a mid zoom. On a 17,465-polygon
-admin-boundary dataset, tylertoo's default z8 tile set carries 865 of those
-polygons and tippecanoe's reaches all 17,465 by z8 (at z4 the counts are 254
-and 6,102). If your layer is a
-coverage rather than a sample — admin boundaries, parcels, a choropleth — that
-is the behaviour to change (`--verbatim`, or raise `--gsd-base` and lower the
-thinning factors; see [tuning reference](../OVERVIEW_TUNING.md)), and
-it is the configuration any honest speed comparison has to use.
-
-**The GeoParquet read is not where most of the speed comes from.** On that
-same dataset the GeoParquet→FlatGeobuf conversion a tippecanoe user must run
-is about 1% of tippecanoe's end-to-end wall. The native columnar read saves a
-43 MB intermediate file and is what makes `--bbox`/`--filter` row-group
-pushdown and remote byte-range reads possible at all, but the tiling engine
-is carrying the ratio.
-
-With those stated, on that dataset (Apple M3 Pro, 12 cores, z0–z14, median of
-3 warm runs; measured at tylertoo 0.11.0 @ `044360d`, which includes the #559
-export speed-up and predates #564's parallel level assignment):
-
-| comparison | tylertoo | tippecanoe 2.79.0 | ratio |
-|---|---|---|---|
-| Near-parity output (`--verbatim --simplify-factor 1.0`) vs tippecanoe reading FlatGeobuf | 2.67 s | 20.05 s | **≈7.5×** |
-| Each tool at its own defaults, end to end from GeoParquet | 1.61 s | 20.24 s | **≈12.5×** |
-| Output archive, quality-matched | 118 MB | 151 MB | 0.78× |
-| Peak RSS, quality-matched run | 835 MB | 413 MB | 2.0× (tylertoo heavier) |
-
-The quality-matched run is near-parity, not identical output: its tile count
-is within 2 of tippecanoe's at every zoom, its distinct features are within
-0.4% of tippecanoe's at z8 and about 5% at z4, and 10 of its tiles hit
-tylertoo's per-tile size valve. Each figure is one run of three warm repeats
-on a laptop, so treat single-digit ratios as approximate; the per-repeat
-spread is in `benchmarks/e2e/RESULTS.md`. The memory row is a loss, not a
-win, and `--partition-wave` is the knob.
-
-The corpus is three in-repo fixtures, the largest 28 MB; nothing here says how
-either tool behaves at planet scale, on points, or on cold cache.
-`benchmarks/e2e/RESULTS.md` lists what is untested.
-
-## API walkthrough
-
-### Mapping tippecanoe concepts to tylertoo
-
-The concepts carry over; the flags and some defaults change. tylertoo applies
-these to overview levels rather than to tiles at encode time, so a knob shapes a
-stored, reusable level.
+## Flag mapping
 
 | tippecanoe | tylertoo | Note |
 |---|---|---|
 | `-z` / `-Z` maximum/minimum zoom | `--max-zoom` / `--min-zoom` | Same zoom range |
-| `-zg` guess the maximum zoom | `--max-zoom auto` | Inspired by `-zg`, not a port: a bounded sample of feature extents and spacing, resolved at 256 px per tile and capped at z16. Like `-zg`, an input with nothing to measure is an error. The divergences are recorded in `context/ARCHITECTURE.md` |
+| `-zg` guess the maximum zoom | `--max-zoom auto` | Inspired by `-zg`, not a port: a bounded sample of feature extents and spacing, resolved at 256 px per tile and capped at z16. Like `-zg`, an input with nothing to measure is an error |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band is its own ladder; tiles at shared zooms carry every layer |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
@@ -127,33 +33,29 @@ stored, reusable level.
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
 | `--use-attribute-for-id` | `--feature-id` | Integer or `DECIMAL(p,0)` columns only (string and float ids are rejected, not parsed); null or negative values are errors, not warnings. Without it, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
+| `tile-join` to merge tilesets | `merge`, or `pyramid` bands sharing a zoom range | `merge` takes archives with disjoint tiles |
+| `tippecanoe-decode` | `decode` | Writes GeoParquet: one row per feature per tile, with `zoom`, `layer`, and `mvt_id` columns, in tiled (simplified, clipped) geometry |
 
-### What only tylertoo does
+## What only tylertoo does
 
-**Reads GeoParquet directly.** The columnar source is the input, with no GeoJSON
-conversion. Remote objects read by byte range, and `--bbox` and `--filter` push
-down to skip row groups at the footer, so a run can carve a filtered slice out of
-a planet-scale remote collection while tiling it.
+- **Reads GeoParquet directly**, with no GeoJSON conversion. It decodes only
+  the columns it needs, prunes row groups with `--bbox` and `--filter`, and
+  reads remote objects by byte range. See [remote reads](remote-reads.md).
+- **Writes an overview file.** The world-space levels live in a GeoParquet
+  file you can query with DuckDB, export more than once, and validate against
+  the `geo:overviews` spec.
+- **Splits one build across machines** and merges the shards without
+  re-encoding a tile. See [scaling](scaling.md#sharded-builds).
 
-**Writes an embedded overview file.** The world-space levels live in a valid
-GeoParquet file you can query with DuckDB, re-export more than once, and validate
-against the `geo:overviews` spec. tippecanoe's output is the tileset; there is no
-intermediate you can open as data.
+## What only tippecanoe does
 
-### What tippecanoe does that tylertoo does not
-
-**Reads more input formats.** GeoJSON, line-delimited GeoJSON, FlatGeobuf, and
-point CSV, plus GeoJSON on standard input. tylertoo reads GeoParquet in
-`EPSG:4326` or `EPSG:3857` and nothing else, on the expectation that `gpio`
-converts other formats first.
-
-**Joins attributes onto finished tiles.** `tile-join` joins CSV columns onto
-the features of an existing tileset by a key column. tylertoo leaves this out on
-purpose. The join belongs in parquet space, before tiling, where the new
-attributes become ordinary columns that `--filter`, `--include-property`, and
-`--feature-id` can use, and where a change to the table means one join and one
-tiling run rather than a join over every tile. Run the join in DuckDB, then let
-`gpio` restore the Hilbert order and row-group layout the join discards:
+- **Reads more formats:** GeoJSON, line-delimited GeoJSON, FlatGeobuf, point
+  CSV, and GeoJSON on standard input. tylertoo reads GeoParquet in
+  `EPSG:4326` or `EPSG:3857` only; convert other formats with `gpio`.
+- **Joins attributes onto finished tiles** with `tile-join`. tylertoo leaves
+  this out on purpose: join in Parquet, before tiling, so the new columns work
+  with `--filter`, `--include-property`, and `--feature-id`. Then restore the
+  Hilbert order and row-group layout the join discards:
 
 ```bash
 duckdb -c "LOAD spatial; COPY (
@@ -165,33 +67,13 @@ gpio sort hilbert joined.parquet parcels-joined.parquet \
   --row-group-size-mb 128
 ```
 
-The other half of `tile-join`, merging tilesets, has counterparts:
-`tylertoo merge` for archives with disjoint tile ids, and `pyramid` bands that
-share a zoom range for one layer per input.
-
-**Writes MBTiles or a tile directory.** tippecanoe writes MBTiles or PMTiles,
-and `-e` writes a directory of tiles. tylertoo writes one PMTiles archive, or
-the overview file, and nothing else. For MBTiles or a directory, convert the
-finished archive with `pmtiles-convert` from the Python
-[`pmtiles`](https://pypi.org/project/pmtiles/) package, which picks the output
-format from the output path:
+- **Writes MBTiles or a tile directory.** tylertoo writes one PMTiles
+  archive. Convert it with `pmtiles-convert` from the Python
+  [`pmtiles`](https://pypi.org/project/pmtiles/) package, which picks the
+  format from the output path. A directory holds gzip-compressed
+  `{z}/{x}/{y}.mvt` files and a `metadata.json`:
 
 ```bash
 uvx --from pmtiles pmtiles-convert tiles.pmtiles tiles.mbtiles
 uvx --from pmtiles pmtiles-convert tiles.pmtiles tiles/
 ```
-
-The directory holds `{z}/{x}/{y}.mvt` files with the tile bytes as stored in
-the archive, which tylertoo gzip-compresses, plus a `metadata.json`. The
-`pmtiles convert` command in go-pmtiles goes the other way, MBTiles to PMTiles,
-so it does not serve this purpose.
-
-### Decoding tiles back
-
-**`tylertoo decode`.** Turns a PMTiles archive back into GeoParquet, following
-tippecanoe-decode's semantics. Nothing is deduplicated, so a feature appears once
-per tile it touched, with `zoom`, `layer`, and `mvt_id` provenance columns for
-filtering to one representation. Coordinates lift through tippecanoe's 32-bit
-world-coordinate transform. Because tiling simplifies and clips geometry
-and drops attributes, the output is the tiled geometry, not a route back to the source
-file.

@@ -493,7 +493,7 @@ struct ExportPmtilesArgs {
 
     /// Partitions processed at once during export; `auto` sizes it to the
     /// cores and available memory. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
@@ -523,7 +523,7 @@ struct ExportPmtilesArgs {
 
     /// Directory for the export's spill file, used when buffered tiles
     /// exceed the memory budget. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 
@@ -847,12 +847,13 @@ struct ConvertTuningArgs {
     full_column_stats: bool,
 
     /// Load the whole dataset into memory instead of streaming it in two
-    /// passes. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// passes. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
     #[arg(long, help_heading = "Memory & performance")]
     no_streaming: bool,
 
     /// Rows per Arrow read batch. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
     #[arg(
         long,
         value_name = "ROWS",
@@ -864,7 +865,7 @@ struct ConvertTuningArgs {
 
     /// Memory profile for writing levels: `speed` buffers in RAM, `bounded`
     /// spills to disk, and `auto` picks per run. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>.
     #[arg(
         long,
         default_value = "auto",
@@ -874,7 +875,8 @@ struct ConvertTuningArgs {
     profile: String,
 
     /// Read batches in flight at once; `auto` sizes it to the machine's
-    /// cores. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// cores. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
     #[arg(
         long,
         value_name = "N|auto",
@@ -886,7 +888,7 @@ struct ConvertTuningArgs {
 
     /// Reader threads for the second pass; `auto` uses a quarter of the
     /// cores, up to 4. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
     #[arg(
         long,
         value_name = "N|auto",
@@ -898,7 +900,7 @@ struct ConvertTuningArgs {
 
     /// Directory for spill files: staged remote input, and on `tiles` the
     /// intermediate overview. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 
@@ -1259,7 +1261,7 @@ struct TilesArgs {
 
     /// Partitions processed at once during export; `auto` sizes it to the
     /// cores and available memory. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
@@ -1288,7 +1290,7 @@ struct TilesArgs {
     /// Build one job of a sharded fleet: `I/N` for data shard I of N, or
     /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
     /// data shards also need `--plan`; see
-    /// <https://geoparquet-io.github.io/tylertoo/guides/sharded-builds/>.
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>.
     #[arg(
         long,
         value_name = "I/N|coarse",

@@ -37,7 +37,7 @@
 //! not a thread-count one) — that is an unrelated, narrower guarantee and is
 //! unaffected by this change. The PMTiles archive remains the primary
 //! byte-determinism promise in `ARCHITECTURE.md`, `OVERVIEW_TUNING.md`,
-//! `bounded-memory.md`, and `cli.md`, and what #423 asks this test to cover; the
+//! `guides/scaling.md`, and `cli.md`, and what #423 asks this test to cover; the
 //! overview-file comparison is additional coverage, not a replacement.
 
 use std::path::Path;

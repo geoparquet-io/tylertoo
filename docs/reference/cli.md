@@ -69,7 +69,7 @@ Generate PMTiles vector tiles from GeoParquet (the default command)
 * `--tile-buffer <TILE_BUFFER>` — Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width)
 
   Default value: `8`
-* `--partition-wave <N|auto>` — Partitions processed at once during export; `auto` sizes it to the cores and available memory. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--partition-wave <N|auto>` — Partitions processed at once during export; `auto` sizes it to the cores and available memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>
 
   Default value: `auto`
 * `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order: `input` keeps source row order, and a property name, optionally with `:asc` or `:desc`, sorts each tile by it. A renderer paints in this order unless a style overrides it
@@ -78,7 +78,7 @@ Generate PMTiles vector tiles from GeoParquet (the default command)
 * `--feature-id <COLUMN>` — Write this integer property column as the MVT feature id on every tile, so `setFeatureState` keys work across tiles and zooms. Every row must hold a value from 0 to 2^64-1; unset keeps tile-local ids
 * `--report <PATH>` — Write a JSON report with `convert` and `export` sections, matching the reports of `overview` and `export-pmtiles`
 * `--keep-overview <PATH>` — Keep the intermediate overview GeoParquet at PATH instead of deleting it after the export. The PMTiles output is the same
-* `--shard <I/N|coarse>` — Build one job of a sharded fleet: `I/N` for data shard I of N, or `coarse` for the zooms below the pivot. Requires `--shard-plan`, and data shards also need `--plan`; see <https://geoparquet-io.github.io/tylertoo/guides/sharded-builds/>
+* `--shard <I/N|coarse>` — Build one job of a sharded fleet: `I/N` for data shard I of N, or `coarse` for the zooms below the pivot. Requires `--shard-plan`, and data shards also need `--plan`; see <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>
 * `--shard-plan <PATH>` — The shard plan from `tylertoo shard-plan` that every job shares
 * `--tile-range <LO..HI>` — Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Prefer `--shard`, which also skips input the range cannot reach
 * `--plan-only` — Write the convert plan (`--save-plan`) and stop, with no export and no OUTPUT. Use it for a coarse job whose tiles the fleet discards
@@ -139,23 +139,23 @@ Generate PMTiles vector tiles from GeoParquet (the default command)
   Possible values: `constant`, `zoom-scaled`
 
 * `--full-column-stats` — Keep Parquet min/max statistics on every column, including large string and geometry columns. Use it when remote clients filter on property columns
-* `--no-streaming` — Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
-* `--read-batch-size <ROWS>` — Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--no-streaming` — Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>
+* `--read-batch-size <ROWS>` — Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>
 
   Default value: `8192`
-* `--profile <PROFILE>` — Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--profile <PROFILE>` — Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>
 
   Default value: `auto`
 
   Possible values: `auto`, `speed`, `bounded`
 
-* `--in-flight-batches <N|auto>` — Read batches in flight at once; `auto` sizes it to the machine's cores. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--in-flight-batches <N|auto>` — Read batches in flight at once; `auto` sizes it to the machine's cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>
 
   Default value: `auto`
-* `--read-workers <N|auto>` — Reader threads for the second pass; `auto` uses a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--read-workers <N|auto>` — Reader threads for the second pass; `auto` uses a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>
 
   Default value: `auto`
-* `--spill-dir <PATH>` — Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--spill-dir <PATH>` — Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>
 * `--save-plan <PATH>` — Write the convert plan to PATH and keep converting, so a later run can reuse it with `--plan`. A sharded build shares one plan
 * `--plan <PATH>` — Reuse the convert plan at PATH and skip the first pass and level assignment. The plan's fingerprint must match this run's version, flags, and inputs
 
@@ -247,23 +247,23 @@ Build a multi-resolution overview GeoParquet file
   Possible values: `constant`, `zoom-scaled`
 
 * `--full-column-stats` — Keep Parquet min/max statistics on every column, including large string and geometry columns. Use it when remote clients filter on property columns
-* `--no-streaming` — Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
-* `--read-batch-size <ROWS>` — Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--no-streaming` — Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>
+* `--read-batch-size <ROWS>` — Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>
 
   Default value: `8192`
-* `--profile <PROFILE>` — Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--profile <PROFILE>` — Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>
 
   Default value: `auto`
 
   Possible values: `auto`, `speed`, `bounded`
 
-* `--in-flight-batches <N|auto>` — Read batches in flight at once; `auto` sizes it to the machine's cores. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--in-flight-batches <N|auto>` — Read batches in flight at once; `auto` sizes it to the machine's cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>
 
   Default value: `auto`
-* `--read-workers <N|auto>` — Reader threads for the second pass; `auto` uses a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--read-workers <N|auto>` — Reader threads for the second pass; `auto` uses a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>
 
   Default value: `auto`
-* `--spill-dir <PATH>` — Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--spill-dir <PATH>` — Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>
 * `--save-plan <PATH>` — Write the convert plan to PATH and keep converting, so a later run can reuse it with `--plan`. A sharded build shares one plan
 * `--plan <PATH>` — Reuse the convert plan at PATH and skip the first pass and level assignment. The plan's fingerprint must match this run's version, flags, and inputs
 
@@ -309,7 +309,7 @@ Export a PMTiles archive from an overview GeoParquet file
   Default value: `500K`
 * `--report <PATH>` — Write the JSON export report, with per-zoom tile and feature counts, to this path
 * `--no-simple-clip-fastpath` — Clip every polygon with the full overlay instead of the fast path for simple rings. Use it for byte-stable tiles: the fast path renders the same but can start a ring at a different vertex
-* `--partition-wave <N|auto>` — Partitions processed at once during export; `auto` sizes it to the cores and available memory. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--partition-wave <N|auto>` — Partitions processed at once during export; `auto` sizes it to the cores and available memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>
 
   Default value: `auto`
 * `--feature-order <input|COLUMN[:asc|:desc]>` — Within-tile feature order: `input` keeps source row order, and a property name, optionally with `:asc` or `:desc`, sorts each tile by it. A renderer paints in this order unless a style overrides it
@@ -318,7 +318,7 @@ Export a PMTiles archive from an overview GeoParquet file
 * `--feature-id <COLUMN>` — Write this integer property column as the MVT feature id on every tile, so `setFeatureState` keys work across tiles and zooms. Every row must hold a value from 0 to 2^64-1; unset keeps tile-local ids
 * `--tile-range <LO..HI>` — Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus all their descendants. Archives cut by ranges that partition a zoom are disjoint, so `tylertoo merge` can join them
 * `--zoom-ceiling <ZOOM>` — Emit only the tiles at or below this zoom, the coarse half of a sharded build. A partial overview kept from `tiles --shard coarse` needs a ceiling at or below its own
-* `--spill-dir <PATH>` — Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>
+* `--spill-dir <PATH>` — Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>
 * `-f`, `--force` — Overwrite the output if it exists
 
 
