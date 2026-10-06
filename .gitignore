@@ -82,4 +82,3 @@ site/
 # Vale packages fetched by `vale sync` (pinned in .vale.ini)
 .vale/styles/Google/
 .vale/styles/Microsoft/
-.vale/styles/Readability/

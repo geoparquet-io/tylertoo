@@ -138,3 +138,21 @@ Mato
 Grosso
 Goiás
 Sul
+# Standard acronyms and identifiers readers know without a definition.
+# Uppercase only: Vale.Terms enforces the casing written here.
+ASCII
+CRS
+DGGS
+EPSG
+GERS
+GPS
+IEEE
+IPC
+RFC
+RSS
+ULID
+UTC
+WKB
+# "extract" is a noun here (a regional extract), not a wordy "remove";
+# listing it exempts it from Microsoft.Wordiness.
+[Ee]xtract
