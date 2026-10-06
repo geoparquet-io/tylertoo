@@ -6,7 +6,7 @@
 //! fine, mostly full-geometry steps with one zoom-band `Point` step at the
 //! coarse end (#317), matching how a `tiles` run's level plan actually looks.
 //!
-//! Run with: cargo bench --package tylertoo-core --bench simplify_cascade
+//! Run with: cargo bench --package tylertoo-core --bench `simplify_cascade`
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
@@ -26,7 +26,7 @@ use tylertoo_core::overview::simplify::{simplify_cascade, CascadeStep, Crs, Simp
 
 /// Path to the Antarctica polygon fixture (316k coords).
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
-/// Path to the FieldMaps boundaries fixture (3 large admin polygons).
+/// Path to the `FieldMaps` boundaries fixture (3 large admin polygons).
 const BOUNDARIES_FIXTURE: &str = "../../tests/fixtures/realdata/fieldmaps-boundaries.parquet";
 
 fn load_antarctica() -> Option<Geometry<f64>> {
@@ -41,7 +41,7 @@ fn load_antarctica() -> Option<Geometry<f64>> {
     geozero::wkb::Wkb(wkb_data).to_geo().ok()
 }
 
-/// The largest polygon (by vertex count) in the FieldMaps boundaries fixture.
+/// The largest polygon (by vertex count) in the `FieldMaps` boundaries fixture.
 fn load_largest_boundary() -> Option<Geometry<f64>> {
     let path = Path::new(BOUNDARIES_FIXTURE);
     if !path.exists() {

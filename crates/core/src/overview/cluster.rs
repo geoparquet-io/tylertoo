@@ -37,7 +37,7 @@
 //! point feature nearest (Euclidean) to the orphan cell's center, over every
 //! present point of the level, found by one scan over the present cells
 //! (ties broken by `Priority`, then input position). This keeps
-//! the invariant *Σ point_count over a level's point rows = total source
+//! the invariant *Σ `point_count` over a level's point rows = total source
 //! point count* whenever the level has at least one point row.
 //!
 //! # DIVERGENCE FROM SUPERCLUSTER
@@ -115,7 +115,9 @@ pub struct ClusterEntry {
     pub aggregates: Vec<Option<f64>>,
 }
 
-/// Per-level cluster tables, parallel to `level_gsds`. Keyed by the winner's
+/// Per-level cluster tables, parallel to `level_gsds`.
+///
+/// Keyed by the winner's
 /// [`AssignFeature::index`]. Only non-singleton clusters are stored (memory is
 /// `O(actual clusters)`), and the canonical (finest) level's table is always
 /// empty: every cluster there is a singleton and rows pass through verbatim
@@ -361,8 +363,9 @@ pub fn build_cluster_tables(
     tables
 }
 
-/// Verify the strict §12.1 accounting / sum invariant over freshly built
-/// cluster tables: at every level, every source point feature is counted in
+/// Verify the strict §12.1 accounting / sum invariant over freshly built cluster tables.
+///
+/// At every level, every source point feature is counted in
 /// exactly one point row of that level, so `Σ point_count` over a level's
 /// point rows equals the total source point count exactly — under any drop
 /// mechanism (cell-winner thinning, density budget, their interactions).
@@ -377,6 +380,10 @@ pub fn build_cluster_tables(
 /// Inputs are the exact arguments/results of [`build_cluster_tables`]
 /// (`min_levels` parallel to `features`). Returns a human-readable violation
 /// description; callers surface it as a conversion error.
+///
+/// # Errors
+///
+/// Returns a human-readable description of the first violation found.
 pub fn verify_sum_invariant(
     features: &[AssignFeature],
     min_levels: &[u8],
@@ -581,7 +588,7 @@ mod tests {
         }
     }
 
-    /// Sum of point_count over a level's PRESENT point rows (singletons = 1).
+    /// Sum of `point_count` over a level's PRESENT point rows (singletons = 1).
     fn level_count_sum(
         features: &[AssignFeature],
         min_levels: &[u8],
@@ -607,7 +614,7 @@ mod tests {
     }
 
     /// 10 points in 2 far-apart clumps (6 + 4) with one coarse level whose
-    /// point cell swallows each clump whole: the two winners get point_count
+    /// point cell swallows each clump whole: the two winners get `point_count`
     /// 6 and 4, and the canonical table is empty (all singletons).
     #[test]
     fn ten_points_two_cells_counts_six_and_four() {

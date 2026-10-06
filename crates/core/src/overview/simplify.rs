@@ -515,7 +515,7 @@ impl CascadeStep {
 /// first vertex for degenerate (zero-area) rings — the same flavor as the
 /// `--collapse` path ([`collapse_polygon`]; `assign.rs` notes centroid is the
 /// closest to cartographic convention). Unlike `--collapse` the fallback
-/// chain is applied to MultiPolygons too: a point-band level must never
+/// chain is applied to `MultiPolygons` too: a point-band level must never
 /// silently lose a feature to a degenerate centroid. `Dropped` only when the
 /// geometry has no coordinates at all.
 ///
@@ -625,8 +625,9 @@ pub(super) fn simplify_step_checked(
     }
 }
 
-/// Cascading simplification (#218): fold a geometry through a fine→coarse
-/// chain of level steps, feeding each coarser level the previous level's
+/// Cascading simplification (#218): fold a geometry through a fine→coarse chain of level steps.
+///
+/// The fold feeds each coarser level the previous level's
 /// already-simplified output instead of re-simplifying canonical geometry.
 ///
 /// `steps_fine_to_coarse` lists every non-canonical level from the finest
@@ -1018,7 +1019,7 @@ const INVALID_RETRY_HALVINGS: u32 = 3;
 /// crossing. The expensive-to-check case and the low-risk case coincide.
 /// The trade is the same as `clip.rs`: a giant candidate that *did* acquire
 /// a crossing ships unrepaired, which the overviews spec explicitly permits
-/// (geometry validity is not a conformance requirement, OVERVIEWS_SPEC §
+/// (geometry validity is not a conformance requirement, `OVERVIEWS_SPEC` §
 /// "validity") and matches tippecanoe, which never validates simplification
 /// output. Everything at or below the cap is validated exactly as before.
 const MAX_VALIDATION_VERTS: usize = 2_048;
@@ -2237,7 +2238,7 @@ mod tests {
         }
     }
 
-    /// Representation::Square in a cascade: a square kept at the band's
+    /// `Representation::Square` in a cascade: a square kept at the band's
     /// finest level re-dithers deterministically at coarser steps (same
     /// anchor ⇒ same u), so survival is monotone and engine-independent.
     #[test]

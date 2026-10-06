@@ -4,7 +4,7 @@
 //! ([`TileHasher`] / [`DeduplicationCache`]) and gzip compression
 //! ([`compression::compress`]).
 //!
-//! Run with: cargo bench --package tylertoo-core --bench tile_compress_dedup
+//! Run with: cargo bench --package tylertoo-core --bench `tile_compress_dedup`
 
 use std::hint::black_box;
 use std::time::Duration;

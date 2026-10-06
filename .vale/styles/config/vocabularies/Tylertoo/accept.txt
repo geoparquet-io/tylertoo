@@ -42,6 +42,7 @@ PR's
 URL's
 
 # Geometry and tiling
+[Aa]ntimeridian
 [Bb]box(es)?
 linestring
 multipolygons
@@ -63,6 +64,11 @@ unsplit
 auto-clamp(ed)?
 
 # Systems and build
+maturin
+pydocstyle
+pydoclint
+[Dd]octests?
+CPUs
 [Ss]harded
 [Ss]harding
 unsharded
@@ -73,13 +79,13 @@ pushdown
 preflights
 pipelined
 subprocess
-subcommand
+[Ss]ubcommands?
 subtrees
 debuginfo
 datetime
 dedup
 deduplicat(ed|ion)
-docstrings
+[Dd]ocstrings?
 env
 config
 dev

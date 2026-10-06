@@ -14,8 +14,8 @@
 //!   tile boundaries (same approach as tippecanoe's clip.cpp). This is O(n) and
 //!   specialized for rectangle clipping. For edge cases where S-H produces invalid
 //!   output (self-intersecting polygons, U-shapes that split), we fall back to
-//!   i_overlay's robust boolean operations. Lines are clipped by that same
-//!   i_overlay (`ioverlay_clip::clip_multilinestring_ioverlay`, #435), so one
+//!   `i_overlay`'s robust boolean operations. Lines are clipped by that same
+//!   `i_overlay` (`ioverlay_clip::clip_multilinestring_ioverlay`, #435), so one
 //!   engine decides where the tile edge is for every geometry type.
 //!
 //! # Edge Case Handling (Issue #94)
@@ -26,7 +26,7 @@
 //! - Polygons with holes that intersect the exterior ring
 //!
 //! When S-H produces output with structural issues (detected via cheap O(n) checks),
-//! we fall back to i_overlay which handles these cases correctly.
+//! we fall back to `i_overlay` which handles these cases correctly.
 //!
 //! See: <https://github.com/felt/tippecanoe> (clipping documentation)
 
@@ -120,7 +120,7 @@ fn has_structural_issues(poly: &Polygon<f64>, assume_simple: bool) -> bool {
 /// **O(n²)** pairwise scan. The sweep replaced a capped scan (issue #237 skipped
 /// rings above 2048 vertices to keep the export from stalling on continental
 /// admin rings); with the sweep the cap is gone, so even a genuinely
-/// self-intersecting giant ring is now detected and routed to i_overlay repair.
+/// self-intersecting giant ring is now detected and routed to `i_overlay` repair.
 ///
 /// ## Byte-identical decision
 ///
@@ -295,10 +295,10 @@ pub fn clip_geometry(
 /// Consulted **only when `assume_simple` is also true**. It additionally skips
 /// the O(V) `has_boundary_connecting_edges` gate, so a simple polygon whose S-H
 /// clip runs an edge along the tile boundary keeps the (cheap) S-H result
-/// instead of routing to i_overlay. For simple rings that S-H "bridge" is a
-/// self-touching ring that is area- and fill-equivalent to i_overlay's split
+/// instead of routing to `i_overlay`. For simple rings that S-H "bridge" is a
+/// self-touching ring that is area- and fill-equivalent to `i_overlay`'s split
 /// under nonzero winding (measured — see `fastpath_u_render_equivalent`), so this
-/// removes the ~94% fine-zoom i_overlay fallback without changing rendered
+/// removes the ~94% fine-zoom `i_overlay` fallback without changing rendered
 /// output. On non-simple inputs the gate always runs, preserving the #94 fix.
 pub fn clip_geometry_simple(
     geom: &Geometry<f64>,
@@ -433,11 +433,11 @@ fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
     }
 }
 
-/// Clip a linestring to bounds on i_overlay (#435).
+/// Clip a linestring to bounds on `i_overlay` (#435).
 ///
 /// Same engine as the polygon fallback (`ioverlay_clip`), so lines and
 /// polygons never disagree about where the tile edge is. Was
-/// `geo::BooleanOps::clip`, the i_overlay 4.x copy `geo` vendors.
+/// `geo::BooleanOps::clip`, the `i_overlay` 4.x copy `geo` vendors.
 fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     if let Some(rect) = ls.bounding_rect() {
@@ -663,7 +663,7 @@ pub fn buffer_pixels_to_world(zoom: u8, buffer_pixels: u32, extent: u32) -> u32 
     (tile_size_world * buffer_pixels as u64 / extent as u64) as u32
 }
 
-/// Clip a point in WorldCoord space to WorldBounds.
+/// Clip a point in `WorldCoord` space to `WorldBounds`.
 ///
 /// # Returns
 /// The point if inside the bounds, or `None` if outside.
@@ -675,14 +675,14 @@ pub fn clip_point_world(point: &WorldCoord, bounds: &WorldBounds) -> Option<Worl
     }
 }
 
-/// Clip a polygon in WorldCoord space using Sutherland-Hodgman.
+/// Clip a polygon in `WorldCoord` space using Sutherland-Hodgman.
 ///
 /// This is the integer-coordinate equivalent of `clip_polygon`. It uses
 /// the WorldCoord-based SH algorithm for exact clipping in world space.
 ///
 /// # Arguments
-/// * `exterior` - Exterior ring as WorldCoord points
-/// * `interiors` - Interior rings (holes) as WorldCoord points
+/// * `exterior` - Exterior ring as `WorldCoord` points
+/// * `interiors` - Interior rings (holes) as `WorldCoord` points
 /// * `bounds` - Tile bounds in world coordinate space
 ///
 /// # Returns
@@ -711,7 +711,7 @@ pub fn clip_polygon_world(
     sutherland_hodgman::clip_polygon_sh_world(exterior, interiors, bounds)
 }
 
-/// Compute the axis-aligned bounding box of a WorldCoord ring.
+/// Compute the axis-aligned bounding box of a `WorldCoord` ring.
 fn worldcoord_bbox(coords: &[WorldCoord]) -> Option<WorldBounds> {
     if coords.is_empty() {
         return None;
@@ -732,12 +732,12 @@ fn worldcoord_bbox(coords: &[WorldCoord]) -> Option<WorldBounds> {
     Some(WorldBounds::new(x_min, y_min, x_max, y_max))
 }
 
-/// Convert a `geo::Polygon<f64>` to WorldCoord rings for clipping.
+/// Convert a `geo::Polygon<f64>` to `WorldCoord` rings for clipping.
 ///
 /// This is a convenience function for the Phase 1 migration -- it converts
-/// from the existing f64 representation to WorldCoord for clipping, then
+/// from the existing f64 representation to `WorldCoord` for clipping, then
 /// results can be converted back. In Phase 2, geometries will already be
-/// in WorldCoord format.
+/// in `WorldCoord` format.
 pub fn polygon_to_world_rings(poly: &Polygon<f64>) -> (Vec<WorldCoord>, Vec<Vec<WorldCoord>>) {
     let exterior: Vec<WorldCoord> = poly
         .exterior()
@@ -1782,7 +1782,7 @@ mod tests {
     /// NOTE: the existing `test_clip_polygon_u_shape` fixture is *self-
     /// intersecting* (its inner edge at y=2 passes through the arm verticals at
     /// (2,2)/(8,2)), so `geometry_is_simple` is false for it and the self-
-    /// intersection check — not the boundary gate — routes it to i_overlay. To
+    /// intersection check — not the boundary gate — routes it to `i_overlay`. To
     /// isolate the boundary gate we need a clean simple U: solid base y∈[0,3]
     /// across x∈[0,10], arms x∈[0,3] and x∈[7,10] up to y=10, notch x∈[3,7].
     fn u_shape() -> Polygon<f64> {
@@ -1833,7 +1833,7 @@ mod tests {
     }
 
     /// The equivalence the flag relies on: on a simple U, S-H's kept ring has the
-    /// same enclosed AREA as i_overlay's split and leaves the mouth EMPTY under
+    /// same enclosed AREA as `i_overlay`'s split and leaves the mouth EMPTY under
     /// nonzero winding — so it renders identically despite being self-touching.
     #[test]
     fn fastpath_u_render_equivalent() {

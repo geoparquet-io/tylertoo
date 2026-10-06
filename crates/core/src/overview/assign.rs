@@ -1390,16 +1390,18 @@ pub fn assign_levels_bounded(
 // This preserves duplicating monotonicity and — because the finest level admits
 // every remaining feature — the canonical level is never thinned (spec §2.4).
 
-/// Super-cell edge length for spatial-fairness budget allocation, as a multiple
-/// of the level GSD (in coordinate units). A super-cell is the neighborhood over
+/// Super-cell edge length for spatial-fairness budget allocation, as a multiple of the level GSD.
+///
+/// The length is in coordinate units. A super-cell is the neighborhood over
 /// which the per-level budget is shared; `128 × GSD` is roughly a tile-scale
 /// patch at the level's nominal display scale — coarse enough to hold many
 /// features (so the budget can bind) yet fine enough that a city spans many
 /// cells (so rural areas are not starved to feed it).
 pub const SUPERCELL_GSD_FACTOR: f64 = 128.0;
 
-/// Levels with fewer surviving features than this are exempt from the density
-/// budget. Such levels are already grid-thinning-limited (sparse) rather than
+/// Levels with fewer surviving features than this are exempt from the density budget.
+///
+/// Such levels are already grid-thinning-limited (sparse) rather than
 /// density-limited, so a budget would only fight the cell-winner stage. This is
 /// what keeps coarse zooms essentially unchanged under the default budget.
 pub const MIN_DENSITY_LEVEL_FEATURES: usize = 256;
@@ -2247,7 +2249,7 @@ mod tests {
         }
     }
 
-    /// SplitMix64 — a self-contained deterministic generator for the oracle
+    /// `SplitMix64` — a self-contained deterministic generator for the oracle
     /// fixture (no RNG crate, so the fixture is reproducible from this file
     /// alone on any commit).
     fn splitmix64(state: &mut u64) -> u64 {
@@ -2290,7 +2292,7 @@ mod tests {
     ///   sharded reduce;
     /// - every 53rd feature carries a ladder entry level (some beyond the
     ///   finest level, which clamps);
-    /// - every 997th is a finite-coordinate bbox of extent 2e300 (a DBL_MAX-
+    /// - every 997th is a finite-coordinate bbox of extent 2e300 (a `DBL_MAX`-
     ///   style nodata sentinel), whose squared diagonal overflows to +inf.
     fn oracle_fixture() -> Vec<AssignFeature> {
         let mut rng = 0x5EED_0534_u64;
@@ -2543,7 +2545,7 @@ mod tests {
         );
     }
 
-    /// A finite-coordinate bbox whose extent overflows `dx * dx` (a DBL_MAX-
+    /// A finite-coordinate bbox whose extent overflows `dx * dx` (a `DBL_MAX`-
     /// style nodata sentinel — `scan_feature` lets it through, it only rejects
     /// non-finite coordinates) has a `+inf` squared diagonal. That is already
     /// totally ordered, so it must rank ABOVE every finite diagonal, exactly as

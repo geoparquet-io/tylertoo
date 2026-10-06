@@ -59,6 +59,10 @@ pub type Result<T> = std::result::Result<T, WkbError>;
 /// let wkb = geometry_to_wkb(&line).unwrap();
 /// assert!(!wkb.is_empty());
 /// ```
+///
+/// # Errors
+///
+/// Returns `WkbError::EncodeError` if the geometry cannot be encoded.
 pub fn geometry_to_wkb(geom: &Geometry) -> Result<Vec<u8>> {
     geom.to_wkb(CoordDimensions::xy())
         .map_err(|e| WkbError::EncodeError(e.to_string()))
@@ -94,6 +98,11 @@ pub fn geometry_to_wkb(geom: &Geometry) -> Result<Vec<u8>> {
 /// allocations are bounded by a small multiple of `wkb.len()`.
 /// GeometryCollections nested more than 100 deep are rejected too, since both
 /// the walk and geozero recurse once per level.
+///
+/// # Errors
+///
+/// Returns `WkbError::DecodeError` if the bytes are not valid WKB or fail the
+/// hostile-input checks below.
 pub fn wkb_to_geometry(wkb: &[u8]) -> Result<Geometry> {
     check_wkb_bounds(wkb).map_err(WkbError::DecodeError)?;
     Wkb(wkb)

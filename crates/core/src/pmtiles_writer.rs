@@ -51,7 +51,7 @@ pub const HEADER_BYTES: usize = 127;
 /// - Bytes 8-95: Offsets and lengths (8 u64s)
 /// - Bytes 96-99: Flags (clustered, compression, type)
 /// - Bytes 100-101: Zoom levels
-/// - Bytes 102-117: Bounds (min_lon, min_lat, max_lon, max_lat as i32 * 10_000_000)
+/// - Bytes 102-117: Bounds (`min_lon`, `min_lat`, `max_lon`, `max_lat` as i32 * `10_000_000`)
 /// - Bytes 118-126: Center (zoom, lon, lat)
 ///
 /// Its on-disk size is fixed: [`HEADER_BYTES`].
@@ -193,6 +193,15 @@ impl Header {
     /// #112) uses this to locate directories and tile data. Fails on short
     /// input, bad magic, unsupported version, or out-of-spec compression /
     /// tile-type codes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PMTilesRead`] in each of the cases above.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: every fixed-width field is read only after the length
+    /// check has confirmed all 127 header bytes are present.
     pub fn from_bytes(bytes: &[u8]) -> Result<Header> {
         let err = |msg: String| Error::PMTilesRead(msg);
         if bytes.len() < 127 {
@@ -335,7 +344,7 @@ impl Header {
 /// one is arithmetic.
 pub const MAX_TILE_ID_ZOOM: u8 = 31;
 
-/// Convert tile coordinates (z, x, y) to a TileID for PMTiles
+/// Convert tile coordinates (z, x, y) to a `TileID` for PMTiles
 ///
 /// Uses Hilbert curve ordering for spatial locality. The tile ID is a cumulative
 /// position on the series of Hilbert curves starting at zoom level 0.
@@ -394,7 +403,7 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
 /// Convert x,y coordinates to Hilbert curve index at zoom level z
 ///
 /// Implementation follows the standard Hilbert curve algorithm:
-/// https://en.wikipedia.org/wiki/Hilbert_curve
+/// <https://en.wikipedia.org/wiki/Hilbert_curve>
 pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
     // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
     // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
@@ -501,10 +510,15 @@ pub fn max_expanded_entries(header: &Header) -> u64 {
     tile_address_space(header.max_zoom).min(MAX_EXPANDED_TILE_ENTRIES)
 }
 
-/// Convert a PMTiles TileID back to tile coordinates (z, x, y).
+/// Convert a PMTiles `TileID` back to tile coordinates (z, x, y).
 ///
 /// Inverse of [`tile_id`]. Supports zoom levels 0-31 (the range a u64
 /// cumulative Hilbert ID can address); returns an error for IDs beyond z31.
+///
+/// # Errors
+///
+/// Returns [`Error::PMTilesRead`] if `id` lies beyond the zoom 31 address
+/// space.
 pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
     let mut acc: u64 = 0;
     for z in 0u8..=MAX_TILE_ID_ZOOM {
@@ -523,7 +537,7 @@ pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
 /// Convert a Hilbert curve index back to x,y coordinates at zoom level z
 ///
 /// Standard inverse Hilbert algorithm (d2xy), mirroring [`xy_to_hilbert`]:
-/// https://en.wikipedia.org/wiki/Hilbert_curve
+/// <https://en.wikipedia.org/wiki/Hilbert_curve>
 fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
     let n = 1u64 << z;
     let (mut x, mut y) = (0u64, 0u64);
@@ -555,8 +569,8 @@ fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
 
 /// A directory entry pointing to tile data
 ///
-/// In PMTiles, directories are columnar: all tile_ids are stored together,
-/// then all run_lengths, then all lengths, then all offsets.
+/// In PMTiles, directories are columnar: all `tile_ids` are stored together,
+/// then all `run_lengths`, then all lengths, then all offsets.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub tile_id: u64,
@@ -578,7 +592,7 @@ pub fn encode_varint(mut value: u64, buf: &mut Vec<u8>) {
 
 /// Decode a varint from bytes
 ///
-/// Returns (value, bytes_consumed) or None if invalid/incomplete.
+/// Returns (value, `bytes_consumed`) or None if invalid/incomplete.
 ///
 /// Only the canonical encoding is accepted (#417). A u64 varint is at most
 /// ten bytes, and the tenth carries exactly one payload bit: `shift` is 63
@@ -607,7 +621,7 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 
 /// Encode directory entries in PMTiles columnar format with delta encoding
 ///
-/// Format: count, delta_tile_ids[], run_lengths[], lengths[], offsets[]
+/// Format: count, `delta_tile_ids`[], `run_lengths`[], lengths[], offsets[]
 /// All values are varints. Tile IDs use simple delta encoding.
 ///
 /// Offset encoding follows the PMTiles v3 spec:
@@ -666,7 +680,7 @@ pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
 
 /// Decode directory entries from PMTiles columnar format
 ///
-/// This is the inverse of encode_directory, used for reading and testing.
+/// This is the inverse of `encode_directory`, used for reading and testing.
 pub fn decode_directory(data: &[u8]) -> Option<Vec<DirEntry>> {
     let mut offset = 0;
 
@@ -991,6 +1005,11 @@ pub(crate) fn offsets_are_clustered(entries: impl IntoIterator<Item = (u64, u64)
 ///   the directory references (`pmtiles/verify.go:148-150`, a hard error
 ///   there). This is what catches a writer that stored the same content
 ///   twice and left one copy unreferenced.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, its header does not parse, or
+/// its directories cannot be read.
 pub fn verify_clustered(path: &Path) -> Result<bool> {
     let bytes = std::fs::read(path)
         .map_err(|e| Error::PMTilesRead(format!("failed to read {}: {e}", path.display())))?;
@@ -1066,7 +1085,7 @@ pub struct DirectoryLayout {
 /// Build leaf directories by partitioning entries into chunks.
 ///
 /// Each chunk becomes a leaf directory. The root directory contains
-/// pointers to these leaves (entries with run_length=0).
+/// pointers to these leaves (entries with `run_length=0`).
 ///
 /// # Arguments
 /// * `entries` - All tile directory entries
@@ -1119,15 +1138,19 @@ fn build_root_leaves(
 ///
 /// Follows the tippecanoe algorithm:
 /// 1. Try to fit all entries in a single root directory
-/// 2. If root exceeds MAX_ROOT_DIR_BYTES, partition into leaf directories
-/// 3. If root still exceeds limit, double leaf_size and retry
+/// 2. If root exceeds `MAX_ROOT_DIR_BYTES`, partition into leaf directories
+/// 3. If root still exceeds limit, double `leaf_size` and retry
 ///
 /// This ensures the root directory always fits in the initial HTTP range request,
 /// which is critical for pmtiles-js and other clients that fetch 16KB initially.
 ///
 /// # Arguments
-/// * `entries` - All tile directory entries (must be sorted by tile_id)
+/// * `entries` - All tile directory entries (must be sorted by `tile_id`)
 /// * `compression` - Compression algorithm to use
+///
+/// # Errors
+///
+/// Returns an I/O error if compressing a directory fails.
 pub fn make_root_leaves(
     entries: &[DirEntry],
     compression: Compression,
@@ -1168,6 +1191,10 @@ pub fn make_root_leaves(
 }
 
 /// Compress data with gzip (backward compatibility wrapper)
+///
+/// # Errors
+///
+/// Returns an I/O error if the gzip encoder fails.
 pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
     compression::compress(data, Compression::Gzip)
 }
@@ -1223,13 +1250,13 @@ struct TileEntry {
 
 /// PMTiles v3 writer
 ///
-/// Accumulates tiles in memory (sorted by tile_id via BTreeMap),
+/// Accumulates tiles in memory (sorted by `tile_id` via `BTreeMap`),
 /// then writes the complete archive on finalize.
 ///
 /// Supports tile deduplication: identical tiles are stored once and
 /// referenced via PMTiles' `run_length` feature.
 pub struct PmtilesWriter {
-    /// tile_id -> tile entry (data + hash)
+    /// `tile_id` -> tile entry (data + hash)
     tiles: BTreeMap<u64, TileEntry>,
     min_zoom: u8,
     max_zoom: u8,
@@ -1335,7 +1362,7 @@ impl PmtilesWriter {
         self.dedup_cache.stats()
     }
 
-    /// Set the layer name for vector_layers metadata
+    /// Set the layer name for `vector_layers` metadata
     pub fn set_layer_name(&mut self, name: &str) {
         self.layer_name = name.to_string();
     }
@@ -1349,7 +1376,7 @@ impl PmtilesWriter {
         self.vector_layers_json = Some(json);
     }
 
-    /// Set field metadata for vector_layers.fields
+    /// Set field metadata for `vector_layers.fields`
     ///
     /// Field types should be MVT-style: "String", "Number", or "Boolean"
     pub fn set_fields(&mut self, fields: HashMap<String, String>) {
@@ -1370,6 +1397,10 @@ impl PmtilesWriter {
     ///
     /// The tile data should be uncompressed MVT bytes.
     /// Use `add_tile_with_count` if you have feature count available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error in the cases [`Self::add_tile_with_count`] does.
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, data: &[u8]) -> std::io::Result<()> {
         self.add_tile_with_count(z, x, y, data, 0)
     }
@@ -1380,6 +1411,11 @@ impl PmtilesWriter {
     ///
     /// If deduplication is enabled, identical tiles will be stored once
     /// and referenced via PMTiles' `run_length` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
+    /// can address, or if compressing the tile fails.
     pub fn add_tile_with_count(
         &mut self,
         z: u8,
@@ -1451,6 +1487,11 @@ impl PmtilesWriter {
     /// Use this if the tile data is already gzip compressed.
     /// Note: Deduplication is not available for pre-compressed tiles
     /// since we cannot hash the original content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
+    /// can address.
     pub fn add_tile_compressed(
         &mut self,
         z: u8,
@@ -1499,7 +1540,12 @@ impl PmtilesWriter {
     /// Layout: [Header (127)] [Root Directory] `Metadata` [Tile Data]
     ///
     /// When deduplication is enabled, identical tiles share storage and
-    /// consecutive identical tiles use run_length encoding in the directory.
+    /// consecutive identical tiles use `run_length` encoding in the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PMTilesWrite`] if the file cannot be created or
+    /// written, or if a directory or the metadata cannot be compressed.
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let file = File::create(path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create file: {}", e)))?;
@@ -1806,8 +1852,8 @@ pub struct StreamingWriteStats {
 
 impl StreamingWriteStats {
     /// Calculate memory used by directory entries (approximate).
-    /// Each StreamingDirEntry is ~24 bytes (tile_id: 8, offset: 8, length: 4 + padding).
-    /// We estimate based on total_tiles since each tile gets a directory entry.
+    /// Each `StreamingDirEntry` is ~24 bytes (`tile_id`: 8, offset: 8, length: 4 + padding).
+    /// We estimate based on `total_tiles` since each tile gets a directory entry.
     pub fn estimated_memory_bytes(&self) -> u64 {
         // Each entry: tile_id (8) + offset (8) + length (4) = 20 bytes + padding ≈ 24 bytes
         // Plus HashMap entry overhead for dedup cache: ~40 bytes per unique
@@ -2014,6 +2060,11 @@ impl StreamingPmtilesWriter {
     /// Create a new streaming writer with the specified compression.
     ///
     /// Creates a temp file in the system temp directory for tile data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the spool file cannot be created in the system
+    /// temp directory.
     pub fn new(compression: Compression) -> std::io::Result<Self> {
         Self::with_temp_dir(compression, std::env::temp_dir())
     }
@@ -2025,6 +2076,10 @@ impl StreamingPmtilesWriter {
     /// so two writers in the same directory can never share a file. It is
     /// removed when the writer is finalized or dropped; a run killed
     /// outright leaves it, like any spool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the spool file cannot be created in `temp_dir`.
     pub fn with_temp_dir(compression: Compression, temp_dir: PathBuf) -> std::io::Result<Self> {
         let (file, temp_path) = tempfile::Builder::new()
             .prefix("tylertoo-spool-")
@@ -2093,6 +2148,13 @@ impl StreamingPmtilesWriter {
     /// missing one fails *here* rather than after the run has done all its
     /// work. It does not create the directory: a typo in the path should stop
     /// the run, not invent a folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if a previous `<output>.partial` cannot be moved
+    /// aside, or if `<output>.partial` cannot be created or its prefix
+    /// reserved, for example because the output directory is missing or not
+    /// writable.
     pub fn with_tail_layout(output_path: &Path, compression: Compression) -> std::io::Result<Self> {
         let partial_path = partial_path_for(output_path);
 
@@ -2253,7 +2315,7 @@ impl StreamingPmtilesWriter {
     ///
     /// This does NOT widen the PMTiles header's `min_zoom` (#529, #522):
     /// `go-pmtiles verify` requires the header to equal the shallowest zoom
-    /// that actually holds a tile ("header MinZoom does not match min tile
+    /// that actually holds a tile ("header `MinZoom` does not match min tile
     /// z"). The declaration is therefore informational only as far as
     /// renderers go: the pmtiles JS library builds TileJSON
     /// `minzoom`/`maxzoom` from the HEADER, and `vector_layers[].minzoom` is
@@ -2419,11 +2481,26 @@ impl StreamingPmtilesWriter {
     ///
     /// Tiles are compressed and written immediately. Duplicate tiles
     /// (same content) are detected and not written again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error in the cases [`Self::add_tile_with_count`] does.
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, data: &[u8]) -> std::io::Result<()> {
         self.add_tile_with_count(z, x, y, data, 0)
     }
 
     /// Add a tile with feature count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
+    /// can address, if the writer was already finalized, or if compressing or
+    /// writing the tile fails.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: the spool file is used only after the finalized check
+    /// has confirmed it is present.
     pub fn add_tile_with_count(
         &mut self,
         z: u8,
@@ -2502,6 +2579,17 @@ impl StreamingPmtilesWriter {
     /// compression is deterministic, an identical uncompressed hash implies
     /// identical compressed bytes, so the archive is bit-identical to compressing
     /// serially.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
+    /// can address, if the writer was already finalized, or if writing the tile
+    /// fails.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: the spool file is used only after the finalized check
+    /// has confirmed it is present.
     #[allow(clippy::too_many_arguments)]
     pub fn add_tile_precompressed(
         &mut self,
@@ -2567,6 +2655,11 @@ impl StreamingPmtilesWriter {
     /// with header, directory, metadata, and tile data sections.
     ///
     /// The temp file is deleted after successful finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if assembling or writing the archive fails, or if
+    /// `output_path` differs from the one a tail-layout writer was created for.
     pub fn finalize(mut self, output_path: &Path) -> Result<StreamingWriteStats> {
         // Assemble the complete archive (byte-identical to the last checkpoint,
         // if any). This flushes the temp buffer in place but leaves the handle
@@ -2627,6 +2720,11 @@ impl StreamingPmtilesWriter {
     /// Under the tail layout (#459) `<output>.partial` *is* the live archive
     /// and is left in place — see [`Self::with_tail_layout`] and
     /// [`Self::salvage_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if assembling or writing the archive fails, or if
+    /// `output_path` differs from the one a tail-layout writer was created for.
     pub fn checkpoint(&mut self, output_path: &Path) -> Result<()> {
         self.write_archive(output_path)?;
         Ok(())
@@ -2991,9 +3089,9 @@ impl StreamingPmtilesWriter {
         }
     }
 
-    /// Whether `self.entries`, already sorted by tile_id, is genuinely
+    /// Whether `self.entries`, already sorted by `tile_id`, is genuinely
     /// clustered: see [`offsets_are_clustered`] for the predicate. Must be
-    /// called after the tile_id sort in [`Self::write_archive`] — before it,
+    /// called after the `tile_id` sort in [`Self::write_archive`] — before it,
     /// `self.entries` is in add order, which is not necessarily tile-id order
     /// for every caller (a pyramid merge, say, may still add out of order),
     /// and the check would be meaningless. Export itself now adds in
@@ -4423,7 +4521,7 @@ mod tests {
     }
 
     /// Three leaf pointers laid out the way tippecanoe / go-pmtiles write a
-    /// root directory: every entry has run_length = 0 and every offset after
+    /// root directory: every entry has `run_length` = 0 and every offset after
     /// the first is encoded as 0 ("contiguous with the previous entry").
     fn tippecanoe_style_leaf_root() -> Vec<u8> {
         let mut buf = Vec::new();
@@ -4709,7 +4807,7 @@ mod tests {
     /// A full-world extent must survive `set_bounds` at the exact Web Mercator
     /// latitude bound. The header stores latitude as `i32 = degrees * 1e7`, so
     /// the clamp is directly observable there: the old `±85.05` clamp wrote
-    /// ±850_500_000 and shaved ~0.0011° (~125 m) off the top and bottom of
+    /// ±`850_500_000` and shaved ~0.0011° (~125 m) off the top and bottom of
     /// every world-spanning archive (#416).
     #[test]
     fn test_writer_bounds_keep_exact_mercator_latitude() {
@@ -4800,7 +4898,7 @@ mod tests {
 
     /// #529, #522: `go-pmtiles verify` rejects a header whose `min_zoom` is
     /// declared below the shallowest tile the archive actually holds
-    /// ("header MinZoom does not match min tile z"). #380's declared-minimum
+    /// ("header `MinZoom` does not match min tile z"). #380's declared-minimum
     /// widening must not reach the header — it still reaches
     /// `vector_layers[].minzoom`, as informational metadata (renderers such
     /// as the pmtiles JS library build TileJSON from the header, so they see
@@ -5818,7 +5916,7 @@ mod tests {
     /// An export adds tiles zoom-by-zoom in row-major `(x, y)` order, not
     /// tile-id (Hilbert) order — but the writer used to stamp every archive
     /// `clustered: true` regardless. Once `self.entries` is sorted by
-    /// tile_id for the directory, a row-major add order leaves offsets
+    /// `tile_id` for the directory, a row-major add order leaves offsets
     /// scattered rather than monotonic, so a header claiming `clustered`
     /// here would be a lie go-pmtiles' `verify` catches ("out-of-order entry
     /// in clustered archive").
@@ -6030,12 +6128,12 @@ mod tests {
     }
 
     /// #516 repro: `hash_to_offset.get(&entry.hash).expect("Hash must exist")`
-    /// panicked when a duplicate's tile_id was lower than the tile_id of the
+    /// panicked when a duplicate's `tile_id` was lower than the `tile_id` of the
     /// tile that carries the bytes, because `self.tiles` (a `BTreeMap`) is
-    /// walked in tile_id order and the single pass had not yet recorded the
+    /// walked in `tile_id` order and the single pass had not yet recorded the
     /// carrier's offset when it reached the duplicate. `add_tile(2,3,3,...)`
     /// then `add_tile(0,0,0,...)` with identical content is exactly that:
-    /// the second add's tile_id (0) is lower than the first's, but the first
+    /// the second add's `tile_id` (0) is lower than the first's, but the first
     /// add is the one that carries the bytes (it was added -- and hashed --
     /// first).
     #[test]

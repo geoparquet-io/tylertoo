@@ -12,7 +12,7 @@
 //!   `highway`/`admin_level`-style values shared by thousands of rows) —
 //!   the shape the #559 alloc-free `ScalarKey`/string dedup targets.
 //!
-//! Run with: cargo bench --package tylertoo-core --bench mvt_encode
+//! Run with: cargo bench --package tylertoo-core --bench `mvt_encode`
 
 #[path = "support/fixtures.rs"]
 mod fixtures;

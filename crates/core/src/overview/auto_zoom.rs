@@ -55,8 +55,9 @@ use super::convert::{
 use super::filter::{parse_filter, BoundFilter};
 use super::level::{Crs, WEBMERC_CIRCUMFERENCE_M};
 
-/// Ceiling for `--max-zoom auto` (issue #444): "never above a documented
-/// ceiling". tippecanoe's own `-zg` cap is `32 - full_detail` (z20 at
+/// Ceiling for `--max-zoom auto` (issue #444).
+///
+/// The estimate is "never above a documented ceiling". tippecanoe's own `-zg` cap is `32 - full_detail` (z20 at
 /// defaults); 16 keeps an auto-guessed archive from silently becoming
 /// enormous while still covering building- and address-level detail.
 pub const AUTO_MAX_ZOOM_CEILING: u8 = 16;
@@ -152,6 +153,12 @@ impl MaxZoom {
     ///
     /// `source` is only read (its column projection is left alone), so it may
     /// be the one the conversion then reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConvertError`] if `min_zoom` is above the ceiling, if
+    /// `options` fail the conversion's up-front validation, or if
+    /// [`estimate_max_zoom`] fails.
     pub fn resolve(
         self,
         source: &ConvertSource,
@@ -474,8 +481,9 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
     }
 }
 
-/// Estimate `--max-zoom auto` for a conversion of `source` under `options`
-/// (module docs for the method): the minimum zoom comes from
+/// Estimate `--max-zoom auto` for a conversion of `source` under `options`.
+///
+/// The module docs describe the method. The minimum zoom comes from
 /// `options.levels` (which must be a zoom range), and `options.bbox` /
 /// `options.filter` scope the sample exactly as they scope the conversion.
 /// [`MaxZoom::resolve`] is the usual entry point; this one returns the
@@ -483,6 +491,13 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
 ///
 /// `source` is only read (its column projection is left alone), so it may be
 /// the one the conversion then reads.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if `options.levels` is not a zoom range, if
+/// `min_zoom` is above the ceiling, if the input has no geometry column, an
+/// unsupported CRS, or a filter that does not parse or bind, if reading the
+/// sample fails, or if the sample holds nothing to measure.
 pub fn estimate_max_zoom(
     source: &ConvertSource,
     options: &ConvertOptions,

@@ -17,16 +17,16 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Handwritten prose people read. Excluded: the generated CLI and Python
-# references, pages that only `--8<--`-include a file linted here, and the
-# symlinks under docs/ (their targets are listed directly or out of scope:
-# CHANGELOG.md is generated, context/ is design notes).
+# Prose people read. The generated CLI and Python reference pages are in
+# scope on purpose: they are the clap help and the Python docstrings as
+# rendered, so linting them lints the docstrings. Excluded: pages that only
+# `--8<--`-include a file linted here, and the symlinks under docs/ (their
+# targets are listed directly or out of scope: CHANGELOG.md is generated,
+# context/ is design notes).
 in_scope() {
     git ls-files -- \
         README.md CONTRIBUTING.md DEVELOPMENT.md \
         ':(glob)docs/**/*.md' ':(glob)examples/*/README.md' \
-        ':(exclude)docs/reference/cli.md' \
-        ':(exclude)docs/reference/python.md' \
         ':(exclude)docs/index.md' \
         ':(exclude,glob)docs/tutorials/*.md' |
         while IFS= read -r f; do

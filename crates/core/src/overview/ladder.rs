@@ -72,6 +72,10 @@ impl EntryZoomLadder {
     ///
     /// Non-finite values are ignored; features carrying them get no entry zoom
     /// and fall through to the ordinary gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LadderError::ZeroStep`] if `step` is 0.
     pub fn dense_rank(
         values: impl IntoIterator<Item = f64>,
         base_zoom: u8,
@@ -119,6 +123,11 @@ impl EntryZoomLadder {
 
     /// Build from an explicit `value -> zoom` map, for callers who want the
     /// rungs placed by hand rather than evenly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LadderError::Empty`] if `pairs` is empty, or
+    /// [`LadderError::NonFiniteValue`] if a value is not finite.
     pub fn explicit(pairs: impl IntoIterator<Item = (f64, u8)>) -> Result<Self, LadderError> {
         let rungs: Vec<(f64, u8)> = pairs.into_iter().collect();
         if rungs.is_empty() {
@@ -209,6 +218,11 @@ pub struct EntryZoomSpec {
 ///
 /// A derived ladder spans the archive: rung 0 sits at the coarsest level's
 /// zoom and nothing is placed past the finest.
+///
+/// # Errors
+///
+/// Returns a [`LadderError`] in the cases [`EntryZoomLadder::explicit`] or
+/// [`EntryZoomLadder::dense_rank`] does.
 pub fn build_ladder(
     spec: &EntryZoomSpec,
     values: &[Option<f64>],

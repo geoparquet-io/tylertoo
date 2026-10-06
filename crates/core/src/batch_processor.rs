@@ -24,6 +24,11 @@ use crate::{Error, Result};
 /// (sorted; `.`/`_`-prefixed basenames such as `_SUCCESS` are skipped —
 /// the collection lives in `crate::input_set::list_parquet_files`, shared
 /// with the multi-partition [`crate::input_set::ConvertSource`]).
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if `path` does not exist, if a directory
+/// cannot be listed, or if a directory holds no `.parquet` files.
 pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
@@ -58,6 +63,11 @@ pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
 /// **silently skipped**, so `output` may end up shorter than the array.
 /// Callers that must keep row indices aligned with other columns should use
 /// [`extract_geometries_opt_from_array`] instead.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if a geometry payload is structurally
+/// invalid.
 pub fn extract_geometries_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Geometry<f64>>,
@@ -68,13 +78,19 @@ pub fn extract_geometries_from_array(
     Ok(())
 }
 
-/// Extract geometries from a GeoArrow array into a **row-aligned** Vec of
-/// `Option`s: exactly one entry per array slot, `None` for null slots (and
-/// for the rare slot that decodes but has no `geo::Geometry` conversion).
+/// Extract geometries from a GeoArrow array into a **row-aligned** Vec of `Option`s.
+///
+/// The output holds exactly one entry per array slot: `None` for null slots
+/// (and for the rare slot that decodes but has no `geo::Geometry` conversion).
 ///
 /// Structurally invalid geometry payloads (e.g. an empty or corrupt WKB
 /// value) still return a hard [`Error::GeoParquetRead`]; only *absent*
 /// geometry maps to `None`.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if a geometry payload is structurally
+/// invalid, such as an empty or corrupt WKB value.
 pub fn extract_geometries_opt_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Option<Geometry<f64>>>,
@@ -286,7 +302,7 @@ mod tests {
         );
     }
 
-    /// Test that resolve_parquet_files handles single files correctly.
+    /// Test that `resolve_parquet_files` handles single files correctly.
     #[test]
     fn test_resolve_parquet_files_single_file() {
         let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
@@ -300,7 +316,7 @@ mod tests {
         assert_eq!(files[0], fixture, "Should return the input file path");
     }
 
-    /// Test that resolve_parquet_files returns error for non-existent path.
+    /// Test that `resolve_parquet_files` returns error for non-existent path.
     #[test]
     fn test_resolve_parquet_files_nonexistent() {
         let nonexistent = Path::new("/nonexistent/path.parquet");
@@ -308,7 +324,7 @@ mod tests {
         assert!(result.is_err(), "Should error on non-existent path");
     }
 
-    /// Test that resolve_parquet_files returns error for empty directory.
+    /// Test that `resolve_parquet_files` returns error for empty directory.
     #[test]
     fn test_resolve_parquet_files_empty_dir() {
         let temp_dir = tempfile::tempdir().expect("Should create temp dir");
@@ -320,7 +336,7 @@ mod tests {
         );
     }
 
-    /// Test that resolve_parquet_files recurses into subdirectories and
+    /// Test that `resolve_parquet_files` recurses into subdirectories and
     /// returns a deterministic (sorted) order.
     #[test]
     fn test_resolve_parquet_files_directory_recursive() {

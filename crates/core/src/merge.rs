@@ -127,6 +127,17 @@ pub struct MergeReport {
 /// id is claimed twice — by two inputs or by one input's own directory. See
 /// the module docs for why that check is per tile id rather than per id
 /// range.
+///
+/// # Errors
+///
+/// Returns an error if `inputs` is empty, if an input cannot be opened or read,
+/// if the inputs disagree on tile type or compression, if a tile id is claimed
+/// twice, or if writing the output fails.
+///
+/// # Panics
+///
+/// Panics only on an internal invariant violation in the merge loop (a heap
+/// entry with no pending tile), which is a bug.
 pub fn merge_shards(
     inputs: &[PathBuf],
     output: &Path,

@@ -346,6 +346,12 @@ pub enum ShardRole {
 
 impl ShardRole {
     /// Parse a `--shard` value: `coarse`, or `I/N`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::BadShardSelector`] if `value` is neither `coarse`
+    /// nor `I/N` with integers and `N > 0`, or
+    /// [`ShardError::ShardIndexOutOfRange`] if `I >= N`.
     pub fn parse(value: &str) -> Result<Self, ShardError> {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("coarse") {
@@ -431,6 +437,11 @@ impl TileRange {
     }
 
     /// Build a range from two tile ids at `pivot_zoom`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShardError`] if `pivot_zoom` is 0 or above the shard pivot
+    /// ceiling, if `lo > hi`, or if an id does not belong to `pivot_zoom`.
     pub fn new(pivot_zoom: u8, lo: u64, hi: u64) -> Result<Self, ShardError> {
         if pivot_zoom == 0 || pivot_zoom > MAX_SHARD_PIVOT_ZOOM {
             return Err(ShardError::TileRangePivotOutOfRange { pivot: pivot_zoom });
@@ -455,6 +466,12 @@ impl TileRange {
     ///
     /// Both ids must sit at the same zoom; that zoom is the pivot, and the
     /// range then owns every descendant of those tiles at every deeper zoom.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShardError`] if `value` is not `LO..HI` with integer ids, if
+    /// `LO > HI`, if an id does not decode, or if the two ids sit at different
+    /// zooms or at a zoom outside the pivot range.
     pub fn parse(value: &str) -> Result<Self, ShardError> {
         let bad = || ShardError::BadTileRange {
             value: value.to_string(),
@@ -500,6 +517,11 @@ impl TileRange {
     /// Test-only: production always cuts ranges through [`ShardPlan`], and a
     /// one-shard "fleet" is not a thing anyone runs. It exists because the
     /// partition property is most cleanly stated against the whole zoom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::TileRangePivotOutOfRange`] if `pivot_zoom` is 0 or
+    /// above the shard pivot ceiling.
     #[cfg(test)]
     pub fn whole_zoom(pivot_zoom: u8) -> Result<Self, ShardError> {
         if pivot_zoom == 0 || pivot_zoom > MAX_SHARD_PIVOT_ZOOM {
@@ -716,6 +738,11 @@ impl ShardPlan {
     ///
     /// Lives here rather than in the CLI so the Rust API gets the same guard,
     /// and so the variant that names it is constructed where it is decided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::PivotNotCoarser`] if the plan's pivot is finer
+    /// than `max_zoom`.
     pub fn check_max_zoom(&self, max_zoom: u8, path: &Path) -> Result<(), ShardError> {
         if self.pivot_zoom > max_zoom {
             return Err(ShardError::PivotNotCoarser {
@@ -728,6 +755,11 @@ impl ShardPlan {
     }
 
     /// The [`TileRange`] shard `index` owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::ShardIndexOutOfRange`] if the plan has no shard
+    /// `index`.
     pub fn range(&self, index: usize) -> Result<TileRange, ShardError> {
         let r = self
             .ranges
@@ -741,6 +773,11 @@ impl ShardPlan {
 
     /// The [`TileRange`] a [`ShardRole`] owns, validating the role's `N`
     /// against the plan's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::ShardCountMismatch`] if the role's `N` differs
+    /// from the plan's shard count, or an error if its index is out of range.
     pub fn range_for(&self, role: ShardRole, path: &Path) -> Result<Option<TileRange>, ShardError> {
         match role {
             ShardRole::Coarse => Ok(None),
@@ -759,6 +796,11 @@ impl ShardPlan {
     }
 
     /// Cut a plan for `source`, balancing on footer statistics alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShardError`] if `pivot_zoom` or `shards` is out of range, or
+    /// if reading the source's footer statistics fails.
     pub fn compute(
         source: &ConvertSource,
         pivot_zoom: u8,
@@ -803,6 +845,11 @@ impl ShardPlan {
     }
 
     /// Write the plan as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShardError`] if the plan cannot be serialized or the file
+    /// cannot be written.
     pub fn save(&self, path: &Path) -> Result<(), ShardError> {
         let json = serde_json::to_string_pretty(self).map_err(|e| ShardError::Malformed {
             path: path.display().to_string(),
@@ -815,6 +862,11 @@ impl ShardPlan {
     }
 
     /// Read a plan, refusing anything that is not one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::Io`] if the file cannot be read, or another
+    /// [`ShardError`] if it is not a well-formed shard plan.
     pub fn load(path: &Path) -> Result<Self, ShardError> {
         let named = || path.display().to_string();
         let text = std::fs::read_to_string(path).map_err(|source| ShardError::Io {
@@ -895,6 +947,12 @@ impl ShardPlan {
     }
 
     /// Check the plan was cut for the input this run is about to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardError::SourceMismatch`] if the source's parts differ from
+    /// the ones the plan was cut for, or an error if reading the source's
+    /// footers fails.
     pub fn verify_source(&self, source: &ConvertSource, path: &Path) -> Result<(), ShardError> {
         let named = || path.display().to_string();
         let now = shard_inputs(source)?;
@@ -954,6 +1012,11 @@ fn shard_inputs(source: &ConvertSource) -> Result<Vec<ShardInput>, ShardError> {
 }
 
 /// Convenience: load a plan and resolve one role's range in one step.
+///
+/// # Errors
+///
+/// Returns a [`ShardError`] in the cases [`ShardPlan::load`],
+/// [`ShardPlan::verify_source`], and [`ShardPlan::range_for`] do.
 pub fn resolve_range(
     plan_path: &Path,
     role: ShardRole,

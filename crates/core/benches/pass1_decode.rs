@@ -9,7 +9,7 @@
 //! wraps per chunk. Batch decode is the thing this bench isolates; the file
 //! open/schema resolution happens once outside the timed closure.
 //!
-//! Run with: cargo bench --package tylertoo-core --bench pass1_decode
+//! Run with: cargo bench --package tylertoo-core --bench `pass1_decode`
 
 #[path = "support/fixtures.rs"]
 mod fixtures;

@@ -102,7 +102,7 @@ enum Flavor {
     /// geometry kinds.
     NoCoalesce,
     /// **Every knob at its default**, coalescing included. The important
-    /// case, and the one a reviewer PoC'd as a panic: `coalesce_lines` is on
+    /// case, and the one a reviewer `PoC`'d as a panic: `coalesce_lines` is on
     /// by default, so a polygon dataset saves a coalesce section that is
     /// present and empty, and the re-addressing has to accept that rather
     /// than assert the section absent.
