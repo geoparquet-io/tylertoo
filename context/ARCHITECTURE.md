@@ -208,6 +208,17 @@ verbatim (spec §2.4).
    count; remote inputs read sequentially regardless (their parts share one
    chunk cache that concurrent readers would evict).
 
+   Under `--profile auto` the sink backing is chosen up front from a
+   geometry-only estimate (`auto_backing`), then **checked for the whole
+   pass** (#626, `SinkAutoTuner`): the consumer sums the Arrow bytes of every
+   batch it buffers and, after each input batch, projects bytes already
+   buffered plus the planned rows still to come at the running rate. Past the
+   budget, every RAM sink is flushed into a spill file once (`LevelSink::
+   downgrade_to_spill`) and the rest of the pass spills. The flip is one-way
+   and preserves row order, so it changes only where rows wait, never the
+   output bytes. Because buffered bytes are a term of the projection, the
+   flip happens no later than the moment the RAM sinks reach the budget.
+
 Pass 1 and the assignment can be **persisted and replayed** (`plan_state.rs`,
 `--save-plan` / `--plan`). Two reasons:
 
@@ -564,6 +575,41 @@ chains is refused, naming `--no-coalesce-lines`. Clustering, accumulation and
 tiny-polygon carriers are supported: each keys off one input row whose own
 bbox bounds it, so the row-group argument that makes ordinary features safe
 covers them unchanged.
+
+**The shard plan binds itself without a checksum.** `shards.json` carries a
+`format` discriminator and version, a structural check that its ranges tile
+the pivot zoom exactly (no gap, no overlap), and a per-part input binding
+(path, row count, row-group count). It is small, human-readable JSON, so a
+corrupted file fails the structure check rather than passing unnoticed; the
+cut digest above is what ties it to the convert plan.
+
+**`--plan-only` (#560, #600).** The coarse job's tiles are discarded in an
+aggregate-into-fields handover build, where an external archive owns the
+coarse zooms. `--plan-only` runs pass 1 and the assignment and stops, so the
+plan is byte-identical to a full or capped coarse job's. Export-only flags are
+tolerated and ignored rather than refused: the fingerprint covers convert
+options only, so they cannot change the plan, and the plan-only line can stay
+the coarse job's own line minus OUTPUT. They are still *validated* (a
+`--tile-buffer` over the cap, a malformed `--tile-range`, a missing
+`--keep-overview` directory, a `--feature-id`/`--feature-order` column that
+`--exclude-property` drops) so mistakes surface before shards are queued. The
+~72% of wall #560 cited was a share of a one-shot run, measured before #541
+capped the coarse job's pass 2, so the saving on a current coarse job is
+smaller. It does not lower the memory peak, which is pass 1 plus the
+assignment either way.
+
+**Coarse-job memory floor (#543, #549).** `PASS1_BYTES_PER_ROW = 64` is
+`size_of::<AssignFeature>()`; two of its fields are `Option`s, so alignment
+padding costs more than the payload suggests. A field incident cross-checks
+it: a 1.58-billion-row coarse job logged `[rss] pass1 scan: 96836 MiB` right
+after the scan (≈64.3 B/row) and was OOM-killed later, in the winner-grid wave
+build, on a 192 GiB box (≈2.04× the 94.2 GiB floor); it ran on 360 GiB. The
+×2.5 whole-job factor was calibrated on that run, before #541 shrank the
+coarse job's pass-2 buffers and #565 removed the density budget's 40 B/feature
+priority table (≈59 GiB of that peak), so it is now conservative. It stays at
+2.5 because re-deriving it needs a fresh billion-row run. #543 tracks
+shrinking the floor itself (a struct-of-arrays layout, or spilling the table
+between scan and assign).
 
 The acceptance test is `crates/core/tests/shard_merge_parity.rs`: coarse + N
 shards + one merge vs. a monolithic run, asserting pairwise-disjoint ids,

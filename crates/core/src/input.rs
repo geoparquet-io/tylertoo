@@ -27,7 +27,7 @@
 //!
 //! - **L1**, a bounded in-memory cache (insertion-order eviction) sized to the
 //!   largest row group's working set (floored at
-//!   [`remote::CHUNK_CACHE_MAX_BYTES`]), so a row group larger than the floor
+//!   `remote::CHUNK_CACHE_MAX_BYTES`), so a row group larger than the floor
 //!   does not thrash — the fix for the per-page re-fetch of an oversized column
 //!   chunk (issue #261);
 //! - **L2**, a local on-disk spill of every chunk ever fetched, so a chunk
@@ -42,7 +42,7 @@
 //!
 //! Remote support is compiled behind the `remote` cargo feature; the CLI and
 //! Python bindings enable it by default. Without the feature, URL inputs
-//! fail with a clear [`InputError::RemoteDisabled`] error.
+//! fail with a clear `InputError::RemoteDisabled` error.
 
 use std::fs::File;
 use std::io::Read;
@@ -191,6 +191,12 @@ impl InputSource {
     /// Classify a CLI-style input path. Anything shaped like `scheme://...`
     /// is treated as a URL (`file://` maps back to a local path); everything
     /// else is a local path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if the path is a URL with an unsupported
+    /// scheme, a remote URL in a build without the `remote` feature, or a
+    /// remote URL the client cannot connect to.
     pub fn from_path(path: &Path) -> Result<Self, InputError> {
         let Some(s) = path.to_str() else {
             // Non-UTF-8 paths cannot be URLs; treat as local.
@@ -200,6 +206,12 @@ impl InputSource {
     }
 
     /// [`InputSource::from_path`] for string inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if `input` is a URL with an unsupported
+    /// scheme, a remote URL in a build without the `remote` feature, or a
+    /// remote URL the client cannot connect to.
     pub fn from_str_input(input: &str) -> Result<Self, InputError> {
         let Some(scheme) = url_scheme(input) else {
             return Ok(InputSource::Local(PathBuf::from(input)));
@@ -252,9 +264,14 @@ impl InputSource {
     /// multi-pass streaming pipeline pays the footer fetch only once.
     ///
     /// Callers that open the same input REPEATEDLY — the pass-2 reader
-    /// segments, above all — should use [`Self::open_with_metadata`] instead:
+    /// segments, above all — should use `Self::open_with_metadata` instead:
     /// a local footer parse is cheap once and quadratic in row groups times
     /// columns when paid per reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if the file cannot be opened or its Parquet
+    /// footer cannot be read or fetched.
     pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
@@ -273,7 +290,7 @@ impl InputSource {
     ///
     /// "Cheap, OS page cache" is true of the file *read*, not of the parse:
     /// `ParquetMetaDataReader` decodes every row group's every column chunk
-    /// descriptor, so a footer parse costs O(row_groups × columns) and the
+    /// descriptor, so a footer parse costs `O(row_groups` × columns) and the
     /// thrift decode of a many-row-group footer is measurable — 6.5-19 s for
     /// 1084 segment opens on the #494 Brazil fixture, paid once per reader
     /// opened. The caller already holds the parsed footer
@@ -352,6 +369,11 @@ impl InputSource {
     /// inputs (the OS page cache already serves re-reads). `selected` (`None`
     /// = all) must match the row groups the passes will read, so pruned groups
     /// are never fetched and total traffic stays ≈1× (#219).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if fetching a remote row group or writing it
+    /// to the spill fails.
     #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
         match self {
@@ -362,8 +384,9 @@ impl InputSource {
     }
 }
 
-/// Sum of the compressed byte sizes of the selected input row groups — the
-/// bytes a remote convert will touch, and therefore the projected size of
+/// Sum of the compressed byte sizes of the selected input row groups.
+///
+/// These are the bytes a remote convert will touch, and therefore the projected size of
 /// the disk spill (#219): every touched chunk is staged locally exactly
 /// once, so the spill grows to ≈ this number (issue #272 free-space
 /// preflight). `None` selects every row group (a full-file read); indices
@@ -491,7 +514,7 @@ pub(crate) mod remote {
     /// boundary can never pull bytes from a bbox-pruned row group.
     const SEQUENTIAL_CHUNK: u64 = 8 * 1024;
 
-    /// Shared tokio runtime driving object_store's async I/O from our
+    /// Shared tokio runtime driving `object_store`'s async I/O from our
     /// synchronous reader plumbing. Two worker threads: requests are issued
     /// one at a time per reader, so this only needs to run the HTTP client.
     fn runtime() -> &'static tokio::runtime::Runtime {
@@ -1184,7 +1207,7 @@ pub(crate) mod remote {
     }
 
     /// Bridges the AWS SDK credential chain (profiles, SSO, IMDS, ...) into
-    /// object_store's credential provider, re-resolving on each request so
+    /// `object_store`'s credential provider, re-resolving on each request so
     /// expiring credentials refresh (the SDK chain caches internally).
     #[derive(Debug)]
     struct SdkCredentialBridge(aws_credential_types::provider::SharedCredentialsProvider);
@@ -1713,7 +1736,7 @@ pub(crate) mod remote {
         }
 
         /// PR-C: a signature/authorization-style failure against a custom
-        /// S3-compatible endpoint appends the AWS_SKIP_SIGNATURE hint in
+        /// S3-compatible endpoint appends the `AWS_SKIP_SIGNATURE` hint in
         /// the error text (string-level; the error types are unchanged).
         #[test]
         fn signature_error_on_custom_endpoint_appends_skip_signature_hint() {

@@ -61,10 +61,11 @@ pub enum ConvertSource {
     Multi(MultiSource),
 }
 
-/// One parquet file/object plus its lazily cached footer metadata, so the
-/// header phase's accessors (schema, kv metadata, row-group counts,
-/// selection) parse the footer ONCE — matching the pre-v0.7 single-open
-/// header cost.
+/// One parquet file/object plus its lazily cached footer metadata.
+///
+/// The cache means the header phase's accessors (schema, kv metadata,
+/// row-group counts, selection) parse the footer ONCE — matching the pre-v0.7
+/// single-open header cost.
 #[derive(Debug)]
 pub struct SingleSource {
     source: InputSource,
@@ -133,13 +134,17 @@ pub struct MultiSource {
     projection: std::sync::OnceLock<Vec<usize>>,
 }
 
-/// Per-part row-group selection: the multi-file analogue of the single-file
+/// Per-part row-group selection.
+///
+/// This is the multi-file analogue of the single-file
 /// `selected_row_groups: Option<&[usize]>` (bbox pruning, #102). Entry `i`
 /// holds part `i`'s *local* row-group indices; an empty entry skips the
 /// part entirely.
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
 
+/// Most bytes of one byte-array column a single decoded record batch can hold.
+///
 /// arrow-rs decodes a parquet `BYTE_ARRAY` column (WKB geometry, strings)
 /// into a `BinaryArray`/`StringArray` whose offsets are `i32`, so one decoded
 /// record batch holds at most this many bytes of any one such column (#563).
@@ -379,8 +384,9 @@ pub struct ReadPlan<'a> {
     pub row_groups: Option<&'a RowGroupSelection>,
 }
 
-/// Sequential record-batch stream over all parts of a [`ConvertSource`],
-/// in part order. Part `i + 1`'s reader is opened lazily when part `i` is
+/// Sequential record-batch stream over all parts of a [`ConvertSource`], in part order.
+///
+/// Part `i + 1`'s reader is opened lazily when part `i` is
 /// exhausted; on each part transition the finished part's in-memory read
 /// cache is released ([`InputSource::release_read_cache`]) so resident
 /// memory stays bounded by one part's working set.
@@ -416,11 +422,17 @@ impl ConvertSource {
     ///   listing: `.parquet` keys sorted by key, `_SUCCESS`/zero-byte/
     ///   hidden (`.`/`_`) names skipped, one store instance shared by all
     ///   parts; requires the `remote` feature (without it, the standard
-    ///   [`InputError::RemoteDisabled`] as before);
+    ///   `InputError::RemoteDisabled` as before);
     /// - `http(s)://` prefix → [`InputError::RemotePrefixUnsupported`]
     ///   (no generic listing API; the error points at `--files-from`);
     /// - a single resolved partition collapses to `Single`;
     /// - an empty directory/glob result → [`InputError::NoParquetInputs`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] for each failure listed above, and if a local
+    /// path, glob, directory listing, or remote listing cannot be read, or if
+    /// the resolved parts are incompatible.
     pub fn resolve(input: &str) -> Result<Self, InputError> {
         if let Some(_scheme) = url_scheme(input) {
             // A remote *prefix* ("directory", trailing `/`) is recognized
@@ -510,6 +522,12 @@ impl ConvertSource {
     /// dataset. Each line is resolved as a SINGLE file/object (no
     /// directory, glob, or prefix expansion); mixing local and remote
     /// entries is allowed (compatibility is validated as usual).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if the manifest cannot be read, lists no
+    /// entries, or names a missing local file or an entry that cannot be
+    /// opened, or if the entries are incompatible.
     pub fn from_manifest(manifest: &Path) -> Result<Self, InputError> {
         let text = std::fs::read_to_string(manifest).map_err(|e| InputError::ManifestRead {
             path: manifest.display().to_string(),
@@ -530,6 +548,11 @@ impl ConvertSource {
     /// Build a source from an explicit ordered list of inputs (local paths
     /// or URLs) — the Python `list[str]` input shape. Order is preserved
     /// verbatim; each entry is a single file/object (no expansion).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if `inputs` is empty, if an entry is a missing
+    /// local file or cannot be opened, or if the entries are incompatible.
     pub fn from_input_list<S: AsRef<str>>(inputs: &[S]) -> Result<Self, InputError> {
         let entries: Vec<(String, String)> = inputs
             .iter()
@@ -571,6 +594,10 @@ impl ConvertSource {
 
     /// [`ConvertSource::resolve`] for `Path` inputs (non-UTF-8 paths fall
     /// back to a single local source, as [`InputSource::from_path`] does).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] in the cases [`ConvertSource::resolve`] does.
     pub fn resolve_path(path: &Path) -> Result<Self, InputError> {
         match path.to_str() {
             Some(s) => Self::resolve(s),
@@ -613,6 +640,11 @@ impl ConvertSource {
     /// The Arrow schema of the dataset. For a multi source this is the
     /// validated union schema (nullability OR-ed across parts). After
     /// [`Self::restrict_columns`], only the kept columns, in file order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read or the
+    /// column restriction cannot be applied to the schema.
     pub fn schema(&self) -> Result<SchemaRef, InputError> {
         let full = match self {
             ConvertSource::Single(s) => s.meta()?.schema.clone(),
@@ -626,6 +658,10 @@ impl ConvertSource {
 
     /// The unprojected schema: every column the files carry, whether or not
     /// [`Self::restrict_columns`] has narrowed what reads return.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn file_schema(&self) -> Result<SchemaRef, InputError> {
         match self {
             ConvertSource::Single(s) => Ok(s.meta()?.schema.clone()),
@@ -640,6 +676,12 @@ impl ConvertSource {
     /// excluded columns are never decoded (a remote input still stages every
     /// chunk of a row group; only the decode is skipped). A second call is a
     /// programming error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read, if `keep`
+    /// is not a strictly ascending subset of the file's columns, or if the
+    /// restriction was already set.
     pub fn restrict_columns(&self, keep: Vec<usize>) -> Result<(), InputError> {
         let ncols = self.file_schema()?.fields().len();
         if keep.windows(2).any(|w| w[0] >= w[1]) || keep.iter().any(|&i| i >= ncols) {
@@ -669,6 +711,10 @@ impl ConvertSource {
 
     /// Parquet key-value metadata of partition 0 (the `geo` metadata used
     /// for CRS detection; construction validated all parts agree).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn key_value_metadata(&self) -> Result<Option<Vec<KeyValue>>, InputError> {
         match self {
             ConvertSource::Single(s) => Ok(s
@@ -686,6 +732,10 @@ impl ConvertSource {
     }
 
     /// Total number of row groups across all parts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn num_row_groups_total(&self) -> Result<usize, InputError> {
         Ok(self
             .metas()?
@@ -704,6 +754,10 @@ impl ConvertSource {
     /// object swapped under a plan changes its row count in every case that
     /// would otherwise corrupt the replay (the row-indexed winner table is
     /// addressed by row position).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn part_row_counts(&self) -> Result<Vec<(i64, usize)>, InputError> {
         Ok(self
             .metas()?
@@ -732,6 +786,10 @@ impl ConvertSource {
     /// A selection index outside the part's row-group range contributes
     /// nothing rather than panicking: the caller compares the total and
     /// reports a mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn selected_row_count(
         &self,
         selected: Option<&RowGroupSelection>,
@@ -810,6 +868,10 @@ impl ConvertSource {
     /// Per-part bbox row-group selection (#102): applies the single-file
     /// covering-statistics pruning to each part independently.
     /// `bbox_units` is `[xmin, ymin, xmax, ymax]` in the file CRS units.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn select_row_groups(
         &self,
         bbox_units: &[f64; 4],
@@ -827,6 +889,10 @@ impl ConvertSource {
     /// ([`crate::overview::filter::BoundFilter::select_row_groups`]) to each
     /// part independently. Conservative — groups without usable statistics
     /// are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn select_row_groups_matching(
         &self,
         filter: &crate::overview::filter::BoundFilter,
@@ -843,6 +909,10 @@ impl ConvertSource {
     /// row group of every part) — the projected disk-spill size the #272
     /// free-space preflight consults. Per-part sums come from the shared
     /// single-file helper [`crate::input::selected_compressed_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
     pub fn selected_input_bytes(
         &self,
         selection: Option<&RowGroupSelection>,
@@ -908,6 +978,11 @@ impl ConvertSource {
     /// the input (#219). Errors are the caller's to handle; the streaming
     /// pipeline treats staging as best-effort (a network error here is one the
     /// passes would hit anyway).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if fetching a remote part's row groups or
+    /// writing them to the spill fails.
     pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
         let parts = self.parts();
         if let Some(sel) = selection {
@@ -924,6 +999,11 @@ impl ConvertSource {
     }
 
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read or the first
+    /// part's reader cannot be opened.
     pub fn open_stream(&self, plan: &ReadPlan<'_>) -> Result<SourceStream<'_>, InputError> {
         let parts = self.parts();
         if let Some(sel) = plan.row_groups {
@@ -1142,10 +1222,19 @@ impl MultiSource {
     /// part's footer and validate compatibility against part 0 (see the
     /// module docs). `parts` must be non-empty and already ordered.
     /// Footer loads run with bounded concurrency
-    /// ([`FOOTER_LOAD_CONCURRENCY`]): a remote footer is two range
+    /// (`FOOTER_LOAD_CONCURRENCY`): a remote footer is two range
     /// requests, so hundreds of parts would otherwise serialize hundreds
     /// of round-trips — but must not open hundreds of connections at once
     /// either.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be loaded, or if a
+    /// part's schema, geometry column, or CRS is incompatible with part 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `parts` is empty.
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
         let metas = load_part_metas(&parts)?;
@@ -1182,7 +1271,7 @@ impl MultiSource {
                 offender: part.display_name(),
                 detail,
             };
-            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(&incompatible)?;
+            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
             let crs = crs_of(meta);
             if crs != first_crs {
                 return Err(incompatible(format!(
@@ -1753,7 +1842,7 @@ mod tests {
 
     /// http(s) prefixes stay hard errors (generic HTTP has no listing API)
     /// and the error points at `--files-from`. s3/gs prefixes are listed
-    /// for real now (covered by the InMemory tests below), so they are NOT
+    /// for real now (covered by the `InMemory` tests below), so they are NOT
     /// rejected here.
     #[cfg(feature = "remote")]
     #[test]
@@ -2375,7 +2464,7 @@ b.parquet
         use object_store::path::Path as ObjectPath;
         use object_store::{ObjectStore, ObjectStoreExt};
 
-        /// Seed one InMemory store with `objects` (key → bytes).
+        /// Seed one `InMemory` store with `objects` (key → bytes).
         fn seeded_store(objects: &[(&str, Vec<u8>)]) -> Arc<InMemory> {
             let store = Arc::new(InMemory::new());
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2435,7 +2524,7 @@ b.parquet
             assert!(listed.iter().all(|p| p.size > 0), "sizes from the listing");
         }
 
-        /// Listed parts stream in key order through a ConvertSource, all
+        /// Listed parts stream in key order through a `ConvertSource`, all
         /// sharing ONE store instance.
         #[test]
         fn listed_parts_stream_in_order() {

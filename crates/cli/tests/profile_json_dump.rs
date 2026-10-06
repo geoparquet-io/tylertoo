@@ -35,7 +35,7 @@ fn tylertoo_bin() -> &'static str {
 /// #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
 /// `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the instant
 /// `convert_to_overviews` finishes) followed by export's own. See
-/// `write_export_profile_json`'s doc and `docs/PROFILING.md`'s "Two JSONL
+/// `write_export_profile_json`'s doc and `context/PROFILING.md`'s "Two JSONL
 /// lines for one `tiles` run" section for why this is two lines rather than
 /// one merged object: convert's line is already on disk by the time export
 /// starts, and merging would mean threading convert's report through the
@@ -342,6 +342,85 @@ fn check_convert_line(
     );
 
     check_rss_sampler(value, value, &CONVERT_PHASES);
+    check_sink_measurement(value);
+    check_pass1_memory_preflight(value);
+}
+
+/// #626: `pass2.sink` — the MEASURED retained cost of a buffered output row,
+/// which is what replaced the 4 KiB-per-row guess the `auto` sink estimate
+/// used to make about property width.
+///
+/// A `--max-zoom 6` run on this fixture emits a single level, so nothing is
+/// buffered and `bytes_per_row` is legitimately null; the shape is asserted
+/// either way, the arithmetic only when a sample exists.
+fn check_sink_measurement(value: &serde_json::Value) {
+    let sink = &value["pass2"]["sink"];
+    assert!(
+        sink.is_object(),
+        "pass2.sink must be an object (#626): {value}"
+    );
+    let sampled = sink["sampled_rows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pass2.sink.sampled_rows must be an integer: {value}"));
+    let projected = sink["projected_bytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pass2.sink.projected_bytes must be an integer: {value}"));
+    assert!(
+        sink["budget_bytes"].is_u64(),
+        "pass2.sink.budget_bytes must be an integer: {value}"
+    );
+    assert!(
+        sink["downgraded_to_spill"].is_boolean(),
+        "pass2.sink.downgraded_to_spill must be a bool: {value}"
+    );
+    match sink["bytes_per_row"].as_u64() {
+        Some(per_row) => {
+            assert!(
+                sampled > 0,
+                "a measured pass2.sink.bytes_per_row implies sampled rows: {value}"
+            );
+            assert!(
+                per_row >= 256,
+                "pass2.sink.bytes_per_row ({per_row}) must include the allocator floor: {value}"
+            );
+            assert!(
+                projected > 0,
+                "a measured rate must project a non-zero buffered set: {value}"
+            );
+        }
+        None => assert!(
+            sink["bytes_per_row"].is_null() && sampled == 0 && projected == 0,
+            "pass2.sink.bytes_per_row is null only when nothing was buffered: {value}"
+        ),
+    }
+}
+
+/// #543 + #626 item 4: the pre-scan pass-1 memory verdict rides along in the
+/// dump, so a job that was warned about and then OOM-killed leaves the
+/// warning in the machine-readable record.
+fn check_pass1_memory_preflight(value: &serde_json::Value) {
+    let pre = &value["pass1_memory_preflight"];
+    let verdict = pre["verdict"]
+        .as_str()
+        .unwrap_or_else(|| panic!("pass1_memory_preflight.verdict must be a string: {value}"));
+    assert!(
+        ["not_checked", "fits", "warned", "exceeded_but_forced"].contains(&verdict),
+        "unexpected pass1_memory_preflight.verdict {verdict:?}: {value}"
+    );
+    let rows = pre["rows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pass1_memory_preflight.rows must be an integer: {value}"));
+    let scanned = value["pass1"]["rows"].as_u64().unwrap_or(0);
+    assert!(
+        rows >= scanned && rows > 0,
+        "the preflight's footer row count ({rows}) must cover what pass 1 then \
+         scanned ({scanned}) — it is an upper bound, exact without --bbox/--filter: {value}"
+    );
+    assert_eq!(
+        pre["estimated_bytes"].as_u64(),
+        Some(rows * 64),
+        "estimated_bytes must be rows x PASS1_BYTES_PER_ROW: {value}"
+    );
 }
 
 /// Every phase a plain (no `--plan`) convert enters, as `rss_sampler`

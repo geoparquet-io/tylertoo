@@ -105,7 +105,7 @@ fn bench_sutherland_hodgman(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark i_overlay clipping at various polygon sizes (for comparison)
+/// Benchmark `i_overlay` clipping at various polygon sizes (for comparison)
 fn bench_ioverlay(c: &mut Criterion) {
     let mut group = c.benchmark_group("ioverlay");
 
@@ -158,7 +158,7 @@ fn bench_wide_polygon(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark end-to-end clip_geometry function
+/// Benchmark end-to-end `clip_geometry` function
 fn bench_clip_geometry(c: &mut Criterion) {
     let mut group = c.benchmark_group("clip_geometry");
 

@@ -164,6 +164,12 @@ impl ArchiveIndex {
     ///
     /// Bytes read here are bounded by the archive's directory size, not by
     /// its total size — see [`Self::bytes_read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened or read, if the header
+    /// fails validation, if a directory cannot be read, or if the header claims
+    /// more metadata than the internal-section ceiling allows.
     pub fn open(path: &Path) -> Result<Self> {
         let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
         let file = File::open(path)
@@ -280,6 +286,11 @@ impl ArchiveIndex {
     }
 
     /// Bytes at an absolute file range — a [`TileRef::range`], typically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `range` runs past the end of the file or is
+    /// reversed, or if the read fails.
     pub fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
         if range.end > self.src.len as usize || range.start > range.end {
             return Err(Error::PMTilesWrite(format!(
@@ -317,6 +328,11 @@ impl ArchiveIndex {
     /// Derived from the directory alone — no tile body is read — which is
     /// what makes the merge's disjointness check cheap enough to run on every
     /// input up front.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a directory entry's run length exceeds the archive's
+    /// expansion limit, or if a run overflows the tile-id range.
     pub fn tile_id_range(&self) -> Result<Option<(u64, u64)>> {
         // The same run-length expansion budget [`Self::tiles`] spends, for
         // the same reason and with the same wording (#417/#510): without it,
@@ -373,6 +389,11 @@ impl ArchiveIndex {
     /// tile ids are Hilbert-curve blocks per zoom, monotonic in zoom, so the
     /// lowest and highest id decode straight to the archive's actual min and
     /// max zoom.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Self::tile_id_range`] fails or a tile id does not
+    /// decode to a zoom.
     pub fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>> {
         let Some((lo, hi)) = self.tile_id_range()? else {
             return Ok(None);

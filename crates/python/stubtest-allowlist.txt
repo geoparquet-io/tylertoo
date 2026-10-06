@@ -1,7 +1,4 @@
 # mypy.stubtest allowlist.
 #
-# maturin wraps the compiled extension in a generated package:
-#   tylertoo/__init__.py  ->  from .tylertoo import *
-# The inner tylertoo.tylertoo submodule is an implementation detail of that
-# wrapping; the public surface is fully described by tylertoo.pyi.
-tylertoo.tylertoo
+# Empty on purpose: tylertoo/__init__.py is typed inline, and
+# tylertoo/_tylertoo.pyi must match the compiled extension exactly.

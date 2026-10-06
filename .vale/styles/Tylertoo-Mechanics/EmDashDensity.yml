@@ -1,0 +1,6 @@
+extends: occurrence
+message: "This file uses more than 3 em dashes. Split the clauses instead."
+level: warning
+scope: text
+max: 3
+token: '—'

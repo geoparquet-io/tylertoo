@@ -1,7 +1,8 @@
-# Deploy Documentation — mkdocs site to GitHub Pages.
+# Deploy Documentation: the Zensical site to GitHub Pages.
 #
-# Purpose: build the docs on every push/PR (the build doubles as a docs
-# lint) and deploy to Pages on pushes to main.
+# Purpose: build the site on pushes to main and deploy it to Pages. Pull
+# requests are covered by the `docs` job in ci.yml, which runs the same
+# strict build plus every documented example.
 #
 # KNOWN FLAKE: the Pages deploy step occasionally fails with a transient
 # "try again later" from GitHub. Policy: manual rerun (Actions -> re-run
@@ -12,9 +13,6 @@ name: Deploy Documentation
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
     branches:
       - main
   workflow_dispatch:
@@ -36,9 +34,18 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: crates/python/uv.lock
 
+      # Only the docs dependency group: the site needs zensical, not the
+      # compiled extension.
       - name: Build documentation
-        run: uvx --with mkdocs-material mkdocs build --strict
+        run: |
+          uv run --project crates/python --locked --only-group docs \
+            zensical build --strict --clean
+        env:
+          UV_PYTHON: "3.12"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

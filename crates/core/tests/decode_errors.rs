@@ -5,7 +5,7 @@
 //! hand-parsing it.
 //!
 //! Run with:
-//!   cargo test --package tylertoo-core --test decode_errors -- --nocapture
+//!   cargo test --package tylertoo-core --test `decode_errors` -- --nocapture
 
 use std::path::PathBuf;
 

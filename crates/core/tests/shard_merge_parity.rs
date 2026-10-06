@@ -102,7 +102,7 @@ enum Flavor {
     /// geometry kinds.
     NoCoalesce,
     /// **Every knob at its default**, coalescing included. The important
-    /// case, and the one a reviewer PoC'd as a panic: `coalesce_lines` is on
+    /// case, and the one a reviewer `PoC`'d as a panic: `coalesce_lines` is on
     /// by default, so a polygon dataset saves a coalesce section that is
     /// present and empty, and the re-addressing has to accept that rather
     /// than assert the section absent.
@@ -593,7 +593,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
 /// for byte. The merged one is assembled from N archives, so its directory
 /// layout, its dedup accounting and its tile ORDER within a zoom differ, and
 /// (today) it carries no tilestats. Tile bodies are identical; the container
-/// is not. See `docs/diving-deeper/sharded-builds.md`.
+/// is not. See `docs/guides/scaling.md`.
 fn assert_archive_metadata_matches(mono: &Path, merged: &Path, shards: usize) {
     let (want_h, got_h) = (
         ArchiveIndex::open(mono)

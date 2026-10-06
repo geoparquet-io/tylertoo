@@ -86,6 +86,11 @@ impl OverviewReader {
     /// key into an [`OverviewsMeta`]. Returns [`ReaderError::MissingOverviewsKey`]
     /// if the key is absent and [`ReaderError::InvalidOverviewsJson`] if it does
     /// not parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReaderError`] if the file cannot be opened or its Parquet
+    /// footer cannot be parsed, as well as the two cases above.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ReaderError> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
@@ -296,6 +301,11 @@ impl OverviewReader {
     ///
     /// - `duplicating`: exactly that level's own band (levels are self-contained).
     /// - `partitioning`: the **prefix** `0..=end` (levels accumulate).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::LevelOutOfRange`] if `level_idx` is not a level
+    /// of the file.
     pub fn row_groups_for_level(&self, level_idx: usize) -> Result<Vec<usize>, ReaderError> {
         let (start, end) = self.level_band(level_idx)?;
         let rgs = match self.mode() {
@@ -350,6 +360,11 @@ impl OverviewReader {
     /// The row groups actually read for `level_idx` given an optional viewport
     /// `bbox`: the level's RG set (§5.1) intersected with the bbox-pruned set.
     /// With `bbox == None` this is exactly [`Self::row_groups_for_level`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::LevelOutOfRange`] if `level_idx` is not a level
+    /// of the file.
     pub fn selected_row_groups(
         &self,
         level_idx: usize,
@@ -372,6 +387,11 @@ impl OverviewReader {
     /// Read a level, optionally pruned by a viewport `bbox`, as an iterator of
     /// `Result<RecordBatch, ArrowError>`. Reads **only** the selected row groups
     /// ([`Self::selected_row_groups`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
+    /// the Parquet reader cannot be built.
     pub fn read_level(
         &self,
         level_idx: usize,
@@ -388,6 +408,11 @@ impl OverviewReader {
     /// [`Self::read_level`] with an explicit Arrow batch size (the builder
     /// default is 1024 rows). Larger batches amortize per-batch overhead for
     /// consumers that do parallel per-row work on each batch (PMTiles export).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
+    /// the Parquet reader cannot be built.
     pub fn read_level_with_batch_size(
         &self,
         level_idx: usize,
@@ -413,6 +438,11 @@ impl OverviewReader {
     /// fan-out scan of the whole file (issue #233): reading each band once
     /// (`Σ_j |band_j|` = every row group exactly once) instead of re-reading a
     /// coarse band from every finer level's prefix (`Σ_k |prefix_k|`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
+    /// the Parquet reader cannot be built.
     pub fn read_band_with_batch_size(
         &self,
         level_idx: usize,

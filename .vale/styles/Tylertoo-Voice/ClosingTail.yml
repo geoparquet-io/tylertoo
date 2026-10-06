@@ -1,0 +1,12 @@
+extends: existence
+message: "Cut the closing line '%s'. End on the last substantive point."
+level: warning
+ignorecase: true
+tokens:
+  - "and that's it"
+  - "hope this helps"
+  - "happy \\w+ing"
+  - "in conclusion"
+  - "to sum up"
+  - "at the end of the day"
+  - "in a nutshell"

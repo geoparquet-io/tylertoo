@@ -1,101 +1,160 @@
 # Contributing to tylertoo
 
-Participation in this project is governed by our [Code of Conduct](https://github.com/geoparquet-io/tylertoo/blob/main/CODE_OF_CONDUCT.md).
+Contributors agree to follow the
+[Code of Conduct](https://github.com/geoparquet-io/tylertoo/blob/main/CODE_OF_CONDUCT.md).
+Report security issues privately through
+[SECURITY.md](https://github.com/geoparquet-io/tylertoo/blob/main/SECURITY.md).
 
-Found a security issue? See [SECURITY.md](https://github.com/geoparquet-io/tylertoo/blob/main/SECURITY.md) for how to report it privately.
+For bugs and feature requests, use the
+[issue templates](https://github.com/geoparquet-io/tylertoo/issues/new/choose).
 
-## Development Setup
+## Development setup
 
 ```bash
 git clone https://github.com/geoparquet-io/tylertoo.git
 cd tylertoo
 git config core.hooksPath .githooks
-cargo build && cargo check
+cargo build
 ```
 
-See [DEVELOPMENT.md](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md) for the day-to-day workflow,
-Python setup, and how to run every CI gate locally.
+[DEVELOPMENT.md](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md)
+covers setup, daily development, and local CI checks.
 
-## Commit Convention
+## Commit convention
 
+Commit messages follow
 [Conventional Commits](https://www.conventionalcommits.org/):
 
-| Type | Description |
-|------|-------------|
-| `feat` | New feature (bumps minor) |
-| `fix` | Bug fix (bumps patch) |
+| Type | Use for |
+|------|---------|
+| `feat` | A new feature (bumps minor) |
+| `fix` | A bug fix (bumps patch) |
 | `docs` | Documentation only |
-| `perf` | Performance improvement |
-| `refactor` | Code change (no feature/fix) |
+| `perf` | A performance improvement |
+| `refactor` | A code change that is neither a feature nor a fix |
 | `test` | Tests only |
 | `chore` | Maintenance |
 
-## Pull Request Process
+## Pull request process
 
-1. Branch from `main` (it is protected — no direct pushes).
-2. Run the gates locally — CI enforces all of them as required checks:
-   `cargo fmt --all --check`, `cargo clippy --all-targets
-   --all-features -- -D warnings`, `cargo machete`, targeted tests,
-   and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
-   suite via `uv run`. The full list with commands:
-   [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
-   One check is advisory rather than required: the diff-scoped mutation
-   run (`Mutation Diff`) lists the mutants in your change that no test
-   catches, in its job summary and in a sticky PR comment. Treat it as a
-   hint for a missing test, not a failure; `scripts/mutants-diff.sh`
-   reproduces it locally.
-3. Submit the PR using the [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md);
-   never bypass the pre-commit hooks (`--no-verify` is forbidden).
+1. Branch from `main`. Branch protection rejects direct pushes.
+2. Run CI checks locally. At minimum, run `cargo fmt --all --check`,
+   `cargo clippy`, `cargo shear`, and targeted tests, plus the `uv run`
+   suite for Python changes. CI requires these checks to pass.
+   [DEVELOPMENT.md → CI gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally)
+   lists every gate with its command.
+3. Open the PR with the
+   [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
+   Never bypass the pre-commit hook with `--no-verify`.
 
-Filing a bug or feature request instead? Use the
-[issue templates](.github/ISSUE_TEMPLATE/) — they ask for the details we
-need to act on the report quickly.
+The diff-scoped mutation check is advisory. Its job summary and sticky PR
+comment list mutants in your change that tests missed. Use these to find
+test gaps. Run `scripts/mutants-diff.sh` to reproduce the check locally.
 
-## Releasing (Maintainers)
+## Docstrings and help text
+
+For public docstrings, CLI help, and `///` docs:
+
+- Open with a one-line summary that ends with a period.
+- Describe what each parameter does for the user in at most two sentences.
+- Leave out issue numbers, references to sweeps or decision files, restated
+  defaults, internal crate names, memory formulas, and tuning history.
+- Give a performance-only knob one sentence and a link to the
+  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).
+  Put tippecanoe comparisons in the
+  [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/).
+- Keep one short runnable example per function. Move removed material
+  users still need to `docs/OVERVIEW_TUNING.md`, a guide, or
+  `CHANGELOG.md`.
+
+## Releasing (maintainers)
 
 ### Prerequisites
 
-1. **Commitizen** installed globally: `uv tool install commitizen`
-2. **GitHub secrets** configured:
-   - `CARGO_REGISTRY_TOKEN` from [crates.io/settings/tokens](https://crates.io/settings/tokens)
-   - PyPI trusted publishing at [pypi.org](https://pypi.org/manage/project/tylertoo/settings/publishing/)
+1. Install Commitizen: `uv tool install commitizen`.
+2. Set the GitHub secret `CARGO_REGISTRY_TOKEN` from
+   [crates.io/settings/tokens](https://crates.io/settings/tokens).
+3. Configure [PyPI trusted publishing](https://pypi.org/manage/project/tylertoo/settings/publishing/).
 
-### Release Workflow
+### Release workflow
+
+1. Branch from an up-to-date `main`:
+
+   ```bash
+   git checkout main
+   git pull
+   git checkout -b release/vX.Y.Z
+   ```
+
+2. Bump the version from the repo root, never from `crates/python`.
+   Choose `MINOR`, `PATCH`, or `MAJOR`. Delete Commitizen's local tag so
+   the workflow can tag the merged commit:
+
+   ```bash
+   uv run cz bump --increment MINOR --changelog
+   git tag -d vX.Y.Z
+   ```
+
+3. Check the build:
+
+   ```bash
+   cargo check
+   ```
+
+4. Curate `CHANGELOG.md` (see below) and commit it.
+5. Push the branch and open the PR:
+
+   ```bash
+   git push -u origin release/vX.Y.Z
+   gh pr create --title "Release vX.Y.Z" \
+     --body "Release vX.Y.Z"
+   ```
+
+6. After the merge, start the release from `main`:
+
+   ```bash
+   gh workflow run release.yml --ref main
+   ```
+
+`release.yml` reads the version from `Cargo.toml` on `main`, tags that
+commit `vX.Y.Z`, publishes to crates.io and PyPI, and creates a GitHub
+release with prebuilt CLI binaries.
+
+A manual run tags the latest commit on `main`. If other PRs merged after
+the release PR, tag the release PR's merge commit directly.
+Pushing the tag starts the same workflow:
 
 ```bash
-# 1. Create release branch from main
-git checkout main && git pull
-git checkout -b release/vX.Y.Z
-
-# 2. Bump version (from repo root, NOT crates/python)
-uv run cz bump --increment MINOR --changelog   # or PATCH/MAJOR
-
-# 3. Verify build works
-cargo check
-
-# 4. Curate CHANGELOG.md (see below), then commit the edit
-
-# 5. Push and create PR
-git push -u origin release/vX.Y.Z
-gh pr create --title "Release vX.Y.Z" --body "Automated release"
-
-# 6. Merge PR → release.yml auto-publishes
+git fetch origin
+git tag vX.Y.Z <merge-commit>
+git push origin vX.Y.Z
 ```
 
-### Curating the Changelog
+Before building, the workflow stops the release if:
 
-`cz bump --changelog` writes a raw commit dump. Before pushing the tag, edit
-the new section in `CHANGELOG.md` into a user-facing one: group it under
-**Added / Changed / Fixed / Performance**, one line per user-visible change
-with its PR reference, and drop or compress the dev noise (clippy, fmt, CI,
-dependency bumps) into a single "Internal" line. Leave older sections alone.
-`docs/changelog.md` is a symlink to `CHANGELOG.md`, so the docs site picks the
-edit up with no second copy to keep in sync.
+- the commit is not on `main`
+- a pushed tag does not match the `Cargo.toml` version
+- the run started on any ref other than `main` or the `vX.Y.Z` tag
+- the `vX.Y.Z` tag already exists on a different commit
 
-### What Commitizen Updates
+### Curating the changelog
 
-The config lives in `.cz.toml` at the repo root (the single source of
-truth for `version_files`). A bump updates:
+`cz bump --changelog` generates entries from commits. Before releasing,
+edit the new section of `CHANGELOG.md` for users:
+
+- Group the entries under **Added**, **Changed**, **Fixed**, and
+  **Performance**.
+- Give each user-visible change one line with its PR reference.
+- Combine clippy, fmt, CI, dependency bumps, and other maintenance into
+  one "Internal" line.
+- Leave older sections alone.
+
+`docs/changelog.md` links to `CHANGELOG.md`; the docs site uses the same file.
+
+### What Commitizen updates
+
+The root `.cz.toml` defines Commitizen's config and `version_files`.
+A bump updates:
 
 | File | Pattern |
 |------|---------|
@@ -104,31 +163,34 @@ truth for `version_files`). A bump updates:
 | `crates/python/pyproject.toml` | `version = "X.Y.Z"` |
 | `.cz.toml` | its own `version` field |
 
-One file it does **not** update is `crates/python/uv.lock`, which pins
-the Python project's own version. The pre-commit hook runs `uv lock`
-and stages the result, so a bump commit carries the refreshed lockfile.
-Commit with the hook enabled (`git config core.hooksPath .githooks`) or
-run `cd crates/python && uv lock` yourself.
-
-The pre-commit hook and the CI Version Consistency job both fail if
-these drift.
+Commitizen leaves `crates/python/uv.lock` unchanged. The pre-commit hook
+runs `uv lock` and stages the updated project version. Keep the hook
+enabled when committing the bump. If the hook has not run, use
+`cd crates/python && uv lock`. The hook and CI Version Consistency job
+fail if the versions disagree.
 
 ### Recovery
 
-```bash
-# If release fails, delete orphan tag
-git push origin :refs/tags/vX.Y.Z
+If the workflow fails after pushing the tag, fix the cause and rerun it
+on that tag. It detects the tag without a release, skips completed steps,
+and publishes the rest:
 
-# Re-trigger manually
-gh workflow run release.yml --ref main
+```bash
+gh workflow run release.yml --ref vX.Y.Z
 ```
 
-### Common Issues
+If the tag points at the wrong commit, delete it before you rerun:
+
+```bash
+git push origin :refs/tags/vX.Y.Z
+```
+
+### Common issues
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `failed to select version for tylertoo-core` | workspace dependency version not updated | Ensure the `[workspace.dependencies]` entry in `Cargo.toml` moved with the bump |
-| `cz: command not found` | Commitizen not installed | `uv tool install commitizen` |
-| Version Consistency job fails | Manual edit to one version file | Re-run `uv run cz bump` from the repo root |
-| `uv.lock needs to be updated, but --locked was provided` | Version bumped without refreshing the lockfile | `cd crates/python && uv lock`, then commit `uv.lock` |
-| `No pyproject.toml found` from `uv lock` | Run from the repo root | The Python project is in `crates/python`; run it there |
+| `failed to select version for tylertoo-core` | The workspace dependency version did not move | Check that the `[workspace.dependencies]` entry in `Cargo.toml` moved with the bump |
+| `cz: command not found` | Commitizen is not installed | `uv tool install commitizen` |
+| Version Consistency job fails | Someone edited one version file by hand | Rerun `uv run cz bump` from the repo root |
+| `uv.lock needs to be updated, but --locked was provided` | The bump did not refresh the lock file | `cd crates/python && uv lock`, then commit `uv.lock` |
+| `No pyproject.toml found` from `uv lock` | `uv lock` ran from the repo root | Run it in `crates/python` |

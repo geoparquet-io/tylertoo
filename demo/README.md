@@ -10,9 +10,11 @@ with **centroids at z0–7 and polygons at z8–14** in a single archive
 tippecanoe does not read GeoParquet, let alone filter a remote collection
 while tiling it.
 
-- **Live demo:** [docs/demo.md](../docs/demo.md) → renders on the docs site at
-  `/demo/`, with the interactive map at [docs/demo/viewer.html](../docs/demo/viewer.html).
-- **Numbers + methodology + findings:** [RESULTS.md](./RESULTS.md).
+- **Numbers + methodology + findings:** [RESULTS.md](./RESULTS.md). The
+  [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/)
+  summarizes them.
+- The docs site no longer hosts an interactive viewer for this archive. Drop
+  the public URL below onto [pmtiles.io](https://pmtiles.io/) to view it.
 
 ## Hosting
 
@@ -20,7 +22,7 @@ The PMTiles is published to **Source Cooperative** and rendered live:
 
 ```
 s3://us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/
-  brazil-2025-fields.pmtiles          # rendered in the viewer
+  brazil-2025-fields.pmtiles          # this demo
   brazil-field-boundaries.pmtiles     # previous demo (kept)
 ```
 
@@ -30,10 +32,7 @@ Public URL (serves HTTP **Range** + **CORS**, which PMTiles requires):
 https://s3.us-west-2.amazonaws.com/us-west-2.opendata.source.coop/nlebovits/gpq-tiles-demo/brazil-2025-fields.pmtiles
 ```
 
-The viewer (`docs/demo/viewer.html`) renders over
-[CARTO Dark Matter](https://carto.com/basemaps/) and defaults to that URL;
-override with `?pmtiles=<url>`. The MVT source-layer is `overview` (tylertoo's
-default). z0–7 tiles carry **points**, so the style needs a `circle` layer
+The MVT source-layer is `overview` (tylertoo's default). z0–7 tiles carry **points**, so the style needs a `circle` layer
 next to the polygon `fill`/`line` layers — fill-only styles render the low
 zooms blank.
 
@@ -47,14 +46,7 @@ aws s3 cp brazil-2025-fields.pmtiles \
 ```
 
 Any bucket works as long as it serves **Range + CORS** — without both, PMTiles
-fails silently (blank map, no error). To preview against local files, Python's
-`http.server` (3.7+) honors Range:
-
-```bash
-cd docs/demo
-python3 -m http.server 8080
-# open http://localhost:8080/viewer.html?pmtiles=http://localhost:8080/local.pmtiles
-```
+fails silently (blank map, no error).
 
 ## Source data
 

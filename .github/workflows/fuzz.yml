@@ -63,7 +63,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: ${{ env.NIGHTLY }}
 
@@ -97,7 +97,7 @@ jobs:
             ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-fuzz
 
