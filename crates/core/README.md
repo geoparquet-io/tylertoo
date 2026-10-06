@@ -8,7 +8,8 @@
 tylertoo turns GeoParquet into PMTiles vector tiles. On the way it writes an
 **overview file**: a GeoParquet file that holds a generalized copy of your data
 for every zoom level, which you can validate, query with SQL, and export again
-without rebuilding. A CLI, a Python package, and a Rust crate share one engine.
+without rebuilding. The CLI and the Python package are thin wrappers over one
+Rust engine, which is also published as a crate.
 
 The name nods to [tippecanoe](https://github.com/felt/tippecanoe), the
 vector-tile tool tylertoo measures itself against

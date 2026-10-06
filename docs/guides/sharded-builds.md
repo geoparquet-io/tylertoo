@@ -89,7 +89,7 @@ it writes `convert.plan` — the artifact every shard then consumes.
 level assignment is dataset-global, so pass 1 and the assignment run over
 every row at every level — that is what makes `convert.plan` a complete
 artifact the shards can consume. Pass 2 then stops at the pivot: the levels at
-and past it are never coalesced, assembled, buffered, spilled or written, and
+and past it are never coalesced, assembled, buffered, spilled, or written, and
 the verbatim canonical level — the largest of all, and the one that otherwise
 costs a whole second read of the input — is not built at all.
 
@@ -241,9 +241,9 @@ silently shadow each other.
 Being precise about this, because the cost model is not obvious.
 
 The coarse job's **floor** is one pass-1 scan plus the level assignment over
-the whole dataset. That cannot be sharded — it is the thing that makes the
-fleet agree with itself (see the next section) — so the fleet's wall clock is
-bounded below by it.
+the whole dataset. Sharding cannot split that work, because it is what makes the fleet agree
+with itself (see the next section), so it sets a lower bound on the fleet's
+wall clock.
 
 Above that floor, the coarse job still makes **one full-width read of the
 input in pass 2**: every selected row group, every column the output carries,
@@ -251,7 +251,7 @@ decoded — most of it only to be discarded, because the rows that reach a
 coarse level are picked *after* decode. What it saves is everything past the
 read, for the levels at and past the pivot:
 
-- pass 2 generalizes, buffers and writes only the levels below the pivot,
+- pass 2 generalizes, buffers, and writes only the levels below the pivot,
   which on a thinned pyramid is a small fraction of the rows;
 - the ladder cascade's **fine steps are still computed** — a coarse level's
   geometry is canonical geometry folded through every finer level's GSD in
@@ -293,7 +293,7 @@ The coarse job's irreducible cost is the **pass-1 feature table**: one
 level assignment. It costs **64 bytes/row** — measured from the struct's
 actual layout (`size_of::<AssignFeature>()`; two of its fields are `Option`s,
 so alignment padding costs more than the payload alone would suggest) and
-cross-checked against a field incident: a 1.58B-row coarse job logged
+cross-checked against a field incident: a 1.58-billion-row coarse job logged
 `[rss] pass1 scan: 96836 MiB` right after the pass-1 scan —
 `96,836 MiB ÷ 1.58B rows ≈ 64.3 bytes/row` — and was OOM-killed later, during
 the winner-grid wave build. 64 bytes/row is a floor, not the scan's whole
@@ -305,7 +305,7 @@ That feature table is only part of what the coarse job holds at once — the
 level-assignment winner grids (per-level, budgeted separately) and pass 2's
 buffered output also need memory, concurrently with (or right after) it.
 **Rule of thumb: budget the coarse job at ≳ (rows × 64 bytes) × 2.5.** For
-the field incident above (1.58B rows, a 94.2 GiB floor), that is ≳235 GiB:
+the field incident above (1.58 billion rows, a 94.2 GiB floor), that is ≳235 GiB:
 the job OOM'd on a 192 GiB box — only ~2.04× the floor — 25 minutes in, and
 ran on 360 GiB. That incident predates #541, when the coarse job's pass 2
 still built every level; since #541 its pass 2 builds only the levels below
@@ -397,11 +397,15 @@ row-group layout. A shard given the wrong plan, a stale plan, or a plan for a
 since-rewritten input fails immediately and by name.
 
 The **shard plan** (`shards.json`) is a different, smaller artifact and binds
-itself differently: a `format` discriminator and a version, a structural check
-that its ranges tile the pivot zoom exactly (no gap, no overlap), and a
-per-part input binding (path, row count, row-group count). It carries no
-checksum — it is small, human-readable JSON, and a corrupted one fails the
-structure check rather than passing unnoticed.
+itself differently:
+
+- a `format` discriminator and a version;
+- a structural check that its ranges tile the pivot zoom exactly (no gap, no
+  overlap);
+- a per-part input binding (path, row count, row-group count).
+
+It carries no checksum. The file is small, human-readable JSON, and a
+corrupted one fails the structure check rather than passing unnoticed.
 
 The two are tied together so a fleet cannot straddle two different cuts: the
 coarse job stamps an xxh3-64 digest of the cut — the pivot zoom and the lo/hi

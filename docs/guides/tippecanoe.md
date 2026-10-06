@@ -25,7 +25,7 @@ compiled native code, so the leverage is the data path, not the language. The
 demo page carries the measured numbers.
 
 **Overviews embed levels inside the input format.** tippecanoe generalizes in
-tile space, per tile, at encode time, and writes the result into tiles. tylertoo
+tile space while it encodes each tile, and writes the result into tiles. tylertoo
 generalizes in world space, per level, and stores those levels in a GeoParquet
 file. This is the core format difference: a tylertoo level is a reusable,
 exact, SQL-queryable row band, where a tippecanoe tile is a rendered endpoint.
@@ -191,6 +191,6 @@ so it does not serve this purpose.
 tippecanoe-decode's semantics. Nothing is deduplicated, so a feature appears once
 per tile it touched, with `zoom`, `layer`, and `mvt_id` provenance columns for
 filtering to one representation. Coordinates lift through tippecanoe's 32-bit
-world-coordinate transform. Because tiling simplifies, clips, and drops
-attributes, the output is the tiled geometry, not a route back to the source
+world-coordinate transform. Because tiling simplifies and clips geometry
+and drops attributes, the output is the tiled geometry, not a route back to the source
 file.

@@ -46,7 +46,7 @@ estimates the buffer from feature and level counts and spills when it would
 exceed a fraction of available RAM. That figure is container-aware: cgroup v2
 (`memory.max` and `memory.high`) and v1 memory limits are respected, less the
 non-reclaimable memory the cgroup is already holding, so a job inside a Slurm,
-Docker or Kubernetes memory cgroup sizes against the cgroup, not the whole
+Docker, or Kubernetes memory cgroup sizes against the cgroup, not the whole
 node. The output is byte-identical across all three, so the choice is purely
 about the memory ceiling.
 
@@ -164,7 +164,7 @@ That bound is a **model**, not a measurement. The budget is charged
 `workers × depth × read-batch-size × per_row`, where `per_row` is the same
 estimate the sink uses: a fixed ~4 KiB non-geometry term plus twice pass 1's
 measured per-row geometry bytes. An input whose non-geometry columns cost much
-more than that — a very wide schema, big strings, many dictionaries — is priced
+more than that — a wide schema, big strings, many dictionaries — is priced
 too cheaply, and the read-ahead will exceed its nominal share. If you are
 sizing a run to the last hundred MB on a wide schema, measure rather than trust
 the fraction, and `--read-workers 1` removes the term entirely.

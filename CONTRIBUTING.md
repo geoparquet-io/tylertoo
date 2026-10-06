@@ -4,7 +4,7 @@ Participation in this project is governed by our [Code of Conduct](https://githu
 
 Found a security issue? See [SECURITY.md](https://github.com/geoparquet-io/tylertoo/blob/main/SECURITY.md) for how to report it privately.
 
-## Development Setup
+## Development setup
 
 ```bash
 git clone https://github.com/geoparquet-io/tylertoo.git
@@ -16,7 +16,7 @@ cargo build && cargo check
 See [DEVELOPMENT.md](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md) for the day-to-day workflow,
 Python setup, and how to run every CI gate locally.
 
-## Commit Convention
+## Commit convention
 
 [Conventional Commits](https://www.conventionalcommits.org/):
 
@@ -30,7 +30,7 @@ Python setup, and how to run every CI gate locally.
 | `test` | Tests only |
 | `chore` | Maintenance |
 
-## Pull Request Process
+## Pull request process
 
 1. Branch from `main` (it is protected — no direct pushes).
 2. Run the gates locally — CI enforces all of them as required checks:
@@ -38,7 +38,7 @@ Python setup, and how to run every CI gate locally.
    --all-features -- -D warnings`, `cargo machete`, targeted tests,
    and (for Python changes) the ruff/mypy/stubtest/vulture/xenon/pytest
    suite via `uv run`. The full list with commands:
-   [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
+   [DEVELOPMENT.md → CI gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally).
    One check is advisory rather than required: the diff-scoped mutation
    run (`Mutation Diff`) lists the mutants in your change that no test
    catches, in its job summary and in a sticky PR comment. Treat it as a
@@ -51,7 +51,7 @@ Filing a bug or feature request instead? Use the
 [issue templates](.github/ISSUE_TEMPLATE/) — they ask for the details we
 need to act on the report quickly.
 
-## Releasing (Maintainers)
+## Releasing (maintainers)
 
 ### Prerequisites
 
@@ -60,7 +60,7 @@ need to act on the report quickly.
    - `CARGO_REGISTRY_TOKEN` from [crates.io/settings/tokens](https://crates.io/settings/tokens)
    - PyPI trusted publishing at [pypi.org](https://pypi.org/manage/project/tylertoo/settings/publishing/)
 
-### Release Workflow
+### Release workflow
 
 ```bash
 # 1. Create release branch from main
@@ -82,7 +82,7 @@ gh pr create --title "Release vX.Y.Z" --body "Automated release"
 # 6. Merge PR → release.yml auto-publishes
 ```
 
-### Curating the Changelog
+### Curating the changelog
 
 `cz bump --changelog` writes a raw commit dump. Before pushing the tag, edit
 the new section in `CHANGELOG.md` into a user-facing one: group it under
@@ -92,7 +92,7 @@ dependency bumps) into a single "Internal" line. Leave older sections alone.
 `docs/changelog.md` is a symlink to `CHANGELOG.md`, so the docs site picks the
 edit up with no second copy to keep in sync.
 
-### What Commitizen Updates
+### What Commitizen updates
 
 The config lives in `.cz.toml` at the repo root (the single source of
 truth for `version_files`). A bump updates:
@@ -123,7 +123,7 @@ git push origin :refs/tags/vX.Y.Z
 gh workflow run release.yml --ref main
 ```
 
-### Common Issues
+### Common issues
 
 | Problem | Cause | Fix |
 |---------|-------|-----|

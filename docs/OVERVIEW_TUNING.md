@@ -1,4 +1,4 @@
-# Overview Generalization Tuning
+# Overview generalization tuning
 
 `tylertoo overview` turns a GeoParquet file into a multi-resolution
 [overview file](architecture.md) — several precomputed generalizations of the
@@ -18,7 +18,7 @@ explains every knob in plain English: what it does, its default, its units, the
 direction that makes maps denser/sparser or smoother/cruder, and how the knobs
 interact.
 
-> TL;DR cheat sheet
+> Cheat sheet
 >
 > - **Coarse levels look too *sparse* (too few features)** → LOWER the thinning
 >   factors (`--point/line/polygon-thinning`) and/or the visibility gates
@@ -67,7 +67,7 @@ number, estimate the finest zoom from the input's own features. A bounded,
 deterministic sample (at most 200,000 rows, honoring `--bbox` and `--filter`)
 of feature bboxes is read from the geometry column, and the finest zoom is
 picked where a standard 256 px tile pixel resolves about half the smaller of
-"median feature size" (features with an extent) and "10th-percentile spacing
+"median feature size" (features with an extent) and "tenth-percentile spacing
 between nearby features", measured in Web Mercator meters and clamped to
 `[--min-zoom, 16]`. The chosen zoom and the measurements behind it are logged
 at `info`; treat it as a starting point, the way tippecanoe users treat `-zg`.
@@ -173,7 +173,7 @@ the directory name, since a layer called `*` is not useful to a client. A path
 containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
 split off the **last** colon when what follows it has no `/`, `\` or `:`, so a
 URL's scheme, a port and a `2024:06/` directory all stay part of the input. A
-drive-relative path with no `\` after the drive, e.g. `C:data.parquet`, stays
+drive-relative path with no `\` after the drive, for example `C:data.parquet`, stays
 whole too: a single ASCII letter before the last colon is treated as a drive
 letter rather than a path, even though `data.parquet` alone would otherwise
 look like a bare layer name.
@@ -305,7 +305,7 @@ This is the opposite of "turn it up to get more." If your coarse roads look too
 empty, **lower** `--line-thinning`, don't raise it.
 
 The defaults are class-aware: points thin hardest (4.0, they clutter fastest),
-lines and polygons least (1.0). The line default was retuned 2.0 → 1.0 after
+and lines and polygons least (1.0). The line default was retuned 2.0 → 1.0 after
 the 2026-07-02 Portland roads sweep (`corpus/SWEEPS.md`): at 1.0, road
 networks stay visibly more continuous at coarse zooms, and the true-scale
 renders showed the extra density costs little legibility. The factor multiplies the GSD, so it stacks with `--gsd-base`: doubling
@@ -355,7 +355,7 @@ be gated out even if its cell is otherwise empty.
 ### Empty coarse levels: the auto-clamp
 
 When **every** feature is culled at a coarse level — the normal outcome for
-datasets of small features at world zooms (e.g. country-scale buildings with
+datasets of small features at world zooms (for example, country-scale buildings with
 `--min-zoom 0`: no building's bbox clears `2 × gsd(z0)` ≈ 78 km) — that level
 is **omitted from the output and the remaining levels are renumbered** (spec
 §7.3), instead of failing the conversion. You will see a `WARN` like:
@@ -377,7 +377,7 @@ feature whose bbox clears the gate but whose geometry collapses below the
 level tolerance). PMTiles export of a clamped file starts at the coarsest
 *written* level's zoom.
 
-This is expected behavior, not data loss: the features are simply not
+This is expected behavior, not data loss: the features are not
 representable at those scales. To *force* coarse levels to be populated,
 lower the gates (`--polygon-visibility` / `--line-visibility`), coarsen the
 ladder (`--gsd-base`), or — for dense small-polygon layers — use the
@@ -506,7 +506,7 @@ Two caveats:
   Add a small `circle` layer filtered to `["==", "$type", "Point"]` (see
   `docs/demo/viewer.html`).
 - **Geometry type changes mid-zoom.** The output's `geometry_types` lists
-  the union (e.g. `["Point","Polygon"]`), per spec §7.5; collapse is
+  the union (for example, `["Point","Polygon"]`), per spec §7.5; collapse is
   opt-in precisely so renderers are never surprised by default
   (spec Q4). Files record the collapse in the `generalization` provenance.
 
@@ -619,7 +619,7 @@ Both are **deterministic**: the accumulator runs once over the pass-1
 feature table in input order, so every engine (in-memory / streaming /
 pipelined) reads the same carrier set, and the dither is a pure function
 of the feature. The same input produces byte-identical output across
-runs, engines and thread counts. Under cascading, a kept square's anchor
+runs, engines, and thread counts. Under cascading, a kept square's anchor
 is its own center, so coarser levels re-dither it against the same hash
 draw with a shrinking keep probability — survival is monotone fine→coarse.
 
@@ -666,7 +666,7 @@ valve then sheds squares for that tile, as it would any feature. Raise
 the cap or accept the thinner carpet.
 
 To see how close each zoom runs to the cap, `tylertoo stats` reports the
-per-zoom tile count, total, mean, p50, p99 and max **stored** (compressed)
+per-zoom tile count, total, mean, p50, p99, and max **stored** (compressed)
 tile size, plus the largest tiles by z/x/y, from the archive's directory
 alone (no tile is read):
 
@@ -776,11 +776,11 @@ callers were doing by hand upstream of it.
 When several features compete for one grid cell, the **winner** is the
 highest-priority feature. Priority tiers (spec §3.5, Q1), highest first:
 
-1. `--sort-key COL` — a numeric column (e.g. population, importance).
-2. `--class-rank COL:VAL=RANK,…` — an explicit categorical map (e.g.
+1. `--sort-key COL` — a numeric column (for example, population, importance).
+2. `--class-rank COL:VAL=RANK,…` — an explicit categorical map (for example,
    `road_class:motorway=5,primary=4,residential=2`). Unlisted values rank below
    every listed one but above nulls.
-3. **Auto-detect** (unless `--no-auto-rank`): Overture roads (`class`/
+3. **Automatic detection** (unless `--no-auto-rank`): Overture roads (`class`/
    `road_class`) get a built-in motorway→…→service ranking; Overture places get
    `confidence`.
 4. **Size fallback**: larger bbox diagonal wins, ties broken by a deterministic
@@ -794,7 +794,7 @@ used is recorded in the footer `generalization.ranking` provenance.
 `--sort-key` and `--class-rank` are mutually exclusive.
 
 **Unrankable values.** A null ranks below every real key: a feature with no key
-still appears, it just loses any cell it contests to one that has a key. A NaN
+still appears, it only loses any cell it contests to one that has a key. A NaN
 or infinity in a numeric column ranks the same way — those are how float
 columns usually spell nodata, and neither is a priority anything can compare
 against. Such a row is never dropped for it; it competes as a keyless feature.
@@ -863,8 +863,8 @@ only redistributes *which* features survive spatially), so it is independent of
 `--drop-rate`.
 
 ⚠️ **Interaction — points may not feel the budget.** The budget applies to
-points, lines and polygons alike, but points are already thinned hard by
-`--point-thinning` (default 4). On a large point dataset (e.g. NYC POIs) the
+points, lines, and polygons alike, but points are already thinned hard by
+`--point-thinning` (default 4). On a large point dataset (for example, NYC POIs) the
 cell-winner point counts often sit *below* the N-anchored budget at every zoom,
 so `--drop-rate` rarely binds; point over-retention is better addressed with
 point clustering (spec Q4). Lines and polygons (thinning factor 1) are where the
@@ -882,7 +882,7 @@ the block.
 
 ## Clustering: `--cluster`, `--accumulate-attribute`
 
-By default a point that loses its thinning-grid cell simply does not appear at
+By default a point that loses its thinning-grid cell does not appear at
 that level — the survivor says nothing about how many features it stands for.
 **`--cluster`** (opt-in, duplicating mode only) makes the survivor **absorb**
 its cell's losers instead:
@@ -977,7 +977,7 @@ run:
   visible artery** — the gate evaluates the chain's extent, not each
   fragment's. This ordering is the entire payoff.
 - Chains never merge **across class values** (when a class ranking is
-  active — explicit `--class-rank` or auto-detected Overture
+  active — explicit `--class-rank` or automatically detected Overture
   `class`/`road_class`). With no class ranking, all lines are compatible.
 - **Junctions** (3+ compatible endpoints meeting) terminate chains by
   default, preserving network topology. `--coalesce-junction-angle` (see
@@ -1144,7 +1144,7 @@ pressure the budget caps the waves. To force the lowest peak, set
 - **Partitioning mode: inert.** Partitioning places each feature exactly
   once with geometry verbatim; a merged chain is a new geometry replacing
   several source rows, which that contract cannot represent. Since
-  coalescing is on by default, partitioning conversions simply proceed
+  coalescing is on by default, partitioning conversions proceed
   without it (no `coalesced_count` column, no provenance, info log); an
   explicit `--coalesce-lines` with `--mode partitioning` is rejected.
 
@@ -1305,7 +1305,7 @@ Rules:
   `DECIMAL(p,0)`. MVT ids are unsigned 64-bit integers. Tippecanoe also parses
   numeric strings and integral floats; tylertoo rejects them. A string id —
   Overture's GERS ids, for example — has no lossless integer form. Cast or hash
-  it to an integer column before tiling (with `gpio` or DuckDB, e.g.
+  it to an integer column before tiling (with `gpio` or DuckDB, for example
   `hash(id)::UBIGINT`), and keep the original string as a property if clients
   need it.
 - **Every row must hold a value in `0..=2^64-1`.** A null, a negative, or an
@@ -1397,7 +1397,7 @@ opens the output file, the converter projects the total row-group count from
 pass 1's per-level winner counts and compares it against a 32,000-group
 preflight ceiling (headroom, because that projection is a pre-simplification
 upper bound rather than an exact count). If the projection is over, the cap is
-**auto-scaled up** to the smallest clean value that fits, with a `warn`-level
+**scaled up automatically** to the smallest clean value that fits, with a `warn`-level
 log line naming the old and new values. The cap actually used is recorded as
 `effective_max_row_group_size` in `--report` JSON and printed as a summary
 note, so the raise is visible after the run rather than only in the log.
@@ -1427,7 +1427,7 @@ tiny row groups and bloat the footer; leave it `constant` otherwise. See
 ### `--full-column-stats` (default off): statistics suppression
 
 By default the writer **suppresses** Parquet per-row-group min/max statistics
-on the WKB geometry column and on every string/binary property column (e.g. an
+on the WKB geometry column and on every string/binary property column (for example, an
 Overture 26-character ULID `id`). These stats are never used by the overview
 read protocol — spatial pruning uses the **bbox covering** struct, and level
 selection uses the **`level`** column, both of which *always* keep full stats
@@ -1438,7 +1438,7 @@ full stats — larger than most viewports' actual data — and drops below **1 M
 with suppression.
 
 Pass `--full-column-stats` to keep stats on all columns. Do this only if remote
-clients push predicates on property columns (e.g. `WHERE id = …` or
+clients push predicates on property columns (for example, `WHERE id = …` or
 `WHERE class = 'motorway'` server-side) and want row-group skipping on them —
 you trade a bigger footer for that pushdown.
 
@@ -1483,9 +1483,9 @@ batch is decoded, filtered, simplified, and written before the next is read.
 LARGER batches amortize per-batch overhead (marginally faster) at the cost of
 proportionally more peak memory; SMALLER batches bound memory tighter. The
 default 8192 keeps per-batch transients in the tens of MB even for
-vertex-heavy polygon data; you rarely need to change it. LOWER it (e.g. 1024)
+vertex-heavy polygon data; you rarely need to change it. LOWER it (for example, to 1024)
 on very memory-constrained machines or for monster geometries (a single batch
-of coastline-sized multipolygons can be large); RAISE it (e.g. 65536) only if
+of coastline-sized multipolygons can be large); RAISE it (for example, to 65536) only if
 profiling shows per-batch overhead dominating on a machine with RAM to spare.
 It also sets how finely pass 1 fans out: each batch is split across the rayon
 pool into chunks of `read_batch_size / threads` rows (clamped to 256..=1024),
@@ -1610,7 +1610,7 @@ under IEEE-754, but UNKNOWN here, which is the SQL reading. And unlike a null,
 a NaN is a *present* value, so `IS NULL` does **not** match it while
 `IS NOT NULL` does. The two rules together mean **no predicate selects NaN
 rows**: they can only be kept by a predicate over some other column. Clean the
-column upstream (e.g. with `gpio`) if you need to address those rows.
+column upstream (for example, with `gpio`) if you need to address those rows.
 
 Like `--bbox`, the filter is two-stage:
 
@@ -1628,7 +1628,7 @@ Like `--bbox`, the filter is two-stage:
 | `--filter EXPR` (alias `--where`) | — | predicate | only features where EXPR is TRUE; omit = no filtering |
 
 **Interactions**: the filter runs before level assignment, ranking, density
-budgets, clustering, and coalescing — dropped features simply never enter the
+budgets, clustering, and coalescing — dropped features never enter the
 pipeline, exactly as if the input had been pre-filtered (`ConvertReport.
 input_features` counts only survivors). Check `row_groups_read` vs
 `row_groups_total` to see whether statistics pruning fired; sorting the input
@@ -1687,7 +1687,7 @@ it. An explicit `--include-property coalesced_count` on export wins over the
 1-everywhere withholding (#379): the column is in the file, and naming it is
 not a typo.
 
-**Column types** (#434): struct, list and map columns are exported as JSON
+**Column types** (#434): struct, list, and map columns are exported as JSON
 strings (tippecanoe's convention for nested attributes), so
 `--include-property names` on an Overture file keeps the whole `names`
 struct as one string property. A column with no MVT encoding at all (a
@@ -1957,11 +1957,15 @@ at *which* level is fingerprinted, and output with `--plan` is byte-identical
 to the run that saved it.
 
 ⚠️ **Why this matters for sharded builds.** The assignment is not a
-per-feature function: the density budget water-fills a 128 × GSD super-cell
-budget over *every* candidate of a level, the level walk carries a running
-kept count coarse → fine, `--magnitude-ladder` dense-ranks the *global*
-distinct values of its column, and the automatic class ranking picks its
-column from a global vocabulary scan. A shard that recomputed the assignment
+per-feature function:
+
+- the density budget water-fills a 128 × GSD super-cell budget over *every*
+  candidate of a level;
+- the level walk carries a running kept count coarse → fine;
+- `--magnitude-ladder` dense-ranks the *global* distinct values of its column;
+- the automatic class ranking picks its column from a global vocabulary scan.
+
+A shard that recomputed the assignment
 over its own subset would reach a different answer, and the shards' pyramids
 would disagree. Compute the assignment once, save the plan, and give every
 shard the same one.
@@ -2001,9 +2005,9 @@ Not yet exposed in the Python bindings.
 
 | Symptom | Fix |
 |---------|-----|
-| Coarse roads look like sparse disconnected dashes | LOWER `--line-thinning` (e.g. 2 → 1) and/or `--line-visibility`; or RAISE `--gsd-base` |
-| Coarse roads are all there but jagged / over-smoothed | LOWER `--simplify-factor` (e.g. 1.0 → 0.5) |
-| Wrong roads survive (residential instead of highways) at coarse zoom | add `--class-rank road_class:…` or rely on auto-detect (don't pass `--no-auto-rank`) |
+| Coarse roads look like sparse disconnected dashes | LOWER `--line-thinning` (for example, 2 → 1) and/or `--line-visibility`; or RAISE `--gsd-base` |
+| Coarse roads are all there but jagged / over-smoothed | LOWER `--simplify-factor` (for example, 1.0 → 0.5) |
+| Wrong roads survive (residential instead of highways) at coarse zoom | add `--class-rank road_class:…` or rely on automatic detection (don't pass `--no-auto-rank`) |
 | Coarse level files are too large / slow | RAISE the thinning factors and/or `--simplify-factor`; or LOWER `--gsd-base` |
 | Small buildings vanish too early | LOWER `--polygon-visibility`; or `--collapse` to keep them as points |
 | Country-scale view of a dense building/parcel layer is empty | `--polygon-visibility 0 --collapse` + a circle layer for points ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)); the `500K` tile cap that keeps coarse dot tiles sane is on by default (#280) |

@@ -1,8 +1,8 @@
-# Development Guide
+# Development guide
 
 Quick reference for working on tylertoo.
 
-## Initial Setup
+## Initial setup
 
 ```bash
 # Install Rust
@@ -18,7 +18,8 @@ sudo apt-get install protobuf-compiler
 # Verify installation
 protoc --version  # Should be 3.x or higher
 
-# Enable the repo git hooks (fmt, clippy, version sync, README sync)
+# Enable the repo git hooks (fmt, clippy, prose lint,
+# version sync, README sync)
 git config core.hooksPath .githooks
 
 # Fetch the geometry-test-data submodule (the geometry fixture tests
@@ -48,11 +49,12 @@ clones only. Run `git submodule update --init` once after cloning and
 again whenever the submodule pointer moves upstream.
 
 The pre-commit hook runs `cargo fmt --check`, `cargo clippy` (deny
-warnings), a version-consistency check across the four version files,
-and syncs the root `README.md` into `crates/*/README.md`. Never bypass
+warnings), the prose lint on staged docs (see
+[Docs prose](#docs-prose)), a version-consistency check across the four
+version files, and syncs the root `README.md` into `crates/*/README.md`. Never bypass
 it with `--no-verify`.
 
-## Day-to-Day Workflow
+## Day-to-day workflow
 
 ```bash
 cargo check                    # Fast compile check — use liberally
@@ -102,7 +104,7 @@ The suite is split into two nextest profiles defined in
 
 3. **`full`, only when it matters** — `quick` plus the slow end-to-end set:
    tests that drive the CLI or the full pipeline over real-data fixtures
-   with real parquet I/O and nested parallelism (20s–7min each). Run it
+   with real parquet I/O and nested parallelism (20 seconds to 7 minutes each). Run it
    before landing a change to pipeline internals, sharding, determinism, or
    anything platform-sensitive (shard-merge parity); otherwise let CI's
    Slow Tests job prove it:
@@ -114,14 +116,14 @@ The suite is split into two nextest profiles defined in
 Plain `cargo test` ignores `nextest.toml`: it runs everything in whatever
 target it's pointed at, slow tests included, with no timeout. Use it for
 targeted runs and `cargo nextest run` for the tiers. The slowest end-to-end
-suites (e.g. `thread_count_determinism`, `shard_merge_parity`) live in
+suites (for example, `thread_count_determinism`, `shard_merge_parity`) live in
 `crates/*/tests/*.rs` as separate binaries, so `cargo test --lib` stays
 reasonably fast — but `--lib` still includes some real-parquet I/O tests
-(e.g. in `overview::convert`).
+(for example, in `overview::convert`).
 
-CI mirrors the tiers: the Test matrix (ubuntu/macos × stable/beta) runs
+CI mirrors the tiers: the Test matrix (Ubuntu/macOS × stable/beta) runs
 `quick`; the Slow Tests job runs exactly the set `quick` excludes, on
-ubuntu and macOS stable, in three shards per OS. The shards are
+Ubuntu and macOS stable, in three shards per OS. The shards are
 `--partition count:N/3` slices of that one set, run on separate runners
 because the set is CPU-bound; they are not different tests, and all six
 checks (`Slow Tests (<os>, shard N/3)`) must pass. Together Test and
@@ -146,7 +148,7 @@ process and the mutant counts as caught. The job is advisory — missed
 mutants and timeouts show up as the mutation score in the job summary,
 not as a red run — but a run that could not measure everything (a
 baseline failure, which needs the `geometry-test-data` submodule and
-the realdata fixtures, a lost runner, or a shard hitting its time
+the `realdata` fixtures, a lost runner, or a shard hitting its time
 limit) opens or updates a pinned `mutation-tests` issue that lists each
 shard's outcome (failed, timed out, or cancelled early by hand). To
 verify a workflow fix without a full sweep, dispatch a subset of
@@ -223,8 +225,8 @@ third-party bytes: the PMTiles header and directory, an MVT tile body, a
 whole `--band` archive, the footer JSON, WKB, and the `--filter` grammar.
 A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
 and opens or updates a pinned `fuzz` issue. `fuzz/README.md` has the
-target table, how to run one locally, and how to minimize a crash into
-a regression test. The fuzz crate is its own workspace and never affects
+target table and explains how to run a target locally and how to turn a
+minimized crash into a regression test. The fuzz crate is its own workspace and never affects
 the per-PR build; two of its targets reach private code through
 `#[doc(hidden)]` hooks behind core's `fuzzing` feature, which nothing
 else enables.
@@ -237,7 +239,7 @@ cargo +nightly fuzz run pmtiles_directory -- \
   -max_total_time=60
 ```
 
-When a new test takes more than ~20s, add it to the slow set in
+When a new test takes more than ~20 seconds, add it to the slow set in
 `.config/nextest.toml`: the `default-filter` exclusion in
 `[profile.default]` (which `quick` inherits) and the matching
 `[[profile.default.overrides]]` filter that gives slow tests a longer
@@ -341,7 +343,7 @@ uv run python scripts/criterion_gate.py --check \
   --criterion-dir target/criterion-compare --baseline base --warn 10 --fail 25
 ```
 
-## CI Gates — and How to Run Them Locally
+## CI gates — and how to run them locally
 
 Every PR must pass all gates (they are branch-protection required
 checks). All of them are runnable locally.
@@ -520,7 +522,7 @@ own archives go through `pmtiles verify` — the tippecanoe-made
 weekly) tiles the fixtures-v1 inputs with tylertoo and with tippecanoe
 2.79.0 built from source at a pinned tag + commit, decodes both
 archives with independent readers, and gates the per-zoom tile,
-feature, distinct-id, vertex and byte ratios against
+feature, distinct-id, vertex, and byte ratios against
 `benchmarks/e2e/tippecanoe_tolerances.toml`. The table lands in the
 job summary; a scheduled failure opens an issue labelled
 `tippecanoe-parity`. Method and flag mapping:
@@ -599,6 +601,63 @@ To change a tutorial, edit its script, run the docs tests, and paste
 the new script and output into the README. A test failure names the
 step and the lines that differ.
 
+### Docs prose
+
+The `Docs Prose` job lints the handwritten docs with
+[Vale](https://vale.sh/) and
+[proselint](https://github.com/amperser/proselint). The pre-commit
+hook runs the same script on the staged files. `scripts/lint-prose.sh`
+holds the file list: the top-level `README.md`, `CONTRIBUTING.md`, and
+`DEVELOPMENT.md`, the hand-written pages under `docs/`, and
+`examples/*/README.md`. The generated reference pages and
+`CHANGELOG.md` are out of scope. Neither tool reads code blocks or
+inline code.
+
+A Vale error or any proselint finding fails the check. Vale's
+warnings and suggestions are advice: CI prints them after the gate,
+and they never fail it.
+
+Vale's settings live in `.vale.ini`, the house rules in
+`.vale/styles/Tylertoo-*`, and their test cases in `.vale/tests/`.
+`vale sync` downloads the pinned Google, Microsoft, and Readability
+packages into `.vale/styles/`, which git ignores. Add a real project
+term to `.vale/styles/config/vocabularies/Tylertoo/accept.txt`
+rather than disabling a rule. proselint's check selection lives in
+`proselint.json`.
+
+Install Vale 3.24.0 or later
+([install guide](https://vale.sh/docs/install)); uv fetches
+proselint 0.16.0 itself.
+
+```bash
+# Fetch the pinned Vale packages (once)
+vale sync
+
+# The gate: every in-scope file, or name files
+scripts/lint-prose.sh
+scripts/lint-prose.sh docs/guides/tippecanoe.md
+
+# Advisory audit: warnings and suggestions too
+scripts/lint-prose.sh --list \
+  | xargs vale --minAlertLevel=suggestion
+
+# The house rules' own test cases
+vale test --coverage .vale/tests \
+  .vale/styles/Tylertoo-Docs \
+  .vale/styles/Tylertoo-Mechanics \
+  .vale/styles/Tylertoo-Terms \
+  .vale/styles/Tylertoo-Voice
+```
+
+To keep one heading or phrase that a rule misreads, turn that rule
+off around it rather than for the whole file:
+
+```markdown
+<!-- vale Tylertoo-Mechanics.Headings = NO -->
+## A heading that is an external Name
+<!-- vale Tylertoo-Mechanics.Headings = YES -->
+```
+
 ### Workflows
 
 ```bash
@@ -619,7 +678,7 @@ and stages the result. If you commit with hooks disabled, run
 `cd crates/python && uv lock` yourself, or the Python Quality job fails
 on `uv sync --locked`.
 
-## Module Layout
+## Module layout
 
 ```
 crates/
@@ -632,7 +691,7 @@ crates/
 The full module map and design rationale live in
 `context/ARCHITECTURE.md`.
 
-## Python Development
+## Python development
 
 ```bash
 cd crates/python
@@ -657,7 +716,7 @@ RUST_LOG=tylertoo_core::overview=debug \
 RUST_BACKTRACE=1 cargo test --package tylertoo-core <test-name>
 ```
 
-### Common Issues
+### Common issues
 
 **Problem**: `protoc` not found during build
 **Solution**: Install protobuf compiler (see Initial Setup)
@@ -673,7 +732,7 @@ RUST_BACKTRACE=1 cargo test --package tylertoo-core <test-name>
 **Solution**: Update `crates/python/tylertoo.pyi` to match the new
 `#[pyo3(signature)]`
 
-## Dependency Updates
+## Dependency updates
 
 `Cargo.lock` is committed, so every build — local, CI, and the release
 artifacts — resolves to the same versions. Update it deliberately
@@ -684,7 +743,7 @@ re-resolves from scratch as an early warning for what the next bump would
 pull in.
 
 Dependabot (weekly) covers cargo, pip (uv lockfile), and GitHub
-Actions; patch/minor updates auto-merge once all gates pass, majors
+Actions; patch/minor updates merge automatically once all gates pass, majors
 wait for a human. A weekly security job (cargo-audit + cargo-deny +
 pip-audit) opens/updates a pinned `security-audit` issue on failure.
 

@@ -4,7 +4,7 @@ How to measure where time and memory go. The recorded performance
 history of the pipeline (what was measured, what was fixed) lives in
 [`benchmarks/overview/PROFILE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/PROFILE.md).
 
-## Phase Timing (built in)
+## Phase timing (built in)
 
 The overview pipeline keeps phase accumulators (pass 1 scan, assignment,
 per-level read/decode, simplification, write; export clip/encode/write)
@@ -30,7 +30,7 @@ cargo build --release
 `Maximum resident set size` is the peak-RSS number quoted throughout
 the benchmark docs.
 
-## Structured JSON Profile Dump (`TYLERTOO_PROFILE_JSON`)
+## Structured JSON profile dump (`TYLERTOO_PROFILE_JSON`)
 
 Set `TYLERTOO_PROFILE_JSON=<path>` and each successful run appends one JSON
 object per phase (one line each, JSONL) to that file: a convert line from
@@ -133,12 +133,12 @@ not "the run was not profiled".
 (`log_phase_rss`, unchanged since #295): the max of those five snapshots. A
 peak that lives and dies entirely **inside** one phase is invisible to it. On
 a 1.5M-line fixture the pass-1 line-coalescing buffer (#449) reached 3.8 GiB
-and released it again 74s later, all inside "pass1 scan" — `peak_rss_mib`
+and released it again 74 seconds later, all inside "pass1 scan" — `peak_rss_mib`
 (and the `[rss] convert peak` log line) reported a number ~3 GiB below the
 true peak.
 
 `rss_sampler` fixes this with a background thread that polls RSS every
-`interval_ms` (250ms) whenever profiling is on, and is not spawned at all
+`interval_ms` (250 ms) whenever profiling is on, and is not spawned at all
 otherwise. Besides its own ticks it also records one sample at every phase
 change (credited to the phase that is ending), one when it stops, and every
 boundary sample behind `peak_rss_mib`. It reports:
@@ -148,7 +148,7 @@ boundary sample behind `peak_rss_mib`. It reports:
   between two boundaries: the gap #571 exists to surface.
 - `phase_peaks_mib`: the max RSS observed while each named phase was
   current, one entry for every phase the run entered, however short. The
-  phases are `preflight` (options, schema and input checks), then
+  phases are `preflight` (options, schema, and input checks), then
   `pass1 scan` and `assignment+budget (winner tables)`, or `plan load` in
   their place on a `--plan` run, then `pre-pass2 (winner tables freed)`,
   `pass2 (output sink)` and `writer.finish`. The object's key order carries
@@ -202,7 +202,7 @@ stage timers were dropped) and is now covered by
 
 An unwritable path (typo, missing directory, read-only mount) is probed
 **at conversion start** — with the other convert path preflights, in
-`validate_options` — not only when the dump is finally appended at the very
+`validate_options` — not only when the dump is finally appended at the
 end of the run: a bad path logs an unmistakable `log::warn` (`NOT WRITABLE`)
 immediately, so a multi-hour batch/sweep run doesn't silently lose its
 profiling data while still exiting `0`. It is deliberately **not**
@@ -288,7 +288,7 @@ missing export line after a failed run is expected, not a profiling bug.
 windows, so `scan + fill + levels + finalize <= total` always holds. The
 remainder of `total` is the open/validation/writer setup before the scan.
 `fill` is the partitioning-mode single-read fill (`fill_member_store`, #235),
-which reads, decodes and clips every band up front. In duplicating mode
+which reads, decodes, and clips every band up front. In duplicating mode
 there is no fill (`fill` is exactly 0.0) and the same work happens per wave
 inside `levels`. Use `export.mode` to tell which case you are looking at.
 
@@ -308,7 +308,7 @@ tile), never around a whole parallel section:
   producer thread but is not timed by any stage; it lands in
   `phase_walls.scan`.
 - `decode`: everything per batch around the clip that is not the clip. That
-  means the geoarrow → `geo::Geometry` decode, the EPSG:3857 → 4326
+  means the GeoArrow → `geo::Geometry` decode, the EPSG:3857 → 4326
   reprojection (timed per geometry), property extraction, and per-row member
   materialization and routing into partition buckets or the `MemberStore`.
   A spill flush triggered while routing is subtracted out and charged to
@@ -354,20 +354,21 @@ tile), never around a whole parallel section:
 
 `export.per_zoom[].wall_secs` is the wall time of that zoom's wave loop in
 `export_level`. It **excludes the partitioning-mode fill** (which does the
-band reads, decode and clip for every level up front, in
+band reads, decode, and clip for every level up front, in
 `phase_walls.fill`) and the checkpoint after the level. In duplicating mode
 it includes the per-wave reads and clip.
 
 `export.per_zoom[].bytes` is the **compressed** (gzipped) tile bytes the zoom
 produced, summed over every tile handed to the writer and counted **before
-the writer's content-hash dedup**. A duplicated tile (e.g. an all-ocean tile)
+the writer's content-hash dedup**. A duplicated tile (for example, an all-ocean tile)
 counts every time it is produced but is stored once, so the per-zoom sums
-can exceed the archive's size. It is not the raw pre-gzip MVT size.
+can exceed the archive's size. Raw pre-gzip MVT sizes do not enter this
+figure.
 
 `export.peak_rss_mib` is the peak of RSS samples taken at the export's phase
-boundaries (after the scan, the fill, each level, and finalize). It is a
-sampled peak, not a true high-water mark, and is `null` where the platform
-cannot report RSS.
+boundaries: after the scan, after the fill, after each level, and at
+finalize. Because it only samples those points, it can miss the true
+high-water mark; it is `null` where the platform cannot report RSS.
 
 `export.rss_sampler` (#571) is the continuous background sampler's report,
 the export-side counterpart of convert's `rss_sampler` (see that section
@@ -427,7 +428,7 @@ Merging the two into one object would mean either:
 A standalone `export-pmtiles` run writes exactly one `"phase": "export"`
 line, the same shape as the second line of a `tiles` run.
 
-## Wall-Time Profiling with cargo-flamegraph
+## Wall-time profiling with cargo-flamegraph
 
 ```bash
 cargo install flamegraph
@@ -442,7 +443,7 @@ Expect simplification (RDP + ring validation) to dominate convert on
 polygon-heavy data, and clipping/encoding to dominate export — both are
 rayon-parallel, so look at per-thread flame widths.
 
-## Memory Profiling with dhat
+## Memory profiling with dhat
 
 Heap profiling is feature-gated (zero overhead in normal builds):
 
@@ -457,7 +458,7 @@ ls dhat-heap.json
 
 (CI's "Profiling Features" job keeps this build working.)
 
-### Analyzing Results
+### Analyzing results
 
 1. Open <https://nnethercote.github.io/dh_view/dh_view.html>
 2. Load `dhat-heap.json`
@@ -483,7 +484,7 @@ mv dhat-heap.json dhat-heap-before.json
 - **~2–5% runtime overhead** while profiling
 - **Feature-gated** — rebuild with `--features dhat-heap`
 
-## Criterion Benchmarks
+## Criterion benchmarks
 
 Micro-benchmarks for the clipping hot path live in
 `crates/core/benches/` (`clipping`, `bbox_containment`):
@@ -493,7 +494,7 @@ cargo bench --package tylertoo-core --bench clipping
 open target/criterion/report/index.html
 ```
 
-## Reproducing the Published Numbers
+## Reproducing the published numbers
 
 The corpus-based storage/access/conversion benchmarks are scripted in
 `benchmarks/overview/` (see its README for the run order); the corpus

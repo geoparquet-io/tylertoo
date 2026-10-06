@@ -25,8 +25,8 @@ files the one before it wrote.
 ## 1. Build the overview
 
 `tylertoo.overview` reads the input and writes the multi-resolution file. It
-returns a report as a plain `dict`, so you can log it, assert on it in a
-pipeline, or print it as this step does.
+returns a report as a plain `dict`, which a pipeline can log or assert on;
+this step prints it.
 
 This file has no GeoParquet `geo` metadata. tylertoo reads it anyway: it logs
 a warning and treats the WKB `geometry` column as lon/lat WGS84. For larger files,

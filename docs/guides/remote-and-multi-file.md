@@ -66,13 +66,17 @@ to build an Antananarivo overview from a country file.
 
 **`--filter <expr>`, aliased `--where`.** A SQL-WHERE predicate over the input's
 property columns, such as `confidence > 0.8` or `crop_type IN ('soy', 'corn')`.
-It supports the comparison operators, `IN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`,
-parentheses, string and numeric literals, quoted column names, and timestamp
-comparisons against date strings read as UTC. Nulls follow SQL three-valued
-logic, so a row survives only when the predicate is true. Where column statistics
-preclude a match, the row group is skipped at the footer like `--bbox`, and it
-composes with `--bbox` for a combined spatial-and-attribute extract straight from
-the source file.
+It supports:
+
+- the comparison operators, `IN`, and `IS [NOT] NULL`;
+- `AND`/`OR`/`NOT` and parentheses;
+- string and numeric literals, and quoted column names;
+- timestamp comparisons against date strings read as UTC.
+
+Nulls follow SQL three-valued logic, so a row survives only when the predicate
+is true. Where column statistics preclude a match, the row group is skipped at
+the footer like `--bbox`, and it composes with `--bbox` for a combined
+spatial-and-attribute extract straight from the source file.
 
 ### Combining many partition files
 

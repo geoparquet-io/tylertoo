@@ -37,7 +37,7 @@ is the 52 part files of the global collection whose footers intersect Brazil
 
 | stage | wall | peak RSS | output |
 |---|---|---|---|
-| **convert** (incl. 40.7 GiB remote read) | 1h 11m 56s | 9.6 GiB | 14.1 GB overview GeoParquet (15 levels) |
+| **convert** (incl. 40.7 GiB remote read) | 1 h 11 m 56 s | 9.6 GiB | 14.1 GB overview GeoParquet (15 levels) |
 | **export** | 11 m 44 s | **1.54 GiB** | **4.5 GiB** PMTiles, 1,647,927 tiles |
 | **total** | **1 h 23 m 40 s** | — | z0–14, 116,504,741 tile-features, 0 oversized |
 
@@ -72,7 +72,7 @@ tylertoo export-pmtiles brazil-2025-fields-ov-z14.parquet \
 3. **Cloud-native at collection scale.** The run fetched 6.9% of the
    collection's bytes — the 52 files that could contain Brazil — once each
    (~1.0×, spilled locally so later passes never re-hit the network).
-4. **Bounded memory at every stage.** Convert auto-selected spill mode (the
+4. **Bounded memory at every stage.** Convert chose spill mode automatically (the
    in-RAM estimate for its 109M output rows was ~315 GiB) and peaked at
    9.6 GiB; export streamed all 15 levels at a peak of **1.54 GiB**.
 
