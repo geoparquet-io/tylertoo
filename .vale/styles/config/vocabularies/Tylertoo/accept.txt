@@ -140,6 +140,7 @@ Goiás
 Sul
 # Standard acronyms and identifiers readers know without a definition.
 # Uppercase only: Vale.Terms enforces the casing written here.
+PRs?
 ASCII
 CRS
 DGGS
