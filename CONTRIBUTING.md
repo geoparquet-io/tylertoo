@@ -47,6 +47,15 @@ Python setup, and how to run every CI gate locally.
 3. Submit the PR using the [PR template](https://github.com/geoparquet-io/tylertoo/blob/main/.github/PULL_REQUEST_TEMPLATE.md);
    never bypass the pre-commit hooks (`--no-verify` is forbidden).
 
+## Docstrings and help text
+
+Public docstrings, CLI help, and `///` docs follow one standard:
+
+- A one-line summary that ends with a period; each parameter in at most two sentences on what it does for the user.
+- No issue numbers, sweep or decision-file references, restated defaults, internal crate names, memory formulas, or tuning history.
+- Performance-only knobs get one sentence and a link to [Keeping memory bounded](https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/); tippecanoe comparisons go in the [tippecanoe guide](https://geoparquet-io.github.io/tylertoo/guides/tippecanoe/).
+- Keep one short runnable example per function, and move anything removed that users still need to `docs/OVERVIEW_TUNING.md`, a guide, or `CHANGELOG.md`.
+
 Filing a bug or feature request instead? Use the
 [issue templates](.github/ISSUE_TEMPLATE/) — they ask for the details we
 need to act on the report quickly.

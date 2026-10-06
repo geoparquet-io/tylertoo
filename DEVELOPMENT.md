@@ -351,10 +351,14 @@ checks). All of them are runnable locally.
 ### Rust
 
 ```bash
-# Lint (curated pedantic subset via [workspace.lints.clippy];
-# cognitive-complexity and too-many-lines thresholds in
-# clippy.toml)
+# Lint (curated pedantic subset via [workspace.lints.clippy],
+# including the doc gates: too_long_first_doc_paragraph,
+# missing_errors_doc, missing_panics_doc, doc_markdown;
+# thresholds and doc-valid-idents in clippy.toml)
 cargo clippy --all-targets --all-features -- -D warnings
+
+# Doctests (CI: the Test job)
+cargo test --all-features --doc
 
 # Format
 cargo fmt --all --check
@@ -457,14 +461,16 @@ cd crates/python
 uv sync --group dev
 uv run maturin develop          # build the extension module
 
-uv run ruff check .             # strict 16-group ruleset
+uv run ruff check .             # strict ruleset, docstrings too
 uv run ruff format --check .
 uv run mypy                     # strict typing
 uv run python -m mypy.stubtest tylertoo \
-  --allowlist stubtest-allowlist.txt   # tylertoo.pyi matches the built module
+  --allowlist stubtest-allowlist.txt
+uv run ty check python          # package + extension stub
 uv run vulture                  # dead code
 uv run xenon --max-absolute C --max-modules A --max-average A tests
 uv run pytest tests/ -v
+uv run pytest --doctest-modules python  # docstring examples
 
 # Supply chain
 uv export --no-emit-project --format requirements-txt \
@@ -472,9 +478,15 @@ uv export --no-emit-project --format requirements-txt \
 uv run pip-audit -r /tmp/requirements.txt --disable-pip
 ```
 
-If you change a `#[pyo3(signature = ...)]` in
-`crates/python/src/lib.rs`, update `crates/python/tylertoo.pyi` —
-stubtest will fail otherwise.
+The package is a maturin mixed layout. The public API, with its types
+and docstrings, is `python/tylertoo/__init__.py`; it passes every
+argument by keyword to the compiled extension, `tylertoo._tylertoo`
+(`src/lib.rs`). If you change a `#[pyo3(signature = ...)]` there, update
+the extension stub `python/tylertoo/_tylertoo.pyi` and the matching
+function in `__init__.py`; stubtest fails on a stale stub. ruff checks
+the docstrings (pydocstyle with the Google convention, pydoclint, and
+`W505` at 72 columns), and the docstring examples run as doctests
+against a small fixture (`python/conftest.py`).
 
 ### Archive e2e (independent readers, #421 / #425)
 
@@ -608,10 +620,12 @@ The `Docs Prose` job lints the handwritten docs with
 [proselint](https://github.com/amperser/proselint). The pre-commit
 hook runs the same script on the staged files. `scripts/lint-prose.sh`
 holds the file list: the top-level `README.md`, `CONTRIBUTING.md`, and
-`DEVELOPMENT.md`, the hand-written pages under `docs/`, and
-`examples/*/README.md`. The generated reference pages and
-`CHANGELOG.md` are out of scope. Neither tool reads code blocks or
-inline code.
+`DEVELOPMENT.md`, the pages under `docs/`, and `examples/*/README.md`.
+That includes the generated CLI and Python reference pages, so the clap
+help and the Python docstrings are linted as they render: after editing
+either, regenerate the page (see [Docs](#docs)) and commit it with the
+change. `CHANGELOG.md` is out of scope. Neither tool reads code blocks
+or inline code.
 
 A Vale error or any proselint finding fails the check. Vale's
 warnings and suggestions are advice: CI prints them after the gate,
@@ -685,7 +699,7 @@ crates/
 ├── core/     # ALL logic: overview/ (the product) + shared infrastructure
 ├── cli/      # Thin argument parsing → core (tiles facade, overview,
 │             # validate, export-pmtiles)
-└── python/   # pyo3 bindings → core (+ tylertoo.pyi stubs)
+└── python/   # typed Python API (python/tylertoo) over pyo3 → core
 ```
 
 The full module map and design rationale live in
@@ -729,8 +743,8 @@ RUST_BACKTRACE=1 cargo test --package tylertoo-core <test-name>
 `tests/fixtures/...`
 
 **Problem**: stubtest fails after a binding change
-**Solution**: Update `crates/python/tylertoo.pyi` to match the new
-`#[pyo3(signature)]`
+**Solution**: Update `crates/python/python/tylertoo/_tylertoo.pyi`
+(and the wrapper in `__init__.py`) to match the new `#[pyo3(signature)]`
 
 ## Dependency updates
 
