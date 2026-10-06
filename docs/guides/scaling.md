@@ -311,6 +311,14 @@ exceed the budget (#626). To size a machine for it:
 The pass-1 feature table is still neither measured per schema nor spillable
 (#543).
 
+**Size from the job's own peak, not its `MaxRSS`.** The 64-byte floor comes
+from the process's resident set, and the 2.5 multiplier from a cgroup kill.
+Both describe tylertoo's own memory. Under Slurm on cgroup v2, `MaxRSS` also
+counts reclaimable page cache. A job that moves tens of GiB can report a
+`MaxRSS` at the cgroup ceiling while the process is ten times smaller. Size
+from `true_peak_mib` or `true_anon_peak_mib` in a `TYLERTOO_PROFILE_JSON`
+capture. See [reading a job's MaxRSS](#reading-a-jobs-maxrss).
+
 **Line coalescing needs extra memory.** tylertoo enables it by default. Below
 the coalescing ceiling, line geometry stays resident through pass 1, costing up
 to `--coalesce-max-level-rows` × 512 bytes, or about 1.2 GiB at the defaults.
@@ -318,3 +326,105 @@ The chain stage peaks at 16 to 29 times that amount. See the
 [tuning reference](../OVERVIEW_TUNING.md). Add this to the budget for
 line-heavy inputs, or use `--no-coalesce-lines`. Above the ceiling, tylertoo
 skips coalescing.
+
+## Reading a job's MaxRSS
+
+The `MaxRSS` a scheduler reports can measure more than tylertoo's memory.
+One `--profile bounded` coarse job over 134M features was modeled at about
+10 GiB. It finished inside a 192 GiB Slurm cgroup with
+`MaxRSS 201,321,784 K` and was not killed. Page cache likely made up most of
+that charge, but the run recorded no breakdown to confirm it.
+
+tylertoo maps none of its data files. It reads the input and the intermediate
+overview, writes spill files, and writes the archive with ordinary `read` and
+`write` calls. That data stays out of the process's resident set. The kernel
+still caches those pages and charges them to the job's cgroup. Whether
+`MaxRSS` includes that cache depends on how Slurm gathers it:
+
+| Slurm setup | `MaxRSS` source | Includes page cache |
+| --- | --- | --- |
+| `jobacct_gather/cgroup`, cgroup v2 | `memory.current`, or `memory.peak` where available | Yes, unless `JobAcctGatherParams=no_file_cache` |
+| `jobacct_gather/cgroup`, cgroup v1 | `total_rss` from `memory.stat` | No |
+| `jobacct_gather/linux` | `/proc/<pid>/statm` summed over the job | No |
+
+On a compute node, `stat -fc %T /sys/fs/cgroup` prints `cgroup2fs` on
+cgroup v2. `scontrol show config` lists `JobAcctGatherType` and
+`JobAcctGatherParams`.
+
+On cgroup v2, a `MaxRSS` at the ceiling can be harmless cache. Setting
+`JobAcctGatherParams=no_file_cache` in `slurm.conf` subtracts that cache from
+the report. It also stops Slurm from reading `memory.peak`, so Slurm can miss
+short spikes. On cgroup v1 or `jobacct_gather/linux`, a `MaxRSS` at the
+ceiling is the job's own memory. Treat it like an out-of-memory failure.
+
+The cgroup kills the job when it cannot reclaim enough of the charge. The
+kernel drops clean page cache first. These parts are harder to reclaim:
+
+- Anonymous memory, the heap that `--profile` bounds.
+- tmpfs files. Spill files or an intermediate overview in a tmpfs `TMPDIR`
+  count as shared memory, and only swap can reclaim them.
+- Dirty pages and pages under write-back, such as the archive's latest writes. They must
+  reach disk first.
+- Kernel memory charged to the cgroup.
+
+### Get the breakdown
+
+With `TYLERTOO_PROFILE_JSON` set, the profile samples anonymous memory every
+250 ms. At each phase boundary it also records the resident set's split and
+the cgroup's own accounting:
+
+```bash
+TYLERTOO_PROFILE_JSON=profile.jsonl \
+  tylertoo tiles in.parquet out.pmtiles \
+  --profile bounded --layer-name fields
+# convert carries rss_sampler at the top level,
+# export carries it under .export
+jq '(.rss_sampler // .export.rss_sampler)
+    | {true_peak_mib, true_anon_peak_mib,
+       phase_anon_peaks_mib, phase_rss_breakdown,
+       phase_cgroup}' profile.jsonl
+```
+
+The export line of a run over the `sharding-grid` test fixture on a cgroup v1
+host, with `phase_rss_breakdown` trimmed to one phase:
+
+```json
+{
+  "true_peak_mib": 139.01171875,
+  "true_anon_peak_mib": 93.41015625,
+  "phase_anon_peaks_mib": { "finalize": 65.171875, "levels": 93.41015625, "scan": 23.796875 },
+  "phase_rss_breakdown": {
+    "levels": { "anon_kib": 64068, "file_kib": 46696, "rss_kib": 110764, "shmem_kib": 0, "swap_kib": 0 }
+  },
+  "phase_cgroup": {}
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `true_anon_peak_mib`, `phase_anon_peaks_mib` | The process's sampled heap peak. Size jobs from these, or from `true_peak_mib`, plus headroom. |
+| `phase_rss_breakdown` | The resident set at the end of each phase, where `anon_kib` + `file_kib` + `shmem_kib` = `rss_kib`. This is a snapshot, not a peak. Above, `levels` peaked at 93.4 MiB of anonymous memory and ended at 62.6 MiB. `file_kib` is the binary's code. A nonzero `swap_kib` means the run already exceeded its budget. |
+| `phase_cgroup` | cgroup v2 only. `memory_current_bytes` and `memory_peak_bytes` match what Slurm reports. `anon_bytes`, `file_bytes`, `file_dirty_bytes`, `file_writeback_bytes`, and `shmem_bytes` break that charge down. |
+
+To diagnose a high `MaxRSS`:
+
+1. If `true_anon_peak_mib` approaches the limit, the profile is not holding
+   memory down. Report it with `profile.jsonl` attached.
+2. On cgroup v2, read `phase_cgroup`. If `file_bytes` covers the gap between
+   `anon_bytes` and `memory_current_bytes`, the gap is clean cache and the job
+   is healthy. A large `shmem_bytes` means spill files sit on tmpfs. Point
+   `--spill-dir` or `TMPDIR` at real disk. Large `file_dirty_bytes` plus
+   `file_writeback_bytes` means writes outrun the disk.
+3. On cgroup v1 or `jobacct_gather/linux`, `MaxRSS` should sit close to
+   `true_peak_mib`. A much higher figure means another process shares the
+   job's accounting.
+
+Off Linux, `phase_anon_peaks_mib` and `phase_rss_breakdown` are empty and
+`true_anon_peak_mib` is `null`. `phase_cgroup` is empty unless the process
+runs in a cgroup v2 hierarchy whose memory files it can read.
+
+tylertoo does not call `posix_fadvise(DONTNEED)` to shrink the reported
+figure. Deleting the spill files and the intermediate overview after use
+frees their cache outright. Pass 2 reads the input again for each level, so
+evicting its cache would turn cache hits into disk reads. The archive's last
+pages are still dirty, and `DONTNEED` leaves dirty pages in place.
