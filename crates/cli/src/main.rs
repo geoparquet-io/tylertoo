@@ -3502,8 +3502,8 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
             "\n  ! ~{} row(s) could not be placed: their row groups carry no usable bbox \
              statistics (or cover so much of the pivot zoom that they name no cut point), so \
              they were spread evenly instead of balanced. Run the input through `gpio \
-             optimize` to give every row group a tight covering, and the cut improves for \
-             free.",
+             sort hilbert --add-bbox` to give every row group a tight covering, and the cut \
+             improves for free.",
             plan.unplaced_rows
         );
     }

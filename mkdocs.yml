@@ -78,7 +78,6 @@ nav:
       - Scaling: guides/scaling.md
       - Remote reads: guides/remote-reads.md
       - Coming from tippecanoe: guides/tippecanoe.md
-  - Demo: demo.md
   - Reference:
       - reference/index.md
       - CLI: reference/cli.md

@@ -525,8 +525,7 @@ Two caveats:
 
 - **Style the points.** A `fill` layer silently ignores Point features — a
   fill-only style renders the same empty country view you started with.
-  Add a small `circle` layer filtered to `["==", "$type", "Point"]` (see
-  `docs/demo/viewer.html`).
+  Add a small `circle` layer filtered to `["==", "$type", "Point"]`.
 - **Geometry type changes mid-zoom.** The output's `geometry_types` lists
   the union (for example, `["Point","Polygon"]`), per spec §7.5; collapse is
   opt-in precisely so renderers are never surprised by default
