@@ -1182,7 +1182,7 @@ impl MultiSource {
                 offender: part.display_name(),
                 detail,
             };
-            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(&incompatible)?;
+            validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
             let crs = crs_of(meta);
             if crs != first_crs {
                 return Err(incompatible(format!(
