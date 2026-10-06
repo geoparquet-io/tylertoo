@@ -5,6 +5,111 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.8.0 (2026-10-06)
+
+Sharded builds, much faster conversion and export, and a long list of
+robustness fixes. Some commands now refuse to overwrite existing files; see
+**Changed** before upgrading.
+
+During development, `main` carried versions 0.8.0 to 0.11.0. None of those
+were released. This is the first release after v0.7.1.
+
+### Added
+
+- **Sharded builds:** `tiles --shard I/N` builds one disjoint slice of a
+  large job, `--tile-range` limits a build to part of the tile space, and
+  `tylertoo merge` joins the shards into one archive. The merged result
+  matches a single-machine build (#498, #510, #537, #541, #555).
+- **Saved convert plans:** `--save-plan` writes the expensive first pass to a
+  file, `--plan` reuses it, and `tiles --plan-only` writes the plan without
+  exporting tiles (#505, #521, #560, #574, #600).
+- **`--max-zoom auto`** picks the finest zoom from the data, similar to
+  tippecanoe's `-zg`. In Python, pass `max_zoom="auto"` (#444, #573).
+- **`--feature-id <COLUMN>`** sets stable MVT feature ids from a column, so
+  MapLibre `setFeatureState` works across tiles and zooms (#443, #568).
+- **`tylertoo stats`** reports tile sizes per zoom (count, total, mean, p50,
+  p99, max), with `--largest N` and `--json` (#551, #557).
+- **`pyramid --feature-order`**, and `--band` now accepts remote inputs and
+  paths that contain colons (#374, #491, #598).
+- **Nested properties:** struct, list and map columns reach the tiles as JSON
+  strings instead of being dropped. Columns that are still skipped produce a
+  warning (#434, #599).
+- **`--bbox` on GeoParquet 2.0 files** skips row groups using the file's
+  native geometry statistics (#497, #500).
+- **Profiling:** `TYLERTOO_PROFILE_JSON` writes per-phase timers and memory
+  use, including peak memory within each phase (#502, #550, #571, #627).
+
+### Changed
+
+- **Existing outputs are no longer overwritten by default.** `tiles`, the
+  bare `tylertoo IN OUT` form, `overview`, `export-pmtiles` and `decode`
+  refuse to write over an existing file unless you pass `-f`/`--force`. A
+  directory at the output path is always refused (#427, #552, #595).
+- **Zoom limit:** zooms above 30 are rejected up front. Before, they were
+  accepted and the run hung (#371, #488).
+- **Out-of-range input fails loudly:** when every feature falls outside the
+  valid coordinate range (for example, meters labelled as degrees), the
+  conversion fails instead of writing an empty archive. Partial drops are
+  counted and reported, and warnings from the core library now reach the
+  CLI (#429, #493, #553, #563).
+- **Clustered PMTiles:** tiles are written in tile-id order, and the header
+  min and max zoom match the tiles actually stored, so `go-pmtiles verify`
+  accepts the archives (#501, #506, #516, #529, #554).
+- **Pyramid bands** are checked against the tiles they really contain, not
+  their declared zoom range (#495, #503, #514, #527).
+- **Rust API:** `tylertoo-core` has breaking changes. The level-assignment
+  and cluster functions take `&FeatureTable` instead of `&[AssignFeature]`;
+  see `crates/core/api/tylertoo-core.txt` for the full surface (#543, #630).
+
+### Fixed
+
+- Features that cross the antimeridian keep the part past ±180°, as in
+  tippecanoe (#342, #642).
+- At zoom 15 and above, the top rows of tiles were lost because latitude was
+  clamped at ±85.05 instead of the exact Web Mercator limit (#416, #484).
+- On the musl Linux binary, large runs no longer abort from memory
+  fragmentation (#480, #483).
+- `--profile auto` and `--partition-wave auto` respect container memory
+  limits (cgroup v1 and v2, as used by Docker, Kubernetes and Slurm) (#481,
+  #485).
+- Killed runs no longer leave a truncated `overview` or `decode` output in
+  place of the previous file (#427, #595).
+- GeometryCollections are encoded as one feature per geometry type instead of
+  being dropped (#431, #592).
+- Hostile or corrupt input is rejected with an error instead of a crash or
+  wrong output: malformed WKB, truncated or hostile remote Parquet footers,
+  hostile PMTiles archives, out-of-tile coordinates, NaN values, and
+  invalid `--extent` or `--tile-buffer` values (#399, #406, #417, #428, #430,
+  #432, #433, #623, #632).
+- Simplifying very long lines no longer overflows the stack (#575, #578).
+- Output is byte-identical across thread counts (#423, #487, #609, #610,
+  #611).
+- The first pass fails early with a clear message when its feature table
+  cannot fit in memory, and pass-1 line memory stays within its limit (#449,
+  #543, #549, #569).
+- Writing more than 32,767 row groups now works (#507, #508, #509).
+
+### Performance
+
+- Export is about 1.75× faster (#535, #559), and checkpoints cost the same
+  no matter how large the archive is (#459, #528).
+- The first pass and the level assignment run in parallel (#460, #504, #534,
+  #564).
+- Pass-2 reads run in parallel, and spilling to disk no longer blocks (#494,
+  #533, #536).
+- Memory use is lower: the pass-1 feature table shrank to 42 bytes per row,
+  and the density table and line-joining step use less memory (#543, #565,
+  #570, #579, #581, #626).
+- Zoom levels that share a simplification step compute it once (#499, #525).
+
+### Internal
+
+- Docs rebuilt around two tested tutorials (#639). Release builds check for
+  integer overflow (#432, #589). Line clipping now uses i_overlay 9 only
+  (#205, #435, #597). New regression guards, benchmarks against tippecanoe,
+  sharded slow tests, dependency updates and CI work (#447, #448, #524, #558,
+  #562, #566, #567, #612, #619).
+
 ## v0.7.1 (2026-09-23)
 
 Packaging and documentation updates for v0.7.0, with easier installation and
