@@ -64,7 +64,7 @@ fn webmerc_square(lon: f64, lat: f64, half_deg: f64) -> Geometry<f64> {
 }
 
 /// Write a GeoParquet file whose geometry column declares EPSG:3857 through
-/// PROJJSON named "WGS 84 / Pseudo-Mercator" — the exact shape GeoPandas
+/// PROJJSON named "WGS 84 / Pseudo-Mercator" — the exact shape `GeoPandas`
 /// writes, and the shape #518 was about.
 fn write_pseudo_mercator_input(path: &Path, geoms: &[Geometry<f64>]) {
     let projjson = serde_json::json!({

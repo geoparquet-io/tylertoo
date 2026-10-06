@@ -52,7 +52,7 @@ use std::path::Path;
 /// Specification for bbox covering columns parsed from GeoParquet metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoveringSpec {
-    /// Column path for xmin values (e.g., "geometry_bbox.xmin")
+    /// Column path for xmin values (e.g., "`geometry_bbox.xmin`")
     pub xmin_path: Vec<String>,
     /// Column path for ymin values
     pub ymin_path: Vec<String>,
@@ -63,7 +63,7 @@ pub struct CoveringSpec {
 }
 
 impl CoveringSpec {
-    /// Create a new CoveringSpec from column paths.
+    /// Create a new `CoveringSpec` from column paths.
     pub fn new(
         xmin_path: Vec<String>,
         ymin_path: Vec<String>,
@@ -178,7 +178,7 @@ impl RowGroupBounds {
         }
     }
 
-    /// Convert to TileBounds for compatibility with existing code.
+    /// Convert to `TileBounds` for compatibility with existing code.
     ///
     /// No NaN guard here on purpose: this is a plain field-for-field view of
     /// the same numbers, and the only way in (`extract_stat_value`) already
@@ -236,7 +236,7 @@ struct BboxCovering {
 /// * `geo_json` - The JSON string from the "geo" key-value metadata
 /// * `geom_column` - the column whose covering is wanted: for pruning, the
 ///   column the rest of the pipeline will actually read
-///   ([`resolve_geometry_column_name`]). `None` means the caller has no
+///   (`resolve_geometry_column_name`). `None` means the caller has no
 ///   column in hand, and then the spec-REQUIRED `primary_column` is the only
 ///   thing consulted.
 ///
@@ -253,6 +253,11 @@ struct BboxCovering {
 /// `Ok(Some(CoveringSpec))` if that column declares a valid covering,
 /// `Ok(None)` if it does not (or is absent from the metadata),
 /// `Err` if the JSON is malformed.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if `geo_json` is not valid geo metadata
+/// JSON.
 pub fn parse_covering_metadata(
     geo_json: &str,
     geom_column: Option<&str>,
@@ -396,6 +401,11 @@ fn extract_stat_value(
 ///
 /// A vector of `Option<RowGroupBounds>`, one per row group.
 /// Returns `Err` if the file cannot be read or has no covering metadata.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if the file cannot be opened, its Parquet
+/// footer cannot be read, or its geo metadata JSON is malformed.
 pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds>>, Error> {
     let file = File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open {}: {}", path.display(), e)))?;
@@ -409,6 +419,11 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
 /// Extract bounding boxes from an already-opened Parquet reader.
 ///
 /// This is useful when you already have a reader open and don't want to re-open the file.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if the file's geo metadata JSON is
+/// malformed.
 pub fn extract_row_group_bounds_from_reader(
     reader: &SerializedFileReader<File>,
 ) -> Result<Vec<Option<RowGroupBounds>>, Error> {
@@ -423,6 +438,11 @@ pub fn extract_row_group_bounds_from_reader(
 /// Returns `None` for row groups whose covering statistics are unavailable —
 /// including a bbox with a NaN corner, which cannot bound anything (#428) —
 /// and `vec![None; n]` when the file lacks geo/covering metadata entirely.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if the file's geo metadata JSON is
+/// malformed.
 pub fn extract_row_group_bounds_from_metadata(
     metadata: &ParquetMetaData,
 ) -> Result<Vec<Option<RowGroupBounds>>, Error> {
@@ -485,6 +505,11 @@ pub fn extract_row_group_bounds_from_metadata(
 }
 
 /// Get the "geo" metadata JSON string from Parquet file metadata.
+///
+/// # Errors
+///
+/// Never returns an error today; the `Result` keeps the signature in line with
+/// the other metadata readers.
 pub fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Error> {
     let kv = metadata.file_metadata().key_value_metadata();
     let Some(kv) = kv else {
@@ -736,6 +761,12 @@ pub(crate) fn extract_row_group_bounds_tiered(
 /// Parse bounds from either tile coordinates (z/x/y) or bbox (xmin,ymin,xmax,ymax).
 ///
 /// Tile coordinates are converted to WGS84 bounds using Web Mercator projection.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfig`] if `input` is neither a valid `z/x/y` tile
+/// nor four comma-separated numbers, or if the bbox has `xmin >= xmax` or
+/// `ymin >= ymax`.
 pub fn parse_bounds(input: &str) -> Result<TileBounds, Error> {
     // Try z/x/y format first
     if let Some(bounds) = parse_tile_coords(input) {
@@ -1545,7 +1576,7 @@ mod tests {
     /// Build synthetic footer metadata with schema
     /// `[xmin, ymin, xmax, ymax, geometry]`: the first four DOUBLE columns
     /// are the GeoParquet 1.1 tier-1 covering columns; `geometry` is a
-    /// BYTE_ARRAY column annotated `LogicalType::Geometry(crs)` for tier 2.
+    /// `BYTE_ARRAY` column annotated `LogicalType::Geometry(crs)` for tier 2.
     /// `with_geo_json` attaches (or omits) the "geo" key-value metadata
     /// that points a covering spec at the four DOUBLE columns — `false`
     /// models a pure GeoParquet 2.0 file (no legacy "geo" JSON at all),

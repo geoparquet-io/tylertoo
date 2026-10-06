@@ -61,6 +61,7 @@ pub mod stats;
 pub mod sutherland_hodgman;
 pub mod tile;
 pub mod wkb;
+pub(crate) mod wkb_column;
 pub mod world_coord;
 
 // Re-export Compression from compression module for public API

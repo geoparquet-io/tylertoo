@@ -24,7 +24,7 @@ pub struct CrsInfo {
 }
 
 impl CrsInfo {
-    /// Create CrsInfo indicating WGS84
+    /// Create `CrsInfo` indicating WGS84
     fn wgs84() -> Self {
         Self {
             identifier: Some("EPSG:4326".to_string()),
@@ -33,7 +33,7 @@ impl CrsInfo {
         }
     }
 
-    /// Create CrsInfo from a CRS identifier string
+    /// Create `CrsInfo` from a CRS identifier string
     fn from_identifier(id: &str) -> Self {
         let is_wgs84 = is_wgs84_identifier(id);
         Self {
@@ -43,7 +43,7 @@ impl CrsInfo {
         }
     }
 
-    /// Create CrsInfo indicating unknown/missing CRS
+    /// Create `CrsInfo` indicating unknown/missing CRS
     fn unknown() -> Self {
         Self {
             identifier: None,
@@ -280,6 +280,12 @@ fn is_wgs84_projjson(projjson: &Value) -> bool {
 /// # Returns
 ///
 /// CRS information, or an error if the file cannot be read.
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if `path` resolves to no Parquet file, if
+/// the file cannot be opened or its footer read, or if its geo metadata JSON is
+/// malformed.
 pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
     use crate::batch_processor::resolve_parquet_files;
 
@@ -331,6 +337,10 @@ mod warn_once {
 /// have a parsed footer in hand already (e.g. remote inputs, #210, where the
 /// footer was range-fetched once and re-opening the file would cost another
 /// round trip).
+///
+/// # Errors
+///
+/// Returns [`Error::GeoParquetRead`] if the geo metadata JSON is malformed.
 pub fn crs_info_from_kv_metadata(
     kv_metadata: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<CrsInfo> {
@@ -476,6 +486,11 @@ pub fn crs_info_from_kv_metadata(
 /// # Returns
 ///
 /// Ok(()) if the file uses WGS84, or an error with reprojection instructions.
+///
+/// # Errors
+///
+/// Returns an error if the CRS cannot be read (see [`extract_crs`]) or the file
+/// is not in WGS84; the message includes reprojection instructions.
 pub fn validate_wgs84(path: &Path) -> Result<()> {
     let crs_info = extract_crs(path)?;
 
@@ -760,7 +775,7 @@ mod tests {
 
     /// #519 (S4): ESRI's Web Mercator codes and the deprecated EPSG:3785 are
     /// the same projection as EPSG:3857. Refusing them made plainly Web
-    /// Mercator ArcGIS exports "unsupported".
+    /// Mercator `ArcGIS` exports "unsupported".
     #[test]
     fn web_mercator_aliases_are_recognized() {
         for id in [

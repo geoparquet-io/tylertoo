@@ -100,8 +100,9 @@ pub(crate) fn placeholder_has_size(simplify_factor: f64) -> bool {
     false
 }
 
-/// Whether a level's effective disposition is the placeholder square, i.e.
-/// whether the accumulator runs there: a `square` representation band, or
+/// Whether a level's effective disposition is the placeholder square.
+///
+/// That is, whether the accumulator runs there: a `square` representation band, or
 /// the global `--collapse-square` at a plain-geometry level. A `point` band
 /// is points only — its polygons thin on the point grid, and their losers
 /// must not come back as squares. Shared by every engine so the carrier
@@ -114,7 +115,9 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
     }
 }
 
-/// Run the accumulator. Returns, per level, the **sorted** row indices
+/// Run the accumulator.
+///
+/// Returns, per level, the **sorted** row indices
 /// (`AssignFeature::index`) of that level's carriers: polygons that are not
 /// members of the level (`min_level > level`) but must be emitted there as a
 /// placeholder square.

@@ -94,6 +94,12 @@ impl PropertySelection {
     /// Unknown `exclude` names are reported through `warn` (excluding a
     /// column that is not there is harmless); unknown `include` names are an
     /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PropertySelectionError`] if an `include` name is the
+    /// geometry column or not a column of `schema`, or if the selection drops a
+    /// column a knob in `required` reads.
     pub fn resolve(
         &self,
         schema: &Schema,

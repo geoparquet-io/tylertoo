@@ -62,7 +62,9 @@ pub struct LargestTile {
     pub bytes: u64,
 }
 
-/// Per-zoom tile-weight report: [`ZoomStats`] for every zoom the archive
+/// Per-zoom tile-weight report.
+///
+/// It holds [`ZoomStats`] for every zoom the archive
 /// holds at least one tile at (ascending by zoom), plus the largest tiles
 /// overall (descending by size, ties by ascending PMTiles tile id — i.e.
 /// lower zoom first, then Hilbert order within a zoom).
@@ -134,6 +136,11 @@ fn zoom_stats_from_weighted(z: u8, mut sizes: Vec<(u64, u64)>) -> ZoomStats {
 ///
 /// Walks [`ArchiveIndex::entries`] once without expanding run lengths:
 /// memory is O(directory entries + `largest_n`).
+///
+/// # Errors
+///
+/// Returns an error if a directory entry points past the tile-data section or
+/// holds a tile id that does not decode.
 pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsReport> {
     let tile_data_length = archive.header().tile_data_length;
     let mut by_zoom: Vec<Vec<(u64, u64)>> = Vec::new();
@@ -464,7 +471,7 @@ mod tests {
 
     /// A run that crosses a zoom boundary is split at it: z0's single tile
     /// and z1's first tile share one body, so the writer emits one entry with
-    /// run_length 2 spanning ids 0 and 1.
+    /// `run_length` 2 spanning ids 0 and 1.
     #[test]
     fn run_crossing_a_zoom_boundary_is_split_per_zoom() {
         let dir = tempfile::tempdir().unwrap();

@@ -27,6 +27,7 @@ pub mod level;
 mod pipe;
 mod pipeline;
 mod plan_state;
+mod procmem;
 pub mod properties;
 pub mod reader;
 pub mod simplify;

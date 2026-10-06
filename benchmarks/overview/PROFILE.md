@@ -31,7 +31,7 @@ Full pipeline (GeoParquet → overview file → PMTiles) < 2 min.
   `RUST_LOG=tylertoo_core::overview=debug` (instrumentation is
   retained behind that log level).
 - **Heap**: `cargo build --release --features dhat-heap` (see
-  `docs/PROFILING.md`).
+  `context/PROFILING.md`).
 - **Output equivalence**: every perf change was gated on footer/row
   equivalence and all `tylertoo validate` checks passing.
 

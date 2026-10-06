@@ -28,7 +28,7 @@
 //!   #239 fast path off (`--no-simple-clip-fastpath`).
 //! - `sh`: raw Sutherland–Hodgman (`sutherland_hodgman::clip_polygon_sh`),
 //!   polygons only, no validity gate.
-//! - `ioverlay`: raw i_overlay 9 (`ioverlay_clip`), the fallback engine.
+//! - `ioverlay`: raw `i_overlay` 9 (`ioverlay_clip`), the fallback engine.
 //! - `wagyu-f64` / `wagyu-i64-mvt` / `wagyu-i64-world`: wagyu-rs 0.2.1, run
 //!   out of process by `corpus/hostile_wagyu` (its dead `geo 0.32` dependency
 //!   cannot resolve beside our geo 0.33 — see that crate's Cargo.toml). This
@@ -44,20 +44,20 @@
 //! output vertex inside the buffered bounds, engine-specific snap tolerance) ·
 //! `geo::Validation` on the output · proper self-crossing via the production
 //! sweep (`clip::geometry_is_simple`) · ring orientation consistency ·
-//! area conservation against the i_overlay reference and, for inputs that are
-//! valid, `geo::BooleanOps` (geo's own vendored i_overlay 4.5 — a different
+//! area conservation against the `i_overlay` reference and, for inputs that are
+//! valid, `geo::BooleanOps` (geo's own vendored `i_overlay` 4.5 — a different
 //! version of the engine) as tiebreaker · vertex count · wall time · peak
 //! heap (counting global allocator). Timings here are indicative (test
 //! build, single run); `benches/hostile_geometry.rs` is the authoritative
 //! perf comparison.
 //!
 //! Run:
-//!   cargo test -p tylertoo-core --test hostile_geometry_eval \
-//!       smoke_scorecard -- --nocapture
-//!   cargo test --release -p tylertoo-core --test hostile_geometry_eval \
-//!       full_scorecard -- --nocapture
+//!   cargo test -p tylertoo-core --test `hostile_geometry_eval` \
+//!       `smoke_scorecard` -- --nocapture
+//!   cargo test --release -p tylertoo-core --test `hostile_geometry_eval` \
+//!       `full_scorecard` -- --nocapture
 //! then, for the wagyu columns,
-//!   cargo run --release --manifest-path corpus/hostile_wagyu/Cargo.toml
+//!   cargo run --release --manifest-path `corpus/hostile_wagyu/Cargo.toml`
 //! and re-run `full_scorecard` to fold them in.
 
 #[cfg(not(feature = "dhat-heap"))]
@@ -1129,7 +1129,7 @@ fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// `geo::BooleanOps` intersection with the buffered rectangle — geo 0.33's
-/// vendored i_overlay 4.5, a different version of the incumbent engine — as
+/// vendored `i_overlay` 4.5, a different version of the incumbent engine — as
 /// the third opinion on area. Only meaningful for valid input; it may panic
 /// on invalid input, which is caught and reported as `None`.
 fn geo_reference_area(g: &Geometry<f64>, c: &Case) -> Option<f64> {
@@ -1227,7 +1227,7 @@ struct Scoreboard {
     /// engine -> tier -> tally
     tallies: BTreeMap<String, BTreeMap<Tier, Tally>>,
     anomalies: Vec<Anomaly>,
-    /// Reference area per case id (i_overlay), and geo's third opinion.
+    /// Reference area per case id (`i_overlay`), and geo's third opinion.
     reference: BTreeMap<String, (f64, Option<f64>)>,
 }
 

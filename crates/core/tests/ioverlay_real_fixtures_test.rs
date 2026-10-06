@@ -1,9 +1,9 @@
-//! CRITICAL TEST: Can i_overlay's boolean operations handle real-world
+//! CRITICAL TEST: Can `i_overlay`'s boolean operations handle real-world
 //! self-intersecting polygons from our test fixtures?
 //!
-//! This tests the hypothesis that i_overlay's Intersect operation with
-//! FillRule can clip self-intersecting polygons correctly, even though
-//! simplify_shape() cannot REPAIR them.
+//! This tests the hypothesis that `i_overlay`'s Intersect operation with
+//! `FillRule` can clip self-intersecting polygons correctly, even though
+//! `simplify_shape()` cannot REPAIR them.
 //!
 //! If these tests pass, wagyu may not have been necessary.
 
@@ -71,7 +71,7 @@ fn parse_polygon_coords(coords: &serde_json::Value) -> Polygon<f64> {
 // i_overlay conversion utilities
 // ============================================================================
 
-/// Convert geo::Polygon to i_overlay format
+/// Convert `geo::Polygon` to `i_overlay` format
 fn polygon_to_ioverlay(poly: &Polygon<f64>) -> Vec<Vec<[f64; 2]>> {
     let mut shape = Vec::with_capacity(1 + poly.interiors().len());
 
@@ -88,7 +88,7 @@ fn polygon_to_ioverlay(poly: &Polygon<f64>) -> Vec<Vec<[f64; 2]>> {
     shape
 }
 
-/// Create a clip box in i_overlay format
+/// Create a clip box in `i_overlay` format
 fn create_clip_box(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<Vec<[f64; 2]>> {
     vec![vec![
         [min_x, min_y],
@@ -103,7 +103,7 @@ fn create_clip_box(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<Vec<[f
 // Validation
 // ============================================================================
 
-/// Check if i_overlay result is valid (non-empty shapes with valid contours)
+/// Check if `i_overlay` result is valid (non-empty shapes with valid contours)
 fn is_valid_ioverlay_result(shapes: &[Vec<Vec<[f64; 2]>>]) -> bool {
     if shapes.is_empty() {
         return true; // Empty result is valid (nothing inside clip bounds)

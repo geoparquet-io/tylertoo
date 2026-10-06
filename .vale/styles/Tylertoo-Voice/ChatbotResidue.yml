@@ -1,0 +1,11 @@
+extends: existence
+message: "Cut the chatbot residue '%s'. Address the reader's task directly."
+level: error
+ignorecase: true
+tokens:
+  - 'I hope this helps'
+  - 'Would you like me to'
+  - 'Let me know if you'
+  - 'Feel free to ask'
+  - 'As an AI (?:language )?model'
+  - 'Is there anything else'

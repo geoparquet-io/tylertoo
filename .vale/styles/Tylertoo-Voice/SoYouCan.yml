@@ -1,0 +1,7 @@
+extends: existence
+message: "Replace '%s' with a specific causal or conditional relationship."
+level: error
+ignorecase: true
+scope: sentence
+tokens:
+  - 'so (?:that )?you can'

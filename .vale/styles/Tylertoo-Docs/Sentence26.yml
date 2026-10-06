@@ -1,0 +1,7 @@
+extends: existence
+message: "This sentence runs past 26 words. Split it."
+level: warning
+scope: sentence
+nonword: true
+raw:
+  - '(?:\S+\s+){26,}\S+'

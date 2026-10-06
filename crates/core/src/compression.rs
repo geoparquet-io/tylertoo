@@ -170,6 +170,10 @@ fn dispatch<A>(
 ///
 /// # Returns
 /// Compressed data, or original data if compression is None.
+///
+/// # Errors
+///
+/// Returns an error for [`Compression::Unknown`], or if the encoder fails.
 pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     dispatch(data, compression, (), COMPRESS)
 }
@@ -196,6 +200,11 @@ pub fn compress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
 ///
 /// # Returns
 /// Decompressed data, or a copy of the input if compression is None.
+///
+/// # Errors
+///
+/// Returns an error for [`Compression::Unknown`], if the data does not decode,
+/// or if the output would exceed [`MAX_TILE_BYTES`].
 pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> {
     decompress_capped(data, compression, MAX_TILE_BYTES)
 }
@@ -216,6 +225,11 @@ pub fn decompress(data: &[u8], compression: Compression) -> io::Result<Vec<u8>> 
 ///
 /// # Returns
 /// Decompressed data, or a copy of the input if compression is None.
+///
+/// # Errors
+///
+/// Returns an error for [`Compression::Unknown`], if the data does not decode,
+/// or if the output would exceed `max_out` bytes.
 pub fn decompress_capped(
     data: &[u8],
     compression: Compression,

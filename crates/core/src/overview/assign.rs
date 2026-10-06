@@ -53,7 +53,7 @@
 //! grid, so a level still holds one entry per occupied cell however many
 //! threads built it. What it adds is a block of pending placements between
 //! shard reduces, budgeted per WAVE rather than per level
-//! ([`WINNER_BLOCK_BYTES_PER_THREAD`]: ≈ 2 MiB per pool thread across the whole
+//! (`WINNER_BLOCK_BYTES_PER_THREAD`: ≈ 2 MiB per pool thread across the whole
 //! wave, floor 1 MiB per level) and freed after every reduce. That term is not
 //! in the #306 estimate; it is bounded instead.
 //!
@@ -67,8 +67,8 @@
 //! job and ~59 GiB at the 1.58B-row global scale, stacked on the pass-1 feature
 //! table ([`FeatureTable`], `convert::PASS1_BYTES_PER_ROW` — 64 B/row when #565
 //! measured this, 33–42 B/row since #543 item 2) that is still live throughout.
-//! Every field of a [`Priority`] is a pure function of three of the row's
-//! columns (`FeatureTable::priority`), so [`priority_order`] derives both
+//! Every field of a `Priority` is a pure function of three of the row's
+//! columns (`FeatureTable::priority`), so `priority_order` derives both
 //! sides per comparison instead. Measured on the `assign_scaling` harness (8M
 //! rows, 14 levels, 1 GiB grid budget), the budget's transient fell from 72.1
 //! to 32.1 B/feature — the phase's peak is now dominated by the per-level
@@ -77,7 +77,7 @@
 //! #565 measured on, the budget phase was 7–16% slower (more at one thread,
 //! less at twelve) for removing ~5/8 of its footprint. With the column-major
 //! table the cost depends on how many columns a comparison reads; see
-//! [`priority_order`] for why it reads three and what that measured.
+//! `priority_order` for why it reads three and what that measured.
 //!
 //! # Parallelism & determinism
 //!
@@ -90,7 +90,7 @@
 //! 2. **Within a level** (#534): the feature range is split across threads,
 //!    each thread buckets its placements by grid **shard**, and the shards are
 //!    then reduced in parallel into one map each — disjoint, so lock-free (see
-//!    [`level_winner_positions`]). This is the decomposition that survives the
+//!    `level_winner_positions`). This is the decomposition that survives the
 //!    memory bound: once the #306 budget packs the levels into waves, (1) has
 //!    almost nothing left to overlap and the per-level pass is the whole cost.
 //! 3. **The winner fold** (#534): folding a wave's winners into `min_levels` is
@@ -101,16 +101,16 @@
 //!    the super-cell partition/sort are element-wise over the dataset and go
 //!    wide. The admission **fold** itself does NOT: it threads a running
 //!    `kept_count` coarse→fine and stays strictly serial, as does
-//!    [`water_fill`].
+//!    `water_fill`.
 //!
 //! Results are unaffected. The sharded winner build **preserves position
 //! order** per cell (chunks are collected in order, each chunk's shard group is
 //! in ascending position, and each shard drains the chunks in order — see
-//! [`level_winner_positions`]), so every cell sees the serial build's contests
+//! `level_winner_positions`), so every cell sees the serial build's contests
 //! in the serial build's order and keeps the same winner, even for
 //! priority-identical twins. A feature takes the *coarsest* level at which it
 //! wins regardless of the order levels finish, and every sort in the budget
-//! stage is by a strict total order ([`priority_order`]: [`Priority::beats`]
+//! stage is by a strict total order (`priority_order`: `Priority::beats`
 //! plus a position tie-break), so its output is unique. Output is identical
 //! across runs, across thread counts and to a fully serial build. The unit
 //! tests pin that at the production thresholds — `oracle_fixture_reproduces_main`
@@ -322,10 +322,10 @@ const NO_ENTRY_LEVEL: u8 = u8::MAX;
 ///    hand, rather than over a retained table afterwards.
 /// 2. **Sentinels instead of `Option`s.** `Option<f64>` costs 16 B — `f64` has
 ///    no spare bit pattern for a niche, so the discriminant takes a full
-///    aligned word. [`Priority::new`] already mapped `Some(non-finite)` and
+///    aligned word. `Priority::new` already mapped `Some(non-finite)` and
 ///    `None` onto one state (#428), so a non-finite `f64` is a lossless
 ///    encoding of the whole `Option`. `Option<u8>`'s 2 B become 1 via
-///    [`NO_ENTRY_LEVEL`]. This is the same trade #565 made inside `Priority`.
+///    `NO_ENTRY_LEVEL`. This is the same trade #565 made inside `Priority`.
 /// 3. **Columns, not structs.** Array-of-structs pays alignment padding per
 ///    row (the fields above sum to 42 B but `size_of` would round to 48);
 ///    columns pay none. Columns also let the two *optional* fields cost
@@ -344,7 +344,7 @@ const NO_ENTRY_LEVEL: u8 = u8::MAX;
 ///
 /// At 1.58 B rows that is 94.2 GiB → 61.8 GiB worst case, 60.3 GiB with a
 /// sort key only and 48.5 GiB with neither.
-/// [`super::convert::PASS1_BYTES_PER_ROW`] pins the worst case, because a
+/// `convert::PASS1_BYTES_PER_ROW` pins the worst case, because a
 /// preflight must not under-estimate.
 ///
 /// # What was deliberately NOT narrowed
@@ -392,7 +392,7 @@ impl FeatureTable {
 
     /// Bytes per row with both optional columns materialized:
     /// [`Self::BASE_BYTES_PER_ROW`] + `sort_key` (8) + `entry_level` (1) =
-    /// **42**. This is the figure [`super::convert::PASS1_BYTES_PER_ROW`]
+    /// **42**. This is the figure `convert::PASS1_BYTES_PER_ROW`
     /// pins, because a preflight must not under-estimate.
     pub const MAX_BYTES_PER_ROW: u64 =
         Self::BASE_BYTES_PER_ROW + (std::mem::size_of::<f64>() + std::mem::size_of::<u8>()) as u64;
@@ -427,6 +427,10 @@ impl FeatureTable {
     /// fallback-to-growth path would hold several full-size columns reserved
     /// while the rest doubled, which is the transient this reservation exists
     /// to avoid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the allocator's error for the first column it cannot reserve.
     pub fn try_reserve_exact(
         &mut self,
         rows: usize,
@@ -1711,9 +1715,9 @@ pub fn assign_levels_banded(
 /// peak the `[rss]` instrumentation pinned in #300 (5.9 GiB on
 /// germany-segments; the ~24 GiB Brazil-scale peak of #295). This variant
 /// schedules the levels in **memory-bounded waves**: per-level grid footprints
-/// are estimated up front ([`estimate_level_grid_bytes`], biased high), levels
+/// are estimated up front (`estimate_level_grid_bytes`, biased high), levels
 /// are greedily packed coarse→fine into waves whose summed estimate fits
-/// `grid_budget_bytes` ([`plan_level_waves`]), and each wave's winners are
+/// `grid_budget_bytes` (`plan_level_waves`), and each wave's winners are
 /// folded into `min_levels` and freed before the next wave starts. Peak grid
 /// memory is `O(max wave)` instead of `O(sum of all levels)`.
 ///
@@ -1904,16 +1908,18 @@ pub fn assign_levels_bounded(
 // This preserves duplicating monotonicity and — because the finest level admits
 // every remaining feature — the canonical level is never thinned (spec §2.4).
 
-/// Super-cell edge length for spatial-fairness budget allocation, as a multiple
-/// of the level GSD (in coordinate units). A super-cell is the neighborhood over
+/// Super-cell edge length for spatial-fairness budget allocation, as a multiple of the level GSD.
+///
+/// The length is in coordinate units. A super-cell is the neighborhood over
 /// which the per-level budget is shared; `128 × GSD` is roughly a tile-scale
 /// patch at the level's nominal display scale — coarse enough to hold many
 /// features (so the budget can bind) yet fine enough that a city spans many
 /// cells (so rural areas are not starved to feed it).
 pub const SUPERCELL_GSD_FACTOR: f64 = 128.0;
 
-/// Levels with fewer surviving features than this are exempt from the density
-/// budget. Such levels are already grid-thinning-limited (sparse) rather than
+/// Levels with fewer surviving features than this are exempt from the density budget.
+///
+/// Such levels are already grid-thinning-limited (sparse) rather than
 /// density-limited, so a budget would only fight the cell-winner stage. This is
 /// what keeps coarse zooms essentially unchanged under the default budget.
 pub const MIN_DENSITY_LEVEL_FEATURES: usize = 256;
@@ -2478,7 +2484,7 @@ mod tests {
     /// `pass1_bytes_per_row_matches_the_feature_table`.
     ///
     /// This is the number `convert::PASS1_BYTES_PER_ROW` preflights against and
-    /// that `docs/diving-deeper/sharded-builds.md` sizes coarse jobs with, so
+    /// that `docs/guides/scaling.md` sizes coarse jobs with, so
     /// it is pinned here as well as there. The pre-#543 array-of-structs table
     /// was `size_of::<AssignFeature>()` = 64 B/row.
     #[test]
@@ -3067,7 +3073,7 @@ mod tests {
         }
     }
 
-    /// SplitMix64 — a self-contained deterministic generator for the oracle
+    /// `SplitMix64` — a self-contained deterministic generator for the oracle
     /// fixture (no RNG crate, so the fixture is reproducible from this file
     /// alone on any commit).
     fn splitmix64(state: &mut u64) -> u64 {
@@ -3110,7 +3116,7 @@ mod tests {
     ///   sharded reduce;
     /// - every 53rd feature carries a ladder entry level (some beyond the
     ///   finest level, which clamps);
-    /// - every 997th is a finite-coordinate bbox of extent 2e300 (a DBL_MAX-
+    /// - every 997th is a finite-coordinate bbox of extent 2e300 (a `DBL_MAX`-
     ///   style nodata sentinel), whose squared diagonal overflows to +inf.
     fn oracle_fixture() -> Vec<AssignFeature> {
         let mut rng = 0x5EED_0534_u64;
@@ -3377,7 +3383,7 @@ mod tests {
         );
     }
 
-    /// A finite-coordinate bbox whose extent overflows `dx * dx` (a DBL_MAX-
+    /// A finite-coordinate bbox whose extent overflows `dx * dx` (a `DBL_MAX`-
     /// style nodata sentinel — `scan_feature` lets it through, it only rejects
     /// non-finite coordinates) has a `+inf` squared diagonal. That is already
     /// totally ordered, so it must rank ABOVE every finite diagonal, exactly as

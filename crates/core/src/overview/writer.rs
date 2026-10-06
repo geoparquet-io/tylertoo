@@ -42,7 +42,7 @@
 //! is a pure per-row transform, so chunk outputs are identical to a serial
 //! encode; the only cross-batch encoder state — the file-level `geo` covering
 //! (per-column bbox union + geometry-type set) — is returned by each task and
-//! folded on the writer thread **in submission order** ([`fold_geo_metadata`]),
+//! folded on the writer thread **in submission order** (`fold_geo_metadata`),
 //! so the accumulated covering is deterministic and equal to the serial
 //! accumulation. Encoded chunks drain in submission order through the same
 //! bounded FIFO discipline as row groups, so row-group boundaries and row
@@ -83,6 +83,7 @@ use super::level::{
     Generalization, Level, Mode, OverviewValidationError, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY,
     SPEC_VERSION,
 };
+use crate::wkb_column::check_wkb_column;
 
 /// Name of the mandatory level column (§4.1).
 pub const LEVEL_COLUMN: &str = "level";
@@ -105,7 +106,9 @@ pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 10_000;
 /// row-group count, not an exact prediction.
 pub(crate) const SAFE_ROW_GROUP_CEILING: usize = 32_000;
 
-/// Maximum rows per parallel WKB-encode chunk (#304). Incoming batches are
+/// Maximum rows per parallel WKB-encode chunk (#304).
+///
+/// Incoming batches are
 /// split at this grain before being dispatched to the Rayon pool, so even the
 /// buffered engine's one-batch-per-level shape parallelizes, and one in-flight
 /// chunk stays a bounded slice of memory. The WKB encode is a pure per-row
@@ -332,6 +335,12 @@ pub struct OverviewWriter<W: Write + Send> {
     /// bbox-covering struct columns whose name collides with the covering the
     /// encoder will generate (§4.4). See [`Self::try_new`].
     drop_indices: Vec<usize>,
+    /// Source columns holding raw WKB (`geoarrow.wkb`), with their names.
+    /// The primary geometry column arrives as a native GeoArrow array; any
+    /// other geometry column is passed through from the input, and the
+    /// geoparquet encoder parses it with the `wkb` crate's reader, so it is
+    /// checked first (#632).
+    wkb_columns: Vec<(usize, String)>,
     /// `row_group_end` recorded for each completed (non-empty) level.
     level_row_group_ends: Vec<i64>,
     /// For each completed level, the index of its declared
@@ -426,6 +435,11 @@ impl OverviewWriter<File> {
     /// before then removes the sibling; a run killed outright leaves it, but
     /// the previous `path` is intact either way. The sibling must therefore
     /// be creatable in `path`'s directory, which must already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WriterError`] if the temporary sibling file cannot be
+    /// created, or in the cases [`Self::try_new`] does.
     pub fn create<P: AsRef<Path>>(
         path: P,
         source_schema: &Schema,
@@ -444,6 +458,12 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// `source_schema` is the schema of the input table (including its geometry
     /// column, carrying the GeoArrow extension metadata). It MUST NOT already
     /// contain a `level` column.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WriterError`] if `source_schema` already has a `level`
+    /// column or has no geometry column, or if the Parquet writer cannot be set
+    /// up.
     pub fn try_new(
         sink: W,
         source_schema: &Schema,
@@ -484,6 +504,18 @@ impl<W: Write + Send> OverviewWriter<W> {
             .enumerate()
             .filter(|(_, f)| covering_names.contains(f.name()) && is_bbox_covering_struct(f))
             .map(|(i, _)| i)
+            .collect();
+
+        let wkb_columns: Vec<(usize, String)> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.metadata()
+                    .get(EXTENSION_TYPE_NAME_KEY)
+                    .is_some_and(|name| name == "geoarrow.wkb")
+            })
+            .map(|(i, f)| (i, f.name().clone()))
             .collect();
 
         // Augment schema: retained source fields + NOT NULL Int32 `level`
@@ -531,6 +563,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             augmented_schema,
             options,
             drop_indices,
+            wkb_columns,
             level_row_group_ends: Vec::new(),
             written_spec_indices: Vec::new(),
             next_level_idx: 0,
@@ -574,6 +607,11 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// footer, and subsequent levels are renumbered down by one physical
     /// index (their `level` column values stay contiguous from 0). The
     /// returned [`LevelWriteOutcome`] tells the caller which case occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WriterError`] if `level_idx` is out of order, if an earlier
+    /// write failed, or if encoding or writing a batch fails.
     pub fn write_level(
         &mut self,
         level_idx: usize,
@@ -703,12 +741,21 @@ impl<W: Write + Send> OverviewWriter<W> {
 
     /// Append the NOT NULL `level` column (§4.1) — set to the level's physical
     /// index — after dropping any colliding pre-existing covering column(s)
-    /// (§4.4). Pure per-batch shaping; no encoding happens here.
+    /// (§4.4). No encoding happens here, but the passed-through WKB columns
+    /// are checked, since the encoder is the next thing to read them.
     fn augment_batch(
         &self,
         batch: &RecordBatch,
         physical_idx: usize,
     ) -> Result<RecordBatch, WriterError> {
+        for (idx, name) in &self.wkb_columns {
+            check_wkb_column(batch.column(*idx).as_ref()).map_err(|(row, e)| {
+                WriterError::GeoParquet(format!(
+                    "invalid geometry in column {name:?} (row {row} of a level-{physical_idx} \
+                     batch): {e}"
+                ))
+            })?;
+        }
         let num_rows = batch.num_rows();
         let level_array = Int32Array::from(vec![physical_idx as i32; num_rows]);
         let mut columns: Vec<_> = batch
@@ -895,6 +942,13 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// Finalize the file: write the `geo` and `geo:overviews` footer keys (plus
     /// the optional `cogp` key), then close. Returns the footer metadata that
     /// was written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WriterError`] if an earlier write failed, if fewer levels
+    /// were written than declared, if every declared level was empty, if the
+    /// footer metadata fails validation, or if writing the footer, closing, or
+    /// renaming the file fails.
     pub fn finish(mut self) -> Result<OverviewsMeta, WriterError> {
         if self.failed {
             return Err(poisoned_writer_error());
@@ -3043,7 +3097,7 @@ mod tests {
     /// returns `Err` through ordinary control flow, since the panic is caught
     /// and converted to an error *inside* the spawned task (#426). What it
     /// proves is that the process is still alive and running normal Rust code
-    /// after the encode task panicked, rather than having been SIGABRTed
+    /// after the encode task panicked, rather than having been `SIGABRTed`
     /// before `write_level` could return at all.
     fn write_level_with_faults(faults: EncodeFaults) -> (WriterError, std::path::PathBuf) {
         let schema = Arc::new(source_schema());

@@ -33,10 +33,10 @@
 //!
 //! `tests/fixtures/guard/br-clip-divergence.parquet` — 3,443 real Brazil field
 //! polygons, all of the features in three 0.2°-square windows centred on the
-//! three locations where the i_overlay 8→9 A/B actually diverged
+//! three locations where the `i_overlay` 8→9 A/B actually diverged
 //! ((-43.3004, -8.5125), (-44.2621, -14.2955), (-50.8011, -14.534)). It is a
 //! subset of a 82,714-feature extract that was *verified* to produce different
-//! tile bytes under i_overlay 8 vs 9 on a full z0–z13 run.
+//! tile bytes under `i_overlay` 8 vs 9 on a full z0–z13 run.
 //!
 //! The windows are kept **whole** — every feature whose bbox intersects one is
 //! present, none are sampled — because dropping neighbours of a divergent
@@ -61,7 +61,7 @@
 //! # The two cases
 //!
 //! `simple_clip_fastpath` defaults to `true`, which routes ~94% of fine-zoom
-//! polygon clips through Sutherland–Hodgman and never touches i_overlay
+//! polygon clips through Sutherland–Hodgman and never touches `i_overlay`
 //! (#239). A golden taken only at the defaults would therefore leave the
 //! boolean-ops engine mostly dark — the same blind spot in a new place. So
 //! there are two cases:

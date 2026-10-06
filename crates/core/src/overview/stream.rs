@@ -113,6 +113,9 @@ use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
+use super::procmem::{
+    cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
+};
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step_at,
     validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
@@ -266,6 +269,16 @@ const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// - the max RSS observed while each named phase was current
 ///   ([`RssSamplerReport::phase_peaks_mib`], attributed via [`Self::mark_phase`]).
 ///
+/// Since #627 each tick also reads the process's anonymous memory from
+/// `/proc/self/status` (the kernel's `RssAnon` counter, so the read costs the
+/// same at any process size), so the report carries a sampled anonymous peak per phase
+/// ([`RssSamplerReport::phase_anon_peaks_mib`]) next to the RSS one. At each
+/// phase boundary it also snapshots the exact anon/file/shmem split of the
+/// resident set ([`RssSamplerReport::phase_rss_breakdown`]) and the cgroup's
+/// own accounting ([`RssSamplerReport::phase_cgroup`]) — the figures that say
+/// whether a ceiling-riding `MaxRSS` is this process's memory or page cache
+/// charged to its cgroup. See [`super::procmem`].
+///
 /// This promotes the polling loop `peak_rss_during` (in `tests` below, #449)
 /// used to verify the pass-1 line-buffer memory model to 1% — same approach,
 /// generalized with phase attribution so the profiling path can use it too,
@@ -300,6 +313,48 @@ struct RssSamplerState {
     /// of phases, so a linear scan per sample is simpler than a `HashMap`.
     /// (The JSON object built from it is key-sorted by `serde_json`.)
     phase_peaks_mib: Vec<(String, f64)>,
+    /// #627: the highest `RssAnon` seen by any sample, in MiB. `None` until
+    /// the first sample that could read it (always `None` off Linux).
+    true_anon_peak_mib: Option<f64>,
+    /// #627: per-phase peak of `RssAnon`, sampled on the same tick as
+    /// `phase_peaks_mib` — the figure to size a job from.
+    phase_anon_peaks_mib: Vec<(String, f64)>,
+    /// #627: the `/proc/self/status` split of the resident set AT the moment
+    /// each phase ended. Boundary *snapshots*, not maxima: a composition is a
+    /// moment, and field-wise maxima across samples would stop adding up.
+    phase_rss_breakdown: Vec<(String, ProcStatusMem)>,
+    /// #627: the cgroup v2 accounting AT the moment each phase ended. Taken
+    /// only at boundaries: `memory.stat` makes the kernel flush per-CPU
+    /// statistics, which is cheap once per phase but not worth paying every
+    /// tick.
+    phase_cgroup: Vec<(String, CgroupMem)>,
+}
+
+/// Replace `current`'s entry in a per-phase list, or append one — a phase
+/// can be closed more than once (`log_phase` then `enter_phase`), and the
+/// last snapshot is the one that describes its end.
+fn upsert_phase<T>(list: &mut Vec<(String, T)>, current: &str, value: T) {
+    match list.iter_mut().find(|(p, _)| p == current) {
+        Some((_, slot)) => *slot = value,
+        None => list.push((current.to_string(), value)),
+    }
+}
+
+/// Fold `mib` into `current`'s entry of a per-phase max list.
+fn max_phase(list: &mut Vec<(String, f64)>, current: &str, mib: f64) {
+    match list.iter_mut().find(|(p, _)| p == current) {
+        Some((_, peak)) => {
+            if mib > *peak {
+                *peak = mib;
+            }
+        }
+        None => list.push((current.to_string(), mib)),
+    }
+}
+
+/// `RssAnon` in MiB, when the status read produced it.
+fn anon_mib(status: Option<&ProcStatusMem>) -> Option<f64> {
+    status?.anon_kib.map(|kib| kib as f64 / 1024.0)
 }
 
 impl RssSamplerState {
@@ -308,14 +363,29 @@ impl RssSamplerState {
         if mib > self.true_peak_mib {
             self.true_peak_mib = mib;
         }
-        let current = &self.current_phase;
-        match self.phase_peaks_mib.iter_mut().find(|(p, _)| p == current) {
-            Some((_, peak)) => {
-                if mib > *peak {
-                    *peak = mib;
-                }
-            }
-            None => self.phase_peaks_mib.push((current.clone(), mib)),
+        max_phase(&mut self.phase_peaks_mib, &self.current_phase, mib);
+    }
+
+    /// Fold one `RssAnon` sample (#627) into the anonymous peaks.
+    fn record_anon(&mut self, mib: f64) {
+        if self.true_anon_peak_mib.is_none_or(|p| mib > p) {
+            self.true_anon_peak_mib = Some(mib);
+        }
+        max_phase(&mut self.phase_anon_peaks_mib, &self.current_phase, mib);
+    }
+
+    /// Record the current phase's closing snapshots (#627). The status
+    /// snapshot's `RssAnon` is also folded into the anonymous peak, so a
+    /// phase's peak is never below its own closing snapshot.
+    fn record_boundary(&mut self, status: Option<ProcStatusMem>, cgroup: Option<CgroupMem>) {
+        if let Some(mib) = anon_mib(status.as_ref()) {
+            self.record_anon(mib);
+        }
+        if let Some(status) = status {
+            upsert_phase(&mut self.phase_rss_breakdown, &self.current_phase, status);
+        }
+        if let Some(cgroup) = cgroup {
+            upsert_phase(&mut self.phase_cgroup, &self.current_phase, cgroup);
         }
     }
 }
@@ -326,6 +396,16 @@ pub(super) struct RssSamplerReport {
     pub(super) interval_ms: u64,
     pub(super) true_peak_mib: f64,
     pub(super) phase_peaks_mib: Vec<(String, f64)>,
+    /// #627: whole-run sampled peak of `RssAnon`; `None` off Linux.
+    pub(super) true_anon_peak_mib: Option<f64>,
+    /// #627: per-phase sampled peak of `RssAnon`. Empty off Linux.
+    pub(super) phase_anon_peaks_mib: Vec<(String, f64)>,
+    /// #627: per-phase-boundary anon/file/shmem split of the resident set.
+    /// Empty off Linux or where `/proc/self/status` is unreadable.
+    pub(super) phase_rss_breakdown: Vec<(String, ProcStatusMem)>,
+    /// #627: per-phase-boundary cgroup v2 accounting. Empty off Linux, on
+    /// cgroup v1, or where the cgroup's memory files are not visible.
+    pub(super) phase_cgroup: Vec<(String, CgroupMem)>,
 }
 
 impl RssSampler {
@@ -355,12 +435,21 @@ impl RssSampler {
             current_phase: initial_phase.to_string(),
             true_peak_mib: 0.0,
             phase_peaks_mib: Vec::new(),
+            true_anon_peak_mib: None,
+            phase_anon_peaks_mib: Vec::new(),
+            phase_rss_breakdown: Vec::new(),
+            phase_cgroup: Vec::new(),
         }));
         let state_bg = Arc::clone(&state);
         let handle = std::thread::spawn(move || loop {
-            if let Some(mib) = current_rss_mib() {
-                if let Ok(mut s) = state_bg.lock() {
+            let mib = current_rss_mib();
+            let anon = anon_mib(read_proc_status().as_ref());
+            if let Ok(mut s) = state_bg.lock() {
+                if let Some(mib) = mib {
                     s.record(mib);
+                }
+                if let Some(anon) = anon {
+                    s.record_anon(anon);
                 }
             }
             // A timeout is the next tick; a message or a dropped sender
@@ -389,14 +478,23 @@ impl RssSampler {
     /// Close the current phase with one sample credited to it, then
     /// attribute every sample from now on to `phase`, until the next call.
     /// The closing sample is what gives a phase shorter than the poll
-    /// interval an entry at all. Cheap (one RSS read, one mutex lock, a
-    /// short-string clone); called only at phase boundaries, never per-row.
+    /// interval an entry at all. Cheap (one RSS read, one
+    /// `/proc/self/status` read, `/proc/self/cgroup` plus three small cgroup
+    /// files, one mutex lock, a short-string clone); called only at phase
+    /// boundaries, never per-row.
+    ///
+    /// #627: the boundary snapshots are taken here, credited to the phase
+    /// that is *ending* — so `phase_rss_breakdown["pass1 scan"]` describes
+    /// the resident set as pass 1 handed off.
     pub(super) fn mark_phase(&self, phase: &str) {
         let mib = current_rss_mib();
+        let status = read_proc_status();
+        let cgroup = read_cgroup_mem();
         if let Ok(mut s) = self.state.lock() {
             if let Some(mib) = mib {
                 s.record(mib);
             }
+            s.record_boundary(status, cgroup);
             if s.current_phase != phase {
                 s.current_phase = phase.to_string();
             }
@@ -417,14 +515,25 @@ impl RssSampler {
         if let Some(mib) = current_rss_mib() {
             self.record(mib);
         }
-        let state = self
+        // #627: the last phase's closing snapshots. Without these the final
+        // phase (`writer.finish` for convert, `finalize` for export) — the
+        // one an operator's MaxRSS most often lands in — would be the only
+        // phase with no breakdown.
+        let status = read_proc_status();
+        let cgroup = read_cgroup_mem();
+        let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.record_boundary(status, cgroup);
         RssSamplerReport {
             interval_ms: self.interval.as_millis() as u64,
             true_peak_mib: state.true_peak_mib,
             phase_peaks_mib: state.phase_peaks_mib.clone(),
+            true_anon_peak_mib: state.true_anon_peak_mib,
+            phase_anon_peaks_mib: state.phase_anon_peaks_mib.clone(),
+            phase_rss_breakdown: state.phase_rss_breakdown.clone(),
+            phase_cgroup: state.phase_cgroup.clone(),
         }
     }
 }
@@ -3305,7 +3414,10 @@ fn pass1_memory_json(r: super::convert::Pass1MemoryReport) -> serde_json::Value 
 /// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
 /// dumps (#571): the continuous background sampler's TRUE peak RSS and its
 /// per-phase maxima (a JSON object, so key-sorted: `serde_json` is built
-/// without `preserve_order`) — see `docs/PROFILING.md` for the
+/// without `preserve_order`), plus the #627 figures: the sampled anonymous
+/// peaks, each phase boundary's anon/file/shmem split, and its cgroup v2
+/// accounting (objects that are empty where the source is unreadable)
+/// — see `context/PROFILING.md` for the
 /// exact contrast with the boundary-sampled `peak_rss_mib` next to it. `null`
 /// only when the sampler never ran (profiling off), which in practice never
 /// happens here since the whole dump is a no-op then.
@@ -3317,10 +3429,29 @@ fn rss_sampler_json(report: &Option<RssSamplerReport>) -> serde_json::Value {
                 .iter()
                 .map(|(phase, mib)| (phase.clone(), serde_json::json!(mib)))
                 .collect();
+            let phase_anon_peaks_mib: serde_json::Map<String, serde_json::Value> = r
+                .phase_anon_peaks_mib
+                .iter()
+                .map(|(phase, mib)| (phase.clone(), serde_json::json!(mib)))
+                .collect();
+            let phase_rss_breakdown: serde_json::Map<String, serde_json::Value> = r
+                .phase_rss_breakdown
+                .iter()
+                .map(|(phase, m)| (phase.clone(), proc_status_json(m)))
+                .collect();
+            let phase_cgroup: serde_json::Map<String, serde_json::Value> = r
+                .phase_cgroup
+                .iter()
+                .map(|(phase, m)| (phase.clone(), cgroup_json(m)))
+                .collect();
             serde_json::json!({
                 "interval_ms": r.interval_ms,
                 "true_peak_mib": r.true_peak_mib,
                 "phase_peaks_mib": phase_peaks_mib,
+                "true_anon_peak_mib": r.true_anon_peak_mib,
+                "phase_anon_peaks_mib": phase_anon_peaks_mib,
+                "phase_rss_breakdown": phase_rss_breakdown,
+                "phase_cgroup": phase_cgroup,
             })
         }
         None => serde_json::Value::Null,
@@ -3409,7 +3540,7 @@ fn nanos_secs(cell: &AtomicU64) -> f64 {
 /// a level's wall time under parallelism, and never double-counts through
 /// nested `par_iter`s or work stealing. Work these windows do not cover (the
 /// per-tile member sort before encode, channel waits, rayon scheduling) is
-/// uncounted, not mis-attributed. See `docs/PROFILING.md`.
+/// uncounted, not mis-attributed. See `context/PROFILING.md`.
 #[derive(Default)]
 pub(super) struct ExportTimers {
     /// Reading overview rows: opening the Parquet reader (footer / page-index
@@ -3595,7 +3726,7 @@ pub(super) struct ExportProfileJsonInputs<'a> {
 
 /// Append a SECOND JSON line to `TYLERTOO_PROFILE_JSON`, if set, for the
 /// export phase — the export-side analogue of [`write_profile_json`] (#535).
-/// See `docs/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section
+/// See `context/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section
 /// for why this is a second line rather than merged into convert's object;
 /// the two are paired by their shared `run_id`. Same best-effort contract as
 /// [`write_profile_json`]: an unset/blank env var is a no-op, an open/write
@@ -6605,6 +6736,193 @@ mod tests {
         );
     }
 
+    /// #627: every phase the run entered — including the LAST one, which
+    /// only `finish` can close — carries a `/proc/self/status` breakdown of
+    /// the resident set at its boundary, and a sampled anonymous peak. Without
+    /// the closing snapshot in `finish`, `writer.finish`/`finalize` (where a
+    /// job's `MaxRSS` most often lands) would be the one phase with no split.
+    ///
+    /// Linux-only assertion: everywhere else `read_proc_status` is `None` by
+    /// construction and the report is legitimately empty.
+    #[test]
+    fn rss_sampler_reports_a_breakdown_for_every_phase_including_the_last() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("b");
+        sampler.mark_phase("c");
+        let report = sampler.finish();
+
+        if read_proc_status().is_none() {
+            assert!(report.phase_rss_breakdown.is_empty());
+            assert!(report.phase_anon_peaks_mib.is_empty());
+            assert_eq!(report.true_anon_peak_mib, None);
+            return;
+        }
+        let phases: Vec<&str> = report
+            .phase_rss_breakdown
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(
+            phases,
+            ["a", "b", "c"],
+            "every entered phase, in execution order, must have a boundary breakdown"
+        );
+        let anon_phases: Vec<&str> = report
+            .phase_anon_peaks_mib
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(anon_phases, ["a", "b", "c"]);
+        for (phase, m) in &report.phase_rss_breakdown {
+            let rss = m.rss_kib.expect("VmRSS is always printed");
+            let anon = m.anon_kib.expect("RssAnon is printed since Linux 4.5");
+            assert!(rss > 0 && anon > 0 && anon <= rss, "{phase}: {m:?}");
+            // The sampled peak folds in the boundary snapshot, so it can
+            // never be below it.
+            let peak = report
+                .phase_anon_peaks_mib
+                .iter()
+                .find(|(p, _)| p == phase)
+                .map(|&(_, mib)| mib)
+                .expect("a phase with a snapshot has an anon peak");
+            assert!(
+                peak >= anon as f64 / 1024.0,
+                "{phase}: anon peak {peak} MiB below its own boundary snapshot {anon} KiB"
+            );
+        }
+        let true_anon = report.true_anon_peak_mib.expect("sampled on Linux");
+        assert!(report
+            .phase_anon_peaks_mib
+            .iter()
+            .all(|&(_, mib)| mib <= true_anon));
+    }
+
+    /// #627: the anonymous peak is SAMPLED, not a boundary snapshot. An
+    /// allocation that lives and dies inside one phase is invisible to the
+    /// end-of-phase breakdown but must show in `phase_anon_peaks_mib` —
+    /// the number an operator sizes a job from.
+    #[test]
+    fn rss_sampler_anon_peak_catches_an_allocation_the_boundary_snapshot_misses() {
+        if read_proc_status().and_then(|m| m.anon_kib).is_none() {
+            return; // no RssAnon on this platform
+        }
+        let sampler = RssSampler::start_if_with_interval(true, "phase-a", Duration::from_millis(5))
+            .expect("profiling_on=true always starts a sampler");
+        const ALLOC_MIB: usize = 200;
+        let mut buf = vec![0u8; ALLOC_MIB * 1024 * 1024];
+        for chunk in buf.chunks_mut(4096) {
+            chunk[0] = 1;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        drop(buf);
+        std::thread::sleep(Duration::from_millis(20));
+        sampler.mark_phase("phase-b");
+        let report = sampler.finish();
+
+        let peak = report
+            .phase_anon_peaks_mib
+            .iter()
+            .find(|(p, _)| p == "phase-a")
+            .map(|&(_, mib)| mib)
+            .expect("phase-a has an anon peak");
+        let snapshot_mib = report
+            .phase_rss_breakdown
+            .iter()
+            .find(|(p, _)| p == "phase-a")
+            .and_then(|(_, m)| m.anon_kib)
+            .expect("phase-a has a boundary snapshot") as f64
+            / 1024.0;
+        // glibc returns a 200 MiB block with munmap, so the end-of-phase
+        // snapshot no longer holds it.
+        assert!(
+            snapshot_mib < peak - 150.0,
+            "boundary snapshot ({snapshot_mib:.0} MiB anon) should sit well below the \
+             sampled anon peak ({peak:.0} MiB): the snapshot alone would have missed it"
+        );
+        assert!(report.true_anon_peak_mib.is_some_and(|t| t >= peak));
+    }
+
+    /// #627: a phase closed twice (`mark_phase` with the phase unchanged)
+    /// keeps ONE entry per phase in every per-phase list — not a duplicate
+    /// key that would collide in the JSON object.
+    #[test]
+    fn rss_sampler_keeps_one_entry_per_phase_when_a_phase_is_closed_twice() {
+        let sampler = RssSampler::start_if_with_interval(true, "a", Duration::from_secs(30))
+            .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("a");
+        sampler.mark_phase("a");
+        sampler.mark_phase("b");
+        let report = sampler.finish();
+
+        fn names<T>(list: &[(String, T)]) -> Vec<&str> {
+            list.iter().map(|(p, _)| p.as_str()).collect()
+        }
+        if read_proc_status().is_some() {
+            assert_eq!(names(&report.phase_rss_breakdown), ["a", "b"]);
+            assert_eq!(names(&report.phase_anon_peaks_mib), ["a", "b"]);
+        }
+        if read_cgroup_mem().is_some() {
+            assert_eq!(names(&report.phase_cgroup), ["a", "b"]);
+        } else {
+            assert!(report.phase_cgroup.is_empty(), "no v2 cgroup, no entries");
+        }
+    }
+
+    /// #627: the sampler's JSON carries the sampled anonymous peaks, the
+    /// boundary breakdown and the cgroup figures under their documented keys
+    /// — always as objects (empty at worst), never as nulls or zeroes.
+    #[test]
+    fn rss_sampler_json_carries_the_627_keys() {
+        let sampler =
+            RssSampler::start_if_with_interval(true, "pass1 scan", Duration::from_secs(30))
+                .expect("profiling_on=true always starts a sampler");
+        sampler.mark_phase("pass2 (output sink)");
+        let report = sampler.finish();
+        let have_status = !report.phase_rss_breakdown.is_empty();
+        let have_cgroup = !report.phase_cgroup.is_empty();
+        let v = rss_sampler_json(&Some(report));
+
+        for key in [
+            "phase_anon_peaks_mib",
+            "phase_rss_breakdown",
+            "phase_cgroup",
+        ] {
+            assert!(v[key].is_object(), "{key} must always be an object: {v}");
+        }
+        assert!(
+            v.as_object().unwrap().contains_key("true_anon_peak_mib"),
+            "true_anon_peak_mib must be present (null when unknown): {v}"
+        );
+        if have_status {
+            let b = &v["phase_rss_breakdown"]["pass1 scan"];
+            for key in ["rss_kib", "anon_kib", "file_kib", "shmem_kib", "swap_kib"] {
+                assert!(b.as_object().unwrap().contains_key(key), "{key}: {v}");
+            }
+            assert!(v["phase_anon_peaks_mib"]["pass1 scan"].as_f64().is_some());
+            assert!(v["true_anon_peak_mib"].as_f64().is_some());
+        } else {
+            assert!(v["phase_rss_breakdown"].as_object().unwrap().is_empty());
+            assert!(v["true_anon_peak_mib"].is_null());
+        }
+        if have_cgroup {
+            let c = &v["phase_cgroup"]["pass1 scan"];
+            for key in [
+                "memory_current_bytes",
+                "memory_peak_bytes",
+                "anon_bytes",
+                "file_bytes",
+                "file_dirty_bytes",
+                "file_writeback_bytes",
+                "shmem_bytes",
+            ] {
+                assert!(c.as_object().unwrap().contains_key(key), "{key}: {v}");
+            }
+        } else {
+            assert!(v["phase_cgroup"].as_object().unwrap().is_empty());
+        }
+    }
+
     /// #571 review: stopping the sampler must not wait out a full poll
     /// interval. `finish` (and `Drop`, on an early `?` return) joins the
     /// thread; a thread parked in a plain `sleep(interval)` held every
@@ -6673,7 +6991,7 @@ mod tests {
     /// Before the fix the two sample sets were disjoint: a boundary sample
     /// taken between two background ticks (any run shorter than the
     /// interval, or a spike the boundary happened to land on) could exceed
-    /// the "true" peak, and `docs/PROFILING.md` had to tell readers the two
+    /// the "true" peak, and `context/PROFILING.md` had to tell readers the two
     /// numbers were not comparable.
     #[test]
     fn rss_tracker_true_peak_is_never_below_the_boundary_peak() {

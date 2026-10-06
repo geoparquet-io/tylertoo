@@ -123,6 +123,15 @@ unnecessary_wraps = "warn"
 unnested_or_patterns = "warn"
 unused_self = "warn"
 zero_sized_map_values = "warn"
+# Docs gates (CI denies warnings, so these are errors there). The Python
+# API's docstrings live in crates/python/python and are ruff's job.
+too_long_first_doc_paragraph = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+# Product and geometry-type names are prose, not code; clippy.toml lists
+# them in `doc-valid-idents` so doc_markdown asks for backticks only on
+# real identifiers.
+doc_markdown = "warn"
 
 [profile.release]
 lto = true

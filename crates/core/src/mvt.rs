@@ -5,8 +5,8 @@
 //!
 //! - **Zigzag encoding**: Efficiently encode signed integers as unsigned
 //! - **Delta encoding**: Store coordinates as differences from previous position
-//! - **Command encoding**: Pack geometry commands (MoveTo, LineTo, ClosePath)
-//! - **Feature encoding**: Convert geo::Geometry to MVT Feature
+//! - **Command encoding**: Pack geometry commands (`MoveTo`, `LineTo`, `ClosePath`)
+//! - **Feature encoding**: Convert `geo::Geometry` to MVT Feature
 //! - **Layer encoding**: Group features with deduplicated keys/values
 //!
 //! Reference: <https://github.com/mapbox/vector-tile-spec>
@@ -62,14 +62,14 @@ pub fn zigzag_decode(n: u32) -> i32 {
 /// Pack a command with a repeat count.
 ///
 /// MVT commands are packed as: `(command_id | (count << 3))`
-/// - command_id: 1=MoveTo, 2=LineTo, 7=ClosePath
+/// - `command_id`: 1=MoveTo, 2=LineTo, 7=ClosePath
 /// - count: number of times to repeat the command
 #[inline]
 pub fn command_encode(command_id: u32, count: u32) -> u32 {
     (command_id & 0x7) | (count << 3)
 }
 
-/// Unpack a command into (command_id, count).
+/// Unpack a command into (`command_id`, count).
 #[inline]
 pub fn command_decode(command: u32) -> (u32, u32) {
     (command & 0x7, command >> 3)
@@ -159,7 +159,7 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 /// * a cross or dot product of two differences (the cleaner's
 ///   `segments_meet`, `ring_is_simple`, `node_insert`, `point_in_ring`
 ///   tests) is at most 2^25 · 2^25 + 2^25 · 2^25 = 2^51;
-/// * a shoelace term `x0·y1 - x1·y0` in [`ring_area2`] is at most
+/// * a shoelace term `x0·y1 - x1·y0` in `ring_area2` is at most
 ///   2 · 2^24 · 2^24 = 2^49, and the sum is accumulated in `i128`, which
 ///   holds 2^78 such terms — no ring length can overflow it;
 /// * a MoveTo/LineTo delta is at most 2^25, which zigzag-encodes without
@@ -167,7 +167,7 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 ///
 /// 2^24 is also the largest power of two at which every integer is exactly
 /// representable in `f64`, so a clamped value survives the round trip
-/// through the `f64` overlay in [`tile_rings_to_polygon`] unchanged, and it
+/// through the `f64` overlay in `tile_rings_to_polygon` unchanged, and it
 /// leaves three orders of magnitude of headroom over the largest tile
 /// extent plus buffer in practical use (65536 + buffer).
 ///
@@ -1092,7 +1092,7 @@ fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
 /// renderer under even-odd would show the overlap as a hole. Parts that
 /// actually interact (see [`parts_interact`]) are grouped into connected
 /// components; each component of two or more is oriented consistently,
-/// unioned under NonZero, then snapped and cleaned again. Every other part
+/// unioned under `NonZero`, then snapped and cleaned again. Every other part
 /// — including a mainland-and-island pair whose boxes nest but whose rings
 /// never touch — passes through untouched, in its original order.
 fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
@@ -1272,7 +1272,7 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
     encode_tile_polygons(&resolve_part_overlaps(polys))
 }
 
-/// Encode a single-type geo::Geometry to MVT geometry commands and return the
+/// Encode a single-type `geo::Geometry` to MVT geometry commands and return the
 /// geometry type.
 ///
 /// `Line`, `Rect` and `Triangle` encode as the line / polygon they are. A
@@ -1307,8 +1307,9 @@ pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Ve
     }
 }
 
-/// Flatten a `GeometryCollection` (recursively) into at most three
-/// single-type geometries, in draw order: every polygonal part as one
+/// Flatten a `GeometryCollection` (recursively) into at most three single-type geometries.
+///
+/// The output is in draw order: every polygonal part as one
 /// `MultiPolygon`, every linear part as one `MultiLineString`, every point
 /// part as one `MultiPoint`. Kinds with no parts are absent, so an empty
 /// collection (or a nest of empty collections) yields an empty vector.
@@ -1866,7 +1867,7 @@ mod tests {
     /// Web-Mercator-correct expected tile-local Y for a latitude at a zoom,
     /// computed independently of production code:
     /// merc fraction y = (1 - ln(tan(φ) + 1/cos(φ)) / π) / 2,
-    /// tile-local = (y * 2^z - tile_y) * extent.
+    /// tile-local = (y * 2^z - `tile_y`) * extent.
     fn expected_mercator_tile_y(lat: f64, zoom: u8, tile_y: u32, extent: u32) -> i32 {
         let phi = lat.to_radians();
         let merc = (1.0 - (phi.tan() + 1.0 / phi.cos()).ln() / std::f64::consts::PI) / 2.0;
@@ -2450,7 +2451,7 @@ mod tests {
     /// Test to measure MVT encoding overhead for MultiLineString vs single LineString.
     ///
     /// Hypothesis: A MultiLineString with many short linestrings is MUCH larger than
-    /// a single LineString with the same total points due to MoveTo command overhead.
+    /// a single LineString with the same total points due to `MoveTo` command overhead.
     ///
     /// Each linestring in a MultiLineString requires:
     /// - MoveTo(1) command: 1 u32
@@ -3564,7 +3565,7 @@ mod tests {
         assert_clamped(&encode_polygon(&huge, &test_bounds(), 4096));
     }
 
-    /// f64::MAX / MIN, ±inf and NaN vertices must be handled explicitly:
+    /// `f64::MAX` / MIN, ±inf and NaN vertices must be handled explicitly:
     /// no panic, every emitted vertex inside the clamp.
     #[test]
     fn encode_polygon_non_finite_coordinates_do_not_panic() {

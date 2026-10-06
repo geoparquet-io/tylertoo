@@ -5,33 +5,33 @@
 //! crate's direct `i_overlay` dependency. `geo` 0.33 vendors its own, older
 //! `i_overlay` for `BooleanOps`; nothing here or in `clip.rs` calls it.
 //!
-//! This module provides clipping functions using i_overlay's boolean operations
+//! This module provides clipping functions using `i_overlay`'s boolean operations
 //! for robust polygon clipping. Unlike wagyu which operates in integer coordinates,
-//! i_overlay works directly with f64 coordinates, eliminating coordinate conversion
+//! `i_overlay` works directly with f64 coordinates, eliminating coordinate conversion
 //! overhead.
 //!
 //! # Design
 //!
 //! The workflow is:
-//! 1. Convert geo::Polygon<f64> to i_overlay's shape format (Vec<Vec<[f64; 2]>>)
-//! 2. Create a clip box from TileBounds
-//! 3. Perform Intersect operation with FillRule::EvenOdd
-//! 4. Convert the result back to geo::Geometry<f64>
+//! 1. Convert `geo::Polygon<f64>` to `i_overlay`'s shape format (Vec<Vec<[f64; 2]>>)
+//! 2. Create a clip box from `TileBounds`
+//! 3. Perform Intersect operation with `FillRule::EvenOdd`
+//! 4. Convert the result back to `geo::Geometry<f64>`
 //!
-//! # Why i_overlay?
+//! # Why `i_overlay`?
 //!
-//! i_overlay's boolean operations correctly handle:
+//! `i_overlay`'s boolean operations correctly handle:
 //! - Self-intersecting polygons (resolved via fill rule)
 //! - U-shaped polygons that split into multiple parts
 //! - Polygons with holes that intersect the exterior ring
 //! - Complex nested holes
 //!
-//! The FillRule::EvenOdd interprets overlapping regions correctly, producing
+//! The `FillRule::EvenOdd` interprets overlapping regions correctly, producing
 //! valid, non-self-intersecting output from invalid input.
 //!
 //! # Performance
 //!
-//! i_overlay uses a sweep-line algorithm with O(n log n) complexity, similar to
+//! `i_overlay` uses a sweep-line algorithm with O(n log n) complexity, similar to
 //! wagyu's Vatti algorithm. However, by operating in f64 directly, we avoid
 //! the overhead of coordinate conversion that wagyu requires.
 
@@ -47,13 +47,13 @@ use i_overlay::string::clip::ClipRule;
 // Type Aliases
 // ============================================================================
 
-/// A point in i_overlay format
+/// A point in `i_overlay` format
 type IOverlayPoint = [f64; 2];
 
-/// A contour (ring) in i_overlay format
+/// A contour (ring) in `i_overlay` format
 type IOverlayContour = Vec<IOverlayPoint>;
 
-/// A shape in i_overlay format (first contour is exterior, rest are holes)
+/// A shape in `i_overlay` format (first contour is exterior, rest are holes)
 type IOverlayShape = Vec<IOverlayContour>;
 
 /// Multiple shapes
@@ -63,13 +63,13 @@ type IOverlayShapes = Vec<IOverlayShape>;
 // Conversion: geo -> i_overlay
 // ============================================================================
 
-/// Convert a geo::Polygon to i_overlay shape format.
+/// Convert a `geo::Polygon` to `i_overlay` shape format.
 ///
-/// i_overlay expects shapes as Vec<Vec<[f64; 2]>> where:
+/// `i_overlay` expects shapes as Vec<Vec<[f64; 2]>> where:
 /// - First contour is the exterior ring
 /// - Subsequent contours are holes
 ///
-/// Note: i_overlay handles both closed (first=last) and open rings.
+/// Note: `i_overlay` handles both closed (first=last) and open rings.
 #[inline]
 fn polygon_to_ioverlay(poly: &Polygon<f64>) -> IOverlayShape {
     let mut shape = Vec::with_capacity(1 + poly.interiors().len());
@@ -87,7 +87,7 @@ fn polygon_to_ioverlay(poly: &Polygon<f64>) -> IOverlayShape {
     shape
 }
 
-/// Create a clip box from TileBounds in i_overlay format.
+/// Create a clip box from `TileBounds` in `i_overlay` format.
 ///
 /// Returns a single shape (rectangle) that can be used as the clip subject.
 #[inline]
@@ -105,12 +105,12 @@ fn bounds_to_clip_box(bounds: &TileBounds) -> IOverlayShape {
 // Conversion: i_overlay -> geo
 // ============================================================================
 
-/// Convert i_overlay shapes to geo::Geometry.
+/// Convert `i_overlay` shapes to `geo::Geometry`.
 ///
 /// Returns:
 /// - None if no shapes (empty result)
-/// - Geometry::Polygon if single shape
-/// - Geometry::MultiPolygon if multiple shapes
+/// - `Geometry::Polygon` if single shape
+/// - `Geometry::MultiPolygon` if multiple shapes
 fn ioverlay_to_geometry(shapes: IOverlayShapes) -> Option<Geometry<f64>> {
     // Filter out empty shapes
     let valid_shapes: Vec<_> = shapes
@@ -134,9 +134,9 @@ fn ioverlay_to_geometry(shapes: IOverlayShapes) -> Option<Geometry<f64>> {
     }
 }
 
-/// Convert a single i_overlay shape to geo::Polygon.
+/// Convert a single `i_overlay` shape to `geo::Polygon`.
 ///
-/// i_overlay returns open contours (no repeated closing point), so we need
+/// `i_overlay` returns open contours (no repeated closing point), so we need
 /// to ensure the LineString is properly closed for geo.
 fn ioverlay_shape_to_polygon(shape: IOverlayShape) -> Option<Polygon<f64>> {
     if shape.is_empty() {
@@ -155,7 +155,7 @@ fn ioverlay_shape_to_polygon(shape: IOverlayShape) -> Option<Polygon<f64>> {
     Some(Polygon::new(exterior, holes))
 }
 
-/// Convert an i_overlay contour to geo::LineString.
+/// Convert an `i_overlay` contour to `geo::LineString`.
 ///
 /// Ensures the ring is closed (first point == last point) as required by geo.
 fn contour_to_linestring(contour: &IOverlayContour) -> Option<LineString<f64>> {
@@ -184,15 +184,15 @@ fn contour_to_linestring(contour: &IOverlayContour) -> Option<LineString<f64>> {
 // Public Clipping API
 // ============================================================================
 
-/// Clip a polygon to tile bounds using i_overlay's boolean intersection.
+/// Clip a polygon to tile bounds using `i_overlay`'s boolean intersection.
 ///
 /// This function:
-/// 1. Converts the polygon to i_overlay format
+/// 1. Converts the polygon to `i_overlay` format
 /// 2. Creates a clip box from the bounds
-/// 3. Performs an Intersect operation with FillRule::EvenOdd
-/// 4. Converts the result back to geo::Geometry
+/// 3. Performs an Intersect operation with `FillRule::EvenOdd`
+/// 4. Converts the result back to `geo::Geometry`
 ///
-/// The EvenOdd fill rule correctly handles self-intersecting polygons by
+/// The `EvenOdd` fill rule correctly handles self-intersecting polygons by
 /// interpreting overlapping regions as "outside", effectively resolving
 /// self-intersections in the output.
 ///
@@ -240,7 +240,7 @@ pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option
     ioverlay_to_geometry(result)
 }
 
-/// Clip a MultiPolygon to tile bounds using i_overlay.
+/// Clip a MultiPolygon to tile bounds using `i_overlay`.
 ///
 /// Each polygon in the MultiPolygon is added to the overlay as a separate
 /// subject shape, then clipped against the bounds.
@@ -283,7 +283,7 @@ pub fn clip_multipolygon_ioverlay(
     ioverlay_to_geometry(result)
 }
 
-/// Largest coordinate magnitude handed to i_overlay's float adapter. i_float 5
+/// Largest coordinate magnitude handed to `i_overlay`'s float adapter. `i_float` 5
 /// documents 2^500 (about 3.3e150) as the f64 limit of
 /// `FloatPointAdapter::new` and panics beyond it; the margin keeps the
 /// extent's centre/radius arithmetic finite too.
@@ -358,11 +358,13 @@ pub fn clip_multilinestring_ioverlay(
     )
 }
 
-/// Union several polygons (whose exteriors all wind the same way and whose
-/// holes wind the other) into non-overlapping polygons, by intersecting the
-/// set with a strict-superset box under `FillRule::NonZero` (#383).
+/// Union several polygons into non-overlapping polygons.
 ///
-/// NonZero is the rule that makes overlapping parts *add*: EvenOdd would
+/// The exteriors must all wind the same way and the holes the other. The
+/// union intersects the set with a strict-superset box under
+/// `FillRule::NonZero` (#383).
+///
+/// `NonZero` is the rule that makes overlapping parts *add*: `EvenOdd` would
 /// cut the overlap out as a hole. It relies on consistent winding, which is
 /// why the caller orients the parts first.
 pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> {

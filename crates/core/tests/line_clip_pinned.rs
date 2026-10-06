@@ -23,14 +23,14 @@
 //! Re-pin history:
 //! - #435 (the switch itself): every hand-built case stayed coordinate-
 //!   identical. The two sweep digests moved — same kept/part/vertex counts,
-//!   but ~half the vertices differ by exactly one unit of i_overlay's
+//!   but ~half the vertices differ by exactly one unit of `i_overlay`'s
 //!   float→integer grid (2^-34..2^-36 degrees, max 2.3e-10), four to five
 //!   orders of magnitude under an MVT unit at z14. The digests below are the
 //!   i_overlay-9 values; the pre-switch ones were
-//!   z12 0xbb55_0c07_303c_8bbe and z14 0xd28a_ce50_39c3_0db2.
+//!   z12 `0xbb55_0c07_303c_8bbe` and z14 `0xd28a_ce50_39c3_0db2`.
 //!
 //! Run with:
-//!   cargo test --package tylertoo-core --test line_clip_pinned -- --nocapture
+//!   cargo test --package tylertoo-core --test `line_clip_pinned` -- --nocapture
 
 use std::path::PathBuf;
 
@@ -397,7 +397,7 @@ fn sweep(zoom: u8) -> Sweep {
 /// Counts are pinned on every platform. The coordinate digest is pinned on
 /// Linux only: tile bounds come from `sinh().atan()` (libm), which differs
 /// by an ulp between platforms, and that ulp reaches the clipped boundary
-/// intersections (macOS: z14 digest 0x1d03_35aa_b999_f979 with identical
+/// intersections (macOS: z14 digest `0x1d03_35aa_b999_f979` with identical
 /// counts). A grid-rounded digest was rejected: a 1-ulp shift straddles a
 /// rounding boundary often enough over ~12k coordinates to flake.
 fn assert_sweep(got: Sweep, want: Sweep) {

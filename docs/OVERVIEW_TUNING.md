@@ -1,55 +1,25 @@
-# Overview Generalization Tuning
+# Overview generalization tuning
 
-`tylertoo overview` turns a GeoParquet file into a multi-resolution
-[overview file](architecture.md) — several precomputed generalizations of the
-dataset at increasing detail (levels `0` = coarsest … `L-1` = finest /
-canonical). Two families of knobs control how much detail each coarse level
-sheds:
+`tylertoo overview` builds an
+[overview file](tutorials/madagascar.md#3-build-and-validate-the-overview)
+with precomputed generalizations of a GeoParquet dataset. Level `0` is the
+coarsest; level `L-1` is the finest, or canonical, level. Two kinds of
+settings control detail:
 
-- **thinning / visibility** — which whole *features* survive at a level
-  (feature dropping);
-- **simplification** — how many *vertices* each surviving feature keeps
-  (geometry smoothing).
+- Thinning and visibility decide which features survive.
+- Simplification decides how many vertices each survivor keeps.
 
-Everything is expressed relative to each level's **GSD** (ground sample
-distance, meters — the smallest ground distance independently meaningful at that
-level), and the GSD ladder itself is set by `--gsd-base` (or `--gsd`). This page
-explains every knob in plain English: what it does, its default, its units, the
-direction that makes maps denser/sparser or smoother/cruder, and how the knobs
-interact.
-
-> TL;DR cheat sheet
->
-> - **Coarse levels look too *sparse* (too few features)** → LOWER the thinning
->   factors (`--point/line/polygon-thinning`) and/or the visibility gates
->   (`--line/polygon-visibility`); or RAISE `--gsd-base`.
-> - **Coarse levels look too *crude / blocky* (features present but jagged or
->   over-smoothed)** → LOWER `--simplify-factor`.
-> - **Coarse levels are too *heavy / dense / large*** → RAISE the thinning
->   factors and/or `--simplify-factor`; or LOWER `--gsd-base`.
-> - **Mid zooms (≈z9–z12) over-retained (way more features than tippecanoe,
->   large duplicating files)** → RAISE `--drop-rate` (the density budget); to
->   disable it entirely use `--no-density-drop`.
-> - **Country-scale view of a dense small-polygon layer (buildings, parcels)
->   is EMPTY when zoomed out** → the features are sub-GSD at those scales and
->   no gate value alone can save them; use the
->   [dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers):
->   `--polygon-visibility 0 --collapse` (+ a circle layer in your style).
-> - **A rank-ordered cut is emptying sparse rural areas** → RAISE `--drop-gamma`
->   (protects sparse neighborhoods).
-> - **Conversion is slow / pins one core** → it now reads the input once and
->   uses all cores; RAISE `--in-flight-batches` for more read/compute overlap.
-> - **Conversion runs out of memory in `speed` mode** → `--profile bounded`
->   (spills each level to temp files; `--profile auto`, the default, now does
->   this for you when the estimated buffered output exceeds a fraction of
->   available RAM — large duplicating *and* partitioning runs both spill).
->   Output is byte-identical either way.
+These factors multiply the level's ground sample distance (GSD): the smallest
+ground distance, in meters, that it resolves. `--gsd-base` or `--gsd` sets
+the GSD ladder. Use [Worked scenarios](#worked-scenarios) to find settings
+for a specific problem. The
+[CLI reference](reference/cli.md) lists every flag with its default.
 
 ---
 
 ## The GSD ladder: `--gsd-base` and `--gsd`
 
-A zoom-range plan (`--min-zoom` / `--max-zoom`, the default) derives each
+A zoom-range plan (`--min-zoom` and `--max-zoom`, the default) derives each
 level's GSD from its Web Mercator zoom:
 
 ```
@@ -58,73 +28,69 @@ gsd(z) = 40075016.69 / gsd_base / 2^z          (meters, spec §5.2)
 
 | Knob | Default | Units | Effect |
 |------|---------|-------|--------|
-| `--gsd-base F` | `1024.0` | dimensionless | tile-band base in the formula above |
-| `--gsd G1,G2,…` | — | meters, strictly decreasing | explicit per-level GSDs; **overrides** the zoom range and `--gsd-base` |
-| `--min-zoom` / `--max-zoom` | `0` / `6` | Web Mercator zoom | coarsest / finest (canonical) level (max **30**) |
+| `--gsd-base F` | `1024.0` | dimensionless | base of the formula above |
+| `--gsd G1,G2,…` | none | meters, strictly decreasing | explicit per-level GSDs that **override** the zoom range and `--gsd-base` |
+| `--min-zoom` / `--max-zoom` | `0` / `6` (`0` / `14` on `tiles`) | Web Mercator zoom | coarsest and finest (canonical) level, at most **30** |
 
-**`--max-zoom auto` (#444, inspired by tippecanoe's `-zg`).** Instead of a
-number, estimate the finest zoom from the input's own features. A bounded,
-deterministic sample (at most 200,000 rows, honoring `--bbox` and `--filter`)
-of feature bboxes is read from the geometry column, and the finest zoom is
-picked where a standard 256 px tile pixel resolves about half the smaller of
-"median feature size" (features with an extent) and "10th-percentile spacing
-between nearby features", measured in Web Mercator meters and clamped to
-`[--min-zoom, 16]`. The chosen zoom and the measurements behind it are logged
-at `info`; treat it as a starting point, the way tippecanoe users treat `-zg`.
-An input with nothing to measure (one location, or only empty geometries) is
-an error, as with `-zg`; so is a `--min-zoom` above 16. With `--gsd` the value
-is unused and nothing is estimated. See `context/ARCHITECTURE.md`'s divergence
-table for how this differs from tippecanoe's formula.
+`--gsd-base` scales the whole zoom-range ladder:
 
-**Zoom ceiling: 30 — an addressability limit, not a recommendation.** Every
-zoom tylertoo writes must fit the tile arithmetic: tile coordinates are 32-bit
-(so z31 is the hard limit) and the PMTiles Hilbert tile id needs `4^z` of
-headroom in a `u64`. 30 is what the math supports with a level of margin. A
-`--max-zoom` above 30 is **rejected at option validation**, before the input is
-opened, rather than running for hours to produce an archive whose every tile id
-is wrong. The same ceiling applies to `--min-zoom` and to a `--gsd` fine enough
-to *imply* a zoom above it — an explicit GSD ladder records no zoom, so the
-implied one is checked on the same footing (#371).
+- A larger value gives smaller GSDs: denser, more detailed, larger levels.
+- A smaller value gives larger GSDs: sparser, less detailed, smaller levels.
 
-The ceiling says a zoom can be *addressed*, not that it is practical. Cost
-grows roughly **4x per zoom**: z30 is ~1.15e18 tiles at a GSD of ~3.6e-5 m, far
-past what any real dataset resolves. Points are cheap — a point touches one
-tile at every zoom — but line and polygon data is not: a single 1-degree
-linestring spans on the order of 3e6 tiles at z30, and rendering it is the
-same CPU-bound, RSS-growing walk that made an unbounded `--max-zoom` a bug in
-the first place. In practice the highest useful `--max-zoom` for non-point data
-is far below the ceiling; raise it a level at a time and watch the output size.
+The default `1024` follows the cogp-rs convention: about 4× a 256 px tile, so
+sub-pixel features drop (spec §5.2, Q6). `--gsd` already gives absolute
+meters, so `--gsd-base` has no effect alongside it.
 
-`--gsd-base` is the **master detail knob** for a zoom-range plan. It scales the
-*whole ladder* at once:
+The thinning, visibility, and simplification factors all multiply GSD.
+Adjust them individually for one geometry class; adjust `--gsd-base` when
+the whole map is too sparse or too dense.
 
-- **LARGER `--gsd-base` ⇒ SMALLER GSDs at every zoom ⇒ denser, more detailed,
-  larger coarse levels** (less is thinned/simplified for a given zoom).
-- **SMALLER `--gsd-base` ⇒ LARGER GSDs ⇒ sparser, cruder, cheaper coarse
-  levels.**
+The `geo:overviews` provenance in the footer records a non-default base as
+`generalization.gsd_base`. A default run omits it, because the
+`levels[].gsd` values in the footer already imply `1024`.
 
-The default `1024` is the cogp-rs convention (~4× a 256 px tile, so sub-pixel
-features drop; spec §5.2 / Q6). `--gsd-base` has **no effect** when `--gsd` is
-given, because those GSDs are already absolute meters.
+### `--max-zoom auto`
 
-Because every other knob below is measured *in multiples of the level GSD*,
-changing `--gsd-base` moves all of them together. Reach for a per-family knob
-when you want to rebalance *one* geometry class; reach for `--gsd-base` when the
-whole map is uniformly too sparse or too dense.
+`--max-zoom auto` estimates the finest zoom from the input's own features, as
+tippecanoe's `-zg` does. tylertoo reads the bounding boxes of a deterministic
+sample of at most 200,000 rows, honoring `--bbox` and `--filter`. It picks the
+zoom where one pixel of a 256 px tile resolves about half the smaller of two
+measures, in Web Mercator meters:
 
-For non-default `--gsd-base` runs the chosen base is recorded in the footer
-`geo:overviews` → `generalization.gsd_base` provenance (a default run omits it —
-the footer `levels[].gsd` already imply `1024`, so default output is unchanged).
+- the median size of the features that have an extent
+- the tenth-percentile spacing between nearby features
+
+The result is clamped to `[--min-zoom, 16]` and logged with its measurements
+at `info`. Treat it as a starting point. Python's `logging` does not receive
+the Rust log; read the finest `zoom` in the report's `levels` instead.
+
+An input with nothing to measure, such as one location or only empty
+geometries, is an error, as with `-zg`. So is a `--min-zoom` above 16. With
+`--gsd`, tylertoo ignores the value and estimates nothing. The divergence
+table in `context/ARCHITECTURE.md` compares the formula with tippecanoe's.
+
+### The zoom ceiling
+
+tylertoo rejects any zoom above 30 at option validation, before it opens the
+input. The limit marks what tile arithmetic can address, not what is useful.
+Tile coordinates are 32-bit, so z31 is the hard limit, and the PMTiles
+Hilbert tile id needs `4^z` of headroom in a `u64`. Thirty leaves one level of
+margin. The same ceiling applies to `--min-zoom` and to a `--gsd` ladder fine
+enough to imply a zoom above 30.
+
+Cost grows about **4× per zoom**: z30 holds about 1.15e18 tiles at a GSD of
+about 3.6e-5 m. A point touches one tile per zoom, so point data stays cheap.
+Lines and polygons do not: one 1-degree linestring spans on the order of 3e6
+tiles at z30. For non-point data, raise `--max-zoom` one level at a time and
+watch the output size.
 
 ---
 
 ## Several inputs, one archive: `tylertoo pyramid`
 
-`--verbatim` makes one input tile honestly across the zooms it owns. A
-**pyramid** goes further: it serves the same map from a *different input* at
-different zooms — a pre-aggregated summary at coarse zooms, the raw features at
-fine ones — in one archive, so a client switches at the handover with no second
-request.
+A pyramid combines inputs in one archive, typically summaries at coarse
+zooms and raw features at fine zooms. The client switches between them
+without a second request.
 
 ```bash
 tylertoo pyramid fire-2023.pmtiles \
@@ -133,85 +99,94 @@ tylertoo pyramid fire-2023.pmtiles \
   --band "9-14:points.parquet:features"
 ```
 
-| layer | source | zooms |
+| Layer | Source | Zooms |
 |-------|--------|-------|
 | `aggregate` | r5 cells | z0–5 |
 | `aggregate` | r8 cells | z6–8 |
 | `features` | raw detections | z9–14 |
 
-Two bands may share a layer name, as `aggregate` does here: to a client it is
-one layer whose content changes at z6. Two bands of the **same** layer must not
-share a zoom — they would write the same tile ids — and that is checked before
-any tiling happens, so a bad plan costs an error rather than a conversion.
-Bands in **different** layers may share zooms (tippecanoe's `-L`): at the
-zooms they share, a tile every band wrote carries every band's layer, and a
-tile only one band wrote passes through untouched. So
-`--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025` is one archive with
-two independent layers over the same zooms.
+Bands may share a layer name: `aggregate` changes source at z6 here. Bands
+in the same layer must have disjoint zoom ranges, or they would write the
+same tile ids. tylertoo checks this before conversion.
 
-**A band is tiled verbatim by default.** That is the premise of banding: the
-input already *is* the right resolution for the zooms it owns, so running the
-ladder over it would re-introduce exactly what the pyramid avoids. Pass
-`--generalize` when a band is raw features spanning several zooms and you do
-want the ladder inside it.
+Bands in different layers may share zooms, as with tippecanoe's `-L`.
+Shared tiles combine the layers; tiles from only one band pass through
+untouched. For example,
+`--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025` builds one archive
+with two independent layers over the same zooms.
 
-**A band may be GeoParquet or an already-tiled PMTiles archive.** Both are
-spelled `--band LO-HI:PATH[:LAYER]`; the kind is detected from the file
-contents, not the extension. A source is tiled here, restricted to the band's
-range; an archive is merged as-is. That keeps the older two-step workflow
-(tile each band yourself, then merge) working unchanged, and lets you mix:
-reuse last week's coarse archive and re-tile only the fine band.
+Bands tile verbatim by default to preserve their input resolution. Pass
+`--generalize` for raw features that need generalization across several zooms.
 
-**A band source may be remote.** `--band 9-13:https://data.source.coop/…/features.parquet`
-streams with byte-range requests exactly as `tiles` and `overview` do, so a
-band no longer has to be staged locally first. A band *archive* must be local:
-the merge reads its directories and tile bytes by offset, so a remote
-`.pmtiles` band is refused with a message saying to stage it.
+### Band sources and syntax
 
-`LAYER` defaults to the input's file stem — or, for a glob or a directory,
-the directory name, since a layer called `*` is not useful to a client. A path
-containing a colon (`s3://…`, `https://…`, `C:\…`) is fine; the layer is only
-split off the **last** colon when what follows it has no `/`, `\` or `:`, so a
-URL's scheme, a port and a `2024:06/` directory all stay part of the input. A
-drive-relative path with no `\` after the drive, e.g. `C:data.parquet`, stays
-whole too: a single ASCII letter before the last colon is treated as a drive
-letter rather than a path, even though `data.parquet` alone would otherwise
-look like a bare layer name.
-The one shape that rule cannot express is an input *ending* in a bare colon
-segment — a Hive directory such as `admin:country_code=BR`. For those, spell
-the band with `=` instead: **`--band LO-HI=INPUT[=LAYER]`**, where the range is
-split at the first `=` and the layer at the last, again only when the segment
-after it has no `/`, `\` or `:`. That keeps
-`--band 0-13=admin:country_code=BR/part.parquet` whole; an input that itself
-ends in `=VALUE` is indistinguishable from a layer, so give it an explicit
-`=LAYER`. For a pre-tiled archive the layer is a *label*: the layer
-name inside its tiles is whatever the archive was exported with, and when bands
-share zooms the two must agree, or the combined tile would hold two layers of
-one name (which a client resolves by dropping one). A **gap** between bands is
-allowed but warns, because the merged archive advertises one continuous range
-and a client will request the uncovered zooms and get nothing.
+A band accepts GeoParquet or PMTiles via `--band LO-HI:PATH[:LAYER]`.
+tylertoo detects the format from the contents, tiles GeoParquet over the
+band's range, and merges an archive as-is. Mix formats to reuse a coarse
+archive while rebuilding a fine band.
 
-Intermediates go to `--work-dir` (default: the system temp directory) and are
-removed whether the build succeeds or fails. Budget for it: a band is tiled in
-duplicating mode, so its intermediate overview holds roughly *levels × input
-size*, every band's finished archive is on disk at once before the merge, and
-the merge itself spools through the temp directory.
+A GeoParquet band may be remote:
+`--band 9-13:https://data.source.coop/…/features.parquet` streams with
+byte-range requests, as `tiles` and `overview` do. Archive bands must be
+local for directory and tile reads by offset. Stage remote `.pmtiles` bands
+before use.
+
+`LAYER` defaults to the input's file stem, or the
+directory name for a glob or a directory. A path may contain colons
+(`s3://…`, `https://…`, `C:\…`). tylertoo splits the layer off the **last**
+colon only when the text after it has no `/`, `\`, or `:`. A URL scheme, a
+port, and a `2024:06/` directory therefore stay part of the input. A
+drive-relative path such as `C:data.parquet` also stays whole: a single ASCII
+letter before the last colon counts as a drive letter.
+
+For an input ending in a bare colon segment, such as the Hive directory
+`admin:country_code=BR`, use `--band LO-HI=INPUT[=LAYER]`.
+tylertoo splits the range at
+the first `=` and the layer at the last. As before, it splits only when the
+text after it has no `/`, `\`, or `:`. That keeps `--band 0-13=admin:country_code=BR/part.parquet`
+whole. An input that itself ends in `=VALUE` reads as a layer, so give it an
+explicit `=LAYER`.
+
+For a pre-tiled archive the layer is a label. The layer name inside its tiles
+is whatever its export wrote. When two bands share zooms, those names must
+agree. Otherwise the combined tile holds two layers of one name, and a client
+drops one.
+
+### Gaps and partial archives
+
+A gap between bands warns: the merged archive
+advertises one continuous range, so a client requests the uncovered zooms and
+gets nothing. An archive may hold more zooms than its band declares. One
+archive splits across bands that way, for example two bands on the same
+z0–13 archive declaring `0-5` and `6-13`. An archive that holds *fewer* zooms
+than its band declares is an error, because those zooms would render empty.
+Check that the band range matches the archive, or pass
+`--allow-missing-zooms` for a deliberately sparse pyramid. A band whose range
+shares no zoom with its archive is always an error.
+
+### Export settings and disk use
+
+`--max-tile-size` is unset by default for pyramid bands, preserving every
+cell. When set,
+the cap applies to each band's tiles before tylertoo combines them.
+`--feature-order` applies to every GeoParquet band alike, as `--generalize`
+does. A band that lacks the column exports in input order with a warning
+naming its layer. An archive band keeps the order it had. tylertoo writes
+bands coarsest first, whatever order you list them in.
+
+Intermediates go to `--work-dir` (the system temp directory by default) and
+are removed after success or failure. Budget roughly *levels × input size*
+for each band's duplicating-mode overview. All finished band archives remain
+on disk until the merge, which also needs temp space for its spool.
 
 ---
 
 ## Switching the ladder off entirely: `--verbatim`
 
-Everything below this heading generalizes: thinning, visibility gates,
-simplification, the density budget, coalescing. That is right when the coarse
-level should be a *coarser drawing of the same features* — a road network, a
-building footprint layer.
-
-It is wrong when the input is already the right resolution for the zooms you
-are asking for. An H3 r6 cell is not a simplified r7 cell; it is their parent,
-and its count is their sum. Run a cell aggregate through the gates and the
-gates ask "is this feature big enough to see" when the question is "what do
-these cells sum to" — so a coarse level shows *some* cells and silently omits
-the rest:
+Generalization works for features such as roads or buildings that need less
+detail at coarse zooms. For cell aggregates or prebuilt levels, it can discard
+data the input already summarizes. An H3 r6 cell holds the sum of its r7
+children; dropping cells changes the totals:
 
 ```
 $ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5
@@ -231,60 +206,54 @@ $ tylertoo tiles cells.parquet out.pmtiles --min-zoom 0 --max-zoom 5 --verbatim 
   …
 ```
 
-It is exactly equivalent to setting every ladder knob by hand — byte-identical
-output — and exists because that is eight flags of ceremony for one
-intention:
+Its output is byte-identical to setting eight ladder knobs by hand:
 
 ```bash
---no-density-drop --no-coalesce-lines --simplify-factor 0 --point-thinning 0 --line-thinning 0 --polygon-thinning 0 --polygon-visibility 0 --line-visibility 0
+--no-density-drop --no-coalesce-lines --simplify-factor 0 \
+  --point-thinning 0 --line-thinning 0 --polygon-thinning 0 \
+  --polygon-visibility 0 --line-visibility 0
 ```
 
-Reach for it when the input is a **DGGS or cell aggregate**, is **pre-levelled**
-by an upstream tool, or is **one band of a pyramid** (see `tylertoo pyramid`)
-where a different input already owns the coarser zooms.
+Use `--verbatim` for:
 
-What it does *not* touch: mode, the level plan, CRS, row-group layout, an
-explicit `--cluster`, and `--representation` (a point or square band still
-replaces polygons with centroids or dithered placeholders — the one
-generalizing knob left on, inert unless you ask for it).
+- A discrete global grid system (DGGS) or other cell aggregate.
+- Levels already built upstream.
+- One band of a [pyramid](#several-inputs-one-archive-tylertoo-pyramid)
+  whose coarser zooms come from another input.
 
-`--verbatim` supplies **defaults**, it does not override: any knob you set
-explicitly wins, so `--verbatim --simplify-factor 0.5` keeps every feature but
-still simplifies geometry. When you do override something, the run says so
-rather than claiming the output is verbatim.
+It leaves the mode, the level plan, the coordinate reference system (CRS),
+the row-group layout, an explicit `--cluster`, and `--representation` alone.
+A requested point or square band still replaces polygons with centroids or
+placeholder squares.
+
+Explicit settings override `--verbatim` defaults. For example,
+`--verbatim --simplify-factor 0.5` keeps every feature but simplifies its
+geometry. The report identifies the override.
 
 It requires `--mode duplicating`. Partitioning writes each feature at exactly
-one level, so with thinning off every feature lands in the coarsest level and
-every finer level comes out empty; that is rejected rather than produced.
+one level. With thinning off, every feature would land in the coarsest level
+and every finer level would be empty, so tylertoo rejects the combination.
 
-On `tiles` it also disables the per-tile size cap, since a valve that sheds
-features to fit a byte budget is not verbatim either. Pass `--max-tile-size`
-explicitly to put a cap back; an explicit value always wins.
+On `tiles`, `--verbatim` also disables the per-tile size cap. An explicit
+`--max-tile-size` restores it.
 
-⚠️ **The two-step form does not inherit that.** `tylertoo overview --verbatim`
-followed by `tylertoo export-pmtiles` still applies the export's own 500K cap
-and sheds features from oversized tiles — the flag is convert-side, and the
-export reads a file, not your flags. Pass `--tile-size-limit 0` to
-`export-pmtiles` (that is the export spelling; `--max-tile-size` is the `tiles`
-one) when every feature must reach a tile.
+For two-step builds, `tylertoo export-pmtiles` still applies its default
+500K cap after `tylertoo overview --verbatim`. Pass `--tile-size-limit 0`
+(alias `--max-tile-size 0`) to export every feature.
 
 ### `0` is the off switch
 
-Every thinning factor accepts `0`, meaning **no thinning**: each feature is its
-own grid cell, so every feature that passes the gates survives. Previously `0`
-was rejected (`must be a finite value > 0`) and callers used `1e-9` to
-approximate it; that workaround is no longer needed, and `0` is exact rather
-than dependent on float resolution to separate neighbouring cells.
-
-Negative and non-finite factors remain errors.
+Every thinning factor accepts `0`, meaning **no thinning**: each feature is
+its own grid cell, so every feature that passes the gates survives. Negative
+and non-finite factors are errors.
 
 ---
 
 ## Feature thinning: `--point/line/polygon-thinning`
 
-Thinning keeps **one winning feature per grid cell** per level (the winner is
-chosen by the ranking — see [Ranking](#ranking-which-feature-wins-a-cell)). The
-grid cell size for a kind is:
+Thinning keeps one winning feature per grid cell per level. The
+[ranking](#ranking-which-feature-wins-a-cell) picks the winner. The cell size
+for each geometry kind is:
 
 ```
 cell_size = thinning_factor * gsd(level)          (in the CRS's units)
@@ -296,69 +265,58 @@ cell_size = thinning_factor * gsd(level)          (in the CRS's units)
 | `--line-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 | `--polygon-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
 
-Bigger factor ⇒ bigger cells ⇒ fewer cells ⇒ fewer survivors ⇒ **sparser**
-map. Smaller ⇒ **denser**.
+Larger factors give larger cells and fewer survivors. Lower
+`--line-thinning` if coarse roads look too sparse.
 
-⚠️ **Interaction warning — the direction is counter-intuitive.** A *bigger*
-thinning number makes the map *sparser*, because it multiplies the cell size.
-This is the opposite of "turn it up to get more." If your coarse roads look too
-empty, **lower** `--line-thinning`, don't raise it.
-
-The defaults are class-aware: points thin hardest (4.0, they clutter fastest),
-lines and polygons least (1.0). The line default was retuned 2.0 → 1.0 after
-the 2026-07-02 Portland roads sweep (`corpus/SWEEPS.md`): at 1.0, road
-networks stay visibly more continuous at coarse zooms, and the true-scale
-renders showed the extra density costs little legibility. The factor multiplies the GSD, so it stacks with `--gsd-base`: doubling
+Points use 4.0 because they clutter sooner than lines and polygons, which
+use 1.0. In the Portland roads sweep, 1.0 kept roads more continuous at
+coarse zooms with little loss of legibility
+([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
+The factor multiplies the GSD, so it stacks with `--gsd-base`. Doubling
 `--gsd-base` halves the GSD, which halves the cell size for the same factor.
 
 ---
 
 ## Visibility gates: `--line/polygon-visibility`
 
-A line or polygon is **eligible** at a level only if its bounding-box diagonal
-clears the gate:
+A line or polygon is eligible only if its bounding-box diagonal clears the
+level's gate:
 
 ```
 eligible  ⇔  bbox_diagonal >= visibility_factor * gsd(level)
 ```
 
-Features below the gate are **dropped outright** at that level (they reappear at
-finer levels once the GSD shrinks below their size). Points are never gated.
+Features below the gate reappear at finer levels as GSD shrinks. Points have
+no gate.
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--line-visibility` | `2.0` | × GSD (min bbox diagonal) | **bigger = sparser** |
 | `--polygon-visibility` | `2.0` | × GSD (min bbox diagonal) | **bigger = sparser** |
 
-Bigger factor ⇒ higher bar ⇒ more small features dropped at coarse levels ⇒
-**sparser**. Smaller ⇒ more small features kept ⇒ **denser**.
+A bigger factor raises the bar and drops more small features at coarse
+levels. A smaller factor keeps more of them.
 
-The polygon default was retuned 4.0 → 2.0 in the 2026-07-15 coarse-zoom
-sweep (#259, `corpus/SWEEPS.md` Decision 6). The write stage independently
-drops any polygon whose *simplified* geometry falls below the level
-tolerance (`--simplify-factor × GSD` — an effective ~2 × GSD survival bar
-on real-world shapes), so a 4 × GSD eligibility gate was strictly stricter
-than what could ever be written and only starved coarse zooms: on Germany
-buildings, 4.0 → 2.0 gives 2.7–4.6× more features at z8–z12 and starts the
-pyramid one zoom coarser, for +13 % file size and +7 % conversion time.
-Values *below* 2.0 change little on their own — the extra eligible features
-are almost all RDP-collapsed at write time — **unless** `--collapse` keeps
-them as representative points (see the
-[dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)).
+The polygon default matches the write stage's effective survival threshold
+of about 2 × GSD: polygons also drop when their simplified geometry falls
+below `--simplify-factor × GSD`. Stricter gates remove otherwise drawable
+features. On Germany buildings,
+2.0 instead of 4.0 gives 2.7–4.6× more features at z8–z12 and starts the
+pyramid one zoom coarser, for 13% more file size and 7% more conversion time
+([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md),
+Decision 6). Values *below* 2.0 change little on their own, because
+simplification collapses nearly every extra feature at write time. The
+exception is `--collapse`, which keeps them as representative points, as in
+the [dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers).
 
-⚠️ **Interaction warning — the gate is multiplied by the GSD.** So it moves with
-`--gsd-base` and with zoom. A polygon visible at one level can be gated out one
-level coarser purely because the GSD (and therefore the gate) doubled. This is a
-*hard drop*, distinct from thinning's *one-per-cell* competition: a feature can
-be gated out even if its cell is otherwise empty.
+The gate scales with zoom and `--gsd-base`. Going one zoom coarser doubles
+the threshold. A feature can fail it even in an empty thinning cell.
 
 ### Empty coarse levels: the auto-clamp
 
-When **every** feature is culled at a coarse level — the normal outcome for
-datasets of small features at world zooms (e.g. country-scale buildings with
-`--min-zoom 0`: no building's bbox clears `2 × gsd(z0)` ≈ 78 km) — that level
-is **omitted from the output and the remaining levels are renumbered** (spec
-§7.3), instead of failing the conversion. You will see a `WARN` like:
+When every feature fails a coarse level's gates, tylertoo omits the level
+and renumbers the rest (spec §7.3). For buildings at `--min-zoom 0`, the
+threshold `2 × gsd(z0)` is about 78 km. A typical warning is:
 
 ```
 omitting 6 empty level(s) [0, 1, 2, 3, 4, 5] spanning GSD 39135.76–1222.99 m:
@@ -369,167 +327,146 @@ pass --collapse to keep sub-GSD polygons as representative points (see
 docs/OVERVIEW_TUNING.md)
 ```
 
-plus a `note:` line under the CLI level table, and the omitted levels are
-recorded in the report's `skipped_empty_levels` (planned level index, GSD,
-zoom) — the written `levels` array is the effective range. The same clamp
-applies when a level empties late, during simplification (a pathological
-feature whose bbox clears the gate but whose geometry collapses below the
-level tolerance). PMTiles export of a clamped file starts at the coarsest
-*written* level's zoom.
+A `note:` line also appears under the CLI level table. The report's
+`skipped_empty_levels` lists each omitted level's planned index, GSD, and
+zoom, and the written `levels` array is the effective range. The same clamp
+applies when a level empties during simplification: a feature's bbox can
+clear the gate while its geometry collapses below the level tolerance.
+PMTiles export of a clamped file starts at the coarsest written level's zoom.
 
-This is expected behavior, not data loss: the features are simply not
-representable at those scales. To *force* coarse levels to be populated,
-lower the gates (`--polygon-visibility` / `--line-visibility`), coarsen the
-ladder (`--gsd-base`), or — for dense small-polygon layers — use the
+The omitted levels contain no drawable features. To populate them, lower
+the gates, raise `--gsd-base`, or use the
 [dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)
-(`--polygon-visibility 0 --collapse`). If **no** level has any rows at all
-(empty input, or an empty `--bbox` selection), the conversion still fails
-with a hard error.
+(`--polygon-visibility 0 --collapse`). If **no** level has any rows, as with
+an empty input or an empty `--bbox` selection, the conversion fails.
 
 ---
 
 ## Per-feature simplification: `--simplify-factor`
 
-Simplification runs Ramer–Douglas–Peucker on each *surviving* feature's geometry
-with a world-space tolerance:
+Simplification runs Ramer–Douglas–Peucker (RDP) on each *surviving* feature's
+geometry with a world-space tolerance:
 
 ```
 tolerance = simplify_factor * gsd(level)          (meters, then CRS-converted)
 ```
 
-| Knob | Default | Units | Direction |
-|------|---------|-------|-----------|
-| `--simplify-factor` | `1.0` | × GSD (RDP tolerance) | **bigger = cruder + lighter** |
-| `--collapse` | off | flag | below-gate polygons become a representative point instead of dropping |
-| `--collapse-square` | off | flag | dropped polygons stand in as ~1×GSD placeholder squares: a per-patch area accumulator for everything a level does not carry, an area dither for members that collapse at write time (type-preserving) |
-| `--representation` | none (all `geom`) | `LO-HI:KIND,…` | per-zoom-band representation: `geom`, `point`, or `square` |
-| `--no-cascade` | off (cascading **on**) | flag | disables cascading simplification, reproducing pre-cascade output byte-for-byte |
+| Option | Default | Effect |
+|--------|---------|--------|
+| `--simplify-factor` | `1.0` | RDP tolerance in GSD multiples; larger = less detail |
+| `--collapse` | off | Keep below-tolerance polygons as points |
+| `--collapse-square` | off | Keep placeholder squares of about 1 × GSD ([details](#zoom-band-representation-and-placeholder-squares)) |
+| `--representation LO-HI:KIND,…` | all `geom` | Choose `geom`, `point`, or `square` by zoom band |
+| `--no-cascade` | off | Disable cascading simplification |
 
-- **LOWER `--simplify-factor` = smoother / less aggressive** = more vertices
-  kept = crisper but heavier coarse levels.
-- **HIGHER = cruder / blockier** = fewer vertices = lighter levels.
+Lower `--simplify-factor` to keep more vertices; raise it for less detail
+and smaller levels.
 
-Duplicating mode only; the **canonical (finest) level is always verbatim**
-regardless of this factor (spec §2.4). `--simplify-factor 0` disables
-simplification entirely (identity).
+Simplification applies in duplicating mode only. The **canonical level always
+stays verbatim**, whatever the factor (spec §2.4). `--simplify-factor 0`
+disables simplification.
 
-⚠️ **Interaction warning — high factors also thin.** A line/polygon whose bbox
-diagonal falls below the tolerance is *dropped*, not just smoothed. So a very
-high `--simplify-factor` removes features in addition to shedding vertices — it
-is not a pure "smoothing" knob at the extremes. If you only want fewer vertices,
-keep the factor modest and adjust density with the thinning/visibility knobs.
+High factors also remove features whose bbox diagonal falls below the
+tolerance. Keep the factor modest to shed vertices, and control feature
+counts with thinning and visibility.
 
 ### Cascading simplification (default on): `--no-cascade`
 
-By default (duplicating mode), each coarser level is simplified from the
-**next-finer level's already-simplified output** rather than from canonical
-full-resolution geometry (tippecanoe-style, #218). Because a feature at its
-coarsest level would otherwise be re-simplified from full resolution at every
-finer level it repeats on, cascading removes the dominant repeat cost of
-duplicating-mode conversion; it also repairs a self-intersecting RDP candidate
-into its valid even-odd interpretation in one boolean-overlay pass instead of
-epsilon-retrying it four times and shipping full resolution.
+In duplicating mode, each coarser level simplifies the next-finer level's
+output, as tippecanoe does. This avoids repeatedly simplifying canonical
+geometry, which dominates conversion time without cascading. A single
+boolean-overlay pass repairs self-intersecting RDP candidates into valid
+even-odd geometry.
 
-Trade-off: coarse-level coordinates differ slightly from the non-cascaded
-pipeline. Cascaded output vertices are still a subset of canonical vertices,
-every step's output is validity-checked or repaired, and the cumulative
-positional deviation is bounded by the geometric GSD ladder (≈ 2× the target
-level's tolerance instead of 1×). Files record `generalization.cascade: true`
-in the footer provenance. Pass `--no-cascade` to reproduce the pre-cascade
-output byte-for-byte.
+Coarse-level coordinates differ slightly from non-cascaded output. Cascaded
+vertices are still a subset of canonical vertices, and every step's output is
+validity-checked or repaired. The geometric GSD ladder bounds the cumulative
+deviation at about 2× the target level's tolerance instead of 1×. The footer
+provenance records `generalization.cascade: true`. Pass `--no-cascade` to
+reproduce non-cascaded output byte-for-byte.
 
-Validity-check vertex cap (#242): a simplification candidate with more than
-2,048 total vertices skips the exact validity check and is assumed valid —
-the check is O(V²) in ring size, and on continental-scale rings at fine GSDs
-it stalled conversion for tens of minutes per feature. Oversized candidates
-arise exactly when RDP removed few vertices from already-valid input, the
-least likely case to have acquired a self-intersection; geometry validity is
-not an overviews conformance requirement (OVERVIEWS_SPEC §2). Candidates at
-or below the cap are validated (and repaired) exactly as before. A skipped
-check is counted and summarized at the end of conversion at info level.
+#### Validity-check vertex cap
+
+A simplification candidate with more than 2,048
+total vertices skips the exact validity check and counts as valid. The check
+is O(V²) in ring size, and on continental-scale rings at fine GSDs it stalled
+conversion for tens of minutes per feature. A candidate that large means RDP
+removed few vertices from already-valid input, the case least likely to
+self-intersect. The overviews spec does not require valid geometry (§2).
+Candidates at or below the cap get the full check and repair. tylertoo logs a
+count of skipped checks at `info` when conversion ends.
 
 ---
 
 ## Country-scale dot fill for dense polygon layers
 
-A dense layer of *small* polygons (buildings, parcels, field boundaries)
-renders an **empty country view** with type-preserving defaults, no matter
-how the gates are tuned. Two independent mechanisms cull sub-GSD polygons
-at coarse levels:
+A dense layer of small buildings, parcels, or fields can render an empty
+country view with the default settings. Sub-GSD polygons drop in two stages:
 
-1. the **visibility gate** (assign time): ineligible below
-   `--polygon-visibility × GSD`;
-2. the **write-time collapse** (simplify time): even an eligible polygon is
-   dropped when its simplified geometry falls below the level tolerance —
-   at z4 the tolerance is ≈ 2.4 km, and no building survives that.
+1. At assignment, a polygon below
+   `--polygon-visibility × GSD` is ineligible.
+2. At write time, an eligible polygon drops if its simplified geometry
+   falls below the tolerance. At z4 that is about 2.4 km, larger than any
+   building.
 
-A 20 m building is therefore unrepresentable *as a polygon* at z0–z8; the
-per-feature fix is representing it as something else. That is what
-**`--collapse`** does (spec Q4, opt-in): a below-tolerance polygon becomes a
-**representative point** instead of vanishing. Combining it with a zero
-gate turns the coarse levels into a cell-winner/budget-bounded **dot
-field**:
+A 20 m building cannot render as a polygon at z0–z8. `--collapse` (opt-in,
+spec Q4) keeps below-tolerance polygons as representative points. With a
+zero visibility gate, coarse levels become a dot field bounded by thinning
+and the density budget:
 
 ```bash
 tylertoo overview buildings.parquet buildings_overview.parquet \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse
 
-# One-shot to PMTiles. The 500K tile cap is on by default (tippecanoe
-# parity, #280) — shown explicitly here for clarity. Uncapped coarse dot
-# tiles on a country-scale layer reach several MB (Germany z6: 12 MB),
-# far past renderer norms; the cap drop-to-fits them to ~500 KB (keeping a
-# spatially even stride of the dots). Pass --max-tile-size 0 to opt out.
-# On multi-GB inputs the recipe buffers the (now much larger) coarse
-# levels; the default --profile auto estimates this and spills when it
-# would exceed a fraction of available RAM (Germany peak RSS 15 -> 29 GB
-# if forced to speed). Pass --profile bounded to force spilling.
+# One-shot PMTiles build; 500K is the default cap (0 disables it).
 tylertoo tiles buildings.parquet buildings.pmtiles \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse --max-tile-size 500K \
   --profile bounded
 ```
 
-Measured on Overture Germany buildings (59M footprints, z0–14,
-`corpus/SWEEPS.md` Decision 6): every level populates (z0 = 581 dots,
-z4 = 128,886, z6 = 1,074,540), coarse levels z6–z13 land exactly on the
-[density budget](#density-budget---drop-rate---drop-gamma---no-density-drop)
-ladder `N / 1.65^(14−z)` with the gamma-fair spatial spread (Ruhr/Berlin
-visibly denser at z6, rural areas protected), and the overview file grows
-+31 % (11.9 → 15.6 GB) with +40 % conversion time. On the Moldova field
-corpus the same recipe costs **+0.3 %** file size.
+For country-scale builds:
 
-Two caveats:
+- Keep the tile cap. Uncapped dot tiles can reach several MB (Germany z6:
+  12 MB). The cap thins dots with a spatially even stride to about 500 KB.
+- Use `--profile auto` to spill when needed, or `bounded` to force spilling.
+  Coarse levels buffer more rows; forcing `speed` raised Germany's peak
+  resident set size from 15 to 29 GB.
 
-- **Style the points.** A `fill` layer silently ignores Point features — a
-  fill-only style renders the same empty country view you started with.
-  Add a small `circle` layer filtered to `["==", "$type", "Point"]` (see
-  `docs/demo/viewer.html`).
-- **Geometry type changes mid-zoom.** The output's `geometry_types` lists
-  the union (e.g. `["Point","Polygon"]`), per spec §7.5; collapse is
-  opt-in precisely so renderers are never surprised by default
-  (spec Q4). Files record the collapse in the `generalization` provenance.
+On Overture Germany buildings (59M footprints, z0–14), every level populates:
+z0 holds 581 dots, z4 128,886, and z6 1,074,540
+([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md),
+Decision 6). Levels z6–z13 land on the
+[density budget](#density-budget-drop-rate-drop-gamma-no-density-drop) ladder
+`N / 1.65^(14−z)`, with dense areas such as the Ruhr and Berlin visibly denser
+and rural areas protected. The overview file grows 31% (11.9 → 15.6 GB), and
+conversion takes 40% longer. On the Moldova field corpus the same recipe adds
+**0.3%** to file size.
 
-`--drop-rate` / `--drop-gamma` need **no** retuning for this recipe: the
-coarse levels are capped by the existing budget ladder, which is what
-shapes the dot density (the #250 demo's `--drop-rate 1.3` only inflated
-mid-zoom row counts by +13 % without changing the coarse fill).
+Add a small `circle` layer filtered to `["==", "$type", "Point"]`; `fill`
+layers ignore points. The output's `geometry_types` lists the union, for
+example `["Point","Polygon"]` (spec §7.5). Collapse is opt-in because it
+changes geometry types (spec Q4), and is recorded in `generalization`
+provenance.
+
+Keep the default `--drop-rate` and `--drop-gamma`. The budget already caps
+coarse levels and shapes dot density. Using `--drop-rate 1.3` increased
+mid-zoom row counts by 13% without changing the coarse fill.
 
 ---
 
-## Zoom-band representation: `--representation` (#317) and placeholder squares: `--collapse-square` (#279)
+## Zoom-band representation and placeholder squares
 
-The dot-fill recipe above changes the representation of below-tolerance
-polygons **globally**. Two further knobs give you (a) full per-zoom-band
-control and (b) a **type-preserving** alternative to points.
+Use `--representation` to choose geometry by zoom band, or
+`--collapse-square` to retain polygons as placeholder squares.
 
-### `--representation LO-HI:KIND,…` — the band selector
+### `--representation LO-HI:KIND,…`: the band selector
 
-One run, one archive, different representations per zoom band — no
-two-archive merge:
+One build can use different representations across zoom bands:
 
 ```bash
-# Dots zoomed out, full polygons zoomed in, in ONE PMTiles:
+# Dots at coarse zooms, polygons at fine zooms:
 tylertoo tiles buildings.parquet buildings.pmtiles -f \
   --min-zoom 0 --max-zoom 14 \
   --representation "0-7:point,8-14:geom"
@@ -540,166 +477,142 @@ tylertoo tiles buildings.parquet buildings.pmtiles -f \
   --representation "0-7:square"
 ```
 
-`KIND` per band:
+The supported kinds are:
 
-- **`point`** — every polygonal feature in the band becomes its
-  **representative point** (centroid, falling back to bbox center then
-  first vertex for degenerate rings) — unconditionally, whatever its size.
-  In-band polygons **bypass the visibility gate** (a dot is always
-  visible) and thin on the **point grid** (`--point-thinning`), so the
-  band renders as a dot field with genuine coverage. Style with a
-  `circle` layer (fill layers ignore points).
-- **`square`** — normal simplification, but **below-tolerance** polygons
-  emit an area-dithered ~1×GSD **placeholder square** (see
-  `--collapse-square` below) instead of dropping. Visible polygons are
-  untouched, the level stays all-`Polygon` (type-preserving — plain fill
-  styles keep working). In-band polygons bypass the visibility gate (the
-  tiny ones are exactly what the dither must see) but keep the polygon
-  thinning grid.
-- **`geom`** — the normal path (default for zooms not listed in any
-  band). Below-tolerance polygons follow the global disposition
-  (drop / `--collapse` / `--collapse-square`).
+- `point`: every polygon becomes its representative point. This is the centroid,
+  falling back to the bbox center and then the first vertex for degenerate
+  rings. Polygons bypass the visibility gate and use the point grid
+  (`--point-thinning`). Render them with a `circle` layer.
+- `square`: normal simplification, with below-tolerance polygons replaced
+  by area-dithered squares of about 1 × GSD (see `--collapse-square` below).
+  Visible polygons stay unchanged, and fill styles work throughout.
+  Polygons bypass the visibility gate but keep the polygon thinning grid.
+- `geom`: normal geometry, also the default for unlisted zooms.
+  Below-tolerance polygons follow the global disposition: drop,
+  `--collapse`, or `--collapse-square`.
 
-Rules (validated at convert entry): duplicating mode with a zoom-range
-plan only (`--gsd` plans carry no zooms to band on); bands must not
-overlap; a non-`geom` band must end **before** `--max-zoom` (the canonical
-level is always verbatim, spec §2.4); and `point` bands must be contiguous
-from the coarsest planned zoom — the cascade's point passes through every
-coarser level regardless, so a "polygons coarser than the point band"
-request is not representable and is rejected rather than silently ignored.
+tylertoo validates the bands when conversion starts:
 
-With cascading (default on), a feature entering a point band collapses at
-the band's **finest** level and every coarser band level reuses that same
-point. Lines and native points are unaffected by every band kind; bands
-combine freely with clustering, coalescing, and the density budget (which
-caps band levels exactly like any other level).
+- They need duplicating mode with a zoom-range plan. A `--gsd` plan has no
+  zooms to band on.
+- Bands must not overlap.
+- A non-`geom` band must end **before** `--max-zoom`, because the canonical
+  level is always verbatim (spec §2.4).
+- `point` bands must run contiguously from the coarsest planned zoom. The
+  cascade carries the point through every coarser level, so tylertoo
+  rejects a request for polygons coarser than a point band.
 
-The requested bands are recorded in the footer provenance
-(`generalization.representation: [{"zooms": [0,7], "repr": "point"}, …]`).
+With cascading on, a feature entering a point band collapses at the band's
+**finest** level, and every coarser band level reuses that point. Lines and
+native points ignore every band kind. Bands work with clustering and
+coalescing, and the density budget caps band levels like any other level.
 
-### `--collapse-square` — tippecanoe tiny-polygon squares as the global disposition
+The footer provenance records the bands, as
+`generalization.representation: [{"zooms": [0,7], "repr": "point"}, …]`.
 
-`--collapse-square` is the third **below-tolerance disposition**, next to
-the drop default and `--collapse`-to-point: polygons a level cannot show
-as themselves stand in as `tol × tol` squares (`tol = simplify-factor ×
-GSD`, CRS-converted). This is tippecanoe's **tiny-polygon reduction** —
-the primary-reference behavior for keeping dense small-polygon layers
-(fields, buildings, parcels) visible at coarse zooms with **no style
-changes**: squares are polygons, `geometry_types` stays `["Polygon"]`, and
-there is no spec-Q4 geometry-type opt-in involved.
+### `--collapse-square`: tippecanoe tiny-polygon squares as the global disposition
 
-Two mechanisms share the threshold `T = side²` (#384), where `side` is
-`tol` floored at one tile unit of the level's zoom (#407, see the
-divergences below):
+`--collapse-square` replaces below-tolerance polygons with `tol × tol`
+squares, where `tol` is `simplify-factor × GSD`, converted to CRS units.
+Like tippecanoe's tiny-polygon reduction, it keeps dense fields, buildings,
+and parcels visible at coarse zooms with existing fill styles.
+`geometry_types` stays `["Polygon"]`, so no spec-Q4 geometry-type opt-in
+applies.
 
-**The accumulator** covers every polygon the level does *not* carry —
-failed the visibility gate, lost its thinning cell, cut by the density
-budget. After assignment, each such polygon adds its area, **clamped to
-`T`**, to a running total for its **patch** (a 32×GSD square, 1/32 of a
-1024-px tile), in input order; each time a patch's total crosses `T`,
-the polygon that crossed it becomes the level's *carrier* and is emitted
-as a `T`-area square at its representative point, with its own
-attributes. A polygon contributes at most one placeholder of area
-(a gate-failed polygon is often bigger than `T` — the gate is
-`--polygon-visibility` pixels wide — and a thinning or budget loser can
-be any size), and a patch keeps less than one `T` unemitted. This is
-what makes a country of 25 m fields read as farmland at z0 instead of
-vanishing: on a 368k-field sample, z1–z6 carry ~98% of the input area
-against 1.5–7% with the dither alone. Features placed by an entry-zoom
-ladder (`--entry-zoom`) are never accumulated: the ladder decides where
-they first appear.
+`--collapse-square` is opt-in, and the default disposition is still to drop. The
+footer provenance records it as `generalization.collapse: "square"`, and
+`--collapse` records `"point"`.
 
-**The dither** covers the polygons the level *does* carry but that
-collapse below `T` at write time (RDP shrinks them under the tolerance):
-one of area `A` survives as a square with probability `A / T`, decided by
-a hash of its anchor coordinates. The two sets are disjoint, so nothing
-is counted twice.
+Two mechanisms share the threshold `T = side²`, where `side` is `tol` floored
+at one tile unit of the level's zoom (see the divergences below).
 
-Both are **deterministic**: the accumulator runs once over the pass-1
-feature table in input order, so every engine (in-memory / streaming /
-pipelined) reads the same carrier set, and the dither is a pure function
-of the feature. The same input produces byte-identical output across
-runs, engines and thread counts. Under cascading, a kept square's anchor
-is its own center, so coarser levels re-dither it against the same hash
-draw with a shrinking keep probability — survival is monotone fine→coarse.
+#### Area accumulation and dithering
 
-Divergences from tippecanoe (see `context/ARCHITECTURE.md`):
+The accumulator covers polygons removed by the visibility gate, thinning,
+or density budget. After assignment, each adds its area, clamped to `T`, to
+its patch's running total in input order. A
+patch is a 32 × GSD square, 1/32 of a 1024-px tile. Each time a patch's total
+crosses `T`, the polygon that crossed it becomes the level's *carrier*.
+tylertoo emits it as a `T`-area square at its representative point, with its
+own attributes.
 
-- tippecanoe accumulates **per tile**; we accumulate per 32×GSD patch of
-  the level, since overview levels have no tile scope. Squares therefore
-  land at the carriers' own positions inside the patch (input order is
-  Hilbert order for a prepared file, so they cluster where the fields
-  are).
-- tippecanoe only accumulates rings with area ≤ `tiny_polygon_size²` and
-  keeps larger rings as geometry; we clamp each polygon's contribution to
-  one placeholder instead of skipping large ones — a non-member was
-  already dropped by the gate or thinning here, so there is no geometry
-  to keep.
-- tippecanoe places the placeholder at the ring's first vertex with side
-  `tiny_polygon_size` (default 2 px); ours sits at the polygon's
-  representative point with side `simplify-factor × GSD`.
-- tippecanoe's placeholder side is a fixed count of tile units; ours is
-  `simplify-factor × GSD`, **floored at one tile unit** at the level's
-  zoom (#407). One unit is `40,075,016.69 m / 2^zoom / 4096`, which for a
-  `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`: a quarter of
-  the GSD at the default `--gsd-base 1024`, so the floor applies when
-  `--simplify-factor < gsd-base / 4096` (below 0.25 by default; at
-  `--gsd-base 8192` even the default 1.0 is floored to 2 × GSD). A narrower
-  square would reach the tile encoder, which keeps a square of side `s <
-  1` unit only with probability `s²`; floored, every placeholder is drawn,
-  there are fewer of them, and the log names the zooms where the floor
-  applied. On those levels a patch's leftover area (under one `T`) is
-  dithered into one more carrier with probability `leftover / T` rather
-  than dropped. The unit assumes the default 4096 extent, the only one the
-  CLI exports at; exporting at a larger extent (Python `export(extent=…)`)
-  draws floored squares over more than one unit, a smaller one draws them
-  under a unit, where they thin as described. `--simplify-factor 0` has no
-  placeholder at all: the accumulator is skipped and logged, as tippecanoe
-  skips its reduction at `tiny_polygon_size` 0.
-- the accumulator needs duplicating mode (a carrier is a second appearance
-  of a feature, which partitioning's feature-once contract cannot
-  represent). In partitioning mode neither mechanism applies: levels are
-  verbatim, so `--collapse-square` is accepted and logged as inert.
+A polygon contributes at most one placeholder's area. Gate failures may be
+larger than `T` because the gate is `--polygon-visibility` pixels wide;
+thinning and budget losers can be any size. Each patch retains less than
+`T` in unemitted area. This keeps 25 m fields visible as farmland at z0.
+On a 368k-field sample, z1–z6
+carry about 98% of the input area, against 1.5–7% with the dither alone. An
+entry-zoom ladder (`--entry-zoom`) decides where its features first appear,
+so the accumulator never counts them.
 
-At the mid zooms, a dense square carpet can exceed `--max-tile-size`; the
-valve then sheds squares for that tile, as it would any feature. Raise
-the cap or accept the thinner carpet.
+The dither covers polygons the level carries but that RDP shrinks
+below `T` at write time. A polygon of area `A` survives as a square with
+probability `A / T`, decided by a hash of its anchor coordinates. The two sets
+are disjoint, so nothing counts twice.
 
-To see how close each zoom runs to the cap, `tylertoo stats` reports the
-per-zoom tile count, total, mean, p50, p99 and max **stored** (compressed)
-tile size, plus the largest tiles by z/x/y, from the archive's directory
-alone (no tile is read):
+Both mechanisms are deterministic. The accumulator traverses the pass-1
+table in input order; the dither is a pure function of each feature. Output
+is byte-identical across runs, engines (in-memory, streaming, pipelined),
+and thread counts. With cascading, a square's anchor is its center. Coarser
+levels reuse the hash draw with a smaller keep probability, so a square
+removed at one level cannot reappear at a coarser one.
 
-```bash
-tylertoo stats buildings.pmtiles --largest 5     # human table
-tylertoo stats buildings.pmtiles --json          # same numbers, machine-readable
-```
+#### Differences from tippecanoe
 
-Opt-in for now: the drop default is unchanged pending the #259-fixture
-sweep (#279 tracks the default decision). Recorded in the footer
-provenance as `generalization.collapse: "square"` (`--collapse` records
-`"point"`).
+See also `context/ARCHITECTURE.md`.
+
+- **Per patch, not per tile.** Tippecanoe accumulates per tile. tylertoo
+  accumulates per 32 × GSD patch, because overview levels have no tile scope.
+  Squares land at the carriers' own positions inside the patch. A prepared
+  file is in Hilbert order, so they cluster where the fields are.
+- **Clamped, not skipped.** Tippecanoe accumulates only rings with area
+  ≤ `tiny_polygon_size²` and keeps larger rings as geometry. tylertoo clamps
+  each polygon's contribution to one placeholder instead: the gate or
+  thinning already dropped a non-member here, so there is no geometry to keep.
+- **Placement.** Tippecanoe places the placeholder at the ring's first vertex
+  with side `tiny_polygon_size` (default 2 px). tylertoo places it at the
+  polygon's representative point with side `simplify-factor × GSD`.
+- **A floor of one tile unit.** Tippecanoe's placeholder side is a fixed count
+  of tile units. tylertoo's is `simplify-factor × GSD`, **floored at one tile
+  unit** at the level's zoom. One unit is `40,075,016.69 m / 2^zoom / 4096`,
+  which for a `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`. At the
+  default `--gsd-base 1024` that is a quarter of the GSD, so the floor applies
+  when `--simplify-factor` is below 0.25. At `--gsd-base 8192`, even the
+  default 1.0 floors to 2 × GSD.
+  The tile encoder keeps a square of side `s < 1` unit only with probability
+  `s²`. The floor lets the encoder draw every placeholder, reducing their
+  count. The log names affected zooms. On those levels a patch's
+  leftover area, under one `T`, becomes one more carrier with probability
+  `leftover / T` instead of vanishing.
+  The unit assumes the default extent of 4096, the only one the CLI exports
+  at. A larger Python `export(extent=…)` draws floored squares over more than
+  one unit, and a smaller one draws them under a unit, where they thin as
+  described above.
+- **No placeholder at `--simplify-factor 0`.** tylertoo skips the
+  accumulator and logs it, as tippecanoe skips its reduction at
+  `tiny_polygon_size` 0.
+- **Duplicating mode only.** A carrier is a second appearance of a feature,
+  which partitioning's feature-once contract cannot represent. In
+  partitioning mode the levels are verbatim, so tylertoo accepts
+  `--collapse-square` and logs it as inert.
+
+Dense squares at mid zooms can exceed `--max-tile-size`, which removes
+squares per tile. Raise the cap to retain more.
+[`tylertoo stats`](#export-and-archive-commands-export-pmtiles-merge-stats)
+reports sizes by zoom.
 
 ---
 
 ## Attribute-driven entry zoom: `--magnitude-ladder`, `--entry-zoom`
 
-Everything in the next section decides *which of the features competing for a
-cell wins*. It runs **after** the visibility gate, which has already dropped
-features for being small. That ordering is backwards whenever a dataset's most
-important features are also its physically smallest.
+[Ranking](#ranking-which-feature-wins-a-cell) runs after the visibility gate,
+so `--sort-key` cannot rescue small features the gate removed. For a
+population-density choropleth, this can hide tiny urban tracts with high
+values while keeping large rural tracts with low values.
 
-A population-density choropleth is the everyday case: the dense urban tracts
-carrying the highest values are tiny next to the sparse rural ones. A coarse
-level therefore keeps the large low-value polygons and hides the small
-high-value ones — precisely the opposite of what the map should show zoomed
-out. `--sort-key` helps where features survive to compete, but cannot reach a
-feature the gate removed first.
-
-A **ladder** answers a different question: not "which of these wins a cell" but
-"how early may this feature appear at all". Each distinct value of a column
-gets an *entry zoom*; a feature appears from its entry zoom inward and at none
-before it, **exempt from the visibility gate and from thinning** throughout.
+An entry-zoom ladder assigns each distinct column value a zoom. Its
+features appear from that zoom inward, exempt from visibility gates and
+thinning, and never appear at coarser zooms.
 
 ```bash
 # Derive it: distinct values ranked descending, one zoom apart from --min-zoom
@@ -712,46 +625,34 @@ tylertoo tiles in.parquet out.pmtiles --min-zoom 0 --max-zoom 8 -f \
   --entry-zoom "density:5000=0,1000=3,200=6"
 ```
 
-With five distinct values over `--min-zoom 0 --max-zoom 6` and the default
-step, counting features present at each zoom, the derived ladder gives a clean
-staircase: the strongest rank is the only thing at z0, and each weaker rank
-joins one zoom later. Without a ladder the strongest values do not appear at
-all until the gate stops removing them — typically the finest zooms, because
-they are the smallest features in the layer.
+With five distinct values, `--min-zoom 0 --max-zoom 6`, and the default step,
+the highest rank appears at z0; each lower rank joins one zoom later. The
+ladder uses distinct-value ranks (SQL `DENSE_RANK`) to avoid concentrating
+entry zooms in a narrow range when raw values cluster together.
 
-Ranking **distinct values** (SQL `DENSE_RANK`) rather than the values
-themselves keeps the ladder scale-free. Mapping a raw value linearly onto the
-zoom range strands every rung in the upper zooms whenever the values occupy a
-narrow part of their nominal scale, which real data usually does.
+A column may have more distinct values than the zoom range has room for.
+Ranks that would fall past the finest zoom get no rung. Their features take
+the ordinary gate and thinning, and tylertoo does not pin them to the finest
+level. The run reports how many it left out.
 
-More distinct values than the zoom range has room for is fine: the ranks that
-would fall past the finest zoom get no rung, and those features keep the
-ordinary gate and thinning rather than being pinned to the finest level. The
-run says how many were left out.
-
-`--ladder-step N` widens the spacing. A value the ladder does not cover (null,
-or unlisted in an explicit spec) gets no entry zoom and takes the ordinary
-gate, so a partly populated column degrades to today's behaviour instead of
-hiding rows.
+`--ladder-step N` (default 1) sets the spacing. Nulls and values omitted
+from an explicit spec get no rung; their features use ordinary gates and
+thinning.
 
 ### Two mechanisms can still undo a ladder
 
-The ladder governs **admission**. Two later stages can remove a feature it
-admitted, and both matter in practice:
+Two later stages can remove admitted features:
 
-- **Simplification.** A feature admitted to a coarse level is still dropped
-  there if its geometry simplifies below that level's tolerance — the usual
-  case for small-but-strong features. `--magnitude-ladder` and `--entry-zoom`
-  therefore **imply `--collapse`**, so such a feature survives as a
-  representative point. `--collapse-square` overrides.
-- **The density budget**, which caps each level and sheds its lowest-priority
-  survivors *by size* — the same inversion the ladder corrects. Pair with
-  `--no-density-drop`, or with `--sort-key` on the same column so the budget
-  ranks the way the ladder does. tylertoo warns when a ladder runs with the
-  budget on and no sort key.
+- Simplification can collapse small geometry below tolerance.
+  `--magnitude-ladder` and `--entry-zoom` therefore imply `--collapse` to
+  retain representative points. `--collapse-square` overrides this.
+- The density budget's size fallback can discard small, high-value survivors. Pair the
+  ladder with `--no-density-drop`, or with `--sort-key` on the same column so
+  the budget ranks the way the ladder does. tylertoo warns when a ladder runs
+  with the budget on and no sort key.
 
-With the budget off, the staircase is exact — each rank appears at its own
-zoom and at none before it, and every rank already admitted stays:
+With the budget off, each rank appears at its entry zoom and stays at finer
+zooms:
 
 ```
 zoom     rank 4  rank 3  rank 2  rank 1  rank 0   (0 = highest value)
@@ -764,159 +665,138 @@ z4          250     192     176     160     160
 
 ### Relation to tippecanoe
 
-This is tippecanoe's per-feature `tippecanoe.minzoom`, the one attribute-driven
-thinning lever it offers. tippecanoe takes the minzoom as an input attribute;
-`--magnitude-ladder` additionally *derives* one from a column, which is what
-callers were doing by hand upstream of it.
+The ladder corresponds to tippecanoe's per-feature `tippecanoe.minzoom`
+attribute. `--magnitude-ladder` also derives entry zooms from a column.
 
 ---
 
 ## Ranking: which feature wins a cell
 
-When several features compete for one grid cell, the **winner** is the
-highest-priority feature. Priority tiers (spec §3.5, Q1), highest first:
+The highest-priority feature wins each grid cell. Priority uses these tiers,
+highest first (spec §3.5, Q1):
 
-1. `--sort-key COL` — a numeric column (e.g. population, importance).
-2. `--class-rank COL:VAL=RANK,…` — an explicit categorical map (e.g.
-   `road_class:motorway=5,primary=4,residential=2`). Unlisted values rank below
-   every listed one but above nulls.
-3. **Auto-detect** (unless `--no-auto-rank`): Overture roads (`class`/
-   `road_class`) get a built-in motorway→…→service ranking; Overture places get
-   `confidence`.
-4. **Size fallback**: larger bbox diagonal wins, ties broken by a deterministic
-   hash (fair/random, tippecanoe-like).
+1. `--sort-key COL`: a numeric column, such as population or importance.
+2. `--class-rank COL:VAL=RANK,…`: an explicit categorical map, such as
+   `road_class:motorway=5,primary=4,residential=2`. Unlisted values rank
+   below every listed one but above nulls.
+3. **Automatic detection**, unless you pass `--no-auto-rank`. Overture roads
+   (`class` or `road_class`) get a built-in motorway-to-service ranking, and
+   Overture places rank by `confidence`.
+4. **Size fallback**: the larger bbox diagonal wins, and a deterministic hash
+   breaks ties, as in tippecanoe.
 
-Ranking does not change *how many* features survive (that's thinning), only
-*which* ones. For road networks, a good ranking is what keeps highways visible
-at coarse zooms instead of a random scatter of residential streets. The tier
-used is recorded in the footer `generalization.ranking` provenance.
+Ranking selects survivors; thinning sets their count. For roads, ranking
+keeps highways visible at coarse zooms. The
+`generalization.ranking` provenance in the footer records the tier used.
 
 `--sort-key` and `--class-rank` are mutually exclusive.
 
-**Unrankable values.** A null ranks below every real key: a feature with no key
-still appears, it just loses any cell it contests to one that has a key. A NaN
-or infinity in a numeric column ranks the same way — those are how float
-columns usually spell nodata, and neither is a priority anything can compare
-against. Such a row is never dropped for it; it competes as a keyless feature.
-The entry-zoom ladder reads its column by the same rule, so a non-finite value
-is no rung. `--accumulate` is aggregation rather than ranking and is one notch
-looser: a NaN is skipped there too, but an infinity is a real summand (see
-[Clustering](#clustering---cluster---accumulate-attribute)).
+Nulls, NaNs, and infinities rank below every real key. Their rows remain
+eligible but lose cells contested by keyed features. The entry-zoom ladder
+uses the same rule: non-finite values get no rung. `--accumulate-attribute`
+skips NaNs but includes infinities (see
+[Clustering](#clustering-cluster-accumulate-attribute)).
 
 ---
 
 ## Density budget: `--drop-rate`, `--drop-gamma`, `--no-density-drop`
 
-Cell-winner thinning (above) stops binding once its grid cell is smaller than
-the typical feature spacing: from roughly z9 up, *every* feature wins its own
-cell, so per-level counts plateau at ~the whole dataset. On Portland roads that
-plateau is 2–3× tippecanoe's feature count at z9–z11 (see
-`corpus/SWEEPS.md`) — visual clutter, and the main driver of duplicating
-mode's storage overhead.
+Once thinning cells are smaller than typical feature spacing, almost every
+feature wins a cell. Counts plateau near the input count, often from z9 up.
+On Portland roads, this is 2–3× tippecanoe's count at z9–z11 and accounts
+for much of duplicating mode's storage overhead.
 
-The **density budget** fixes this the way tippecanoe does: after cell-winner
-thinning, each level is capped at a feature **budget** that decays geometrically
-toward coarse zooms, and the lowest-priority survivors (same
-[ranking](#ranking-which-feature-wins-a-cell) order) are dropped until the level
-meets its budget.
+The density budget caps survivors after thinning, decreasing geometrically
+toward coarse levels. It drops the lowest-priority features in
+[ranking](#ranking-which-feature-wins-a-cell) order:
 
 ```
 budget(level) = N / drop_rate ^ (finest_level − level)      (N = input features)
 keep(level)   = min(cell_winner_survivors(level), budget(level))
 ```
 
-The finest (canonical) level keeps everything (never dropped, spec §2.4). The
-cut is a *ceiling*: a level already sparser than its budget — every coarse zoom,
-where cell-winner did the thinning — is untouched, so the budget only bites the
-mid-zoom plateau.
+The canonical level keeps everything (spec §2.4). Levels below their budget
+stay unchanged, typically including coarse zooms where thinning already
+limits counts.
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
 | `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
 | `--drop-gamma F` | `1.5` | exponent (≥1) | **bigger = more sparse-area protection** |
-| `--no-density-drop` | off | flag | disables the budget (pre-Q2 behavior) |
+| `--no-density-drop` | off | flag | disables the budget |
 
-**`--drop-rate`** is the strength knob. Each coarser level keeps `1/rate` of the
-next finer one. BIGGER ⇒ coarse levels shed harder (sparser mid zooms, smaller
-files); SMALLER ⇒ gentler. The default `1.65` was calibrated on Portland roads
-(`corpus/SWEEPS.md`): it brings z9 to 1.21× and z10 to 1.03× tippecanoe
-(z11 lands at 0.67×, a storage win) and leaves z8 and the coarse zooms
-essentially at their cell-winner counts.
+### Drop rate
 
-> **Why 1.65, not tippecanoe's 2.5?** Our budget anchors on the *full canonical
-> count* `N` (every feature appears at the finest level), whereas tippecanoe's
-> `-rate` is relative to a per-tile basezoom count. So an equivalent per-level
-> thinning lands at a smaller numeric rate. `2.5` here over-thins hard (Portland
-> z9–z13 all drop below tippecanoe).
+Each coarser level has `1/rate` of the next finer level's budget. Raise
+`--drop-rate` for sparser mid zooms and smaller files. The default `1.65`
+comes from Portland roads. It brings z9 to 1.21× and z10 to 1.03× tippecanoe's
+counts and puts z11 at 0.67×. It leaves z8 and the coarse zooms near their
+cell-winner counts
+([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
 
-**Spatial fairness (`--drop-gamma`).** A global rank-ordered cut would empty
-sparse rural areas to keep dense cities under budget. Instead the per-level
-budget is shared across coarse **super-cells** (`128 × GSD` neighborhoods): each
-super-cell keeps its top-priority features up to an allocation
-`∝ population^(1/gamma)`, water-filled so no cell gets more than it has.
-`gamma = 1` is a proportional cut (every neighborhood keeps the same fraction);
-`gamma > 1` is **sublinear** — dense neighborhoods keep proportionally fewer,
-sparse ones proportionally more (protected). This is exactly tippecanoe's
-`-g`/gamma dot-dropping ("reduce dots to the `1/gamma` power in dense areas")
-applied per super-cell. `--drop-gamma` does **not** change per-level totals (it
-only redistributes *which* features survive spatially), so it is independent of
-`--drop-rate`.
+tylertoo anchors its budget on the full canonical count `N`; tippecanoe's
+`-rate` uses a per-tile basezoom count. Equivalent thinning therefore needs
+a smaller rate here. At `2.5`, Portland's z9–z13 counts fall below
+tippecanoe's.
 
-⚠️ **Interaction — points may not feel the budget.** The budget applies to
-points, lines and polygons alike, but points are already thinned hard by
-`--point-thinning` (default 4). On a large point dataset (e.g. NYC POIs) the
-cell-winner point counts often sit *below* the N-anchored budget at every zoom,
-so `--drop-rate` rarely binds; point over-retention is better addressed with
-point clustering (spec Q4). Lines and polygons (thinning factor 1) are where the
-budget does the most work.
+### Spatial fairness
 
-**`--no-density-drop`** turns the budget off entirely, reverting to pure
-cell-winner thinning (the pre-Q2 behavior) and a byte-identical footer.
+`--drop-gamma` protects sparse areas by distributing the budget across
+`128 × GSD` super-cells. Each keeps its highest-priority features up to an
+allocation `∝ population^(1/gamma)`. Water-filling reallocates unused
+capacity so no cell gets more than it has:
 
-Only the mid-zoom plateau is affected. The chosen drop mechanism + parameters
-are recorded in the footer `geo:overviews` → `generalization.density_drop`
-provenance (`drop_rate`, `gamma`, `supercell_gsd_factor`); a disabled run omits
-the block.
+- `gamma = 1` is a proportional cut: every neighborhood keeps the same
+  fraction.
+- `gamma > 1` is **sublinear**: dense neighborhoods keep proportionally fewer
+  features, and sparse ones proportionally more.
+
+This is tippecanoe's `-g` gamma dot-dropping ("reduce dots to the `1/gamma`
+power in dense areas"), applied per super-cell. `--drop-gamma` does **not**
+change per-level totals. It only redistributes *which* features survive
+spatially, so it is independent of `--drop-rate`.
+
+Points often stay below the budget because `--point-thinning` (default 4)
+already removes many, as with New York City points of interest. Changing
+`--drop-rate` then has little effect; use
+[clustering](#clustering-cluster-accumulate-attribute). Lines and polygons
+use thinning factor 1, so the budget usually affects them more.
+
+**`--no-density-drop`** turns the budget off, leaving pure cell-winner
+thinning and a footer without the budget block. It affects only the mid-zoom
+plateau. The `geo:overviews` → `generalization.density_drop` provenance in
+the footer records the mechanism and its parameters (`drop_rate`, `gamma`,
+`supercell_gsd_factor`).
 
 ---
 
 ## Clustering: `--cluster`, `--accumulate-attribute`
 
-By default a point that loses its thinning-grid cell simply does not appear at
-that level — the survivor says nothing about how many features it stands for.
-**`--cluster`** (opt-in, duplicating mode only) makes the survivor **absorb**
-its cell's losers instead:
+`--cluster` (opt-in, duplicating mode only) counts points that lose their
+thinning cell under the winner:
 
-- Every output row gains a **`point_count`** INT64 NOT NULL column — the
-  number of source features the row represents at its level (the tippecanoe /
-  supercluster convention). At the canonical (finest) level every value is 1;
-  lines and polygons always carry 1 (clustering only applies to points).
-- The winner keeps its **own geometry and attribute values** — clusters are
-  anchored on a real feature, not moved to a centroid (a deliberate divergence
-  from supercluster's re-centering: deterministic, and the anchor stays a real
-  place).
-- Absorption is **per level**: a point absorbed at z4 may itself be a winner
-  at z6 with its own (smaller) cluster. At each level,
-  `sum(point_count) == total source point count` — the clusters partition the
+- Every output row gains `point_count` (`INT64 NOT NULL`), the number of
+  source features it represents, following tippecanoe and supercluster.
+  Canonical rows, lines, and polygons always carry 1.
+- Winners keep their own geometry and attributes. Unlike supercluster's
+  centroids, these deterministic anchors remain at real features.
+- Clusters are computed per level. A point absorbed at z4 may win at z6
+  with its own smaller cluster. At each level,
+  `sum(point_count) == total source point count`: the clusters partition the
   dataset at every level's grid.
 
-Use it for graduated-dot rendering of dense point data (POIs, addresses): the
-client scales the symbol by `point_count` instead of drawing a misleadingly
-sparse constant-size dot field.
+For dense points such as places or addresses, scale symbols by
+`point_count` to show how many features each represents.
 
-**Clustering changes the `--point-thinning` default from 4.0 to 16.0.** With
-thin-only output a coarse grid *discards* data, so the default stays dense;
-with clustering the losers are summarized into `point_count`, so a sparser
-grid is pure win and gives the familiar graduated-cluster look (supercluster's
-default radius is ~40 px; 16 × GSD ≈ one dot per ~16 display pixels). Chosen
-from the NYC pt={4,16,48} sweep — each 4× step in the factor shifts the whole
-density ladder two zooms. Pass `--point-thinning` explicitly to override in
-either mode.
+Clustering changes the `--point-thinning` default from 4.0 to 16.0.
+Counts retain the discarded points' contribution, allowing a sparser grid.
+16 × GSD gives about one dot per 16 display pixels; supercluster's default
+radius is about 40 px. In the New York City sweep over factors 4, 16, and
+48, each 4× step shifted the density ladder by two zooms. An explicit
+`--point-thinning` overrides either default.
 
-**`--accumulate-attribute COL:OP`** (repeatable; requires `--cluster`)
-aggregates a numeric column across each cluster: the winner's value of `COL`
-becomes the `OP` over itself + everything it absorbed at that level. Ops:
-`sum`, `max`, `min`, `mean`. Examples:
+`--accumulate-attribute COL:OP` (repeatable, requires `--cluster`) replaces
+the winner's numeric value with the cluster's `sum`, `max`, `min`, or `mean`:
 
 ```bash
 tylertoo overview places.parquet places_overview.parquet \
@@ -926,70 +806,58 @@ tylertoo overview places.parquet places_overview.parquet \
   --accumulate-attribute confidence:mean
 ```
 
-Notes:
+### Aggregation and counts
 
-- Aggregates are computed **per level from source values** (never from
-  already-aggregated coarser values), so `mean` is exact at every level.
-- Null values don't contribute; a cluster whose members are all null keeps
-  the winner's null. Non-accumulated columns keep the winner's own values.
-- A **NaN** doesn't contribute either — it is nodata far more often than a
-  value, and one would poison every aggregate it touched. It is not counted
-  as a contributor, so `mean` is the mean of the real values. **Infinities
-  are kept**: `±inf` is an ordinary summand here, so `value:max` over
-  `{1.0, +inf}` is `+inf` at every level, agreeing with the canonical level,
-  which carries the source value verbatim.
-- Aggregation is computed in `f64` and written back in the column's original
-  type; a `mean` over an integer column rounds to the nearest integer
-  (prefer float columns for `mean`).
-- The column must exist and be numeric — the conversion fails early otherwise.
-- Interaction with the density budget: a budget-deferred cell winner leaves
-  its cell without a representative; those features attach to the **nearest
-  surviving point** at that level, so counts still sum correctly.
-- **Partitioning mode is rejected.** A partitioning row is read at many zooms
-  (prefix reads) but exists at exactly one level, so a single stored
-  `point_count` cannot reflect every zoom's grid — and absorbed features
-  reappear as their own rows at finer levels while remaining counted in
-  coarser winners, double-counting every prefix sum.
+- tylertoo computes aggregates **per level from source values**, never from
+  coarser aggregates, so `mean` is exact at every level.
+- Nulls do not contribute. A cluster whose members are all null keeps the
+  winner's null. Non-accumulated columns keep the winner's own values.
+- NaNs do not contribute or count toward the mean.
+- **Infinities count.** `±inf` is an ordinary summand, so `value:max` over
+  `{1.0, +inf}` is `+inf` at every level. That agrees with the canonical
+  level, which carries the source value verbatim.
+- Aggregation runs in `f64` and writes back in the column's original type. A
+  `mean` over an integer column rounds to the nearest integer, so prefer float
+  columns for `mean`.
+- The column must exist and be numeric, or the conversion fails early.
+- **The density budget** can defer a cell winner and leave its cell without a
+  representative. Those features attach to the **nearest surviving point** at
+  that level, so the counts still sum correctly.
+- Partitioning mode is rejected: a row serves several zooms through prefix
+  reads, but one stored count cannot describe every zoom's grid. Finer rows
+  would also double-count points already absorbed by coarse winners.
 
-Clustering is recorded in the footer `geo:overviews` →
-`generalization.clustering` provenance (`enabled`, `point_count_column`,
-`accumulated: [{column, op}]`); `tylertoo validate` checks that the column
-exists as INT64 NOT NULL and that canonical-level values are all 1.
+The `geo:overviews` → `generalization.clustering` provenance in the footer
+records clustering (`enabled`, `point_count_column`, `accumulated: [{column, op}]`).
+`tylertoo validate` checks that the column exists as `INT64 NOT NULL` and that
+canonical-level values are all 1.
 
 ---
 
 ## Line coalescing: `--no-coalesce-lines`, `--coalesce-junction-angle`, `--coalesce-snap`, `--coalesce-max-level-rows`
 
-At coarse levels a line network (roads, rivers) can degrade into scattered
-dashes: a segment whose bbox diagonal is below the visibility gate
-(`--line-visibility × gsd`) is dropped outright, and cell-winner thinning
-keeps disconnected fragments of what remains. Selection is smart;
-*continuity* is destroyed.
+Short road or river segments can disappear below the visibility gate
+(`--line-visibility × gsd`), leaving disconnected fragments after thinning.
+Line coalescing, on by default, joins touching compatible segments into
+stroke LineStrings before gates and thinning at each non-canonical
+duplicating level. Pass `--no-coalesce-lines` to disable it.
 
-Line coalescing is therefore **ON by default** (maintainer render review
-2026-07-03 — like `--line-thinning 1.0` and the clustered point grid,
-defaults should look right; pass **`--no-coalesce-lines`** to opt out). It
-chains touching compatible segments into single "stroke" LineStrings at
-each non-canonical duplicating level, **before** the gate and thinning
-run:
-
-- A chain of individually sub-visibility segments survives as **one long
-  visible artery** — the gate evaluates the chain's extent, not each
-  fragment's. This ordering is the entire payoff.
-- Chains never merge **across class values** (when a class ranking is
-  active — explicit `--class-rank` or auto-detected Overture
-  `class`/`road_class`). With no class ranking, all lines are compatible.
-- **Junctions** (3+ compatible endpoints meeting) terminate chains by
-  default, preserving network topology. `--coalesce-junction-angle` (see
-  below) can optionally continue the best-aligned pair through them.
-- The merged feature keeps the **attributes of its highest-priority
-  member** (same class-rank → size → hash order as the cell-winner stage)
-  and the output gains a **`coalesced_count`** INT32 NOT NULL column
-  (source segments merged per row; 1 for unmerged rows and everywhere at
-  the canonical level, which is never coalesced). It is withheld from tiles
-  when it is 1 everywhere — nothing was merged, so it says nothing about
-  the data (#379); the overview file keeps it.
-- Points and polygons are untouched. MultiLineString rows pass through
+- The gate tests a chain's extent, allowing short segments to survive
+  together as one visible line.
+- Chains never merge **across class values** when a class ranking is active,
+  whether an explicit `--class-rank` or an automatically detected Overture
+  `class` or `road_class`. With no class ranking, all lines are compatible.
+- **Junctions**, where three or more compatible endpoints meet, end chains by
+  default and preserve network topology. `--coalesce-junction-angle` can
+  continue the most closely aligned pair through them.
+- The merged feature keeps the **attributes of its highest-priority member**,
+  in the same class-rank, size, and hash order as the cell-winner stage. The
+  output gains a **`coalesced_count`** `INT32 NOT NULL` column: the number of
+  source segments merged into the row. It is 1 for unmerged rows and for every
+  row at the canonical level, which never coalesces. Tiles omit the column
+  when it is 1 everywhere, since it then says nothing about the data. The
+  overview file keeps it.
+- Points and polygons stay untouched. MultiLineString rows pass through
   unmerged.
 
 ```bash
@@ -997,231 +865,187 @@ run:
 tylertoo overview roads.parquet roads_overview.parquet \
   --min-zoom 0 --max-zoom 14
 
-# Opt out (pre-Q3 behavior, no coalesced_count column):
+# Opt out (no coalesced_count column):
 tylertoo overview roads.parquet roads_overview.parquet \
   --min-zoom 0 --max-zoom 14 --no-coalesce-lines
 ```
 
 ### `--coalesce-junction-angle` (default 0 = off, degrees)
 
-By default chains stop at junctions (strict degree-2 chaining) — the
-Portland sweep (`corpus/data/bench/q3/portland-roads-junction{00,30}.pmtiles`,
-maintainer review 2026-07-03) found this renders better than junction
-continuation, which over-merges. Set an angle to opt in: at each junction
-the best-continuing pair of lines merges when its deviation from a
-straight continuation is at most this angle, best pair first (a 4-way
-crossing continues **both** through-streets). BIGGER = chains bend
-further through junctions (fewer, longer strokes; z0–z1 gain giant
-arterial strokes on Portland at 30°) at the cost of merging through
-genuine turns and smearing attributes across crossings.
+Chains stop at junctions by default, which rendered better in the Portland
+sweep. An angle allows the straightest pair to continue if its deviation
+is within the limit, then repeats for the next pair. Both through-streets
+can continue across a four-way crossing. Larger angles give fewer, longer
+strokes but can merge real turns and smear attributes across crossings.
+At 30°, Portland's z0–z1 gains large arterial strokes.
 
 ### `--coalesce-snap` (default 1.0, GSD multiples)
 
-Exactly-touching endpoints always chain (Overture/OSM segments share exact
-node coordinates). The snap pass additionally joins chain ends within
-`factor × gsd` of each other — two endpoints closer than one ground sample
-are indistinguishable at that level. BIGGER bridges larger digitization
-gaps but risks fusing the ends of nearby parallel lines; `0` disables the
-snap pass (exact matches only).
+Exact endpoint matches always chain, including shared Overture and
+OpenStreetMap nodes. Snapping also joins chain ends within `factor × gsd`.
+Raise the factor to bridge larger gaps, at the risk of joining nearby
+parallel lines. `0` leaves exact matches only.
 
 ### `--coalesce-max-level-rows` (default 2,000,000): memory guard
 
-Chaining needs a level's candidate line geometries in memory at once, and
-the candidate set at every non-canonical level is **all** lines (dropped
-fragments must be reclaimable, so no winner-table pre-filter applies).
-Datasets over this ceiling skip coalescing with a warning — the file still
-carries the `coalesced_count` column (all 1) and the provenance block, so
-the overview schema is stable (the tiles then withhold the column, as for
-any all-1 counter). Levels that large are near-canonical anyway, where
-segments are individually visible and coalescing matters least. This is the
-streaming pipeline's one deliberate `O(lines)` residual allocation.
+Chaining holds all candidate line geometries in memory, including fragments
+otherwise dropped. Above either limit below, tylertoo skips coalescing and
+warns which limit was exceeded. The overview keeps `coalesced_count` (all 1)
+and provenance; tiles omit the all-1 column. Large levels tend to be near
+canonical, where individual segments are visible and coalescing matters
+less. This allocation is `O(lines)` even in streaming mode.
 
-**The ceiling has two limbs**, because a row count does not bound memory
-(modelled: 2M two-point road segments retain 168 MiB, 2M 500-vertex contour
-lines ~15 GiB). Coalescing is skipped when **either** is exceeded:
+The guard checks both rows and modeled bytes. For 2M lines, the model
+estimates 168 MiB for two-point roads but about 15 GiB for 500-vertex
+contours:
 
-| limb | default | what it counts |
+| Limit | Default | What it counts |
 |------|---------|----------------|
 | candidate lines | `--coalesce-max-level-rows` (2,000,000) | line features in the input |
-| retained geometry | `--coalesce-max-level-rows × 512 B` (1.024 GB ≈ 977 MiB, "≈1 GB") | a fixed model: 56 B slot + 16 B per vertex, per line |
+| retained geometry | `--coalesce-max-level-rows × 512 B` (1.024 GB, about 977 MiB) | a fixed model: a 56 B slot plus 16 B per vertex, per line |
 
-The byte limb is a **model**, not a measurement: a pure function of the
-vertex counts, so the verdict never depends on the machine, allocator or
-`geo` version. Real resident memory runs higher — allocator headers, `Vec`
-growth slack and side vectors add ~100–120 B per line — so the default
-ceiling is ≈1 GB modelled but **≈1.2 GiB resident** when the byte limb is
-what binds (and short lines are the worst ratio: 2M two-point segments model
-at 168 MiB but measured ~400 MiB resident in the #569 review).
+The byte model depends only on vertex counts, independent of the machine,
+allocator, or `geo` version. Allocator headers, `Vec` slack, and side vectors
+add about 100–120 B per line: the default 1 GB modeled limit means about
+1.2 GiB resident. Short lines have more overhead relative to geometry;
+2M two-point segments measured about 400 MiB resident against 168 MiB modeled.
 
-**When the byte limb binds — and changes output.** 512 B/line is
-56 + 16 × 28.5, so the byte limb trips *before* the row limb on inputs whose
-lines average **more than ~28 vertices** — concretely, fewer than 2M lines
-that together carry more than ~57–64 million vertices (2M lines × 29
-vertices, 1M × 61, 250k × 253). Up to #449 the guard counted rows only, so
-**these inputs used to be coalesced and now are not** — the one intended
-output change of that fix:
+The byte limit binds first when lines average more than about 28 vertices
+(`512 = 56 + 16 × 28.5`). Depending on line count, about 57–64M vertices
+cross it: 2M lines at 29 vertices, 1M at 61, or 250k at 253.
 
 - *Not affected:* road networks split at intersections. Overture
-  transportation segments average ≈8 vertices (≈190 B modelled); the row
-  limb is what binds for them, exactly as before.
-- *Affected:* **unsplit** line data — OSM ways as whole ways, rivers and
-  streams, admin and coastline boundaries, contour lines, GPS tracks — once
-  there are enough of them to cross ≈1 GB modelled.
+  transportation segments average about 8 vertices (about 190 B modeled), so
+  the row limb binds for them.
+- *Affected:* **unsplit** line data, once there are enough lines to cross
+  about 1 GB modeled. Examples include OpenStreetMap ways kept whole, rivers,
+  streams, administrative boundaries, coastlines, contour lines, and GPS
+  tracks.
 
-To coalesce such an input anyway, raise `--coalesce-max-level-rows`: it
-scales both limbs together (4,000,000 → 4M lines / 2.048 GB modelled). The
-cost is that much more resident line geometry (≈1.2× the modelled figure)
-**plus** the chain-stage peak below, which is a large multiple of it — so
-size the box first, or leave coalescing off for those layers
-(`--no-coalesce-lines`). The skip warning names which limb tripped.
+Raise `--coalesce-max-level-rows` to scale both limits: 4,000,000 permits
+4M lines or 2.048 GB modeled. Allow about 1.2× modeled bytes for resident
+geometry, plus the larger chain-stage peak below, or disable coalescing.
 
-(#569's benchmark "germany-segments proxy" used 6M synthetic 37-vertex lines
-— 648 B modelled each, so a set of them trips the byte limb from ~1.58M
-lines up to the 2M row ceiling. At 6M lines the row limb trips first, as it
-does on the real 19.2M-line germany-segments; the proxy's vertex count is not
-a claim about typical road segments.)
+Both limbs are pure functions of the input, so the verdict and the output are
+identical across machines, engines (`--no-streaming` or not), and
+`--read-batch-size` values. Pass 1 enforces the limbs *while it collects*:
+the moment the running totals cross, it frees what it has buffered and falls
+back to counting. On a 6M-line synthetic input, that cut the macOS peak
+memory footprint from 4890 to 1157 MiB with byte-identical output.
 
-Both limbs are pure functions of the input, so the verdict — and the output
-— is identical across machines, engines (`streaming` on or off) and
-`--read-batch-size` values. Pass 1 enforces them *while it collects*:
-the moment the running totals cross, it frees what it has buffered and
-falls back to counting (#449). Before that, an over-ceiling input paid for
-the whole buffer and then threw it away. Measured: the real
-germany-segments input (19.2M lines) peaked at **11.9 GiB** before the fix
-(#449), for a run that emits no chains at all. The "after" figure is from
-the 6M-line synthetic proxy, not the real input: macOS peak memory
-footprint **4890 → 1157 MiB** (−76 %, byte-identical output); the real
-input's post-fix peak is an extrapolation, not a measurement.
+#### Chain-stage memory
 
-**What the guard does not bound** is the chain stage itself, on inputs that
-*are* inside the ceiling. Every overview level runs it over the whole line
-scratch, and pass 1 runs it for every planned level (a level's row count is
-its chain count, which the level plan needs before pass 2). Since #570 an
-unmerged line borrows its coordinates instead of copying them, endpoints are
-grouped by a sort instead of a hash map of vectors, and pass 2 reuses the
-tables pass 1 built instead of running the stage a second time.
+The guard does not bound chaining itself. Pass 1 chains the whole line
+scratch for every planned level to obtain the row counts needed by the plan.
+Pass 2 reuses those tables.
 
 The levels run in parallel, in waves sized against the `--profile` memory
-budget (60 % of available RAM under `auto`/`bounded`, unbounded under
-`speed`): at most `budget / (2 × modelled line bytes)` levels at once, and
-never fewer than one. A tighter budget costs wall time, never output.
-Measured on Linux (`/usr/bin/time -v` max RSS), 1.5M 7-vertex lines in
-chains of ten (240 MiB modelled):
+budget: 60% of available RAM under `auto` and `bounded`, unbounded under
+`speed`. At most `budget / (2 × modeled line bytes)` levels run at once, and
+never fewer than one. A tighter budget costs wall time, never output. Peak RSS
+on Linux (`/usr/bin/time -v`) for 1.5M 7-vertex lines in chains of ten
+(240 MiB modeled):
 
-| run | before #570 | #570, unbounded budget | #570, budget capped |
-|---|---|---|---|
-| `tiles`, z0–z14 | 5340 MiB, 80 s | 4667 MiB, 19 s | 3525 MiB, 19 s (8 GB RAM, 9 levels per wave) |
-| `overview` defaults (6 of 7 levels empty) | 1227 MiB, 24 s | 2386 MiB, 2.4 s | 1373 MiB, 5.6 s (2.5 GB RAM, 2 levels per wave) |
-| `tiles --plan-only` | 1437 MiB, 50 s | 4973 MiB, 4.6 s | 1845 MiB, 9.6 s (2.5 GB RAM, 2 levels per wave) |
+| run | unbounded budget | capped budget |
+|---|---|---|
+| `tiles`, z0–z14 | 4667 MiB, 19 s | 3525 MiB, 19 s (8 GB RAM, 9 levels per wave) |
+| `overview` defaults (6 of 7 levels empty) | 2386 MiB, 2.4 s | 1373 MiB, 5.6 s (2.5 GB RAM, 2 levels per wave) |
+| `tiles --plan-only` | 4973 MiB, 4.6 s | 1845 MiB, 9.6 s (2.5 GB RAM, 2 levels per wave) |
 
-The same input with `--no-coalesce-lines` peaks at 935 MiB (`tiles`,
-z0–z14). With RAM to spare, the parallel levels trade memory for time: a
-run whose coarse levels come out empty can peak higher than before #570,
-because pass 2 used to build only the levels that had rows, while pass 1
-cannot know which levels are empty until it has run them. Under memory
-pressure the budget caps the waves. To force the lowest peak, set
-`TYLERTOO_AUTO_MEM_LIMIT_BYTES` low (one level per wave), or pass
-`--no-coalesce-lines`.
+With `--no-coalesce-lines`, the same `tiles` z0–z14 run peaks at 935 MiB.
+Pass 1 must chain levels before it can know they are empty. For the lowest
+peak, set `TYLERTOO_AUTO_MEM_LIMIT_BYTES` low enough for one level per wave,
+or disable coalescing.
 
 ### Interactions
 
-- **`--line-visibility` / `--line-thinning`** now act on *chains*: the
-  gate tests the merged extent, and one **chain** (not one segment)
-  survives per thinning cell. Expect coarse levels to show **fewer rows
-  but much more retained line length** than a non-coalesced run.
-- **Class ranking** does double duty: it both prioritizes which chain wins
-  a cell and defines the compatibility groups. `--no-auto-rank` (or a
-  numeric `--sort-key`) makes all lines compatible — fine for
-  single-class datasets (rivers), usually wrong for mixed road networks.
-- **Density budget (Q2)** applies to **chains**: after gate + thinning,
-  each level keeps at most `num_lines / drop_rate^(finest − level)` chains
-  (same geometric ladder, floor, and spatial-fairness gamma as the
-  point/polygon budget), cutting the lowest-priority chains first. Without
-  this the reclaimed fragments would re-inflate exactly the mid-zoom
-  counts the budget was calibrated to cap. `--no-density-drop` disables
-  the chain budget too. Points and polygons keep the row-level budget as
-  usual.
-- **Partitioning mode: inert.** Partitioning places each feature exactly
-  once with geometry verbatim; a merged chain is a new geometry replacing
-  several source rows, which that contract cannot represent. Since
-  coalescing is on by default, partitioning conversions simply proceed
-  without it (no `coalesced_count` column, no provenance, info log); an
-  explicit `--coalesce-lines` with `--mode partitioning` is rejected.
+- **`--line-visibility` and `--line-thinning`** act on *chains*. The gate
+  tests the merged extent, and one **chain**, not one segment, survives per
+  thinning cell. Expect coarse levels to show **fewer rows but much more line
+  length** than a run without coalescing.
+- **Class ranking** does double duty: it picks which chain wins a cell and
+  defines the compatibility groups. `--no-auto-rank`, or a numeric
+  `--sort-key`, makes all lines compatible. That suits single-class datasets
+  such as rivers and is usually wrong for mixed road networks.
+- **The density budget** applies to **chains**. After the gate and thinning,
+  each level keeps at most `num_lines / drop_rate^(finest − level)` chains,
+  with the same ladder, floor, and spatial-fairness gamma as the point and
+  polygon budget, cutting the lowest-priority chains first. Without it, the
+  reclaimed fragments would re-inflate the mid-zoom counts the budget caps.
+  `--no-density-drop` disables the chain budget too. Points and polygons keep
+  the row-level budget.
+- **Partitioning mode: inert.** Partitioning places each feature exactly once
+  with verbatim geometry. A merged chain is a new geometry replacing several
+  source rows, which that contract cannot represent. Partitioning conversions
+  run without coalescing (no `coalesced_count` column, no provenance, an
+  `info` log line). An explicit `--coalesce-lines` with
+  `--mode partitioning` is an error.
 
-Coalescing is recorded in the footer `geo:overviews` →
-`generalization.coalescing` provenance (`enabled`,
-`snap_tolerance_gsd_factor`, `junction_angle`, `max_level_rows`,
-`coalesced_count_column` — the complete knob set, spec §13.4); `tylertoo
-validate` checks that the column exists as INT32 NOT NULL, all values are
->= 1, and canonical-level values are all 1.
+The `geo:overviews` → `generalization.coalescing` provenance in the footer
+records the complete knob set (`enabled`, `snap_tolerance_gsd_factor`,
+`junction_angle`, `max_level_rows`, and `coalesced_count_column`, per spec §13.4).
+`tylertoo validate` checks that the column exists as `INT32 NOT NULL`, that
+every value is at least 1, and that canonical-level values are all 1.
 
 ---
 
 ## Reserved column names
 
-tylertoo appends its own columns to the intermediate overview GeoParquet, and
-those names are reserved. A source column whose name collides (comparison is
-case-insensitive) is **renamed** by appending `_`, looping until the name is
-free — `level` → `level_`, `LEVEL` → `LEVEL_`, `level_` → `level__`. The
-reserved column is authoritative.
+tylertoo reserves names for its appended overview columns, ignoring case.
+A colliding source name gains `_` suffixes until free:
+`level` becomes `level_`, `LEVEL` becomes `LEVEL_`, and `level_` becomes
+`level__`. The reserved column is authoritative.
 
 | Reserved name | Reserved when | Reaches MVT? |
 |---|---|---|
-| `level` | always | **no** — dropped from tile properties |
+| `level` | always | **no**: dropped from tile properties |
 | `point_count` | `--cluster` | yes |
-| `coalesced_count` | line coalescing (on by default) | yes, unless 1 on every row (then withheld from tiles; the overview file keeps it) |
+| `coalesced_count` | line coalescing (on by default) | yes, unless 1 on every row (then omitted from tiles, but kept in the overview file) |
 
-A rename is logged at `warn`:
+tylertoo logs a rename at `warn`:
 
 ```
 input column "level" collides with the reserved overview column "level";
 renaming the input column to "level_" in the output
 ```
 
-**In PMTiles output the source name is given back where it is free** (#359).
-Because tylertoo's own `level` never reaches MVT properties, a source `level`
-is published in tiles as `level` — the rename stays an implementation detail of
-the intermediate GeoParquet, which is the only place the collision is real:
+Export restores source names when free. tylertoo's `level` never reaches
+vector tile (MVT) properties, so a source `level` is restored in tiles:
 
 ```
 overview.parquet:   level_ (your data)  +  level (tylertoo's)
 out.pmtiles:        level  (your data)
 ```
 
-This also holds for a standalone `export-pmtiles` run on an overview file
-written earlier: the rename is recorded in the file footer
-(`geo:overviews.generalization.renamed_columns`, output name → source name), so
-the export does not need the converting run's state.
+The same holds for a standalone `export-pmtiles` run on an earlier overview
+file. The footer records the rename (`geo:overviews.generalization.renamed_columns`,
+output name → source name), so the export does not need the converting run's
+state.
 
-Restoration is conditional. `point_count` and `coalesced_count` *are* real MVT
-properties in the modes that append them, so a column moved aside from one of
-those keeps its renamed name — merging two columns into one tile property would
-be worse than the wrong name. Only names that are genuinely free are restored.
-A `coalesced_count` withheld from the tiles (1 on every row) counts as free, so
-a source `coalesced_count` is then published under its own name.
+Source `point_count` and `coalesced_count` columns keep their renamed names
+when the reserved columns reach MVT. If tylertoo omits an all-1
+`coalesced_count`, the source column regains its original name.
 
 By-name options follow the rename automatically (`--sort-key level`,
-`class_ranking.column`, `--accumulate-attribute`, `--filter`), so you do not
-need to spell the renamed name yourself.
+`class_ranking.column`, `--accumulate-attribute`, `--filter`), so you never
+spell the renamed name yourself.
+
+---
+
 ## Output feature order: `--feature-order`
 
-MVT does not define draw order, but renderers paint features in the order the
-tile lists them. So the order tylertoo writes features in **is** the paint order
-for any style that does not override it — and a style that relies on it will
-render differently against a differently-ordered archive of the same data.
+MVT does not define draw order, but renderers paint features in tile order
+unless a style overrides it. Changing that order can change the map.
 
-**tylertoo's default is input row order**, exactly: the overview file's row
-order, which is the source file's row order restricted to the rows each level
-kept. Measured across z12–z14 on a nested-polygon fixture, the within-tile
-sequence has zero inversions against source row order at every zoom.
+The default is input row order: source order restricted to the rows each
+overview level kept. A nested-polygon fixture at z12–z14 has zero
+within-tile inversions against source order.
 
-**Do not assume tippecanoe matches it.** Tippecanoe's order is incidental
-rather than specified — it varies by zoom and by tile, and on the same input it
-can point the opposite way at some zooms and the same way at others (#361).
-If your style depends on paint order, pin it rather than inheriting it:
+Tippecanoe's order is unspecified and varies by tile and zoom, sometimes
+reversing within one input. Set `--feature-order` when paint order matters:
 
 ```bash
-# Source row order (the default, and what tylertoo has always emitted)
+# Source row order (the default)
 tylertoo tiles in.parquet out.pmtiles --feature-order input
 
 # Sort within each tile by a property: high `level` painted last (on top)
@@ -1231,340 +1055,377 @@ tylertoo tiles in.parquet out.pmtiles --feature-order level -f
 tylertoo tiles in.parquet out.pmtiles --feature-order level:desc -f
 ```
 
-Accepted on both `tiles` and `export-pmtiles`.
+Both `tiles` and `export-pmtiles` accept it.
 
-Sorting by a column is the fix for any nested-polygon choropleth, where the
-small high-value shapes sit inside larger low-value ones and must land on top.
-`--feature-order level` does in the archive what
-`"fill-sort-key": ["get", "level"]` does in every downstream style, so
-consumers do not each have to know.
+For a nested-polygon choropleth, sort small high-value shapes above larger
+low-value shapes. `--feature-order level` sets the archive order equivalent
+to a style's `"fill-sort-key": ["get", "level"]`.
 
-Details that make the result reproducible:
+### Sorting rules
 
 - **Ties keep input order.** The within-tile sort is stable over the
   `(tile, row)` order, so two runs of the same build produce byte-identical
   tiles.
-- **Ordering is per tile.** Nothing moves across tile boundaries; the option
+- **Ordering is per tile.** Nothing moves across tile boundaries. The option
   changes the sequence within a tile and nothing else.
 - **Numeric types compare as numbers.** A column read as an integer in one
   row group and a double in another is one ordering class, not two.
-- **A feature missing the property sorts first** (painted underneath) rather
-  than being dropped. A `NaN` is treated the same way: it is a value no style
-  can rank, so it joins the unrankable features underneath rather than taking
-  an arbitrary place among the numbers.
-- **Sorting is independent of the oversized-tile valve.** When
-  `--max-tile-size` is in force, which features survive is decided by
-  `select_kept_members` (largest-first, or a uniform spatial stride on
-  point-dominated tiles); `--feature-order` then orders the survivors.
+- **A feature missing the property sorts first**, painted underneath, rather
+  than dropping. A `NaN` sorts the same way: no style can rank it, so it joins
+  the unrankable features underneath instead of taking an arbitrary place
+  among the numbers.
+- **Sorting is independent of the oversized-tile valve.** With
+  `--max-tile-size` in force, `select_kept_members` decides which features
+  survive: largest first, or a uniform spatial stride on point-dominated
+  tiles. `--feature-order` then orders the survivors.
+- **The name is the key the tile advertises**, not the schema column name.
+  Export restores a source column renamed to clear a reserved name (see
+  [Reserved column names](#reserved-column-names)), so sort by the *source*
+  name. `--feature-order level` is right for an input with its own `level`
+  column, even though the overview file stores it as `level_`. A column stays
+  renamed when tiles publish the reserved name, as they publish `point_count`
+  under `--cluster`. Name such a column as it appears in the tile.
+- An unpublished column produces a warning listing available property names.
+  All features remain unranked and keep input order.
 
-- **The name is the key the tile advertises**, not the schema column name. A
-  source column renamed on the way in to clear a reserved overview name is
-  restored on export (see [Reserved column names](#reserved-column-names)), so
-  sort by the *source* name: `--feature-order level` is right for an input with
-  its own `level` column, even though the overview file stores it as `level_`.
-  A column that stays renamed — because the reserved name is genuinely
-  published, as `point_count` is under `--cluster` — has to be named as it
-  appears in the tile.
-- **Naming a column the layer does not publish warns and changes nothing.**
-  Every feature is then equally unranked, so the output is input order — which
-  on its own looks exactly like success. The run lists the available property
-  names so a typo is obvious.
-
-`--feature-order input` is the default and costs nothing; naming a column adds
+`--feature-order input` is the default and costs nothing. Naming a column adds
 one stable sort per tile over features already in memory.
 
 ---
 
 ## Stable feature ids: `--feature-id`
 
-Every MVT feature carries an `id`. **Without `--feature-id` that id is
-tile-local**: it is the feature's position within one tile at one zoom, so the
-same building gets a different id in the neighbouring tile and at the next
-zoom. That is enough for an `id` to exist, and not enough for anything that
-keys on it.
+Every MVT feature carries an `id`, defaulting to its position in one tile
+at one zoom. This tile-local id can change across tiles and zooms.
 
 `--feature-id COLUMN` writes the column's value as the feature id instead, on
-every tile and zoom the feature appears in (tippecanoe's
-`--use-attribute-for-id`):
+every tile and zoom the feature appears in. It matches tippecanoe's
+`--use-attribute-for-id`:
 
 ```bash
 tylertoo tiles buildings.parquet buildings.pmtiles --feature-id building_id
 tylertoo export-pmtiles overview.parquet out.pmtiles --feature-id building_id
 ```
 
-With a stable id, MapLibre's feature state works across tile and zoom
-boundaries without `promoteId`: `map.setFeatureState({ source, sourceLayer, id },
-{ hover: true })` highlights the same feature wherever it is drawn, and a join
-of external data keyed on the id stays attached as the map pans and zooms.
-(`promoteId` still works on any property, `--feature-id` or not; the flag
-lets clients that read the MVT id directly skip it.)
+Stable ids let MapLibre feature state and external joins follow a feature
+across tiles and zooms without `promoteId`. For example:
 
-Rules:
+```javascript
+map.setFeatureState({ source, sourceLayer, id }, { hover: true });
+```
 
-- **Integer columns only**: `Int8`..`Int64`, `UInt8`..`UInt64`, or an unscaled
-  `DECIMAL(p,0)`. MVT ids are unsigned 64-bit integers. Tippecanoe also parses
-  numeric strings and integral floats; tylertoo rejects them. A string id —
-  Overture's GERS ids, for example — has no lossless integer form. Cast or hash
-  it to an integer column before tiling (with `gpio` or DuckDB, e.g.
-  `hash(id)::UBIGINT`), and keep the original string as a property if clients
-  need it.
-- **Every row must hold a value in `0..=2^64-1`.** A null, a negative, or an
-  out-of-range decimal fails the export. Unlike tippecanoe, tylertoo does not
-  turn `-5` into `18446744073709551611`. The whole column of the overview file
-  (every level) is checked **before any tile is written**, so the error arrives
-  in seconds. It names the overview file's row and level, not the source row:
-  the convert reorders rows into levels.
-- **The column is moved, not copied.** It becomes the id and is dropped from
-  the tile properties and `vector_layers`, whatever `--include-property` /
-  `--exclude-property` say at export. To keep it as a property as well, carry
-  it under a second name in the source. On `tiles`, the convert step must keep
-  the column, so `--exclude-property` naming it is an error there.
-- **It cannot be the `--feature-order` column** (that sort reads the tile
-  properties the id was moved out of) or an `--accumulate-attribute` column,
-  whose clustered value is a sum or mean of several ids.
-- **Aggregated features keep one member's id.** A cluster (`--cluster`) carries
-  its representative point's id. A coalesced line chain carries its
+`promoteId` still works on any property, with or without `--feature-id`.
+
+### Stable id requirements
+
+- **Integer columns only**: `Int8` to `Int64`, `UInt8` to `UInt64`, or an
+  unscaled `DECIMAL(p,0)`. MVT ids are unsigned 64-bit integers. Tippecanoe
+  also parses numeric strings and integral floats, and tylertoo rejects them.
+  A string id, such as an Overture GERS id, has no lossless integer form. Cast
+  or hash it to an integer column before tiling, with `gpio` or DuckDB (for
+  example `hash(id)::UBIGINT`), and keep the original string as a property if
+  clients need it.
+- Every row must hold a value in `0..=2^64-1`. Nulls, negatives, and
+  out-of-range decimals fail export. Unlike tippecanoe, tylertoo does not
+  wrap `-5` to `18446744073709551611`. It checks every overview level before
+  writing tiles. Errors name the overview row and level, since conversion
+  reorders source rows.
+- **The column moves rather than copies.** It becomes the id and leaves the
+  tile properties and `vector_layers`, whatever `--include-property` and
+  `--exclude-property` say at export. To keep it as a property too, carry it
+  under a second name in the source. On `tiles`, the convert step must keep
+  the column, so an `--exclude-property` naming it is an error there.
+- **It cannot be the `--feature-order` column**, because that sort reads the
+  tile properties the id left. Nor can it be an `--accumulate-attribute`
+  column, whose clustered value is a sum or mean of several ids.
+- **Aggregated features keep one member's id.** A cluster (`--cluster`)
+  carries its representative point's id. A coalesced line chain carries its
   highest-priority member's id. A tiny-polygon placeholder carries its own
-  polygon's id. Ids are not checked for uniqueness; a column with duplicate
-  values gives features that share an id, and feature state then applies to
-  all of them.
+  polygon's id. tylertoo does not check ids for uniqueness. Duplicate values
+  give features that share an id, and feature state then applies to all
+  of them at once.
 
-`pyramid` does not take `--feature-id` yet, and neither does the Python
-`convert()` one-shot. Use `overview()` + `export_pmtiles(..., feature_id=...)`
-instead.
+`pyramid` does not take `--feature-id`, and neither does the Python
+`convert()` one-shot. Use `overview()` and then
+`export_pmtiles(..., feature_id=...)` instead.
 
 ---
 
 ## Tile geometry knobs: `--tile-buffer`, `extent`
 
-Both act at export, on the tiles, not on the overview file.
+Both settings apply at export.
 
-- **`--tile-buffer` (default 8, at most 256, tile pixels).** How far past its
-  edge a tile carries geometry, so a feature spanning a seam renders
-  continuously. The unit is the 256-pixel nominal tile, the same as
-  tippecanoe's `--buffer` (default 5). The cap is one full tile width: at 256
-  a tile already holds every feature of its eight neighbours, and past it a
-  tile would duplicate geometry from tiles it does not border. The cap is also
-  what keeps the export bounded — the buffer is what makes a feature belong to
-  more than one tile, so `--tile-buffer 100000` (≈390 tile widths) put every
-  feature in every tile and the export went O(features × tiles). A wider value
-  is refused up front, before any convert or export work runs (#433). A
-  sharded build's read-pruning margin is two pivot tiles (512 px), so this cap
-  sits inside it; see `docs/diving-deeper/sharded-builds.md`.
-- **`extent` (default 4096; Python `export_pmtiles(extent=...)`, not a CLI
-  flag).** The MVT tile-local coordinate resolution. Must be positive: `0`
-  quantizes every coordinate to the tile's origin — every line and polygon
-  degenerates and is dropped — and writes a layer that consumers divide by
-  zero on, so it is refused. The MVT spec recommends a power of two and
-  decoders assume one when they reason about coordinate precision; any other
-  positive value is accepted with a warning. `tylertoo decode` refuses an
-  archive whose layer declares `extent: 0` for the same reason.
+### Tile buffer
+
+`--tile-buffer` (default 8, maximum 256) extends geometry past tile edges
+to render seams continuously. Units are pixels of a nominal 256-pixel tile,
+matching tippecanoe's `--buffer` (default 5).
+
+At 256, a tile already includes features from all eight neighbors. Larger
+buffers would reach nonadjacent tiles and risk O(features × tiles) export,
+so tylertoo rejects them before conversion or export. Sharded builds read
+two pivot tiles (512 px) beyond their range, covering this margin. See
+[Scaling](guides/scaling.md#sharded-builds).
+
+### Tile extent
+
+`extent` (default 4096) sets tile-local coordinate resolution through
+Python's `export_pmtiles(extent=...)`; there is no CLI flag. It must be
+positive. At `0`, geometry quantizes to the origin, lines and polygons
+degenerate, and consumers divide by zero. Both export and `tylertoo decode`
+reject zero extents.
+
+The MVT spec recommends a power of two, which decoders assume for coordinate
+precision. Other positive values are accepted with a warning.
+
+---
+
+## Export and archive commands: `export-pmtiles`, `merge`, `stats`
+
+### Tile size cap
+
+`export-pmtiles --tile-size-limit`, also spelled
+`--max-tile-size` as on `tiles`, caps each tile's encoded MVT size. The
+default of 500K matches tippecanoe, and `0` disables the cap. A tile over the
+cap sheds features for that tile only, in one non-iterative pass. It drops
+the largest first for polygons and lines, and keeps a uniform spatial stride
+for point tiles.
+
+### Polygon clipping
+
+By default, a polygon whose rings are already
+simple skips the `i_overlay` boundary-bridge fallback when tylertoo clips it
+to a tile. Fine-zoom polygon export runs faster and renders the same, but a
+simple ring comes out rotated to a different start vertex. Pass
+`--no-simple-clip-fastpath` when you need byte-stable tile output.
+
+### Declared minimum zoom
+
+`export-pmtiles --min-zoom` sets the minimum zoom
+the archive declares in its metadata (`vector_layers[].minzoom`), even when
+the overview file lacks its coarsest levels. `overview` omits a level that
+generalizes to nothing, so a file built for z0–13 can start at z2. This flag
+records the requested z0 anyway. The PMTiles header's minimum zoom does not
+widen: it always reports the shallowest zoom that holds a tile, as
+`go-pmtiles verify` requires. A renderer that reads the header gets z2, and
+the empty zooms would render nothing either way. The value must not be finer
+than the coarsest level present. Unset, it is the coarsest level's zoom.
+`tiles` and Python's `convert()` pass their own `--min-zoom` here.
+
+### Property selection at export
+
+`export-pmtiles --include-property`,
+`--exclude-property`, and `--exclude-all-properties` act on the tiles only.
+See [Property selection](#property-selection-include-property-exclude-property-exclude-all-properties).
+
+### Encode tallies
+
+`--report`, and the return value of
+Python's `export_pmtiles()`, carry per-zoom tile and feature counts and the
+oversized-tile tally. They also carry two encode tallies, in total and per
+zoom:
+
+- `encode_dropped_features` counts tile members with nothing to encode: empty
+  geometries or empty GeometryCollections. A non-zero value means clipping
+  lost content. A warning names the total, and the summary line repeats it.
+- `encode_quantized_features` counts tile members whose geometry collapsed at
+  the tile extent: zero-area polygon rings or lines of fewer than two points,
+  typically clip slivers at a buffered tile edge. Ordinary data produces
+  these, and they never warn.
+
+### Sharded export
+
+`--tile-range LO..HI` takes two tile ids at the same
+pivot zoom and emits every descendant of those tiles at every deeper zoom. The
+ids under one tile are contiguous on the Hilbert curve, so the restriction is
+an exact interval test at each zoom. Tiles coarser than the pivot are not
+emitted. `--zoom-ceiling Z` emits only the zooms at or below `Z`, the coarse
+half. It is a ceiling, not a `--max-zoom`, because it chooses which zooms to
+emit, while `--min-zoom` only widens what the metadata declares. The overview
+file still holds every level. [Scaling](guides/scaling.md#sharded-builds)
+covers both in context.
+
+### `tylertoo merge`
+
+`merge` takes two or more inputs that hold disjoint tile ids
+and agree on tile type and tile compression. The merged archive's bounds,
+zoom range, and `vector_layers` are the unions of the inputs'. Layers sharing
+an id collapse into one entry spanning their combined zooms, with the union
+of their fields. A shard's ids need not form a contiguous slice of the id
+space, because subtrees at different depths interleave on the Hilbert curve.
+tylertoo therefore checks disjointness per tile id, not per range.
+`--work-dir` holds the spool file of merged tile data until merge assembles
+the archive. Set it when the output is large and `/tmp` is a small tmpfs.
+`--report` writes per-zoom tile counts for checking a sharded build. For
+overlapping archives, such as different data at different zooms or several
+layers over the same zooms, use [`tylertoo pyramid`](#several-inputs-one-archive-tylertoo-pyramid).
+
+### `tylertoo stats`
+
+For each zoom, `stats` prints the tile count and the total,
+mean, p50, p99, and maximum tile size. `--largest N` adds the largest tiles by
+z/x/y, and `--json` prints the same numbers machine-readably:
+
+```bash
+tylertoo stats buildings.pmtiles --largest 5
+tylertoo stats buildings.pmtiles --json
+```
+
+Sizes are stored (compressed) bytes per addressed tile, read from directory
+entries without reading or decompressing tiles. Run-length
+members and deduplicated tiles each count at the full length of their shared
+body. The `total` column is therefore the bytes a client would fetch, and it
+can exceed the archive's size on disk. Percentiles are nearest-rank: pN is
+the smallest size such that at least ⌈N/100 × tiles⌉ of the zoom's tiles are
+no larger. The largest tiles sort by size, descending, with ties broken by
+ascending PMTiles tile id. Memory and time scale with the archive's directory
+entries, not its tile count, because runs aggregate with their multiplicity
+rather than expanding.
 
 ---
 
 ## File layout knobs: `--row-group-size`, `--full-column-stats`
 
-These do not change *which* features or vertices survive — geometry and
-attributes are byte-identical regardless — but they control the **physical
-Parquet layout**, which drives remote read cost (footer size + bbox pruning).
+These settings change Parquet layout, footer size, and bbox pruning.
+Geometry and attributes remain byte-identical.
 
 ### `--row-group-size` (default 10000): per-level row-group sizing
 
-The value is a per-level **cap**, not a global row-group size:
+`--row-group-size` caps rows per group separately for each level:
 
-- A level whose feature count is `<= row-group-size` is written as a **single**
-  row group. Coarse bands (a handful of features) therefore become one broad
-  row group — which is what a reader fetches whole anyway (the coarse overview
-  is the "quick look").
-- A larger level is split into `ceil(features / row-group-size)` row groups of
-  **roughly uniform** size. Fine bands keep many small row groups, so their
-  per-row-group bbox statistics prune tightly against a viewport.
+- A level at or below the cap uses one group, fetched whole for a coarse view.
+- Larger levels use `ceil(features / row-group-size)` roughly equal groups,
+  allowing bbox statistics to prune fine-level reads to a viewport.
 
-Each level always ends exactly on a row-group boundary and no row group ever
-mixes two levels (spec §4.2) — this is invariant and independent of the knob.
+Each level always ends on a row-group boundary, and no row group mixes two
+levels (spec §4.2), whatever the knob says.
 
-Smaller values → tighter bbox pruning (fetch fewer features for a small
-viewport) but more row groups → a larger footer. Larger values → the reverse.
-The default 10000 balances the two; because string/geometry stats are
-suppressed by default (below), even hundreds of row groups keep the footer
-small, so there is rarely a reason to raise it. LOWER it if you serve tiny
-viewports over a high-latency store and want tighter pruning.
+Smaller groups tighten bbox pruning but enlarge the footer; larger groups
+do the reverse. The default 10000 balances both. String and geometry
+statistics are suppressed by default, keeping footers small even with
+hundreds of groups. Lower the cap for tiny viewports over high-latency storage.
 
-**The value is a request, not a guarantee (#507).** A Parquet file holds at
-most 32,768 row groups (the row-group ordinal is an `i16`), and a very low
-`--row-group-size` on a planet-scale input can project past that. Before pass 2
-opens the output file, the converter projects the total row-group count from
-pass 1's per-level winner counts and compares it against a 32,000-group
-preflight ceiling (headroom, because that projection is a pre-simplification
-upper bound rather than an exact count). If the projection is over, the cap is
-**auto-scaled up** to the smallest clean value that fits, with a `warn`-level
-log line naming the old and new values. The cap actually used is recorded as
-`effective_max_row_group_size` in `--report` JSON and printed as a summary
-note, so the raise is visible after the run rather than only in the log.
+Parquet's `i16` group ordinal limits files to 32,768 groups. Before pass 2
+opens the output, tylertoo projects group counts from pass 1's winners and
+checks a 32,000-group ceiling, leaving headroom for the estimate taken before
+simplification. Above it, the cap rises to the smallest clean value that
+fits. A warning logs both caps; the summary and `--report` field
+`effective_max_row_group_size` record the applied value.
 
-A raised cap costs memory: the writer holds a whole row group in RAM before
-flushing it, so peak write memory scales with the cap. If that matters more
-than the file layout, cut the projected row-group count at the source
-instead — fewer levels (`--min-zoom` / `--max-zoom`), or
-`--row-group-size-policy zoom-scaled` (below), which already gives coarse
-bands far larger caps.
+A raised cap needs more memory because the writer buffers a whole group.
+To reduce group counts, plan fewer levels with `--min-zoom` and
+`--max-zoom`, or use `--row-group-size-policy zoom-scaled` for larger coarse
+groups.
 
 ### `--row-group-size-policy` (default `constant`): per-level cap scaling
 
-Controls how the `--row-group-size` cap is applied across levels (#202):
+This sets how the `--row-group-size` cap applies across levels:
 
 - **`constant`** (default): every level uses the same cap.
 - **`zoom-scaled`**: the cap doubles for each zoom step *below* the finest
-  level (`cap = row-group-size << (max_zoom − level_zoom)`). Coarse bands —
-  which a wide viewport reads mostly whole anyway — collapse into fewer, larger
-  row groups (fewer remote requests), while the finest level keeps tight
+  level, `cap = row-group-size << (max_zoom − level_zoom)`. Coarse bands,
+  which a wide viewport reads mostly whole anyway, collapse into fewer and
+  larger row groups and fewer remote requests. The finest level keeps tight
   per-row-group bbox pruning.
 
-Reach for `zoom-scaled` when a deep pyramid's coarse levels fragment into many
-tiny row groups and bloat the footer; leave it `constant` otherwise. See
-`corpus/SWEEPS.md` (Decision 5) for the rationale.
+Use `zoom-scaled` when a deep pyramid's coarse levels fragment into many tiny
+row groups and bloat the footer. Otherwise leave it `constant`. Decision 5 in
+[`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)
+gives the evidence.
 
 ### `--full-column-stats` (default off): statistics suppression
 
-By default the writer **suppresses** Parquet per-row-group min/max statistics
-on the WKB geometry column and on every string/binary property column (e.g. an
-Overture 26-character ULID `id`). These stats are never used by the overview
-read protocol — spatial pruning uses the **bbox covering** struct, and level
-selection uses the **`level`** column, both of which *always* keep full stats
-(spec §4.4). But on high-cardinality data they dominate the Thrift footer,
-which is read in full on *every* remote query regardless of viewport. On the
-Moldova polygon set (631k features, ULID ids) the footer was **8.84 MB** with
-full stats — larger than most viewports' actual data — and drops below **1 MB**
-with suppression.
+The writer suppresses per-group min/max statistics on WKB geometry and
+string or binary properties, such as Overture's 26-character ULID `id`.
+The overview read protocol uses bbox covering and `level` statistics,
+which always remain enabled (spec §4.4).
 
-Pass `--full-column-stats` to keep stats on all columns. Do this only if remote
-clients push predicates on property columns (e.g. `WHERE id = …` or
-`WHERE class = 'motorway'` server-side) and want row-group skipping on them —
-you trade a bigger footer for that pushdown.
+Suppressed statistics can dominate the Thrift footer, which every remote
+query reads in full. On Moldova polygons (631k features, ULID ids), full
+statistics make an 8.84 MB footer, larger than most viewport reads.
+Suppression reduces it to under 1 MB.
+
+Pass `--full-column-stats` to keep statistics on all columns. Do this only if
+remote clients push predicates on property columns, such as `WHERE id = …`
+or `WHERE class = 'motorway'`, and want row-group skipping on them. You trade
+a bigger footer for that pushdown.
 
 ---
 
 ## Memory / streaming knobs: `--no-streaming`, `--read-batch-size`
 
-Like the [file layout knobs](#file-layout-knobs---row-group-size---full-column-stats),
-these never change the output's content: level assignments, geometry,
-attributes, and footer metadata are equivalent either way. They control **how
-much memory the conversion itself uses**.
-
-By default the converter runs a **two-pass streaming pipeline** (H3):
-
-1. **Pass 1** streams the input once and keeps only a tiny record per feature
-   (bbox, geometry kind, ranking key — no geometry). The level-assignment
-   engine and density budget run over those records to build the **winner
-   table**: one byte per feature saying which levels it survives at.
-2. **Pass 2** reads the input **once more** and fans each read batch out to
-   *all* levels at once (the single-read pipelined engine, #213): a reader
-   thread streams batches over a bounded channel while a consumer parallelizes
-   every `(level × feature)` simplification across cores, and each level's
-   output drains to the writer in level order. The finest (canonical) level is
-   verbatim and streamed to the writer last. An older engine that re-read the
-   input once *per level* survives only as the equivalence-tested reference
-   path — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers).
-
-Peak memory is `O(read batch + winner tables)` instead of `O(dataset)`: on the
-Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
-(in-memory) to well under 1 GB, with equivalent output.
+These settings control conversion memory without changing output content.
+[How streaming bounds memory](guides/scaling.md#how-streaming-bounds-memory)
+explains the two-pass pipeline and its pass-1 floor of up to 42 bytes per row.
+See also the [file layout knobs](#file-layout-knobs-row-group-size-full-column-stats).
 
 | Knob | Default | Units | Direction |
 |------|---------|-------|-----------|
-| `--read-batch-size N` | `8192` | rows per read batch (max 1048576) | **bigger = faster-ish, more memory** |
-| `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
-| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
-| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
-| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4; explicit capped at 2× cores) | parallel input read — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
+| `--read-batch-size N` | `8192` | rows per read batch (max 1048576) | **bigger = slightly faster, more memory** |
+| `--no-streaming` | off | flag | use the one-pass in-memory pipeline |
 
-**`--read-batch-size`** bounds the transient working set of both passes: each
-batch is decoded, filtered, simplified, and written before the next is read.
-LARGER batches amortize per-batch overhead (marginally faster) at the cost of
-proportionally more peak memory; SMALLER batches bound memory tighter. The
-default 8192 keeps per-batch transients in the tens of MB even for
-vertex-heavy polygon data; you rarely need to change it. LOWER it (e.g. 1024)
-on very memory-constrained machines or for monster geometries (a single batch
-of coastline-sized multipolygons can be large); RAISE it (e.g. 65536) only if
-profiling shows per-batch overhead dominating on a machine with RAM to spare.
-It also sets how finely pass 1 fans out: each batch is split across the rayon
-pool into chunks of `read_batch_size / threads` rows (clamped to 256..=1024),
-so lowering it for memory costs some pass-1 parallelism but never disables it.
+### Read batch size
 
-**`--no-streaming`** runs the original in-memory pipeline: the whole table and
-every decoded geometry are held at once (`O(dataset)` memory). It decodes each
-geometry only once — the streaming default re-decodes the winners in pass 2 —
-so it can be marginally faster on *small* inputs that comfortably fit in RAM;
-on large inputs it is both slower and enormously more memory-hungry. It is kept as the reference
-implementation — the two paths are equivalence-tested against each other —
-and as an escape hatch; there is no output-quality reason to use it.
+`--read-batch-size` bounds transient memory in both passes. The default
+keeps each batch's working set in the tens of MB even for vertex-heavy
+polygons. Try 1024 for limited RAM or huge multipolygons; try 65536 only
+when profiling shows batch overhead and RAM is available.
 
-Residual per-feature memory in streaming mode (the "winner tables") is at
-least 33 bytes per input feature during pass 1 (typically ~42–80 with the
-transient per-row scan vectors) and 1 byte per feature during pass 2 — about
-26–50 MB / 0.6 MB for a 632k-feature file. The pass-1 side of that is the
-column-major feature table, held resident from pass 1's scan through the level
-assignment: 33 bytes/row, 41 with a sort key (explicit, or a ranking
-auto-detected from the schema), and 42 with a sort key and an entry-zoom ladder
-(those two columns are allocated only if the job uses them).
-It is a lower bound on the scan-time peak, and the coarse job's irreducible
-memory floor on a
-[sharded build](diving-deeper/sharded-builds.md#sizing-the-coarse-jobs-memory),
-where it can reach tens of GiB at billion-row scale. tylertoo preflights this
-from footer row counts before pass 1 scans anything (#543): it warns when the
-realistic whole-job need (rows × 42 B × 3.3) exceeds the memory figure, and
-hard-errors only when the floor alone exceeds a hard cgroup limit
-(`memory.max`) with no `--bbox`/`--filter` active. Set
-`TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` to downgrade the error to a warning.
+Pass 1 divides each batch across rayon threads in chunks of
+`read_batch_size / threads`, clamped to 256–1024 rows. Smaller batches
+reduce parallelism but never disable it.
+
+### In-memory conversion
+
+`--no-streaming` holds the whole table and all decoded geometry,
+using `O(dataset)` memory. It decodes geometry once rather than re-decoding
+winners in pass 2, so small inputs may run slightly faster. Large inputs
+run slower and need far more RAM. This is the equivalence-tested reference
+implementation and a fallback, with no output-quality advantage.
+
+During pass 2, the winner table holds 1 byte per feature, about 0.6 MB for a
+632k-feature file.
+
+The pass-1 feature table is held from pass 1's scan through level
+assignment. It costs 33 bytes per input row, 41 with a sort key (explicit or
+detected from the schema), and 42 with a sort key and an entry-zoom
+ladder. The transient scan vectors raise the scan-time peak to about 42–80
+bytes per row. The table is the coarse job's memory floor on a
+[sharded build](guides/scaling.md#sizing-the-coarse-jobs-memory) and reaches
+tens of GiB at a billion rows. Before pass 1, tylertoo checks it against the
+footer row counts (#543). It warns when rows × 42 B × 3.3 exceeds the memory
+figure. It fails only when the floor alone exceeds a hard cgroup limit and no
+`--bbox` or `--filter` is active. `TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` turns the
+error into a warning.
 
 ---
 
 ## Regional extract: `--bbox`
 
-`--bbox xmin,ymin,xmax,ymax` (lon/lat degrees, EPSG:4326) converts only the
-features whose bounding box intersects the given region — useful for extracting
-a city from a country-wide file without processing the whole dataset.
+`--bbox xmin,ymin,xmax,ymax` converts only features whose bounding box
+intersects the region, in longitude and latitude degrees (EPSG:4326).
+[Remote reads](guides/remote-reads.md#what-gets-skipped) explains how covering
+statistics let it skip row groups, and what makes a source prunable.
 
 ```bash
-# Tile just Antananarivo from a Madagascar-wide file
+# Tile Antananarivo from a Madagascar-wide file
 tylertoo overview madagascar.parquet antananarivo.parquet \
   --bbox 47.4,-19.0,47.6,-18.8 \
   --min-zoom 0 --max-zoom 14
 ```
 
-The filter is two-stage:
-
-1. **Row-group pruning** (statistics-based): row groups whose GeoParquet 1.1
-   bbox covering column statistics don't intersect the region are skipped at
-   the parquet footer level — their data pages are never read. This is the
-   big win: a gpio-optimized (Hilbert-sorted) file typically reduces I/O by
-   90%+ for small regional extracts.
-
-2. **Exact feature filter**: features of the surviving row groups whose own
-   bbox misses the region are dropped exactly. This guarantees correctness
-   even when the input lacks covering statistics.
-
-**Graceful degradation**: if the input has no covering column or its statistics
-are unavailable (non-gpio-optimized, GDAL without covering, etc.), all row
-groups are read and only the exact per-feature filter applies — the output is
-identical, just slower. Check `ConvertReport.row_groups_read` vs
-`row_groups_total` to see whether pruning fired.
-
-| Knob | Default | Units | Effect |
-|------|---------|-------|--------|
-| `--bbox xmin,ymin,xmax,ymax` | — | lon/lat degrees | only features intersecting this region; omit = full extent |
-
-**Tip**: for EPSG:3857 inputs, still pass lon/lat degrees — the converter
-reprojects the bbox internally.
+Use degrees even for EPSG:3857 input; the converter reprojects the box.
+Without covering statistics, every row group is read before the same
+per-feature test. Compare `ConvertReport.row_groups_read` with
+`row_groups_total` to check pruning.
 
 ---
 
 ## Attribute filter: `--filter` / `--where`
 
-`--filter <EXPR>` (aliased as `--where`) converts only the features matching a
-SQL-WHERE-style predicate over the input's property columns — the attribute
-analogue of `--bbox`, and it composes with it. Available on both `overview`
-and the one-shot `tiles` facade.
+`--filter <EXPR>` (alias `--where`) selects features using a SQL
+`WHERE`-style predicate on input properties. It combines with `--bbox` on
+both `overview` and `tiles`.
 
 ```bash
 # Only high-confidence field boundaries, straight from the source file
@@ -1573,82 +1434,76 @@ tylertoo tiles fields.parquet fields.pmtiles \
 
 # Composes with --bbox and richer predicates
 tylertoo overview brazil.parquet subset.parquet \
-  --bbox -48.0,-16.0,-47.0,-15.0 \
+  --bbox=-48.0,-16.0,-47.0,-15.0 \
   --where "crop_type IN ('soy', 'corn') AND confidence >= 0.5"
 ```
 
-**Expression language** (small built-in recursive-descent parser — no SQL
-engine involved):
+### Expression syntax
+
+A built-in recursive-descent parser supports:
 
 - Comparisons: `=` (or `==`), `!=` (or `<>`), `<`, `<=`, `>`, `>=`, with the
   column on the left: `confidence > 0.8`, `country = 'BRA'`, `active = true`.
-- Membership: `col IN (v1, v2, ...)`, `col NOT IN (...)`.
-- Null tests: `col IS NULL`, `col IS NOT NULL`.
-- Boolean composition: `AND`, `OR`, `NOT`, parentheses. `OR` binds loosest,
-  then `AND`, then `NOT`.
+- Membership: `col IN (v1, v2, ...)` and `col NOT IN (...)`.
+- Null tests: `col IS NULL` and `col IS NOT NULL`.
+- Boolean composition: `AND`, `OR`, `NOT`, and parentheses. `OR` binds
+  loosest, then `AND`, then `NOT`.
 - Literals: numbers (`0.8`, `-2`, `1e6`), single-quoted strings (`'it''s'`
-  escapes a quote), `TRUE`/`FALSE`. Keywords are case-insensitive.
+  escapes a quote), and `TRUE`/`FALSE`. Keywords are case-insensitive.
 - Columns: bare identifiers, or `"double quoted"` for names with spaces.
-  Supported column types: numeric (int/uint/float), string, boolean,
+  Supported column types are numeric (signed or unsigned integer, float), string, boolean, and
   timestamp.
 - Timestamp columns compare against single-quoted datetime strings:
   `time >= '2025-01-01'`, `time < '2025-06-01 12:30:00'`, or full RFC 3339
-  with an offset. Timezone-less literals are read as UTC (Arrow timestamps
-  store a UTC instant regardless of the column's display timezone), and a
-  malformed datetime errors at startup, not mid-run. Statistics pushdown
-  works when the file stores timestamps as INT64 (modern writers); legacy
-  INT96 timestamps (older Spark) expose no statistics, so those predicates
-  filter exactly but prune nothing.
+  with an offset. A literal without a timezone reads as UTC, because Arrow
+  timestamps store a UTC instant whatever the column's display timezone. A
+  malformed datetime fails at startup, not mid-run. Statistics pushdown works
+  when the file stores timestamps as INT64, as modern writers do. Legacy
+  INT96 timestamps, from older Spark, expose no statistics, so those
+  predicates filter exactly but prune nothing.
 
-**Null semantics** are SQL three-valued logic: a comparison or `IN` over a
-NULL value is UNKNOWN, `AND`/`OR`/`NOT` combine with Kleene logic, and a row
-is kept only when the whole predicate is TRUE. So `confidence > 0.8` drops
-null-confidence rows — and so does `NOT (confidence > 0.8)`. Use
-`IS NULL` / `IS NOT NULL` to test nulls explicitly. A NaN in a float column is
-UNKNOWN too — no comparison against it has an answer, and it is nodata far more
-often than it is a value. Infinities are ordinary values and compare normally.
+### Nulls and non-finite values
 
-Note that this also makes `!=` (and `NOT IN`) drop NaN rows: `NaN != 5` is TRUE
-under IEEE-754, but UNKNOWN here, which is the SQL reading. And unlike a null,
-a NaN is a *present* value, so `IS NULL` does **not** match it while
-`IS NOT NULL` does. The two rules together mean **no predicate selects NaN
-rows**: they can only be kept by a predicate over some other column. Clean the
-column upstream (e.g. with `gpio`) if you need to address those rows.
+Filters use SQL three-valued logic:
 
-Like `--bbox`, the filter is two-stage:
+- A comparison or `IN` over a `NULL` is `UNKNOWN`.
+- `AND`, `OR`, and `NOT` combine with Kleene logic.
+- A row stays only when the whole predicate is `TRUE`.
 
-1. **Row-group pruning** (statistics-based): row groups whose parquet column
-   chunk statistics (min/max/null-count) prove the predicate cannot match are
-   skipped at the footer level — their data pages are never read, and on
-   remote input those byte ranges are never fetched. `AND` intersects the
-   prunable sets, `OR` unions them; `NOT (...)` subtrees and columns without
-   usable statistics conservatively keep the row group.
-2. **Exact per-row evaluation** during the pass-1 scan guarantees identical
-   output whether or not pruning fired.
+So `confidence > 0.8` drops null-confidence rows, and so does
+`NOT (confidence > 0.8)`. Use `IS NULL` and `IS NOT NULL` to test nulls
+explicitly.
 
-| Knob | Default | Units | Effect |
-|------|---------|-------|--------|
-| `--filter EXPR` (alias `--where`) | — | predicate | only features where EXPR is TRUE; omit = no filtering |
+NaN comparisons are `UNKNOWN`, including `!=` and `NOT IN`; infinities
+compare normally. For example, `NaN != 5` is `TRUE` in IEEE-754 but
+`UNKNOWN` here. NaN is present rather than null: `IS NULL` does not match
+it, and `IS NOT NULL` does. To select these rows by value, clean the column
+upstream, for example with `gpio`, or filter on another column.
 
-**Interactions**: the filter runs before level assignment, ranking, density
-budgets, clustering, and coalescing — dropped features simply never enter the
-pipeline, exactly as if the input had been pre-filtered (`ConvertReport.
-input_features` counts only survivors). Check `row_groups_read` vs
-`row_groups_total` to see whether statistics pruning fired; sorting the input
-by a filtered column (or lowering `--row-group-size`) tightens per-row-group
-statistics and prunes more.
+### Pruning and pipeline order
+
+Like `--bbox`, the filter checks row-group statistics before it reads data.
+It then evaluates each row exactly in pass 1, so the output is identical
+whether pruning fired or not. See
+[Remote reads](guides/remote-reads.md#filters). `AND` intersects the prunable
+sets and `OR` unions them. `NOT (...)` subtrees and columns without usable
+statistics keep the row group.
+
+The filter runs before level assignment, ranking, density budgets,
+clustering, and coalescing. Rejected features never enter the pipeline.
+`ConvertReport.input_features` counts only survivors. Compare
+`row_groups_read` with `row_groups_total` to see whether pruning fired.
+Sorting the input by a filtered column, or lowering `--row-group-size`,
+tightens per-row-group statistics and prunes more.
 
 ---
 
 ## Property selection: `--include-property` / `--exclude-property` / `--exclude-all-properties`
 
-Which attribute columns the output carries — tippecanoe's `-y` / `-x` / `-X`.
-Everything not selected is dropped **at scan time** on `overview` and `tiles`:
-the excluded columns are not decoded, the intermediate overview file only
-carries the kept columns, and the tiles' per-feature bytes shrink
-accordingly (which matters for the `--max-tile-size` valve — a tile that has
-to shed features to fit its byte budget sheds fewer when it is not carrying
-eight columns nobody asked for). The geometry column is always kept.
+These flags select output properties, like tippecanoe's `-y`, `-x`, and
+`-X`. On `overview` and `tiles`, excluded columns are never decoded or
+written to the overview. Smaller tile properties leave room for more
+features under `--max-tile-size`. Geometry always stays.
 
 ```bash
 # Tiles carry only confidence and metrics:area
@@ -1665,252 +1520,165 @@ tylertoo tiles fields.parquet outlines.pmtiles --exclude-all-properties
 
 | Knob | Default | Semantics |
 |------|---------|-----------|
-| `--include-property COL` (repeatable) | all | keep ONLY these; naming a column the input lacks is an error |
-| `--exclude-property COL` (repeatable) | none | drop these; an unknown name only warns; ignored when `--include-property` is given |
-| `--exclude-all-properties` | off | geometry-only output; ignored when `--include-property` is given |
+| `--include-property COL` (repeatable) | all | keep only these. Naming a column the input lacks is an error |
+| `--exclude-property COL` (repeatable) | none | drop these. An unknown name only warns. An include list overrides it |
+| `--exclude-all-properties` | off | geometry-only output. An include list overrides it |
 
-The three combine as tippecanoe's do: an include list is the whole answer and
-the exclude flags are then ignored (tippecanoe's `-y` implies `-X`, and its
-attribute filter consults only the include set once one exists), so
+An include list overrides all exclusions, matching tippecanoe, where `-y`
+implies `-X`. For example,
 `--exclude-all-properties --include-property foo` keeps `foo`, and
 `--include-property a --include-property b --exclude-property b` keeps both.
 Without an include list, `--exclude-all-properties` keeps nothing and
 `--exclude-property` drops what it names.
 
-**Interactions**: a column another knob reads — `--sort-key`, `--class-rank`,
-`--magnitude-ladder` / `--entry-zoom`, `--accumulate-attribute`, `--filter` —
-must stay included; excluding it is rejected with the knob's name, because
-the knobs evaluate over the projected batches and would otherwise go silently
-inert. `export-pmtiles` takes the same three flags and applies them to the
-tiles only, matched on the property names the tiles publish (the overview
-file is untouched); there, the `--feature-order` column is the one that must
-stay — and `tiles` rejects the same pairing up front, since its selection is
-applied at convert and the column would be gone before export could sort on
-it. An explicit `--include-property coalesced_count` on export wins over the
-1-everywhere withholding (#379): the column is in the file, and naming it is
-not a typo.
+### Columns required by other options
 
-**Column types** (#434): struct, list and map columns are exported as JSON
-strings (tippecanoe's convention for nested attributes), so
-`--include-property names` on an Overture file keeps the whole `names`
-struct as one string property. A column with no MVT encoding at all (a
-binary column) is dropped with one warning per column, listed in the export
-report's `skipped_property_columns`, and rejected by name if
-`--include-property` asks for it; `--exclude-property` naming it silences
-the warning. The full type table is in
-[preparing input](diving-deeper/preparing-input.md#design-decisions).
+Columns used by these options must stay included:
+`--sort-key`, `--class-rank`, `--magnitude-ladder`, `--entry-zoom`,
+`--accumulate-attribute`, and `--filter`. Excluding one is an error naming
+the option that needs it.
+
+`export-pmtiles` applies the same flags to published tile property names,
+leaving the overview untouched. The `--feature-order` column must remain;
+`tiles` checks this before conversion too. At export, an explicit
+`--include-property coalesced_count` retains even an all-1 column. Include
+lists still override exclusions; an included property the file cannot
+export is an error.
+
+### Column types
+
+tylertoo exports struct, list, and map columns as JSON
+strings, tippecanoe's convention for nested attributes. So
+`--include-property names` on an Overture file keeps the whole `names` struct
+as one string property. A column with no MVT encoding, such as a binary
+column, drops with one warning per column and appears in the export report's
+`skipped_property_columns`. tylertoo rejects it by name if `--include-property`
+asks for it, and an `--exclude-property` naming it silences the warning. The
+full type table is in [preparing input](tutorials/madagascar.md#1-prepare-the-input).
 
 ---
 
 ## Performance profiles: `--profile`, `--in-flight-batches`, `--read-workers`
 
-Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),
-these never change the output's content: **the produced file is byte-identical
-across every profile, `--in-flight-batches` value, `--read-workers` value,
-and thread count.** They control only how fast the conversion runs and how
-much memory it uses while running.
+These settings control speed and memory. Output is byte-identical across
+profiles, batch concurrency, read-worker counts, and thread counts, as with
+the [memory and streaming knobs](#memory-streaming-knobs-no-streaming-read-batch-size).
 
-The rewritten pass-2 engine reads the input Parquet **once** and pipelines
-Parquet read/decode with per-feature simplification fanned out across **all
-cores**. This replaces the old pass 2, which re-read the whole input once per
-level (15 reads on a 15-level plan) and simplified effectively on a single
-core. The win is largest on vertex-heavy duplicating-mode conversions and on
-partitioning mode, which previously spent ~73% of wall time re-reading the
-input (#212 / #213).
+The Scaling guide covers [memory profiles](guides/scaling.md#memory-profiles),
+[read concurrency](guides/scaling.md#read-concurrency), and
+[spill files](guides/scaling.md#spill-files) in depth, including container
+memory limits and `--spill-dir`.
 
-The one remaining choice is **where each output level's rows live between the
-compute stage and the write stage**:
+Pass 2 reads Parquet once and pipelines reads, decoding, and simplification
+across all cores. The profile decides where output rows wait before writing.
 
-- **`speed`** buffers each level's rows in RAM, then writes them. Fastest — no
-  temp I/O — but peak RAM grows with total *output* size. Best when the output
-  comfortably fits: duplicating mode, or partitioning on inputs well under
-  available RAM.
-- **`bounded`** spills each level's rows to temporary **Arrow IPC** files and
-  streams them back at write time, capping peak RAM regardless of output size.
-  Slightly slower (temp read/write) but memory-safe for very large / wide
-  inputs. Best for partitioning mode on multi-GB inputs, or memory-constrained
-  machines.
-- **`auto`** (default) picks from the workload: it estimates the buffered
-  output as `buffered rows × per-row cost` and spills (`bounded`) when the
-  estimate exceeds a fraction (0.6) of *available* RAM, keeping RAM (`speed`)
-  otherwise. The per-row cost is derived from pass 1's measured average
-  encoded-geometry size for **this input** (geometry weight dominates a
-  buffered row and varies ~400× across datasets — points vs. boundary
-  polygons), with a deliberate high bias toward the near-free spill path;
-  calibrated constants (~8 KiB/row duplicating, ~16 KiB/row partitioning)
-  are the fallback when nothing was scanned. Partitioning additionally keeps
-  its historical 2M-buffered-row spill floor. That up-front estimate sees
-  geometry only — a 256 B/row allocator floor stands in for everything else —
-  so an `auto` run that starts in RAM keeps **measuring** (#626): it sums the
-  Arrow bytes of every batch it buffers (geometry plus every kept property
-  column) and, after each input batch, projects the bytes already buffered
-  plus the rows still to come at the rate so far. If that passes the budget,
-  the RAM sinks are flushed to spill files once, mid-pass — one-way, order
-  preserved, output byte-identical. The check runs for the whole pass, so a
-  light head cannot hide a heavy tail; the downgrade fires at the latest when
-  the bytes actually buffered reach the budget. The measured rate and whether
-  it downgraded are logged and reported as `pass2.sink` in
-  `TYLERTOO_PROFILE_JSON`. The up-front decision (measured average geometry,
-  estimate, budget) is logged too; `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the
-  detected available RAM. The probe is **container-aware** (#481): cgroup v2
-  (`memory.max` and `memory.high`, minimum along the cgroup path) and cgroup v1
-  (`memory.limit_in_bytes`) limits are respected, the binding cgroup's
-  non-reclaimable current usage is subtracted so the figure is *headroom*
-  rather than a ceiling the run may already be sitting near, and the budget is
-  `min(cgroup headroom, machine available)` — so a Slurm / Docker / k8s job
-  inside a 160 GiB cgroup on a 2 TB node no longer sizes against the node.
-  When the cgroup limit is the binding constraint, one info line says so
-  (`memory budget from cgroup limit: N GiB (machine has M GiB)`).
-  Note that `bounded` (and an `auto` that picks it) spills to the process temp
-  directory, which on many Slurm and Kubernetes nodes is a tmpfs `/tmp` — RAM
-  charged to the very same cgroup, so the spill does not relieve the limit.
-  Point `TMPDIR` (or `--spill-dir`) at real disk there. `--spill-dir` is the
-  one scratch-disk knob (#427): it places the remote-input spill, the pass-2
-  level spill files (`tylertoo-spill-*.arrow`), the `tiles` intermediate
-  overview, and — on `export-pmtiles` too, where the flag also exists — the
-  export's member spill. It must be an existing directory; both `overview`
-  and `export-pmtiles` refuse a missing one before doing any work. The
-  PMTiles archive is never spilled: it is assembled in place at
-  `OUTPUT.partial` beside the output and renamed over it at the end.
+| Option | Default | Effect |
+|--------|---------|--------|
+| `--profile speed\|bounded\|auto` | `auto` | Choose RAM buffering or disk spilling |
+| `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
+| `--read-workers N\|auto` | cores/4, at most 4 | More pass-2 readers = more throughput and resident batches |
 
-The profile also governs the **pass-1 level-assignment grids** (#306). Level
-assignment builds one cell-winner grid per coarse level, concurrently across
-cores (#264); on large simple-geometry layers the concurrently-live grids are
-the whole-convert RSS peak (germany-segments: 5.9 GiB; ~24 GiB at Brazil
-scale — see the `[rss]` phase logs). Under `bounded` and `auto` the grids'
-footprints are estimated up front and the levels are built in
-**memory-budgeted waves** against the same fraction-of-available-RAM budget
-(and the same `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override): when the estimate
-exceeds the budget, levels are grouped so only one wave's grids are live at a
-time — trading cross-level parallelism for a bounded peak, degrading in the
-limit to one level per wave rather than an OOM. Each level's grid is still
-built across every core (#534: the level's features are classified in
-parallel and its grid is sharded across threads), so a one-level wave is not a
-serial build. That per-level parallelism adds one transient the estimate does
-not count — the placements waiting between shard reduces — which is bounded
-per wave instead: about 2 MiB per thread across the whole wave (at least 1 MiB
-per level), freed after every reduce. A one-line
-`[assign] winner grids …` log reports the split when it happens; on a roomy
-box the plan is a single wave and nothing changes. `speed` opts out
-(unbounded grids, maximum parallelism). As with everything in this section,
-the wave schedule never changes the output.
+- **`speed`** buffers each level's rows in RAM. It runs in the least wall
+  time, with no temp I/O, but peak RAM grows with total *output* size.
+- **`bounded`** spills each level's rows to temporary Arrow IPC files and
+  streams them back at write time, capping peak RAM whatever the output size.
+- **`auto`** spills when the estimated buffered output exceeds 0.6 of
+  available RAM and keeps rows in RAM otherwise.
 
-| Knob | Default | Units | Direction |
-|------|---------|-------|-----------|
-| `--profile speed\|bounded\|auto` | `auto` | preset | `speed` = fastest, most RAM; `bounded` = capped RAM, temp I/O |
-| `--in-flight-batches N` | `4` | read batches in flight | **bigger = more overlap + core use, more memory** |
-| `--read-workers N\|auto` | `auto` | pass-2 reader threads | **more = more read throughput, more resident batches** |
+### Automatic memory estimate
 
-**`--in-flight-batches`** is the primary read/compute-overlap knob: it sets how
-many Arrow read batches may be moving through the pipeline at once (the
-bounded-channel depth) — both passes use it: pass 1's chunked scan and pass 2's
-per-level fan-out. RAISE it for more read/compute overlap and better core
-utilization when a few long-pole geometries otherwise stall the pipeline; each
-extra in-flight batch costs proportionally more peak RAM (`N × read_batch_size`
-rows resident, per pass — passes 1 and 2 never run concurrently, so this does
-not double). `--read-batch-size` (above) remains the rows-per-batch knob;
-`--in-flight-batches` is how many such batches coexist. Since #494 it is not
-the only resident-batch term: pass 2's readers hold `--read-workers` × their
-queue depth on top of it, and under `bounded` each level's spill writer holds
-up to three more (two queued plus the one it is encoding).
+`auto` estimates `buffered rows × per-row cost` from pass 1's average
+encoded-geometry size. Geometry dominates buffered rows and varies about
+400× across datasets. The estimate is conservative, favoring spilling.
+If pass 1 scanned nothing, it uses about 8 KiB per duplicating row or
+16 KiB per partitioning row. Partitioning always spills above 2M buffered
+rows. The log reports the average, estimate, budget, and decision.
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides the detected available RAM.
 
-**`--read-workers`** splits the pass-2 *read itself* across threads (#494).
-Parquet row groups are independently readable, so several threads can decode
-disjoint runs of them at once; an in-order merge then reassembles the batches
-into exactly the sequence a single reader would have produced, which is why the
-output is byte-identical for every value (`crates/cli/tests/thread_count_determinism.rs`
-checks `1` against `2` and `4` directly). `auto` takes a quarter of the
-machine's cores, capped at 4 — a reader thread decompresses and decodes, so it
-competes with the pool doing the simplification it is feeding, and past a
-handful of streams the device queue is saturated anyway. An explicit value is
-honoured up to a ceiling of **2× the machine's cores** (at least 4); above that
-the CLI rejects it and the library clamps with a warning, because every worker
-is a thread plus its own read-ahead queue.
+That estimate counts geometry only, so a run that starts in RAM keeps
+measuring for the whole pass (#626). It sums the Arrow bytes of every
+buffered batch, geometry plus every kept property column, with a 256-byte
+floor per row. After each input batch, it adds the bytes already buffered to
+the rows still to come at the rate so far. If that total passes the budget,
+`auto` moves the buffered rows to spill files once and spills for the rest of
+the pass. Row order and output bytes do not change. The switch happens no
+later than the moment the buffered bytes reach the budget. The log and
+`TYLERTOO_PROFILE_JSON` (`pass2.sink`) report the measured bytes per row and
+whether it switched. `speed` and `bounded` never switch.
 
-Two things bound the win, both worth knowing before reaching for a bigger
-number:
+### Pass-1 winner grids
 
-- **Row-group size.** A worker buffers its run ahead of the merge, so a run has
-  to fit in that worker's queue; a row group larger than the queue makes the
-  worker park mid-run and the reads serialize again (a `[convert] pass 2 read:`
-  debug line says so when it happens). Inputs written by `gpio` have
-  well-sized row groups; a single-row-group file cannot be split at all and
-  reads sequentially whatever you ask for.
-- **The memory budget.** The read-ahead is sized against the same
-  fraction-of-available-RAM budget the pass-2 sink uses (10% of it), so a small
-  box, or a wide/vertex-heavy input, quietly gets fewer workers rather than a
-  larger resident set. Under an explicit `--profile bounded` a worker's queue
-  is additionally capped at half its usual maximum depth.
+Level assignment builds one winner grid per coarse level. Concurrent grids
+can set peak RSS on large inputs with simple geometry: 5.9 GiB on
+germany-segments and about 24 GiB at Brazil scale (see `[rss]` logs).
 
-  That bound is a **model**, not a measurement: the budget is charged
-  `workers × depth × read_batch_size × per_row`, and `per_row` is a fixed
-  ~4 KiB non-geometry term plus twice pass 1's measured per-row geometry
-  bytes. The read-ahead is sized before pass 2 reads a row, so unlike the
-  sink (which measures itself since #626) it cannot measure what it holds. A schema whose non-geometry columns cost far more
-  than that term is priced too cheaply and the read-ahead can exceed its
-  nominal share. On a run sized to the last hundred MB, measure; on a wide
-  schema, `--read-workers 1` removes the term entirely.
+`bounded` and `auto` estimate grid memory against the same budget and split
+levels into waves when needed, down to one level per wave. Each level still
+uses all cores. Parallel reduction adds transient memory outside the estimate: about
+2 MiB per thread across a wave, at least 1 MiB per level, freed after each
+reduce. `[assign] winner grids …` logs any split. With enough RAM, one wave
+runs all levels; `speed` always uses unbounded parallel grids.
 
-Remote inputs always read sequentially: a remote source's parts share one
-in-memory chunk cache that concurrent readers would evict out from under each
-other. **Staging does not change this.** A remote convert's pass-0 staging
-fills that same per-part cache and its disk spill; it does not turn the source
-into a local one, so the pass-2 read stays sequential for the whole run. If you
-want the parallel read on remote data, land the file locally yourself (`gpio`,
-`aws s3 cp`) and convert from the local path.
+### Batch concurrency
 
-⚠️ **musl binaries v0.7.1 and earlier — prefer `--profile bounded` on large
-duplicating runs.** The `x86_64-unknown-linux-musl` release binary up to and
-including v0.7.1 could abort with `memory allocation of N bytes failed` part
-way through pass 2 of a `speed`/`auto` run — musl's `mallocng` failing a small
-allocation under heavy multi-threaded fragmentation while tens of GB of
-headroom remained ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)).
-`--profile bounded` avoids the in-RAM level buffering that triggers it. From
-the release after v0.7.1 the musl binary ships with mimalloc as its global
-allocator and no longer needs the workaround; other platforms were never
-affected.
+`--in-flight-batches` sets each pass's channel depth. Raise it to overlap
+reads and computation when a few expensive geometries stall the pipeline.
+Each extra batch holds `read_batch_size` more rows; passes do not overlap.
+`--read-batch-size` sets the rows per batch, and `--in-flight-batches` sets
+how many batches coexist. Pass 2's readers add `--read-workers` × their queue
+depth on top. Under `bounded`, each level's spill writer adds up to three
+more batches: two queued and one in the encoder.
 
-⚠️ **Interaction — `speed` + partitioning on a multi-GB input is the
-memory-risky quadrant.** `speed` buffers whole output levels in RAM, and
-partitioning's output can approach input size; on a multi-GB input that can
-exhaust memory. `auto` (the default) already routes partitioning and any
-over-budget run to `bounded` — only an explicit `--profile speed` overrides
-that. If you force `speed` on a large partitioning run, watch peak RSS.
+### Read workers
+
+`--read-workers` decodes disjoint runs of Parquet row groups concurrently
+in pass 2. An ordered merge restores the single-reader batch sequence,
+keeping output byte-identical.
+`crates/cli/tests/thread_count_determinism.rs` checks `1` against `2` and
+`4`. tylertoo honors an explicit value up to **2× the machine's cores**, at
+least 4. Above that the CLI rejects it, and the library clamps it with a
+warning, because each worker is a thread plus its own read-ahead queue. A
+worker buffers its run ahead of the merge. A row group larger than its queue
+makes the worker wait mid-run, and the reads serialize again. A
+`[convert] pass 2 read:` debug line reports it. A single-row-group file
+always reads sequentially.
+
+For multi-GB partitioning inputs, `speed` can exhaust RAM: buffered output
+may approach input size. `auto` selects `bounded` for large partitioning
+and over-budget runs. Watch peak RSS if you explicitly choose `speed`.
 
 ---
 
 ## Reusing a plan: `--save-plan`, `--plan`
 
-The streaming pipeline runs in two passes. **Pass 1** streams the whole input
-to decide which level every row enters at — the *winner table* — and then
-runs the level assignment and the density budget over it. **Pass 2** writes.
-On a large input, pass 1 plus the assignment is most of the wall time, and it
-depends on nothing the write side does.
+Pass 1 scans the input and assigns rows to levels, including density
+budgets. It often takes most of the conversion time. Save its winner table
+to repeat builds with different write settings without repeating assignment.
 
-`--save-plan PATH` persists that result; `--plan PATH` replays it instead of
-recomputing it.
+`--save-plan PATH` saves the result; `--plan PATH` replays it. Both work on
+`overview` and `tiles`, require streaming, and are mutually exclusive.
+Neither is exposed in Python.
 
 ```bash
 # Once: scan, assign, and keep the plan.
 tylertoo overview roads.parquet roads.parquet.overview \
   --min-zoom 0 --max-zoom 14 --save-plan roads.plan
 
-# Again, tuning only the write side — pass 1 and the assignment are skipped.
+# Again, tuning only the write side; pass 1 and the assignment are skipped.
 tylertoo overview roads.parquet roads-tuned.overview \
   --min-zoom 0 --max-zoom 14 --plan roads.plan \
   --profile bounded --row-group-size 50000
 ```
 
-The artifact is a magic + checksum header followed by one Arrow IPC file,
-sized by input **rows** rather than input bytes: one winner byte per row plus
-the small per-level side tables. A 28 MB / 24k-feature polygon file yields a
-49 KB plan. Line coalescing is the exception — the plan carries the collected
-line geometries as WKB, so a line-heavy input produces a proportionally
-larger artifact.
+The plan contains a header with magic bytes and a checksum, followed by an
+Arrow IPC file. It stores one winner byte per row plus small per-level
+tables: a 28 MB, 24k-feature polygon input produces a 49 KB plan. With line
+coalescing, it also stores collected WKB geometries, increasing its size.
 
-**The file is checksummed.** A plan is meant to be copied to other machines,
-so `--plan` verifies an xxh3-64 over the whole payload before decoding any of
-it. A truncated, edited, or bit-rotted plan is one named error —
+### Plan validation
+
+`--plan` verifies the payload's xxh3-64 hash before decoding. Truncated,
+edited, or damaged plans produce an error naming the path:
 
 ```
 --plan /mnt/shared/roads.plan: is corrupt: the payload hashes to
@@ -1918,19 +1686,19 @@ it. A truncated, edited, or bit-rotted plan is one named error —
 damaged in transit — re-create it with --save-plan.
 ```
 
-— rather than an arrow-internal panic. Every other structural problem (a
-plan that is not a plan, a foreign format version, an impossible level count
-or cluster stride, an unknown geometry-kind code, row-indexed sections of
-disagreeing length) is likewise an error naming `--plan` and the path.
+Other errors also name `--plan` and the path:
 
-The checksum proves the file is the one that was written; it proves nothing
-about whether the file makes sense. So the plan's row domain is also compared
-against the rows this run will actually read — the sum over the row groups
-`--bbox` / `--filter` selected — every time, pruned or not.
+- a file that is not a plan
+- a foreign format version
+- an impossible level count or cluster stride
+- an unknown geometry-kind code
+- row-indexed sections of disagreeing length
 
-**The plan is verified, not trusted.** It stores a fingerprint: the tylertoo
-version, every thinning-relevant flag, and each input's identity. A mismatch
-is a hard error naming the field:
+Every run also checks the plan's row domain against the row groups selected
+by `--bbox` and `--filter`.
+
+A fingerprint records the tylertoo version, thinning flags, and input
+identities. Mismatches name the changed field:
 
 ```
 --plan: saved plan does not match this run: input "roads.parquet" mtime was
@@ -1938,103 +1706,126 @@ is a hard error naming the field:
 now. Re-run without --plan (add --save-plan to write a fresh one).
 ```
 
-**What "input identity" pins, exactly.** For every part — local file or
-remote object alike — the path/URL, the byte size, the **row count** and the
-**row-group count** read from the parquet footer, plus the row groups
-`--bbox`/`--filter` pruned to. A **local** part additionally pins its mtime.
+### Input identity
 
-| | local file | remote object |
+The fingerprint records these fields for every input part:
+
+| Field | Local file | Remote object |
 |---|---|---|
-| path / URL | ✅ | ✅ |
-| byte size | ✅ (`stat`) | ✅ (Content-Length) |
-| row count | ✅ (footer) | ✅ (footer) |
-| row-group count + pruned selection | ✅ | ✅ |
-| mtime | ✅ | ❌ |
-| content hash / ETag | ❌ | ❌ |
+| Path / URL | Yes | Yes |
+| Byte size | Yes (`stat`) | Yes (Content-Length) |
+| Row count | Yes (footer) | Yes (footer) |
+| Row-group count and pruned selection | Yes | Yes |
+| mtime | Yes | No |
+| Content hash / ETag | No | No |
 
-The row count is the load-bearing one: the winner table is one byte per input
-row, addressed by row *position*, so an input swapped under a saved plan
-either produces a silently wrong pyramid (fewer rows) or indexes out of
-bounds (more rows). Pinning the footer row count turns both into a named
-error, for remote inputs as well as local ones. tylertoo prints a one-line
-warning naming what is and is not pinned whenever a part is remote.
+Row counts are essential because the winner table is indexed by row
+position. Replacing an input with fewer or more rows could assign incorrect levels
+or index out of bounds; footer count checks reject both. Remote parts
+produce a warning listing which identity fields are checked.
 
-Neither a local mtime+size nor a remote size+row-count is a content hash:
-`cp -p` / `rsync -a` preserve mtime and size, and an object can be rewritten
-in place with the same size and row count. Treat the fingerprint as a strong
-staleness check, not a cryptographic seal.
+The fingerprint checks staleness, not content integrity. `cp -p` and
+`rsync -a` preserve mtime and size; remote objects can be replaced with the
+same size and row count.
 
-Deliberately **not** fingerprinted, so one plan replays across them:
-`--profile`, `--row-group-size`, `--row-group-size-policy`,
+The fingerprint deliberately leaves out these flags, so one plan replays
+across them: `--profile`, `--row-group-size`, `--row-group-size-policy`,
 `--full-column-stats`, `--read-batch-size`, `--in-flight-batches`,
-`--spill-dir`, `--cogp-compat`. Everything that changes *which* features land
-at *which* level is fingerprinted, and output with `--plan` is byte-identical
+`--spill-dir`, and `--cogp-compat`. It covers everything that changes *which*
+features land at *which* level, and output with `--plan` is byte-identical
 to the run that saved it.
 
-⚠️ **Why this matters for sharded builds.** The assignment is not a
-per-feature function: the density budget water-fills a 128 × GSD super-cell
-budget over *every* candidate of a level, the level walk carries a running
-kept count coarse → fine, `--magnitude-ladder` dense-ranks the *global*
-distinct values of its column, and the automatic class ranking picks its
-column from a global vocabulary scan. A shard that recomputed the assignment
-over its own subset would reach a different answer, and the shards' pyramids
-would disagree. Compute the assignment once, save the plan, and give every
-shard the same one.
+### Shared plans for sharded builds
 
-That is exactly what `tiles --shard` does, and it refuses to run without
-`--plan` rather than let the mistake through. A shard also *narrows* the
-plan's row-group selection — it reads only the groups whose bbox reaches its
-tile range — so the fingerprint compares that one term as a subset relation
-and the plan's row-indexed tables are re-addressed onto the shard's shorter
-row stream before pass 2. See [Sharded builds across a
-fleet](diving-deeper/sharded-builds.md) for the whole recipe.
+Shards need one shared plan because assignment depends on the whole input:
 
-Both flags require the streaming pipeline (they are its pass-1 stage), they
-are mutually exclusive, and they are available on `overview` and `tiles`.
+- The density budget water-fills a 128 × GSD super-cell budget over *every*
+  candidate of a level.
+- The level walk carries a running kept count from coarse to fine.
+- `--magnitude-ladder` dense-ranks the *global* distinct values of its column.
+- The automatic class ranking picks its column from a global vocabulary scan.
 
-**Both paths are checked before anything is scanned.** `--save-plan` is
-written only once pass 1 *and* the assignment are complete, so pointing it at
-an unmounted volume used to cost the entire scan and then leave you with no
-plan **and** no overview. Its parent directory must therefore exist and be
-writable at option-validation time — and if a plan is already sitting at that
-path, it must itself be writable, since it is about to be clobbered. `--plan`
-must be a readable convert plan (magic bytes checked, with a future format
-version named as such) — same fail-fast contract as `--spill-dir`.
-An existing plan at `--save-plan PATH` is **overwritten**, with a log line.
-Every subcommand that writes a file — `overview`, `tiles`, `export-pmtiles`,
-`decode`, `pyramid`, `merge` and `shard-plan` — refuses an existing output
-unless given `-f/--force` (#427). The GeoParquet writers (`overview`,
-`decode`) also build their output in a uniquely named sibling
-(`OUTPUT.<random>.partial`) and rename it over `OUTPUT` only once the footer
-is written, so a run killed part-way leaves a previous output intact; a
-failed run removes the sibling, a killed one leaves it to be deleted by hand.
-Not yet exposed in the Python bindings.
+Recomputing assignment on each shard would produce inconsistent levels, so
+`tiles --shard` requires `--plan`. A shard reads only planned row groups
+whose bbox reaches its tile range. Validation allows this subset, and the
+plan's row tables are remapped to the shorter stream before pass 2. See
+[Scaling](guides/scaling.md#sharded-builds).
+
+### Paths and output replacement
+
+Both plan paths are checked before scanning. `--save-plan` needs an existing
+writable parent and, if present, a writable file. The plan is written after
+assignment; overwriting an existing plan is logged. `--plan` must be
+readable and have valid magic bytes. Future format versions are identified
+in the error.
+
+Every subcommand that writes a file
+(`overview`, `tiles`, `export-pmtiles`, `decode`, `pyramid`, `merge`, and
+`shard-plan`) refuses an existing output unless given `-f`/`--force`. The
+GeoParquet writers, `overview` and `decode`, build their output in a uniquely
+named sibling (`OUTPUT.<random>.partial`) and rename it over `OUTPUT` only
+after writing the footer. A run killed part-way therefore leaves a previous
+output intact. A failed run removes the sibling. After a killed run, delete
+it by hand.
 
 ---
 
 ## Worked scenarios
 
-| Symptom | Fix |
-|---------|-----|
-| Coarse roads look like sparse disconnected dashes | LOWER `--line-thinning` (e.g. 2 → 1) and/or `--line-visibility`; or RAISE `--gsd-base` |
-| Coarse roads are all there but jagged / over-smoothed | LOWER `--simplify-factor` (e.g. 1.0 → 0.5) |
-| Wrong roads survive (residential instead of highways) at coarse zoom | add `--class-rank road_class:…` or rely on auto-detect (don't pass `--no-auto-rank`) |
-| Coarse level files are too large / slow | RAISE the thinning factors and/or `--simplify-factor`; or LOWER `--gsd-base` |
-| Small buildings vanish too early | LOWER `--polygon-visibility`; or `--collapse` to keep them as points |
-| Country-scale view of a dense building/parcel layer is empty | `--polygon-visibility 0 --collapse` + a circle layer for points ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)); the `500K` tile cap that keeps coarse dot tiles sane is on by default (#280) |
-| Whole map uniformly too sparse or too dense | move `--gsd-base` (up = denser, down = sparser) instead of tuning each family |
-| Mid zooms have far more features than tippecanoe / duplicating files too large | RAISE `--drop-rate` (density budget); or `--no-density-drop` to turn it off |
-| Density cut is stripping sparse rural areas to keep cities | RAISE `--drop-gamma` (sparse-area protection) |
-| Dense point data renders as a misleadingly sparse dot field at coarse zooms | `--cluster` and style the symbol size by `point_count` |
-| Need per-cluster totals/averages of a numeric column | `--accumulate-attribute col:sum` / `col:mean` (with `--cluster`) |
-| Every remote query fetches a huge footer before any data | default already suppresses string/geometry stats; do NOT pass `--full-column-stats` |
-| Need server-side row-group skipping on a property predicate | pass `--full-column-stats` (bigger footer, gains column pruning) |
-| Tiny viewports over high-latency storage fetch too much | LOWER `--row-group-size` for tighter bbox pruning |
-| Conversion runs out of memory / swaps on a big file | streaming is already the default; LOWER `--read-batch-size`; make sure `--no-streaming` is NOT set |
-| Conversion is slow / uses only one core | the engine now reads the input once and parallelizes simplification across all cores; RAISE `--in-flight-batches` for more read/compute overlap |
-| Conversion runs out of memory in `speed` profile | `--profile bounded` (spills each level to temp files, caps RAM); `--profile auto` picks this automatically for large partitioning runs |
-| `memory allocation of N bytes failed` on a v0.7.1-or-earlier musl binary, with RAM to spare | `--profile bounded` — musl `mallocng` fragmentation, fixed after v0.7.1 by shipping mimalloc ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)) |
+### Detail and visibility
 
-See `corpus/SWEEPS.md` for an empirical `--line-thinning` ×
-`--simplify-factor` sweep on Portland roads, and the Q2 section there for the
-`--drop-rate` calibration (before/after ratios vs tippecanoe).
+- Too few coarse features: lower `--point-thinning`, `--line-thinning`, or
+  `--polygon-thinning`; lower `--line-visibility` or
+  `--polygon-visibility`; or raise `--gsd-base`.
+- Disconnected coarse roads: lower `--line-thinning` or
+  `--line-visibility`, keep
+  [coalescing](#line-coalescing-no-coalesce-lines-coalesce-junction-angle-coalesce-snap-coalesce-max-level-rows)
+  on, or raise `--gsd-base`.
+- Jagged or over-smoothed geometry: lower `--simplify-factor`, for example
+  from 1.0 to 0.5.
+- Residential roads displace highways: use `--class-rank road_class:…` or
+  automatic ranking (leave `--no-auto-rank` unset).
+- Coarse levels are too large or slow: raise thinning factors or
+  `--simplify-factor`, or lower `--gsd-base`.
+- Small buildings vanish early: lower `--polygon-visibility` or use
+  `--collapse` for points.
+- Empty country view of buildings or parcels: use
+  `--polygon-visibility 0 --collapse` and a circle layer
+  ([dot-fill recipe](#country-scale-dot-fill-for-dense-polygon-layers)), or
+  `--collapse-square` for polygons.
+- Whole map is too sparse or dense: adjust `--gsd-base` (up = denser,
+  down = sparser).
+- Too many mid-zoom features (about z9–z12), or large duplicating files:
+  raise `--drop-rate`. `--no-density-drop` disables the budget entirely.
+- Sparse rural areas disappear under the budget: raise `--drop-gamma`.
+- Dense points look misleadingly sparse: use `--cluster` and scale symbols
+  by `point_count`.
+- Need cluster totals or averages: add `--accumulate-attribute col:sum` or
+  `col:mean` with `--cluster`.
+- Cell aggregates or prebuilt levels lose features: use `--verbatim`.
+
+### Remote reads
+
+- Huge footer on every query: leave `--full-column-stats` unset to suppress
+  string and geometry statistics.
+- Need row-group skipping on property predicates: enable
+  `--full-column-stats`, accepting a larger footer.
+- Tiny viewports fetch too much: lower `--row-group-size` for tighter bbox
+  pruning.
+
+### Speed and memory
+
+- Conversion exhausts RAM or swaps: lower `--read-batch-size`, keep
+  streaming enabled, and see [Scaling](guides/scaling.md).
+- Cores remain idle: raise `--in-flight-batches` for more read/compute overlap.
+- `--profile speed` exhausts RAM: use `bounded` to spill each level.
+  The default `auto` spills when the estimate exceeds its budget.
+- `memory allocation of N bytes failed` on a musl binary at v0.7.1 or
+  earlier, despite available RAM: use `--profile bounded` or upgrade.
+  Later binaries ship mimalloc to avoid musl `mallocng` fragmentation
+  ([#480](https://github.com/geoparquet-io/tylertoo/issues/480)).
+
+[`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)
+holds the corpus sweeps behind the defaults, including `--line-thinning` ×
+`--simplify-factor` on Portland roads and the `--drop-rate` calibration
+against tippecanoe.

@@ -105,6 +105,12 @@ struct GeoDoc {
 /// Runs every metadata-only check of [`validate_metadata`], plus the
 /// data-reading §12.1 cluster sum-invariant check (which needs the column
 /// values, not just row-group statistics).
+///
+/// # Errors
+///
+/// Returns a [`CheckError`] if the file cannot be opened or its Parquet footer
+/// cannot be parsed. Failed conformance checks are reported in the
+/// [`ValidationReport`], not as an error.
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
     let path = path.as_ref();
     let file = File::open(path)?;
@@ -119,6 +125,11 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
 ///
 /// Split out so callers holding a [`ParquetMetaData`] (and tests) can validate
 /// without re-opening the file.
+///
+/// # Panics
+///
+/// Does not panic in practice: the clustering check unwraps the parsed
+/// overviews metadata only after confirming it is present.
 pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
     let mut report = ValidationReport::default();
     let num_row_groups = metadata.num_row_groups();
@@ -347,7 +358,7 @@ pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
     report
 }
 
-/// Explicit §3.4 mode/canonical_level consistency (separate report entry).
+/// Explicit §3.4 `mode/canonical_level` consistency (separate report entry).
 fn check_mode_canonical(meta: &OverviewsMeta, report: &mut ValidationReport) {
     let l = meta.levels.len() as i64;
     match meta.mode {
@@ -389,7 +400,7 @@ fn check_mode_canonical(meta: &OverviewsMeta, report: &mut ValidationReport) {
 /// - the mode must be `duplicating` (clustering cannot be represented in
 ///   partitioning mode without double counting);
 /// - the named point-count column must exist as INT64 NOT NULL;
-/// - every row group's point_count stats must have `min >= 1`, and the
+/// - every row group's `point_count` stats must have `min >= 1`, and the
 ///   canonical level band's must be exactly `min == max == 1` (every
 ///   canonical cluster is a singleton).
 fn check_clustering(
@@ -494,7 +505,7 @@ fn check_clustering(
 /// - the mode must be `duplicating` (merged chains cannot satisfy
 ///   partitioning's feature-once / geometry-verbatim contract);
 /// - the named merged-count column must exist as INT32 NOT NULL;
-/// - every row group's coalesced_count stats must have `min >= 1`, and the
+/// - every row group's `coalesced_count` stats must have `min >= 1`, and the
 ///   canonical level band's must be exactly `min == max == 1` (the
 ///   canonical level is never coalesced, §2.4).
 fn check_coalescing(
@@ -823,10 +834,17 @@ pub fn level_for_rg(meta: &OverviewsMeta, rg: usize) -> Option<usize> {
     None
 }
 
-/// Compare a `cogp` compatibility key's JSON against the authoritative
-/// [`OverviewsMeta`] (§3.1). The `cogp` subset is `version` and
+/// Compare a `cogp` compatibility key's JSON against the authoritative [`OverviewsMeta`].
+///
+/// See §3.1. The `cogp` subset is `version` and
 /// `levels[].{row_group_end, gsd}`; disagreement (including differing level
 /// count) is an error.
+///
+/// # Errors
+///
+/// Returns a description of the first mismatch if `cogp_json` is not valid
+/// JSON, has no `levels` array, or disagrees with `meta` on the version, the
+/// level count, or any level's `row_group_end` or `gsd`.
 pub fn compare_cogp(meta: &OverviewsMeta, cogp_json: &str) -> Result<(), String> {
     let v: serde_json::Value = serde_json::from_str(cogp_json)
         .map_err(|e| format!("'cogp' key is not valid JSON: {e}"))?;

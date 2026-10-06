@@ -121,12 +121,18 @@ class TestOverviewApi:
 
     def test_overview_invalid_mode(self):
         with pytest.raises(ValueError, match=r"[Ii]nvalid mode"):
-            tylertoo.overview("/nonexistent.parquet", "/tmp/out.parquet", mode="bogus")
+            tylertoo.overview(
+                "/nonexistent.parquet",
+                "/tmp/out.parquet",
+                mode="bogus",  # type: ignore[arg-type]
+            )
 
     def test_overview_invalid_sort_direction(self):
         with pytest.raises(ValueError, match="sort_direction"):
             tylertoo.overview(
-                "/nonexistent.parquet", "/tmp/out.parquet", sort_direction="sideways"
+                "/nonexistent.parquet",
+                "/tmp/out.parquet",
+                sort_direction="sideways",  # type: ignore[arg-type]
             )
 
     def test_overview_sort_key_and_class_rank_conflict(self):
@@ -178,7 +184,7 @@ class TestOverviewApi:
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
                 cluster=True,
-                accumulate_attributes={"population": "median"},
+                accumulate_attributes={"population": "median"},  # type: ignore[dict-item]
             )
 
     def test_overview_cluster_requires_duplicating(self):
