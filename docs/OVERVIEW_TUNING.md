@@ -71,6 +71,8 @@ picked where a standard 256 px tile pixel resolves about half the smaller of
 between nearby features", measured in Web Mercator meters and clamped to
 `[--min-zoom, 16]`. The chosen zoom and the measurements behind it are logged
 at `info`; treat it as a starting point, the way tippecanoe users treat `-zg`.
+From Python, that log goes to Rust's logger, which Python's `logging` does not
+receive; the chosen zoom is the finest `zoom` in the report's `levels`.
 An input with nothing to measure (one location, or only empty geometries) is
 an error, as with `-zg`; so is a `--min-zoom` above 16. With `--gsd` the value
 is unused and nothing is estimated. See `context/ARCHITECTURE.md`'s divergence
@@ -190,6 +192,26 @@ share zooms the two must agree, or the combined tile would hold two layers of
 one name (which a client resolves by dropping one). A **gap** between bands is
 allowed but warns, because the merged archive advertises one continuous range
 and a client will request the uncovered zooms and get nothing.
+
+**A pre-tiled band may declare part of its archive.** An archive that
+holds more zooms than its band declares is accepted quietly: that is how one
+pre-tiled archive is split across several bands, for example two bands pointing
+at the same z0–13 archive, one declaring `0-5` and the other `6-13`. An archive
+that holds *fewer* zooms than its band declares is an error, because those
+zooms would render silently empty, and the cause is almost always a band range
+that disagrees with how the archive was tiled. Pass `--allow-missing-zooms` for
+a deliberately sparse pyramid. A band whose range shares no zoom at all with its
+archive is always an error, with or without that flag.
+
+**Per-band export settings.** `--max-tile-size` is unset by default for
+pyramid bands, so a band keeps every cell it exists to draw; when set, the cap
+applies to each band's tiles before they are combined, not to the combined
+tile. `--feature-order` (#374) applies to every GeoParquet band alike, like
+`--generalize`; each band's export reads the column independently, so a band
+that lacks it is exported in input order with a warning naming its layer, not
+an error. A pre-tiled archive band is merged as-is and keeps the order it was
+tiled with. Bands are written coarsest-first regardless of the order they are
+listed in.
 
 Intermediates go to `--work-dir` (default: the system temp directory) and are
 removed whether the build succeeds or fails. Budget for it: a band is tiled in
@@ -1359,6 +1381,88 @@ Both act at export, on the tiles, not on the overview file.
   decoders assume one when they reason about coordinate precision; any other
   positive value is accepted with a warning. `tylertoo decode` refuses an
   archive whose layer declares `extent: 0` for the same reason.
+
+---
+
+## Export and archive commands: `export-pmtiles`, `merge`, `stats`
+
+**The per-tile size cap.** `export-pmtiles --tile-size-limit` (also spelled
+`--max-tile-size`, the `tiles` spelling) caps each tile's encoded MVT size,
+500K by default for tippecanoe parity (#280); 0 disables it. A tile over the
+cap sheds features for that tile only, in a single non-iterative pass:
+largest-first for polygons and lines, and a uniform spatial stride for point
+tiles.
+
+**The simple-clip fast path.** By default, a polygon whose rings are already
+simple skips the `i_overlay` boundary-bridge fallback when it is clipped to a
+tile (#239). Fine-zoom polygon export is faster, and the result renders the
+same, but a simple ring is stored rotated to a different start vertex. Pass
+`--no-simple-clip-fastpath` when you need byte-stable tile output.
+
+**Declaring a minimum zoom.** `export-pmtiles --min-zoom` sets the minimum zoom
+the archive declares in its metadata (`vector_layers[].minzoom`), even when the
+overview file's coarsest levels are missing (#380). `overview` omits a level
+that generalizes to nothing, so a file built for z0–13 can start at z2; this
+records the requested z0 anyway. The PMTiles header's minimum zoom is not
+widened: it always reports the shallowest zoom that holds a tile, as
+`go-pmtiles verify` requires, so a renderer that reads the header sees z2 (the
+empty zooms would render nothing either way). The value must not be finer than
+the coarsest level present; unset, it is the coarsest level's zoom. `tiles`
+and Python's `convert()` pass their own `--min-zoom` here.
+
+**Export-time property selection.** `export-pmtiles --include-property`,
+`--exclude-property`, and `--exclude-all-properties` (tippecanoe's `-y`, `-x`,
+and `-X`) act on the tiles only, matched on the names the tiles publish; the
+overview file is untouched. Naming a property the file does not export is an
+error, and the `--feature-order` column must stay included. As in tippecanoe,
+the exclusions are ignored when `--include-property` is given.
+
+**The export report's encode tallies.** Besides per-zoom tile and feature
+counts and the oversized-tile tally, `--report` (and Python's
+`export_pmtiles()` return value) carries two encode tallies, in total and per
+zoom (#431). `encode_dropped_features` counts tile members with nothing to
+encode: empty geometries or empty GeometryCollections. A non-zero value means
+content was lost after clipping; a warning names the total and the summary line
+repeats it. `encode_quantized_features` counts tile members whose geometry
+collapsed at the tile extent: zero-area polygon rings or lines of fewer than
+two points, typically clip slivers at a buffered tile edge. That is expected on
+ordinary data and never a warning.
+
+**Sharded export flags.** `--tile-range LO..HI` takes two tile ids at the same
+zoom, the pivot, and emits every descendant of those tiles at every deeper
+zoom; the ids under one tile are contiguous on the Hilbert curve, so the restriction is
+an exact interval test at each zoom. Tiles coarser than the pivot are not
+emitted. `--zoom-ceiling Z` emits only the zooms at or below `Z`, the coarse
+half. It is named a ceiling, not `--max-zoom`, because it decides which zooms
+are emitted, while `--min-zoom` only widens what the metadata declares; the
+overview file still holds every level. See the sharded builds guide for both.
+
+**`tylertoo merge`.** The inputs, two or more, must hold disjoint tile ids and
+agree on tile type and tile compression. The merged archive's bounds are the
+union of theirs, its zoom range the union of the ranges they declare, and its
+`vector_layers` the union of theirs: layers sharing an id collapse into one
+entry spanning their combined zooms, with the union of their fields. A shard's ids
+need not form a contiguous slice of the id space, because subtrees at different
+depths interleave on the Hilbert curve; disjointness is checked per tile id,
+not per range. `--work-dir` holds the spool file with the merged tile data
+until the archive is assembled; set it when the output is large and `/tmp` is a
+small tmpfs. `--report` writes per-zoom tile counts, which are what a sharded
+build is checked against. To combine archives that do overlap, such as
+different data at different zooms or several layers over the same zooms, use
+`tylertoo pyramid`.
+
+**`tylertoo stats`.** For each zoom it prints the tile count and the total,
+mean, p50, p99, and maximum tile size, plus the largest tiles (`--largest N`).
+Sizes are **stored** (compressed) bytes per addressed tile, read from the
+directory entries alone: no tile is decompressed or read. Run-length members
+and deduplicated tiles each count at the full length of their shared body, so
+the `total` column is the bytes a client would fetch and can exceed the
+archive's size on disk. Percentiles are nearest-rank: pN is the smallest size
+such that at least ⌈N/100 × tiles⌉ of the zoom's tiles are no larger. The
+largest tiles are ordered by size, descending, with ties broken by ascending
+PMTiles tile id. Memory and time scale with the archive's directory entries,
+not its tile count, since runs are aggregated with their multiplicity rather
+than expanded.
 
 ---
 

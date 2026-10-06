@@ -111,7 +111,10 @@ is small and speed matters more than the ceiling.
 to 8192. Larger batches amortize per-batch overhead for a little more speed at
 proportionally more peak memory; smaller batches bound memory tighter. The
 default keeps per-batch transients in the tens of megabytes even for
-vertex-heavy polygons.
+vertex-heavy polygons. The value is capped at 1,048,576 rows, and it is lowered
+automatically, with a warning, when the input's rows are so large that a batch
+would pass the ~2 GiB Arrow can decode per byte-array column. It has no effect
+with `--no-streaming`.
 
 ### Choosing a memory profile
 
@@ -188,10 +191,30 @@ caveat is that a small or full `$TMPDIR` volume turns a remote convert's stage
 write into a failure, so on a big remote run, set `--spill-dir` to somewhere you
 know has space.
 
+**The `tiles` intermediate.** `tiles` writes its intermediate overview, which
+is at least input-sized and has its own free-space preflight, to `--spill-dir`
+if given, else `$TMPDIR` if set, else the output directory, and deletes it once
+the export finishes. `--keep-overview PATH` writes it to `PATH` and keeps it
+instead; the PMTiles output is identical either way.
+
+**The export's spill file.** `export-pmtiles --spill-dir` (and the same flag on
+`tiles`) places the export's member spill file: the on-disk backing the
+partitioning single-read pass 2 falls back to when the buffered members would
+not fit the memory budget. The directory must exist; a missing one is an error
+before any work is done. On many Slurm and Kubernetes nodes `$TMPDIR` is a
+RAM-backed `/tmp`, so point this at real disk there. The archive itself is
+never spilled here: it is assembled in place at `OUTPUT.partial` beside the
+output.
+
 ### Sizing export waves
 
 **`--partition-wave N|auto`.** The number of partitions export holds resident
 per band. `auto` preflights a memory budget from the core count and available
-RAM. Override it with an explicit integer to cap memory harder on a shared
-machine, or to push utilization on a dedicated one. The output is byte-identical
-for every value.
+RAM: the core count, capped by how many estimated per-partition transients fit
+in a fraction of available RAM (cgroup v2 and v1 limits are respected), with a
+floor of 6 and a fixed cap of 16 only when RAM cannot be probed. The chosen
+width and the preflight inputs are logged at export start. Override it with an
+explicit integer to cap memory harder on a shared machine, or to push
+utilization on a dedicated one; wider waves keep more cores busy at
+proportionally more peak memory. The output is byte-identical for every
+value.

@@ -25,7 +25,7 @@
 //! `overview::writer`), whose raw JSON element order varied run to run
 //! independent of anything this ticket touches — confirmed empirically while
 //! building this test, the kept `--keep-overview` Parquet differed by a
-//! handful of bytes at RAYON_NUM_THREADS=8 (the `geometry_types` array in a
+//! handful of bytes at `RAYON_NUM_THREADS=8` (the `geometry_types` array in a
 //! different order) even though the exported PMTiles archive was still
 //! byte-identical. #508 fixed that source at the writer
 //! (`geo_metadata_json_deterministic` sorts the array before it is ever
@@ -36,8 +36,8 @@
 //! byte-compares the *PMTiles* output (a one-step-vs-two-step parity check,
 //! not a thread-count one) — that is an unrelated, narrower guarantee and is
 //! unaffected by this change. The PMTiles archive remains the primary
-//! byte-determinism promise in ARCHITECTURE.md, OVERVIEW_TUNING.md,
-//! bounded-memory.md, and cli.md, and what #423 asks this test to cover; the
+//! byte-determinism promise in `ARCHITECTURE.md`, `OVERVIEW_TUNING.md`,
+//! `bounded-memory.md`, and `cli.md`, and what #423 asks this test to cover; the
 //! overview-file comparison is additional coverage, not a replacement.
 
 use std::path::Path;

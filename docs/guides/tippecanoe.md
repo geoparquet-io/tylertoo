@@ -121,6 +121,7 @@ stored, reusable level.
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder; tylertoo anchors on the full canonical count, so the default differs |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell, leaving per-level totals unchanged |
 | `-S` simplification | `--simplify-factor` | RDP, cascading by default |
+| `-M` maximum tile bytes (default 500K) | `--max-tile-size` / `--tile-size-limit` (default 500K) | Same default; 0 disables the cap |
 | `--drop-fraction-as-needed` tile-size loop | `--tile-size-limit` | Single non-iterative drop pass, since levels are already budgeted |
 | tiny-polygon reduction | `--collapse-square` | Area accumulator per 32×GSD patch of the level (tile-less), plus a per-feature dither for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
