@@ -1,0 +1,68 @@
+extends: existence
+message: "'%s' is passive. Name the agent that does the action."
+level: suggestion
+ignorecase: true
+raw:
+  - '\b(?:am|are|were|being|is|been|was|be)\b\s*'
+tokens:
+  - '[\w]+ed'
+  - beaten
+  - become
+  - begun
+  - bound
+  - broken
+  - brought
+  - built
+  - caught
+  - chosen
+  - come
+  - cut
+  - dealt
+  - done
+  - drawn
+  - driven
+  - eaten
+  - fallen
+  - fed
+  - felt
+  - fought
+  - found
+  - forgotten
+  - frozen
+  - given
+  - gone
+  - grown
+  - held
+  - hidden
+  - hit
+  - kept
+  - known
+  - laid
+  - led
+  - left
+  - lent
+  - lost
+  - made
+  - meant
+  - met
+  - paid
+  - put
+  - read
+  - run
+  - said
+  - seen
+  - sent
+  - set
+  - shown
+  - sold
+  - spent
+  - split
+  - spread
+  - stood
+  - taken
+  - taught
+  - thought
+  - told
+  - understood
+  - withheld
+  - written

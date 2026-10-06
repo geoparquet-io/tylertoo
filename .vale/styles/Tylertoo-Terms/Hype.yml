@@ -1,0 +1,19 @@
+extends: existence
+message: "'%s' is a hype word. State the measured behavior instead."
+level: error
+ignorecase: true
+tokens:
+  - powerful
+  - seamless
+  - seamlessly
+  - robust
+  - blazing[- ]fast
+  - effortless
+  - effortlessly
+  - game[- ]chang(?:er|ing)
+  - cutting[- ]edge
+  - state[- ]of[- ]the[- ]art
+  - best[- ]in[- ]class
+  - revolutionary
+  - unparalleled
+  - turnkey

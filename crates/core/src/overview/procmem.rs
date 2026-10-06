@@ -57,7 +57,7 @@ pub(super) struct ProcStatusMem {
     /// `RssFile`: resident pages of mapped files (for tylertoo, the binary
     /// and its shared libraries).
     pub(super) file_kib: Option<u64>,
-    /// `RssShmem`: resident shared memory (SysV, shared anonymous mappings,
+    /// `RssShmem`: resident shared memory (`SysV`, shared anonymous mappings,
     /// tmpfs files the process has mapped).
     pub(super) shmem_kib: Option<u64>,
     /// `VmSwap`: anonymous pages evicted to swap (not resident, but ours).

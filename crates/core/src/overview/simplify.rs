@@ -2,7 +2,7 @@
 //!
 //! # Why this module exists (vs. `crate::simplify`)
 //!
-//! The crate-level [`crate::simplify`] module simplifies in **tile-local
+//! The crate-level `crate::simplify` module simplifies in **tile-local
 //! pixel space**: every entry point transforms geometry into a
 //! `TileCoord` + `extent` (0–4096) pixel frame, runs Ramer–Douglas–Peucker
 //! (RDP), and transforms back. That is correct for MVT tile generation but
@@ -515,7 +515,7 @@ impl CascadeStep {
 /// first vertex for degenerate (zero-area) rings — the same flavor as the
 /// `--collapse` path ([`collapse_polygon`]; `assign.rs` notes centroid is the
 /// closest to cartographic convention). Unlike `--collapse` the fallback
-/// chain is applied to MultiPolygons too: a point-band level must never
+/// chain is applied to `MultiPolygons` too: a point-band level must never
 /// silently lose a feature to a degenerate centroid. `Dropped` only when the
 /// geometry has no coordinates at all.
 ///
@@ -556,12 +556,12 @@ fn polygonal_representative_point(geom: &Geometry<f64>) -> Option<Simplified> {
 /// [`Representation::Geometry`] is exactly [`simplify_for_level`]. On a
 /// [`Representation::Point`] level (a zoom-band point level), polygonal
 /// geometry is replaced by its representative point
-/// ([`polygonal_representative_point`]) — unconditionally, with no
+/// (`polygonal_representative_point`) — unconditionally, with no
 /// visibility gating (a dot is always visible) — while points pass through
 /// and lines keep the normal simplification path. On a
 /// [`Representation::Square`] level (#279), simplification is normal but
 /// below-tolerance polygons emit area-dithered placeholder squares
-/// ([`squarify_polygon`]) instead of following the global [`CollapseMode`].
+/// (`squarify_polygon`) instead of following the global [`CollapseMode`].
 pub fn simplify_step(
     geom: &Geometry<f64>,
     gsd_meters: f64,
@@ -625,8 +625,9 @@ pub(super) fn simplify_step_checked(
     }
 }
 
-/// Cascading simplification (#218): fold a geometry through a fine→coarse
-/// chain of level steps, feeding each coarser level the previous level's
+/// Cascading simplification (#218): fold a geometry through a fine→coarse chain of level steps.
+///
+/// The fold feeds each coarser level the previous level's
 /// already-simplified output instead of re-simplifying canonical geometry.
 ///
 /// `steps_fine_to_coarse` lists every non-canonical level from the finest
@@ -660,7 +661,7 @@ pub(super) fn simplify_step_checked(
 /// An empty chain is the identity (bit-identical clone), matching
 /// [`simplify_for_level`]'s canonical path at zero tolerance.
 ///
-/// The step rules live in [`CascadeFold`], which the pipelined engine's
+/// The step rules live in `CascadeFold`, which the pipelined engine's
 /// incremental fold (`overview::stream::process_batch_cascade`) drives too;
 /// equivalence is enforced by
 /// `overview::convert::tests::pipelined_matches_serial`.
@@ -1018,7 +1019,7 @@ const INVALID_RETRY_HALVINGS: u32 = 3;
 /// crossing. The expensive-to-check case and the low-risk case coincide.
 /// The trade is the same as `clip.rs`: a giant candidate that *did* acquire
 /// a crossing ships unrepaired, which the overviews spec explicitly permits
-/// (geometry validity is not a conformance requirement, OVERVIEWS_SPEC §
+/// (geometry validity is not a conformance requirement, `OVERVIEWS_SPEC` §
 /// "validity") and matches tippecanoe, which never validates simplification
 /// output. Everything at or below the cap is validated exactly as before.
 const MAX_VALIDATION_VERTS: usize = 2_048;
@@ -2237,7 +2238,7 @@ mod tests {
         }
     }
 
-    /// Representation::Square in a cascade: a square kept at the band's
+    /// `Representation::Square` in a cascade: a square kept at the band's
     /// finest level re-dithers deterministically at coarser steps (same
     /// anchor ⇒ same u), so survival is monotone and engine-independent.
     #[test]

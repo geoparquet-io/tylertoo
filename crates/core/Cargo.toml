@@ -2,6 +2,7 @@
 name = "tylertoo-core"
 description = "Core library for converting GeoParquet to PMTiles vector tiles"
 readme = "README.md"
+documentation = "https://docs.rs/tylertoo-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +12,11 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+# docs.rs documents the public `remote` feature; `fuzzing` and `dhat-heap`
+# are internal hooks and stay out of the published API docs.
+[package.metadata.docs.rs]
+features = ["remote"]
 
 [features]
 default = []

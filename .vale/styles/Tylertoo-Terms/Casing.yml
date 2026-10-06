@@ -1,0 +1,15 @@
+extends: substitution
+message: "Write '%s', not '%s'."
+level: warning
+ignorecase: false
+swap:
+  'Geoparquet': GeoParquet
+  'geojson': GeoJSON
+  'Geojson': GeoJSON
+  'Pmtiles': PMTiles
+  'PmTiles': PMTiles
+  'Duckdb': DuckDB
+  'Geoarrow': GeoArrow
+  'Maplibre': MapLibre
+  'github': GitHub
+  'Github': GitHub

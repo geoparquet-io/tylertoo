@@ -1,0 +1,7 @@
+extends: occurrence
+message: "This paragraph stacks inline lists. Vary the syntax or use a real list."
+level: error
+scope: paragraph
+max: 1
+token: >-
+  ,\s+[^,.;:!?\n]{1,80},\s+and\s+[^.;:!?\n]{1,80}

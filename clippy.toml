@@ -13,3 +13,27 @@ cognitive-complexity-threshold = 30
 # one is 183 clippy lines. RATCHET: lower this toward 100 as the remaining long
 # functions get split — never raise it.
 too-many-lines-threshold = 200
+
+# doc_markdown (enabled in Cargo.toml) treats CamelCase words as code that
+# needs backticks. These are product, format, and OGC geometry-type names
+# written as prose. ".." keeps clippy's built-in list (GitHub, JavaScript, ...).
+doc-valid-idents = [
+    "..",
+    "DuckDB",
+    "ETag",
+    "GeoArrow",
+    "GeoJSON",
+    "GeoParquet",
+    "GeometryCollection",
+    "GeometryCollections",
+    "LineString",
+    "LineStrings",
+    "MapLibre",
+    "MBTiles",
+    "MultiLineString",
+    "MultiPoint",
+    "MultiPolygon",
+    "PMTiles",
+    "ProtoBuf",
+    "TileJSON",
+]

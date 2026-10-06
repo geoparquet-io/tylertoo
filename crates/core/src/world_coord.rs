@@ -34,8 +34,9 @@ pub const WORLD_SCALE: u64 = 1_u64 << 32;
 /// Half the world scale (2^31) - useful for center calculations.
 pub const WORLD_HALF: u32 = 1_u32 << 31;
 
-/// Maximum valid latitude for Web Mercator projection: `atan(sinh(π))` in
-/// degrees, the latitude whose projected y reaches the edge of the square
+/// Maximum valid latitude for Web Mercator projection.
+///
+/// This is `atan(sinh(π))` in degrees, the latitude whose projected y reaches the edge of the square
 /// world extent (normalized y = 0 at the north edge, 1 at the south edge).
 ///
 /// The exact value is 85.05112877980658…°, which is not representable in
@@ -76,7 +77,7 @@ impl WorldCoord {
         Self { x, y }
     }
 
-    /// Create a WorldCoord from longitude/latitude.
+    /// Create a `WorldCoord` from longitude/latitude.
     ///
     /// Convenience wrapper around [`lng_lat_to_world`].
     #[inline]
@@ -90,7 +91,7 @@ impl WorldCoord {
     /// * `zoom` - Zoom level (0-30)
     ///
     /// # Returns
-    /// TileCoord containing this point
+    /// `TileCoord` containing this point
     #[inline]
     pub fn to_tile(&self, zoom: u8) -> TileCoord {
         // At zoom 0, shift by 32 would overflow, but the result should be (0, 0)
@@ -154,7 +155,7 @@ impl WorldCoord {
 /// * `lat` - Latitude in degrees [-85.05, 85.05] (Web Mercator bounds)
 ///
 /// # Returns
-/// WorldCoord with x, y in [0, 2^32) space
+/// `WorldCoord` with x, y in [0, 2^32) space
 ///
 /// # Examples
 ///
@@ -233,7 +234,7 @@ pub fn world_to_lng_lat(coord: WorldCoord) -> (f64, f64) {
 /// * `extent` - Tile extent (typically 4096)
 ///
 /// # Returns
-/// WorldCoord in global space
+/// `WorldCoord` in global space
 pub fn tile_local_to_world(
     tile: &TileCoord,
     local_x: i32,
@@ -425,7 +426,7 @@ impl WorldBounds {
         self.y_max - self.y_min
     }
 
-    /// Convert to f64-based TileBounds (geographic coordinates).
+    /// Convert to f64-based `TileBounds` (geographic coordinates).
     ///
     /// This is a convenience method for interoperability with the existing
     /// f64-based pipeline during Phase 1 migration.
@@ -435,7 +436,7 @@ impl WorldBounds {
         TileBounds::new(lng_min, lat_min, lng_max, lat_max)
     }
 
-    /// Create WorldBounds from f64-based TileBounds (geographic coordinates).
+    /// Create `WorldBounds` from f64-based `TileBounds` (geographic coordinates).
     ///
     /// Converts the geographic bounds to world coordinate space.
     /// Note: This involves the Web Mercator projection, so lat/y mapping is non-linear.

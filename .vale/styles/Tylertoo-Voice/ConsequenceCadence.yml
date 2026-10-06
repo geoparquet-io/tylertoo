@@ -1,0 +1,6 @@
+extends: occurrence
+message: "This file repeats ', so X can Y'. Rewrite the repeated consequence."
+level: warning
+scope: text
+max: 1
+token: ', so (?:a |an |the |this |that |it |we |you )?\w+ can\b'

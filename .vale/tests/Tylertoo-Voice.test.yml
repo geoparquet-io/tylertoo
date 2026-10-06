@@ -1,0 +1,123 @@
+# Cases for the Tylertoo-Voice rules, run by `vale test` (Vale >= 3.24).
+# They live outside StylesPath so older Vale releases, which reject a
+# rule's `tests:` key, can still load the styles.
+
+- name: AffirmativeNegativeEcho flags the pattern
+  rule: ../styles/Tylertoo-Voice/AffirmativeNegativeEcho.yml
+  input: "It reads the policy. It does not read the answers."
+  contains: Tylertoo-Voice.AffirmativeNegativeEcho
+
+- name: AffirmativeNegativeEcho leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/AffirmativeNegativeEcho.yml
+  input: "Although it reads the policy, the answers remain unavailable."
+  absent: Tylertoo-Voice.AffirmativeNegativeEcho
+
+- name: ChatbotResidue flags the pattern
+  rule: ../styles/Tylertoo-Voice/ChatbotResidue.yml
+  input: "I hope this helps."
+  contains: Tylertoo-Voice.ChatbotResidue
+
+- name: ChatbotResidue leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/ChatbotResidue.yml
+  input: "The command prints the result."
+  absent: Tylertoo-Voice.ChatbotResidue
+
+- name: ClosingTail flags the pattern
+  rule: ../styles/Tylertoo-Voice/ClosingTail.yml
+  input: "In conclusion, publish the files."
+  contains: Tylertoo-Voice.ClosingTail
+
+- name: ClosingTail leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/ClosingTail.yml
+  input: "Publish the files."
+  absent: Tylertoo-Voice.ClosingTail
+
+- name: ConsequenceCadence flags the pattern
+  rule: ../styles/Tylertoo-Voice/ConsequenceCadence.yml
+  input: "It is indexed, so people can search. It is open, so people can query."
+  contains: Tylertoo-Voice.ConsequenceCadence
+
+- name: ConsequenceCadence leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/ConsequenceCadence.yml
+  input: "It is indexed, so people can search. People query the open files."
+  absent: Tylertoo-Voice.ConsequenceCadence
+
+- name: ContrastSlogan flags the pattern
+  rule: ../styles/Tylertoo-Voice/ContrastSlogan.yml
+  input: "It is not just a report, but a complete transformation."
+  contains: Tylertoo-Voice.ContrastSlogan
+
+- name: ContrastSlogan leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/ContrastSlogan.yml
+  input: "The report includes the measured results."
+  absent: Tylertoo-Voice.ContrastSlogan
+
+- name: DramaticColon flags the pattern
+  rule: ../styles/Tylertoo-Voice/DramaticColon.yml
+  input: "Remember: this changes the final result."
+  contains: Tylertoo-Voice.DramaticColon
+
+- name: DramaticColon leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/DramaticColon.yml
+  input: "Remember that this changes the result."
+  absent: Tylertoo-Voice.DramaticColon
+
+- name: DramaticColon leaves clean prose alone (2)
+  rule: ../styles/Tylertoo-Voice/DramaticColon.yml
+  input: "**Stage 3: field matching.** Apply the matching rule."
+  absent: Tylertoo-Voice.DramaticColon
+
+- name: Filler flags the pattern
+  rule: ../styles/Tylertoo-Voice/Filler.yml
+  input: "It basically works."
+  contains: Tylertoo-Voice.Filler
+
+- name: Filler leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/Filler.yml
+  input: "It works."
+  absent: Tylertoo-Voice.Filler
+
+- name: Filler leaves clean prose alone (2)
+  rule: ../styles/Tylertoo-Voice/Filler.yml
+  input: "The scanner checks content, not just paths."
+  absent: Tylertoo-Voice.Filler
+
+- name: Passive flags the pattern
+  rule: ../styles/Tylertoo-Voice/Passive.yml
+  input: "The file was written yesterday."
+  contains: Tylertoo-Voice.Passive
+
+- name: Passive leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/Passive.yml
+  input: "The publisher wrote the file yesterday."
+  absent: Tylertoo-Voice.Passive
+
+- name: SerialListCadence flags the pattern
+  rule: ../styles/Tylertoo-Voice/SerialListCadence.yml
+  input: "It reads red, blue, and green files. It writes one, two, and three."
+  contains: Tylertoo-Voice.SerialListCadence
+
+- name: SerialListCadence leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/SerialListCadence.yml
+  input: "It reads red, blue, and green files. The output contains three files."
+  absent: Tylertoo-Voice.SerialListCadence
+
+- name: SoYouCan flags the pattern
+  rule: ../styles/Tylertoo-Voice/SoYouCan.yml
+  input: "It is open, so you can read it."
+  contains: Tylertoo-Voice.SoYouCan
+
+- name: SoYouCan leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/SoYouCan.yml
+  input: "Because it is open, you can read it."
+  absent: Tylertoo-Voice.SoYouCan
+
+- name: StockTransitions flags the pattern
+  rule: ../styles/Tylertoo-Voice/StockTransitions.yml
+  input: "In today's landscape, catalogs matter."
+  contains: Tylertoo-Voice.StockTransitions
+
+- name: StockTransitions leaves clean prose alone
+  rule: ../styles/Tylertoo-Voice/StockTransitions.yml
+  input: "Catalogs make distributed data searchable."
+  absent: Tylertoo-Voice.StockTransitions

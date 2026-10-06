@@ -1,7 +1,7 @@
 //! PMTiles → GeoParquet decoding (issue #112).
 //!
 //! Decodes a PMTiles v3 vector-tile archive back into a GeoParquet file,
-//! following the model of `tippecanoe-decode` (decode.cpp / write_json.cpp):
+//! following the model of `tippecanoe-decode` (decode.cpp / `write_json.cpp)`:
 //!
 //! - **Every feature from every selected tile is emitted — no deduplication.**
 //!   A feature near a tile seam appears once per neighboring tile (buffer
@@ -16,7 +16,7 @@
 //! # Coordinate transform
 //!
 //! Tile-local integer coordinates are lifted to WGS84 through tippecanoe's
-//! 32-bit Web Mercator world coordinate space (write_json.cpp /
+//! 32-bit Web Mercator world coordinate space (`write_json.cpp` /
 //! projection.cpp):
 //!
 //! ```text
@@ -33,8 +33,8 @@
 //! # Output schema
 //!
 //! Three provenance columns are always present so users can filter the
-//! duplicated representation: `zoom` (UInt8), `layer` (Utf8), and `mvt_id`
-//! (UInt64, nullable — the raw MVT feature id, if any). They are followed by
+//! duplicated representation: `zoom` (`UInt8`), `layer` (Utf8), and `mvt_id`
+//! (`UInt64`, nullable — the raw MVT feature id, if any). They are followed by
 //! the union of all property columns seen across tiles/layers (alphabetical,
 //! all nullable; a feature lacking a property gets null), then `geometry`.
 //! A property named like a provenance column is rejected with
@@ -199,6 +199,12 @@ pub enum DecodeError {
 ///
 /// See the module docs for output semantics (no deduplication, tiled
 /// representation, provenance columns, property type unification).
+///
+/// # Errors
+///
+/// Returns a [`DecodeError`] if the archive cannot be read or parsed, does not
+/// hold MVT tiles, holds a section or tile that does not decompress or decode,
+/// or if writing the output fails.
 pub fn decode_pmtiles(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -679,9 +685,9 @@ pub fn fuzz_decode_tile(
 
 /// One MoveTo-initiated run of vertices in tile-local coordinates.
 struct Part {
-    /// Vertices, without the implicit ClosePath closing vertex.
+    /// Vertices, without the implicit `ClosePath` closing vertex.
     pts: Vec<(i64, i64)>,
-    /// Whether the part was terminated by ClosePath (i.e. it is a ring).
+    /// Whether the part was terminated by `ClosePath` (i.e. it is a ring).
     closed: bool,
 }
 
@@ -715,7 +721,7 @@ impl Part {
 }
 
 /// Parse an MVT geometry command stream (MoveTo/LineTo/ClosePath with
-/// zigzag-encoded deltas) into parts. Each MoveTo coordinate starts a new
+/// zigzag-encoded deltas) into parts. Each `MoveTo` coordinate starts a new
 /// part, so multipoints come out as one single-vertex part per point.
 fn parse_command_stream(geom: &[u32]) -> Result<Vec<Part>, String> {
     const CMD_MOVE_TO: u32 = 1;
@@ -1078,7 +1084,7 @@ impl RowBatch {
     }
 }
 
-/// Convert the buffered rows into a RecordBatch, encode, and write it.
+/// Convert the buffered rows into a `RecordBatch`, encode, and write it.
 fn flush_batch(
     batch: &mut RowBatch,
     schema: &Arc<Schema>,

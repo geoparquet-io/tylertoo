@@ -58,7 +58,7 @@ impl Band {
     ///   cannot express, `=` being invalid in a zoom range.
     ///
     /// Which one a spec is in is decided by whichever of `:` and `=` closes
-    /// the zoom range, i.e. whichever comes first ([`band_separator`]).
+    /// the zoom range, i.e. whichever comes first (`band_separator`).
     ///
     /// In the `:` form the remainder is the INPUT, *unless* its last
     /// colon-separated segment is a bare layer token — no `/`, `\` or `:`.
@@ -80,6 +80,13 @@ impl Band {
     ///
     /// All of this is pure string work — no filesystem access, so it behaves
     /// the same for a glob or a URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the problem if the spec has no zoom range, a
+    /// zoom that does not parse, a minimum above the maximum, a maximum above
+    /// [`crate::tile::MAX_ZOOM`], an empty input or layer, or no layer when
+    /// none can be derived from the input.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (sep, at) =
             band_separator(spec).ok_or_else(|| format!("band {spec:?}: {BAND_FORMS}"))?;
@@ -317,7 +324,7 @@ pub enum BandSource {
 /// error case, only two classifications, and a `scheme://foo.pmtiles` input
 /// classifies as `Source` exactly like any other remote path (it will only
 /// fail later, obscurely, inside the parquet reader). [`validate_bands`]
-/// applies [`remote_archive_rejection`] up front to every band before any
+/// applies `remote_archive_rejection` up front to every band before any
 /// band is tiled; a caller that classifies bands without going through
 /// `validate_bands` first (or `build_pyramid`, which calls it) must apply
 /// `remote_archive_rejection` itself to get that check.
@@ -350,9 +357,10 @@ pub fn classify_band_input(path: &Path) -> BandSource {
     }
 }
 
-/// Reject two bands claiming one zoom **for the same layer**: each would write
-/// the same tile ids and the merge would silently keep whichever came last.
-/// Also rejects any band naming a remote `.pmtiles` archive (#482) — checked
+/// Reject two bands claiming one zoom **for the same layer**.
+///
+/// Each would write the same tile ids and the merge would silently keep
+/// whichever came last. Also rejects any band naming a remote `.pmtiles` archive (#482) — checked
 /// for every band up front, before any band is tiled.
 ///
 /// The remote-archive check is pure string work (no I/O), so doing it here
@@ -364,6 +372,11 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 /// Bands naming *different* layers may share zooms (#385): that is
 /// tippecanoe's `-L`, several layers in one tile, and the merge concatenates
 /// their layer messages tile by tile.
+///
+/// # Errors
+///
+/// Returns a description of the problem if `bands` is empty, if two bands of
+/// one layer share a zoom, or if a band names a remote `.pmtiles` archive.
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
         return Err("a pyramid needs at least one --band".to_string());
@@ -1327,6 +1340,11 @@ impl Default for PyramidOptions {
 ///
 /// Intermediates live in `work_dir` and are removed whether the build succeeds
 /// or fails.
+///
+/// # Errors
+///
+/// Returns an error if the bands are invalid, if a band's input cannot be
+/// classified, converted, or exported, or if the merge fails.
 pub fn build_pyramid(
     bands: &[Band],
     output: &Path,
@@ -1490,15 +1508,28 @@ pub fn build_pyramid(
 /// `tilestats` — reconstructing feature counts and attribute histograms would
 /// mean parsing every MVT, which is exactly the cost this merge exists to
 /// avoid.
+///
+/// # Errors
+///
+/// Returns an error in the cases [`merge_bands_with_options`] does with
+/// `allow_missing_zooms` off.
 pub fn merge_bands(bands: &[Band], output: &Path) -> Result<PyramidReport, Error> {
     merge_bands_with_options(bands, output, false)
 }
 
-/// Like [`merge_bands`], but lets a caller allow a pre-tiled band's declared
-/// zoom range to overshoot what its archive actually holds (#495) instead of
-/// failing. Off (`false`) matches [`merge_bands`]'s behavior exactly. A
+/// Like [`merge_bands`], but can allow a band's declared zoom range to overshoot its archive.
+///
+/// With `allow_missing_zooms`, a pre-tiled band's declared zoom range may
+/// overshoot what its archive actually holds (#495) instead of failing. Off (`false`) matches [`merge_bands`]'s behavior exactly. A
 /// *disjoint* range (the band and its archive share no zoom at all) is
 /// always an error; `allow_missing_zooms` has no effect on that case.
+///
+/// # Errors
+///
+/// Returns an error if the bands are invalid, if a band's archive cannot be
+/// opened or read, if a band's declared zoom range does not fit what its
+/// archive holds, if two bands write one tile for the same layer, or if writing
+/// the output fails.
 pub fn merge_bands_with_options(
     bands: &[Band],
     output: &Path,
@@ -2830,8 +2861,8 @@ mod tests {
         String::from_utf8(plain).unwrap()
     }
 
-    /// The merge never called set_bounds, so the header carried
-    /// TileBounds::empty() -- infinities saturating to min 214.7 / max -214.7 --
+    /// The merge never called `set_bounds`, so the header carried
+    /// `TileBounds::empty()` -- infinities saturating to min 214.7 / max -214.7 --
     /// and go-pmtiles rejected the archive: "bounds has area <= 0: clients may
     /// not display tiles correctly".
     #[test]
@@ -3513,7 +3544,7 @@ mod tests {
         assert!((h.max_lon - 0.0).abs() < 1e-6, "max_lon {}", h.max_lon);
     }
 
-    /// A corrupt json_metadata_length used to index the file slice unchecked
+    /// A corrupt `json_metadata_length` used to index the file slice unchecked
     /// and panic: "range end index 100278 out of range for slice of length
     /// 300". A library function must not panic on untrusted input.
     #[test]
