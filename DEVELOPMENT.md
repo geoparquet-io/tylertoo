@@ -586,9 +586,13 @@ cargo build --release -p tylertoo
 cd crates/python
 uv sync --group docs
 uv run pytest -m docs tests/docs -v
+cd ../..
 
-# Preview the site
-uv run zensical serve -f ../../mkdocs.yml
+# Preview the site at http://localhost:8000/tylertoo/
+# (repo root; the docs group alone, no extension build;
+# it rebuilds when you save a page)
+uv run --project crates/python --only-group docs \
+  zensical serve
 ```
 
 To change a tutorial, edit its script, run the docs tests, and paste
