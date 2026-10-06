@@ -3405,14 +3405,20 @@ fn process_wave(
     // Row-group pruning is only valid when the file's coordinates (and thus its
     // row-group bbox statistics) are lon/lat. For 3857 files the stats are in
     // meters; skip pruning (correct, just unpruned). Prune to the *union* of the
-    // wave's partition bboxes.
-    let bbox = match ctx.crs {
+    // wave's partition bboxes, and of that union shifted ±360°: the export
+    // draws a feature stored one world width away at its wrapped position
+    // (#342, `wrap_shifts`), so its row group's stats sit there, not over the
+    // wave's tiles.
+    let bboxes = match ctx.crs {
         Crs::Epsg4326 => {
             let mut b = wave[0].bbox;
             for p in &wave[1..] {
                 b.expand(&p.bbox);
             }
-            Some([b.lng_min, b.lat_min, b.lng_max, b.lat_max])
+            Some(
+                [0.0, -360.0, 360.0]
+                    .map(|shift| [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]),
+            )
         }
         Crs::Epsg3857 => None,
     };
@@ -3445,8 +3451,11 @@ fn process_wave(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
             let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-                ctx.reader
-                    .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)
+                ctx.reader.read_level_any_bbox_with_batch_size(
+                    ctx.level_idx,
+                    bboxes.as_ref().map(|b| b.as_slice()),
+                    EXPORT_BATCH_SIZE,
+                )
             })?;
             loop {
                 let next = ExportTimers::time(&timers.band_read, || batch_reader.next());
@@ -3692,8 +3701,11 @@ fn feature_tile_members(
 /// Longitude shift of each world copy of a feature with `bbox` that reaches
 /// the tile grid at a zoom whose edge buffer is `buffer` degrees (#342).
 ///
-/// The stored copy (shift 0) is always first. A ±360° copy joins it when that
-/// copy overlaps the world grown by the buffer: a feature past +180° draws its
+/// The stored copy (shift 0) comes first, unless it lies wholly outside the
+/// world grown by the buffer: `expand_bbox` would collapse such a copy onto
+/// the edge column, where the clip drops it, so planning it only inflates
+/// that column's counts. A ±360° copy joins when it overlaps the buffered
+/// world with positive width: a feature past +180° draws its
 /// overhang at the west edge, a feature at 0..360 lands at its -180..0 twin,
 /// and a feature within `buffer` of +180° fills the west-edge tile's buffer.
 /// This is tippecanoe's world-edge rule: `clip_to_tile` at z0 appends a copy
@@ -3707,8 +3719,13 @@ fn wrap_shifts(bbox: &TileBounds, buffer: f64) -> impl Iterator<Item = f64> + '_
     [0.0, -360.0, 360.0]
         .into_iter()
         .filter(move |&shift: &f64| {
-            shift == 0.0
-                || (bbox.lng_max + shift > -180.0 - buffer && bbox.lng_min + shift < 180.0 + buffer)
+            let (lo, hi) = (bbox.lng_min + shift, bbox.lng_max + shift);
+            if shift == 0.0 {
+                // Edge contact counts for the stored copy, as it always has.
+                hi >= -180.0 - buffer && lo <= 180.0 + buffer
+            } else {
+                hi > -180.0 - buffer && lo < 180.0 + buffer
+            }
         })
 }
 
@@ -3721,15 +3738,16 @@ fn near_world_edge(bbox: &TileBounds, buffer: f64) -> bool {
     bbox.lng_min < -180.0 + buffer || bbox.lng_max > 180.0 - buffer
 }
 
-/// `geom` moved `shift` degrees east.
-fn shift_lng(geom: &Geometry<f64>, shift: f64) -> Geometry<f64> {
+/// `geom` moved `shift` degrees east. The stored copy borrows, so a large
+/// polygon on the world edge is not cloned for it.
+fn shift_lng(geom: &Geometry<f64>, shift: f64) -> std::borrow::Cow<'_, Geometry<f64>> {
     if shift == 0.0 {
-        return geom.clone();
+        return std::borrow::Cow::Borrowed(geom);
     }
-    geom.map_coords(|c| geo::Coord {
+    std::borrow::Cow::Owned(geom.map_coords(|c| geo::Coord {
         x: c.x + shift,
         y: c.y,
-    })
+    }))
 }
 
 /// `bbox` moved `shift` degrees east.
@@ -7279,6 +7297,97 @@ mod tests {
         ] {
             assert_eq!(bounds(raw), raw);
         }
+    }
+
+    /// The duplicating-mode wave read prunes row groups by the wave's tile
+    /// bbox, which lies inside the ±180° domain. A wrapped copy is drawn in a
+    /// tile whose bbox is one world width away from the row group's stored
+    /// stats, so the prune must test the shifted wave bbox too, or the
+    /// wrapped piece is lost whenever its tile reads in a wave of its own.
+    #[test]
+    fn wave_row_group_prune_keeps_wrapped_copies() {
+        use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, Header};
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        // One feature per row group: the dateline cell, a 0..360 point and
+        // an ordinary point that keeps the row-group stats apart.
+        write_mode_fixture(
+            tin.path(),
+            &[(
+                vec![0, 1, 2],
+                vec![
+                    rect_polygon(178.0, 1.0, 181.0, 3.0),
+                    Geometry::Point(geo::Point::new(250.0, -40.0)),
+                    Geometry::Point(geo::Point::new(10.0, 10.0)),
+                ],
+            )],
+            Mode::Duplicating,
+            1,
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            partition_wave: 1,
+            ..Default::default()
+        };
+        export_pmtiles_with_partition_target(tin.path(), tout.path(), &opts, 1).unwrap();
+
+        let bytes = std::fs::read(tout.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        let root = crate::compression::decompress_capped(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+            header.internal_compression,
+            crate::compression::MAX_INTERNAL_BYTES,
+        )
+        .unwrap();
+        let tiles: HashSet<(u8, u32, u32)> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .flat_map(|e| {
+                (0..u64::from(e.run_length)).map(move |i| tile_id_to_zxy(e.tile_id + i).unwrap())
+            })
+            .collect();
+        // The cell's 180°–181° part lands at -180°…-179°: z2 tile (0, 1).
+        assert!(tiles.contains(&(2, 0, 1)), "dateline overhang: {tiles:?}");
+        // The point at lng 250 lands at lng -110, in a row of its own.
+        let home = crate::tile::lng_lat_to_tile(-110.0, -40.0, 2);
+        assert_eq!((home.x, home.y), (0, 2));
+        assert!(
+            tiles.contains(&(2, home.x, home.y)),
+            "0..360 point: {tiles:?}"
+        );
+    }
+
+    /// A feature stored wholly past the buffered world (the 0..360
+    /// convention) is tiled through its wrapped copy alone. Its stored copy
+    /// reaches no tile, so the scan must not plan one for it: `expand_bbox`
+    /// would collapse that copy onto the east-edge column, where the clip
+    /// then drops it, and every such feature would inflate that column's
+    /// planned counts.
+    #[test]
+    fn stored_copy_outside_the_buffered_world_plans_no_tile() {
+        let opts = ExportOptions::default();
+        for zoom in [0u8, 4, 10] {
+            let bbox = TileBounds::new(200.0, 10.0, 200.0, 10.0);
+            let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts);
+            let home = crate::tile::lng_lat_to_tile(-160.0, 10.0, zoom);
+            let planned: Vec<_> = counts.keys().map(|&k| key_to_xy(k, zoom)).collect();
+            assert_eq!(
+                planned,
+                vec![(home.x, home.y)],
+                "z{zoom}: only the wrapped copy's tile"
+            );
+        }
+        // Beyond one wrap nothing reaches the grid.
+        let far = TileBounds::new(600.0, 10.0, 600.0, 10.0);
+        assert!(size_bboxes(&[Some(far)], 4, &opts).1.is_empty());
+        assert!(feature_tile_members(
+            &Geometry::Point(geo::Point::new(600.0, 10.0)),
+            4,
+            &opts,
+            0,
+            u64::MAX
+        )
+        .is_empty());
     }
 
     /// The scan pass plans the partitions and the emit pass fills them; the

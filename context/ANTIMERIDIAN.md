@@ -47,7 +47,12 @@ copies put in one tile join into one multi-geometry. Three results:
   buffer of +180° also reaches tile column 0.
 
 The scan pass plans the same copies, and the archive bounds advertise
-the wrapped extent inside ±180°. Convert counts a feature as out of
+the wrapped extent inside ±180°. A copy wholly outside the buffered
+world is skipped, the stored one included, so a 0..360 feature plans
+no phantom tile on the east edge. The duplicating-mode wave read prunes
+row groups by the wave's bbox and by that bbox shifted ±360°. A row
+group's statistics describe the stored coordinates, one world width
+from the tiles its wrapped copies land in. Convert counts a feature as out of
 range only past ±540° longitude, the reach of one wrap, so wrapped
 features are neither warned about as lost nor fatal to the all-lost
 gate.
@@ -201,6 +206,8 @@ World-edge wrap (#342):
 - `overview::export::tests::both_wrapped_copies_in_one_tile_make_one_member`
 - `overview::export::tests::scan_plans_wrapped_copies_and_counts_shared_tiles_once`
 - `overview::export::tests::scan_bounds_wrap_into_the_lng_domain`
+- `overview::export::tests::stored_copy_outside_the_buffered_world_plans_no_tile`
+- `overview::export::tests::wave_row_group_prune_keeps_wrapped_copies`
 - `overview::hostile::wrappable_longitude_overhang_is_in_range`
 - `overview_hostile::overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian`
 - `overview_hostile::zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes`
