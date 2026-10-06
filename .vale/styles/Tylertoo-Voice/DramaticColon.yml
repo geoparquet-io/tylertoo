@@ -1,0 +1,7 @@
+extends: existence
+message: "Do not use a colon to set up a dramatic clause. Use a colon for a list."
+level: warning
+scope: sentence
+nonword: true
+raw:
+  - '^[A-Z][A-Za-z]+: [a-z]\w+ \w+ \w+[^,:]*[.!?]$'

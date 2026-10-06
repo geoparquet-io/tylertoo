@@ -1,0 +1,14 @@
+The Tylertoo-* Vale rules come from nlebovits/geodata-llm-eval
+(styles/Geodata-*), which adapted them from the Portolan prose rules:
+
+  https://github.com/portolan-sdi/portolan-ops
+  commit ae93b7c7c23ddb9661292f621243896c3e23c25e
+
+  https://github.com/nlebovits/geodata-llm-eval
+  commit 8f320c0168af80016bae9224c10c6a6400b202d9
+
+They remain available under the Apache License, Version 2.0 (see LICENSE
+at the repository root). For tylertoo the styles were renamed, the
+Headings exceptions and Casing swaps were replaced with this project's
+terms, and each rule's examples moved into its `tests:` block for
+`vale test`.

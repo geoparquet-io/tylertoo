@@ -20,6 +20,8 @@
 #   Coverage        cargo-llvm-cov -> lcov -> codecov (informational)
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
+#   Docs Prose      Vale + proselint on the handwritten docs, via
+#                   scripts/lint-prose.sh (same command as the pre-commit hook)
 #   CI Lint         zizmor (GitHub Actions security linter) on this repo's
 #                   own workflows
 #
@@ -925,6 +927,56 @@ jobs:
             exit 1
           fi
         working-directory: crates/core
+
+  # Prose lint for the handwritten docs. scripts/lint-prose.sh owns the file
+  # list and is the same command the pre-commit hook runs: Vale errors and
+  # any proselint finding fail the job. Vale's warnings and suggestions print
+  # afterwards as an advisory audit that never fails.
+  prose:
+    name: Docs Prose
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VALE_VERSION: "3.24.0"
+      VALE_SHA256: 867534ddb678abca7f214bc4706ead0922bd5252ffe8035fc227013f66c8b214
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Install Vale
+        working-directory: ${{ runner.temp }}
+        run: |
+          gh release download "v${VALE_VERSION}" --repo vale-cli/vale \
+            --pattern "vale_${VALE_VERSION}_Linux_64-bit.tar.gz" \
+            --output vale.tar.gz
+          echo "${VALE_SHA256}  vale.tar.gz" | sha256sum --check
+          tar xzf vale.tar.gz vale
+          sudo install -m 0755 vale /usr/local/bin/vale
+          vale --version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch the pinned Vale packages
+        run: vale sync
+
+      - name: Test the Tylertoo-* Vale rules
+        run: |
+          vale test --coverage .vale/tests \
+            .vale/styles/Tylertoo-Docs .vale/styles/Tylertoo-Mechanics \
+            .vale/styles/Tylertoo-Terms .vale/styles/Tylertoo-Voice
+
+      - name: Lint docs prose (Vale errors + proselint)
+        run: scripts/lint-prose.sh
+
+      - name: Vale advisory audit (warnings and suggestions)
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/lint-prose.sh --list \
+            | xargs vale --no-exit --minAlertLevel=suggestion --output=line
 
   # Lint the CI configuration itself.
   ci-lint:

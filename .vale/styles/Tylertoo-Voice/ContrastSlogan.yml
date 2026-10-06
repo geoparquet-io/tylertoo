@@ -1,0 +1,8 @@
+extends: existence
+message: "'%s' uses a formulaic not-X-but-Y contrast. State the concrete difference."
+level: warning
+ignorecase: true
+scope: sentence
+nonword: true
+raw:
+  - '\bnot (?:just|only)\b[^.!?]{1,100}\bbut\b'

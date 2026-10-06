@@ -1,0 +1,43 @@
+extends: capitalization
+message: "'%s' should use sentence case."
+level: error
+scope: heading
+match: $sentence
+exceptions:
+  - API
+  - APIs
+  - Arrow
+  - CI
+  - CLI
+  - Criterion
+  - DuckDB
+  - EPSG
+  - GeoArrow
+  - GeoJSON
+  - GeoParquet
+  - GitHub
+  - GSD
+  - HTTP
+  - JSON
+  - Kubernetes
+  - Linux
+  - macOS
+  - Markdown
+  - MBTiles
+  - MVT
+  - PMTiles
+  - PR
+  - PyPI
+  - Python
+  - README
+  - Rust
+  - S3
+  - Slurm
+  - SQL
+  - tippecanoe
+  - TL;DR
+  - tylertoo
+  - v1
+  - WGS84
+  - Windows
+  - YAML

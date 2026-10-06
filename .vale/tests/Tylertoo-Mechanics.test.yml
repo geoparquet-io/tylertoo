@@ -1,0 +1,73 @@
+# Cases for the Tylertoo-Mechanics rules, run by `vale test` (Vale >= 3.24).
+# They live outside StylesPath so older Vale releases, which reject a
+# rule's `tests:` key, can still load the styles.
+
+- name: Ellipsis flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/Ellipsis.yml
+  input: "Wait..."
+  contains: Tylertoo-Mechanics.Ellipsis
+
+- name: Ellipsis leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/Ellipsis.yml
+  input: "Wait."
+  absent: Tylertoo-Mechanics.Ellipsis
+
+- name: EmDash flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/EmDash.yml
+  input: "word—word"
+  contains: Tylertoo-Mechanics.EmDash
+
+- name: EmDash leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/EmDash.yml
+  input: "word — word"
+  absent: Tylertoo-Mechanics.EmDash
+
+- name: EmDashDensity flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/EmDashDensity.yml
+  input: "a — b — c — d — e"
+  contains: Tylertoo-Mechanics.EmDashDensity
+
+- name: EmDashDensity leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/EmDashDensity.yml
+  input: "a — b — c — d"
+  absent: Tylertoo-Mechanics.EmDashDensity
+
+- name: Headings flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/Headings.yml
+  input: "# Bad Heading Here"
+  contains: Tylertoo-Mechanics.Headings
+
+- name: Headings leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/Headings.yml
+  input: "# Good heading"
+  absent: Tylertoo-Mechanics.Headings
+
+- name: Headings flags the pattern (2)
+  rule: ../styles/Tylertoo-Mechanics/Headings.yml
+  input: "# Bad Heading Here"
+  contains: Tylertoo-Mechanics.Headings
+
+- name: Headings leaves clean prose alone (2)
+  rule: ../styles/Tylertoo-Mechanics/Headings.yml
+  input: "# Export PMTiles from GeoParquet"
+  absent: Tylertoo-Mechanics.Headings
+
+- name: Oxford flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/Oxford.yml
+  input: "Choose red, blue and green options."
+  contains: Tylertoo-Mechanics.Oxford
+
+- name: Oxford leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/Oxford.yml
+  input: "Choose red, blue, and green options."
+  absent: Tylertoo-Mechanics.Oxford
+
+- name: Quotes flags the pattern
+  rule: ../styles/Tylertoo-Mechanics/Quotes.yml
+  input: "“quoted”"
+  contains: Tylertoo-Mechanics.Quotes
+
+- name: Quotes leaves clean prose alone
+  rule: ../styles/Tylertoo-Mechanics/Quotes.yml
+  input: "\"quoted\""
+  absent: Tylertoo-Mechanics.Quotes

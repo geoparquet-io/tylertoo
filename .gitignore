@@ -78,3 +78,8 @@ site/
 
 # Serena (AI code-navigation tool) state; not used by this project
 .serena/
+
+# Vale packages fetched by `vale sync` (pinned in .vale.ini)
+.vale/styles/Google/
+.vale/styles/Microsoft/
+.vale/styles/Readability/
