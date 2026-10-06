@@ -303,7 +303,7 @@ class OverviewReport(TypedDict):
 * `skipped_empty_levels`: Planned levels with nothing visible.
 * `row_groups_read`: Row groups selected by `bbox` and `filter`.
 * `antimeridian_suspect_features`: Features wider than 180° of longitude, usually a broken antimeridian crossing.
-* `out_of_range_features`: Features dropped or clipped because their coordinates are outside the valid range.
+* `out_of_range_features`: Features dropped or clipped because their coordinates are outside the valid range. Longitude past ±180° but within ±540° wraps and is not counted.
 * `unprojectable_features`: Features beyond ±85.05° latitude, which Web Mercator cannot tile.
 
 ### `LevelReport`

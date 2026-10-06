@@ -48,16 +48,44 @@ STREAMING_SMALL = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
 DATELINE = FIXTURES_DIR / "streaming" / "out-of-range-dateline.parquet"
 
 
+def _move_point(src: Path, dst: Path, row: int, lng: float) -> None:
+    """Copy a WKB-point GeoParquet file with one row's longitude replaced."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(src)
+    wkb = table.column("geometry").to_pylist()
+    byte_order, geom_type, _, lat = struct.unpack("<BIdd", wkb[row])
+    wkb[row] = struct.pack("<BIdd", byte_order, geom_type, lng, lat)
+    idx = table.schema.get_field_index("geometry")
+    table = table.set_column(idx, table.schema.field(idx), pa.array(wkb, pa.binary()))
+    geo = json.loads(table.schema.metadata[b"geo"])
+    geo["columns"]["geometry"].pop("bbox", None)
+    table = table.replace_schema_metadata({b"geo": json.dumps(geo).encode()})
+    pq.write_table(table, dst)
+
+
 class TestOutOfRangeExemplars:
     """#553: the report names where out-of-range features are, not only how many."""
 
-    def test_report_names_the_row_and_coordinate(self):
+    def test_dateline_overhang_is_not_out_of_range(self):
+        # #342: a longitude past +180° wraps at export, as in tippecanoe, so
+        # row 7's lon 190.25 is drawn at -169.75 rather than lost.
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "o.parquet"
             report = tylertoo.overview(str(DATELINE), str(out), max_zoom=4)
+            assert report["out_of_range_features"] == 0
+            assert report["out_of_range_exemplars"] == []
+
+    def test_report_names_the_row_and_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "beyond-wrap.parquet"
+            _move_point(DATELINE, src, row=7, lng=600.25)
+            out = Path(tmpdir) / "o.parquet"
+            report = tylertoo.overview(str(src), str(out), max_zoom=4)
             assert report["out_of_range_features"] == 1
             assert report["out_of_range_exemplars"] == [
-                {"part": None, "row": 7, "axis": "lon", "value": 190.25}
+                {"part": None, "row": 7, "axis": "lon", "value": 600.25}
             ]
 
 
