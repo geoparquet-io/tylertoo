@@ -270,14 +270,13 @@ pub struct PyramidArgs {
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
-    /// Run the generalization ladder on each GeoParquet band instead of
-    /// tiling it verbatim. Use it when a band holds raw features spanning
-    /// several zooms.
+    /// Generalize each GeoParquet band instead of tiling it verbatim. Use
+    /// for raw features spanning several zooms.
     #[arg(long)]
     pub generalize: bool,
 
     /// Per-tile MVT size cap for bands tiled here, such as `500K`. Unset
-    /// means no cap, so a band keeps every cell it exists to draw.
+    /// means no cap, preserving every cell in the band.
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     pub max_tile_size: Option<usize>,
 
@@ -287,14 +286,13 @@ pub struct PyramidArgs {
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     pub feature_order: FeatureOrder,
 
-    /// Directory for the per-band intermediate files, which tylertoo deletes
-    /// afterwards. Defaults to the system temp directory.
+    /// Directory for temporary per-band files, deleted after the build.
+    /// Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
     pub work_dir: Option<PathBuf>,
 
-    /// Accept a pre-tiled band whose archive holds fewer zooms than the band
-    /// declares. Those zooms render empty, so use it only when you want a
-    /// sparse pyramid.
+    /// Accept a pre-tiled band with fewer zooms than declared. Missing
+    /// zooms render empty; use only for a sparse pyramid.
     #[arg(long)]
     pub allow_missing_zooms: bool,
 
@@ -337,24 +335,26 @@ pub struct MergeArgs {
 /// The output schema and its limits are in the `after_help` text below.
 #[derive(Parser, Debug)]
 #[command(after_help = "\
-The output holds the tiles' features, not the original source:
-  - simplified: tiling drops vertices at lower zooms. Decode the max
-    zoom for the most detail.
-  - clipped: tiling cuts features at the buffered tile edges.
-  - duplicated: a feature appears once per tile it touches and once per
-    zoom. Filter with --zoom or the `zoom` column.
-  - lost properties: attributes that tiling dropped do not come back.
-Decoding does not restore the input: `A.parquet` -> `B.pmtiles` ->
-`C.parquet` gives a C that differs from A.
+Decoding reconstructs tile features. A round trip from `A.parquet` to
+`B.pmtiles` to `C.parquet` changes the data:
+
+- Tiling simplifies vertices at lower zooms. Decode the maximum zoom
+  for the most detail.
+- Features are clipped at buffered tile edges.
+- Features repeat for each tile they touch and each zoom. Filter with
+  `--zoom` or the `zoom` column.
+- Properties dropped during tiling cannot be recovered.
 
 Output columns, in order:
-  - `zoom` (UInt8), `layer` (Utf8), `mvt_id` (UInt64, null when the
-    encoder set no id): where each row came from.
-  - every property seen in any tile, alphabetical, and null for a
-    feature that lacks it. Integers become Int64 and floats Float64.
-    A key that mixes the two becomes Float64, and any other mix Utf8.
-  - geometry: Well-Known Binary (WKB) in lon/lat (`EPSG:4326`), with a
-    bbox covering.
+
+1. `zoom` (UInt8), `layer` (Utf8), and `mvt_id` (UInt64; null if the
+   encoder set no id) identify each row's origin.
+2. All properties found in any tile, alphabetically ordered and null
+   where absent. Integers become Int64; floats become Float64. Mixed
+   integers and floats become Float64; other mixed types become Utf8.
+3. `geometry`: Well-Known Binary (WKB) in lon/lat (`EPSG:4326`), with a
+   bbox covering.
+
 A source property named `zoom`, `layer`, `mvt_id`, or `geometry` is an error.")]
 struct DecodeArgs {
     /// Input PMTiles archive (vector tiles).
@@ -415,18 +415,18 @@ pub struct ShardPlanArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// How many data shards to cut. Run one `tiles --shard i/N` job per
+    /// Number of data shards. Run one `tiles --shard i/N` job per
     /// shard plus one `--shard coarse` job, then merge all N+1 archives.
     #[arg(long, value_name = "N")]
     pub shards: usize,
 
-    /// Zoom to cut at. Shards own the zooms from here to `--max-zoom`, and
-    /// the coarse job owns the zooms below. Pick a zoom where each shard
-    /// holds a few tiles of data, usually z4 to z8.
+    /// Pivot zoom: data shards cover this zoom through `--max-zoom`; the
+    /// coarse job covers lower zooms. Choose a zoom with a few populated
+    /// tiles per shard, usually z4 to z8.
     #[arg(long, value_name = "ZOOM", default_value = "6")]
     pub pivot: u8,
 
-    /// Overwrite an existing plan at --output.
+    /// Overwrite an existing plan at `--output`.
     #[arg(short, long)]
     pub force: bool,
 }
@@ -446,9 +446,8 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "overview")]
     layer_name: String,
 
-    /// Minimum zoom to declare in the archive metadata, even when the
-    /// overview file's coarsest levels are empty. Unset uses the coarsest
-    /// level's zoom.
+    /// Minimum zoom in archive metadata, including empty coarse overview
+    /// levels. Defaults to the coarsest level's zoom.
     #[arg(long, value_name = "ZOOM")]
     min_zoom: Option<u8>,
 
@@ -482,9 +481,9 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
-    /// Clip every polygon with the full overlay instead of the fast path for
-    /// simple rings. Use it for byte-stable tiles: the fast path renders the
-    /// same but can start a ring at a different vertex.
+    /// Clip all polygons with the full overlay for byte-stable tiles. The
+    /// simple-ring fast path renders identically but can change a ring's
+    /// starting vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
 
@@ -494,16 +493,15 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order: `input` keeps source row order, and a
-    /// property name, optionally with `:asc` or `:desc`, sorts each tile by
-    /// it. A renderer paints in this order unless a style overrides it.
+    /// Feature order within each tile: `input` preserves source row order;
+    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
+    /// order unless the style overrides it.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
-    /// Write this integer column as each feature's MVT id, so
-    /// `setFeatureState` keys work across tiles and zooms. Every row
-    /// must hold a value from 0 to 2^64-1. Without it, tiles keep
-    /// tile-local ids.
+    /// Use this integer column as the MVT feature id for `setFeatureState`
+    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
+    /// Defaults to tile-local ids.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
@@ -548,9 +546,9 @@ struct OverviewArgs {
     #[arg(value_name = "OUTPUT", required_unless_present = "files_from")]
     output: Option<PathBuf>,
 
-    /// Convert the `.parquet` files this manifest lists instead of `INPUT`.
-    /// Give one path or URL per line, in dataset row order. Blank lines and
-    /// `#` lines do nothing.
+    /// Read `.parquet` files from this manifest instead of `INPUT`: one
+    /// path or URL per line, in dataset row order. Ignores blank lines and
+    /// lines starting with `#`.
     #[arg(long, value_name = "PATH")]
     files_from: Option<PathBuf>,
 
@@ -573,13 +571,13 @@ struct OverviewArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Convert only features whose bbox intersects this lon/lat box. Row
-    /// groups outside the box go unread.
+    /// Convert features whose bbox intersects this lon/lat box. Skips row
+    /// groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
-    /// Also write the third-party `cogp` footer key, for readers of that
-    /// overview format. Partitioning mode only.
+    /// Write the third-party `cogp` footer key for readers of that overview
+    /// format. Partitioning mode only.
     #[arg(long)]
     cogp_compat: bool,
 
@@ -602,20 +600,20 @@ struct OverviewArgs {
 /// [`ConvertOptions`] via [`ConvertTuningArgs::build_convert_options`].
 #[derive(Args, Debug)]
 struct ConvertTuningArgs {
-    /// Tile the input exactly as given, with every thinning,
-    /// simplification, and density step off. Use it for pre-aggregated or
-    /// pre-levelled input. Knobs you set yourself still win.
+    /// Disable thinning, simplification, and density reduction for
+    /// pre-aggregated or pre-levelled input. Explicit tuning flags override
+    /// these defaults.
     #[arg(long, help_heading = "Thinning & visibility")]
     verbatim: bool,
 
-    /// Numeric column that decides which feature wins each thinning cell.
+    /// Numeric column used to choose each thinning cell's winning feature.
     /// Conflicts with `--class-rank`.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     sort_key: Option<String>,
 
-    /// Rank the values of `COL` from high to low to set each feature's
-    /// entry zoom, one `--ladder-step` apart from `--min-zoom`. Features
-    /// appear from their entry zoom inward, exempt from thinning.
+    /// Rank `COL` values from highest to lowest, assigning entry zooms
+    /// from `--min-zoom` in `--ladder-step` increments. Features appear at
+    /// their entry zoom and finer zooms, exempt from thinning.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     magnitude_ladder: Option<String>,
 
@@ -629,9 +627,8 @@ struct ConvertTuningArgs {
     )]
     ladder_step: u8,
 
-    /// Place entry zooms by hand: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...`, for
-    /// example `density:5000=4,1000=6`. Unlisted values take the ordinary
-    /// visibility gate.
+    /// Assign entry zooms: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...`, for example
+    /// `density:5000=4,1000=6`. Unlisted values use the normal visibility gate.
     #[arg(
         long,
         value_name = "SPEC",
@@ -651,9 +648,8 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Ranking")]
     no_auto_rank: bool,
 
-    /// Convert only features matching this SQL `WHERE` predicate over the
-    /// property columns, such as `confidence > 0.8`. Row groups that cannot
-    /// match go unread, and the tuning guide has the grammar:
+    /// Filter property columns with a SQL `WHERE` predicate, such as
+    /// `confidence > 0.8`. Skips row groups that cannot match. Grammar:
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(
         long,
@@ -694,21 +690,20 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Generalization")]
     simplify_factor: Option<f64>,
 
-    /// Collapse polygons too small for a level to a single point instead of
-    /// dropping them. Fill styles ignore points, so add a circle layer or
-    /// use `--collapse-square`.
+    /// Replace polygons too small for a level with a point. Fill styles
+    /// ignore points; add a circle layer or use `--collapse-square`.
     #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
-    /// Replace the polygons a coarse level drops with small placeholder
-    /// squares, so the level still shows where the area is. Duplicating mode
-    /// only, and the output stays Polygon.
+    /// Replace polygons dropped at coarse levels with small placeholder
+    /// squares marking their location. Duplicating mode only; output
+    /// remains Polygon.
     #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
     collapse_square: bool,
 
-    /// Zoom bands that change how polygons render: comma-separated
+    /// Polygon representation by zoom band: comma-separated
     /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
-    /// `0-7:point,8-14:geom`. The band rules are in the tuning guide:
+    /// `0-7:point,8-14:geom`. Band rules:
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(long, value_name = "SPEC", help_heading = "Generalization")]
     representation: Option<String>,
@@ -745,7 +740,7 @@ struct ConvertTuningArgs {
     polygon_visibility: Option<f64>,
 
     /// Density budget decay: each coarser level keeps 1/rate of the next
-    /// finer level's feature budget. Larger values thin mid zooms harder.
+    /// finer level's feature budget. Larger values thin mid zooms more.
     #[arg(
         long,
         value_name = "F",
@@ -754,8 +749,8 @@ struct ConvertTuningArgs {
     )]
     drop_rate: f64,
 
-    /// How strongly the density budget protects sparse areas: 1 cuts every
-    /// neighborhood equally, and larger values protect sparse ones more.
+    /// Sparse-area protection: 1 reduces every neighborhood equally;
+    /// larger values protect sparse areas more.
     #[arg(
         long,
         value_name = "F",
@@ -814,8 +809,8 @@ struct ConvertTuningArgs {
     )]
     coalesce_snap: f64,
 
-    /// Skip coalescing on a level with more candidate lines than this, to
-    /// bound memory. Long lines hit a matching geometry-size limit first.
+    /// Skip coalescing above this candidate-line count to bound memory.
+    /// Long lines reach a corresponding geometry-size limit first.
     #[arg(
         long,
         value_name = "ROWS",
@@ -824,8 +819,8 @@ struct ConvertTuningArgs {
     )]
     coalesce_max_level_rows: usize,
 
-    /// Maximum rows per output row group, per level. A level that would pass
-    /// Parquet's row-group limit gets a larger cap.
+    /// Maximum rows per output row group at each level. The cap increases
+    /// if a level would exceed Parquet's row-group limit.
     #[arg(long, default_value = "10000", help_heading = "Output layout")]
     row_group_size: usize,
 
@@ -903,8 +898,8 @@ struct ConvertTuningArgs {
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 
-    /// Write the convert plan to PATH and keep converting, so a later run
-    /// can reuse it with `--plan`. A sharded build shares one plan.
+    /// Save the convert plan to PATH and continue converting. Reuse it
+    /// with `--plan`; sharded builds share one plan.
     #[arg(
         long,
         value_name = "PATH",
@@ -913,9 +908,8 @@ struct ConvertTuningArgs {
     )]
     save_plan: Option<PathBuf>,
 
-    /// Reuse the convert plan at PATH and skip the first pass and level
-    /// assignment. The plan's fingerprint must match this run's version,
-    /// flags, and inputs.
+    /// Reuse a convert plan, skipping the first pass and level assignment.
+    /// Its fingerprint must match this run's version, flags, and inputs.
     #[arg(
         long,
         value_name = "PATH",
@@ -1182,7 +1176,7 @@ struct StatsArgs {
     #[arg(value_name = "ARCHIVE")]
     archive: PathBuf,
 
-    /// How many of the largest tiles (by stored size) to list.
+    /// Number of largest tiles to list, ranked by stored size.
     #[arg(long, value_name = "N", default_value = "10")]
     largest: usize,
 
@@ -1209,9 +1203,9 @@ struct TilesArgs {
     )]
     output: Option<PathBuf>,
 
-    /// Convert the `.parquet` files this manifest lists instead of `INPUT`.
-    /// Give one path or URL per line, in dataset row order. Blank lines and
-    /// `#` lines do nothing.
+    /// Read `.parquet` files from this manifest instead of `INPUT`: one
+    /// path or URL per line, in dataset row order. Ignores blank lines and
+    /// lines starting with `#`.
     #[arg(long, value_name = "PATH")]
     files_from: Option<PathBuf>,
 
@@ -1229,8 +1223,8 @@ struct TilesArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Convert only features whose bbox intersects this lon/lat box. Row
-    /// groups outside the box go unread.
+    /// Convert features whose bbox intersects this lon/lat box. Skips row
+    /// groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
@@ -1244,9 +1238,9 @@ struct TilesArgs {
     #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
-    /// Clip every polygon with the full overlay instead of the fast path for
-    /// simple rings. Use it for byte-stable tiles: the fast path renders the
-    /// same but can start a ring at a different vertex.
+    /// Clip all polygons with the full overlay for byte-stable tiles. The
+    /// simple-ring fast path renders identically but can change a ring's
+    /// starting vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
 
@@ -1264,16 +1258,15 @@ struct TilesArgs {
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order: `input` keeps source row order, and a
-    /// property name, optionally with `:asc` or `:desc`, sorts each tile by
-    /// it. A renderer paints in this order unless a style overrides it.
+    /// Feature order within each tile: `input` preserves source row order;
+    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
+    /// order unless the style overrides it.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
-    /// Write this integer column as each feature's MVT id, so
-    /// `setFeatureState` keys work across tiles and zooms. Every row
-    /// must hold a value from 0 to 2^64-1. Without it, tiles keep
-    /// tile-local ids.
+    /// Use this integer column as the MVT feature id for `setFeatureState`
+    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
+    /// Defaults to tile-local ids.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
@@ -1282,12 +1275,12 @@ struct TilesArgs {
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
-    /// Keep the intermediate overview GeoParquet at PATH instead of
-    /// deleting it after the export. The PMTiles output is the same.
+    /// Save the intermediate overview GeoParquet to PATH after export.
+    /// Does not change the PMTiles output.
     #[arg(long, value_name = "PATH")]
     keep_overview: Option<PathBuf>,
 
-    /// Build one job of a sharded fleet: `I/N` for data shard I of N, or
+    /// Build one shard: `I/N` for data shard I of N, or
     /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
     /// data shards also need `--plan`. See
     /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>.
@@ -1361,17 +1354,17 @@ fn main() -> Result<()> {
     }
 }
 
-/// Render the whole clap command tree as Markdown for the CLI reference page.
-///
-/// Single source of truth is the `#[command]`/`#[arg]` help strings on the
-/// clap types in this file — the reference is generated, never hand-edited.
+#[cfg(feature = "gen-docs")]
+mod reference_docs;
+
+/// Render the CLI reference from the clap help strings and option definitions.
 #[cfg(feature = "gen-docs")]
 fn gen_reference_markdown() -> String {
     let options = clap_markdown::MarkdownOptions::new()
         .title("CLI reference".to_string())
         .show_footer(false)
-        .show_table_of_contents(true);
-    let body = clap_markdown::help_markdown_custom::<Cli>(&options);
+        .show_table_of_contents(false);
+    let body = reference_docs::format(clap_markdown::help_markdown_custom::<Cli>(&options));
     format!(
         "<!-- GENERATED FILE — do not edit by hand.\n     \
          Regenerate: cargo run -p tylertoo --features gen-docs -- \

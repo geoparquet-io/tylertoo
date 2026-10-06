@@ -1,49 +1,45 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+Notable changes to this project are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## v0.7.1 (2026-09-23)
 
-A packaging and docs release that fills in what v0.7.0 left out. The tiling
-engine is unchanged. What's new is how you install it and how you get started.
+Packaging and documentation updates for v0.7.0, with easier installation and
+a new quickstart. The tiling engine is unchanged.
 
 ### Added
 
-- **Python wheels for every common platform.** `pip install tylertoo` now
-  finds a prebuilt wheel on Linux x86_64 and aarch64 (manylinux and musllinux,
-  so Alpine works too), macOS Intel and Apple Silicon, and Windows x86_64.
-  Wheels are built for the stable ABI (`abi3-py39`), so one wheel covers every
-  CPython from 3.9 up and there are no more source builds on newer
-  interpreters (#410, #473).
-- **`cargo binstall tylertoo`** downloads the prebuilt release binary instead
-  of building from source, so you don't need Rust or `protoc` (#411, #469).
-- **A quickstart you can run in 60 seconds**, in the README and at the top of
-  the getting-started guide. It uses a 28 MB sample file you can download, and
-  every command was checked by running it (#413, #472).
+- **Python wheels:** `pip install tylertoo` uses prebuilt wheels on Linux
+  x86_64 and aarch64 (manylinux and musllinux, including Alpine), macOS Intel
+  and Apple Silicon, and Windows x86_64. Each stable-ABI wheel (`abi3-py39`)
+  supports CPython 3.9 and newer without source builds (#410, #473).
+- **`cargo binstall tylertoo`** downloads a prebuilt release binary without
+  requiring Rust or `protoc` (#411, #469).
+- **60-second quickstart** in the README and at the start of the
+  getting-started guide, using a downloadable 28 MB sample file. Every
+  command was tested (#413, #472).
 - **Community files:** `SECURITY.md` with private vulnerability reporting, a
-  code of conduct, issue forms, a PR template, and a set of issues labelled
+  code of conduct, issue forms, a PR template, and issues labelled
   good-first-issue (#415, #467).
 
 ### Changed
 
-- **Reproducible builds.** `Cargo.lock` is now committed, and release
-  binaries, wheels and crates.io publishes all build with `--locked`. Every
-  artifact is built from the reviewed dependency tree, not whatever crates.io
-  resolves on release day. v0.7.0 was built without a lockfile (#412, #468).
+- **Reproducible builds:** `Cargo.lock` is committed, and release binaries,
+  wheels and crates.io publishes use `--locked` to build from reviewed
+  dependencies. v0.7.0 was built without a lockfile (#412, #468).
 - **Clearer README intro and a curated v0.7.0 changelog.** The Brazil tutorial
-  now points at the real 52-file remote manifest (the single file it named
-  never existed), and the gpio commands, which included a flag gpio 1.5.0
-  doesn't have, are corrected (#414, #472).
+  now links to the 52-file remote manifest; the previously named single file
+  never existed. The gpio commands no longer use a flag absent from gpio
+  1.5.0 (#414, #472).
 
 ### Fixed
 
-- **Release pipeline:** the natively built wheels are smoke-tested (installed
-  and imported) before publish, and a manual re-run of the release workflow
-  can no longer upload wheels under a version that has already been released
-  (#473).
+- **Release pipeline:** natively built wheels are smoke-tested (installed and
+  imported) before publication. Manual workflow re-runs cannot upload wheels
+  under an already released version (#473).
 
 ### Internal
 
@@ -54,10 +50,9 @@ engine is unchanged. What's new is how you install it and how you get started.
 
 ## v0.7.0 (2026-09-19)
 
-The release that replaces the original per-tile pipeline with the
-`geo:overviews` architecture. Tiling now runs as *build a multi-resolution
-overview GeoParquet, then export tiles from it*, with the overview file as a
-first-class artifact you can validate, query with SQL, and re-export.
+Replaces the original per-tile pipeline with `geo:overviews`: build a
+multi-resolution overview GeoParquet, then export tiles from it. The overview
+file can be validated, queried with SQL, and re-exported.
 
 ### Added
 
@@ -66,49 +61,49 @@ first-class artifact you can validate, query with SQL, and re-export.
   `tylertoo validate` checks one against the draft spec (#168, #184, #190).
 - **`tylertoo export-pmtiles`** — PMTiles v3 export from an overview file,
   with per-level progress logging and incremental checkpoints (#169, #229).
-- **`tylertoo tiles`, and the bare form** — one-shot GeoParquet → PMTiles as a
-  facade over overview → export, with `--keep-overview`, a controllable spill
-  directory, a free-space preflight, and tuning parity with the two-step
-  commands (#251, #276, #318, #319).
+- **`tylertoo tiles`, and the bare form** — one-shot GeoParquet → PMTiles via
+  overview → export, with `--keep-overview`, a configurable spill directory,
+  a free-space preflight, and the same tuning options as the two-step commands
+  (#251, #276, #318, #319).
 - **`tylertoo decode`** — PMTiles v3 → GeoParquet with tippecanoe-decode
   semantics and `zoom` / `layer` / `mvt_id` provenance columns (#112, #206).
-- **`tylertoo pyramid`** — multi-band archives: several inputs, each owning a
-  disjoint zoom range, merged into one PMTiles. Bands may be GeoParquet (tiled
-  for you) or already-tiled PMTiles, and bands in different layers may share a
-  zoom range (#348, #385, #392).
+- **`tylertoo pyramid`** — merge several inputs with disjoint zoom ranges into
+  one PMTiles archive. Bands may be GeoParquet (tiled during conversion) or
+  existing PMTiles. Bands in different layers may share a zoom range (#348,
+  #385, #392).
 - **Remote input** — read `s3://`, `https://` and `gs://` GeoParquet over
   byte-range requests, including remote prefix listing (#210, #216, #281).
 - **Multi-file input** — a local directory, a glob, an `s3://` / `gs://`
   prefix, a `--files-from` manifest (ordered, mixed local and remote), or a
-  Python `list[str]` is read as one logical dataset, with cross-partition
+  Python `list[str]` is read as one dataset, with cross-partition
   schema and CRS validation and a deterministic row order (#277, #281, #282).
-- **`--spill-dir` and a free-space guard** — place the remote-input spill file
-  where you want it; the converter projects the spill footprint before pass 1
-  and warns when the volume may not fit it, or when it is on tmpfs (#272,
-  #273). A full-file remote conversion that would stage roughly the whole
-  object warns up front with the equivalent download-then-convert commands
-  (#267).
-- **`--bbox` regional extracts** — row-group-level spatial pushdown, so a city
-  comes out of a country-scale file without reading — or, on remote input,
-  fetching — the rest (#102, #207).
+- **`--spill-dir` and a free-space guard** — choose where to store the
+  remote-input spill file. Before pass 1, the converter estimates its size
+  and warns about potentially insufficient space or tmpfs storage (#272,
+  #273).
+  Conversions that would stage roughly the whole remote object also show
+  equivalent download-then-convert commands up front (#267).
+- **`--bbox` regional extracts** — spatial pushdown skips row groups outside
+  the requested region, avoiding unnecessary reads and remote fetches
+  (#102, #207).
 - **`--filter` / `--where`** — SQL-WHERE-style attribute predicates with
   parquet row-group statistics pushdown, timestamp columns included
   (#315, #321).
 - **Property selection** — `--include-property`, `--exclude-property` and
   `--exclude-all-properties` (tippecanoe `-y` / `-x` / `-X`), applied at scan
   time on `overview` and at encode time on `export-pmtiles` (#386, #391).
-- **`--feature-order`** — pin within-tile draw order to input order or to a
+- **`--feature-order`** — set within-tile draw order to input order or a
   property, ascending or descending (#361, #366).
-- **Magnitude ladder** — `--magnitude-ladder` and `--entry-zoom` let an
-  attribute decide the zoom at which each feature first appears (#364, #375).
-- **`--verbatim`** — tile the input exactly as given, switching the whole
-  generalization ladder off at every level (#345, #360, #367).
+- **Magnitude ladder** — `--magnitude-ladder` and `--entry-zoom` set each
+  feature's first zoom from an attribute (#364, #375).
+- **`--verbatim`** — tile the input as given, disabling generalization at
+  every level (#345, #360, #367).
 - **Zoom-band representation** — `--representation "0-7:point"` draws a band as
   representative points and the rest as polygons in one archive, and
-  `--collapse-square` stands in for dropped tiny polygons with area-dithered
+  `--collapse-square` replaces dropped tiny polygons with area-dithered
   placeholder squares (#279, #317, #322).
-- **Tiny-polygon accumulator** — coarse levels keep the area they drop instead
-  of losing it (#384, #394).
+- **Tiny-polygon accumulator** — preserve the area of dropped polygons at
+  coarse levels (#384, #394).
 - **Per-level point clustering** — `--cluster` and `--accumulate-attribute`
   carry cluster winners with a `point_count` column and numeric attribute
   aggregation through the overview pipeline (#170).
@@ -123,47 +118,45 @@ first-class artifact you can validate, query with SQL, and re-export.
 - **Prebuilt CLI binaries** attached to every GitHub Release — Linux x86_64
   (gnu and musl), macOS Intel and Apple Silicon, Windows x86_64 — plus
   generated release notes (#275).
-- Antimeridian-suspect features are flagged with a warning at convert time
+- Warn during conversion about features suspected of crossing the antimeridian
   (#188, #199).
 
 ### Changed
 
-- **Breaking: the legacy per-tile pipeline is gone.** `pipeline.rs`,
-  `Converter` and `TilerConfig` were removed along with their library
-  re-exports, and every path now runs overview → export (#177, #189). The
-  flags tied to the old pipeline — `--streaming-mode`, the old
-  `--include` / `--exclude` / `--exclude-all` property filtering,
-  output-compression selection, `--deterministic` — are gone; the tuning
-  surface is the `overview` / `export-pmtiles` flag set, all of which the
-  one-shot `tiles` command also accepts (#249).
+- **Breaking: the legacy per-tile pipeline is gone.** Removed `pipeline.rs`,
+  `Converter`, `TilerConfig` and their library re-exports. All conversion now
+  runs overview → export (#177, #189). Removed the old pipeline flags:
+  `--streaming-mode`, `--include` / `--exclude` / `--exclude-all` property
+  filtering, output-compression selection, and `--deterministic`. Use the
+  `overview` / `export-pmtiles` tuning flags, also accepted by `tiles` (#249).
 - **Breaking: Python `convert()` is deprecated.** It no longer runs the removed
-  legacy pipeline; it is a facade chaining `overview()` + `export_pmtiles()`.
-  Use the two-step API for the full option surface. Its legacy keyword
+  legacy pipeline; it chains `overview()` + `export_pmtiles()`.
+  Use the two-step API for all options. Its legacy keyword
   arguments `drop_density`, `compression`, `include`, `exclude`,
   `exclude_all`, `deterministic`, `drop_smallest_as_needed`,
   `drop_smallest_threshold` and `progress_callback` were removed; passing one
   raises `TypeError`.
 - `--polygon-visibility` retuned **4.0 → 2.0** (#259): the rendered sweep
-  showed gates above 2.0 starve coarse zooms without making files smaller, and
-  gates below ~2.0 mostly admit candidates the write-time collapse drops
-  anyway (`corpus/SWEEPS.md`, Decision 6).
+  showed gates above 2.0 remove too many features at coarse zooms without
+  reducing file size. Gates below ~2.0 mostly admit candidates dropped by
+  write-time collapse (`corpus/SWEEPS.md`, Decision 6).
 - Per-tile size caps at 500K by default, matching tippecanoe (#280).
 - The simple-clip fast path is on by default; `--no-simple-clip-fastpath` opts
   out (#239, #256).
 - Line thinning retuned 2.0 → 1.0, point thinning defaults to 16.0 under
-  clustering, and junction continuation now defaults off — all from the same
+  clustering, and junction continuation now defaults off, based on the same
   sweep methodology.
 - Overview footers declare spec version 0.2.0 (#184, #190).
-- The declared MSRV is 1.95 — it had claimed 1.75 — and CI verifies it (#358).
+- The declared MSRV is now 1.95, corrected from 1.75 and verified in CI (#358).
 
 ### Fixed
 
 - **PMTiles directories**: the contiguous-offset rule now applies to leaf
   entries, oversized directories split into leaves, and `leaf_dirs_offset` is
   never written as 0 (#356, #377, #378).
-- **MVT polygons are cleaned in tile space after quantization**, so
-  quantization can no longer leave self-intersecting or degenerate rings
-  (#383, #393). Ring winding follows the spec.
+- **MVT polygons are cleaned in tile space after quantization**, preventing
+  self-intersecting or degenerate rings (#383, #393). Ring winding follows
+  the spec.
 - `export-pmtiles` declares the requested minimum zoom even when the coarse
   levels generalized to nothing (#380, #390).
 - `coalesced_count` is withheld from tiles when it is 1 everywhere (#379,
@@ -188,22 +181,21 @@ first-class artifact you can validate, query with SQL, and re-export.
 
 ### Performance
 
-- Remote-input network traffic is bounded to about 1× the object's bytes —
-  down from ~3× — regardless of zoom range or pass count: the selected row
-  groups are staged up front so the fetches coalesce and parallelize, fetched
-  column chunks are cached to the largest row group's working set (#261), and
-  an on-disk spill file serves passes 2 and later from local disk instead of
-  the network (#219, #286, #287). The spill is best-effort; if the volume
-  fills, conversion continues with network re-fetch.
-- Export runs a single-read fan-out pass that kills cross-level prefix and
-  per-partition re-reads, and parallelizes clip, simplify, MVT encode and gzip
-  (#227, #228, #233, #235).
+- Remote-input network traffic is bounded to about 1× the object's bytes,
+  down from ~3×, regardless of zoom range or pass count. Selected row groups
+  are staged up front for coalesced, parallel fetches; column chunks are
+  cached to the largest row group's working set (#261); and an on-disk spill
+  file serves passes 2 and later (#219, #286, #287). If the spill volume fills,
+  conversion continues by re-fetching from the network.
+- Export uses a single-read fan-out pass to avoid cross-level prefix and
+  per-partition re-reads, with parallel clipping, simplification, MVT encoding
+  and gzip (#227, #228, #233, #235).
 - Large polygons split top-down recursively instead of being clipped whole
   (#226), and three O(V²) hot spots in clipping and validity checking were
   replaced or capped (#237, #241, #242).
-- Memory is budgeted rather than guessed: winner-grid level waves, partition
-  waves sized from the densest partition and from available cores, and an auto
-  profile that picks RAM-vs-spill from measured geometry (#293, #294, #303,
+- Memory budgeting uses winner-grid level waves, partition waves sized from
+  the densest partition and available cores, and an auto profile that selects
+  RAM or spill storage from measured geometry (#293, #294, #303,
   #305, #306, #311).
 - Parquet row-group encoding and GeoParquet WKB encoding run in parallel
   (#296, #304).
@@ -211,8 +203,8 @@ first-class artifact you can validate, query with SQL, and re-export.
 
 ### Internal
 
-Clippy, rustfmt, dependency, CI and benchmark-harness work is omitted from this
-section; `git log v0.6.0..v0.7.0` holds the full 465-commit record.
+For Clippy, rustfmt, dependency, CI and benchmark-harness changes, see the full
+465-commit record: `git log v0.6.0..v0.7.0`.
 
 ## v0.6.0 (2026-03-11)
 

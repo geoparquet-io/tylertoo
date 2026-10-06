@@ -1,26 +1,25 @@
 # Brazil fields: cloud data to a sharded, two-layer map
 
-This tutorial starts from data you never download whole. The
-[Fields of the World](https://fieldsofthe.world/) (FTW) predictions hold about
-3.2 billion field polygons, published on
-[Source Cooperative](https://source.coop/ftw/global-data) as one GeoParquet
-file per country subdivision. The goal is one PMTiles archive that maps the
-soy belt around Sorriso, Mato Grosso. It shows field polygons up close and a
-field-density grid when zoomed out.
+Build a PMTiles map of the soy belt around Sorriso, Mato Grosso, with field
+polygons up close and a density grid at low zooms. The source is
+[Fields of the World](https://fieldsofthe.world/) (FTW): about 3.2 billion
+field polygons on [Source Cooperative](https://source.coop/ftw/global-data),
+stored as one GeoParquet file per country subdivision. You only download
+the row groups needed for this area.
 
-The tutorial uses tools the
+This extends the
 [Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
-does not:
+with:
 
 - remote reads with `--files-from`, `--bbox`, and `--filter`
-- DuckDB and the `tylertoo` Python package, to derive a second layer
-- a sharded build: `shard-plan`, a coarse job, four shard jobs, and `merge`
-- `pyramid`, to put two layers with their own zoom ranges in one archive
+- DuckDB and the `tylertoo` Python package to derive a second layer
+- `shard-plan` and `merge` to split tiling into independent jobs
+- `pyramid` to combine layers with separate zoom ranges
 
 Each step is a script in
 [`examples/brazil-fields/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/brazil-fields).
-CI runs every script on each pull request, against the live data, and
-checks that this page shows the same code and the same output.
+CI runs the scripts against live data on each pull request and checks the
+code and output shown here.
 
 ## Before you begin
 
@@ -30,25 +29,21 @@ checks that this page shows the same code and the same output.
 | `tylertoo` Python package and DuckDB | `pip install tylertoo duckdb` | Validation and the density layer |
 | `gpio` | `pip install geoparquet-io` | Row-group bounds for the shard plan |
 
-Run the steps in order from one empty working directory. Step 1 reads about
-120 MB over the network. The rest runs locally in seconds.
+Run the steps in order in an empty working directory. Step 1 downloads
+about 120 MB; the remaining steps run locally in seconds.
 
 ## 1. Extract a window from three remote files
 
-The Mato Grosso file alone is 1.1 GB, and the window you want covers about
-4% of it. tylertoo reads the Parquet footer of each file first, then
-fetches only the row groups whose bounding boxes touch `--bbox`. FTW sorts
-its files in space and records each row group's bounds, which makes this
-pruning work.
+The Mato Grosso file is 1.1 GB; this window covers about 4% of it.
+tylertoo reads each file's Parquet footer, then fetches the row groups whose
+bounds intersect `--bbox`. FTW stores features in spatial order and records
+row-group bounds, allowing tylertoo to skip the rest.
 
-`--files-from` takes a list of inputs, local paths or URLs, and treats them
-as one dataset in the listed order. This step lists Goiás and Mato Grosso do
-Sul too, to show that a file outside the window costs one footer read and
-nothing more. `--filter` drops fields smaller than one hectare, using the
-dataset's own `metrics:area` column.
-
-The output is an overview file, as in the Madagascar tutorial. Its finest
-level is the extract itself.
+`--files-from` treats a list of local paths or URLs as one dataset, in the
+listed order. Goiás and Mato Grosso do Sul lie outside the window, so each
+costs only a footer read. `--filter` uses `metrics:area` to drop fields
+smaller than one hectare. The output is an overview file whose finest
+level contains the extract.
 
 File: `01-extract.sh`
 
@@ -84,22 +79,19 @@ remote input: 11 range requests, 119.46 MiB fetched of a 2988.72 MiB object (4.0
    10          2.39         534     172,653  504.61 KiB
 ```
 
-Five of 167 row groups matched, so tylertoo fetched 4% of the three files'
-bytes. Most of the run time is that download. The same command on a whole
-state reads more row groups, not more footers.
+Five of 167 row groups matched: 4% of the three files' bytes. The download
+accounts for most of the run time. Expanding the window to a whole state
+requires more row-group reads; the footer count stays the same.
 
 ## 2. Derive the layers with Python and DuckDB
 
-The overview file is plain GeoParquet, so the next step treats it as a table.
-`tylertoo.validate` checks it against the `geo:overviews` spec first and
-returns the result as a `dict`.
+`tylertoo.validate` checks the GeoParquet overview against the
+`geo:overviews` spec and returns a `dict`. DuckDB then exports its finest
+level as `fields-raw.parquet` for tiling in step 3, and builds a density
+grid for low zooms.
 
-Then DuckDB does two things. It writes the finest level back out as
-`fields-raw.parquet`, the extract the sharded build tiles in step 3. And it
-builds the layer for low zooms. At z5 a pixel spans about 5 km, wider than
-any field here, so single fields would vanish or turn to noise. A grid of
-0.01° cells, each counting its fields and their total area, reads better at
-that scale.
+At z5, a pixel spans about 5 km, so individual fields are too small to see.
+The grid uses 0.01° cells, each recording a field count and total area.
 
 File: `02_layers.py`
 
@@ -161,33 +153,26 @@ valid=True  checks=12
 └───────┴────────┴──────────────┴──────────┘
 ```
 
-The 534 fields cover 36,733 ha, an average of 69 ha each. Large, regular
-fields like these are typical of the soy farms in Mato Grosso.
+The 534 fields cover 36,733 ha, averaging 69 ha each: large, regular fields
+typical of Mato Grosso's soy farms.
 
 ## 3. Tile the fields as a sharded build
 
-A single `tylertoo tiles` run is one process on one machine. For a country or
-a continent, a sharded build splits the fine zooms into independent jobs that
-can run at the same time on separate machines. This window is small, so the
-four shards run here one after another in seconds. The commands are the ones a
-cluster would run.
+A sharded build splits fine zooms into jobs that can run concurrently on
+separate machines. This small window runs four shards sequentially in
+seconds, using the same commands you would run on a cluster:
 
-The build has four parts:
+1. `gpio convert geoparquet` adds the row-group bounds and bbox covering
+   missing from DuckDB's export.
+2. `shard-plan` uses those bounds to divide tile space at z10, the pivot
+   zoom, into ranges with roughly equal row counts.
+3. The coarse job builds z8–z9, below the pivot, and saves `convert.plan`.
+   Every shard uses this plan to generalize the data consistently.
+4. Each shard builds z10–z14 for its range. `merge` copies the disjoint tiles
+   from all five archives into one archive without recomputing them.
 
-1. `gpio convert geoparquet` records row-group bounds and a bbox covering.
-   `shard-plan` balances shards by those bounds, and DuckDB's export in step 2
-   did not write them.
-2. `shard-plan` cuts the tile space at a pivot zoom, here z10, into ranges of
-   about equal row count.
-3. The coarse job builds z8 and z9, the zooms below the pivot, and saves
-   `convert.plan`. Every shard reads that plan, so all jobs generalize the
-   data the same way.
-4. Each shard builds z10 to z14 for its own range. `merge` then concatenates
-   the five archives. They hold disjoint tiles, so the merge copies tiles and
-   recomputes nothing.
-
-The window's center falls on the corner of four z10 tiles, so each shard gets
-a share of the work.
+The window is centered on the corner of four z10 tiles, giving each shard
+some fields to tile.
 
 File: `03-shard.sh`
 
@@ -242,18 +227,17 @@ Merging 5 archive(s) → fields.pmtiles
 ✓ 191 tiles (191 unique) from 5 archive(s), z8..z14 in 0.00s
 ```
 
-Each shard got about 134 of the 534 fields. "191 unique" confirms that no two
-jobs wrote the same tile.
+Each shard gets about 134 of the 534 fields. "191 unique" confirms the jobs
+produced no duplicate tiles.
 
 ## 4. Combine both layers with `pyramid`
 
-`pyramid` builds one archive from bands, each owning a zoom range. A band can
-be a GeoParquet file, tiled here, or a PMTiles archive, merged as it is. The
-density grid becomes layer `density` at z0 to z7. The sharded fields archive
-becomes layer `fields` at z8 to z14. A map style then needs two rules: fill
-the density cells by `fields`, and outline the fields.
+`pyramid` combines zoom bands into one archive. It tiles GeoParquet inputs
+and copies tiles from PMTiles inputs. Here, `density` covers z0–z7 and
+`fields` covers z8–z14. Style the map with filled density cells colored by
+their `fields` count and outlined field polygons.
 
-`tylertoo stats` reports tile weight per zoom, as in the Madagascar tutorial.
+`tylertoo stats` reports tile sizes at each zoom.
 
 File: `04-pyramid.sh`
 
@@ -282,9 +266,9 @@ tylertoo stats brazil.pmtiles
 ...
 ```
 
-The density tiles stay near 3 KB at every zoom, since 266 squares is all they
-hold. The field tiles are heaviest at z11 and z12, where one tile still
-holds many whole fields, and shrink as the zoom increases. Drop
+The density tiles stay around 3 KB or less, holding just 266 squares. Field
+tiles are heaviest at z11–z12, where each tile contains many whole fields,
+and shrink at higher zooms. Drop
 `brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to see both layers.
 
 ## Run the whole workflow

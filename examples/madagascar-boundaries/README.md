@@ -1,16 +1,13 @@
 # Madagascar boundaries: from a raw export to PMTiles
 
-This tutorial takes one real file from a raw export to a PMTiles archive you
-can drop on a map. It uses only the command line. Along the way it builds the
-artifact at the center of tylertoo: an **overview file**. This GeoParquet
-file holds every zoom level of your data and stays queryable.
+Convert 17,465 admin-4 boundary polygons for Madagascar (28 MB), from the
+[fieldmaps.io](https://fieldmaps.io/) global boundaries, into a PMTiles archive
+using the command line. First, build an **overview file**: queryable
+GeoParquet containing your data at every zoom level.
 
-The input is 17,465 admin-4 boundary polygons for Madagascar (28 MB), from
-the [fieldmaps.io](https://fieldmaps.io/) global boundaries. Each step below
-is a script in
+Each step is a script in
 [`examples/madagascar-boundaries/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/madagascar-boundaries).
-CI runs every script on each pull request and checks that this page shows the
-same code and the same output.
+CI runs the scripts on every pull request and checks this page's code and output.
 
 ## Before you begin
 
@@ -22,22 +19,20 @@ You need three tools on your `PATH`:
 | `gpio` | `pip install geoparquet-io` | Sorting and repacking the input |
 | `duckdb` | `pip install duckdb-cli` | Adding GeoParquet metadata |
 
-Run each script from one empty working directory. Every step reads the files
-the step before it wrote.
+Run the scripts in order from the same empty working directory. Each step
+reads the previous step's files.
 
 ## 1. Prepare the input
 
-tylertoo reads WGS84 GeoParquet. It runs faster on a Hilbert-sorted file,
-where geographic neighbors sit near each other on disk, packed into row groups
-of a few megabytes or more. Raw exports from databases and Spark jobs seldom
-arrive in that shape. One preparation pass pays off at every zoom level that
-follows.
+tylertoo reads WGS84 GeoParquet. Hilbert sorting puts geographic neighbors
+near each other on disk; row groups of a few megabytes or more improve read
+performance. Raw database and Spark exports often need both adjustments.
 
-This export has a second problem. Its geometry column holds valid Well-Known
-Binary (WKB), but the file carries no `geo` metadata, so GeoParquet tools cannot tell which column
-is the geometry. A DuckDB round trip writes that metadata. Then
+This export also lacks `geo` metadata, despite having valid Well-Known Binary
+(WKB) geometry. A DuckDB round trip adds the metadata so GeoParquet tools can
+identify the geometry column. Then
 [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) (`gpio`) sorts
-and repacks the file in one pass.
+and repacks the file.
 
 File: `01-prepare.sh`
 
@@ -82,18 +77,15 @@ Bbox: [43.187051, -25.606140, 50.493403, -11.949812]
 ...
 ```
 
-`gpio inspect` confirms what tylertoo needs. The coordinate reference system
-is `OGC:CRS84`, which is lon/lat WGS84, and the rows sit in three
-Zstandard-compressed row groups. If your own data uses a projected coordinate
-system, add `gpio convert reproject input.parquet wgs84.parquet -d EPSG:4326`
-before the sort.
+`gpio inspect` confirms lon/lat WGS84 (`OGC:CRS84`) and three
+Zstandard-compressed row groups. For projected data, run
+`gpio convert reproject input.parquet wgs84.parquet -d EPSG:4326` before sorting.
 
 ## 2. Preview one region
 
-On a large input, try your settings on a small window before you commit to the
-whole file. `--bbox` takes lon/lat bounds as `xmin,ymin,xmax,ymax`. tylertoo
-reads only the row groups whose bounds intersect the box, so a city-sized
-preview of a country-sized file finishes in seconds.
+Test settings on a small region with `--bbox`, which takes lon/lat bounds as
+`xmin,ymin,xmax,ymax`. tylertoo reads only row groups whose bounds intersect
+the box, so a city preview from a country file finishes in seconds.
 
 File: `02-preview.sh`
 
@@ -125,30 +117,24 @@ tylertoo overview prepared.parquet preview-ov.parquet \
   note: 3 empty level(s) omitted (z0, z1, z2) — no features visible at those scales; the pyramid starts at the coarsest non-empty level
 ```
 
-The box holds 943 of the 17,465 polygons. Read the table from the top: `gsd`
-is the ground sample distance, the size of one pixel in meters at that level.
-At z0 to z2 a pixel spans 10 to 40 km. Every polygon in the box is smaller
-than the visibility gate there, so tylertoo leaves those levels out and says
-so. To
-keep small polygons visible as dots at coarse zooms, add `--collapse`. The
+The box contains 943 polygons. `gsd` (ground sample distance) is the size of
+one pixel in meters. At z0–z2, pixels span 10–40 km: all polygons fall below
+the visibility gate, so those levels are omitted. Add `--collapse` to show
+small polygons as dots at coarse zooms. The
 [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
-covers that knob and the rest.
+explains the available settings.
 
 ## 3. Build and validate the overview
 
-`tylertoo overview` builds the full pyramid. Each level holds a thinned,
-simplified copy of the features sized for its scale, and the finest level
-holds the source geometry unchanged. All levels go into one GeoParquet file,
-tagged by a `level` column.
+`tylertoo overview` writes all levels to one GeoParquet file with a `level`
+column. Each level thins and simplifies features for its scale; the finest
+preserves the source geometry.
 
-`--max-zoom` defaults to 6, which suits a continental view. A map that zooms
-in to individual communes needs more, so this step asks for z10. If you are
-not sure how far to go, `--max-zoom auto` estimates a zoom from the size and
-spacing of your features.
+`--max-zoom` defaults to 6 for a continental view. Use z10 to see individual
+communes, or `--max-zoom auto` to estimate a zoom from feature size and spacing.
 
-`tylertoo validate` then checks the file against the `geo:overviews`
-specification: the level metadata, the zoom-to-resolution ladder, and the
-per-level structure.
+`tylertoo validate` checks `geo:overviews` metadata, zoom-to-resolution
+mapping, and per-level structure.
 
 File: `03-overview.sh`
 
@@ -182,22 +168,20 @@ Validating madagascar-ov.parquet
 ✓ valid overview file (12 checks passed)
 ```
 
-The table shows the idea in ten lines. At 19.6 km per pixel, 40 of the 17,465
-polygons survive. From level 2 to level 8 the count grows about 1.65 times per
-zoom, the default `--drop-rate`. Level 9 holds every polygon at full detail. The file is still ordinary GeoParquet, so any
-Parquet reader opens it. The [Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
-queries one with DuckDB.
+At 19.6 km per pixel, 40 polygons remain. From level 2 to level 8, the count
+grows about 1.65 times per zoom, the default `--drop-rate`. Level 9 holds all
+17,465 polygons at full detail. Any Parquet reader can open the file; the
+[Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
+shows how to query an overview with DuckDB.
 
 ## 4. Export PMTiles
 
-`tylertoo export-pmtiles` cuts each level into vector tiles and writes one
-PMTiles archive. It recomputes no geometry: the levels you built in step 3
-become the tiles. `--layer-name` sets the MVT source layer your map style
-refers to, and `--min-zoom 1` starts the archive at the overview's first zoom.
+`tylertoo export-pmtiles` cuts the overview levels into vector tiles without
+recomputing geometry. `--layer-name` sets the MVT source layer used by your
+map style; `--min-zoom 1` starts at the overview's first zoom.
 
-`tylertoo stats` then reads the archive's directory and reports how heavy the
-tiles are at each zoom. Use it to find the zooms and tiles that load
-slowest.
+`tylertoo stats` reads the archive directory and reports tile sizes by zoom
+to help identify slow-loading tiles.
 
 File: `04-export.sh`
 
@@ -233,22 +217,19 @@ Largest 10 tile(s):
 ...
 ```
 
-Tile features outnumber level features because the export clips a polygon
-that crosses a tile edge into every tile it touches. A few slivers from those
-clips shrink to nothing at the tile's 4096-unit grid. The export counts them
-as "collapsed at extent" and leaves them out. No tile exceeds the 500 KB default
-size limit, and the largest, at z10, is 88 KB.
+Polygons crossing tile edges appear in every tile they touch, so tile
+features outnumber overview features. Clipped slivers that vanish on the
+tile's 4096-unit grid are omitted and counted as "collapsed at extent".
+The largest tile is 88 KB at z10, below the default 500 KB limit.
 
-To see the result, drop `madagascar.pmtiles` onto
-[pmtiles.io](https://pmtiles.io/). Any server that honors HTTP range requests
-can host the file. There is no tile server to run.
+View `madagascar.pmtiles` at [pmtiles.io](https://pmtiles.io/), or host it on
+any server that supports HTTP range requests. No tile server is needed.
 
 ## 5. Decode tiles back to GeoParquet
 
-`tylertoo decode` reads any PMTiles v3 vector archive, not only ones tylertoo
-wrote, and writes the features of the zooms you choose as GeoParquet. Use it
-to check what a map shows at a zoom, or to compare two archives in
-SQL.
+`tylertoo decode` extracts chosen zooms from any PMTiles v3 vector archive
+to GeoParquet. Use it to inspect a map's features at a zoom or compare
+archives in SQL.
 
 File: `05-decode.sh`
 
@@ -267,15 +248,13 @@ Decoding madagascar.pmtiles → z8.parquet
 ✓ 8,268 features from 44 tiles (0 skipped as degenerate) in 0.13s
 ```
 
-The output is the tiled form of the data, not the source. Its geometry
-carries the tile simplification and the clips at tile edges. A feature that
-spans two tiles appears twice. The `zoom`, `layer`, and `mvt_id` columns record where each row
-came from.
+Decoded geometry retains tile simplification and clipping; a feature spanning
+two tiles appears twice. The `zoom`, `layer`, and `mvt_id` columns identify
+each row's origin.
 
 ## Run the whole workflow
 
-The steps write their files to the current directory, so run them from a
-fresh one:
+Run all five scripts from a fresh directory:
 
 ```bash
 git clone https://github.com/geoparquet-io/tylertoo.git
@@ -288,9 +267,9 @@ done
 
 ## Next steps
 
-- One command does steps 3 and 4 when you do not need the overview file:
+- Combine steps 3 and 4 with
   `tylertoo prepared.parquet madagascar.pmtiles --max-zoom 10`. Add
-  `--keep-overview madagascar-ov.parquet` to keep it anyway.
+  `--keep-overview madagascar-ov.parquet` to save the overview too.
 - The [Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
   reads cloud data with `--files-from`, `--bbox`, and `--filter`, splits the
   tiling across shards, and combines two layers with `pyramid`.

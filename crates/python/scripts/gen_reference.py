@@ -28,6 +28,16 @@ import tylertoo
 # one-shot.
 FUNCTION_ORDER = ["overview", "export_pmtiles", "validate", "convert"]
 
+# Start groups at named arguments, retaining docstring order.
+OVERVIEW_GROUPS = {
+    "input": "Input and levels",
+    "sort_key": "Feature priority",
+    "simplify_factor": "Geometry and thinning",
+    "cluster": "Clustering",
+    "coalesce_lines": "Line coalescing",
+    "cogp_compat": "Output, filtering, and memory",
+}
+
 # Report types, outermost first.
 TYPE_ORDER = [
     "OverviewReport",
@@ -140,20 +150,25 @@ def _render_function(name: str) -> str:
     if doc.long_description:
         lines += [_flat(doc.long_description), ""]
     if doc.params:
-        lines += ["###### **Parameters:**", ""]
-        lines += [f"* `{p.arg_name}`: {_flat(p.description)}" for p in doc.params]
+        lines += ["### Parameters", ""]
+        for param in doc.params:
+            if name == "overview" and param.arg_name in OVERVIEW_GROUPS:
+                if lines[-1]:
+                    lines.append("")
+                lines += [f"#### {OVERVIEW_GROUPS[param.arg_name]}", ""]
+            lines += [f"* `{param.arg_name}`: {_flat(param.description)}"]
         lines.append("")
     if doc.returns and doc.returns.description:
         returned = _link_type(func.__annotations__["return"])
-        lines += ["###### **Returns:**", ""]
+        lines += ["### Returns", ""]
         lines += [f"{returned}: {_flat(doc.returns.description)}", ""]
     if doc.raises:
-        lines += ["###### **Raises:**", ""]
+        lines += ["### Raises", ""]
         lines += [f"* `{r.type_name}`: {_flat(r.description)}" for r in doc.raises]
         lines.append("")
     snippets = [e.description for e in doc.examples if e.description]
     if snippets:
-        lines += ["###### **Example:**", "", "```python", *snippets, "```", ""]
+        lines += ["### Example", "", "```python", *snippets, "```", ""]
     return "\n".join(lines)
 
 
