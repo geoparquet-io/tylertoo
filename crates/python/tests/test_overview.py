@@ -46,23 +46,9 @@ class TestRemoteInput:
 
 STREAMING_SMALL = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
 DATELINE = FIXTURES_DIR / "streaming" / "out-of-range-dateline.parquet"
-
-
-def _move_point(src: Path, dst: Path, row: int, lng: float) -> None:
-    """Copy a WKB-point GeoParquet file with one row's longitude replaced."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    table = pq.read_table(src)
-    wkb = table.column("geometry").to_pylist()
-    byte_order, geom_type, _, lat = struct.unpack("<BIdd", wkb[row])
-    wkb[row] = struct.pack("<BIdd", byte_order, geom_type, lng, lat)
-    idx = table.schema.get_field_index("geometry")
-    table = table.set_column(idx, table.schema.field(idx), pa.array(wkb, pa.binary()))
-    geo = json.loads(table.schema.metadata[b"geo"])
-    geo["columns"]["geometry"].pop("bbox", None)
-    table = table.replace_schema_metadata({b"geo": json.dumps(geo).encode()})
-    pq.write_table(table, dst)
+# DATELINE with row 7's longitude moved to 600.25, past the one-world wrap
+# the export applies (#342), and the stale `geo` bbox dropped.
+BEYOND_WRAP = FIXTURES_DIR / "streaming" / "out-of-range-beyond-wrap.parquet"
 
 
 class TestOutOfRangeExemplars:
@@ -79,10 +65,8 @@ class TestOutOfRangeExemplars:
 
     def test_report_names_the_row_and_coordinate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            src = Path(tmpdir) / "beyond-wrap.parquet"
-            _move_point(DATELINE, src, row=7, lng=600.25)
             out = Path(tmpdir) / "o.parquet"
-            report = tylertoo.overview(str(src), str(out), max_zoom=4)
+            report = tylertoo.overview(str(BEYOND_WRAP), str(out), max_zoom=4)
             assert report["out_of_range_features"] == 1
             assert report["out_of_range_exemplars"] == [
                 {"part": None, "row": 7, "axis": "lon", "value": 600.25}
