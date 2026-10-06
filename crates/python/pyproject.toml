@@ -44,14 +44,30 @@ dev = [
     "ruff",
     "commitizen",
     "mypy>=1.14",
+    # Type checker for the package and its extension stub (CI: Python
+    # Quality). Exact pin: ty is pre-1.0 and its rules still move.
+    "ty==0.0.84",
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
+]
+# Tools the tutorials call and the site builder (tests/docs, docs.yml).
+# Exact pins: tutorial output is compared line by line, and zensical is
+# alpha. Run `uv sync --group docs`.
+docs = [
+    "zensical==0.0.68; python_version >= '3.11'",
+    "geoparquet-io==1.6.0; python_version >= '3.11'",
+    "duckdb==1.5.6; python_version >= '3.11'",
+    "duckdb-cli==1.5.6; python_version >= '3.11'",
 ]
 
 [tool.maturin]
 # Build using pyo3 bindings
 bindings = "pyo3"
+# Mixed layout: the typed, documented API is python/tylertoo/__init__.py,
+# which calls the compiled extension at tylertoo._tylertoo.
+python-source = "python"
+module-name = "tylertoo._tylertoo"
 # extension-module tells pyo3 to build an extension module (skips linking against libpython.so)
 features = ["pyo3/extension-module"]
 # Strip the library for minimum file size
@@ -60,6 +76,9 @@ strip = true
 [tool.ruff]
 line-length = 88
 target-version = "py39"
+# python/ holds the package (maturin mixed layout); listing it keeps
+# `tylertoo` sorted as first-party in the tests' imports.
+src = [".", "python"]
 
 [tool.ruff.lint]
 # Strict ruleset (CI gate: `ruff check` must pass clean).
@@ -81,16 +100,36 @@ select = [
     "PT",  # flake8-pytest-style
     "RUF", # ruff-specific
     "PL",  # pylint
+    "D",   # pydocstyle (Google convention, below)
+    # pydoclint: docstring sections match the code. Preview rules, enabled
+    # one by one (explicit-preview-rules). DOC502 stays off: it flags a
+    # documented exception the body does not raise itself, but the public
+    # functions document what the Rust extension raises.
+    "DOC102",
+    "DOC201",
+    "DOC202",
+    "DOC402",
+    "DOC403",
+    "DOC501",
 ]
 ignore = []
+preview = true
+explicit-preview-rules = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+# W505 (selected via "W"): docstrings and comments wrap at PEP 8's 72.
+max-doc-length = 72
 
 [tool.ruff.lint.per-file-ignores]
-# The stub mirrors the pyo3 signatures verbatim; `input` is part of the
-# public API (renaming it would break keyword callers).
-"tylertoo.pyi" = ["A002"]
+# The extension stub mirrors the pyo3 signatures verbatim; `input` and
+# `filter` are public keyword names (renaming them would break callers).
+"python/tylertoo/_tylertoo.pyi" = ["A002"]
 # Tests: magic-value comparisons are the point of golden assertions, and a
 # handful of API-surface tests deliberately assert "raises *something*".
-"tests/**" = ["PLR2004", "B017", "PT011"]
+"tests/**" = ["PLR2004", "B017", "PT011", "D", "DOC", "W505"]
 
 [tool.mypy]
 # mypy >= 1.14 cannot target 3.9 anymore; 3.10 is the oldest it can check.
@@ -104,7 +143,12 @@ strict = true
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 disallow_untyped_calls = false
-files = ["tests"]
+files = ["python", "tests"]
+# pytest needs these files named conftest.py, which mypy reads as one
+# module name more than once. The docs conftest holds only small fixtures.
+# python/conftest.py (doctest fixtures) is excluded for the same reason;
+# ty checks it.
+exclude = ["^tests/docs/conftest\\.py$", "^python/conftest\\.py$"]
 warn_unused_ignores = true
 
 [tool.vulture]
@@ -117,6 +161,10 @@ ignore_names = ["pytest_configure"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Docs tests need the release CLI and the `docs` group; CI runs them with
+# `pytest -m docs tests/docs` (a later -m overrides this one).
+addopts = "-m 'not docs'"
 markers = [
     "integration: marks tests as integration tests (may be slow)",
+    "docs: runs the documentation examples (see tests/docs/conftest.py)",
 ]

@@ -35,7 +35,7 @@ fn tylertoo_bin() -> &'static str {
 /// #535 step 1: a one-shot `tiles` run now writes TWO JSONL lines to
 /// `TYLERTOO_PROFILE_JSON` — convert's (unchanged schema, emitted the instant
 /// `convert_to_overviews` finishes) followed by export's own. See
-/// `write_export_profile_json`'s doc and `docs/PROFILING.md`'s "Two JSONL
+/// `write_export_profile_json`'s doc and `context/PROFILING.md`'s "Two JSONL
 /// lines for one `tiles` run" section for why this is two lines rather than
 /// one merged object: convert's line is already on disk by the time export
 /// starts, and merging would mean threading convert's report through the

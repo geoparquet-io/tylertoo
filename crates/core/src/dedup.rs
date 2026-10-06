@@ -7,7 +7,7 @@
 //!
 //! 1. Hash tile content BEFORE compression (raw MVT bytes)
 //! 2. Track seen hashes → (offset, length) in deduplication cache
-//! 3. For consecutive identical tiles, use run_length encoding
+//! 3. For consecutive identical tiles, use `run_length` encoding
 //! 4. Track statistics: original count, unique count, savings %
 
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ impl TileHasher {
 
 /// Cache for tracking seen tiles and their storage locations
 ///
-/// Maps content hash → (offset, compressed_length) for deduplication
+/// Maps content hash → (offset, `compressed_length`) for deduplication
 #[derive(Debug, Default)]
 pub struct DeduplicationCache {
     /// Hash → (offset in tile data buffer, compressed length)

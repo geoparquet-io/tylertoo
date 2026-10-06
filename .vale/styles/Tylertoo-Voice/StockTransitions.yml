@@ -1,0 +1,12 @@
+extends: existence
+message: "The transition '%s' sounds formulaic. Start with the substantive point."
+level: warning
+ignorecase: true
+tokens:
+  - 'in today''s (?:world|landscape)'
+  - 'it is (?:important|worth) to (?:note|remember)'
+  - 'it should be noted that'
+  - 'it is worth mentioning'
+  - 'when it comes to'
+  - 'at its core'
+  - 'looking ahead'

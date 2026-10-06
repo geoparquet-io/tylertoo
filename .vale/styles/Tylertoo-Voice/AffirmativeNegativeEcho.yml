@@ -1,0 +1,30 @@
+extends: script
+message: "Vary the repeated affirmative-negative sentence frame."
+level: error
+scope: paragraph
+script: |
+  text := import("text")
+  matches := []
+  patterns := [
+    ". It does not",
+    ". It is not",
+    ". It has not",
+    ". It cannot",
+    ". It will not",
+    ". This does not",
+    ". This is not",
+    ". This has not",
+    ". This cannot",
+    ". This will not",
+    ". That does not",
+    ". That is not",
+    ". That has not",
+    ". That cannot",
+    ". That will not"
+  ]
+  for pattern in patterns {
+    i := text.index(scope, pattern)
+    if i >= 0 {
+      matches = append(matches, {begin: i + 2, end: i + len(pattern)})
+    }
+  }

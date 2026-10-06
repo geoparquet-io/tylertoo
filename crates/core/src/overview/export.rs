@@ -15,16 +15,16 @@
 //!    this module treats both modes identically: "read level `k`, emit tiles
 //!    at level `k`'s zoom".
 //! 3. **Partition pass**: split the zoom's tiles into contiguous ascending
-//!    PMTiles tile-id (Hilbert) ranges of roughly [`DEFAULT_PARTITION_TARGET`]
+//!    PMTiles tile-id (Hilbert) ranges of roughly `DEFAULT_PARTITION_TARGET`
 //!    members each, then process them in **waves** of
 //!    [`resolve_partition_wave`] partitions. Each wave reads the band **once**
 //!    (row groups pruned to the wave's combined bbox), splits every feature
 //!    into its tiles with a **top-down recursive quadtree cascade** (see
-//!    [`feature_tile_members`]) — each feature clipped once per pyramid level
+//!    `feature_tile_members`) — each feature clipped once per pyramid level
 //!    into an already-reduced child region down to the target zoom, so a
 //!    vertex takes part in `O(depth)` clips rather than `O(tiles_spanned)`
 //!    (issue #226) — and *routes* each resulting member to its owning
-//!    partition (see [`process_wave`]). Sharing one read+decode across a wave
+//!    partition (see `process_wave`). Sharing one read+decode across a wave
 //!    replaces the old per-partition re-read (issue #228): a level now costs
 //!    `ceil(P / PARTITION_WAVE)` band reads, not `P`. The per-tile clips reuse
 //!    the [`clip_geometry_simple`] entry point, MVT-encode via [`crate::mvt`],
@@ -42,7 +42,7 @@
 //!    to a **single-read fan-out** there (issue #235, the pass-2 analogue of
 //!    the #233 scan fix): one reader pass streams every band once, clips each
 //!    feature at every including level's zoom, and buffers the members in a
-//!    RAM/spill-backed [`MemberStore`] that the same wave loop drains — see
+//!    RAM/spill-backed `MemberStore` that the same wave loop drains — see
 //!    the "Pass-2 single-read fan-out" section below. Duplicating bands are
 //!    self-contained, so the per-level wave read stays.
 //!
@@ -65,7 +65,7 @@
 //! partition target — **not** the zoom band's feature count — but a single
 //! dense tile that overshoots the target is one partition whose members are
 //! *unbounded* by it. On `auto` the wave width is therefore sized per level from
-//! the densest planned partition ([`memory_safe_level_wave`], #311), narrowing
+//! the densest planned partition (`memory_safe_level_wave`, #311), narrowing
 //! (down to serial if need be) so a dense finest zoom stays within RAM instead
 //! of OOM-killing the run.
 //! The scan pass keeps only per-tile member counts (`O(#tiles)`), and the
@@ -75,9 +75,9 @@
 //! The partitioning single-read path (#235) buffers every level's clipped
 //! members between its fill and drain phases, but its **RAM** ceiling is
 //! unchanged: the auto RAM-vs-spill policy shared with the converter's pass-2
-//! sinks ([`auto_backing`]) keeps small buffered sets in RAM and spills large
+//! sinks (`auto_backing`) keeps small buffered sets in RAM and spills large
 //! ones to a temp file, the fill's in-RAM buckets are capped at
-//! [`MEMBER_STORE_RAM_BUDGET`], and the drain holds one wave of partitions at
+//! `MEMBER_STORE_RAM_BUDGET`, and the drain holds one wave of partitions at
 //! a time — the same `O(one wave)` ceiling as the per-level read path.
 //!
 //! ## Tile-boundary duplication (expected MVT semantics)
@@ -187,8 +187,10 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
     f64::from(opts.tile_buffer) / NOMINAL_TILE_PIXELS
 }
 
-/// Default per-tile MVT size cap, in bytes (500 KiB — matches what `500K`
-/// parses to and tippecanoe's on-by-default 500K bar; issue #280). A tile whose
+/// Default per-tile MVT size cap, in bytes.
+///
+/// 500 KiB matches what `500K` parses to and tippecanoe's on-by-default 500K
+/// bar (issue #280). A tile whose
 /// encoded MVT exceeds this trips the single-pass drop valve (see
 /// [`ExportOptions::tile_size_limit`]). Set `tile_size_limit` to `None` (CLI:
 /// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
@@ -217,7 +219,7 @@ pub struct ExportOptions {
     pub extent: u32,
     /// Per-tile MVT size limit in **bytes**. When `Some(limit)` with
     /// `limit > 0`, a tile whose encoded size exceeds the limit triggers the
-    /// single, non-iterative safety valve: [`select_kept_members`] chooses which
+    /// single, non-iterative safety valve: `select_kept_members` chooses which
     /// features survive (largest-first for sized geometries, uniform spatial
     /// stride for point-dominated tiles — see that function) and the tile is
     /// re-encoded once. When `None` (or `Some(0)`), no size limit is enforced
@@ -226,10 +228,10 @@ pub struct ExportOptions {
     /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (500 KiB — tippecanoe
     /// parity, issue #280).
     pub tile_size_limit: Option<usize>,
-    /// Skip the i_overlay boundary-bridge fallback for features whose rings are
+    /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
     /// boundary-following clip is a self-touching polygon that is area- and
-    /// fill-equivalent to the i_overlay split under nonzero winding, so the
+    /// fill-equivalent to the `i_overlay` split under nonzero winding, so the
     /// fallback (which fires on ~94% of fine-zoom polygon clips) is wasted work.
     /// Non-simple inputs always keep the fallback, preserving the #94 U-shape
     /// fix. Defaults to `true` (fast path on); the S-H clip of a simple ring is
@@ -342,7 +344,7 @@ pub struct ExportOptions {
     ///
     /// Default `None`: every feature keeps the tile-local member index it has
     /// always had (unique only within a single tile/zoom pair -- see
-    /// [`build_mvt`]). Whether that no-flag default should instead omit the
+    /// `build_mvt`). Whether that no-flag default should instead omit the
     /// id entirely is an open question (#443) this option does not decide.
     pub feature_id: Option<String>,
     /// Directory for the export's member spill file (#427) -- the on-disk
@@ -391,6 +393,12 @@ impl ExportOptions {
     /// spec only recommends a power of two, but renderers and this crate's
     /// own decoder (see `decode.rs`'s module docs) assume one when they
     /// reason about precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportError::InvalidExtent`] if `extent` is 0, or
+    /// [`ExportError::TileBufferTooWide`] if `tile_buffer` is above
+    /// [`MAX_TILE_BUFFER_PX`].
     pub fn validate(&self) -> Result<(), ExportError> {
         if self.extent == 0 {
             return Err(ExportError::InvalidExtent {
@@ -624,7 +632,7 @@ pub enum ExportError {
     TileBufferTooWideForShard {
         /// The requested buffer, in tile pixels.
         buffer: u32,
-        /// [`crate::shard::MAX_SHARD_TILE_BUFFER_PX`].
+        /// `crate::shard::MAX_SHARD_TILE_BUFFER_PX`.
         max: u32,
     },
 
@@ -838,6 +846,12 @@ struct EncodedTile {
 /// is reported, correctly, as above the ceiling.
 ///
 /// [`LevelGsdNotFinitePositive`]: ExportError::LevelGsdNotFinitePositive
+///
+/// # Errors
+///
+/// Returns [`ExportError::LevelGsdNotFinitePositive`] for a GSD that is zero,
+/// negative, or NaN, and [`ExportError::LevelZoomAboveCeiling`] for a level
+/// whose zoom is above [`MAX_ZOOM`].
 pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, ExportError> {
     let level = &meta.levels[level_idx];
     let implied: i64 = match level.zoom {
@@ -888,9 +902,10 @@ pub fn zoom_for_level(meta: &OverviewsMeta, level_idx: usize) -> Result<u8, Expo
 /// memory.
 const DEFAULT_PARTITION_TARGET: usize = 32_768;
 
-/// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing
-/// from the machine's available parallelism (see [`resolve_partition_wave`]).
-/// This is the library default so an export uses the cores it is given without
+/// Sentinel for [`ExportOptions::partition_wave`] requesting automatic sizing.
+///
+/// The size comes from the machine's available parallelism (see
+/// [`resolve_partition_wave`]). This is the library default so an export uses the cores it is given without
 /// the caller having to know the box (#293).
 pub const PARTITION_WAVE_AUTO: usize = 0;
 
@@ -899,8 +914,9 @@ pub const PARTITION_WAVE_AUTO: usize = 0;
 /// baseline, so a small box behaves exactly as before.
 pub const PARTITION_WAVE_MIN: usize = 6;
 
-/// Upper clamp for the auto-sized partition wave **when available RAM cannot
-/// be probed** — i.e. when no term of the probe yields a figure: non-Linux
+/// Upper clamp for the auto-sized partition wave **when available RAM cannot be probed**.
+///
+/// That is, when no term of the probe yields a figure: non-Linux
 /// without the env override, or a Linux box where `/proc/meminfo` is
 /// unreadable *and* no cgroup memory limit is readable either. A readable
 /// cgroup limit is a signal on its own (#481/#485), so an unreadable
@@ -922,7 +938,7 @@ pub const PARTITION_WAVE_FALLBACK_MAX: usize = 16;
 /// wave transient sits *on top of* export baseline state the estimate does
 /// not model (scan accumulators, decode buffers, PMTiles writer directory),
 /// so the budget leaves headroom for that baseline. Bias is toward not
-/// OOMing — a too-narrow wave only costs wall clock.
+/// `OOMing` — a too-narrow wave only costs wall clock.
 const EXPORT_WAVE_RAM_FRACTION: f64 = 0.5;
 
 /// Flat fallback estimate of one wave slot's transient memory cost, used **only
@@ -987,7 +1003,7 @@ fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize 
 ///
 /// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
 /// this uses the level's *actual* densest planned partition:
-/// `max(partition.members) × mean_member_bytes × [`MEMBER_MEMORY_INFLATION`]`
+/// `max(partition.members) × mean_member_bytes × [``MEMBER_MEMORY_INFLATION``]`
 /// directly estimates the largest partition's resident geometry volume. This
 /// captures the real driver — a single dense tile that overshoots
 /// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
@@ -1032,11 +1048,11 @@ fn memory_safe_level_wave(
 /// [`PARTITION_WAVE_AUTO`] (0) runs the memory-budget preflight (#303): the
 /// width is the machine's [`std::thread::available_parallelism`], capped by
 /// how many per-partition transients (estimated
-/// [`PARTITION_SLOT_TRANSIENT_BYTES`] each) fit in
-/// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM (probe shared with the
+/// `PARTITION_SLOT_TRANSIENT_BYTES` each) fit in
+/// `EXPORT_WAVE_RAM_FRACTION` of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
 /// then the container-aware `min(cgroup headroom, /proc/meminfo
-/// MemAvailable)` — see [`available_memory_bytes`]), floored at
+/// MemAvailable)` — see `available_memory_bytes`), floored at
 /// [`PARTITION_WAVE_MIN`].
 /// When RAM cannot be probed the cap falls back to
 /// [`PARTITION_WAVE_FALLBACK_MAX`], reproducing #293's fixed clamp. Any
@@ -1113,6 +1129,14 @@ const WAVE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 ///
 /// See the module documentation for the full pipeline and the design
 /// constraints it observes.
+///
+/// # Errors
+///
+/// Returns an [`ExportError`] if the options fail [`ExportOptions::validate`]
+/// or conflict with the file, if the input is not a readable overview file or
+/// has an unsupported CRS, if a level's zoom cannot be resolved, if a feature-
+/// id column is unusable, if the spill directory is missing, or if reading,
+/// encoding, or writing fails.
 pub fn export_pmtiles(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -1213,6 +1237,11 @@ fn restrict_scans_to_range(scans: &mut [LevelScan], level_zooms: &[u8], options:
 /// its own `[pivot, max_zoom]` half. Bounds are deliberately left unset: an
 /// archive with no tiles has no extent, and claiming its range's extent would
 /// widen the merged bbox on the word of a job that contributed nothing.
+///
+/// # Errors
+///
+/// Returns an [`ExportError`] if the archive cannot be created or written at
+/// `output`.
 pub fn write_empty_archive(
     output: &Path,
     layer_name: &str,
@@ -4351,7 +4380,7 @@ fn encode_members(
 
 /// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
 /// side. Clipping such a feature to the buffered tile is a geometric no-op, so
-/// the clip can be skipped (and BooleanOps ring normalization avoided).
+/// the clip can be skipped (and `BooleanOps` ring normalization avoided).
 #[inline]
 fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool {
     bbox.lng_min >= tb.lng_min - buffer
@@ -5611,7 +5640,7 @@ impl JsonNode {
     }
 
     /// Write row `i` as JSON. `serde_json` does every string escape and
-    /// number rendering (a non-finite float becomes `null`, as serde_json
+    /// number rendering (a non-finite float becomes `null`, as `serde_json`
     /// renders it everywhere); only the punctuation is written by hand.
     fn write(&self, out: &mut Vec<u8>, i: usize) {
         if self.is_null(i) {
@@ -5845,7 +5874,7 @@ mod tests {
         write_mode_fixture(path, level_geoms, Mode::Duplicating, 10_000)
     }
 
-    /// Decode all (geom_type, coords, keys) of a raw MVT tile's single layer.
+    /// Decode all (`geom_type`, coords, keys) of a raw MVT tile's single layer.
     fn decode_tile(bytes: &[u8]) -> Tile {
         Tile::decode(bytes).unwrap()
     }
@@ -5913,11 +5942,11 @@ mod tests {
 
     /// Byte-level anchor for the H3(b) export restructure: the whole archive
     /// (header + directory + metadata + tile data) must hash to the value
-    /// produced by the pre-refactor per-zoom BTreeMap implementation. The
+    /// produced by the pre-refactor per-zoom `BTreeMap` implementation. The
     /// reference hash was captured from that implementation (commit b8a1635)
     /// on this exact fixture before the partitioned-streaming rewrite.
     ///
-    /// REPIN (issue #112): the MVT winding fix (orient_polygon_for_mvt now
+    /// REPIN (issue #112): the MVT winding fix (`orient_polygon_for_mvt` now
     /// emits spec-compliant positive-area exterior rings) intentionally
     /// changed polygon command bytes; the hash was re-captured from the
     /// fixed encoder. The anchor still guards the export restructure — the

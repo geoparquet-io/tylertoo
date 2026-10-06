@@ -1,6 +1,7 @@
 #!/bin/sh
 # Pre-commit hook for tylertoo
-# Runs cargo fmt, clippy, version consistency check, and syncs READMEs before allowing commit
+# Runs cargo fmt, clippy, prose lint on staged docs, version consistency check,
+# and syncs READMEs before allowing commit
 
 set -e
 
@@ -21,6 +22,19 @@ if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -20; t
     exit 1
 fi
 echo "Clippy check passed!"
+
+# Lint the prose of staged, in-scope docs with Vale and proselint. The script
+# holds the file list (shared with the CI `Docs Prose` job) and returns at
+# once when no in-scope Markdown is staged.
+echo "Running prose lint on staged docs..."
+if ! scripts/lint-prose.sh --staged; then
+    echo ""
+    echo "ERROR: Prose lint failed. Fix the findings above; see"
+    echo "       DEVELOPMENT.md (CI gates → Docs prose) for the rules."
+    echo ""
+    exit 1
+fi
+echo "Prose lint passed!"
 
 # Check version consistency across workspace
 echo "Checking version consistency..."

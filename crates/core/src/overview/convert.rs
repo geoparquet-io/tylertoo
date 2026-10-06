@@ -3,17 +3,17 @@
 //! [`convert_to_overviews`] wires the existing overview modules into a single
 //! GeoParquet → GeoParquet overview build. By default
 //! ([`ConvertOptions::streaming`]) it dispatches to the two-pass
-//! bounded-memory pipeline in [`super::stream`]; the in-memory reference
+//! bounded-memory pipeline in `super::stream`; the in-memory reference
 //! implementation below (`streaming: false`) proceeds as:
 //!
 //! 1. **read** the whole input GeoParquet preserving the full property schema
 //!    (the entire table is concatenated into one batch). The CRS is detected
 //!    from the `geo` metadata and mapped to [`Crs`]; non-4326/3857 inputs and
 //!    inputs that already carry a `level` column are rejected (spec Q3, §4.1).
-//! 2. **assign** every feature a coarsest level via [`assign::assign_levels`]
+//! 2. **assign** every feature a coarsest level via `assign::assign_levels`
 //!    over per-feature bbox + [`FeatureKind`] + an optional sort key.
 //! 3. **generalize + write**, coarse→fine, feeding [`OverviewWriter`]:
-//!    - `duplicating` non-canonical levels: [`simplify::simplify_for_level`]
+//!    - `duplicating` non-canonical levels: `simplify::simplify_for_level`
 //!      per feature, dropping [`Simplified::Dropped`];
 //!    - `duplicating` canonical (finest) level: original geometry **untouched**
 //!      (spec §2.4, value-identity — no simplify round-trip);
@@ -25,7 +25,7 @@
 //!    benchmark tasks.
 //!
 //! The in-memory path is the correctness-first reference: memory is
-//! `O(dataset)`. The default streaming path ([`super::stream`]) produces
+//! `O(dataset)`. The default streaming path (`super::stream`) produces
 //! equivalent output in `O(read batch + winner tables)` memory; equivalence
 //! is asserted by the `streaming_matches_*` tests below.
 
@@ -89,7 +89,7 @@ use super::writer::{
 /// How the caller specifies the overview levels.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LevelPlan {
-    /// A Web Mercator zoom range, mapped through [`gsd_for_zoom`]. `min_zoom`
+    /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
     ZoomRange {
         /// Coarsest zoom (level 0).
@@ -389,7 +389,7 @@ pub struct ConvertOptions {
     /// A null — or a NaN/infinite value, which is how a float column usually
     /// spells nodata — is a *missing* key: the feature still appears, it just
     /// loses any cell it contests to a feature that has a key
-    /// ([`extract_sort_keys`]).
+    /// (`extract_sort_keys`).
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
@@ -476,7 +476,7 @@ pub struct ConvertOptions {
     /// in-order merge re-chunks their output into exactly the batch sequence
     /// one reader would have produced. Explicit values are honoured up to
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
-    /// for remote inputs (see [`super::pipeline`]) and when `streaming` is
+    /// for remote inputs (see `super::pipeline`) and when `streaming` is
     /// `false`.
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
@@ -696,8 +696,9 @@ pub struct ConvertOptions {
 /// Default rows per read batch for the streaming pipeline (H3).
 pub const DEFAULT_READ_BATCH_SIZE: usize = 8192;
 
-/// Sentinel value for [`ConvertOptions::in_flight_batches`] requesting
-/// automatic sizing from the machine's available parallelism (see
+/// Sentinel value for [`ConvertOptions::in_flight_batches`] requesting automatic sizing.
+///
+/// The size comes from the machine's available parallelism (see
 /// [`resolve_in_flight_batches`]). This is the library default so a convert
 /// uses the cores it is given without the caller having to know the box.
 pub const IN_FLIGHT_BATCHES_AUTO: usize = 0;
@@ -706,7 +707,9 @@ pub const IN_FLIGHT_BATCHES_AUTO: usize = 0;
 /// on a small box, and matches the historical hard default (#213).
 pub const IN_FLIGHT_BATCHES_MIN: usize = 4;
 
-/// Upper clamp for auto-sized in-flight batches. The single-threaded parquet
+/// Upper clamp for auto-sized in-flight batches.
+///
+/// The single-threaded parquet
 /// writer (#264 follow-up) caps the achievable speedup, so pushing in-flight
 /// past this only grows the resident batch set (`in_flight × read_batch_size`
 /// rows) without a matching throughput gain. Power users can still pass a
@@ -757,7 +760,7 @@ pub const READ_WORKERS_AUTO: usize = 0;
 /// A reader worker is a decompress+decode thread, not an I/O-wait thread: it
 /// competes with the rayon compute pool for cores, and the merge that puts its
 /// output back in order is itself single-threaded. Past a handful of
-/// concurrent streams an NVMe queue is saturated anyway, so more workers buy
+/// concurrent streams an `NVMe` queue is saturated anyway, so more workers buy
 /// resident batches rather than throughput.
 pub const READ_WORKERS_MAX: usize = 4;
 
@@ -785,7 +788,7 @@ pub fn read_workers_ceiling() -> usize {
 /// the engine still bounds against the memory budget. Above the ceiling the
 /// value is clamped and a warning is logged.
 ///
-/// Output is byte-identical for every value — see [`super::pipeline`]'s
+/// Output is byte-identical for every value — see `super::pipeline`'s
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
 /// `crates/cli/tests/thread_count_determinism.rs`.
 pub fn resolve_read_workers(requested: usize) -> usize {
@@ -1233,7 +1236,7 @@ pub enum ConvertError {
         /// The rejected CRS identifier.
         crs: String,
     },
-    /// All but a sliver (≥99%, [`ALL_LOST_PERCENT`]) of the input cannot be
+    /// All but a sliver (≥99%, `ALL_LOST_PERCENT`) of the input cannot be
     /// tiled (#429): the coordinates fall outside the declared CRS's range,
     /// or they are valid lon/lat outside the Web Mercator tiling domain.
     /// Either way the conversion used to "succeed" into an empty tile
@@ -1457,7 +1460,7 @@ pub enum ConvertError {
         ceiling: usize,
     },
     /// The pass-1 feature table (`Vec<AssignFeature>`, held resident from
-    /// pass 1's scan through the level assignment — see [`super::stream`]'s
+    /// pass 1's scan through the level assignment — see `super::stream`'s
     /// module doc) alone exceeds the process's hard cgroup memory limit
     /// (#543), so the run would be OOM-killed. Caught from footer row counts
     /// alone, before pass 1 scans a single row, so this fails in seconds
@@ -1475,10 +1478,10 @@ pub enum ConvertError {
         /// with no per-feature filter active, every one of them becomes a
         /// feature-table entry unless its geometry is null or unusable).
         rows: u64,
-        /// `rows * `[`PASS1_BYTES_PER_ROW`].
+        /// `rows * ``PASS1_BYTES_PER_ROW`.
         estimated_bytes: u64,
         /// The hard cgroup memory limit's headroom the estimate was checked
-        /// against (NOT [`super::pipeline`]'s fractional `Auto` budget — the
+        /// against (NOT `super::pipeline`'s fractional `Auto` budget — the
         /// feature table must exist in full regardless of `MemoryProfile`).
         limit_bytes: u64,
     },
@@ -1949,12 +1952,19 @@ pub(super) fn representation_for_zoom(
         .unwrap_or_default()
 }
 
-/// Parse a representation spec string (#317 / #279): comma-separated
-/// `LO-HI:KIND` (or `Z:KIND`) entries, e.g. `0-7:point,8-14:geom` or
+/// Parse a representation spec string (#317 / #279).
+///
+/// The spec is comma-separated `LO-HI:KIND` (or `Z:KIND`) entries, e.g. `0-7:point,8-14:geom` or
 /// `0-5:square`. KIND is one of `geom` (alias `geometry`), `point`,
 /// `square`. Shared by the CLI and the Python bindings so the grammar has a
 /// single definition; structural validity against the level plan is checked
 /// later by convert-entry validation.
+///
+/// # Errors
+///
+/// Returns a description of the problem if the spec has no entries, or if an
+/// entry is not `LO-HI:KIND` or `Z:KIND`, names an unknown KIND, or has a zoom
+/// that does not parse as an integer from 0 to 255.
 pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, String> {
     let mut bands = Vec::new();
     for part in spec.split(',') {
@@ -2040,6 +2050,12 @@ pub(super) fn level_representations(
 /// [`ConvertOptions::plan`] to replay, a data-shard
 /// [`ConvertOptions::shard`] range (whose plan would cover only that shard's
 /// rows), and `streaming: false`.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if the input cannot be resolved, if the options
+/// break any of the requirements above or fail validation, or if reading the
+/// input or writing the plan fails.
 pub fn write_convert_plan(
     input_path: impl AsRef<Path>,
     options: &ConvertOptions,
@@ -2048,9 +2064,15 @@ pub fn write_convert_plan(
     write_convert_plan_sources(&source, options)
 }
 
-/// [`write_convert_plan`] over an already-resolved [`ConvertSource`] — the
-/// entry point for a `--files-from` manifest, an explicit input list, or a
+/// [`write_convert_plan`] over an already-resolved [`ConvertSource`].
+///
+/// This is the entry point for a `--files-from` manifest, an explicit input list, or a
 /// custom object store, exactly as [`convert_to_overviews_sources`] is.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] in the cases [`write_convert_plan`] does, except
+/// input resolution.
 pub fn write_convert_plan_sources(
     source: &ConvertSource,
     options: &ConvertOptions,
@@ -2098,6 +2120,20 @@ pub fn write_convert_plan_sources(
     super::stream::write_plan_streaming(source, options)
 }
 
+/// Convert a GeoParquet input into a multi-resolution overview file.
+///
+/// `input_path` is resolved by [`ConvertSource::resolve_path`]: a local file,
+/// a directory or glob of partitions, or a remote URL or prefix. The overview
+/// file is written to `output_path`, and the returned [`ConvertReport`]
+/// describes every level written.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if the input cannot be resolved or read, if
+/// the options are invalid or conflict with the input (for example a missing
+/// or mistyped column, an unsupported CRS, or an input almost entirely
+/// outside the tiling range), if the pass-1 memory preflight fails, or if
+/// writing the output fails.
 pub fn convert_to_overviews(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -2119,8 +2155,9 @@ pub fn convert_to_overviews(
     )
 }
 
-/// [`convert_to_overviews`] over an already-resolved [`ConvertSource`] —
-/// the entry point for callers that build the (possibly multi-partition)
+/// [`convert_to_overviews`] over an already-resolved [`ConvertSource`].
+///
+/// This is the entry point for callers that build the (possibly multi-partition)
 /// source themselves: a `--files-from` manifest
 /// ([`ConvertSource::from_manifest`]), an explicit input list
 /// ([`ConvertSource::from_input_list`]), or custom object stores.
@@ -2129,6 +2166,12 @@ pub fn convert_to_overviews(
 /// #386) has been applied to it: the column projection lives on the
 /// `ConvertSource`, so a second conversion through the same source is an
 /// error — with any selection, the default included.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] in the cases [`convert_to_overviews`] does,
+/// except input resolution, and if a property selection was already applied to
+/// `source`.
 pub fn convert_to_overviews_sources(
     source: &ConvertSource,
     output_path: &Path,
@@ -2145,6 +2188,11 @@ pub fn convert_to_overviews_sources(
 /// [`convert_to_overviews`] over an already-resolved [`InputSource`] — the
 /// entry point for callers that construct the source themselves (custom
 /// object stores, tests over in-memory stores).
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] in the cases [`convert_to_overviews`] does,
+/// except input resolution.
 pub fn convert_to_overviews_source(
     source: &InputSource,
     output_path: &Path,
@@ -3819,8 +3867,9 @@ fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
     )
 }
 
-/// One #429 out-of-range feature's row and offending coordinate (#553): the
-/// exemplar a summary points investigators at instead of a bare count.
+/// One #429 out-of-range feature's row and offending coordinate (#553).
+///
+/// This is the exemplar a summary points investigators at instead of a bare count.
 /// Root-causing a real dateline case (a5 grid cells 0.6° past ±180°) used to
 /// require a separate DuckDB query against the input; this is what lets the
 /// message name the answer up front.
@@ -3873,9 +3922,10 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
         .unwrap_or((lon, bbox[0]))
 }
 
-/// The "e.g. lon 180.548 (row 1041), lon 180.101 (row 2210)" suffix naming
-/// the first few out-of-range exemplars (#553), or `""` when there are none.
-/// Shared by the aggregate `log::warn!` ([`out_of_range_warning`]) and the
+/// The suffix naming the first few out-of-range exemplars (#553).
+///
+/// It reads "e.g. lon 180.548 (row 1041), lon 180.101 (row 2210)", or `""`
+/// when there are none. Shared by the aggregate `log::warn!` (`out_of_range_warning`) and the
 /// CLI's `tiles` summary line, so both name where the loss came from instead
 /// of only how much was lost.
 pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
@@ -4222,7 +4272,7 @@ pub(super) fn spill_space_check(
 }
 
 /// Free bytes available to the current user on the volume holding `dir`
-/// (statvfs / GetDiskFreeSpaceEx via `fs4`), or `None` if the probe fails.
+/// (statvfs / `GetDiskFreeSpaceEx` via `fs4`), or `None` if the probe fails.
 /// Compiled to a stub without the `remote` feature — nothing spills there,
 /// and [`spill_space_check`] never probes for a local input.
 fn probe_available_space(dir: &Path) -> Option<u64> {
@@ -4292,7 +4342,7 @@ pub(super) fn warn_spill_space(
 /// that on top (#570). The preflight does not fold this in: the scratch
 /// size depends on the line count and vertex counts, which the footers do
 /// not carry, and a row-count-derived upper bound would warn on every small
-/// line input. `docs/diving-deeper/sharded-builds.md` gives the sizing
+/// line input. `docs/guides/scaling.md` gives the sizing
 /// figure to add by hand.
 pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
 
@@ -4327,7 +4377,7 @@ fn env_flag_enabled(value: &str) -> bool {
 }
 
 /// Sizing-guidance doc named in both the warning and the hard error.
-const MEMORY_SIZING_DOC: &str = "docs/diving-deeper/sharded-builds.md";
+const MEMORY_SIZING_DOC: &str = "docs/guides/scaling.md";
 
 /// Why a sharded build is not the fix — shared by the warning and the error.
 const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its coarse job \
@@ -6695,7 +6745,7 @@ mod tests {
             "bigger box",
             "does not avoid this",
             "--plan",
-            "docs/diving-deeper/sharded-builds.md",
+            "docs/guides/scaling.md",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
         }
@@ -6734,7 +6784,7 @@ mod tests {
             "≳235.4 GiB: use a bigger box",
             "does not avoid this",
             "--plan",
-            "docs/diving-deeper/sharded-builds.md",
+            "docs/guides/scaling.md",
             "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
         ] {
             assert!(msg.contains(want), "missing {want:?}: {msg}");
@@ -6817,8 +6867,8 @@ mod tests {
     }
 
     /// #371: the ceiling applies to `--min-zoom` too, as the docs claim. A z33
-    /// minimum with a default z6 maximum used to be reported as "min_zoom must
-    /// be <= max_zoom", which says nothing about the real problem.
+    /// minimum with a default z6 maximum used to be reported as "`min_zoom` must
+    /// be <= `max_zoom`", which says nothing about the real problem.
     #[test]
     fn validate_options_rejects_min_zoom_above_the_ceiling() {
         let opts = ConvertOptions {
@@ -8263,7 +8313,7 @@ mod tests {
     }
 
     /// #541 review (S2-2): a ceiling coarser than every level the data
-    /// reaches is the coarse job's legal "nothing here", not a NoData — and
+    /// reaches is the coarse job's legal "nothing here", not a `NoData` — and
     /// the saved plan is already on disk when it is returned.
     #[test]
     fn a_ceiling_below_every_planned_level_is_a_distinct_outcome() {
@@ -8497,7 +8547,7 @@ mod tests {
         assert!(!plan.exists(), "a refused plan-only run wrote a plan");
     }
 
-    /// An input with nothing to tile fails the plan-only run with NoData, as
+    /// An input with nothing to tile fails the plan-only run with `NoData`, as
     /// it fails a full run — and, the plan being the only output, does not
     /// leave a zero-level plan on disk for a fleet to be launched against.
     #[test]
@@ -12445,7 +12495,7 @@ mod tests {
             std::fs::read(tmp.path()).unwrap()
         }
 
-        /// Convert a remote ConvertSource and export to PMTiles; returns
+        /// Convert a remote `ConvertSource` and export to PMTiles; returns
         /// the archive bytes (PMTiles export is byte-deterministic).
         fn convert_sources_and_export(
             source: &crate::input_set::ConvertSource,
@@ -12633,7 +12683,7 @@ mod tests {
 
         /// A throwaway localhost HTTP/1.1 server that serves one byte blob with
         /// Range support — the hermetic, no-network stand-in for object storage.
-        /// Answers `HEAD` (size) and ranged/full `GET` exactly as object_store's
+        /// Answers `HEAD` (size) and ranged/full `GET` exactly as `object_store`'s
         /// HTTP store expects. Returns the base URL (`http://127.0.0.1:PORT`);
         /// the accept loop runs on a detached thread until the test process
         /// exits. Binding happens before return, so the listen backlog absorbs

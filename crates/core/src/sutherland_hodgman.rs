@@ -1,7 +1,7 @@
 //! Sutherland-Hodgman polygon clipping for axis-aligned rectangles.
 //!
 //! This module implements the Sutherland-Hodgman algorithm for clipping polygons
-//! against axis-aligned rectangular bounds. Unlike i_overlay's Vatti algorithm which
+//! against axis-aligned rectangular bounds. Unlike `i_overlay`'s Vatti algorithm which
 //! handles general polygon boolean operations, Sutherland-Hodgman is specialized
 //! for rectangle clipping and runs in O(n) time per edge (O(4n) = O(n) total).
 //!
@@ -181,7 +181,7 @@ fn clip_ring(ring: &[Coord<f64>], bounds: &TileBounds) -> Vec<Coord<f64>> {
 /// Returns `None` if the polygon doesn't intersect the bounds.
 /// Returns `Geometry::Polygon` for a single polygon result.
 ///
-/// Note: Unlike Vatti/i_overlay, Sutherland-Hodgman does NOT split a polygon into
+/// Note: Unlike `Vatti/i_overlay`, Sutherland-Hodgman does NOT split a polygon into
 /// multiple disconnected parts. A U-shape clipped across its opening will produce
 /// a single (possibly self-intersecting) polygon, not two separate polygons.
 /// For tile rendering purposes, this is acceptable and matches tippecanoe's behavior.
@@ -257,7 +257,7 @@ use crate::world_coord::{WorldBounds, WorldCoord};
 /// 2. Buffer regions extend beyond tile boundaries (negative offsets)
 /// 3. The Sutherland-Hodgman intersection formula requires signed arithmetic
 ///
-/// After clipping, results are converted back to WorldCoord (u32).
+/// After clipping, results are converted back to `WorldCoord` (u32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipCoord {
     pub x: i64,
@@ -270,7 +270,7 @@ impl ClipCoord {
         Self { x, y }
     }
 
-    /// Convert from WorldCoord (u32) to ClipCoord (i64).
+    /// Convert from `WorldCoord` (u32) to `ClipCoord` (i64).
     #[inline]
     pub fn from_world(coord: WorldCoord) -> Self {
         Self {
@@ -279,7 +279,7 @@ impl ClipCoord {
         }
     }
 
-    /// Convert to WorldCoord (u32), clamping to valid range.
+    /// Convert to `WorldCoord` (u32), clamping to valid range.
     #[inline]
     pub fn to_world(&self) -> WorldCoord {
         WorldCoord::new(
@@ -312,10 +312,10 @@ impl ClipBounds {
 /// Check if a point is inside the given edge in integer space.
 ///
 /// In world coordinate space:
-/// - Left edge: x >= x_min
-/// - Right edge: x <= x_max
-/// - Top edge: y >= y_min (y increases southward, so "top" = min y)
-/// - Bottom edge: y <= y_max
+/// - Left edge: x >= `x_min`
+/// - Right edge: x <= `x_max`
+/// - Top edge: y >= `y_min` (y increases southward, so "top" = min y)
+/// - Bottom edge: y <= `y_max`
 #[inline]
 fn is_inside_world(coord: &ClipCoord, edge: Edge, bounds: &ClipBounds) -> bool {
     match edge {
@@ -435,9 +435,9 @@ fn clip_ring_against_edge_world(
     output
 }
 
-/// Clip a ring of WorldCoord points against all four edges of a WorldBounds rectangle.
+/// Clip a ring of `WorldCoord` points against all four edges of a `WorldBounds` rectangle.
 ///
-/// Returns the clipped ring as ClipCoord points, or empty if fully outside.
+/// Returns the clipped ring as `ClipCoord` points, or empty if fully outside.
 fn clip_ring_world(coords: &[ClipCoord], bounds: &WorldBounds) -> Vec<ClipCoord> {
     let clip_bounds = ClipBounds::from_world_bounds(bounds);
 
@@ -466,19 +466,19 @@ fn clip_ring_world(coords: &[ClipCoord], bounds: &WorldBounds) -> Vec<ClipCoord>
     }
 }
 
-/// Clip a polygon using Sutherland-Hodgman in WorldCoord integer space.
+/// Clip a polygon using Sutherland-Hodgman in `WorldCoord` integer space.
 ///
 /// This is the integer-coordinate equivalent of `clip_polygon_sh`.
 /// It operates directly in world coordinate space, eliminating
 /// floating-point precision issues.
 ///
 /// # Arguments
-/// * `exterior` - Exterior ring as WorldCoord points
-/// * `interiors` - Interior rings (holes) as WorldCoord points
+/// * `exterior` - Exterior ring as `WorldCoord` points
+/// * `interiors` - Interior rings (holes) as `WorldCoord` points
 /// * `bounds` - Clipping bounds in world coordinate space
 ///
 /// # Returns
-/// * `Some((clipped_exterior, clipped_interiors))` - Clipped rings as WorldCoord vectors
+/// * `Some((clipped_exterior, clipped_interiors))` - Clipped rings as `WorldCoord` vectors
 /// * `None` - If the polygon doesn't intersect the bounds
 pub fn clip_polygon_sh_world(
     exterior: &[WorldCoord],
@@ -1151,7 +1151,7 @@ mod tests {
         use super::*;
         use crate::world_coord::{WorldBounds, WorldCoord};
 
-        /// Helper: create a WorldBounds representing a box from (1000, 1000) to (5000, 5000)
+        /// Helper: create a `WorldBounds` representing a box from (1000, 1000) to (5000, 5000)
         fn test_world_bounds() -> WorldBounds {
             WorldBounds::new(1000, 1000, 5000, 5000)
         }
