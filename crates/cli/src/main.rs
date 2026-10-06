@@ -479,7 +479,16 @@ The output is the tiled representation, not the original source:
   - lossy properties: attributes dropped during tiling cannot be
     recovered
 There is no round-trip guarantee: A.parquet -> B.pmtiles -> C.parquet
-does not reproduce A. See docs/decode.md for details.")]
+does not reproduce A.
+
+Output columns, in order:
+  - zoom (UInt8), layer (Utf8), mvt_id (UInt64, null when the encoder
+    set no id): where each row came from
+  - every property seen in any tile, alphabetical and nullable.
+    Integers become Int64 and floats Float64. A key that mixes the two
+    becomes Float64; any other mix becomes Utf8.
+  - geometry: WKB in EPSG:4326, with a bbox covering
+A source property named zoom, layer, mvt_id, or geometry is an error.")]
 struct DecodeArgs {
     /// Input PMTiles archive (vector tiles).
     #[arg(value_name = "INPUT")]

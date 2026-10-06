@@ -69,7 +69,7 @@ polygons and tippecanoe's reaches all 17,465 by z8 (at z4 the counts are 254
 and 6,102). If your layer is a
 coverage rather than a sample — admin boundaries, parcels, a choropleth — that
 is the behaviour to change (`--verbatim`, or raise `--gsd-base` and lower the
-thinning factors; see [Tuning what appears at each zoom](tuning-zoom.md)), and
+thinning factors; see [tuning reference](../OVERVIEW_TUNING.md)), and
 it is the configuration any honest speed comparison has to use.
 
 **The GeoParquet read is not where most of the speed comes from.** On that
@@ -125,7 +125,7 @@ stored, reusable level.
 | tiny-polygon reduction | `--collapse-square` | Area accumulator per 32×GSD patch of the level (tile-less), plus a per-feature dither for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
-| `--use-attribute-for-id` | `--feature-id` | Integer or `DECIMAL(p,0)` columns only (string and float ids are rejected, not parsed); null or negative values are errors, not warnings. Without it, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids---feature-id) |
+| `--use-attribute-for-id` | `--feature-id` | Integer or `DECIMAL(p,0)` columns only (string and float ids are rejected, not parsed); null or negative values are errors, not warnings. Without it, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
 
 ### What only tylertoo does
 

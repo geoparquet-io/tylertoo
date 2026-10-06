@@ -537,15 +537,23 @@ jobs:
           uv export --no-emit-project --format requirements-txt -o /tmp/requirements.txt
           uv run pip-audit -r /tmp/requirements.txt --disable-pip
 
-  # Generated reference docs stay in sync with source. The CLI reference is
-  # rendered from the clap help strings (via the hidden gen-docs feature) and
-  # the Python reference from the pyo3 docstrings on the compiled module. Both
-  # are committed under docs/reference/; this job regenerates them and
-  # fails if the committed copies drift, so the source doc-comments remain the
-  # single source of truth.
-  reference-docs:
-    name: Reference Docs
+  # Docs: the reference pages, the rustdoc, and every example the site shows.
+  #
+  # - The CLI and Python reference pages are generated from the clap help
+  #   strings (hidden gen-docs feature) and the pyo3 docstrings, committed
+  #   under docs/reference/, and must match a fresh regeneration.
+  # - rustdoc builds with -D warnings, so docs.rs never shows a broken link.
+  # - crates/python/tests/docs runs both tutorials (examples/*) and the
+  #   README quickstart against the release CLI, checks every command the
+  #   guides show against `--help`, and builds the site with
+  #   `zensical build --strict`. See tests/docs/conftest.py for the policy.
+  docs:
+    name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The docs dependency group (zensical, gpio) needs Python >= 3.11.
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -568,13 +576,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-reference-docs-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
+
+      # The tutorials run on the Madagascar fixture. A plain checkout holds
+      # only its LFS pointer, so fetch the real file from the release.
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Regenerate CLI reference
         run: |
@@ -584,7 +608,7 @@ jobs:
       - name: Build extension and regenerate Python reference
         working-directory: crates/python
         run: |
-          uv sync --locked
+          uv sync --locked --group docs
           uv run --no-sync --with docstring-parser==0.18.0 \
             python scripts/gen_reference.py > ../../docs/reference/python.md
 
@@ -596,6 +620,18 @@ jobs:
             echo "  cd crates/python && uv run --no-sync --with docstring-parser==0.18.0 python scripts/gen_reference.py > ../../docs/reference/python.md"
             exit 1
           fi
+
+      - name: rustdoc (warnings are errors)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps -p tylertoo-core --features remote
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p tylertoo
+
+      - name: Test documentation examples and site build
+        working-directory: crates/python
+        run: uv run --no-sync pytest -m docs tests/docs -v
 
   # Coverage reporting
   coverage:

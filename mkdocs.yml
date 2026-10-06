@@ -1,5 +1,5 @@
 site_name: tylertoo
-site_description: Fast GeoParquet → PMTiles converter in Rust
+site_description: GeoParquet to PMTiles, with queryable multi-resolution overviews
 site_author: Nissim Lebovits
 site_url: https://geoparquet-io.github.io/tylertoo/
 repo_name: geoparquet-io/tylertoo
@@ -39,6 +39,12 @@ extra:
 plugins:
   - search
 
+# Strict builds (`zensical build --strict`) fail on these.
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+
 markdown_extensions:
   - admonition
   - attr_list
@@ -47,32 +53,38 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.highlight
+  # The home page and tutorials are includes of README.md and
+  # examples/*/README.md, so each has one source of truth.
+  - pymdownx.snippets:
+      base_path: .
+      check_paths: true
   - tables
   - toc:
       permalink: true
 
+# Kept in the repo but out of the nav (developer-facing):
+# architecture.md, PROFILING.md, development.md.
+not_in_nav: |
+  /architecture.md
+  /PROFILING.md
+  /development.md
+
 nav:
   - Home: index.md
-  - Getting Started: getting-started.md
-  - Diving Deeper:
-      - diving-deeper/index.md
-      - Preparing input for tiling: diving-deeper/preparing-input.md
-      - Working with the overview file: diving-deeper/overview-file.md
-      - Tuning what appears at each zoom: diving-deeper/tuning-zoom.md
-      - Tiling remote and multi-file inputs: diving-deeper/remote-and-multi-file.md
-      - Keeping memory bounded: diving-deeper/bounded-memory.md
-      - Sharded builds across a fleet: diving-deeper/sharded-builds.md
-      - How tylertoo relates to tippecanoe: diving-deeper/tippecanoe.md
+  - Tutorials:
+      - CLI: tutorials/cli.md
+      - Python: tutorials/python.md
+  - Guides:
+      - Remote and multi-file inputs: guides/remote-and-multi-file.md
+      - Sharded builds across a fleet: guides/sharded-builds.md
+      - Keeping memory bounded: guides/bounded-memory.md
+      - Coming from tippecanoe: guides/tippecanoe.md
+      - "Demo: Brazil 2025 fields": demo.md
   - Reference:
       - reference/index.md
       - CLI: reference/cli.md
       - Python: reference/python.md
       - Rust: reference/rust.md
-  - Demo (Brazil 2025 fields): demo.md
-  - Overview Tuning: OVERVIEW_TUNING.md
-  - Decoding PMTiles: decode.md
-  - Architecture: architecture.md
-  - Profiling: PROFILING.md
-  - Development: development.md
+      - Tuning knobs: OVERVIEW_TUNING.md
   - Contributing: contributing.md
   - Changelog: changelog.md

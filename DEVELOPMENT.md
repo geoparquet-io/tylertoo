@@ -557,6 +557,44 @@ cargo test -p tylertoo-core --test decode_roundtrip \
   decode_golden -- --nocapture
 ```
 
+### Docs
+
+The `Docs` job in `ci.yml` covers the site. Docs rule: if a page shows
+it, a test runs it. The tutorials live as numbered scripts under
+`examples/*/`, and each tutorial's `README.md` must show every script
+verbatim, followed by output the run reproduces. `docs/index.md` and
+`docs/tutorials/*.md` are one-line includes of those READMEs. See
+`crates/python/tests/docs/conftest.py` for the full policy.
+
+```bash
+# Reference pages: regenerate, then commit any diff
+cargo run -p tylertoo --features gen-docs -- \
+  gen-reference-docs > docs/reference/cli.md
+cd crates/python
+uv run --no-sync --with docstring-parser==0.18.0 \
+  python scripts/gen_reference.py \
+  > ../../docs/reference/python.md
+cd ../..
+
+# rustdoc, as docs.rs builds it
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps \
+  -p tylertoo-core --features remote
+
+# Tutorials, README quickstart, command flags,
+# and the strict site build
+cargo build --release -p tylertoo
+cd crates/python
+uv sync --group docs
+uv run pytest -m docs tests/docs -v
+
+# Preview the site
+uv run zensical serve -f ../../mkdocs.yml
+```
+
+To change a tutorial, edit its script, run the docs tests, and paste
+the new script and output into the README. A test failure names the
+step and the lines that differ.
+
 ### Workflows
 
 ```bash

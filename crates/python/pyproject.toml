@@ -48,6 +48,15 @@ dev = [
     "xenon>=0.9",
     "pip-audit>=2.7",
 ]
+# Tools the tutorials call and the site builder (tests/docs, docs.yml).
+# Exact pins: tutorial output is compared line by line, and zensical is
+# alpha. Run `uv sync --group docs`.
+docs = [
+    "zensical==0.0.68; python_version >= '3.11'",
+    "geoparquet-io==1.6.0; python_version >= '3.11'",
+    "duckdb==1.5.6; python_version >= '3.11'",
+    "duckdb-cli==1.5.6; python_version >= '3.11'",
+]
 
 [tool.maturin]
 # Build using pyo3 bindings
@@ -105,6 +114,9 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 disallow_untyped_calls = false
 files = ["tests"]
+# pytest needs both files named conftest.py, which mypy reads as one
+# module name twice. The docs conftest holds only small fixtures.
+exclude = ["^tests/docs/conftest\\.py$"]
 warn_unused_ignores = true
 
 [tool.vulture]
@@ -117,6 +129,10 @@ ignore_names = ["pytest_configure"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Docs tests need the release CLI and the `docs` group; CI runs them with
+# `pytest -m docs tests/docs` (a later -m overrides this one).
+addopts = "-m 'not docs'"
 markers = [
     "integration: marks tests as integration tests (may be slow)",
+    "docs: runs the documentation examples (see tests/docs/conftest.py)",
 ]

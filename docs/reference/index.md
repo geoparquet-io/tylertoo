@@ -1,20 +1,20 @@
 # Reference
 
-Complete, lookup-oriented API surface. Every page here is **generated from the
-source** (CLI help strings, Python docstrings, Rust doc-comments) and kept in
-sync by CI, so it cannot drift from the implementation.
+Lookup pages for each surface. CI regenerates the CLI and Python pages from
+the source on every pull request and fails if the committed copies drift.
 
-- [CLI reference](cli.md) — every `tylertoo` subcommand, argument, and option,
-  with defaults and possible values.
-- [Python reference](python.md) — the `tylertoo` package: `overview`,
-  `export_pmtiles`, `validate`, and the `convert` facade.
-- [Rust reference](rust.md) — embedding `tylertoo-core`, with a pointer to the
-  crate's rustdoc on docs.rs.
+- [CLI reference](cli.md): every `tylertoo` subcommand, argument, and option,
+  with defaults and possible values. Generated from the clap help strings.
+- [Python reference](python.md): `overview`, `export_pmtiles`, `validate`,
+  and the `convert` facade. Generated from the pyo3 docstrings.
+- [Rust reference](rust.md): the entry points of `tylertoo-core`, with links
+  to its rustdoc on docs.rs.
+- [Tuning reference](../OVERVIEW_TUNING.md): what each generalization knob
+  does, its default, and how the knobs interact.
 
-Coverage is complete per surface, but the three surfaces are not literally 1:1
-(for example, the CLI exposes `decode`, which the Python module does not). Where
-a capability exists on one surface but not another, that is stated rather than
-hidden.
+The surfaces are not one to one. The CLI has `decode`, `stats`, `pyramid`,
+`merge`, and `shard-plan`; the Python module does not expose them yet.
 
-For the *why* behind the knobs — the mental model rather than the flag list —
-see [Diving Deeper](../diving-deeper/index.md).
+For a guided path through the main commands, start with the
+[CLI tutorial](../tutorials/cli.md) or the
+[Python tutorial](../tutorials/python.md).

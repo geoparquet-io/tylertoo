@@ -11,14 +11,16 @@ The canonical, always-current API reference is the crate's rustdoc — generated
 from the doc-comments in the source, so it never drifts. Rather than re-render
 rustdoc into this site, this page links to it.
 
-- **Published docs:** [docs.rs/tylertoo-core](https://docs.rs/tylertoo-core) —
-  live once the crate is published to crates.io. Until the first release, use
-  the local build below.
-- **Local docs (works today):**
+- **Published docs:** [docs.rs/tylertoo-core](https://docs.rs/tylertoo-core),
+  built for each release with the `remote` feature on.
+- **Local docs** for an unreleased checkout:
 
   ```bash
-  cargo doc -p tylertoo-core --no-deps --open
+  cargo doc -p tylertoo-core --no-deps --features remote --open
   ```
+
+CI builds the rustdoc with `RUSTDOCFLAGS="-D warnings"`, so a broken
+intra-doc link fails the pull request.
 
 ## Key entry points
 
@@ -39,4 +41,4 @@ then export it to a PMTiles archive — mirroring the CLI and Python surfaces.
 
 For the shape of `ConvertOptions` / `ExportOptions` and their defaults, see the
 rustdoc above; each field carries a doc-comment. The tuning semantics behind the
-knobs are covered in [Tuning at each zoom](../diving-deeper/tuning-zoom.md).
+knobs are covered in [tuning reference](../OVERVIEW_TUNING.md).

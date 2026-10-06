@@ -1,0 +1,1 @@
+--8<-- "examples/cli-madagascar/README.md"

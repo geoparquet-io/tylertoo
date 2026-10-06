@@ -58,8 +58,9 @@ many partition objects.
 **`--bbox xmin,ymin,xmax,ymax`.** Converts only features whose bounding box
 intersects the box, in lon/lat degrees. Row groups outside the box are pruned at
 the footer, so a city-sized window from a country file reads a fraction of the
-data and, on remote input, downloads a fraction of the bytes. The tutorial's São
-Paulo preview is this knob used to finish in seconds.
+data and, on remote input, downloads a fraction of the bytes. The
+[CLI tutorial's preview step](../tutorials/cli.md#2-preview-one-region) uses it
+to build an Antananarivo overview from a country file.
 
 ### Filtering by attribute
 

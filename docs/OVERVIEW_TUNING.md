@@ -493,7 +493,7 @@ tylertoo tiles buildings.parquet buildings.pmtiles \
 Measured on Overture Germany buildings (59M footprints, z0–14,
 `corpus/SWEEPS.md` Decision 6): every level populates (z0 = 581 dots,
 z4 = 128,886, z6 = 1,074,540), coarse levels z6–z13 land exactly on the
-[density budget](#density-budget---drop-rate---drop-gamma---no-density-drop)
+[density budget](#density-budget-drop-rate-drop-gamma-no-density-drop)
 ladder `N / 1.65^(14−z)` with the gamma-fair spatial spread (Ruhr/Berlin
 visibly denser at z6, rural areas protected), and the overview file grows
 +31 % (11.9 → 15.6 GB) with +40 % conversion time. On the Moldova field
@@ -801,7 +801,7 @@ against. Such a row is never dropped for it; it competes as a keyless feature.
 The entry-zoom ladder reads its column by the same rule, so a non-finite value
 is no rung. `--accumulate` is aggregation rather than ranking and is one notch
 looser: a NaN is skipped there too, but an infinity is a real summand (see
-[Clustering](#clustering---cluster---accumulate-attribute)).
+[Clustering](#clustering-cluster-accumulate-attribute)).
 
 ---
 
@@ -1350,7 +1350,7 @@ Both act at export, on the tiles, not on the overview file.
   feature in every tile and the export went O(features × tiles). A wider value
   is refused up front, before any convert or export work runs (#433). A
   sharded build's read-pruning margin is two pivot tiles (512 px), so this cap
-  sits inside it; see `docs/diving-deeper/sharded-builds.md`.
+  sits inside it; see `docs/guides/sharded-builds.md`.
 - **`extent` (default 4096; Python `export_pmtiles(extent=...)`, not a CLI
   flag).** The MVT tile-local coordinate resolution. Must be positive: `0`
   quantizes every coordinate to the tile's origin — every line and polygon
@@ -1446,7 +1446,7 @@ you trade a bigger footer for that pushdown.
 
 ## Memory / streaming knobs: `--no-streaming`, `--read-batch-size`
 
-Like the [file layout knobs](#file-layout-knobs---row-group-size---full-column-stats),
+Like the [file layout knobs](#file-layout-knobs-row-group-size-full-column-stats),
 these never change the output's content: level assignments, geometry,
 attributes, and footer metadata are equivalent either way. They control **how
 much memory the conversion itself uses**.
@@ -1464,7 +1464,7 @@ By default the converter runs a **two-pass streaming pipeline** (H3):
    output drains to the writer in level order. The finest (canonical) level is
    verbatim and streamed to the writer last. An older engine that re-read the
    input once *per level* survives only as the equivalence-tested reference
-   path — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers).
+   path — see [Performance profiles](#performance-profiles-profile-in-flight-batches-read-workers).
 
 Peak memory is `O(read batch + winner tables)` instead of `O(dataset)`: on the
 Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
@@ -1474,9 +1474,9 @@ Moldova corpus file (632k polygons, 38M vertices) peak RSS drops from ~5.4 GB
 |------|---------|-------|-----------|
 | `--read-batch-size N` | `8192` | rows per read batch (max 1048576) | **bigger = faster-ish, more memory** |
 | `--no-streaming` | off | flag | revert to the one-pass in-memory pipeline |
-| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
-| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
-| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4; explicit capped at 2× cores) | parallel input read — see [Performance profiles](#performance-profiles---profile---in-flight-batches---read-workers) |
+| `--profile speed\|bounded\|auto` | `auto` | preset | speed vs bounded RAM — see [Performance profiles](#performance-profiles-profile-in-flight-batches-read-workers) |
+| `--in-flight-batches N\|auto` | `auto` | read batches in flight (auto = cores, clamped 4–16) | read/compute overlap — see [Performance profiles](#performance-profiles-profile-in-flight-batches-read-workers) |
+| `--read-workers N\|auto` | `auto` | pass-2 reader threads (auto = cores/4, capped at 4; explicit capped at 2× cores) | parallel input read — see [Performance profiles](#performance-profiles-profile-in-flight-batches-read-workers) |
 
 **`--read-batch-size`** bounds the transient working set of both passes: each
 batch is decoded, filtered, simplified, and written before the next is read.
@@ -1506,7 +1506,7 @@ transient per-row scan vectors) and 1 byte per feature during pass 2 — about
 64 bytes/row (`size_of::<AssignFeature>()`), held resident from pass 1's scan
 through the level assignment — a lower bound on the scan-time peak, and the
 coarse job's irreducible memory floor on a
-[sharded build](diving-deeper/sharded-builds.md#sizing-the-coarse-jobs-memory),
+[sharded build](guides/sharded-builds.md#sizing-the-coarse-jobs-memory),
 where it can reach tens of GiB at billion-row scale. tylertoo preflights this
 from footer row counts before pass 1 scans anything (#543): it warns when the
 realistic whole-job need (rows × 64 B × 2.5) exceeds the memory figure, and
@@ -1695,13 +1695,13 @@ binary column) is dropped with one warning per column, listed in the export
 report's `skipped_property_columns`, and rejected by name if
 `--include-property` asks for it; `--exclude-property` naming it silences
 the warning. The full type table is in
-[preparing input](diving-deeper/preparing-input.md#design-decisions).
+[preparing input](tutorials/cli.md#1-prepare-the-input).
 
 ---
 
 ## Performance profiles: `--profile`, `--in-flight-batches`, `--read-workers`
 
-Like the [memory / streaming knobs](#memory--streaming-knobs---no-streaming---read-batch-size),
+Like the [memory / streaming knobs](#memory-streaming-knobs-no-streaming-read-batch-size),
 these never change the output's content: **the produced file is byte-identical
 across every profile, `--in-flight-batches` value, `--read-workers` value,
 and thread count.** They control only how fast the conversion runs and how
@@ -1972,7 +1972,7 @@ plan's row-group selection — it reads only the groups whose bbox reaches its
 tile range — so the fingerprint compares that one term as a subset relation
 and the plan's row-indexed tables are re-addressed onto the shard's shorter
 row stream before pass 2. See [Sharded builds across a
-fleet](diving-deeper/sharded-builds.md) for the whole recipe.
+fleet](guides/sharded-builds.md) for the whole recipe.
 
 Both flags require the streaming pipeline (they are its pass-1 stage), they
 are mutually exclusive, and they are available on `overview` and `tiles`.

@@ -247,6 +247,7 @@ feat(cli): add --report flag to export-pmtiles
 | `docs/OVERVIEW_TUNING.md` | Every generalization knob, default, and interaction |
 | `corpus/SWEEPS.md` | The sweep-derived default-value decisions |
 | `corpus/HOSTILE_GEOMETRY.md` | The clipping-engine scorecard (i_overlay vs wagyu-rs, #205) and how to re-run it |
+| `examples/` | The CLI and Python tutorials as runnable scripts; `crates/python/tests/docs` runs them and checks the site shows them verbatim |
 | `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup, running CI gates locally |
 | `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
 | `context/archive/` | Frozen historical docs (plans, session artifacts, legacy-pipeline notes) |
