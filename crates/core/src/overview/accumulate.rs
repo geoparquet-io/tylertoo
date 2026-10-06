@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 
-use super::assign::{gsd_to_coord_units, AssignFeature, FeatureKind};
+use super::assign::{gsd_to_coord_units, FeatureKind, FeatureTable};
 use super::level::Crs;
 use super::simplify::{
     dither_u01, export_zoom, level_tolerance, placeholder_side, CollapseMode, Representation,
@@ -142,7 +142,7 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
 /// floor, so the accumulator and the `--collapse-square` dither share one
 /// square.
 pub fn tiny_polygon_carriers(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     min_levels: &[u8],
     areas: &[f32],
     levels: &[AccumulateLevel],
@@ -170,11 +170,11 @@ pub fn tiny_polygon_carriers(
             continue;
         }
         let mut acc: HashMap<(i64, i64), Patch> = HashMap::new();
-        for ((f, &ml), &area) in features.iter().zip(min_levels).zip(areas) {
-            if f.kind != FeatureKind::Polygon || usize::from(ml) <= li {
+        for (pos, (&ml, &area)) in min_levels.iter().zip(areas).enumerate() {
+            if features.kind(pos) != FeatureKind::Polygon || usize::from(ml) <= li {
                 continue; // not a polygon, or already present at this level
             }
-            if f.entry_level.is_some() {
+            if features.entry_level(pos).is_some() {
                 continue; // #364: the ladder decides where it first appears
             }
             let area = f64::from(area);
@@ -194,15 +194,15 @@ pub fn tiny_polygon_carriers(
             // therefore lands in a patch near lng 0, far from where it
             // sits. The rest of the pipeline has no wrap handling either
             // (#342); this stays consistent with it until that lands.
-            let (cx, cy) = f.center();
+            let (cx, cy) = features.center(pos);
             let key = ((cx / cell).floor() as i64, (cy / cell).floor() as i64);
             let patch = acc.entry(key).or_default();
             patch.total += area;
             if patch.total >= threshold {
-                out[li].push(f.index);
+                out[li].push(features.indices()[pos]);
                 patch.total -= threshold;
             } else {
-                patch.last_free = Some((f.index, cx, cy));
+                patch.last_free = Some((features.indices()[pos], cx, cy));
             }
         }
         // A patch keeps less than one `T` unemitted. At a floored level `T`
@@ -257,6 +257,15 @@ pub fn is_carrier(carriers: &[usize], g: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::assign::AssignFeature;
+
+    /// Array-of-structs fixture → the column-major table the engine takes
+    /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
+    /// pipeline fills a [`FeatureTable`] directly from the scan, so this
+    /// conversion exists only here.
+    fn table(feats: &[AssignFeature]) -> FeatureTable {
+        feats.iter().collect()
+    }
     use super::*;
     use crate::mvt::MIN_SURVIVING_SQUARE_SIDE;
 
@@ -289,7 +298,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10];
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         assert_eq!(out[0], vec![6]);
         assert!(out[1].is_empty(), "disabled level accumulates nothing");
     }
@@ -301,7 +317,14 @@ mod tests {
         let mut min_levels = vec![1u8; 10];
         min_levels[0] = 0; // already a member of level 0
         let areas = vec![160_000.0f32; 10];
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         // 8 polygons accumulate (10 minus the member minus the point):
         // 1.28e6 ⇒ one carrier, and it is the 7th accumulated (index 8).
         assert_eq!(out[0], vec![8]);
@@ -319,11 +342,25 @@ mod tests {
         }
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10]; // 5 × 160k = 800k < 1e6 per cell
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         assert!(out[0].is_empty(), "{:?}", out[0]);
         // Bigger fields: 5 × 300k = 1.5e6 per cell ⇒ one carrier per cell.
         let areas = vec![300_000.0f32; 10];
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         assert_eq!(out[0].len(), 2);
         assert_eq!(out[0], vec![3, 8], "the 4th field of each cell crosses");
     }
@@ -341,7 +378,14 @@ mod tests {
         let min_levels = vec![1u8; 11];
         let mut areas = vec![1_400_000.0f32; 10];
         areas.push(500_000.0);
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         assert_eq!(
             out[0],
             (0..10).collect::<Vec<_>>(),
@@ -365,7 +409,14 @@ mod tests {
             areas.push((0.1 * t) as f32);
         }
         let min_levels = vec![1u8; feats.len()];
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         let expected: f64 = areas.iter().map(|&a| f64::from(a).min(t)).sum();
         let emitted = out[0].len() as f64 * t;
         assert!(
@@ -389,7 +440,14 @@ mod tests {
         }
         let min_levels = vec![3u8; 3];
         let areas = vec![25_000_000.0f32; 3]; // 25 T each
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         assert!(
             out[0].is_empty(),
             "laddered features became carriers: {:?}",
@@ -422,8 +480,15 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10];
-        tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, factor)
-            .swap_remove(0)
+        tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            factor,
+        )
+        .swap_remove(0)
     }
 
     /// The factor at which level 0's `factor × gsd` is exactly one tile unit.
@@ -475,8 +540,15 @@ mod tests {
         let min_levels = vec![1u8; n];
         let run = |factor: f64, area: f64| {
             let areas = vec![area as f32; n];
-            tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, factor)
-                .swap_remove(0)
+            tiny_polygon_carriers(
+                &table(&feats),
+                &min_levels,
+                &areas,
+                &level(),
+                Crs::Epsg3857,
+                factor,
+            )
+            .swap_remove(0)
         };
         let floored = run(1e-6, 0.5 * unit * unit);
         let sd = (n as f64 * 0.25).sqrt();
@@ -554,7 +626,14 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 1000];
         let areas = vec![90_000.0f32; 1000];
-        let out = tiny_polygon_carriers(&feats, &min_levels, &areas, &level(), Crs::Epsg3857, 1.0);
+        let out = tiny_polygon_carriers(
+            &table(&feats),
+            &min_levels,
+            &areas,
+            &level(),
+            Crs::Epsg3857,
+            1.0,
+        );
         let cells = 4; // 128 km / 32 km patches
         let n = out[0].len();
         assert!((90 - cells..=90).contains(&n), "{n} carriers");

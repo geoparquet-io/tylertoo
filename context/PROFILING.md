@@ -123,7 +123,7 @@ not "the run was not profiled".
     "verdict": "fits",              // fits | warned | exceeded_but_forced |
                                     // not_checked (a --plan replay)
     "rows": 1000,                   // footer-counted input rows
-    "estimated_bytes": 64000,       // rows x PASS1_BYTES_PER_ROW (64)
+    "estimated_bytes": 42000,       // rows x PASS1_BYTES_PER_ROW (42)
     "limit_bytes": 34359738368,     // the probed figure; null if unprobed
     "limit_source": "available memory (MemAvailable)"
   },
@@ -183,9 +183,10 @@ not "the run was not profiled".
 These two are the memory-sizing pair, and they bracket the run.
 
 `pass1_memory_preflight` is decided **before any data page is read**, from
-footer row counts alone: `rows × 64 B` for the pass-1 feature table against a
-fresh, source-attributed memory probe. A `warned` verdict on a job that then
-died is the single most useful line in this dump. `not_checked` means a
+footer row counts alone: `rows × 42 B` (the pass-1 feature table's worst case,
+`PASS1_BYTES_PER_ROW`) against a fresh, source-attributed memory probe. A
+`warned` verdict on a job that then died is the single most useful line in
+this dump. `not_checked` means a
 `--plan` replay, which builds no feature table.
 
 `pass2.sink` is decided **during** pass 2, by measurement rather than model.

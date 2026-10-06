@@ -25,8 +25,8 @@ about 1 byte per feature. Pass 2 simplifies and writes each level in batches.
 Peak memory is one read batch plus the per-feature tables. It depends on
 the largest row group and feature count: well under 1 GB on a 632k-polygon
 file that would otherwise need several GB. Choose the row-group size when
-preparing input with `gpio`. Pass 1 uses 64 bytes per row, reaching tens of
-GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
+preparing input with `gpio`. Pass 1 uses up to 42 bytes per row, reaching
+tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
 
 - **`--no-streaming`** decodes the whole dataset in memory. It can be slightly
   faster on small inputs that fit in RAM.
@@ -268,19 +268,40 @@ Set `SPILL` to an existing directory on real disk. To rerun shard 7, submit
 
 ## Sizing the coarse job's memory
 
-The coarse job holds a 64-byte record per input row through pass 1 and level
+The coarse job holds a column-major feature table through pass 1 and level
 assignment. This memory floor is independent of the shard count. Winner
 grids and pass-2 buffers need additional memory.
 
-**Budget at least rows × 64 bytes × 2.5.** For 1.58 billion rows, the floor is
-94.2 GiB and the budget about 235 GiB. This job ran out of memory on a 192 GiB
-machine and finished on 360 GiB. A `--plan` replay skips pass 1, but generating
-the plan first requires a machine with enough RAM.
+The table's cost per input row depends on its optional columns:
 
-Before pass 1, both convert pipelines estimate rows × 64 bytes from the
+| Columns | Bytes per row |
+| --- | --- |
+| Base: bbox center and squared diagonal (three `f64`), row index, geometry kind | 33 |
+| Base plus a sort key | 41 |
+| Base plus a sort key and an entry-zoom ladder | 42 |
+
+A sort key comes from `--sort-key` or `--class-rank`. tylertoo also detects
+some rankings from the schema, such as Overture road classes or places
+`confidence`. Pass 1 reduces each bbox to its center and diagonal at scan
+time and keeps neither the bbox nor any padding.
+
+**Budget at least rows × 42 bytes × 3.3**, about 138 bytes per row. For 1.58
+billion rows, the floor is 61.8 GiB and the budget about 204 GiB. This job ran
+out of memory on a 192 GiB machine and finished on 360 GiB. A `--plan` replay
+skips pass 1, but generating the plan first requires a machine with enough RAM.
+
+That job ran when the table cost 64 bytes per row, a 94.2 GiB floor budgeted at
+×2.5. #543 shrank only the table, so the multiplier rose to ×3.3 to keep the
+absolute budget near its old value. The 138 bytes per row assume the smallest
+saving (64 to 42). The winner grids, scan vectors, and pass-2 buffers did not
+shrink. #541 and #565 had already cut the coarse job's pass-2 buffers and the density
+budget's priority table, so the multiplier is conservative. Tightening it needs
+a fresh billion-row run.
+
+Before pass 1, both convert pipelines estimate rows × 42 bytes from the
 footers and compare it with available memory:
 
-- It **warns** when 2.5 times the floor exceeds the figure, naming the
+- It **warns** when 3.3 times the floor exceeds the figure, naming the
   figure's source: `MemAvailable`, cgroup `memory.max` or `memory.high`, or
   `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. With `--bbox` or `--filter` the count is an
   upper bound, so this check only warns.
@@ -292,7 +313,7 @@ footers and compare it with available memory:
 into a warning. Off Linux, the check only runs if you set
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES`. A `--plan` replay skips it.
 
-**Wide property schemas need more.** The 2.5 multiplier assumes buffered rows
+**Wide property schemas need more.** The 3.3 multiplier assumes buffered rows
 are mostly geometry. A buffered row also carries every kept property column,
 so a schema with dozens or hundreds of columns can cost far more per row.
 Under `auto`, pass 2 measures this cost and spills mid-pass when it would
@@ -311,8 +332,9 @@ exceed the budget (#626). To size a machine for it:
 The pass-1 feature table is still neither measured per schema nor spillable
 (#543).
 
-**Size from the job's own peak, not its `MaxRSS`.** The 64-byte floor comes
-from the process's resident set, and the 2.5 multiplier from a cgroup kill.
+**Size from the job's own peak, not its `MaxRSS`.** The 64-byte floor that
+calibrated the budget came from the process's resident set, and the multiplier
+from a cgroup kill.
 Both describe tylertoo's own memory. Under Slurm on cgroup v2, `MaxRSS` also
 counts reclaimable page cache. A job that moves tens of GiB can report a
 `MaxRSS` at the cgroup ceiling while the process is ten times smaller. Size

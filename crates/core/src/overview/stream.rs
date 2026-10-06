@@ -7,9 +7,10 @@
 //!
 //! - **Pass 1** streams the input once (row batches of
 //!   [`ConvertOptions::read_batch_size`] rows, geometry + ranking columns
-//!   only): per feature it keeps only the bbox, [`FeatureKind`], and sort key
-//!   — a small [`AssignFeature`] — plus the incremental state for Q1 ranking
-//!   auto-detection. [`assign_levels_bounded`] and [`apply_density_budget`] then run
+//!   only): per feature it keeps only the bbox *center*, its squared
+//!   diagonal, [`FeatureKind`], and the sort key — one row of the
+//!   column-major [`FeatureTable`] — plus the incremental state for Q1
+//!   ranking auto-detection. [`assign_levels_bounded`] and [`apply_density_budget`] then run
 //!   over those (the assign engine's own state is `O(occupied cells)` per
 //!   level), producing the **winner table**: one `min_level` byte per feature.
 //! - **Pass 2** re-reads the (seekable) input once **per level**, coarse →
@@ -18,17 +19,23 @@
 //!   [`OverviewWriter`]. Nothing is retained across batches.
 //!
 //! Peak memory is `O(read batch + winner tables)`: the winner table is 1 byte
-//! per feature; pass 1 additionally holds the `AssignFeature` vector (64
-//! bytes/feature, [`super::convert::PASS1_BYTES_PER_ROW`]) from the scan
+//! per feature; pass 1 additionally holds the [`FeatureTable`] from the scan
 //! through the assignment, plus transient per-row vectors during the scan
 //! (ranking-key candidates at 16 bytes/row each, and — when those options are
 //! on — accumulate/ladder values, polygon areas, coalesce line geometries),
-//! all freed before pass 2. Residual `O(N)` state is therefore ≥ 64 bytes per
-//! input feature (typically ~64–100) — for 632k features, a few tens of MB,
-//! far below the geometry payload the in-memory path holds, but tens of GiB
-//! at billion-row scale (#543: preflighted from the footers before pass 1).
+//! all freed before pass 2. The table costs **33 bytes/feature**, plus 8 if
+//! the job has a sort key and 1 if it has an entry-zoom ladder — 42 with
+//! both, the worst case [`super::convert::PASS1_BYTES_PER_ROW`] preflights
+//! against. (It was 64
+//! before #543 item 2, when it was an array of `AssignFeature` structs
+//! holding the raw bbox and two `Option`s; see [`FeatureTable`] for what
+//! changed and for why the four `f64` columns stayed `f64`.) Residual `O(N)`
+//! state is therefore ≥ 33 bytes per input feature (typically ~42–80) — for
+//! 632k features, a few tens of MB, far below the geometry payload the
+//! in-memory path holds, but tens of GiB at billion-row scale (#543:
+//! preflighted from the footers before pass 1).
 //!
-//! **Line coalescing is the one exception to "64–100 bytes per feature"**: it
+//! **Line coalescing is the one exception to "42–80 bytes per feature"**: it
 //! retains each line's full geometry, not a fixed-size record, because
 //! chaining needs the coordinate runs it merges. That buffer is capped by
 //! both limbs of [`ConvertOptions::coalesce_max_level_rows`] (rows AND the
@@ -84,7 +91,9 @@ use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
 use super::accumulate::{
     is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
 };
-use super::assign::{apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind};
+use super::assign::{
+    apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
+};
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{collected_line_bytes, CoalesceInput};
 use super::convert::{
@@ -851,7 +860,7 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
 /// unless the accumulator applies there.
 fn streaming_carriers(
     options: &ConvertOptions,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     feat_min_levels: &[u8],
     areas: Vec<f32>,
     level_specs: &[(f64, Option<u8>)],
@@ -1772,7 +1781,7 @@ fn coalesce_level_counts_in_waves(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_winner_tables(
-    features: &mut Vec<AssignFeature>,
+    features: &mut FeatureTable,
     acc_values: Vec<Vec<Option<f64>>>,
     areas: Vec<f32>,
     coalesce_scratch: Option<CoalesceScratch>,
@@ -1856,7 +1865,7 @@ fn resolve_winner_tables(
     let cluster_tables: Option<ClusterTables> = if options.cluster {
         let acc_feat: Vec<Vec<Option<f64>>> = acc_values
             .iter()
-            .map(|vals| features.iter().map(|f| vals[f.index]).collect())
+            .map(|vals| features.indices().iter().map(|&i| vals[i]).collect())
             .collect();
         Some(super::convert::build_verified_cluster_tables(
             features,
@@ -1884,8 +1893,8 @@ fn resolve_winner_tables(
     let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes);
     let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
         let mut k = vec![FeatureKind::Point; num_rows];
-        for f in features.iter() {
-            k[f.index] = f.kind;
+        for (pos, &row) in features.indices().iter().enumerate() {
+            k[row] = features.kind(pos);
         }
         k
     });
@@ -1899,8 +1908,8 @@ fn resolve_winner_tables(
     // which matches no level in either mode (the level plan is capped at
     // [`super::convert::MAX_LEVELS`] levels, so `finest < u8::MAX`).
     let mut min_levels = vec![UNASSIGNED_LEVEL; num_rows];
-    for (f, &ml) in features.iter().zip(&feat_min_levels) {
-        min_levels[f.index] = ml;
+    for (&row, &ml) in features.indices().iter().zip(&feat_min_levels) {
+        min_levels[row] = ml;
     }
 
     // Per-level winner counts (exact row counts in partitioning mode; in
@@ -1911,15 +1920,17 @@ fn resolve_winner_tables(
     // chain stage per level, which also builds the simplified tables pass 2
     // consumes, #570; see `coalesce_level_counts`).
     let mut hist = vec![0usize; num_levels];
-    for (f, &ml) in features.iter().zip(&feat_min_levels) {
-        if coalesce_scratch.is_some() && f.kind == FeatureKind::Line {
+    for (pos, &ml) in feat_min_levels.iter().enumerate() {
+        if coalesce_scratch.is_some() && features.kind(pos) == FeatureKind::Line {
             continue; // counted via the per-level chain stage below
         }
         hist[(ml as usize).min(finest)] += 1;
     }
     drop(feat_min_levels);
-    features.clear();
-    features.shrink_to_fit(); // free the pass-1 O(N)·48B scratch before pass 2
+    // Free the pass-1 O(N) table (`FeatureTable::MAX_BYTES_PER_ROW`) before
+    // pass 2. `take` drops every column outright, which is what the old
+    // `clear` + `shrink_to_fit` pair was reaching for.
+    *features = FeatureTable::new();
     let mut counts: Vec<usize> = match options.mode {
         Mode::Duplicating => hist
             .iter()
@@ -2453,6 +2464,7 @@ fn run_pass1_and_assign(
     let t_pass1 = Instant::now();
     let Pass1Output {
         mut features,
+        bbox_tally,
         areas,
         provenance: ranking_provenance,
         acc_values,
@@ -2471,6 +2483,7 @@ fn run_pass1_and_assign(
         inputs.selected_row_groups,
         inputs.bbox_units,
         inputs.bound_filter,
+        inputs.crs,
     )?;
     if skipped_rows > 0 {
         log::warn!(
@@ -2483,9 +2496,10 @@ fn run_pass1_and_assign(
     // them to size its work); one extra O(N) pass, taken only when saving.
     let kind_counts = options.save_plan.is_some().then(|| count_kinds(&features));
 
-    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
-    // antimeridian suspects, and the #429 losses (outside the CRS range, or
-    // outside the Web Mercator tiling domain). Warns once per kind and
+    // The bbox-derived tallies were folded DURING the scan (#543: the pass-1
+    // table keeps center + squared diagonal, not the bbox): #188 antimeridian
+    // suspects, and the #429 losses (outside the CRS range, or outside the
+    // Web Mercator tiling domain). Resolving them here warns once per kind and
     // refuses to "succeed" into an empty archive when ~everything is lost.
     // #553: exemplars name the file row, not the position in the pruned
     // stream; a multi-part input also names the part.
@@ -2493,9 +2507,7 @@ fn run_pass1_and_assign(
         .source
         .stream_row_locator(inputs.selected_row_groups)?;
     let multi_part = inputs.source.parts().len() > 1;
-    let tallies = super::convert::tally_feature_bboxes(&features, inputs.crs, &|i| match locator
-        .locate(i)
-    {
+    let tallies = bbox_tally.finish(num_features, inputs.crs, &|i| match locator.locate(i) {
         Some((part, row)) => (multi_part.then_some(part), row),
         None => (None, i),
     })?;
@@ -2537,7 +2549,7 @@ fn run_pass1_and_assign(
 
     // Persisted here, the first moment the assignment is complete and before
     // pass 2 touches anything: what survives resolve_winner_tables IS the
-    // whole dataset-global result (the O(N)·48B feature scratch it folded
+    // whole dataset-global result (the O(N) feature scratch it folded
     // over is already freed).
     if let Some(path) = &options.save_plan {
         let (n_points, n_lines, n_polygons) = kind_counts.expect("counted when saving a plan");
@@ -2585,10 +2597,10 @@ fn run_pass1_and_assign(
 }
 
 /// `(points, lines, polygons)` over the pass-1 features.
-fn count_kinds(features: &[AssignFeature]) -> (usize, usize, usize) {
+fn count_kinds(features: &FeatureTable) -> (usize, usize, usize) {
     let mut counts = (0usize, 0usize, 0usize);
-    for f in features {
-        match f.kind {
+    for pos in 0..features.len() {
+        match features.kind(pos) {
             FeatureKind::Point => counts.0 += 1,
             FeatureKind::Line => counts.1 += 1,
             FeatureKind::Polygon => counts.2 += 1,
@@ -3961,8 +3973,13 @@ impl CoalesceScratch {
 
 /// Result of [`run_pass1`].
 struct Pass1Output {
-    /// Per-feature assignment inputs (bbox, kind, resolved sort key).
-    features: Vec<AssignFeature>,
+    /// Per-feature assignment inputs (center, squared diagonal, kind,
+    /// resolved sort key) — the compact column-major table of #543.
+    features: FeatureTable,
+    /// The #188/#429 bbox tallies, folded during the scan while the bboxes
+    /// existed (#543). The caller resolves the exemplars and emits the
+    /// warnings via [`super::convert::BboxTally::finish`].
+    bbox_tally: super::convert::BboxTally,
     /// Per-feature unsigned polygon area in CRS units² (0 for other kinds),
     /// parallel to `features`; empty unless the tiny-polygon accumulator is
     /// on (#384), since it is the one consumer.
@@ -4139,7 +4156,7 @@ fn apply_entry_levels(
     options: &ConvertOptions,
     ladder_values: &[Option<f64>],
     num_rows: usize,
-    features: &mut [AssignFeature],
+    features: &mut FeatureTable,
 ) -> Result<(), ConvertError> {
     if options.entry_zoom.is_none() {
         return Ok(());
@@ -4148,8 +4165,9 @@ fn apply_entry_levels(
     let level_specs = options.levels.resolve(options.gsd_base)?;
     if let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
     {
-        for f in features.iter_mut() {
-            f.entry_level = entry.get(f.index).copied().flatten();
+        for pos in 0..features.len() {
+            let row = features.indices()[pos];
+            features.set_entry_level(pos, entry.get(row).copied().flatten());
         }
     }
     Ok(())
@@ -4238,9 +4256,13 @@ enum LineCollect {
 /// base, so there is no way to rebase twice or drift (see the module's
 /// pass-1 parallelization notes on `run_pass1`).
 struct ChunkScan {
-    /// Features found in this chunk; `AssignFeature::index` is the row's
-    /// offset WITHIN THE CHUNK, rebased by the consumer to `chunk_base + i`.
-    features: Vec<AssignFeature>,
+    /// Features found in this chunk; each index is the row's offset WITHIN
+    /// THE CHUNK, rebased by the consumer to `chunk_base + i`.
+    features: FeatureTable,
+    /// The #188/#429 bbox tallies for this chunk's kept features, with
+    /// chunk-local exemplar indices (#543: the feature table no longer keeps
+    /// bboxes, so the tally is folded here, where they still exist).
+    tally: super::convert::BboxTally,
     /// #384 polygon areas, parallel to `features` (empty unless enabled).
     areas: Vec<f32>,
     /// One entry per chunk row: was it kept (became a feature)? Length
@@ -4302,6 +4324,7 @@ fn scan_chunk(
     diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
     bbox_units: Option<&[f64; 4]>,
+    crs: Crs,
     collect_lines: LineCollect,
     want_areas: bool,
     timers: &Pass1Timers,
@@ -4325,7 +4348,8 @@ fn scan_chunk(
     // area entry when the row is a polygon). Slight over-allocation on a
     // mostly-skipped/mostly-non-polygon chunk beats the repeated reallocation
     // an unsized `Vec::new()` would otherwise do as the chunk fills in.
-    let mut features: Vec<AssignFeature> = Vec::with_capacity(chunk_len);
+    let mut features = FeatureTable::with_capacity(chunk_len);
+    let mut tally = super::convert::BboxTally::default();
     let mut areas: Vec<f32> = Vec::with_capacity(if want_areas { chunk_len } else { 0 });
     let mut kept_row = vec![false; geoms_buf.len()];
     let mut lines: Vec<ChunkLine> = Vec::with_capacity(match collect_lines {
@@ -4385,7 +4409,10 @@ fn scan_chunk(
         if want_areas {
             areas.push(polygon_area_f32(g));
         }
-        features.push(AssignFeature {
+        // #543: the bbox is tallied HERE, while it exists — the table
+        // retains only center + squared diagonal.
+        tally.observe(&fbbox, crs, i);
+        features.push(&AssignFeature {
             index: i, // chunk-local; the consumer rebases to `chunk_base + i`
             bbox: fbbox,
             kind,
@@ -4397,6 +4424,7 @@ fn scan_chunk(
 
     Ok(ChunkScan {
         features,
+        tally,
         areas,
         kept_row,
         lines,
@@ -4417,6 +4445,7 @@ fn run_pass1(
     row_groups: Option<&RowGroupSelection>,
     bbox_units: Option<&[f64; 4]>,
     filter: Option<&super::filter::BoundFilter>,
+    crs: Crs,
 ) -> Result<Pass1Output, ConvertError> {
     run_pass1_with_chunk_rows(
         source,
@@ -4427,6 +4456,7 @@ fn run_pass1(
         row_groups,
         bbox_units,
         filter,
+        crs,
         adaptive_pass1_chunk_rows(options.read_batch_size),
     )
 }
@@ -4615,7 +4645,7 @@ impl LineScratch {
     /// `groups` are the row-indexed interned class values, when class-ranked.
     fn finish(
         self,
-        features: &[AssignFeature],
+        features: &FeatureTable,
         all_groups: Option<Vec<u32>>,
     ) -> Option<CoalesceScratch> {
         if self.mode != LineCollect::Collect {
@@ -4625,7 +4655,7 @@ impl LineScratch {
             sort_keys: self
                 .feat_pos
                 .iter()
-                .map(|&p| features[p].sort_key)
+                .map(|&p| features.sort_key(p))
                 .collect(),
             groups: all_groups.map(|g| self.rows.iter().map(|&r| g[r]).collect()),
             rows: self.rows,
@@ -4669,7 +4699,8 @@ fn merge_pass1_chunks(
     chunk_results: Vec<Result<ChunkScan, ConvertError>>,
     ranges: &[(usize, usize)],
     base: usize,
-    features: &mut Vec<AssignFeature>,
+    features: &mut FeatureTable,
+    tally: &mut super::convert::BboxTally,
     areas: &mut Vec<f32>,
     lines: &mut LineScratch,
     point_count: &mut usize,
@@ -4697,10 +4728,8 @@ fn merge_pass1_chunks(
             chunk.line_count,
             chunk.line_bytes,
         );
-        for mut f in chunk.features {
-            f.index += chunk_base;
-            features.push(f);
-        }
+        tally.merge(&chunk.tally, chunk_base);
+        features.append_rebased(&chunk.features, chunk_base);
     }
     Ok(kept_row)
 }
@@ -4743,6 +4772,7 @@ fn run_pass1_with_chunk_rows(
     row_groups: Option<&RowGroupSelection>,
     bbox_units: Option<&[f64; 4]>,
     filter: Option<&super::filter::BoundFilter>,
+    crs: Crs,
     chunk_rows: usize,
 ) -> Result<Pass1Output, ConvertError> {
     let chunk_rows = chunk_rows.max(1);
@@ -4783,7 +4813,10 @@ fn run_pass1_with_chunk_rows(
     let in_flight = resolve_and_log_in_flight_batches("pass 1", options.in_flight_batches);
     log::debug!("[profile] pass1 chunk_rows={chunk_rows}");
 
-    let mut features: Vec<AssignFeature> = Vec::new();
+    let mut features = FeatureTable::new();
+    // #188/#429 bbox tallies, folded chunk by chunk as the scan produces
+    // features (#543 — see `super::convert::BboxTally`).
+    let mut bbox_tally = super::convert::BboxTally::default();
     // #543 review: pre-size the feature table when its final length is known
     // from the footers — i.e. no per-feature `--bbox`/`--filter` can drop
     // rows (only null/unusable geometries, a small overshoot). Growing by
@@ -4897,6 +4930,7 @@ fn run_pass1_with_chunk_rows(
                             base + start,
                             mask_slice,
                             bbox_units,
+                            crs,
                             collect_lines,
                             want_areas,
                             timers_ref,
@@ -4914,6 +4948,7 @@ fn run_pass1_with_chunk_rows(
                     &ranges,
                     base,
                     &mut features,
+                    &mut bbox_tally,
                     &mut areas,
                     &mut lines,
                     &mut point_count,
@@ -4976,8 +5011,9 @@ fn run_pass1_with_chunk_rows(
         // they are looked up by each feature's row index, not zipped
         // positionally.
         debug_assert_eq!(keys.len(), num_rows);
-        for f in features.iter_mut() {
-            f.sort_key = keys[f.index];
+        for pos in 0..features.len() {
+            let row = features.indices()[pos];
+            features.set_sort_key(pos, keys[row]);
         }
     }
 
@@ -4995,6 +5031,7 @@ fn run_pass1_with_chunk_rows(
 
     Ok(Pass1Output {
         features,
+        bbox_tally,
         areas,
         provenance,
         acc_values,
@@ -5839,6 +5876,14 @@ pub(super) fn process_batch_cascade(
 
 #[cfg(test)]
 mod tests {
+
+    /// Array-of-structs fixture → the column-major table the engine takes
+    /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
+    /// pipeline fills a [`FeatureTable`] directly from the scan, so this
+    /// conversion exists only here.
+    fn table(feats: &[AssignFeature]) -> FeatureTable {
+        feats.iter().collect()
+    }
     use super::*;
 
     use geo::{LineString, Point, Polygon};
@@ -5954,7 +5999,7 @@ mod tests {
             Err(
                 err @ ConvertError::Pass1MemoryFloorExceeded {
                     rows: 10,
-                    estimated_bytes: 640,
+                    estimated_bytes: 420,
                     limit_bytes: 1,
                 },
             ) => {
@@ -6187,21 +6232,31 @@ mod tests {
             pre.selected_row_groups.as_ref(),
             pre.bbox_units.as_ref(),
             pre.bound_filter.as_ref(),
+            pre.crs,
             chunk_rows,
         )
         .unwrap()
     }
 
-    /// Field-by-field [`AssignFeature`] comparison ([`AssignFeature`] has no
-    /// `PartialEq` — it isn't needed outside tests, and deriving it here would
-    /// mean editing `assign.rs`, outside this PR's file scope).
-    fn assert_features_eq(a: &[AssignFeature], b: &[AssignFeature]) {
+    /// Column-by-column [`FeatureTable`] comparison ([`FeatureTable`] has no
+    /// `PartialEq` — it isn't needed outside tests). Every column the table
+    /// holds is compared, which since #543 means the derived center and
+    /// squared diagonal rather than the raw bbox they came from: those two
+    /// ARE what assignment reads, so a difference in either is a difference
+    /// the assignment would see.
+    fn assert_features_eq(a: &FeatureTable, b: &FeatureTable) {
         assert_eq!(a.len(), b.len(), "feature count differs");
-        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        for i in 0..a.len() {
+            let (x, y) = (a.row(i), b.row(i));
             assert_eq!(x.index, y.index, "feature {i}: index differs");
-            assert_eq!(x.bbox, y.bbox, "feature {i}: bbox differs");
+            assert_eq!(x.center, y.center, "feature {i}: center differs");
+            assert_eq!(x.diag_sq, y.diag_sq, "feature {i}: diag_sq differs");
             assert_eq!(x.kind, y.kind, "feature {i}: kind differs");
-            assert_eq!(x.sort_key, y.sort_key, "feature {i}: sort_key differs");
+            assert_eq!(
+                a.sort_key(i),
+                b.sort_key(i),
+                "feature {i}: sort_key differs"
+            );
             assert_eq!(
                 x.entry_level, y.entry_level,
                 "feature {i}: entry_level differs"
@@ -7215,6 +7270,7 @@ mod tests {
             pre.selected_row_groups.as_ref(),
             pre.bbox_units.as_ref(),
             pre.bound_filter.as_ref(),
+            pre.crs,
             CHUNK_ROWS,
         );
         let err = match res {
@@ -7927,7 +7983,7 @@ mod tests {
         };
         streaming_carriers(
             &options,
-            &feats,
+            &table(&feats),
             &min_levels,
             areas,
             &[(1000.0, None), (10.0, None)],

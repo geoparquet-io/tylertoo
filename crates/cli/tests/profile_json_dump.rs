@@ -416,9 +416,12 @@ fn check_pass1_memory_preflight(value: &serde_json::Value) {
         "the preflight's footer row count ({rows}) must cover what pass 1 then \
          scanned ({scanned}) — it is an upper bound, exact without --bbox/--filter: {value}"
     );
+    // `PASS1_BYTES_PER_ROW` is crate-private, so this restates it. #543 item 2
+    // cut it from 64 to 42 (the column-major `FeatureTable`, worst case: both
+    // optional columns materialized).
     assert_eq!(
         pre["estimated_bytes"].as_u64(),
-        Some(rows * 64),
+        Some(rows * 42),
         "estimated_bytes must be rows x PASS1_BYTES_PER_ROW: {value}"
     );
 }

@@ -59,7 +59,7 @@ use super::accumulate::{
 };
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
-    DensityBudgetConfig, FeatureKind, SUPERCELL_GSD_FACTOR,
+    DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{
     build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, ClusterTables,
@@ -2602,7 +2602,7 @@ fn intern_coalesce_groups(
 /// `acc_values` holds one vector per accumulate spec, indexed by position in
 /// `features` (not by input row).
 pub(super) fn build_verified_cluster_tables(
-    features: &[AssignFeature],
+    features: &FeatureTable,
     min_levels: &[u8],
     level_gsds: &[f64],
     acc_values: &[Vec<Option<f64>>],
@@ -2831,7 +2831,7 @@ fn record_emitted_merged(
 #[allow(clippy::too_many_arguments)]
 fn build_emitted_levels(
     assignment: &Assignment,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     geometries: &[Geometry<f64>],
     level_specs: &[(f64, Option<u8>)],
     level_reprs: &[Representation],
@@ -2875,14 +2875,16 @@ fn build_emitted_levels(
         // path handles only the non-line rows. The chain table's rep rows are
         // added back below with their merged, pre-simplified geometry.
         let coalesce: Option<CoalesceTable> = if coalesce_on && !verbatim {
-            let inputs: Vec<CoalesceInput<'_>> = features
-                .iter()
-                .filter(|f| f.kind == FeatureKind::Line)
-                .map(|f| CoalesceInput {
-                    index: f.index,
-                    geom: &geometries[f.index],
-                    sort_key: f.sort_key,
-                    group: line_groups.as_ref().map_or(0, |g| g[f.index]),
+            let inputs: Vec<CoalesceInput<'_>> = (0..features.len())
+                .filter(|&p| features.kind(p) == FeatureKind::Line)
+                .map(|p| {
+                    let index = features.indices()[p];
+                    CoalesceInput {
+                        index,
+                        geom: &geometries[index],
+                        sort_key: features.sort_key(p),
+                        group: line_groups.as_ref().map_or(0, |g| g[index]),
+                    }
                 })
                 .collect();
             Some(build_level_coalesce_table(
@@ -2894,7 +2896,7 @@ fn build_emitted_levels(
         let member_indices: Vec<usize> = if let Some(table) = &coalesce {
             let mut v: Vec<usize> = member_indices
                 .into_iter()
-                .filter(|&i| features[i].kind != FeatureKind::Line)
+                .filter(|&i| features.kind(i) != FeatureKind::Line)
                 .collect();
             v.extend(table.keys().copied());
             v.sort_unstable();
@@ -3129,23 +3131,26 @@ pub(crate) fn convert_to_overviews_source_strategy(
     let ladder_values = entry_zoom_column_values(options, &input_schema, &full)?;
     let entry = resolve_entry_levels(options, &ladder_values, &level_specs)?;
 
-    let features: Vec<AssignFeature> = geometries
-        .iter()
-        .enumerate()
-        .map(|(i, g)| AssignFeature {
+    // The bbox-derived tallies ride along with the table build (#543): #188
+    // antimeridian suspects, and the #429 losses (outside the CRS range, or
+    // outside the Web Mercator tiling domain). The table keeps center +
+    // squared diagonal, not the bbox, so the tally has to see each bbox here,
+    // while it is in hand. Warns once per kind and refuses to "succeed" into
+    // an empty archive when ~everything is lost.
+    let mut tally = BboxTally::default();
+    let mut features = FeatureTable::with_capacity(geometries.len());
+    for (i, g) in geometries.iter().enumerate() {
+        let bbox = geometry_bbox(g);
+        tally.observe(&bbox, crs, i);
+        features.push(&AssignFeature {
             index: i,
-            bbox: geometry_bbox(g),
+            bbox,
             kind: feature_kind(g),
             sort_key: sort_keys[i],
             entry_level: entry.as_ref().and_then(|e| e[i]),
-        })
-        .collect();
-
-    // One pass over the pass-1 bboxes for every bbox-derived tally: #188
-    // antimeridian suspects, and the #429 losses (outside the CRS range, or
-    // outside the Web Mercator tiling domain). Warns once per kind and
-    // refuses to "succeed" into an empty archive when ~everything is lost.
-    let tallies = tally_feature_bboxes(&features, crs, &|i| rows.locate(i))?;
+        });
+    }
+    let tallies = tally.finish(features.len(), crs, &|i| rows.locate(i))?;
 
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
@@ -3403,7 +3408,7 @@ fn write_emitted_levels(
 /// table, so the two paths agree on every carrier.
 fn in_memory_carriers(
     options: &ConvertOptions,
-    features: &[AssignFeature],
+    features: &FeatureTable,
     row_min_levels: &[u8],
     geometries: &[Geometry<f64>],
     level_specs: &[(f64, Option<u8>)],
@@ -4091,64 +4096,121 @@ pub(super) fn all_lost_error(t: &BboxTallies, total: usize, crs: Crs) -> Option<
     })
 }
 
-/// Tally a pass-1 scan's bboxes, emit the aggregate warnings, and fail when
-/// all but a sliver of the input cannot be tiled (#188, #429).
+/// Streaming accumulator for the pass-1 bbox tallies: #188 antimeridian
+/// suspects plus the #429 losses, folded one kept feature at a time as the
+/// scan produces it.
 ///
-/// Called from both engines at the end of pass 1, where the `AssignFeature`
-/// bboxes exist and nothing has been written yet.
-///
-/// DIVERGENCE FROM THE TICKET'S WORDING: the all-lost check fires here rather
-/// than "at the end of convert". Pass 1 already knows the answer, and failing
-/// here costs no second pass and leaves no half-written overview behind (see
-/// `context/ARCHITECTURE.md`).
-///
-/// `locate` turns a feature's [`AssignFeature::index`] (its position in the
-/// pruned read stream) into the `(part, file row)` an exemplar names (#553);
-/// it is called at most [`OUT_OF_RANGE_EXEMPLAR_CAP`] times.
-pub(super) fn tally_feature_bboxes(
-    features: &[AssignFeature],
-    crs: Crs,
-    locate: &dyn Fn(usize) -> (Option<usize>, usize),
-) -> Result<BboxTallies, ConvertError> {
-    let mut t = BboxTallies::default();
-    for f in features {
-        if bbox_antimeridian_suspect(&f.bbox, crs) {
-            t.antimeridian_suspect += 1;
+/// Before #543 this was `tally_feature_bboxes`, one serial pass over the
+/// retained `Vec<AssignFeature>` after the scan. The pass-1 table is now
+/// column-major and keeps only what assignment needs
+/// ([`super::assign::FeatureTable`]) — the raw `[f64; 4]` bbox is gone by
+/// then, so the tally moved to where the bbox still exists. Same predicates,
+/// same warnings, same all-lost verdict; only the traversal changed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(super) struct BboxTally {
+    antimeridian_suspect: usize,
+    out_of_range: usize,
+    unprojectable: usize,
+    max_abs_out_of_range: f64,
+    /// `(feature index, axis, value)` for the first
+    /// [`OUT_OF_RANGE_EXEMPLAR_CAP`] out-of-range features. The index is
+    /// resolved to a `(part, file row)` pair by [`BboxTally::finish`], once,
+    /// at the end of the scan — the row locator is not available (nor
+    /// thread-safe to call) inside a scan task.
+    exemplars: Vec<(usize, &'static str, f64)>,
+}
+
+impl BboxTally {
+    /// Fold one kept feature's bbox in. Called **while the bbox is in hand**,
+    /// during the scan (#543): the pass-1 feature table no longer retains
+    /// bboxes, so there is nothing to make a second pass over afterwards.
+    pub(super) fn observe(&mut self, bbox: &[f64; 4], crs: Crs, index: usize) {
+        if bbox_antimeridian_suspect(bbox, crs) {
+            self.antimeridian_suspect += 1;
         }
-        if bbox_out_of_crs_range(&f.bbox, crs) {
-            t.out_of_range += 1;
-            t.max_abs_out_of_range = t.max_abs_out_of_range.max(bbox_max_abs(&f.bbox));
-            if t.out_of_range_exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
-                let (axis, value) = out_of_range_coordinate(&f.bbox, crs);
-                let (part, row) = locate(f.index);
-                t.out_of_range_exemplars.push(OutOfRangeExemplar {
-                    part,
-                    row,
-                    axis,
-                    value,
-                });
+        if bbox_out_of_crs_range(bbox, crs) {
+            self.out_of_range += 1;
+            self.max_abs_out_of_range = self.max_abs_out_of_range.max(bbox_max_abs(bbox));
+            if self.exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
+                let (axis, value) = out_of_range_coordinate(bbox, crs);
+                self.exemplars.push((index, axis, value));
             }
-        } else if bbox_unprojectable(&f.bbox, crs) {
-            t.unprojectable += 1;
+        } else if bbox_unprojectable(bbox, crs) {
+            self.unprojectable += 1;
         }
     }
-    let total = features.len();
-    warn_antimeridian_suspects(t.antimeridian_suspect);
-    if let Some(msg) = out_of_range_warning(
-        t.out_of_range,
-        total,
-        crs,
-        t.max_abs_out_of_range,
-        &t.out_of_range_exemplars,
-    ) {
-        log::warn!("{msg}");
+
+    /// Merge a chunk's tally, rebasing its chunk-local exemplar indices by
+    /// `index_base`. Counts are sums and the magnitude is a max, so those are
+    /// order-independent; the exemplars are not, so callers must merge **in
+    /// ascending chunk order** to keep "the first N out-of-range features"
+    /// meaning what it did when one serial pass collected them.
+    pub(super) fn merge(&mut self, other: &BboxTally, index_base: usize) {
+        self.antimeridian_suspect += other.antimeridian_suspect;
+        self.out_of_range += other.out_of_range;
+        self.unprojectable += other.unprojectable;
+        self.max_abs_out_of_range = self.max_abs_out_of_range.max(other.max_abs_out_of_range);
+        for &(index, axis, value) in &other.exemplars {
+            if self.exemplars.len() >= OUT_OF_RANGE_EXEMPLAR_CAP {
+                break;
+            }
+            self.exemplars.push((index + index_base, axis, value));
+        }
     }
-    if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
-        log::warn!("{msg}");
-    }
-    match all_lost_error(&t, total, crs) {
-        Some(e) => Err(e),
-        None => Ok(t),
+
+    /// Resolve the exemplars, emit the aggregate warnings, and fail when all
+    /// but a sliver of the input cannot be tiled (#188, #429).
+    ///
+    /// `locate` turns a feature's index (its position in the pruned read
+    /// stream) into the `(part, file row)` an exemplar names (#553); it is
+    /// called at most [`OUT_OF_RANGE_EXEMPLAR_CAP`] times.
+    ///
+    /// DIVERGENCE FROM THE TICKET'S WORDING: the all-lost check fires at the
+    /// end of pass 1 rather than "at the end of convert". Pass 1 already knows
+    /// the answer, and failing here costs no second pass and leaves no
+    /// half-written overview behind (see `context/ARCHITECTURE.md`).
+    pub(super) fn finish(
+        self,
+        total: usize,
+        crs: Crs,
+        locate: &dyn Fn(usize) -> (Option<usize>, usize),
+    ) -> Result<BboxTallies, ConvertError> {
+        let t = BboxTallies {
+            antimeridian_suspect: self.antimeridian_suspect,
+            out_of_range: self.out_of_range,
+            unprojectable: self.unprojectable,
+            max_abs_out_of_range: self.max_abs_out_of_range,
+            out_of_range_exemplars: self
+                .exemplars
+                .into_iter()
+                .map(|(index, axis, value)| {
+                    let (part, row) = locate(index);
+                    OutOfRangeExemplar {
+                        part,
+                        row,
+                        axis,
+                        value,
+                    }
+                })
+                .collect(),
+        };
+        warn_antimeridian_suspects(t.antimeridian_suspect);
+        if let Some(msg) = out_of_range_warning(
+            t.out_of_range,
+            total,
+            crs,
+            t.max_abs_out_of_range,
+            &t.out_of_range_exemplars,
+        ) {
+            log::warn!("{msg}");
+        }
+        if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
+            log::warn!("{msg}");
+        }
+        match all_lost_error(&t, total, crs) {
+            Some(e) => Err(e),
+            None => Ok(t),
+        }
     }
 }
 
@@ -4307,19 +4369,32 @@ pub(super) fn warn_spill_space(
     }
 }
 
-/// Bytes the pass-1 feature table (`Vec<AssignFeature>`) costs per input row,
+/// Bytes the pass-1 feature table ([`FeatureTable`]) costs per input row,
 /// resident from pass 1's scan through the level assignment (#543 — see
 /// [`super::stream`]'s module doc for the phase this spans).
 ///
-/// Equal to `size_of::<AssignFeature>()`, pinned by the
-/// `pass1_bytes_per_row_matches_struct_size` test below: `index: usize` (8
-/// bytes) + `bbox: [f64; 4]` (32) + `kind: FeatureKind` (1, padded) +
-/// `sort_key: Option<f64>` (16 — `f64` has no spare bit pattern to steal a
-/// niche from, so the discriminant costs a full 8-byte-aligned word, not one
-/// extra byte) + `entry_level: Option<u8>` (padded) round up to a 64-byte,
-/// 8-byte-aligned struct. That is measurably more than a "sum the payload
-/// sizes" guess (~48 bytes): the two `Option` fields cost their alignment
-/// padding, not just their payload.
+/// Equal to [`FeatureTable::MAX_BYTES_PER_ROW`], pinned by the
+/// `pass1_bytes_per_row_matches_the_feature_table` test below (which reads it
+/// back off the allocated capacity of a table filled the way the streaming
+/// engine fills one): `index` (8 bytes) + `center_x` + `center_y` + `diag_sq`
+/// (8 each) + `kind` (1) + `sort_key` (8) + `entry_level` (1). It is the
+/// **worst case** on purpose: the last two columns are allocated only when the
+/// job actually has a sort key (`--sort-key`/`--class-rank`, or a ranking
+/// auto-detected from the schema) or an entry-zoom ladder (`--entry-zoom`), so
+/// a convert with neither carries 33 B/row and one with only a sort key 41 —
+/// but a preflight that under-estimates is worse than useless, so this warns
+/// against the figure a job *could* reach.
+///
+/// #543 item 2 cut this from 64. The array-of-`AssignFeature` table it
+/// replaced stored the raw `[f64; 4]` bbox (assignment wants only its center
+/// and squared diagonal), paid 16 bytes for an `Option<f64>` sort key (`f64`
+/// has no spare bit pattern to steal a niche from, so the discriminant cost a
+/// full 8-byte-aligned word) and 2 for an `Option<u8>`, and then rounded the
+/// whole struct up to a 64-byte, 8-byte-aligned record. Columns pay no
+/// per-row padding, sentinels replace both discriminants, and the two derived
+/// geometry values are computed once at scan time instead of on every level's
+/// pass. Every assignment is bit-identical; see [`FeatureTable`] for the
+/// precision argument and for what was deliberately left at `f64`.
 ///
 /// This is a **lower bound** on the scan-time peak, not the whole of it:
 /// other per-row vectors coexist with the table during the scan — the
@@ -4331,7 +4406,8 @@ pub(super) fn warn_spill_space(
 /// scan (the OOM kill came later, during the winner-grid wave build):
 /// `96,836 MiB × 1,048,576 B/MiB ÷ 1,580,000,000 rows ≈ 64.3 B/row`, i.e.
 /// the table dominated there, but the whole job needed well over 2× that —
-/// see [`PASS1_RECOMMENDED_FACTOR`].
+/// see [`PASS1_RECOMMENDED_FACTOR`]. That same table is 61.8 GiB at today's
+/// 42 B/row (48.5 GiB carrying neither optional column): 32–46 GiB less.
 ///
 /// **Line coalescing is not in this estimate** (nor in the ×
 /// [`PASS1_RECOMMENDED_FACTOR`] total): with coalescing on (the default), a
@@ -4344,23 +4420,41 @@ pub(super) fn warn_spill_space(
 /// not carry, and a row-count-derived upper bound would warn on every small
 /// line input. `docs/guides/scaling.md` gives the sizing
 /// figure to add by hand.
-pub(super) const PASS1_BYTES_PER_ROW: u64 = 64;
+pub(super) const PASS1_BYTES_PER_ROW: u64 = FeatureTable::MAX_BYTES_PER_ROW;
 
 /// The realistic whole-job need as a multiple of the pass-1 feature-table
 /// floor (`rows ×` [`PASS1_BYTES_PER_ROW`]): the table plus the transient
 /// per-row scan vectors, the level-assignment winner grids (#306) and pass
-/// 2's buffered output. Calibrated on the #543 incident: 1.58B rows (a
-/// 94.2 GiB floor) OOM'd at 192 GiB — ≈2.04× the floor — and ran at 360 GiB,
-/// so the factor must sit above 2.04. Crossing it warns; it never fails a run.
+/// 2's buffered output. Crossing it warns; it never fails a run.
 ///
-/// **Left at 2.5 by #565, deliberately.** That ticket removed 40 B/feature from
-/// the density budget's peak (the `Vec<Priority>` it used to hold live across
-/// the whole admission fold — 0.63× this floor on its own), so the true
-/// multiple on the incident job is now *lower* than when 2.5 was calibrated and
-/// the factor is strictly more conservative than before. Lowering it would mean
-/// re-deriving it against a fresh billion-row run, which is the only evidence
-/// that would justify moving a number this one warns on.
-const PASS1_RECOMMENDED_FACTOR: f64 = 2.5;
+/// The calibration is an **absolute** figure, expressed as a multiple. The
+/// #543 incident is the only billion-row evidence there is: 1.58B rows OOM'd
+/// at 192 GiB and ran at 360 GiB, which brackets the whole job's need between
+/// ≈130 and ≈245 B/row. `2.5 × 64 B/row` = 160 B/row sat inside that bracket
+/// and is what the original factor encoded.
+///
+/// **Re-derived by #543 item 2, because the denominator moved.** Shrinking the
+/// feature table takes at least 22 B/row out of the whole-job need (64 → 42;
+/// 31 for a job with neither optional column, 64 → 33) and leaves every other
+/// term of it untouched — the winner grids, the per-row scan vectors and pass
+/// 2's buffers do not care how the table is laid out. Which optional columns
+/// the incident job carried is not recorded, so the saving it would see is
+/// only known to be in that 22–31 B/row range. Taking the smallest saving
+/// gives the largest, i.e. most conservative, *absolute* recommendation:
+/// ≈138 B/row (160 − 22). The multiple must RISE to keep saying the same
+/// thing: `138 / 42 ≈ 3.3`. Leaving it at 2.5 would have quietly cut the
+/// recommendation from 160 to 105 B/row and stopped warning about the very
+/// job that motivated the ticket (1.58B rows under 192 GiB:
+/// `61.8 GiB × 2.5 = 155 GiB`, which "fits"). At 3.3 that job warns again —
+/// `61.8 × 3.3 = 204 GiB` > 192 — and the 360 GiB box that worked still
+/// passes quietly, which is the behaviour #543 asked for and the behaviour
+/// `pass1_memory_verdict_warns_for_the_field_incident` pins.
+///
+/// (#565's removal of the density budget's 40 B/feature `Vec<Priority>` is
+/// *not* folded in here for the same reason it was not folded in then: it
+/// makes the figure more conservative, not less, and moving a number that
+/// warns needs a fresh billion-row run, not arithmetic.)
+const PASS1_RECOMMENDED_FACTOR: f64 = 3.3;
 
 /// Escape hatch (#543): downgrades the pass-1 memory-floor hard error to a
 /// warning, for setups where the estimate or the probe is known to be wrong
@@ -6373,18 +6467,23 @@ mod tests {
         );
     }
 
-    /// `tally_feature_bboxes` collects the first [`OUT_OF_RANGE_EXEMPLAR_CAP`]
+    /// [`BboxTally`] collects the first [`OUT_OF_RANGE_EXEMPLAR_CAP`]
     /// out-of-range rows and their offending coordinate — and stops there,
     /// so a run with millions of offenders does not grow an unbounded `Vec`.
     #[test]
-    fn tally_feature_bboxes_caps_exemplars_and_names_rows() {
+    fn bbox_tally_caps_exemplars_and_names_rows() {
         let mut features = vec![point_feature(0, 10.0, 10.0)]; // in range
                                                                // Five out-of-range dateline features at rows 1, 2, 3, 4, 5.
         for row in 1..=5usize {
             features.push(point_feature(row, 180.0 + row as f64 * 0.1, 10.0));
         }
-        let tallies =
-            tally_feature_bboxes(&features, Crs::Epsg4326, &|i| (None, i)).expect("not all lost");
+        let mut tally = BboxTally::default();
+        for f in &features {
+            tally.observe(&f.bbox, Crs::Epsg4326, f.index);
+        }
+        let tallies = tally
+            .finish(features.len(), Crs::Epsg4326, &|i| (None, i))
+            .expect("not all lost");
         assert_eq!(tallies.out_of_range, 5);
         assert_eq!(
             tallies.out_of_range_exemplars.len(),
@@ -6668,15 +6767,87 @@ mod tests {
         assert!(spill_space_check(true, 10 << 30, dir, |_| Some(1)).is_some());
     }
 
-    /// #543: [`PASS1_BYTES_PER_ROW`] must track `AssignFeature`'s actual
-    /// in-memory layout size exactly. If this fails, `AssignFeature` grew or
-    /// shrank and the #543 estimate (and its incident cross-check) needs
-    /// recalibrating against the new size.
+    /// #543: [`PASS1_BYTES_PER_ROW`] must track what a filled
+    /// [`FeatureTable`] actually **allocates** per row — read off each
+    /// column's `capacity()` after the fill the streaming engine performs
+    /// (reserve from the footer count, append the scan's chunk tables, then
+    /// set the sort keys and entry levels once the scan is done), not restated
+    /// from the element widths. So capacity slack in that fill — a column
+    /// grown by doubling instead of reserved or allocated exactly — fails
+    /// here. If it fails, either the fill regressed or the table's columns
+    /// changed and the #543 estimate (its incident cross-check, the preflight
+    /// wording and `docs/guides/scaling.md`) needs
+    /// recalibrating against the new figure.
     #[test]
-    fn pass1_bytes_per_row_matches_struct_size() {
+    fn pass1_bytes_per_row_matches_the_feature_table() {
+        const ROWS: usize = 4_096;
+        const CHUNK: usize = 1_000; // deliberately not a divisor of ROWS
+        let fill = |sort_key: bool, entry_level: bool| {
+            let mut table = FeatureTable::new();
+            table.try_reserve_exact(ROWS).expect("reserve");
+            let mut base = 0;
+            while base < ROWS {
+                let n = CHUNK.min(ROWS - base);
+                let mut chunk = FeatureTable::with_capacity(n);
+                for i in 0..n {
+                    chunk.push(&AssignFeature {
+                        index: i,
+                        bbox: [0.0, 0.0, 1.0, 1.0],
+                        kind: FeatureKind::Polygon,
+                        sort_key: None,
+                        entry_level: None,
+                    });
+                }
+                table.append_rebased(&chunk, base);
+                base += n;
+            }
+            for pos in 0..ROWS {
+                if sort_key {
+                    table.set_sort_key(pos, Some(pos as f64));
+                }
+                if entry_level {
+                    table.set_entry_level(pos, Some(1));
+                }
+            }
+            assert_eq!(table.len(), ROWS);
+            table.allocated_bytes() as f64 / ROWS as f64
+        };
+        let worst = fill(true, true);
         assert_eq!(
-            std::mem::size_of::<AssignFeature>() as u64,
-            PASS1_BYTES_PER_ROW
+            worst, PASS1_BYTES_PER_ROW as f64,
+            "a table with both optional columns must allocate PASS1_BYTES_PER_ROW"
+        );
+        assert_eq!(PASS1_BYTES_PER_ROW, 42, "the documented #543 figure");
+        assert_eq!(
+            fill(true, false),
+            41.0,
+            "a sort key (explicit or auto-detected), no ladder"
+        );
+        assert_eq!(fill(false, false), 33.0, "no sort key, no ladder");
+        // The preflight must never under-estimate: no fill can cost more.
+        for (k, e) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(
+                fill(k, e) <= PASS1_BYTES_PER_ROW as f64,
+                "sort_key={k} entry_level={e}"
+            );
+        }
+
+        // The measurement sees slack: a table grown by `push` with no
+        // reservation allocates more than its rows occupy. Without this, the
+        // assertions above could pass by restating the element widths.
+        let mut grown = FeatureTable::new();
+        for i in 0..=ROWS {
+            grown.push(&AssignFeature {
+                index: i,
+                bbox: [0.0, 0.0, 1.0, 1.0],
+                kind: FeatureKind::Point,
+                sort_key: None,
+                entry_level: None,
+            });
+        }
+        assert!(
+            grown.allocated_bytes() > grown.heap_bytes(),
+            "a push-grown table must show capacity slack"
         );
     }
 
@@ -6686,38 +6857,42 @@ mod tests {
         Some(MemoryLimit { bytes, source })
     }
 
-    /// #543: the verdict's boundaries — the realistic need (floor × 2.5)
-    /// over the figure warns; the floor strictly over a HARD limit errors;
-    /// an unknown limit never fails.
+    /// #543: the verdict's boundaries — the realistic need
+    /// (floor × [`PASS1_RECOMMENDED_FACTOR`]) over the figure warns; the floor
+    /// strictly over a HARD limit errors; an unknown limit never fails.
     #[test]
     fn pass1_memory_verdict_thresholds() {
         let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
-        // 10 rows: floor 640 B, need 1,600 B.
+        // 10 rows: floor `10 × PASS1_BYTES_PER_ROW`, need that × the factor.
+        // Derived, not written down, so a change to either constant moves the
+        // boundaries with it instead of failing here for the wrong reason.
+        let floor = 10 * PASS1_BYTES_PER_ROW;
+        let need = (floor as f64 * PASS1_RECOMMENDED_FACTOR).ceil() as u64;
         assert_eq!(
-            pass1_memory_verdict(10, hard(1_600), false),
+            pass1_memory_verdict(10, hard(need), false),
             Pass1MemoryVerdict::Fits
         );
         assert_eq!(
-            pass1_memory_verdict(10, hard(1_599), false),
+            pass1_memory_verdict(10, hard(need - 1), false),
             Pass1MemoryVerdict::Warn {
-                estimated_bytes: 640,
-                limit: hard(1_599).unwrap(),
+                estimated_bytes: floor,
+                limit: hard(need - 1).unwrap(),
             }
         );
         // Floor exactly at the hard limit: still only warns.
         assert_eq!(
-            pass1_memory_verdict(10, hard(640), false),
+            pass1_memory_verdict(10, hard(floor), false),
             Pass1MemoryVerdict::Warn {
-                estimated_bytes: 640,
-                limit: hard(640).unwrap(),
+                estimated_bytes: floor,
+                limit: hard(floor).unwrap(),
             }
         );
         // Strictly over the hard limit: errors.
         assert_eq!(
-            pass1_memory_verdict(10, hard(639), false),
+            pass1_memory_verdict(10, hard(floor - 1), false),
             Pass1MemoryVerdict::Exceeds {
-                estimated_bytes: 640,
-                limit_bytes: 639,
+                estimated_bytes: floor,
+                limit_bytes: floor - 1,
             }
         );
         assert_eq!(
@@ -6739,7 +6914,7 @@ mod tests {
             assert_eq!(
                 pass1_memory_verdict(1_000, mem_limit(1, source), false),
                 Pass1MemoryVerdict::Warn {
-                    estimated_bytes: 64_000,
+                    estimated_bytes: 1_000 * PASS1_BYTES_PER_ROW,
                     limit: mem_limit(1, source).unwrap(),
                 },
                 "{source:?} must be warn-only"
@@ -6763,10 +6938,15 @@ mod tests {
         assert!(preflight_pass1_memory(1_000, limit, false, true).is_ok());
     }
 
-    /// #543 review (S2-2): the motivating incident — 1.58B rows (a 94.2 GiB
-    /// floor) OOM'd under a 192 GiB hard limit — must warn (its realistic
-    /// need, ×2.5 ≈ 235 GiB, is over 192 GiB) without hard-erroring (the
-    /// floor fits), and the 360 GiB box that worked must pass quietly.
+    /// #543 review (S2-2): the motivating incident — 1.58B rows OOM'd under a
+    /// 192 GiB hard limit — must warn (its realistic need, a 61.8 GiB table
+    /// floor × [`PASS1_RECOMMENDED_FACTOR`] ≈ 204 GiB, is over 192 GiB)
+    /// without hard-erroring (the floor fits), and the 360 GiB box that
+    /// worked must pass quietly.
+    ///
+    /// This is the test that keeps #543 item 2 honest: shrinking the table
+    /// without re-deriving [`PASS1_RECOMMENDED_FACTOR`] would silence the
+    /// warning on the exact job the ticket exists for.
     #[test]
     fn pass1_memory_verdict_warns_for_the_field_incident() {
         let rows = 1_580_000_000u64;
@@ -6790,8 +6970,8 @@ mod tests {
     }
 
     /// #543: the warning names the concrete numbers, the source of the
-    /// figure it was judged against, the ×2.5 need, the right remediation
-    /// and the sizing doc.
+    /// figure it was judged against, the ×[`PASS1_RECOMMENDED_FACTOR`] need,
+    /// the right remediation and the sizing doc.
     #[test]
     fn pass1_memory_warn_message_names_numbers_source_and_doc() {
         let rows = 1_580_000_000u64;
@@ -6802,8 +6982,8 @@ mod tests {
         let msg = pass1_memory_warn_message(rows, rows * PASS1_BYTES_PER_ROW, limit, false);
         for want in [
             "1580000000 input row(s)",
-            "94.2 GiB",
-            "≳235.4 GiB",
+            "61.8 GiB",
+            "≳203.9 GiB",
             "192.0 GiB available memory (MemAvailable)",
             "bigger box",
             "does not avoid this",
@@ -6834,17 +7014,17 @@ mod tests {
     }
 
     /// #543: the hard-error message names the concrete numbers, the hard
-    /// limit, the ×2.5 need, the right remediation, and the escape hatch
-    /// verbatim.
+    /// limit, the ×[`PASS1_RECOMMENDED_FACTOR`] need, the right remediation,
+    /// and the escape hatch verbatim.
     #[test]
     fn pass1_memory_floor_message_names_numbers_doc_and_escape_hatch() {
         let rows = 1_580_000_000u64;
         let msg = pass1_memory_floor_message(&rows, &(rows * PASS1_BYTES_PER_ROW), &(64 << 30));
         for want in [
             "1580000000 input row(s)",
-            "94.2 GiB",
+            "61.8 GiB",
             "64.0 GiB cgroup hard memory limit (memory.max)",
-            "≳235.4 GiB: use a bigger box",
+            "≳203.9 GiB: use a bigger box",
             "does not avoid this",
             "--plan",
             "docs/guides/scaling.md",
@@ -6902,8 +7082,10 @@ mod tests {
             Some("cgroup hard memory limit (memory.max)")
         );
 
-        // Floor fits, ×2.5 total does not → warned, not failed.
-        let warned = preflight_pass1_memory(10, hard(1_599), false, false).unwrap();
+        // Floor fits, the ×PASS1_RECOMMENDED_FACTOR total does not → warned,
+        // not failed.
+        let need = (10.0 * PASS1_BYTES_PER_ROW as f64 * PASS1_RECOMMENDED_FACTOR).ceil() as u64;
+        let warned = preflight_pass1_memory(10, hard(need - 1), false, false).unwrap();
         assert_eq!(warned.outcome, Pass1MemoryOutcome::Warned);
 
         // Over a hard limit, but the hatch is set.
