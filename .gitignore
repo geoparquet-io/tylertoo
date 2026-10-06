@@ -75,3 +75,6 @@ site/
 
 # pinned go-pmtiles binary (scripts/setup_go_pmtiles.sh)
 .tools/
+
+# Serena (AI code-navigation tool) state; not used by this project
+.serena/
