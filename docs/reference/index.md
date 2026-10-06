@@ -16,5 +16,5 @@ The surfaces are not one to one. The CLI has `decode`, `stats`, `pyramid`,
 `merge`, and `shard-plan`; the Python module does not expose them yet.
 
 For a guided path through the main commands, start with the
-[CLI tutorial](../tutorials/cli.md) or the
-[Python tutorial](../tutorials/python.md).
+[Madagascar tutorial](../tutorials/madagascar.md) or the
+[Brazil tutorial](../tutorials/brazil.md).

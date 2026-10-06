@@ -1,1 +1,0 @@
---8<-- "examples/python-madagascar/README.md"

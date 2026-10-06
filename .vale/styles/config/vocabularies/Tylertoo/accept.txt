@@ -132,3 +132,9 @@ thinning's
 fokontany
 Ihosy
 Mahabo
+# Brazil place names in the examples
+Sorriso
+Mato
+Grosso
+Goiás
+Sul

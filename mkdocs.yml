@@ -72,8 +72,8 @@ not_in_nav: |
 nav:
   - Home: index.md
   - Tutorials:
-      - CLI: tutorials/cli.md
-      - Python: tutorials/python.md
+      - Madagascar boundaries: tutorials/madagascar.md
+      - Brazil fields from the cloud: tutorials/brazil.md
   - Guides:
       - Remote and multi-file inputs: guides/remote-and-multi-file.md
       - Sharded builds across a fleet: guides/sharded-builds.md

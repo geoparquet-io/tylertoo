@@ -49,9 +49,9 @@ Prebuilt CLI binaries for Linux, macOS, and Windows are attached to every
 
 The [documentation site](https://geoparquet-io.github.io/tylertoo/) has:
 
-- Two end-to-end tutorials, for the
-  [CLI](https://geoparquet-io.github.io/tylertoo/tutorials/cli/) and for
-  [Python](https://geoparquet-io.github.io/tylertoo/tutorials/python/)
+- Two end-to-end tutorials:
+  [a local file, from raw export to PMTiles](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/),
+  and [cloud data into a sharded, two-layer archive](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
 - Guides to remote inputs, sharded builds, memory limits, and tippecanoe
 - The [CLI](https://geoparquet-io.github.io/tylertoo/reference/cli/),
   [Python](https://geoparquet-io.github.io/tylertoo/reference/python/), and

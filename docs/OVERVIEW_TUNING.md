@@ -1799,7 +1799,7 @@ binary column) is dropped with one warning per column, listed in the export
 report's `skipped_property_columns`, and rejected by name if
 `--include-property` asks for it; `--exclude-property` naming it silences
 the warning. The full type table is in
-[preparing input](tutorials/cli.md#1-prepare-the-input).
+[preparing input](tutorials/madagascar.md#1-prepare-the-input).
 
 ---
 

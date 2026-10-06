@@ -59,8 +59,8 @@ many partition objects.
 intersects the box, in lon/lat degrees. Row groups outside the box are pruned at
 the footer, so a city-sized window from a country file reads a fraction of the
 data and, on remote input, downloads a fraction of the bytes. The
-[CLI tutorial's preview step](../tutorials/cli.md#2-preview-one-region) uses it
-to build an Antananarivo overview from a country file.
+[Brazil fields tutorial](../tutorials/brazil.md) uses it
+to read a 20 km window out of three state files.
 
 ### Filtering by attribute
 

@@ -1,4 +1,4 @@
-# CLI tutorial: Madagascar admin boundaries
+# Madagascar boundaries: from a raw export to PMTiles
 
 This tutorial takes one real file from a raw export to a PMTiles archive you
 can drop on a map, using only the command line. Along the way it builds the
@@ -8,7 +8,7 @@ that holds every zoom level of your data and stays queryable.
 The input is 17,465 admin-4 boundary polygons for Madagascar (28 MB), from
 the [fieldmaps.io](https://fieldmaps.io/) global boundaries. Each step below
 is a script in
-[`examples/cli-madagascar/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/cli-madagascar).
+[`examples/madagascar-boundaries/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/madagascar-boundaries).
 CI runs every script on each pull request and checks that this page shows the
 same code and the same output.
 
@@ -183,8 +183,8 @@ Validating madagascar-ov.parquet
 The table shows the idea in ten lines. At 19.6 km per pixel, 40 of the 17,465
 polygons survive. The count roughly doubles with each zoom, and level 9 holds
 all of them at full detail. The file is still ordinary GeoParquet, so any
-Parquet reader opens it. The [Python tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/python/)
-queries it with DuckDB.
+Parquet reader opens it. The [Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
+queries one with DuckDB.
 
 ## 4. Export PMTiles
 
@@ -279,7 +279,7 @@ fresh one:
 git clone https://github.com/geoparquet-io/tylertoo.git
 mkdir madagascar
 cd madagascar
-for step in ../tylertoo/examples/cli-madagascar/0*.sh; do
+for step in ../tylertoo/examples/madagascar-boundaries/0*.sh; do
   bash "$step"
 done
 ```
@@ -289,9 +289,8 @@ done
 - One command does steps 3 and 4 when you do not need the overview file:
   `tylertoo prepared.parquet madagascar.pmtiles --max-zoom 10`. Add
   `--keep-overview madagascar-ov.parquet` to keep it anyway.
-- The [Python tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/python/)
-  runs the same pipeline from Python and queries the overview with DuckDB.
-- The [guides](https://geoparquet-io.github.io/tylertoo/guides/remote-and-multi-file/)
-  cover remote inputs, sharded builds, and memory limits.
+- The [Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
+  reads cloud data with `--files-from`, `--bbox`, and `--filter`, splits the
+  tiling across shards, and combines two layers with `pyramid`.
 - The [CLI reference](https://geoparquet-io.github.io/tylertoo/reference/cli/)
   lists every flag with its default.

@@ -34,7 +34,7 @@ def _step_id(param: tuple[Path, Path]) -> str:
 
 def test_examples_exist() -> None:
     """Both tutorials ship, and each has steps to run."""
-    assert {p.name for p in EXAMPLES} >= {"cli-madagascar", "python-madagascar"}
+    assert {p.name for p in EXAMPLES} >= {"madagascar-boundaries", "brazil-fields"}
     for example in EXAMPLES:
         assert (example / "README.md").is_file(), f"{example.name} has no README"
         assert example_steps(example), f"{example.name} has no steps"
