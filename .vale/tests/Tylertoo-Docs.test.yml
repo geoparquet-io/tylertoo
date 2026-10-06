@@ -1,0 +1,13 @@
+# Cases for the Tylertoo-Docs rules, run by `vale test` (Vale >= 3.24).
+# They live outside StylesPath so older Vale releases, which reject a
+# rule's `tests:` key, can still load the styles.
+
+- name: Sentence26 flags the pattern
+  rule: ../styles/Tylertoo-Docs/Sentence26.yml
+  input: "word word word word word word word word word word word word word word word word word word word word word word word word word word word."
+  contains: Tylertoo-Docs.Sentence26
+
+- name: Sentence26 leaves clean prose alone
+  rule: ../styles/Tylertoo-Docs/Sentence26.yml
+  input: "word word word word word word word word word word word word word word word word word word word word word word word word word word."
+  absent: Tylertoo-Docs.Sentence26

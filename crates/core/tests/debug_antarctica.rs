@@ -1,6 +1,6 @@
-//! Debug test to find which tile(s) cause i_overlay issues (if any).
+//! Debug test to find which tile(s) cause `i_overlay` issues (if any).
 //!
-//! Run with: cargo test --release -p tylertoo-core --test debug_antarctica -- --nocapture
+//! Run with: cargo test --release -p tylertoo-core --test `debug_antarctica` -- --nocapture
 
 use geo::MultiPolygon;
 use std::fs::File;

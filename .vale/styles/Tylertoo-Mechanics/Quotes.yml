@@ -1,0 +1,7 @@
+extends: existence
+message: "Use straight quotes in source, not '%s'."
+level: warning
+scope: text
+nonword: true
+raw:
+  - '[“”‘’]'

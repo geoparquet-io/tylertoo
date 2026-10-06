@@ -31,12 +31,12 @@
 //!    continue each other within that deviation of straight merge
 //!    best-pair first (stroke building).
 //! 3. The merged feature takes the attributes of its **highest-priority
-//!    member** (the same [`Priority`] order the cell-winner stage uses),
+//!    member** (the same `Priority` order the cell-winner stage uses),
 //!    and records the number of merged source segments
 //!    (`coalesced_count`, 1 for unmerged).
 //! 4. The **visibility gate** and **cell-winner thinning** then run on the
 //!    merged chains (gate on the chain's bbox diagonal; one chain per
-//!    `line_thinning × GSD` grid cell, best [`Priority`] wins).
+//!    `line_thinning × GSD` grid cell, best `Priority` wins).
 //!
 //! The canonical level is NEVER coalesced (spec §2.4 value fidelity), and
 //! coalescing is INERT in partitioning mode (merged geometries violate
@@ -64,7 +64,7 @@
 //!
 //! Segments are processed in input order; joins are a pure function of the
 //! endpoint grid; walk starts are chosen by smallest feature index; ties in
-//! gating/thinning fall back to the strict [`Priority`] total order. No
+//! gating/thinning fall back to the strict `Priority` total order. No
 //! result depends on hash-map iteration order.
 
 use std::borrow::Cow;
@@ -83,8 +83,9 @@ pub const COALESCED_COUNT_COLUMN: &str = "coalesced_count";
 /// one ground sample distance are indistinguishable at the level.
 pub const DEFAULT_SNAP_GSD_FACTOR: f64 = 1.0;
 
-/// Default junction continuation threshold, in degrees. **`0` = OFF**
-/// (strict degree-2 chaining): the maintainer's Portland junction-angle
+/// Default junction continuation threshold, in degrees.
+///
+/// **`0` = OFF** (strict degree-2 chaining): the maintainer's Portland junction-angle
 /// sweep (`corpus/data/bench/q3/portland-roads-junction{00,30}.pmtiles`,
 /// reviewed 2026-07-03) found strict degree-2 chaining renders better —
 /// junction continuation over-merges. The knob remains available
@@ -93,8 +94,9 @@ pub const DEFAULT_SNAP_GSD_FACTOR: f64 = 1.0;
 /// their deviation from a straight continuation is at most the angle.
 pub const DEFAULT_JUNCTION_ANGLE_DEG: f64 = 0.0;
 
-/// Default per-level candidate-row ceiling above which coalescing is
-/// skipped (bounded-memory guard; see `docs/OVERVIEW_TUNING.md`). Chaining
+/// Default per-level candidate-row ceiling above which coalescing is skipped.
+///
+/// This is a bounded-memory guard; see `docs/OVERVIEW_TUNING.md`. Chaining
 /// needs the level's line geometries in memory at once; levels larger than
 /// this are near-canonical, where segments are individually visible and
 /// coalescing matters least.
@@ -234,8 +236,9 @@ impl Default for CoalesceParams {
     }
 }
 
-/// Coalesce one level's candidate lines: chain within compatibility groups
-/// through endpoint nodes (degree-2 always; junction continuation per
+/// Coalesce one level's candidate lines.
+///
+/// The lines chain within compatibility groups through endpoint nodes (degree-2 always; junction continuation per
 /// [`CoalesceParams::junction_angle_deg`]), then apply the visibility gate,
 /// cell-winner thinning, and the optional chain budget. Returns the
 /// surviving chains ordered by ascending `rep` index.
@@ -245,6 +248,11 @@ impl Default for CoalesceParams {
 ///   singleton (degenerate; callers pass canonical levels elsewhere).
 /// - `config`: the assignment configuration; `line_visibility`,
 ///   `line_thinning`, and `sort_direction` are used.
+///
+/// # Panics
+///
+/// Does not panic in practice: the chain builder never yields a chain without
+/// members.
 pub fn coalesce_level_lines(
     lines: &[CoalesceInput<'_>],
     gsd_m: f64,
@@ -1256,7 +1264,7 @@ mod tests {
 /// priorities) with the claim that output is unchanged. This pins that claim:
 /// 1500 seeded hostile cases (shared endpoints of degree 2 to 4+, duplicate
 /// and reversed-duplicate lines, zero-length and one-vertex lines, closed
-/// self-touching rings, repeated vertices, MultiLineStrings, antimeridian
+/// self-touching rings, repeated vertices, `MultiLineStrings`, antimeridian
 /// coordinates, NaN/inf/-0.0, mixed groups and sort keys, shuffled indices,
 /// every junction/snap/budget/gate setting) digest to the value the
 /// pre-#570 builder produced. The same generator was also run for 40,000

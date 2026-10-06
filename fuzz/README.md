@@ -12,10 +12,11 @@ member of the root workspace and never affects `cargo build/check/test
 | `pmtiles_header` | `pmtiles_writer::Header::from_bytes` — the 127-byte header of any archive handed to `decode`, `merge` or `--band`; a header that parses must re-parse after `to_bytes` | the golden fixtures' headers |
 | `pmtiles_directory` | `pmtiles_writer::decode_directory` — root and leaf directories (#397's class of bug); a directory that decodes must round-trip through `encode_directory` | the golden fixtures' root directories, decompressed |
 | `mvt_decode` | `decode::fuzz_decode_tile` → `decode_tile_features` — one uncompressed MVT tile body; the first input byte picks the zoom (`z & 31`) | three tiles per golden fixture, decompressed, zoom byte prepended |
+| `geoparquet_wkb` | `batch_processor::fuzz_geoparquet_wkb` → `extract_geometries_opt_from_array` over a one-row `geoarrow.wkb` array — each value of a GeoParquet WKB geometry column, decoded by the `wkb` crate behind `wkb_column::check_wkb_value` (#632); panics if the check and the reader disagree about a value | #632's two crash inputs, a MultiPoint whose last member sets the SRID flag, and one valid value per OGC type |
 | `band_archive` | `pyramid::fuzz_band_archive` → `BandArchive::open` + `for_each_tile` — a whole archive as `--band` input, through the directory-walk budgets and the decompression caps (#417) | `open-buildings.pmtiles` (31 KB) |
 | `filter_expr` | `overview::filter::parse_filter` — the `--filter` grammar (recursive descent; deep nesting must be an error, not a stack overflow) | a handful of expressions |
 | `footer_json` | `overview::level::OverviewsMeta::from_json` — the `overviews` footer JSON read verbatim from any input file | none |
-| `wkb` | `wkb::wkb_to_geometry` — WKB geometry blobs read verbatim from any input file | none |
+| `wkb` | `wkb::wkb_to_geometry` — the WKB coalesce lines stored in a saved `--plan` file. GeoParquet geometry columns are decoded by geoarrow and the `wkb` crate instead, which this target does not reach | one of each of the seven OGC types, a ZM point, and #623's oversized-count crash |
 
 `mvt_decode` and `band_archive` reach code that is private on purpose
 through `#[doc(hidden)]` hooks in core gated on the `fuzzing` cargo feature

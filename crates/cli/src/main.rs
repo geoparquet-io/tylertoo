@@ -207,11 +207,10 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
     Ok(bbox)
 }
 
-/// Top-level CLI: a default (bare) tile pipeline plus subcommands.
+/// Convert GeoParquet to PMTiles vector tiles and multi-resolution
+/// overviews.
 ///
-/// `tylertoo input.parquet output.pmtiles` still works (bare tile pipeline);
-/// `tylertoo tiles ...` is the explicit form, and `overview` / `validate`
-/// are the GeoParquet-overview subcommands.
+/// `tylertoo INPUT OUTPUT` with no subcommand runs `tiles`.
 #[derive(Parser, Debug)]
 #[command(
     name = "tylertoo",
@@ -225,41 +224,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate PMTiles vector tiles (the default pipeline).
+    /// Generate PMTiles vector tiles from GeoParquet (the default command).
     Tiles(Box<TilesArgs>),
     /// Build a multi-resolution overview GeoParquet file.
     Overview(Box<OverviewArgs>),
-    /// Validate a GeoParquet overview file against the spec (§6.2).
+    /// Check a GeoParquet overview file against the overviews spec.
     Validate(ValidateArgs),
-    /// Export a PMTiles archive from an overview GeoParquet file (Plan E0).
+    /// Export a PMTiles archive from an overview GeoParquet file.
     ExportPmtiles(ExportPmtilesArgs),
     /// Decode a PMTiles vector-tile archive back to GeoParquet.
     Decode(DecodeArgs),
-    /// Per-zoom tile-weight report for a PMTiles archive (issue #552).
-    ///
-    /// For each zoom: tile count, total, mean, p50, p99 and max tile size, plus
-    /// the largest individual tiles (`--largest N`). Sizes are STORED
-    /// (compressed) bytes per addressed tile, read from the directory entries
-    /// alone -- no tile is decompressed or even read. Run-length members and
-    /// deduplicated tiles each count at the full length of their shared body,
-    /// so `tiles x mean` (the `total` column) is the bytes a client would
-    /// fetch and can exceed the archive's size on disk.
-    ///
-    /// Percentiles are nearest-rank: pN is the smallest size such that at
-    /// least ceil(N/100 x tiles) of the zoom's tiles are no larger. Largest
-    /// tiles are ordered by size descending, ties by ascending PMTiles tile
-    /// id (lower zoom first, then Hilbert order).
-    ///
-    /// Memory and time are proportional to the archive's directory entries,
-    /// not its tile count: runs are aggregated with their multiplicity, never
-    /// expanded.
+    /// Report per-zoom tile sizes for a PMTiles archive, from its
+    /// directory alone.
     Stats(StatsArgs),
-    /// Build a multi-band pyramid: several inputs, each owning a zoom range,
-    /// one archive (issue #345).
+    /// Build one archive from several inputs, each owning a zoom range.
     Pyramid(PyramidArgs),
-    /// Concatenate disjoint PMTiles archives into one (issue #498).
+    /// Combine PMTiles archives that hold disjoint tiles into one.
     Merge(MergeArgs),
-    /// Cut a dataset's tile space into N disjoint shards (issue #498).
+    /// Cut a dataset's tile space into N disjoint shards for a sharded build.
     ShardPlan(ShardPlanArgs),
     /// Emit the full CLI reference as Markdown (docs generator, hidden).
     ///
@@ -273,127 +255,44 @@ enum Command {
 
 /// Arguments for `tylertoo pyramid`.
 ///
-/// A pyramid serves the same map from a *different input* at different zooms:
-/// coarse zooms read a pre-aggregated summary, fine zooms read the raw
-/// features. That is not the generalization ladder — a coarse aggregate is a
-/// different aggregation, not a thinned sample of the fine one — which is why
-/// a band is tiled verbatim by default.
-///
-/// A band may point at GeoParquet (tiled here, one shot) or at a PMTiles
-/// archive already covering that range (merged as-is). The kind is detected
-/// from the file, so both spellings are just `--band LO-HI:PATH[:LAYER]`. A
-/// pre-tiled archive does not have to match the declared range exactly: it
-/// may hold MORE zooms than the band declares (a subrange — see
-/// `--allow-missing-zooms` for the reverse, an archive holding FEWER).
+/// The band rules are documented in the pyramid section of
+/// `docs/OVERVIEW_TUNING.md`.
 #[derive(Parser, Debug)]
 pub struct PyramidArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,
 
-    /// A band: `LO-HI:INPUT[:LAYER]`, repeatable.
-    ///
-    /// INPUT is either a GeoParquet source — tiled here, restricted to this
-    /// band's zoom range — or a PMTiles archive already covering that range,
-    /// which is merged as-is. For a pre-tiled archive the declared LO-HI does
-    /// not have to equal the archive's own zoom range exactly: an archive
-    /// that holds MORE zooms than LO-HI is a subrange — the documented way to
-    /// split one pre-tiled archive across several bands (e.g. two `--band`
-    /// entries pointing at the same z0-z13 archive, one declaring z0-5 and
-    /// the other z6-13) — and is accepted quietly. An archive that holds
-    /// FEWER zooms than LO-HI is an error by default: those missing zooms
-    /// would render silently empty, almost always because LO-HI disagrees
-    /// with what the archive was actually tiled with; pass
-    /// `--allow-missing-zooms` for a deliberately sparse pyramid. A LO-HI
-    /// that shares no zoom at all with the archive is always an error,
-    /// regardless of that flag. Which kind of INPUT this is is detected from
-    /// the file, not the extension. A source may be remote (`https://`,
-    /// `s3://`, `gs://`), read with byte-range requests like every other
-    /// subcommand's input; a band ARCHIVE must be local, since the merge
-    /// reads it by offset.
-    ///
-    /// LAYER defaults to the file stem, and several bands may share one layer
-    /// name (the usual case: a coarse and a fine aggregate that are the same
-    /// layer to a client). Two bands in the SAME layer must not share a zoom
-    /// -- they would write the same tile ids. Bands in DIFFERENT layers may
-    /// (tippecanoe's -L): at the zooms they share, each tile carries every
-    /// band's layer, so `--band 0-13:a.parquet:2024 --band 0-13:b.parquet:2025
-    /// --generalize` is one archive with two independently generalized
-    /// layers. The per-tile size cap applies to each band's tiles before
-    /// they are combined, not to the combined tile. For a pre-tiled archive
-    /// LAYER is a label: when bands share zooms it must match the layer
-    /// name inside the archive, or the merge is refused rather than write
-    /// two layers of one name into a tile.
-    ///
-    /// Bands are emitted coarsest-first in the merged archive regardless of
-    /// listing order.
-    ///
-    /// Colons in INPUT: the LAYER is only split off the LAST `:` when what
-    /// follows it has no `/`, `\` or `:`, so a URL, a Windows drive and a
-    /// `2024:06/` directory stay whole. A drive-relative path with no `\`
-    /// after the drive, e.g. `C:data.parquet`, also stays whole: a single
-    /// ASCII letter before the last `:` is treated as a drive letter, not a
-    /// path, even though `data.parquet` alone would otherwise look like a
-    /// bare layer name. For the inputs that rule cannot express — one ENDING
-    /// in a bare colon segment, e.g. a Hive directory
-    /// `admin:country_code=BR` — spell the band `LO-HI=INPUT[=LAYER]`
-    /// instead: the range is split at the first `=` and the LAYER at the
-    /// last, again only when the segment after it has no `/`, `\` or `:`. An
-    /// INPUT that itself ends in `=VALUE` needs an explicit `=LAYER`.
+    /// One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a
+    /// GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and
+    /// `LAYER` defaults to its file stem. The tuning guide covers the colon
+    /// rules and the `LO-HI=INPUT[=LAYER]` form:
+    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
 
-    /// Generalize each GeoParquet band with the normal ladder instead of
-    /// tiling it verbatim.
-    ///
-    /// Off by default: a band's premise is that its input is already the right
-    /// resolution for the zooms it owns, so thinning and simplifying it would
-    /// re-introduce exactly what banding avoids. Pass this when a band is raw
-    /// features spanning several zooms and you do want the ladder inside it.
+    /// Generalize each GeoParquet band instead of tiling it verbatim. Use
+    /// for raw features spanning several zooms.
     #[arg(long)]
     pub generalize: bool,
 
-    /// Per-tile MVT size cap for bands tiled here (e.g. "500K"). Unset means
-    /// no cap, matching the verbatim default: a valve that sheds features to
-    /// fit a byte budget would drop cells the band exists to draw.
+    /// Per-tile MVT size cap for bands tiled here, such as `500K`. Unset
+    /// means no cap, preserving every cell in the band.
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     pub max_tile_size: Option<usize>,
 
-    /// Within-tile feature order for bands tiled here (#374): `input`
-    /// (default) or a property name, optionally `:asc` / `:desc`.
-    ///
-    /// Same knob as `tiles` / `export-pmtiles` `--feature-order` (#361):
-    /// MVT does not define draw order, but renderers paint features in the
-    /// order the tile lists them, so this is the paint order for any style
-    /// that does not override it. `input` emits source row order. Naming a
-    /// column sorts within each tile by that property — `--feature-order
-    /// level` puts high `level` on top, which is what a banded aggregate or
-    /// nested choropleth usually wants — with ties kept in input order so
-    /// output stays deterministic.
-    ///
-    /// Applies to every GeoParquet band alike, like `--generalize` and
-    /// `--max-tile-size`; a pre-tiled archive band is merged as-is and keeps
-    /// the order it was tiled with. Each band's export reads the column
-    /// independently: a GeoParquet band that does not have it is exported in
-    /// input order with a warning naming the band's layer, not an error.
+    /// Within-tile feature order for GeoParquet bands: `input`, or a
+    /// property name with optional `:asc` or `:desc`. A band without that
+    /// column keeps input order with a warning.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     pub feature_order: FeatureOrder,
 
-    /// Directory for the per-band intermediates (removed on the way out).
+    /// Directory for temporary per-band files, deleted after the build.
     /// Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
     pub work_dir: Option<PathBuf>,
 
-    /// Allow a pre-tiled band's declared zoom range to overshoot what its
-    /// archive actually holds.
-    ///
-    /// Off by default: an overshooting band declares zooms its archive does
-    /// not have, and those zooms would render silently empty — almost always
-    /// a `--band` range that disagrees with what the archive was actually
-    /// tiled with, so it is a hard error unless this is set. Has no effect
-    /// on a band whose declared range shares no zoom at all with its
-    /// archive (that is always an error), nor on a band that declares a
-    /// subrange of its archive (that is always fine, with or without this
-    /// flag). Pass this only for a deliberately sparse pyramid.
+    /// Accept a pre-tiled band with fewer zooms than declared. Missing
+    /// zooms render empty; use only for a sparse pyramid.
     #[arg(long)]
     pub allow_missing_zooms: bool,
 
@@ -404,52 +303,25 @@ pub struct PyramidArgs {
 
 /// Arguments for `tylertoo merge`.
 ///
-/// Merge concatenates PMTiles archives that hold *disjoint* tiles into one,
-/// by copying tile bodies verbatim: nothing is decoded, re-simplified or
-/// re-encoded, so the merged archive's tiles are bit-identical to its inputs'.
-///
-/// It is the second half of a sharded build: tile each shard of a large input
-/// separately, then merge the shard archives into the archive that ships.
-/// A shard's tile ids are disjoint from every other shard's by construction,
-/// but they need not form a contiguous slice of the archive's id space — two
-/// subtrees at different depths interleave on the Hilbert curve, so one
-/// shard's first and last id can straddle ids another shard holds. The merge
-/// handles that; disjointness is checked per tile id, not per id range.
-///
-/// That disjointness is checked, not assumed: if any two inputs claim
-/// overlapping tile ids the merge is refused, naming both archives, before
-/// any tile is copied. An overlap means the shards were cut wrong (or one was
-/// listed twice, or is left over from an earlier run), and merging anyway
-/// would produce an archive whose tiles silently shadow each other.
-///
-/// To combine archives that *do* overlap — different data at different zooms,
-/// or several layers over the same zooms — use `tylertoo pyramid`, which
-/// merges by band and concatenates layers where they meet.
+/// The merge copies tile bodies unchanged and refuses inputs whose tile
+/// ids overlap; see the sharded builds guide.
 #[derive(Parser, Debug)]
 pub struct MergeArgs {
     /// Output PMTiles archive.
     pub output: PathBuf,
 
-    /// Input PMTiles archives, two or more. They must hold disjoint tile ids
-    /// and agree on tile type and tile compression; the merged archive's
-    /// bounds are the union of theirs, its zoom range the union of the ranges
-    /// they declare, and its `vector_layers` the union of theirs (layers
-    /// sharing an id collapse into one entry spanning their combined zooms,
-    /// with their fields unioned).
+    /// Two or more input PMTiles archives with disjoint tile ids and one tile
+    /// type and compression. The output's bounds, zoom range, and
+    /// `vector_layers` are the union of the inputs'.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
 
-    /// Directory for the merge's spool file, which holds the merged tile data
-    /// until the archive is assembled. Defaults to the system temp directory
-    /// — worth setting when the output is large and `/tmp` is a small tmpfs.
+    /// Directory for the spool file that holds tile data until the archive
+    /// is complete. Defaults to the system temp directory.
     #[arg(long, value_name = "DIR")]
     pub work_dir: Option<PathBuf>,
 
-    /// Write the JSON merge report to this path.
-    ///
-    /// Includes per-zoom tile counts, which are what a sharded build is
-    /// checked against: merging N shards must yield the same tiles per zoom
-    /// as tiling the whole input in one pass.
+    /// Write the JSON merge report, with per-zoom tile counts, to this path.
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
 
@@ -460,26 +332,30 @@ pub struct MergeArgs {
 
 /// Arguments for `tylertoo decode`.
 ///
-/// The output is the TILED representation, not the original source data:
-/// geometries are simplified per zoom, clipped to (buffered) tile bounds,
-/// duplicated across neighboring tiles and zoom levels, and only the
-/// properties that survived tiling are present. There is no round-trip
-/// guarantee. Matching tippecanoe-decode, nothing is deduplicated; use
-/// `--zoom` (or filter the output's `zoom` column) for a single
-/// representation, and prefer the maximum zoom for the best detail.
+/// The output schema and its limits are in the `after_help` text below.
 #[derive(Parser, Debug)]
 #[command(after_help = "\
-The output is the tiled representation, not the original source:
-  - simplified: vertices were removed during tiling at lower zooms
-    (extract the max zoom for best detail)
-  - clipped: features are cut at (buffered) tile boundaries
-  - duplicated: a feature appears once per neighboring tile and per
-    zoom level; nothing is deduplicated (matches tippecanoe-decode) -
-    filter with --zoom or the output's `zoom` column
-  - lossy properties: attributes dropped during tiling cannot be
-    recovered
-There is no round-trip guarantee: A.parquet -> B.pmtiles -> C.parquet
-does not reproduce A. See docs/decode.md for details.")]
+Decoding reconstructs tile features. A round trip from `A.parquet` to
+`B.pmtiles` to `C.parquet` changes the data:
+
+- Tiling simplifies vertices at lower zooms. Decode the maximum zoom
+  for the most detail.
+- Features are clipped at buffered tile edges.
+- Features repeat for each tile they touch and each zoom. Filter with
+  `--zoom` or the `zoom` column.
+- Properties dropped during tiling cannot be recovered.
+
+Output columns, in order:
+
+1. `zoom` (UInt8), `layer` (Utf8), and `mvt_id` (UInt64; null if the
+   encoder set no id) identify each row's origin.
+2. All properties found in any tile, alphabetically ordered and null
+   where absent. Integers become Int64; floats become Float64. Mixed
+   integers and floats become Float64; other mixed types become Utf8.
+3. `geometry`: Well-Known Binary (WKB) in lon/lat (`EPSG:4326`), with a
+   bbox covering.
+
+A source property named `zoom`, `layer`, `mvt_id`, or `geometry` is an error.")]
 struct DecodeArgs {
     /// Input PMTiles archive (vector tiles).
     #[arg(value_name = "INPUT")]
@@ -489,7 +365,7 @@ struct DecodeArgs {
     #[arg(value_name = "OUTPUT")]
     output: PathBuf,
 
-    /// Decode a single zoom level (recommended for most uses).
+    /// Decode one zoom level, which suits most uses.
     #[arg(long, conflicts_with_all = ["min_zoom", "max_zoom"])]
     zoom: Option<u8>,
 
@@ -519,29 +395,19 @@ struct DecodeArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `tylertoo shard-plan` — step 0 of a sharded build (#498).
+/// Arguments for `tylertoo shard-plan`, step 0 of a sharded build.
 ///
-/// Cuts the pivot zoom's tile-id space into N contiguous runs of roughly equal
-/// estimated rows and writes them as a small JSON artifact. Every job of the
-/// fleet is then given that one file, so all of them agree on the cut by
-/// construction rather than by each recomputing an estimate.
-///
-/// Reads parquet **footers only** — no data page is touched — so planning a
-/// planet-scale input takes seconds.
+/// Reads Parquet footers only, so planning a large input takes seconds.
 #[derive(Parser, Debug)]
 pub struct ShardPlanArgs {
-    /// Input GeoParquet (the same input every job of the fleet tiles): a
-    /// local file, a directory or glob of partitions, or a remote URL
-    /// (s3://, https://, gs://). Resolved exactly as `tiles` resolves it, so
-    /// a plan can be cut for whatever a fleet will actually read.
-    /// Omit when --files-from is given.
+    /// Input GeoParquet that every job in the fleet tiles, in any form
+    /// `tiles` accepts. Omit it with `--files-from`.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     pub input: Option<PathBuf>,
 
-    /// Plan for the inputs listed in this manifest instead of a positional
-    /// INPUT: one local path or remote URL per line, order preserved
-    /// VERBATIM (it defines the dataset row order). Same manifest every job
-    /// of the fleet is given — the plan binds itself to it part by part.
+    /// Plan for the inputs this manifest lists, one path or URL per line in
+    /// dataset row order, instead of `INPUT`. Give every job in the fleet
+    /// the same manifest.
     #[arg(long, value_name = "PATH")]
     pub files_from: Option<PathBuf>,
 
@@ -549,22 +415,18 @@ pub struct ShardPlanArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// How many data shards to cut. One `tiles --shard i/N` job per shard,
-    /// plus one `--shard coarse` job; all N+1 archives merge in one step.
+    /// Number of data shards. Run one `tiles --shard i/N` job per
+    /// shard plus one `--shard coarse` job, then merge all N+1 archives.
     #[arg(long, value_name = "N")]
     pub shards: usize,
 
-    /// Zoom to cut at. Shards own zooms [PIVOT, --max-zoom]; the coarse job
-    /// owns [0, PIVOT-1].
-    ///
-    /// Pick it so each shard holds a few tiles' worth of data: too coarse and
-    /// the fleet cannot be balanced (there are not enough tiles to cut), too
-    /// fine and the coarse job is doing most of the build on its own. z4-z8
-    /// covers every realistic fleet size.
+    /// Pivot zoom: data shards cover this zoom through `--max-zoom`; the
+    /// coarse job covers lower zooms. Choose a zoom with a few populated
+    /// tiles per shard, usually z4 to z8.
     #[arg(long, value_name = "ZOOM", default_value = "6")]
     pub pivot: u8,
 
-    /// Overwrite an existing plan at --output.
+    /// Overwrite an existing plan at `--output`.
     #[arg(short, long)]
     pub force: bool,
 }
@@ -572,7 +434,7 @@ pub struct ShardPlanArgs {
 /// Arguments for `tylertoo export-pmtiles`.
 #[derive(Parser, Debug)]
 struct ExportPmtilesArgs {
-    /// Input overview GeoParquet file (produced by `tylertoo overview`).
+    /// Input overview GeoParquet file from `tylertoo overview`.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -584,169 +446,80 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "overview")]
     layer_name: String,
 
-    /// Minimum zoom the archive declares in its metadata
-    /// (vector_layers[].minzoom), even if the overview file's coarsest levels
-    /// are missing (#380). `overview` omits a level that generalizes to
-    /// nothing, so a file built for z0..z13 can start at z2; this records the
-    /// requested z0 anyway. The PMTiles header's min zoom is not widened: it
-    /// always reports the shallowest zoom that actually holds a tile, as
-    /// `go-pmtiles verify` requires, so renderers that read the header see
-    /// z2 (the empty zooms would render nothing either way). Must not be
-    /// finer than the coarsest level present. Default: the coarsest level's
-    /// zoom
+    /// Minimum zoom in archive metadata, including empty coarse overview
+    /// levels. Defaults to the coarsest level's zoom.
     #[arg(long, value_name = "ZOOM")]
     min_zoom: Option<u8>,
 
-    /// Keep ONLY these properties in the tiles (repeatable; tippecanoe -y),
-    /// matched on the names the tiles publish. The overview file is
-    /// untouched. Naming a property the file does not export is an error;
-    /// the --feature-order column must stay included
+    /// Keep only these properties in the tiles (repeatable). The overview
+    /// file keeps every column, and the `--feature-order` column must stay.
     #[arg(long, value_name = "NAME")]
     include_property: Vec<String>,
 
-    /// Drop these properties from the tiles (repeatable; tippecanoe -x).
-    /// Ignored when --include-property is given, as in tippecanoe
+    /// Drop these properties from the tiles (repeatable).
+    /// `--include-property` overrides it.
     #[arg(long, value_name = "NAME")]
     exclude_property: Vec<String>,
 
-    /// Drop every property (tippecanoe -X): geometry-only tiles. Ignored
-    /// when --include-property is given, as in tippecanoe
+    /// Drop every property, writing geometry-only tiles.
+    /// `--include-property` overrides it.
     #[arg(long)]
     exclude_all_properties: bool,
 
-    /// Per-tile edge buffer, in tile pixels (feature seam continuity). At
-    /// most 256 (one full tile width); wider is refused, since past that a
-    /// tile duplicates geometry from tiles it does not border and every
-    /// feature belongs to O(buffer²) tiles (#433)
+    /// Edge buffer around each tile, in tile pixels, so features continue
+    /// across tile seams. At most 256 (one tile width).
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
-    /// Per-tile MVT size cap (e.g., "500K", "1M", or raw bytes). When a tile
-    /// exceeds it, a single non-iterative drop pass sheds features for that tile
-    /// only (largest-first for polygons/lines; a uniform spatial stride for
-    /// point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to
-    /// disable the cap. Aliased as --max-tile-size for parity with the `tiles`
-    /// command.
-    #[arg(long, value_name = "SIZE", alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
+    /// Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for
+    /// no cap. A tile over the cap drops features until it fits.
+    #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
     tile_size_limit: usize,
 
-    /// Write the JSON export report to this path.
-    ///
-    /// Besides per-zoom tile and feature counts and the oversized-tile tally,
-    /// the report carries two encode tallies (total and per zoom, #431).
-    /// `encode_dropped_features`: tile members with nothing to encode -- empty
-    /// geometries or empty GeometryCollections; non-zero means content was
-    /// lost after clipping, a warning names the total and the summary line
-    /// repeats it. `encode_quantized_features`: tile members whose geometry
-    /// collapsed at the tile extent -- zero-area polygon rings, lines of
-    /// fewer than two points, typically clip slivers at a buffered tile edge;
-    /// expected on ordinary data and never a warning.
+    /// Write the JSON export report, with per-zoom tile and feature counts,
+    /// to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
-    /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
-    /// boundary-bridge fallback on every polygon clip. The fast path is on by
-    /// default (render-equivalent on simple rings); pass this only when you need
-    /// byte-stable tile output, since the fast path rotates simple rings to a
-    /// different start vertex.
+    /// Clip all polygons with the full overlay for byte-stable tiles. The
+    /// simple-ring fast path renders identically but can change a ring's
+    /// starting vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
 
-    /// Partitions processed per band read during export (the export
-    /// concurrency knob). `auto` (the default) preflights a memory budget:
-    /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (container-aware: cgroup
-    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
-    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
-    /// Pass an explicit integer to override.
-    /// Wider waves keep more cores busy at proportionally more peak memory
-    /// (one wave of partitions resident). The chosen width and the preflight
-    /// inputs are logged at export start. Output is byte-identical for every
-    /// value.
+    /// Partitions to export at once, or `auto` to size the wave to the cores
+    /// and free memory. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order (#361): `input` (default) or a property
-    /// name, optionally `:asc` / `:desc`.
-    ///
-    /// MVT does not define draw order, but renderers paint features in the
-    /// order the tile lists them, so this is the paint order for any style
-    /// that does not override it. `input` emits source row order. Naming a
-    /// column sorts within each tile by that property — `--feature-order
-    /// level` puts high `level` on top, which is what a nested choropleth
-    /// usually wants — with ties kept in input order so output stays
-    /// deterministic.
+    /// Feature order within each tile: `input` preserves source row order;
+    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
+    /// order unless the style overrides it.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
-    /// Carry a property column through as the MVT feature `id` on every tile
-    /// the feature appears in, at every zoom (#443; tippecanoe's
-    /// `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover,
-    /// selection, joins) keys correctly across tile and zoom boundaries.
-    ///
-    /// Matched against the property name as the tile publishes it -- the
-    /// same naming `--feature-order` / `--include-property` /
-    /// `--exclude-property` use -- and it always wins over those flags
-    /// naming the same column (harmless no-op, never an error).
-    ///
-    /// The column must be an integer type (or DECIMAL(p,0)) and every row of
-    /// the overview file must hold a non-null value in 0..=u64::MAX (MVT
-    /// feature ids are `uint64`). The whole column is checked before any
-    /// tile is written; a violation fails naming the column, the overview
-    /// file's row (not the source file's) and its level. String and float
-    /// ids are rejected, unlike tippecanoe: cast them to an integer first
-    /// (e.g. with gpio or DuckDB). The column is moved to the id, never also
-    /// published as a regular property (tippecanoe's behaviour) -- repeat it
-    /// under two names in the source data if both are wanted.
-    ///
-    /// Clusters carry their representative's id, coalesced lines their
-    /// highest-priority member's; duplicate ids are not checked. Unset (the
-    /// default) keeps the tile-local member index -- unique only within a
-    /// single tile/zoom pair.
+    /// Use this integer column as the MVT feature id for `setFeatureState`
+    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
+    /// Defaults to tile-local ids.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
-    /// Emit only the tiles in this PMTiles tile-id range (#498): `LO..HI`,
-    /// two tile ids AT THE SAME ZOOM.
-    ///
-    /// That zoom is the pivot. The range then owns every descendant of those
-    /// tiles at every deeper zoom — a subtree's ids are contiguous on the
-    /// Hilbert curve, so the restriction is an exact interval test at each
-    /// zoom, not a bounding approximation. Tiles COARSER than the pivot are
-    /// outside the range and are not emitted.
-    ///
-    /// Ranges that partition the pivot zoom partition every deeper zoom, so
-    /// the resulting archives are disjoint by construction and `tylertoo
-    /// merge` concatenates them without re-encoding anything. `tiles --shard`
-    /// derives this automatically from a shard plan; this flag is the manual
-    /// form, for a cut you want to choose yourself
+    /// Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at
+    /// one zoom, plus their descendants. Ranges that partition a zoom give
+    /// disjoint archives, which `tylertoo merge` can join.
     #[arg(long, value_name = "LO..HI")]
     tile_range: Option<String>,
 
-    /// Emit only the tiles at or below this zoom (#498) — the coarse half of
-    /// a sharded build, complementing --tile-range's finer half.
-    ///
-    /// Named a CEILING, not --max-zoom, because it is the opposite of
-    /// --min-zoom here: --min-zoom only widens what the metadata DECLARES
-    /// (vector_layers), while this one decides which zooms are actually
-    /// emitted. Distinct from
-    /// building a shallower pyramid too: the overview file still holds every
-    /// level (its convert plan is the one the shards consume, and the level
-    /// plan is fingerprinted), and this only decides which of them reach the
-    /// archive. A partial overview kept from a `tiles --shard coarse` run
-    /// holds only the levels up to its own ceiling and can only be exported
-    /// with this set at or below that ceiling
+    /// Emit only the tiles at or below this zoom, the coarse half of a
+    /// sharded build. A partial overview kept from `tiles --shard coarse`
+    /// needs a ceiling at or below its own.
     #[arg(long, value_name = "ZOOM")]
     zoom_ceiling: Option<u8>,
 
-    /// Directory for the export's member spill file (#427): the on-disk
-    /// backing the partitioning single-read pass 2 falls back to when the
-    /// buffered members would not fit the memory budget. Same knob as
-    /// `overview`/`tiles --spill-dir`. Defaults to the process temp
-    /// directory ($TMPDIR), which on many Slurm and Kubernetes nodes is a
-    /// RAM-backed /tmp; point this at real disk there. The directory must
-    /// exist. The archive itself is never spilled here: it is assembled in
-    /// place at OUTPUT.partial beside the output.
+    /// Directory for the export's spill file, used when buffered tiles
+    /// exceed the memory budget. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 
@@ -763,12 +536,9 @@ struct ExportPmtilesArgs {
 /// Arguments for `tylertoo overview`.
 #[derive(Parser, Debug)]
 struct OverviewArgs {
-    /// Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory
-    /// or glob of partitions, or a remote URL (s3://, https://, gs://).
-    /// s3://.../ and gs://.../ prefixes (trailing slash) are listed to their
-    /// .parquet objects. Remote inputs are read with byte-range requests;
-    /// with --bbox, only the matching row groups are ever downloaded.
-    /// Omit when --files-from is given (then the one positional is OUTPUT).
+    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
+    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// `gs://` prefix, or omit it with `--files-from`.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     input: Option<PathBuf>,
 
@@ -776,46 +546,38 @@ struct OverviewArgs {
     #[arg(value_name = "OUTPUT", required_unless_present = "files_from")]
     output: Option<PathBuf>,
 
-    /// Convert the inputs listed in this manifest instead of a positional
-    /// INPUT: one local path or remote URL per line; `#` comment lines and
-    /// blank lines are skipped; line order is preserved VERBATIM (it defines
-    /// the dataset row order). Each line must be a single .parquet
-    /// file/object — no directories, globs, or prefixes. Local and remote
-    /// entries may be mixed. Usage: --files-from <PATH> OUTPUT.
+    /// Read `.parquet` files from this manifest instead of `INPUT`: one
+    /// path or URL per line, in dataset row order. Ignores blank lines and
+    /// lines starting with `#`.
     #[arg(long, value_name = "PATH")]
     files_from: Option<PathBuf>,
 
-    /// Level materialization mode.
+    /// Level layout: `duplicating` writes each level in full,
+    /// and `partitioning` writes each feature once, at its coarsest level.
     #[arg(long, default_value = "duplicating", value_parser = ["duplicating", "partitioning"])]
     mode: String,
 
-    /// Minimum (coarsest) Web Mercator zoom for the level range.
+    /// Minimum (coarsest) Web Mercator zoom.
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest / canonical) Web Mercator zoom for the level range, or
-    /// `auto` (#444, inspired by tippecanoe's `-zg`) to estimate it from a
-    /// bounded sample of the input's feature extents and spacing (honoring
-    /// --bbox/--filter, never above z16). The chosen zoom and its evidence are
-    /// logged; an input with nothing to measure is an error. Ignored with --gsd.
+    /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
+    /// sample of the input. Ignored with `--gsd`.
     #[arg(long, default_value = "6")]
     max_zoom: MaxZoom,
 
-    /// Explicit comma-separated GSD list (meters, strictly decreasing).
-    /// Overrides --min-zoom/--max-zoom when set.
+    /// Comma-separated ground sample distances (GSDs) in meters, each
+    /// smaller than the last. Overrides `--min-zoom` and `--max-zoom`.
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Regional extract: only convert features whose bbox intersects this
-    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). Row groups whose
-    /// GeoParquet 1.1 covering statistics don't intersect are skipped at the
-    /// parquet footer level (no data pages read); inputs without covering
-    /// stats degrade gracefully (all row groups read, exact per-feature
-    /// filter still applies).
+    /// Convert features whose bbox intersects this lon/lat box. Skips row
+    /// groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
-    /// Emit the optional COGP compatibility footer key (partitioning mode).
+    /// Write the third-party `cogp` footer key for readers of that overview
+    /// format. Partitioning mode only.
     #[arg(long)]
     cogp_compat: bool,
 
@@ -838,72 +600,24 @@ struct OverviewArgs {
 /// [`ConvertOptions`] via [`ConvertTuningArgs::build_convert_options`].
 #[derive(Args, Debug)]
 struct ConvertTuningArgs {
-    /// Tile the input EXACTLY AS GIVEN: switch the whole generalization
-    /// ladder off at every level (#345 / #360).
-    ///
-    /// The ladder derives coarse levels from the fine input by thinning and
-    /// simplifying. That is right for a road network and wrong for a
-    /// pre-aggregated grid: an H3 r6 cell is not a simplified r7 cell, it is
-    /// their parent, and its count is their sum. Run an aggregate through the
-    /// gates and a coarse level shows SOME cells and silently omits the rest,
-    /// instead of showing what they sum to.
-    ///
-    /// Equivalent to --no-density-drop --no-coalesce-lines --simplify-factor 0
-    /// with every thinning factor and visibility gate at 0 — a flag set that
-    /// was not even reachable before, since a thinning factor of 0 used to be
-    /// rejected. Reach for it when the input is already the right resolution
-    /// for the zooms you are asking for: DGGS/cell aggregates, pre-levelled
-    /// input, or one band of a pyramid.
-    ///
-    /// Requires --mode duplicating: partitioning writes each feature at one
-    /// level, so with thinning off everything lands in the coarsest level.
-    ///
-    /// On `tiles` it also disables the per-tile size cap (an unbounded
-    /// --max-tile-size), since a valve that sheds features to fit a byte
-    /// budget is not verbatim either; pass --max-tile-size explicitly to put
-    /// a cap back. The two-step form does NOT inherit that — pass
-    /// --tile-size-limit 0 to export-pmtiles.
-    ///
-    /// Supplies DEFAULTS rather than overriding: any knob you set explicitly
-    /// wins, so --verbatim --simplify-factor 0.5 is NEARLY verbatim.
+    /// Disable thinning, simplification, and density reduction for
+    /// pre-aggregated or pre-levelled input. Explicit tuning flags override
+    /// these defaults.
     #[arg(long, help_heading = "Thinning & visibility")]
     verbatim: bool,
 
-    /// Column name used as the cell-winner priority (sort) key. Mutually
-    /// exclusive with --class-rank.
+    /// Numeric column used to choose each thinning cell's winning feature.
+    /// Conflicts with `--class-rank`.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     sort_key: Option<String>,
 
-    /// Magnitude ladder: let COL decide each feature's ENTRY ZOOM (#364).
-    ///
-    /// Thinning ranks on geometry, which is backwards whenever a dataset's
-    /// most important features are its physically smallest — a population
-    /// density layer, say, where dense urban tracts are tiny next to sparse
-    /// rural ones. Coarse levels then keep the big low-value polygons and drop
-    /// the small high-value ones. --sort-key cannot fix that: it chooses
-    /// between features competing for a cell, and the visibility gate has
-    /// already dropped the small ones on size.
-    ///
-    /// A ladder ranks COL's DISTINCT values descending and gives each rank an
-    /// entry zoom one --ladder-step apart, starting at --min-zoom. A feature
-    /// appears from its entry zoom inward and not before, exempt from the
-    /// visibility gate and from thinning throughout. Nothing is deleted: the
-    /// finest level still carries every feature.
-    ///
-    /// Ranking DISTINCT values (SQL DENSE_RANK) rather than the values
-    /// themselves keeps the ladder scale-free — mapping a raw value onto the
-    /// zoom range strands everything in the upper zooms whenever the values
-    /// occupy a narrow part of their nominal scale.
-    ///
-    /// Implies --collapse unless you pass --collapse-square, so a promoted
-    /// feature that simplifies below its level's tolerance survives as a
-    /// representative point rather than being dropped again.
-    ///
-    /// Mutually exclusive with --entry-zoom.
+    /// Rank `COL` values from highest to lowest, assigning entry zooms
+    /// from `--min-zoom` in `--ladder-step` increments. Features appear at
+    /// their entry zoom and finer zooms, exempt from thinning.
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     magnitude_ladder: Option<String>,
 
-    /// Zooms between consecutive --magnitude-ladder rungs (default 1).
+    /// Zooms between consecutive `--magnitude-ladder` rungs.
     #[arg(
         long,
         value_name = "N",
@@ -913,13 +627,8 @@ struct ConvertTuningArgs {
     )]
     ladder_step: u8,
 
-    /// Explicit entry zooms, for full control over the rungs:
-    /// `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` — e.g.
-    /// `--entry-zoom "density:5000=4,1000=6,200=8"`.
-    ///
-    /// Same semantics as --magnitude-ladder but the rungs are placed by hand
-    /// rather than derived. Values the spec does not list get no entry zoom
-    /// and take the ordinary gate. Mutually exclusive with --magnitude-ladder.
+    /// Assign entry zooms: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...`, for example
+    /// `density:5000=4,1000=6`. Unlisted values use the normal visibility gate.
     #[arg(
         long,
         value_name = "SPEC",
@@ -928,71 +637,46 @@ struct ConvertTuningArgs {
     )]
     entry_zoom: Option<String>,
 
-    /// Categorical class ranking (higher priority wins a cell). Format:
-    /// `COLUMN:VALUE=RANK,VALUE=RANK,...` — e.g.
-    /// `--class-rank road_class:motorway=5,primary=4,residential=2`.
-    /// Present-but-unlisted values rank below every listed value (but above
-    /// nulls). Mutually exclusive with --sort-key.
+    /// Rank categorical classes for cell winners: `COLUMN:VALUE=RANK,...`,
+    /// where higher wins. Unlisted values rank below listed ones and above
+    /// nulls.
     #[arg(long, value_name = "SPEC", help_heading = "Ranking")]
     class_rank: Option<String>,
 
-    /// Disable auto-detection of well-known schemas (Overture roads `class`/
-    /// `road_class`, Overture places `confidence`).
+    /// Turn off automatic ranking for known schemas (Overture roads
+    /// `class`/`road_class`, Overture places `confidence`).
     #[arg(long, help_heading = "Ranking")]
     no_auto_rank: bool,
 
-    /// Attribute filter: only convert features matching this SQL-WHERE-style
-    /// predicate over the input's property columns, e.g.
-    /// "confidence > 0.8", "crop_type IN ('soy', 'corn')",
-    /// "note IS NOT NULL AND (class = 'a' OR class = 'b')".
-    /// Supports =, !=, <, <=, >, >=, IN (...), IS [NOT] NULL, AND/OR/NOT,
-    /// parentheses, 'string' and numeric literals, and "quoted column"
-    /// names; timestamp columns compare against 'YYYY-MM-DD' /
-    /// 'YYYY-MM-DD HH:MM:SS' / RFC 3339 datetime strings (read as UTC);
-    /// nulls follow SQL three-valued logic (a row is kept only when
-    /// the predicate is TRUE). Evaluated during the pass-1 scan, so it
-    /// composes with --bbox; input row groups whose parquet column
-    /// statistics preclude any match are skipped at the footer level (on
-    /// remote input those byte ranges are never fetched). Aliased as
-    /// --where. See docs/OVERVIEW_TUNING.md.
-    #[arg(long, value_name = "EXPR", alias = "where", help_heading = "Filtering")]
+    /// Filter property columns with a SQL `WHERE` predicate, such as
+    /// `confidence > 0.8`. Skips row groups that cannot match. Grammar:
+    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
+    #[arg(
+        long,
+        value_name = "EXPR",
+        visible_alias = "where",
+        help_heading = "Filtering"
+    )]
     filter: Option<String>,
 
-    /// Keep ONLY these property columns (repeatable; tippecanoe -y). Every
-    /// other property is dropped at scan time: the excluded columns are not
-    /// decoded and the overview file only carries what was asked for. The
-    /// geometry column is always kept. A column another knob
-    /// reads (--sort-key, --filter, --accumulate-attribute,
-    /// --magnitude-ladder, --class-rank) must stay included; naming a column
-    /// the input does not have is an error
+    /// Keep only these property columns (repeatable) and skip decoding the
+    /// rest. Columns that other flags read must stay in the list.
     #[arg(long, value_name = "COL", help_heading = "Properties")]
     include_property: Vec<String>,
 
-    /// Drop these property columns (repeatable; tippecanoe -x). Ignored when
-    /// --include-property is given, as in tippecanoe. Naming a column the
-    /// input does not have only warns
+    /// Drop these property columns (repeatable). `--include-property`
+    /// overrides it.
     #[arg(long, value_name = "COL", help_heading = "Properties")]
     exclude_property: Vec<String>,
 
-    /// Drop every property column (tippecanoe -X): geometry-only output.
-    /// Ignored when --include-property is given, as in tippecanoe
+    /// Drop every property column, writing geometry only.
+    /// `--include-property` overrides it.
     #[arg(long, help_heading = "Properties")]
     exclude_all_properties: bool,
 
-    /// GSD tile-band base for the zoom→GSD mapping: gsd(z) = 40075016.69 /
-    /// base / 2^z (spec §5.2, cogp-rs default 1024).
-    ///
-    /// This is the master detail knob for a zoom-range plan. A LARGER base
-    /// makes every level's GSD SMALLER, so less is thinned and simplified at a
-    /// given zoom (denser, more detailed, larger coarse levels). A SMALLER
-    /// base makes GSDs LARGER (sparser, cruder, cheaper coarse levels). It
-    /// scales the whole ladder at once, whereas --simplify-factor and the
-    /// --*-thinning knobs act relative to each level's GSD. No effect when
-    /// --gsd is given (those GSDs are already absolute meters).
-    ///
-    /// Cheat sheet: coarse levels too sparse → RAISE --gsd-base (or lower the
-    /// thinning factors); too crude → lower --simplify-factor. See
-    /// docs/OVERVIEW_TUNING.md.
+    /// Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base /
+    /// 2^z`: a larger base keeps more detail at every level. No effect with
+    /// `--gsd`.
     #[arg(
         long,
         value_name = "F",
@@ -1001,152 +685,62 @@ struct ConvertTuningArgs {
     )]
     gsd_base: f64,
 
-    /// Simplification tolerance factor: RDP tolerance = factor * gsd (meters),
-    /// duplicating mode only (default 1.0).
-    ///
-    /// Controls how much per-feature vertex detail each coarse level sheds.
-    /// LOWER = smoother/less aggressive = more vertices kept = crisper but
-    /// heavier levels; HIGHER = cruder = fewer vertices = lighter levels. The
-    /// canonical (finest) level is always verbatim regardless. A line/polygon
-    /// whose bbox diagonal is below the tolerance is dropped entirely, so a
-    /// very high factor also thins features, not just vertices.
-    ///
-    /// Cheat sheet: coarse levels look too crude/blocky → LOWER
-    /// --simplify-factor. See docs/OVERVIEW_TUNING.md.
+    /// Simplification tolerance in multiples of each level's GSD (default
+    /// 1.0, duplicating mode only). Lower values keep more vertices.
     #[arg(long, help_heading = "Generalization")]
     simplify_factor: Option<f64>,
 
-    /// Collapse below-visibility polygons to a representative point instead of
-    /// dropping them (spec Q4 opt-in). Changes the geometry type at coarse
-    /// levels (fill-styled renderers silently ignore points — add a circle
-    /// layer, or use --collapse-square to stay type-preserving).
+    /// Replace polygons too small for a level with a point. Fill styles
+    /// ignore points; add a circle layer or use `--collapse-square`.
     #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
-    /// Stand in for the polygons a coarse level drops with ~1xGSD placeholder
-    /// SQUARES, so the level still shows where the area is (tippecanoe
-    /// tiny-polygon reduction; opt-in).
-    ///
-    /// Two mechanisms, one threshold T = (simplify-factor * gsd)^2 (#384):
-    /// every polygon the level does NOT carry — failed the visibility gate,
-    /// lost its thinning cell, cut by the density budget — adds its area to
-    /// an accumulator for its 32xGSD patch, and each time a patch's total
-    /// crosses T the polygon that crossed it is emitted as a T-area square
-    /// with its own attributes; a polygon the level DOES carry but that
-    /// collapses below T at write time survives as a square with probability
-    /// A/T. Either way aggregate area stays truthful: a country of 25 m
-    /// fields reads as farmland at z0 instead of vanishing, and dense blocks
-    /// read denser than isolated barns. Type-preserving (the output stays
-    /// Polygon), so plain fill styles keep working, unlike --collapse.
-    /// Deterministic (same input -> same output, engine- and
-    /// thread-independent). Duplicating mode only. See
-    /// docs/OVERVIEW_TUNING.md.
+    /// Replace polygons dropped at coarse levels with small placeholder
+    /// squares marking their location. Duplicating mode only; output
+    /// remains Polygon.
     #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
     collapse_square: bool,
 
-    /// Zoom-band representation selector: comma-separated LO-HI:KIND bands,
-    /// e.g. "0-7:point,8-14:geom" or "0-5:square". KIND is geom, point, or
-    /// square.
-    ///
-    /// point: ALL polygonal features in the band become representative
-    /// points (centroid) — "dots zoomed out, polygons zoomed in" in ONE
-    /// archive, no two-archive merge. In-band polygons bypass the visibility
-    /// gate (a dot is always visible) and thin on the point grid.
-    /// square: below-tolerance polygons in the band emit area-dithered
-    /// ~1xGSD placeholder squares (see --collapse-square) instead of
-    /// dropping; visible polygons are untouched. geom: normal (the default
-    /// for unlisted zooms). Bands must not overlap, non-geom bands must end
-    /// before --max-zoom (the canonical level is always verbatim), and point
-    /// bands must be contiguous from the coarsest zoom. Requires a zoom-range
-    /// plan (not --gsd) and duplicating mode. Lines and native points are
-    /// unaffected by every band kind. See docs/OVERVIEW_TUNING.md.
+    /// Polygon representation by zoom band: comma-separated
+    /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
+    /// `0-7:point,8-14:geom`. Band rules:
+    /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(long, value_name = "SPEC", help_heading = "Generalization")]
     representation: Option<String>,
 
-    /// Disable cascading simplification (#218) and reproduce the pre-cascade
-    /// output byte-for-byte.
-    ///
-    /// By default each coarser level is simplified from the next-finer
-    /// level's already-simplified output (tippecanoe-style) and invalid RDP
-    /// candidates are repaired via a boolean overlay instead of epsilon-
-    /// retried — much faster on duplicating mode, at the cost of coarse-level
-    /// coordinates differing slightly from the non-cascaded pipeline (bounded
-    /// by ~2x the level tolerance). See docs/OVERVIEW_TUNING.md.
+    /// Simplify each level from the source instead of from the next finer
+    /// level. Slower, but each level stays within its own tolerance of the
+    /// source.
     #[arg(long, help_heading = "Generalization")]
     no_cascade: bool,
 
-    /// Point thinning factor: grid cell size = factor * gsd.
-    ///
-    /// Default 4.0, or 16.0 when --cluster is enabled (absorbed points are
-    /// summarized via point_count rather than dropped, so a coarser grid
-    /// gives the familiar graduated-cluster look; chosen from the NYC
-    /// pt={4,16,48} sweep).
-    ///
-    /// One feature survives per grid cell per level, so BIGGER factor = BIGGER
-    /// cells = FEWER survivors = SPARSER map; SMALLER = denser. This multiplies
-    /// the GSD cell size, so it interacts with --gsd-base (which sets the GSD).
-    ///
-    /// Cheat sheet: coarse levels too sparse → LOWER the thinning factors.
+    /// Point thinning grid cell, as a multiple of the level's GSD (default
+    /// 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points.
     #[arg(long, help_heading = "Thinning & visibility")]
     point_thinning: Option<f64>,
 
-    /// Line thinning factor: grid cell size = factor * gsd (default 1.0).
-    ///
-    /// BIGGER = SPARSER (fewer lines survive per level), SMALLER = denser.
-    /// See --point-thinning; this is the roads/line knob. Default retuned
-    /// 2.0 -> 1.0 after the Portland sweep (corpus/SWEEPS.md): 1.0
-    /// keeps road networks visibly more continuous at coarse zooms.
+    /// Line thinning grid cell, as a multiple of the level's GSD (default
+    /// 1.0). Larger cells keep fewer lines.
     #[arg(long, help_heading = "Thinning & visibility")]
     line_thinning: Option<f64>,
 
-    /// Polygon thinning factor: grid cell size = factor * gsd (default 1.0).
-    ///
-    /// BIGGER = SPARSER, SMALLER = denser. Polygons thin least by default
-    /// (1.0) since they tile space rather than cluster.
+    /// Polygon thinning grid cell, as a multiple of the level's GSD
+    /// (default 1.0). Larger cells keep fewer polygons.
     #[arg(long, help_heading = "Thinning & visibility")]
     polygon_thinning: Option<f64>,
 
-    /// Line visibility gate in GSD multiples: a line is eligible at a level
-    /// only if its bbox diagonal >= factor * gsd (default 2.0).
-    ///
-    /// This is a hard drop, not a thin: BIGGER = more small lines dropped at
-    /// coarse levels (sparser); SMALLER = more small lines kept. The gate is
-    /// multiplied by the level GSD, so --gsd-base moves it too.
+    /// Drop lines whose bbox diagonal is shorter than this many GSDs at a
+    /// level (default 2.0).
     #[arg(long, help_heading = "Thinning & visibility")]
     line_visibility: Option<f64>,
 
-    /// Polygon visibility gate in GSD multiples: a polygon is eligible only if
-    /// its bbox diagonal >= factor * gsd (default 2.0).
-    ///
-    /// BIGGER = more small polygons dropped at coarse levels (sparser);
-    /// SMALLER = more kept. See --line-visibility. Retuned 4.0 -> 2.0 in the
-    /// #259 coarse-zoom sweep (corpus/SWEEPS.md Decision 6): write-time RDP
-    /// already drops polygons that simplify below the level tolerance, so
-    /// gates above 2.0 starve coarse zooms without making files smaller,
-    /// and gates below ~2.0 mostly admit candidates that RDP drops anyway
-    /// (use --collapse to keep those as representative points).
+    /// Drop polygons whose bbox diagonal is shorter than this many GSDs at
+    /// a level (default 2.0).
     #[arg(long, help_heading = "Thinning & visibility")]
     polygon_visibility: Option<f64>,
 
-    /// Per-level density drop rate: each coarser level keeps 1/rate of the
-    /// next finer level's feature budget (default 1.65).
-    ///
-    /// This is the Q2 knob that stops mid-zoom counts plateauing at ~everything.
-    /// Cell-winner thinning stops binding once its grid cell is smaller than the
-    /// typical feature spacing, so from ~z9 up every feature survives and coarse
-    /// levels over-retain (Portland roads: ours/tippecanoe ≈ 2–3x at z9–z11).
-    /// After cell-winner thinning, each level is capped at a budget that decays
-    /// geometrically toward coarse zooms — budget(L) = N / rate^(finest−L),
-    /// where N is the input feature count — and the lowest-priority survivors
-    /// (same class-rank → size → hash order as the cell-winner, spec Q1) are
-    /// dropped until the level meets its budget. Levels already sparser than
-    /// their budget (the coarse zooms) are untouched, so this only bites the
-    /// mid-zoom plateau. BIGGER rate = coarser levels shed harder (sparser mid
-    /// zooms, smaller files); SMALLER = gentler. The default 1.65 is smaller than
-    /// tippecanoe's nominal 2.5 because our budget anchors on the full canonical
-    /// count N (every feature appears at the finest level), not a per-tile
-    /// basezoom count. The canonical (finest) level is never dropped. See
-    /// docs/OVERVIEW_TUNING.md and corpus/SWEEPS.md.
+    /// Density budget decay: each coarser level keeps 1/rate of the next
+    /// finer level's feature budget. Larger values thin mid zooms more.
     #[arg(
         long,
         value_name = "F",
@@ -1155,20 +749,8 @@ struct ConvertTuningArgs {
     )]
     drop_rate: f64,
 
-    /// Spatial-fairness strength for the density budget (default 1.5).
-    ///
-    /// The budget is shared across coarse super-cells (neighborhoods) so a
-    /// global rank-ordered cut cannot empty sparse rural areas to keep dense
-    /// cities under budget. Each super-cell keeps its top-priority features up
-    /// to an allocation proportional to population^(1/gamma): gamma=1 is a
-    /// proportional cut (every neighborhood keeps the same fraction); gamma>1 is
-    /// SUBLINEAR — dense neighborhoods keep proportionally fewer, sparse ones
-    /// proportionally more (they are protected). This is tippecanoe's gamma
-    /// dot-dropping ("reduce dots to the 1/gamma power in dense areas") applied
-    /// per super-cell. BIGGER = more protection for sparse areas / harder
-    /// relative thinning of dense areas. Does not change per-level totals (it
-    /// only redistributes which features survive spatially), so it is
-    /// independent of --drop-rate. No effect when --no-density-drop is set.
+    /// Sparse-area protection: 1 reduces every neighborhood equally;
+    /// larger values protect sparse areas more.
     #[arg(
         long,
         value_name = "F",
@@ -1177,36 +759,18 @@ struct ConvertTuningArgs {
     )]
     drop_gamma: f64,
 
-    /// Disable the Q2 per-level density budget entirely (off switch).
-    ///
-    /// Reverts to pure cell-winner thinning — the pre-Q2 behavior — and emits a
-    /// byte-identical footer (no density_drop provenance). Use this to compare
-    /// before/after, or when the cell-winner thinning already meets your needs.
+    /// Turn off the per-level density budget, leaving cell-winner thinning
+    /// only.
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
 
-    /// Enable point clustering (duplicating mode only; opt-in).
-    ///
-    /// At each overview level, the surviving point in each thinning grid cell
-    /// ABSORBS the other points in its cell instead of them simply vanishing:
-    /// the output gains a `point_count` INT64 NOT NULL column recording how
-    /// many source features each row represents at its level (tippecanoe /
-    /// supercluster convention; always 1 at the canonical level). The winner
-    /// keeps its own geometry and attribute values. Lines and polygons are
-    /// unaffected (their rows carry point_count = 1). Use for graduated-dot
-    /// rendering of dense point data. See docs/OVERVIEW_TUNING.md.
+    /// Merge each thinning cell's points into its surviving point, which
+    /// gains a `point_count` column. Duplicating mode only.
     #[arg(long, help_heading = "Clustering")]
     cluster: bool,
 
-    /// Aggregate a numeric column across clustered points: COL:OP where OP is
-    /// sum, max, min, or mean. Repeatable. Requires --cluster.
-    ///
-    /// At each level the winner's value of COL becomes the aggregate over
-    /// itself + the points it absorbed at that level (computed per level from
-    /// SOURCE values — mean is exact, never a mean of means). All other
-    /// columns keep the winner's own values. Example:
-    /// --accumulate-attribute population:sum
-    /// --accumulate-attribute confidence:mean
+    /// Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is
+    /// `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`.
     #[arg(
         long = "accumulate-attribute",
         value_name = "COL:OP",
@@ -1214,23 +778,8 @@ struct ConvertTuningArgs {
     )]
     accumulate_attribute: Vec<String>,
 
-    /// Disable line network coalescing (ON by default; duplicating mode).
-    ///
-    /// By default, at each non-canonical level touching same-class line
-    /// segments are chained into single "stroke" LineStrings BEFORE the
-    /// visibility gate and thinning run, so a chain of individually
-    /// sub-visibility fragments survives as one long, connected artery —
-    /// road/river networks read as continuous lines at coarse zooms instead
-    /// of scattered dashes. Chains never merge across class values (when a
-    /// class ranking is active); junctions continue only within
-    /// --coalesce-junction-angle of straight. The merged feature keeps the
-    /// attributes of its highest-priority member, and the output gains a
-    /// `coalesced_count` INT32 NOT NULL column (source segments merged per
-    /// row; 1 for unmerged rows and everywhere at the canonical level;
-    /// withheld from tiles when it is 1 everywhere). Points and polygons are
-    /// unaffected. In partitioning mode coalescing
-    /// is inert (a merged chain cannot satisfy the feature-once/verbatim
-    /// contract). See docs/OVERVIEW_TUNING.md.
+    /// Turn off line coalescing, which joins touching same-class line
+    /// segments into longer strokes at coarse levels.
     #[arg(long, help_heading = "Line coalescing")]
     no_coalesce_lines: bool,
 
@@ -1240,18 +789,8 @@ struct ConvertTuningArgs {
     #[arg(long, hide = true, conflicts_with = "no_coalesce_lines")]
     coalesce_lines: bool,
 
-    /// Junction continuation angle for line coalescing, in degrees
-    /// (default 0 = OFF: junctions terminate chains, preserving network
-    /// topology — chosen from the Portland junction-angle sweep in
-    /// corpus/data/bench/q3/, where strict degree-2 chaining rendered
-    /// better).
-    ///
-    /// When > 0: at a junction (3+ same-class segment endpoints meeting),
-    /// the pair of lines that best continue each other merge when their
-    /// deviation from a straight continuation is at most this angle — best
-    /// pair first, so a 4-way crossing continues BOTH through-streets.
-    /// BIGGER = chains bend further through junctions (longer, fewer
-    /// strokes; risk of merging through genuine turns).
+    /// Continue a line through a junction when the straightest pair turns by
+    /// at most this many degrees. Set 0 to stop chains at every junction.
     #[arg(
         long,
         value_name = "DEG",
@@ -1260,14 +799,8 @@ struct ConvertTuningArgs {
     )]
     coalesce_junction_angle: f64,
 
-    /// Endpoint snap tolerance for line coalescing, in GSD multiples
-    /// (default 1.0).
-    ///
-    /// Exactly-touching endpoints always chain; this knob additionally joins
-    /// chain ends within factor * gsd of each other (two endpoints closer
-    /// than one ground sample are indistinguishable at that level). BIGGER =
-    /// bridges larger digitization gaps (risk: rungs of nearby parallel
-    /// lines fusing); 0 = exact endpoint matching only.
+    /// Join line ends within this many GSDs of each other when coalescing.
+    /// Set 0 to join only ends that match exactly.
     #[arg(
         long,
         value_name = "F",
@@ -1276,21 +809,8 @@ struct ConvertTuningArgs {
     )]
     coalesce_snap: f64,
 
-    /// Per-level candidate-line ceiling for line coalescing (memory guard).
-    ///
-    /// Chaining holds the level's candidate line geometries in memory at
-    /// once (every line is a candidate at every non-canonical level, since
-    /// sub-visibility fragments must be reclaimable). Inputs over this
-    /// ceiling skip coalescing with a warning instead of breaking the
-    /// streaming pipeline's memory bound; near-canonical levels that large
-    /// need coalescing least (segments are individually visible).
-    ///
-    /// Two limbs, since a row count does not bound memory: the candidate
-    /// line count, and the geometry those lines retain (this value x 512 B
-    /// of modelled geometry — ~1 GB by default, ~1.2 GiB resident).
-    /// Exceeding either skips coalescing. The byte limb binds first on lines
-    /// averaging over ~28 vertices (unsplit rivers, boundaries, contours);
-    /// raise this value to coalesce them, at a proportional memory cost.
+    /// Skip coalescing above this candidate-line count to bound memory.
+    /// Long lines reach a corresponding geometry-size limit first.
     #[arg(
         long,
         value_name = "ROWS",
@@ -1299,26 +819,13 @@ struct ConvertTuningArgs {
     )]
     coalesce_max_level_rows: usize,
 
-    /// Maximum output row-group size in rows.
-    ///
-    /// Interpreted per level: a level with at most this many rows is written as
-    /// a single row group; a larger level is split into roughly uniform row
-    /// groups of at most this size. Coarse bands (few features) therefore become
-    /// one broad row group; fine bands keep tight per-row-group bbox statistics.
-    ///
-    /// This is a request, not a guarantee: it may be raised automatically to fit
-    /// parquet's row-group ceiling of 32,768 groups per file (a warning says so,
-    /// and the conversion report records the cap actually used).
+    /// Maximum rows per output row group at each level. The cap increases
+    /// if a level would exceed Parquet's row-group limit.
     #[arg(long, default_value = "10000", help_heading = "Output layout")]
     row_group_size: usize,
 
-    /// Per-level row-group sizing policy (#202).
-    ///
-    /// `constant`: every level uses --row-group-size as its cap (default).
-    /// `zoom-scaled`: the cap doubles per zoom step below the finest level
-    /// (cap = row_group_size << (max_zoom - level_zoom)) — coarse bands, which
-    /// wide viewports read mostly whole anyway, become fewer/larger row groups
-    /// (fewer remote requests) while the finest level keeps tight bbox pruning.
+    /// How the row-group cap varies by level: `constant`, or `zoom-scaled`,
+    /// which doubles it per zoom step coarser than the finest level.
     #[arg(
         long,
         default_value = "constant",
@@ -1327,41 +834,20 @@ struct ConvertTuningArgs {
     )]
     row_group_size_policy: String,
 
-    /// Keep full Parquet statistics on every column, including high-cardinality
-    /// string/binary property columns and the WKB geometry column.
-    ///
-    /// By default those columns' per-row-group min/max stats are suppressed to
-    /// keep the footer small (a 26-char ULID `id` over hundreds of row groups
-    /// otherwise bloats the footer to megabytes, paid on every remote query).
-    /// The bbox covering and `level` column always keep their pruning stats.
-    /// Enable this if remote clients push predicates on property columns and
-    /// want row-group skipping on them.
+    /// Keep Parquet min/max stats on every column, even large string and
+    /// geometry columns. Use it when remote clients filter on
+    /// property columns.
     #[arg(long, help_heading = "Output layout")]
     full_column_stats: bool,
 
-    /// Disable the two-pass bounded-memory streaming pipeline (H3).
-    ///
-    /// By default the converter streams the input twice: pass 1 builds the
-    /// per-feature winner tables (level assignment + density budget) holding
-    /// only bboxes/kinds/sort-keys; pass 2 re-reads the input per level and
-    /// simplifies + writes batch-by-batch. Peak memory is O(read batch +
-    /// winner tables) instead of O(dataset) — e.g. Moldova (632k polygons)
-    /// drops from ~5.4 GB to well under 1 GB peak RSS. Output is equivalent
-    /// (same level assignments, rows, and footer). This flag reverts to the
-    /// original in-memory pipeline, which decodes the whole dataset once and
-    /// may be marginally faster on small inputs that comfortably fit in RAM.
+    /// Load the whole dataset into memory instead of streaming it in two
+    /// passes. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
     #[arg(long, help_heading = "Memory & performance")]
     no_streaming: bool,
 
-    /// Rows per Arrow read batch in the streaming pipeline (both passes).
-    ///
-    /// LARGER batches amortize per-batch overhead (slightly faster) at the
-    /// cost of proportionally more peak memory; SMALLER batches bound memory
-    /// tighter. The default (8192) keeps per-batch transients in the tens of
-    /// MB even for vertex-heavy polygon data. Capped at 1048576 rows, and
-    /// lowered automatically (with a warning) when the input's rows are so
-    /// large that a batch of this many would pass the ~2 GiB arrow can
-    /// decode per byte-array column. No effect with --no-streaming.
+    /// Rows per Arrow read batch. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>.
     #[arg(
         long,
         value_name = "ROWS",
@@ -1371,17 +857,9 @@ struct ConvertTuningArgs {
     )]
     read_batch_size: usize,
 
-    /// Memory/throughput profile for the single-read pass-2 engine (#213/#212).
-    ///
-    /// `speed` buffers each output level's rows in RAM (fastest; peak RAM grows
-    /// with buffered output). `bounded` spills them to temporary Arrow IPC
-    /// files (memory-capped; slight temp-I/O cost). `auto` (default) is
-    /// workload-based: it estimates buffered output from feature and level
-    /// counts and spills when that exceeds a fraction of available RAM
-    /// (container-aware: cgroup v2/v1 limits are respected), so large
-    /// duplicating runs prefer bounded instead of risking OOM (override the RAM
-    /// figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES). Output is byte-identical
-    /// across profiles. No effect with --no-streaming.
+    /// Memory profile for writing levels: `speed` buffers in RAM, `bounded`
+    /// spills to disk, and `auto` picks per run. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>.
     #[arg(
         long,
         default_value = "auto",
@@ -1390,20 +868,9 @@ struct ConvertTuningArgs {
     )]
     profile: String,
 
-    /// Read batches allowed in flight through the streaming pipeline at once
-    /// (read/compute-overlap knob; bounded-channel depth) — pass 1's scan and
-    /// pass 2's per-level fan-out both use it.
-    ///
-    /// `auto` (the default) sizes this to the machine's available cores
-    /// (clamped to 4..=16); pass an explicit integer to override. Higher
-    /// improves core utilization on long-pole geometries at proportionally
-    /// more peak memory (in-flight-batches × read-batch-size rows resident,
-    /// PER PASS — passes 1 and 2 never run concurrently, so this does not
-    /// double). This is no longer the only resident-batch term: pass 2's
-    /// readers hold their own read-ahead on top (--read-workers × its queue
-    /// depth), and under --profile bounded each level's spill writer holds up
-    /// to 3 more. The chosen depth and detected core count are logged at the
-    /// start of each pass. No effect with --no-streaming.
+    /// Read batches in flight at once, or `auto` to size it to the cores.
+    /// See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
     #[arg(
         long,
         value_name = "N|auto",
@@ -1413,29 +880,9 @@ struct ConvertTuningArgs {
     )]
     in_flight_batches: usize,
 
-    /// Reader threads pass 2 splits the input across (issue #494).
-    ///
-    /// Parquet row groups are independently readable, so pass 2 can read the
-    /// input with several threads at once and merge their batches back into
-    /// read order. `auto` (the default) takes a quarter of the machine's
-    /// cores, capped at 4 — readers decompress and decode, so they compete
-    /// with the pool doing the simplification they are feeding. `1` is the
-    /// single sequential reader. An explicit value is honoured up to a ceiling
-    /// of 2× this machine's cores (at least 4); above that it is rejected.
-    ///
-    /// Output is byte-identical for every value: workers own disjoint runs of
-    /// row groups and the merge reproduces exactly the batch sequence one
-    /// reader would have produced.
-    ///
-    /// Remote inputs always read sequentially (concurrent readers over one
-    /// remote source evict each other's fetched chunks) — including a remote
-    /// input the run has staged to local disk, since staging is per-part and
-    /// the source stays remote. The read-ahead is sized against a modelled
-    /// slice of the same memory budget the pass-2 sink uses (and each worker's
-    /// queue is capped shallower under --profile bounded), so a small box, or a
-    /// wide input, quietly gets fewer workers. Helps most when the input's row
-    /// groups are small relative to that budget — `gpio` writes well-sized
-    /// ones.
+    /// Reader threads for the second pass, or `auto` for a quarter of the
+    /// cores, up to 4. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
     #[arg(
         long,
         value_name = "N|auto",
@@ -1445,45 +892,14 @@ struct ConvertTuningArgs {
     )]
     read_workers: usize,
 
-    /// Directory for the remote-input spill file (issues #219/#272).
-    ///
-    /// A remote convert stages every fetched column chunk in an anonymous
-    /// temp file — growing to ≈1× the touched input bytes (the whole object
-    /// for a full-file convert; only the covering row groups with --bbox) —
-    /// so later passes re-read from local disk instead of the network. By
-    /// default it lives under the process temp dir ($TMPDIR); point this at
-    /// a volume with enough room (a free-space preflight warns about a
-    /// projected shortfall). The directory must exist. Local inputs never
-    /// spill.
-    ///
-    /// On `tiles` this directory also hosts the removed-after-export
-    /// intermediate overview (#314) — at least input-sized, with its own
-    /// free-space preflight — unless --keep-overview is given (then the
-    /// intermediate goes to that path instead). Location precedence for
-    /// the intermediate: --spill-dir, $TMPDIR, the output directory.
+    /// Directory for spill files: staged remote input, and on `tiles` the
+    /// intermediate overview. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
     #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     spill_dir: Option<PathBuf>,
 
-    /// Write the convert plan artifact to PATH, then carry on converting.
-    ///
-    /// The plan is the complete result of pass 1 and the level assignment:
-    /// which level every input row enters at, the per-level counts, the
-    /// clustering / coalescing / carrier side tables, the resolved ranking
-    /// provenance and the dataset-wide tallies — plus a fingerprint of the
-    /// inputs and of every thinning-relevant flag (see --plan for exactly
-    /// what the fingerprint pins). Re-running with --plan then skips pass 1
-    /// and the assignment entirely.
-    ///
-    /// The assignment is dataset-global: the density budget water-fills a
-    /// super-cell budget over every candidate of a level, the level walk
-    /// carries a running kept count coarse to fine, and --magnitude-ladder
-    /// dense-ranks the whole column. A sharded build must therefore consume
-    /// ONE plan rather than recompute the assignment per shard, or the
-    /// shards' pyramids disagree.
-    ///
-    /// PATH's parent directory must exist and be writable; that is checked
-    /// up front, before anything is scanned. An existing plan at PATH is
-    /// overwritten, with a log line.
+    /// Save the convert plan to PATH and continue converting. Reuse it
+    /// with `--plan`; sharded builds share one plan.
     #[arg(
         long,
         value_name = "PATH",
@@ -1492,27 +908,8 @@ struct ConvertTuningArgs {
     )]
     save_plan: Option<PathBuf>,
 
-    /// Reuse the convert plan artifact at PATH instead of running pass 1 and
-    /// the level assignment.
-    ///
-    /// The plan's fingerprint must match this run — the tylertoo version,
-    /// every thinning-relevant flag, and each input's identity. A mismatch is
-    /// a hard error naming the offending field, so a stale plan never
-    /// silently produces a different pyramid. The write-side flags
-    /// (--profile, --row-group-size, --in-flight-batches, --spill-dir) are
-    /// deliberately NOT fingerprinted, so one plan can be replayed across
-    /// them.
-    ///
-    /// What "input identity" pins: for every part, local or remote, the
-    /// path/URL, the byte size, the row count and the row-group layout from
-    /// the parquet footer, plus the row groups --bbox/--filter pruned to.
-    /// A local part additionally pins its mtime. A remote object has no
-    /// mtime and no ETag here, so an object rewritten in place with the same
-    /// size, row count and row-group layout is NOT detected; tylertoo warns
-    /// when any part is remote.
-    ///
-    /// PATH must be a readable convert plan; that is checked up front,
-    /// before the input is opened.
+    /// Reuse a convert plan, skipping the first pass and level assignment.
+    /// Its fingerprint must match this run's version, flags, and inputs.
     #[arg(
         long,
         value_name = "PATH",
@@ -1772,16 +1169,14 @@ struct ValidateArgs {
     files_from: Option<PathBuf>,
 }
 
-/// Arguments for `tylertoo stats` (see the `Command::Stats` docs for the
-/// report's semantics). Walks the archive's header and directory entries only
-/// (the same `ArchiveIndex` machinery `merge`/`pyramid` use).
+/// Arguments for `tylertoo stats`.
 #[derive(Parser, Debug)]
 struct StatsArgs {
     /// PMTiles archive to report on.
     #[arg(value_name = "ARCHIVE")]
     archive: PathBuf,
 
-    /// How many of the largest tiles (by stored size) to list.
+    /// Number of largest tiles to list, ranked by stored size.
     #[arg(long, value_name = "N", default_value = "10")]
     largest: usize,
 
@@ -1790,26 +1185,17 @@ struct StatsArgs {
     json: bool,
 }
 
-/// Arguments for `tylertoo tiles` — the one-shot GeoParquet → PMTiles facade.
-///
-/// This is a thin wrapper that runs `overview` (convert) into a temporary
-/// GeoParquet file and then `export-pmtiles` from it. The full convert-tuning
-/// set (ranking, generalization, thinning/visibility, density budget,
-/// clustering, coalescing, memory/performance) is flattened in below, so a
-/// one-shot `tiles` run reaches the same quality and memory levers as the
-/// two-step chain — see `--help` for the grouped flags. The legacy per-tile
-/// pipeline this command used to run was removed (see issue #177).
+/// Arguments for `tylertoo tiles`: `overview` into a temporary file,
+/// then `export-pmtiles` from it.
 #[derive(Parser, Debug)]
 struct TilesArgs {
-    /// Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory
-    /// or glob of partitions, or a remote URL (s3://, https://, gs://).
-    /// s3://.../ and gs://.../ prefixes (trailing slash) are listed to their
-    /// .parquet objects; remote inputs are read with byte-range requests.
-    /// Omit when --files-from is given (then the one positional is OUTPUT).
+    /// Input GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
+    /// (`EPSG:3857`). Pass a file, directory, glob, URL, or `s3://` or
+    /// `gs://` prefix, or omit it with `--files-from`.
     #[arg(value_name = "INPUT", required_unless_present = "files_from")]
     input: Option<PathBuf>,
 
-    /// Output PMTiles file. Omitted under --plan-only, which writes no
+    /// Output PMTiles file. Omit it with `--plan-only`, which writes no
     /// archive.
     #[arg(
         value_name = "OUTPUT",
@@ -1817,173 +1203,87 @@ struct TilesArgs {
     )]
     output: Option<PathBuf>,
 
-    /// Convert the inputs listed in this manifest instead of a positional
-    /// INPUT: one local path or remote URL per line; `#` comment lines and
-    /// blank lines are skipped; line order is preserved VERBATIM (it defines
-    /// the dataset row order). Each line must be a single .parquet
-    /// file/object — no directories, globs, or prefixes. Local and remote
-    /// entries may be mixed. Usage: --files-from <PATH> OUTPUT.
+    /// Read `.parquet` files from this manifest instead of `INPUT`: one
+    /// path or URL per line, in dataset row order. Ignores blank lines and
+    /// lines starting with `#`.
     #[arg(long, value_name = "PATH")]
     files_from: Option<PathBuf>,
 
-    /// Minimum (coarsest) Web Mercator zoom level.
+    /// Minimum (coarsest) Web Mercator zoom.
     #[arg(long, default_value = "0")]
     min_zoom: u8,
 
-    /// Maximum (finest) Web Mercator zoom level, or `auto` (#444, inspired by
-    /// tippecanoe's `-zg`) to estimate it from a bounded sample of the input's
-    /// feature extents and spacing (honoring --bbox/--filter, never above
-    /// z16). The chosen zoom and its evidence are logged; an input with
-    /// nothing to measure is an error. Ignored with --gsd.
+    /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
+    /// sample of the input. Ignored with `--gsd`.
     #[arg(long, default_value = "14")]
     max_zoom: MaxZoom,
 
-    /// Explicit comma-separated GSD list (meters, strictly decreasing).
-    /// Overrides --min-zoom/--max-zoom when set — the same semantics as
-    /// `tylertoo overview --gsd`, so the absolute-GSD ladder is reachable in
-    /// one step.
+    /// Comma-separated ground sample distances (GSDs) in meters, each
+    /// smaller than the last. Overrides `--min-zoom` and `--max-zoom`.
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Regional extract: only convert features whose bbox intersects this
-    /// bounding box (lon/lat degrees: xmin,ymin,xmax,ymax). See --bbox in
-    /// `tylertoo overview --help` for details.
+    /// Convert features whose bbox intersects this lon/lat box. Skips row
+    /// groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
-    /// Layer name for the output tiles (default: derived from input filename).
+    /// Layer name for the tiles. Defaults to the input's file stem.
     #[arg(long)]
     layer_name: Option<String>,
 
-    /// Maximum tile size (e.g., "500K", "1M", or raw bytes). When a tile
-    /// exceeds this limit, the export sheds features in a single non-iterative
-    /// pass (largest-first for polygons/lines; a uniform spatial stride for
-    /// point tiles). Defaults to 500K (tippecanoe parity, #280); pass 0 to
-    /// disable the cap. Aliased as --tile-size-limit for parity with
-    /// `export-pmtiles`.
-    /// With --verbatim and no explicit value, the cap is disabled: a valve
-    /// that sheds features to fit a byte budget is not verbatim either.
-    #[arg(long, value_name = "SIZE", alias = "tile-size-limit", value_parser = parse_size_bytes)]
+    /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
+    /// (default 500K, or no cap with `--verbatim`). A tile over the cap drops
+    /// features until it fits.
+    #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
-    /// Disable the simple-clip fast path (issue #239), forcing the i_overlay
-    /// boundary-bridge fallback on every polygon clip. The fast path is on by
-    /// default (render-equivalent on simple rings); pass this only when you need
-    /// byte-stable tile output, since the fast path rotates simple rings to a
-    /// different start vertex.
+    /// Clip all polygons with the full overlay for byte-stable tiles. The
+    /// simple-ring fast path renders identically but can change a ring's
+    /// starting vertex.
     #[arg(long)]
     no_simple_clip_fastpath: bool,
 
-    /// Per-tile edge buffer, in tile pixels, carried across tile seams so
-    /// features don't clip at boundaries. At most 256 (one full tile width);
-    /// wider is refused, since past that a tile duplicates geometry from tiles
-    /// it does not border and every feature belongs to O(buffer²) tiles (#433)
+    /// Edge buffer around each tile, in tile pixels, so features continue
+    /// across tile seams. At most 256 (one tile width).
     #[arg(
         long,
         default_value_t = tylertoo_core::overview::export::ExportOptions::default().tile_buffer
     )]
     tile_buffer: u32,
 
-    /// Partitions processed per band read during the export phase (the export
-    /// concurrency knob). `auto` (the default) preflights a memory budget:
-    /// the machine's core count, capped by how many estimated per-partition
-    /// transients fit in a fraction of available RAM (container-aware: cgroup
-    /// v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot
-    /// be probed; override the RAM figure with TYLERTOO_AUTO_MEM_LIMIT_BYTES).
-    /// Pass an explicit integer to override.
-    /// Wider waves keep more cores busy at proportionally more peak memory
-    /// (one wave of partitions resident). The chosen width and the preflight
-    /// inputs are logged at export start. Output is byte-identical for every
-    /// value.
+    /// Partitions to export at once, or `auto` to size the wave to the cores
+    /// and free memory. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
     #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
     partition_wave: usize,
 
-    /// Within-tile feature order (#361): `input` (default) or a property
-    /// name, optionally `:asc` / `:desc`.
-    ///
-    /// MVT does not define draw order, but renderers paint features in the
-    /// order the tile lists them, so this is the paint order for any style
-    /// that does not override it. `input` emits source row order. Naming a
-    /// column sorts within each tile by that property — `--feature-order
-    /// level` puts high `level` on top, which is what a nested choropleth
-    /// usually wants — with ties kept in input order so output stays
-    /// deterministic.
+    /// Feature order within each tile: `input` preserves source row order;
+    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
+    /// order unless the style overrides it.
     #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
     feature_order: FeatureOrder,
 
-    /// Carry a property column through as the MVT feature `id` on every tile
-    /// the feature appears in, at every zoom (#443; tippecanoe's
-    /// `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover,
-    /// selection, joins) keys correctly across tile and zoom boundaries.
-    ///
-    /// Matched against the property name as the tile publishes it -- the
-    /// same naming `--feature-order` / `--include-property` /
-    /// `--exclude-property` use. The column must survive the convert step's
-    /// own property selection to reach the export that reads it (naming a
-    /// column `--exclude-property` already dropped is an error, same as
-    /// `--feature-order`); an export-time `--include-property` /
-    /// `--exclude-property` naming this column is instead a harmless no-op,
-    /// since the id is always moved out of the properties regardless.
-    ///
-    /// The column must be an integer type (or DECIMAL(p,0)) and every row of
-    /// the overview file must hold a non-null value in 0..=u64::MAX (MVT
-    /// feature ids are `uint64`). The whole column is checked before any
-    /// tile is written; a violation fails naming the column, the overview
-    /// file's row (not the source file's) and its level. String and float
-    /// ids are rejected, unlike tippecanoe: cast them to an integer first
-    /// (e.g. with gpio or DuckDB). The column is moved to the id, never also
-    /// published as a regular property (tippecanoe's behaviour) -- repeat it
-    /// under two names in the source data if both are wanted.
-    ///
-    /// It cannot also be an --accumulate-attribute column. Clusters carry
-    /// their representative's id, coalesced lines their highest-priority
-    /// member's; duplicate ids are not checked. Unset (the default) keeps the
-    /// tile-local member index -- unique only within a single tile/zoom pair.
+    /// Use this integer column as the MVT feature id for `setFeatureState`
+    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
+    /// Defaults to tile-local ids.
     #[arg(long, value_name = "COLUMN")]
     feature_id: Option<String>,
 
-    /// Write a JSON report to this path: a combined object with a `convert`
-    /// section (the overview build, matching `overview --report`) and an
-    /// `export` section (the PMTiles export, matching `export-pmtiles
-    /// --report`), so the one-step run captures both halves the two-step
-    /// chain would.
+    /// Write a JSON report with `convert` and `export` sections, matching
+    /// the reports of `overview` and `export-pmtiles`.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
 
-    /// Write the intermediate overview GeoParquet to PATH and RETAIN it,
-    /// instead of a temp file removed after the export — one run then yields
-    /// both artifacts: the reusable multi-resolution overview (queryable,
-    /// re-exportable, see `tylertoo overview`) and the PMTiles. The PMTiles
-    /// output is identical either way. Without this flag the intermediate is
-    /// written to --spill-dir if given, else $TMPDIR if set, else the output
-    /// directory, and deleted once the export finishes (see the note on the
-    /// materialized intermediate under --spill-dir).
+    /// Save the intermediate overview GeoParquet to PATH after export.
+    /// Does not change the PMTiles output.
     #[arg(long, value_name = "PATH")]
     keep_overview: Option<PathBuf>,
 
-    /// Build one job of a sharded fleet (#498): `I/N` for data shard I of N,
-    /// or `coarse` for the job that owns the zooms coarser than the pivot.
-    ///
-    /// Requires --shard-plan. A data shard additionally requires --plan: the
-    /// level assignment is dataset-global (the density budget water-fills a
-    /// super-cell over every candidate of a level, the level walk carries a
-    /// running kept count, --magnitude-ladder dense-ranks the whole column),
-    /// so a shard that recomputed it over its own rows would disagree with
-    /// its siblings and the seams would not line up. The coarse job, which
-    /// reads the whole input anyway, is the run that writes that plan with
-    /// --save-plan.
-    ///
-    /// A data shard reads only the row groups whose bbox reaches its range
-    /// and emits only the tiles its range owns. Features are kept WHOLE: one
-    /// straddling a seam is read and clipped by both neighbours, and each
-    /// emits only its own tiles — so there is no border double-inclusion to
-    /// dedup afterwards, and the merge is a blob copy.
-    ///
-    /// The three build steps, after `tylertoo shard-plan` has cut the plan:
-    /// (1) `--shard coarse --shard-plan shards.json --save-plan convert.plan`;
-    /// (2) one job per shard, `--shard $i/16 --shard-plan shards.json --plan
-    /// convert.plan`; (3) `tylertoo merge out.pmtiles coarse.pmtiles
-    /// shard-*.pmtiles`. See the Sharded builds guide for the full recipe
+    /// Build one shard: `I/N` for data shard I of N, or
+    /// `coarse` for the zooms below the pivot. Requires `--shard-plan`, and
+    /// data shards also need `--plan`. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds>.
     #[arg(
         long,
         value_name = "I/N|coarse",
@@ -1992,27 +1292,13 @@ struct TilesArgs {
     )]
     shard: Option<String>,
 
-    /// The shard plan every job of the fleet shares, from `tylertoo
-    /// shard-plan`. It fixes the pivot zoom and the N tile-id ranges, so the
-    /// jobs agree on the cut by construction
+    /// The shard plan from `tylertoo shard-plan` that every job shares.
     #[arg(long, value_name = "PATH", help_heading = "Sharded builds")]
     shard_plan: Option<PathBuf>,
 
-    /// Emit only the tiles in this PMTiles tile-id range: `LO..HI`, two tile
-    /// ids AT THE SAME ZOOM (#498). The manual form of a shard's restriction,
-    /// for a cut you want to choose yourself.
-    ///
-    /// That zoom is the pivot, and the range owns every descendant of those
-    /// tiles at every deeper zoom; tiles coarser than the pivot are outside it
-    /// and are not emitted. Ranges that partition the pivot zoom partition
-    /// every deeper zoom, so the archives are disjoint by construction and
-    /// `tylertoo merge` concatenates them without re-encoding.
-    ///
-    /// This restricts the EXPORT only. `--shard` is the form that also prunes
-    /// the convert's input to the row groups the range can reach, which is
-    /// what makes a shard cheaper than the whole build rather than merely
-    /// narrower — prefer it unless you are cutting by hand. The two are
-    /// mutually exclusive: `--shard` derives its range from the shard plan
+    /// Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at
+    /// one zoom, plus their descendants. Prefer `--shard`, which also skips
+    /// input the range cannot reach.
     #[arg(
         long,
         value_name = "LO..HI",
@@ -2021,38 +1307,12 @@ struct TilesArgs {
     )]
     tile_range: Option<String>,
 
-    /// Write the convert plan (--save-plan) and stop: run pass 1 and the level
-    /// assignment, skip the export entirely (#560). No PMTiles archive, no
-    /// intermediate overview — omit the OUTPUT positional.
-    ///
-    /// Requires --save-plan, which is then this run's only output.
-    ///
-    /// For the fleet whose coarse tiles are DISCARDED: an
-    /// aggregate-into-fields handover build, where cell aggregates from
-    /// outside tylertoo own the coarse zooms and real geometry owns the fine
-    /// ones, merged with `tylertoo merge`. The coarse job still has to run —
-    /// the level assignment is dataset-global, so no data shard can recompute
-    /// it — but only for its plan, so it skips pass 2 and the export.
-    ///
-    /// For a fleet, pass `--shard coarse --shard-plan` as well: the data
-    /// shards (`--shard I/N`) refuse a plan that does not record their shard
-    /// plan's cut. Without them the plan is for an unsharded `tiles --plan` /
-    /// `overview --plan` replay only. The pivot may equal --min-zoom here
-    /// (the handover shape: the external archive owns every zoom below it),
-    /// since a plan-only coarse job builds no zoom of its own.
-    ///
-    /// Pass the coarse job's own line minus OUTPUT, plus this flag: the plan
-    /// is fingerprinted, so a plan-only run is byte-identical to the plan a
-    /// full (or `--shard coarse`) run writes with the same options, and
-    /// nothing else about the fleet changes. Export-only flags on that line
-    /// (--layer-name, --max-tile-size, --no-simple-clip-fastpath,
-    /// --tile-buffer, --partition-wave, --feature-order, --feature-id,
-    /// --report, --keep-overview, --tile-range, --force) cannot reach the
-    /// plan, so they are ignored and named in one info line (#600).
+    /// Write the convert plan (`--save-plan`) and stop, with no export and
+    /// no OUTPUT. Use it for a coarse job whose tiles the fleet discards.
     #[arg(long, requires = "save_plan", help_heading = "Sharded builds")]
     plan_only: bool,
 
-    /// Enable verbose output (per-level and per-zoom breakdowns).
+    /// Print per-level and per-zoom breakdowns.
     #[arg(short, long)]
     verbose: bool,
 
@@ -2094,17 +1354,17 @@ fn main() -> Result<()> {
     }
 }
 
-/// Render the whole clap command tree as Markdown for the CLI reference page.
-///
-/// Single source of truth is the `#[command]`/`#[arg]` help strings on the
-/// clap types in this file — the reference is generated, never hand-edited.
+#[cfg(feature = "gen-docs")]
+mod reference_docs;
+
+/// Render the CLI reference from the clap help strings and option definitions.
 #[cfg(feature = "gen-docs")]
 fn gen_reference_markdown() -> String {
     let options = clap_markdown::MarkdownOptions::new()
         .title("CLI reference".to_string())
         .show_footer(false)
-        .show_table_of_contents(true);
-    let body = clap_markdown::help_markdown_custom::<Cli>(&options);
+        .show_table_of_contents(false);
+    let body = reference_docs::format(clap_markdown::help_markdown_custom::<Cli>(&options));
     format!(
         "<!-- GENERATED FILE — do not edit by hand.\n     \
          Regenerate: cargo run -p tylertoo --features gen-docs -- \
@@ -4235,8 +3495,8 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
             "\n  ! ~{} row(s) could not be placed: their row groups carry no usable bbox \
              statistics (or cover so much of the pivot zoom that they name no cut point), so \
              they were spread evenly instead of balanced. Run the input through `gpio \
-             optimize` to give every row group a tight covering, and the cut improves for \
-             free.",
+             sort hilbert --add-bbox` to give every row group a tight covering, and the cut \
+             improves for free.",
             plan.unplaced_rows
         );
     }
@@ -4675,7 +3935,7 @@ mod tests {
     // --- --files-from (v0.7 multi-partition) ---------------------------------
 
     /// `--files-from` parses on BOTH subcommands; the single positional is
-    /// the OUTPUT (clap slots it into the INPUT position; resolve_io swaps).
+    /// the OUTPUT (clap slots it into the INPUT position; `resolve_io` swaps).
     #[test]
     fn files_from_parses_on_both_subcommands() {
         let cli =

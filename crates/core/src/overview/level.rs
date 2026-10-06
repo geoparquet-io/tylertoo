@@ -539,11 +539,20 @@ pub enum OverviewValidationError {
 
 impl OverviewsMeta {
     /// Serialize to the footer JSON string (`geo:overviews` value).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if serialization fails.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
     /// Parse from a footer JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if `s` is not valid `geo:overviews`
+    /// JSON.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
@@ -551,6 +560,10 @@ impl OverviewsMeta {
     /// Serialize the OPTIONAL COGP-compatibility subset (§3.1): `version` and
     /// `levels[].{row_group_end, gsd}` only. Value of the [`COGP_KEY`] footer
     /// key when the writer's compatibility flag is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] if serialization fails.
     pub fn to_cogp_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&CogpMeta {
             version: self.version.clone(),
@@ -567,6 +580,17 @@ impl OverviewsMeta {
 
     /// Validate the structural invariants of §3.3 and §3.4 against the actual
     /// number of row groups in the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`OverviewValidationError`] if `levels` is empty, `version`
+    /// is not semver, or the `row_group_end` values are out of range, not
+    /// strictly increasing, or do not end at the file's last row group.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: the last level is read only after the empty-levels check
+    /// has passed.
     pub fn validate(&self, num_row_groups: i64) -> Result<(), OverviewValidationError> {
         if !is_semver(&self.version) {
             return Err(OverviewValidationError::InvalidVersion(

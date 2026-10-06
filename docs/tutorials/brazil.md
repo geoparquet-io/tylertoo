@@ -1,0 +1,1 @@
+--8<-- "examples/brazil-fields/README.md"

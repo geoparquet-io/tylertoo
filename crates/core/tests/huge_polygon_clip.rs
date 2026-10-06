@@ -1,8 +1,8 @@
-//! Performance test for Sutherland-Hodgman vs i_overlay on huge polygons.
+//! Performance test for Sutherland-Hodgman vs `i_overlay` on huge polygons.
 //!
-//! Run: cargo test --release -p tylertoo-core --test huge_polygon_clip -- --ignored --nocapture
+//! Run: cargo test --release -p tylertoo-core --test `huge_polygon_clip` -- --ignored --nocapture
 //!
-//! The 316k-coord polygon should clip in <0.1s with SH (vs ~1-2s with i_overlay).
+//! The 316k-coord polygon should clip in <0.1s with SH (vs ~1-2s with `i_overlay`).
 
 use geo::Polygon;
 use std::fs::File;

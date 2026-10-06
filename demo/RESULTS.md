@@ -167,6 +167,6 @@ Running this surfaced four things worth recording:
   [`context/ARCHITECTURE.md`](../context/ARCHITECTURE.md)); this demonstrates
   a *pipeline and its output*, not byte-identical tiling.
 
-The archive is hosted on Source Cooperative and rendered live on the docs
-site — see [`docs/demo.md`](../docs/demo.md) and the viewer at
-[`docs/demo/viewer.html`](../docs/demo/viewer.html).
+The archive is hosted on Source Cooperative (see [README.md](./README.md)).
+The headline numbers are summarized in the
+[scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/).

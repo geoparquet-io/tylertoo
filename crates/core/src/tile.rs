@@ -209,7 +209,7 @@ impl TileBounds {
 ///
 /// # Returns
 ///
-/// TileCoord with x, y, and zoom
+/// `TileCoord` with x, y, and zoom
 pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     let n = 2_f64.powi(zoom as i32);
 
@@ -359,7 +359,7 @@ pub(crate) fn node_id_range(node: TileCoord, target_z: u8) -> std::ops::RangeInc
 ///
 /// # Returns
 ///
-/// Iterator of TileCoord that intersect the bbox
+/// Iterator of `TileCoord` that intersect the bbox
 pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
     let r = tile_ranges_for_bbox(bbox, zoom);
     let (min_y_tile, max_y_tile) = r.y;
@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     /// F2 (#506 review): `target_z < node.z` has no valid descendant range
-    /// (node.z's Hilbert index and target_z's cumulative base would be
+    /// (node.z's Hilbert index and `target_z`'s cumulative base would be
     /// different zooms' incompatible units) and must fail loudly rather than
     /// silently collapse `delta` to 0 via `saturating_sub`.
     #[test]

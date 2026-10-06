@@ -3,7 +3,7 @@
 //! A small SQL-WHERE-style predicate over the input's property columns,
 //! evaluated during the pass-1 scan so it composes with `--bbox` and feeds
 //! the same downstream pipeline: a row the predicate does not accept simply
-//! never produces an [`AssignFeature`], exactly like a bbox miss.
+//! never produces an `AssignFeature`, exactly like a bbox miss.
 //!
 //! # Grammar (hand-rolled recursive descent — no new dependencies)
 //!
@@ -45,7 +45,7 @@
 //! when writers truncate them, so bound-based pruning stays correct.
 //!
 //! Numeric comparisons are performed in `f64` (through the ranking path's
-//! [`extract_numeric_values`]); Int64 statistics outside the exact-`f64`
+//! `extract_numeric_values`); Int64 statistics outside the exact-`f64`
 //! range (|v| >= 2^53) are widened before pruning so rounding can never prune
 //! a matching row group. A NaN — nodata in most float columns, and a value no
 //! comparison can answer — evaluates to UNKNOWN like a null rather than to
@@ -228,6 +228,11 @@ impl FilterExpr {
 }
 
 /// Parse a filter expression source string into a [`FilterExpr`].
+///
+/// # Errors
+///
+/// Returns a [`FilterError`] if `src` does not tokenize or parse, including an
+/// expression nested too deeply.
 pub fn parse_filter(src: &str) -> Result<FilterExpr, FilterError> {
     let tokens = tokenize(src)?;
     let mut p = Parser {
@@ -726,8 +731,10 @@ enum BoundExpr {
     Or(Box<BoundExpr>, Box<BoundExpr>),
 }
 
-/// A filter expression bound to an input schema: column names resolved to
-/// indices, literal types checked against column types. Ready for per-batch
+/// A filter expression bound to an input schema.
+///
+/// Column names are resolved to indices and literal types checked against
+/// column types. Ready for per-batch
 /// evaluation ([`Self::eval_mask`]) and row-group statistics pushdown
 /// ([`Self::select_row_groups`]).
 #[derive(Debug, Clone)]
@@ -743,6 +750,12 @@ impl BoundFilter {
     /// pairs: a filter column matching an OLD (input-file) name resolves to
     /// the renamed schema column, while pushdown keeps addressing the parquet
     /// footer by the old name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FilterError`] if `expr` names a column `schema` does not
+    /// have or one of an unsupported type, compares a column with a literal of
+    /// an incompatible type, or orders a boolean column.
     pub fn bind(
         expr: &FilterExpr,
         schema: &Schema,
@@ -960,8 +973,8 @@ fn cmp_ord<T: Ord + ?Sized>(v: &T, op: CmpOp, lit: &T) -> bool {
     }
 }
 
-/// Apply `f` to each row of a string-kinded column (Utf8 / LargeUtf8 /
-/// Utf8View / dictionary-of-string), producing `None` for null rows.
+/// Apply `f` to each row of a string-kinded column (Utf8 / `LargeUtf8` /
+/// `Utf8View` / dictionary-of-string), producing `None` for null rows.
 fn str_mask(col: &dyn Array, f: &dyn Fn(&str) -> bool) -> Vec<Option<bool>> {
     let n = col.len();
     match col.data_type() {

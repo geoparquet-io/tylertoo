@@ -1,0 +1,1 @@
+--8<-- "examples/madagascar-boundaries/README.md"

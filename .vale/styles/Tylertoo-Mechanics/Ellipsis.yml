@@ -1,0 +1,7 @@
+extends: existence
+message: "Do not trail off with '%s'. End the sentence."
+level: warning
+scope: text
+nonword: true
+raw:
+  - '\.\.\.|…'

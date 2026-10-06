@@ -1,0 +1,23 @@
+# Cases for the Tylertoo-Terms rules, run by `vale test` (Vale >= 3.24).
+# They live outside StylesPath so older Vale releases, which reject a
+# rule's `tests:` key, can still load the styles.
+
+- name: Casing flags the pattern
+  rule: ../styles/Tylertoo-Terms/Casing.yml
+  input: "Read the Geoparquet file."
+  contains: Tylertoo-Terms.Casing
+
+- name: Casing leaves clean prose alone
+  rule: ../styles/Tylertoo-Terms/Casing.yml
+  input: "Read the GeoParquet file."
+  absent: Tylertoo-Terms.Casing
+
+- name: Hype flags the pattern
+  rule: ../styles/Tylertoo-Terms/Hype.yml
+  input: "A seamless tool."
+  contains: Tylertoo-Terms.Hype
+
+- name: Hype leaves clean prose alone
+  rule: ../styles/Tylertoo-Terms/Hype.yml
+  input: "A direct tool."
+  absent: Tylertoo-Terms.Hype

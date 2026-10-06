@@ -3293,7 +3293,7 @@ fn pass1_memory_json(r: super::convert::Pass1MemoryReport) -> serde_json::Value 
 /// Build the `rss_sampler` object shared by both `TYLERTOO_PROFILE_JSON`
 /// dumps (#571): the continuous background sampler's TRUE peak RSS and its
 /// per-phase maxima (a JSON object, so key-sorted: `serde_json` is built
-/// without `preserve_order`) — see `docs/PROFILING.md` for the
+/// without `preserve_order`) — see `context/PROFILING.md` for the
 /// exact contrast with the boundary-sampled `peak_rss_mib` next to it. `null`
 /// only when the sampler never ran (profiling off), which in practice never
 /// happens here since the whole dump is a no-op then.
@@ -3397,7 +3397,7 @@ fn nanos_secs(cell: &AtomicU64) -> f64 {
 /// a level's wall time under parallelism, and never double-counts through
 /// nested `par_iter`s or work stealing. Work these windows do not cover (the
 /// per-tile member sort before encode, channel waits, rayon scheduling) is
-/// uncounted, not mis-attributed. See `docs/PROFILING.md`.
+/// uncounted, not mis-attributed. See `context/PROFILING.md`.
 #[derive(Default)]
 pub(super) struct ExportTimers {
     /// Reading overview rows: opening the Parquet reader (footer / page-index
@@ -3583,7 +3583,7 @@ pub(super) struct ExportProfileJsonInputs<'a> {
 
 /// Append a SECOND JSON line to `TYLERTOO_PROFILE_JSON`, if set, for the
 /// export phase — the export-side analogue of [`write_profile_json`] (#535).
-/// See `docs/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section
+/// See `context/PROFILING.md`'s "Two JSONL lines for one `tiles` run" section
 /// for why this is a second line rather than merged into convert's object;
 /// the two are paired by their shared `run_id`. Same best-effort contract as
 /// [`write_profile_json`]: an unset/blank env var is a no-op, an open/write
@@ -6618,7 +6618,7 @@ mod tests {
     /// Before the fix the two sample sets were disjoint: a boundary sample
     /// taken between two background ticks (any run shorter than the
     /// interval, or a spike the boundary happened to land on) could exceed
-    /// the "true" peak, and `docs/PROFILING.md` had to tell readers the two
+    /// the "true" peak, and `context/PROFILING.md` had to tell readers the two
     /// numbers were not comparable.
     #[test]
     fn rss_tracker_true_peak_is_never_below_the_boundary_peak() {

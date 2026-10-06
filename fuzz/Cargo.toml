@@ -26,6 +26,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "geoparquet_wkb"
+path = "fuzz_targets/geoparquet_wkb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pmtiles_header"
 path = "fuzz_targets/pmtiles_header.rs"
 test = false

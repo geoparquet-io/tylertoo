@@ -1,0 +1,13 @@
+extends: existence
+message: "'%s' adds nothing. Cut it."
+level: warning
+ignorecase: true
+tokens:
+  - '(?<!not )\bjust\b'
+  - really
+  - basically
+  - simply
+  - actually
+  - of course
+  - needless to say
+  - it should be noted that
