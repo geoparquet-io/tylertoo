@@ -6,9 +6,9 @@
 [![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
 tylertoo turns GeoParquet into PMTiles vector tiles. On the way it writes an
-**overview file**: a GeoParquet file that holds a generalized copy of your data
-for every zoom level, which you can validate, query with SQL, and export again
-without rebuilding. The CLI and the Python package are thin wrappers over one
+**overview file**: a GeoParquet file with a generalized copy of your data for
+every zoom level. You can validate the overview file, query it with SQL, and
+export it again without rebuilding. The CLI and the Python package are thin wrappers over one
 Rust engine, which is also published as a crate.
 
 The name nods to [tippecanoe](https://github.com/felt/tippecanoe), the
@@ -21,8 +21,10 @@ Tile 17,465 Madagascar boundary polygons (28 MB) into a PMTiles archive:
 
 ```bash
 cargo install tylertoo
-curl -LO https://github.com/geoparquet-io/tylertoo/releases/download/fixtures-v1/fieldmaps-madagascar-adm4.parquet
-tylertoo fieldmaps-madagascar-adm4.parquet madagascar.pmtiles --max-zoom 10
+repo=https://github.com/geoparquet-io/tylertoo
+file=fieldmaps-madagascar-adm4.parquet
+curl -LO "$repo/releases/download/fixtures-v1/$file"
+tylertoo "$file" madagascar.pmtiles --max-zoom 10
 ```
 
 Drop `madagascar.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to view it.
@@ -42,8 +44,8 @@ cargo install tylertoo    # CLI
 pip install tylertoo      # Python
 ```
 
-Prebuilt CLI binaries for Linux, macOS, and Windows are attached to every
-[GitHub release](https://github.com/geoparquet-io/tylertoo/releases).
+Every [GitHub release](https://github.com/geoparquet-io/tylertoo/releases)
+carries prebuilt CLI binaries for Linux, macOS, and Windows.
 
 ## Documentation
 
