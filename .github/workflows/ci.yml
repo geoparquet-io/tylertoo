@@ -149,7 +149,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-shear
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-shear
 
@@ -294,7 +294,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-nextest
 
@@ -434,7 +434,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-nextest
 
@@ -705,7 +705,7 @@ jobs:
       - name: Install cargo-llvm-cov and cargo-nextest
         # Prebuilt binaries via install-action; compiling them from source
         # costs minutes on every run.
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -848,7 +848,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
         with:
           tool: cargo-audit,cargo-deny
 
