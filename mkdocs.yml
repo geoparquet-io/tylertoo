@@ -62,12 +62,6 @@ markdown_extensions:
   - toc:
       permalink: true
 
-# Kept in the repo but out of the nav (developer-facing):
-# architecture.md, PROFILING.md, development.md.
-not_in_nav: |
-  /architecture.md
-  /PROFILING.md
-  /development.md
 
 nav:
   - Home: index.md
@@ -79,10 +73,9 @@ nav:
       - Remote reads: guides/remote-reads.md
       - Coming from tippecanoe: guides/tippecanoe.md
   - Reference:
-      - reference/index.md
       - CLI: reference/cli.md
       - Python: reference/python.md
-      - Rust: reference/rust.md
+      - Rust (docs.rs): https://docs.rs/tylertoo-core
       - Tuning knobs: OVERVIEW_TUNING.md
   - Contributing: contributing.md
   - Changelog: changelog.md

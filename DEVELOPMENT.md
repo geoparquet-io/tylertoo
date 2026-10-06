@@ -290,7 +290,7 @@ criterion's repeated-sampling model. It isn't part of the regression gate
 below.
 
 The corpus-scale benchmarks (storage/access/conversion) are scripted in
-`benchmarks/overview/`; profiling is documented in `docs/PROFILING.md`.
+`benchmarks/overview/`; profiling is documented in `context/PROFILING.md`.
 
 #### Criterion regression gate (#448)
 

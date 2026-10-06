@@ -15,9 +15,10 @@
 #   Python Quality  ruff check/format (docstrings: pydocstyle, pydoclint,
 #                   W505), mypy + stubtest, ty, doctests, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
-#   Reference Docs  the committed CLI + Python reference (docs/reference/)
-#                   still match regeneration from source (clap help strings +
-#                   pyo3 docstrings); fails on drift
+#   Docs            the committed CLI + Python reference (docs/reference/)
+#                   matches regeneration from source; rustdoc -D warnings;
+#                   tests/docs runs both tutorials, the README quickstart,
+#                   the --help flag check, and the strict site build
 #   Coverage        cargo-llvm-cov -> lcov -> codecov (informational)
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)

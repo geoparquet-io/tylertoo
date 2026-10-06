@@ -1,7 +1,7 @@
 # Overview generalization tuning
 
 `tylertoo overview` turns a GeoParquet file into a multi-resolution
-[overview file](architecture.md) — several precomputed generalizations of the
+[overview file](tutorials/madagascar.md#3-build-and-validate-the-overview) — several precomputed generalizations of the
 dataset at increasing detail (levels `0` = coarsest … `L-1` = finest /
 canonical). Two families of knobs control how much detail each coarse level
 sheds:
