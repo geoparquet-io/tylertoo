@@ -138,7 +138,11 @@ first-class artifact you can validate, query with SQL, and re-export.
   one-shot `tiles` command also accepts (#249).
 - **Breaking: Python `convert()` is deprecated.** It no longer runs the removed
   legacy pipeline; it is a facade chaining `overview()` + `export_pmtiles()`.
-  Use the two-step API for the full option surface.
+  Use the two-step API for the full option surface. Its legacy keyword
+  arguments `drop_density`, `compression`, `include`, `exclude`,
+  `exclude_all`, `deterministic`, `drop_smallest_as_needed`,
+  `drop_smallest_threshold` and `progress_callback` were removed; passing one
+  raises `TypeError`.
 - `--polygon-visibility` retuned **4.0 → 2.0** (#259): the rendered sweep
   showed gates above 2.0 starve coarse zooms without making files smaller, and
   gates below ~2.0 mostly admit candidates the write-time collapse drops

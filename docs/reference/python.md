@@ -2,200 +2,414 @@
      Regenerate: cd crates/python && uv run --no-sync \
        --with docstring-parser==0.18.0 \
        python scripts/gen_reference.py > ../../docs/reference/python.md
-     CI fails if this file drifts from the lib.rs docstrings. -->
+     CI fails if this file drifts from python/tylertoo/__init__.py. -->
 
 # Python reference
 
-tylertoo: Fast GeoParquet to PMTiles converter
+Build GeoParquet overview files and export them to PMTiles archives.
 
-This module provides Python bindings for the tylertoo Rust library.
+The functions take the same options and defaults as the CLI. GSD means ground sample distance: the meters one pixel covers at a level. The tuning reference explains every generalization option: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>
 
 ## `overview`
 
 ```python
-overview(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, simplify_factor=1.0, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=1.0, polygon_thinning=1.0, line_visibility=2.0, polygon_visibility=2.0, drop_rate=1.65, drop_gamma=1.5, density_drop=True, cluster=False, accumulate_attributes=None, coalesce_lines=True, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)
+overview(
+    input: str | Sequence[str],
+    output: str,
+    *,
+    mode: Literal['duplicating', 'partitioning'] = "duplicating",
+    min_zoom: int = 0,
+    max_zoom: int | Literal['auto'] = 6,
+    gsds: Sequence[float] | None = None,
+    gsd_base: float = 1024.0,
+    sort_key: str | None = None,
+    magnitude_ladder: str | None = None,
+    ladder_step: int = 1,
+    sort_direction: Literal['desc', 'asc'] = "desc",
+    class_rank_column: str | None = None,
+    class_ranks: dict[str, float] | None = None,
+    class_rank_unknown: float | None = None,
+    no_auto_rank: bool = False,
+    simplify_factor: float = 1.0,
+    collapse: bool = False,
+    collapse_square: bool = False,
+    representation: str | None = None,
+    cascade: bool = True,
+    point_thinning: float | None = None,
+    line_thinning: float = 1.0,
+    polygon_thinning: float = 1.0,
+    line_visibility: float = 2.0,
+    polygon_visibility: float = 2.0,
+    drop_rate: float = 1.65,
+    drop_gamma: float = 1.5,
+    density_drop: bool = True,
+    cluster: bool = False,
+    accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
+    coalesce_lines: bool = True,
+    coalesce_snap: float = 1.0,
+    coalesce_junction_angle: float = 0.0,
+    coalesce_max_level_rows: int = 2_000_000,
+    cogp_compat: bool = False,
+    row_group_size: int = 10_000,
+    full_column_stats: bool = False,
+    streaming: bool = True,
+    read_batch_size: int = 8192,
+    bbox: tuple[float, float, float, float] | None = None,
+    filter: str | None = None,
+    profile: Literal['auto', 'speed', 'bounded'] = "auto",
+    in_flight_batches: int = 0,
+    read_workers: int = 0,
+    spill_dir: str | os.PathLike[str] | None = None,
+) -> OverviewReport
 ```
 
-Build a multi-resolution GeoParquet overview file (COG-style vector overviews).
-
-This is the Python equivalent of `tylertoo overview` with the full CLI knob surface and identical defaults. The pipeline reads a (gpio-sorted) GeoParquet file, thins features per level with grid cell-winner selection, applies the per-level density budget, simplifies geometry in world space, and writes a level-banded GeoParquet file validated by `validate()` and exportable to PMTiles by `export_pmtiles()`.
+Build a GeoParquet overview file: one generalized level per zoom.
 
 ###### **Parameters:**
 
-* `input` (`str or list[str]`) — Input GeoParquet (EPSG:4326 or EPSG:3857): a local file, a directory or glob of partitions, a remote URL (`s3://`, `https://`, `gs://`), an `s3://…/` or `gs://…/` prefix (listed to its `.parquet` objects, sorted by key), or an explicit ordered `list[str]` of files/URLs (each a single file/object — no expansion; list order defines the dataset row order). Remote inputs are read via byte-range requests. With `bbox`, only the matching row groups of a remote input are ever downloaded.
-* `output` (`str`) — Output overview GeoParquet file.
-* `mode` (`str`) — Level materialization mode, "duplicating" (each level is a self-contained rendering) or "partitioning" (each feature appears once at its coarsest level; prefix reads). Defaults to "duplicating".
-* `min_zoom` (`int`) — Coarsest Web Mercator zoom of the level range. Defaults to 0.
-* `max_zoom` (`int or "auto"`) — Finest (canonical) Web Mercator zoom of the level range. Defaults to 6. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, honoring `bbox` and `filter`, never above 16; ignored with `gsds`. The chosen zoom is the finest `zoom` in the returned report's `levels` (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
-* `gsds` (`list[float]`) — Explicit per-level GSD list in meters, strictly decreasing coarse-to-fine. Overrides min_zoom/max_zoom.
-* `gsd_base` (`float`) — GSD tile-band base for the zoom-to-GSD mapping: gsd(z) = 40075016.69 / base / 2^z. Larger = finer (denser) levels, smaller = coarser. No effect with explicit gsds. Defaults to 1024.0.
-* `sort_key` (`str`) — Numeric column used as the cell-winner priority key (higher wins by default; see sort_direction). Mutually exclusive with class_rank_column.
-* `magnitude_ladder` (`str`) — Column whose value decides each feature's ENTRY ZOOM (#364). Its distinct values are ranked descending and placed one `ladder_step` apart from the coarsest zoom; a feature appears from its entry zoom inward and not before, exempt from the visibility gate and from thinning. Use when the strongest signal is carried by the physically smallest feature, where geometry-ranked thinning is backwards. Pair with `collapse=True` and `density_drop=False` so a promoted feature is not deleted again by simplification or the per-level budget.
-* `ladder_step` (`int`) — Zooms between consecutive `magnitude_ladder` rungs. Defaults to 1.
-* `sort_direction` (`str`) — "desc" (larger sort_key wins, default) or "asc" (smaller wins, e.g. rank columns where 1 is best).
-* `class_rank_column` (`str`) — String column carrying categorical classes for cell-winner ranking. Requires class_ranks. Mutually exclusive with sort_key.
-* `class_ranks` (`dict[str, float]`) — Map of class value to priority; higher priority wins a cell. Present-but-unlisted values rank below every listed value (but above nulls) unless class_rank_unknown overrides that. Priorities must be finite: NaN and infinity cannot be ordered against other classes and are rejected with ValueError.
-* `class_rank_unknown` (`float`) — Priority for present-but-unlisted class values. Defaults to min(class_ranks.values()) - 1. Must be finite.
-* `no_auto_rank` (`bool`) — Disable auto-detection of well-known schemas (Overture roads class/road_class, Overture places confidence). Defaults to False.
-* `simplify_factor` (`float`) — RDP tolerance = factor * gsd (duplicating mode only). Lower = crisper but heavier levels; higher = cruder and lighter. Defaults to 1.0.
-* `collapse` (`bool`) — Collapse below-visibility polygons to a representative point instead of dropping them. Defaults to False.
-* `collapse_square` (`bool`) — Collapse below-visibility polygons to a ~1xGSD area-dithered placeholder square at the representative point (tippecanoe tiny-polygon reduction; type-preserving, so fill styles keep working). Mutually exclusive with collapse. Defaults to False.
-* `representation` (`str`) — Zoom-band representation selector: comma-separated "LO-HI:KIND" bands (KIND: geom, point, square), e.g. "0-7:point,8-14:geom". Point bands render ALL polygonal features as centroids; square bands emit dithered placeholder squares for below-tolerance polygons. Requires a zoom-range plan and duplicating mode. Defaults to None (all levels geom).
-* `cascade` (`bool`) — Cascading simplification (duplicating mode only): simplify each coarser level from the next-finer level's already-simplified output (tippecanoe-style) and repair invalid RDP candidates via a boolean overlay instead of epsilon-retrying. Much faster; coarse-level coordinates differ slightly from the non-cascaded pipeline. Set False to reproduce pre-cascade output byte-for-byte. Defaults to True.
-* `point_thinning` (`float`) — Point thinning grid factor (cell size = factor * gsd). Defaults to 4.0, or 16.0 when cluster=True (absorbed points are summarized rather than dropped).
-* `line_thinning` (`float`) — Line thinning grid factor. Defaults to 1.0.
-* `polygon_thinning` (`float`) — Polygon thinning grid factor. Defaults to 1.0.
-* `line_visibility` (`float`) — A line is eligible at a level only if its bbox diagonal >= factor * gsd. Defaults to 2.0.
-* `polygon_visibility` (`float`) — Same gate for polygons. Defaults to 2.0 (retuned from 4.0 in the #259 coarse-zoom sweep; see corpus/SWEEPS.md Decision 6).
-* `drop_rate` (`float`) — Per-level density budget drop rate: each coarser level keeps 1/rate of the next finer level's budget. Defaults to 1.65.
-* `drop_gamma` (`float`) — Spatial-fairness strength for the density budget (1.0 = proportional cut; larger protects sparse neighborhoods). Defaults to 1.5.
-* `density_drop` (`bool`) — Master switch for the per-level density budget. Defaults to True.
-* `cluster` (`bool`) — Enable point clustering (duplicating mode only): the surviving point per grid cell absorbs the other points in its cell and the output gains a point_count INT64 column. Defaults to False.
-* `accumulate_attributes` (`dict[str, str]`) — Numeric per-cluster attribute aggregation, mapping column name to operator ("sum", "max", "min", "mean"). Requires cluster=True.
-* `coalesce_lines` (`bool`) — Chain touching same-class line segments into single "stroke" LineStrings at non-canonical levels; the output gains a coalesced_count INT32 column. Defaults to True. Inert in partitioning mode (feature-once/verbatim contract).
-* `coalesce_snap` (`float`) — Endpoint snap tolerance in GSD multiples; <= 0 requires exact endpoint matches. Defaults to 1.0.
-* `coalesce_junction_angle` (`float`) — Junction continuation threshold in degrees; 0 disables (junctions terminate chains). Defaults to 0.0.
-* `coalesce_max_level_rows` (`int`) — Per-level candidate-line ceiling (memory guard); inputs over it skip coalescing with a log. Two limbs: this many candidate lines, and this value x 512 B of modelled line geometry (~1 GB by default, ~1.2 GiB resident) — exceeding either skips coalescing. The byte limb binds first on lines averaging over ~28 vertices (unsplit rivers, boundaries, contours); raise this to coalesce them, at a proportional memory cost. Defaults to 2_000_000.
-* `cogp_compat` (`bool`) — Emit the optional COGP compatibility footer key. Defaults to False.
-* `row_group_size` (`int`) — Maximum output row-group size in rows (interpreted per level). Defaults to 10_000.
-* `full_column_stats` (`bool`) — Keep full Parquet statistics on every column instead of suppressing high-cardinality property and geometry stats. Defaults to False.
-* `streaming` (`bool`) — Use the two-pass bounded-memory streaming pipeline. Defaults to True.
-* `read_batch_size` (`int`) — Rows per Arrow read batch in the streaming pipeline. Defaults to 8192.
-* `bbox` (`tuple`) — Regional extract as `(xmin, ymin, xmax, ymax)` in EPSG:4326 lon/lat degrees. Only features whose bbox intersects the region are converted; input row groups whose bbox covering statistics don't intersect are skipped without reading their data pages (inputs without covering stats read everything and rely on the exact per-feature filter). Defaults to None (full extent).
-* `filter` (`str`) — Attribute filter — a SQL-WHERE-style predicate over the input's property columns, e.g. `"confidence > 0.8"` or `"crop IN ('soy', 'corn')"`. Supports `=, !=, <, <=, >, >=`, `IN (...)`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and parentheses; nulls follow SQL three-valued logic (a row is kept only when the predicate is TRUE). Composes with `bbox`; input row groups whose parquet column statistics preclude any match are skipped without reading their data pages. Defaults to None (no filtering).
-* `profile` (`str`) — Memory/throughput profile for the single-read pass-2 engine: "speed" (buffer output in RAM), "bounded" (spill to temporary Arrow IPC files), or "auto" (pick per mode + estimated size). Output is byte-identical across profiles. Defaults to "auto".
-* `in_flight_batches` (`int`) — Read batches allowed in flight through the streaming pipeline at once (read/compute-overlap knob) — pass 1's scan and pass 2's per-level fan-out both use it. Higher improves core utilization at proportionally more peak memory (per pass; passes 1 and 2 never run concurrently, so this does not double). Defaults to 0, which auto-sizes to the machine's available cores (clamped to 4..=16); pass an explicit positive integer to override.
-* `read_workers` (`int`) — Reader threads pass 2 splits the input across (#494). Output is byte-identical for every value — workers own disjoint runs of row groups and an in-order merge reproduces the single reader's batch sequence exactly. Defaults to 0, which takes a quarter of the machine's cores (capped at 4); remote inputs always read sequentially.
-* `spill_dir` (`str or os.PathLike`) — Directory for the remote-input spill file. A remote convert stages every fetched chunk on local disk (≈1x the touched input bytes) so later passes re-read from disk instead of the network; a free-space preflight warns if the projected spill may not fit there. The directory must exist. Local inputs never spill. Defaults to None (the process temp dir, $TMPDIR).
+* `input`: A GeoParquet file, directory, glob, `s3://`, `gs://`, or `https://` URL or prefix, or a list of files, in EPSG:4326 or EPSG:3857.
+* `output`: Overview file to write.
+* `mode`: `"duplicating"` makes each level a complete map; `"partitioning"` stores each feature once.
+* `min_zoom`: Coarsest zoom.
+* `max_zoom`: Finest zoom, or `"auto"` to estimate it (at most 16).
+* `gsds`: Per-level GSDs in meters, coarse to fine, instead of zooms.
+* `gsd_base`: Pixels per tile edge when mapping zooms to GSDs; larger is denser.
+* `sort_key`: Numeric column that decides which feature wins a cell.
+* `magnitude_ladder`: Column whose values set each feature's first zoom, largest first.
+* `ladder_step`: Zooms between `magnitude_ladder` values.
+* `sort_direction`: Whether larger or smaller `sort_key` values win.
+* `class_rank_column`: String column ranked by `class_ranks`.
+* `class_ranks`: Finite priority per class; higher wins.
+* `class_rank_unknown`: Priority of unlisted classes; None ranks them last.
+* `no_auto_rank`: Skip automatic ranking of Overture roads and places.
+* `simplify_factor`: Simplification tolerance, in GSDs.
+* `collapse`: Keep too-small polygons as points.
+* `collapse_square`: Keep too-small polygons as small squares.
+* `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
+* `cascade`: Simplify each level from the next finer one, which is faster.
+* `point_thinning`: Point grid cell size in GSDs; None means 4, or 16 with `cluster`.
+* `line_thinning`: Line grid cell size in GSDs.
+* `polygon_thinning`: Polygon grid cell size in GSDs.
+* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs.
+* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs.
+* `drop_rate`: Ratio between feature budgets of adjacent levels.
+* `drop_gamma`: How strongly the budget spares sparse areas.
+* `density_drop`: Apply the per-level feature budget.
+* `cluster`: Merge each cell's points into one, with a `point_count`.
+* `accumulate_attributes`: Columns to aggregate per cluster, and how.
+* `coalesce_lines`: Join touching same-class lines at coarse levels.
+* `coalesce_snap`: Largest gap between joined line ends, in GSDs.
+* `coalesce_junction_angle`: Largest turn through a junction, in degrees; 0 stops at junctions.
+* `coalesce_max_level_rows`: Lines per level above which joining is skipped, to bound memory.
+* `cogp_compat`: Also write the COGP compatibility footer key.
+* `row_group_size`: Most rows per output row group.
+* `full_column_stats`: Keep Parquet statistics for every column.
+* `streaming`: Read the input in batches. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `read_batch_size`: Rows per read batch. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `bbox`: Keep features that intersect this lon/lat box.
+* `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
+* `profile`: Hold output in RAM, on disk, or choose per run. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `in_flight_batches`: Batches processed at once; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `read_workers`: Reader threads; 0 sizes from the CPU count. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `spill_dir`: Where a remote input is staged. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
 
 ###### **Returns:**
 
-`dict` — Conversion report with keys "mode", "levels" (list of dicts with "level", "gsd", "zoom", "feature_count", "vertex_count", "uncompressed_bytes", "compressed_bytes"), "skipped_empty_levels" (list of dicts with "planned_level", "gsd", "zoom": planned levels omitted because no feature is visible at their scale — the written pyramid is auto-clamped to the non-empty levels), "input_features", "total_rows", "total_vertices", "total_compressed_bytes", "row_groups_total", "row_groups_read", "antimeridian_suspect_features" (features whose bbox spans more than 180° of longitude), "out_of_range_features" (features reaching beyond the declared CRS's coordinate range — dropped or clipped), "unprojectable_features" (features with valid lon/lat outside the Web Mercator tiling domain, |lat| > 85.05° — these cannot be tiled), "out_of_range_exemplars" (the first few out-of-range features, as dicts with "part" (None for a single file), "row" (the row in that file), "axis" ("lon"/"lat", or "x"/"y" for EPSG:3857), and "value"), "duration_secs", and "remote_fetch" (None for local inputs; for remote URLs a dict with "requests", "bytes_fetched", "object_size").
+[`OverviewReport`](#overviewreport): What was written, level by level.
 
 ###### **Raises:**
 
-* `ValueError` — Invalid options (bad mode/direction/op, conflicting or incomplete ranking options, invalid level plan, missing or mistyped columns), an unsupported input CRS, or an input where ≥99% of features cannot be tiled.
-* `RuntimeError` — The conversion itself failed (I/O, decode, writer errors).
+* `ValueError`: Invalid or conflicting options, a missing or mistyped column, an unsupported CRS, or almost nothing to tile.
+* `MemoryError`: Too little memory for this input.
+* `RuntimeError`: Reading or writing failed.
 
 ###### **Example:**
 
 ```python
->>> from tylertoo import overview
->>> report = overview("moldova.parquet", "moldova-overviews.parquet",
-...                   min_zoom=0, max_zoom=10)
->>> report = overview("nyc-trees.parquet", "nyc-trees-overviews.parquet",
-...                   max_zoom=12, cluster=True,
-...                   accumulate_attributes={"count": "sum"})
+>>> report = overview(
+...     "buildings.parquet", "overview.parquet", max_zoom=10
+... )
+>>> report["input_features"]
+1000
 ```
 
 ## `export_pmtiles`
 
 ```python
-export_pmtiles(input, output, *, layer_name='overview', tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=True, partition_wave=0, feature_order='input', min_zoom=None, feature_id=None, spill_dir=None)
+export_pmtiles(
+    input: str,
+    output: str,
+    *,
+    layer_name: str = "overview",
+    tile_buffer: int = 8,
+    extent: int = 4096,
+    tile_size_limit: int | None = 512_000,
+    simple_clip_fastpath: bool = True,
+    partition_wave: int = 0,
+    feature_order: Literal['input'] | str = "input",
+    min_zoom: int | None = None,
+    feature_id: str | None = None,
+    spill_dir: str | os.PathLike[str] | None = None,
+) -> ExportReport
 ```
 
-Export an overview GeoParquet file to a PMTiles archive.
-
-Python equivalent of `tylertoo export-pmtiles`: each overview level becomes one Web Mercator zoom of MVT tiles (gzip-compressed).
+Export an overview file to a PMTiles archive, one zoom per level.
 
 ###### **Parameters:**
 
-* `input` (`str`) — Input overview GeoParquet file (produced by `overview()`).
-* `output` (`str`) — Output PMTiles archive.
-* `layer_name` (`str`) — MVT layer name written into every tile and the archive metadata. Defaults to "overview".
-* `tile_buffer` (`int`) — Per-tile edge buffer in tile pixels (feature seam continuity). Defaults to 8; at most 256 (one full tile width), wider raises.
-* `extent` (`int`) — MVT tile extent (tile-local resolution). Defaults to 4096. Must be positive (0 raises); a value that is not a power of two is accepted with a warning.
-* `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single non-iterative drop pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
-* `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
-* `partition_wave` (`int`) — Partitions processed per band read during export (the export concurrency knob). Defaults to 0, which auto-sizes via a memory-budget preflight: the machine's core count, capped by how many estimated per-partition transients fit in a fraction of available RAM (container-aware: cgroup v2/v1 limits are respected; floor 6; fixed cap 16 only when RAM cannot be probed; override the RAM figure with the TYLERTOO_AUTO_MEM_LIMIT_BYTES env var). Pass an explicit positive integer to override. Wider waves keep more cores busy at proportionally more peak memory. Output is byte-identical for every value (the wave is a scheduling concern).
-* `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
-* `min_zoom` (`int`) — Minimum zoom the archive declares in its metadata (`vector_layers[].minzoom`) even when the overview file's coarsest levels are missing (#380). `overview` omits a level that generalizes to nothing, so a file built for z0..z13 can start at z2; this records the requested z0 anyway. The PMTiles header's min zoom is not widened: it always reports the shallowest zoom that actually holds a tile, as `go-pmtiles verify` requires. The empty zooms hold no tiles. Must not be finer than the coarsest level present. Defaults to None (the coarsest level's zoom). `convert()` passes its own `min_zoom` here, so pass the same value to match what it writes.
-* `feature_id` (`str`) — Carry a property column through as the MVT feature `id` on every tile the feature appears in, at every zoom (#443; tippecanoe's `--use-attribute-for-id`), so MapLibre `setFeatureState` (hover, selection, joins) keys correctly across tile and zoom boundaries without `promoteId`. Matched against the property name as the tile publishes it. The column must be an integer type (or `DECIMAL(p,0)`) and every row of the overview file a non-null value in `0..=2**64-1`; the whole column is checked before any tile is written, and a violation raises `RuntimeError` naming the column and the overview file's row and level. String and float ids are rejected (unlike tippecanoe): cast them to an integer first. The column is moved to the id, never also published as a regular property. Clusters carry their representative's id and coalesced lines their highest-priority member's; duplicate ids are not checked. Defaults to None, which keeps the tile-local member index (unique only within a single tile/zoom pair). Not available on `convert()`.
-* `spill_dir` (`str or os.PathLike`) — Directory for the export's member spill file (#427): the on-disk backing the partitioning single-read pass 2 falls back to when the buffered members would not fit the memory budget. The same knob as `overview()`'s `spill_dir`. Defaults to None (the process temp directory, `$TMPDIR` -- often a RAM-backed `/tmp` on cluster nodes; point it at real disk there). The directory must exist; a missing one raises `RuntimeError` before any work is done. The archive itself is never spilled here: it is assembled in place at `<output>.partial` beside the output.
+* `input`: Overview file from `overview()`.
+* `output`: PMTiles archive to write.
+* `layer_name`: MVT layer name.
+* `tile_buffer`: Tile edge buffer in pixels, at most 256.
+* `extent`: Tile resolution in MVT units.
+* `tile_size_limit`: Largest tile in bytes; 0 or None for no limit.
+* `simple_clip_fastpath`: Clip simple polygons faster; False gives byte-stable output.
+* `partition_wave`: Partitions held in memory at once; 0 sizes it from CPUs and RAM. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
+* `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
+* `min_zoom`: Coarsest zoom to declare when the coarsest levels are empty.
+* `feature_id`: Integer column to write as the MVT feature id.
+* `spill_dir`: Where spill files go when memory runs short. See <https://geoparquet-io.github.io/tylertoo/guides/bounded-memory/>.
 
 ###### **Returns:**
 
-`dict` — Export report with keys "mode", "min_zoom", "max_zoom", "zooms" (list of dicts with "zoom", "level", "level_feature_count", "tile_count", "tile_feature_count", "oversized_tiles", "encode_dropped_features", "encode_quantized_features"), "total_tiles", "total_tile_features", "oversized_tiles", "encode_dropped_features", "encode_quantized_features", "skipped_property_columns", "duration_secs". `encode_dropped_features` counts tile members with nothing to encode (empty geometries, empty GeometryCollections); non-zero means content was lost after clipping, and a warning names the total. `encode_quantized_features` counts tile members whose geometry collapsed at the tile extent (zero-area polygon rings, lines of fewer than two points, typically clip slivers at a buffered tile edge); expected on ordinary data and never a warning. `skipped_property_columns` is a list of dicts with "name" and "data_type": the property columns the export dropped because their Arrow type has no MVT encoding, such as a binary column; each is also warned about once. Struct, list and map columns are not dropped: they reach the tiles as JSON strings, the tippecanoe convention for nested attributes.
+[`ExportReport`](#exportreport): What was written, zoom by zoom.
 
 ###### **Raises:**
 
-* `RuntimeError` — The export failed (not an overview file, unsupported CRS, I/O errors).
+* `ValueError`: `feature_order` is malformed.
+* `RuntimeError`: Not an overview file, an option is out of range, or reading or writing failed.
 
 ###### **Example:**
 
 ```python
->>> from tylertoo import export_pmtiles
->>> report = export_pmtiles("moldova-overviews.parquet", "moldova.pmtiles",
-...                         layer_name="admin")
->>> print(report["total_tiles"])
+>>> report = export_pmtiles("overview.parquet", "out.pmtiles")
+>>> report["max_zoom"]
+10
 ```
 
 ## `validate`
 
 ```python
-validate(file)
+validate(
+    file: str,
+) -> ValidationReport
 ```
 
-Validate a GeoParquet overview file against the overviews spec checklist.
-
-Python equivalent of `tylertoo validate`: runs every structural conformance check (footer metadata, level column, row-group banding, bbox covering, provenance blocks, ...) and returns the structured results instead of raising on failure.
+Check an overview file against the overview format specification.
 
 ###### **Parameters:**
 
-* `file` (`str`) — GeoParquet overview file to validate.
+* `file`: Overview file to check.
 
 ###### **Returns:**
 
-`dict` — `{"valid": bool, "checks": [{"name": str, "passed": bool, "message": str}, ...]}` where "valid" is True iff every check passed.
+[`ValidationReport`](#validationreport): Each check's result; a failed check is reported, not raised.
 
 ###### **Raises:**
 
-* `RuntimeError` — The file could not be opened or its Parquet footer could not be parsed (validation never started).
+* `RuntimeError`: The file could not be opened as Parquet.
 
 ###### **Example:**
 
 ```python
->>> from tylertoo import validate
->>> result = validate("moldova-overviews.parquet")
->>> assert result["valid"], [c for c in result["checks"] if not c["passed"]]
+>>> validate("overview.parquet")["valid"]
+True
 ```
 
 ## `convert`
 
 ```python
-convert(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input')
+convert(
+    input: str,
+    output: str,
+    min_zoom: int = 0,
+    max_zoom: int | Literal['auto'] = 14,
+    layer_name: str | None = None,
+    tile_size_limit: int | None = 512_000,
+    simple_clip_fastpath: bool = True,
+    feature_order: Literal['input'] | str = "input",
+) -> None
 ```
 
-Convert GeoParquet to PMTiles in one shot (overview facade).
+Convert GeoParquet to PMTiles in one call (deprecated).
 
-**Deprecated.** `convert()` no longer runs the removed legacy per-tile pipeline. It is now a thin facade that chains `overview()` (convert, with default knobs) into a temporary GeoParquet file and then `export_pmtiles()` to the requested output. For control over generalization quality (ranking, clustering, coalescing, thinning), call `overview()` and `export_pmtiles()` directly.
-
-The legacy keyword arguments `drop_density`, `compression`, `include`, `exclude`, `exclude_all`, `deterministic`, `drop_smallest_as_needed`, `drop_smallest_threshold` and `progress_callback` were removed with the legacy pipeline; passing them raises `TypeError`.
+Use `overview()` and then `export_pmtiles()`, which take every option.
 
 ###### **Parameters:**
 
-* `input` (`str`) — Path to input GeoParquet file (EPSG:4326 or EPSG:3857), or a remote URL (`s3://`, `https://`, `gs://`) read via byte-range requests.
-* `output` (`str`) — Path to output PMTiles file.
-* `min_zoom` (`int`) — Minimum (coarsest) zoom level. Defaults to 0.
-* `max_zoom` (`int or "auto"`) — Maximum (finest) zoom level. Defaults to 14. Pass `"auto"` (#444, inspired by tippecanoe's `-zg`) to estimate it from a bounded sample of the input's feature extents and spacing, never above 16. The chosen zoom is the archive's max zoom (the evidence is logged through Rust's logger, which is not forwarded to Python `logging`). Raises ValueError when the input has nothing to measure or min_zoom is above 16.
-* `layer_name` (`str`) — Override the MVT layer name (defaults to the input filename stem).
-* `tile_size_limit` (`int`) — Per-tile MVT size cap in bytes. A tile exceeding it sheds features in a single pass (largest-first for polygons/lines; a uniform spatial stride for point tiles). Defaults to 512000 (500 KiB, tippecanoe parity); pass 0 (or None) to disable the cap.
-* `simple_clip_fastpath` (`bool`) — Skip the i_overlay boundary-bridge fallback for features whose rings are already simple (issue #239). Faster fine-zoom polygon export; output is render-equivalent on simple rings but stores them rotated to a different start vertex. Defaults to True; set False for byte-stable tile output.
-* `feature_order` (`str`) — Within-tile feature order (#361): "input" (default) or a property name, optionally suffixed ":asc" / ":desc". Renderers paint features in the order the tile lists them, so this is the paint order for any style that does not override it. "input" emits source row order; naming a column sorts within each tile by that property, ties kept in input order.
-
-###### **Returns:**
-
-None
+* `input`: See `overview()`.
+* `output`: PMTiles archive to write.
+* `min_zoom`: See `overview()`.
+* `max_zoom`: See `overview()`.
+* `layer_name`: MVT layer name; None uses the input's name.
+* `tile_size_limit`: See `export_pmtiles()`.
+* `simple_clip_fastpath`: See `export_pmtiles()`.
+* `feature_order`: See `export_pmtiles()`.
 
 ###### **Raises:**
 
-* `ValueError` — Invalid zoom range or conversion options.
-* `RuntimeError` — The conversion or export failed.
+* `ValueError`: Invalid zoom range or options.
+* `MemoryError`: Too little memory for this input.
+* `RuntimeError`: The conversion or the export failed.
 
 ###### **Example:**
 
 ```python
->>> from tylertoo import convert
->>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
->>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
+>>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+```
+
+## Report types
+
+### `OverviewReport`
+
+What `overview()` wrote.
+
+```python
+class OverviewReport(TypedDict):
+    mode: Literal['duplicating', 'partitioning']
+    levels: list[LevelReport]
+    skipped_empty_levels: list[SkippedLevel]
+    input_features: int
+    total_rows: int
+    total_vertices: int
+    total_compressed_bytes: int
+    row_groups_total: int
+    row_groups_read: int
+    antimeridian_suspect_features: int
+    out_of_range_features: int
+    unprojectable_features: int
+    out_of_range_exemplars: list[OutOfRangeExemplar]
+    duration_secs: float
+    remote_fetch: RemoteFetch | None
+```
+
+* `skipped_empty_levels`: Planned levels with nothing visible.
+* `row_groups_read`: Row groups left after `bbox` and `filter`.
+* `antimeridian_suspect_features`: Features wider than 180° of longitude, usually a broken antimeridian crossing.
+* `out_of_range_features`: Features dropped or clipped for lying outside the CRS range.
+* `unprojectable_features`: Features beyond ±85.05° latitude, which Web Mercator cannot tile.
+
+### `LevelReport`
+
+One written level of an overview file.
+
+```python
+class LevelReport(TypedDict):
+    level: int
+    gsd: float
+    zoom: int
+    feature_count: int
+    vertex_count: int
+    uncompressed_bytes: int
+    compressed_bytes: int
+```
+
+### `SkippedLevel`
+
+A planned level left out because nothing in it is visible.
+
+```python
+class SkippedLevel(TypedDict):
+    planned_level: int
+    gsd: float
+    zoom: int
+```
+
+### `OutOfRangeExemplar`
+
+Where a feature with out-of-range coordinates sits in the input.
+
+```python
+class OutOfRangeExemplar(TypedDict):
+    part: int | None
+    row: int
+    axis: Literal['lon', 'lat', 'x', 'y']
+    value: float
+```
+
+* `part`: Input file index, or None for a single file.
+* `axis`: "x" and "y" are for EPSG:3857 input.
+
+### `RemoteFetch`
+
+Network traffic for a remote input.
+
+```python
+class RemoteFetch(TypedDict):
+    requests: int
+    bytes_fetched: int
+    object_size: int
+```
+
+### `ExportReport`
+
+What `export_pmtiles()` wrote.
+
+```python
+class ExportReport(TypedDict):
+    mode: str
+    min_zoom: int
+    max_zoom: int
+    zooms: list[ZoomReport]
+    total_tiles: int
+    total_tile_features: int
+    oversized_tiles: int
+    encode_dropped_features: int
+    encode_quantized_features: int
+    skipped_property_columns: list[SkippedPropertyColumn]
+    duration_secs: float
+```
+
+* `oversized_tiles`: Tiles that shed features to fit `tile_size_limit`.
+* `encode_dropped_features`: Features with nothing left after clipping; above zero means lost content and a warning.
+* `encode_quantized_features`: Features that collapsed at the tile extent, usually edge slivers; normal.
+* `skipped_property_columns`: Columns MVT cannot encode, such as binary. Struct, list, and map columns become JSON strings.
+
+### `ZoomReport`
+
+One zoom of an exported archive.
+
+```python
+class ZoomReport(TypedDict):
+    zoom: int
+    level: int
+    level_feature_count: int
+    tile_count: int
+    tile_feature_count: int
+    oversized_tiles: int
+    encode_dropped_features: int
+    encode_quantized_features: int
+```
+
+### `SkippedPropertyColumn`
+
+A property column MVT cannot encode, left out of the tiles.
+
+```python
+class SkippedPropertyColumn(TypedDict):
+    name: str
+    data_type: str
+```
+
+### `ValidationReport`
+
+What `validate()` found.
+
+```python
+class ValidationReport(TypedDict):
+    valid: bool
+    checks: list[ValidationCheck]
+```
+
+* `valid`: True when every check passed.
+
+### `ValidationCheck`
+
+The result of one conformance check.
+
+```python
+class ValidationCheck(TypedDict):
+    name: str
+    passed: bool
+    message: str
 ```

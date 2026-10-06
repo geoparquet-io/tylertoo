@@ -12,7 +12,8 @@
 #   Slow Tests      the slow tests `quick` excludes; Test + Slow Tests
 #                   together cover the `full` tier, on ubuntu/macos stable,
 #                   split into three CPU shards per OS (six checks)
-#   Python Quality  ruff check/format, mypy + stubtest, vulture, xenon,
+#   Python Quality  ruff check/format (docstrings: pydocstyle, pydoclint,
+#                   W505), mypy + stubtest, ty, doctests, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
 #   Reference Docs  the committed CLI + Python reference (docs/reference/)
 #                   still match regeneration from source (clap help strings +
@@ -517,8 +518,16 @@ jobs:
       - name: mypy (strict)
         run: uv run mypy
 
-      - name: stubtest (tylertoo.pyi matches the built module)
+      - name: stubtest (_tylertoo.pyi matches the built extension)
         run: uv run python -m mypy.stubtest tylertoo --allowlist stubtest-allowlist.txt
+
+      - name: ty (the package and the extension stub)
+        run: uv run --no-sync ty check python
+
+      # The docstring examples, run against a small committed fixture
+      # (python/conftest.py).
+      - name: doctests
+        run: uv run --no-sync pytest --doctest-modules python -v
 
       # The binding's own test suite (#418): kwarg-surface tests plus the
       # integration classes against the downloaded fixtures. 88 tests, <1s
@@ -542,7 +551,8 @@ jobs:
   # Docs: the reference pages, the rustdoc, and every example the site shows.
   #
   # - The CLI and Python reference pages are generated from the clap help
-  #   strings (hidden gen-docs feature) and the pyo3 docstrings, committed
+  #   strings (hidden gen-docs feature) and the docstrings in
+  #   crates/python/python/tylertoo/__init__.py, committed
   #   under docs/reference/, and must match a fresh regeneration.
   # - rustdoc builds with -D warnings, so docs.rs never shows a broken link.
   # - crates/python/tests/docs runs both tutorials (examples/*) and the

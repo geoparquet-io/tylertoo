@@ -1,8 +1,10 @@
-# Type stubs for the tylertoo pyo3 extension module.
+# Type stub for the compiled extension, tylertoo._tylertoo.
 #
-# Kept honest by CI: `python -m mypy.stubtest tylertoo` verifies these
-# signatures against the compiled module on every PR. If you change a
-# #[pyo3(signature = ...)] in crates/python/src/lib.rs, update this file.
+# Private: the public, typed, documented API is tylertoo/__init__.py,
+# which passes every argument here by keyword. CI checks this file
+# against the built module with `python -m mypy.stubtest tylertoo`.
+# If you change a #[pyo3(signature = ...)] in crates/python/src/lib.rs,
+# update it here and in __init__.py.
 from pathlib import Path
 from typing import Any, Literal
 
