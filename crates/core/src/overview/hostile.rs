@@ -60,11 +60,12 @@ fn coordinates_exactly_on_the_domain_edge_are_in_range() {
             "bbox {bbox:?} sits on (not beyond) the domain edge"
         );
     }
-    // One ULP beyond any edge is out.
+    // One ULP beyond any edge is out. Longitude's edge is the one-world
+    // wrap the export applies (#342): ±540°.
     for bbox in [
-        [-180.000_001, 0.0, 0.0, 0.0],
+        [-540.000_001, 0.0, 0.0, 0.0],
         [0.0, -90.000_001, 0.0, 0.0],
-        [0.0, 0.0, 180.000_001, 0.0],
+        [0.0, 0.0, 540.000_001, 0.0],
         [0.0, 0.0, 0.0, 90.000_001],
     ] {
         assert!(
@@ -78,6 +79,33 @@ fn coordinates_exactly_on_the_domain_edge_are_in_range() {
         Crs::Epsg3857
     ));
     assert!(bbox_out_of_crs_range(
+        &[0.0, 0.0, 70_000_000.0, 0.0],
+        Crs::Epsg3857
+    ));
+}
+
+/// Longitude past ±180° is not lost (#342): the export draws it at its
+/// wrapped position, as tippecanoe does, so the convert must not count it
+/// as out of range, warn that it was dropped, or fail on a 0..360 dataset.
+#[test]
+fn wrappable_longitude_overhang_is_in_range() {
+    use super::convert::bbox_out_of_crs_range;
+    use super::level::Crs;
+
+    for bbox in [
+        [178.563, 10.0, 180.4, 11.0],     // a5 dateline cell
+        [-180.751, -5.0, -175.853, -4.0], // its western twin
+        [0.0, -60.0, 360.0, 60.0],        // a 0..360 dataset's extent
+        [200.0, 10.0, 210.0, 12.0],       // wholly past +180°
+        [-540.0, 0.0, 540.0, 0.0],        // the wrap's own edge
+    ] {
+        assert!(
+            !bbox_out_of_crs_range(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} wraps into the tile grid"
+        );
+    }
+    // A 3857 x past the world edge wraps the same way.
+    assert!(!bbox_out_of_crs_range(
         &[0.0, 0.0, 30_000_000.0, 0.0],
         Crs::Epsg3857
     ));

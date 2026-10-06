@@ -3200,17 +3200,35 @@ fn size_bboxes(
             || (None::<TileBounds>, HashMap::<u64, usize>::new()),
             |(mut bounds, mut counts), bbox| {
                 if let Some(bbox) = bbox {
-                    match &mut bounds {
-                        Some(acc) => acc.expand(bbox),
-                        None => bounds = Some(*bbox),
+                    for extent in wrapped_extents(bbox) {
+                        match &mut bounds {
+                            Some(acc) => acc.expand(&extent),
+                            None => bounds = Some(extent),
+                        }
                     }
                     // Counts must match what `feature_tile_members` will emit,
-                    // so both go through `member_ranges`; the accumulated
-                    // `bounds` above stay the true extent, since they become the
-                    // archive's advertised bbox.
-                    let ranges = member_ranges(bbox, zoom, opts);
-                    for tc in tiles_in_ranges(&ranges, zoom) {
-                        *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
+                    // so both go through `wrap_shifts` and `member_ranges`; the
+                    // accumulated `bounds` above stay the true (wrapped)
+                    // extent, since they become the archive's advertised bbox.
+                    let buffer = buffer_deg_at_zoom(zoom, opts);
+                    if !near_world_edge(bbox, buffer) {
+                        let ranges = member_ranges(bbox, zoom, opts);
+                        for tc in tiles_in_ranges(&ranges, zoom) {
+                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
+                        }
+                        return (bounds, counts);
+                    }
+                    let copies: Vec<BboxTileRanges> = wrap_shifts(bbox, buffer)
+                        .map(|shift| member_ranges(&shift_bbox(bbox, shift), zoom, opts))
+                        .collect();
+                    for (i, ranges) in copies.iter().enumerate() {
+                        for tc in tiles_in_ranges(ranges, zoom) {
+                            // A tile two copies share is one member (#342).
+                            if copies[..i].iter().any(|r| ranges_contain(r, tc)) {
+                                continue;
+                            }
+                            *counts.entry(tile_key(tc.x, tc.y, zoom)).or_insert(0) += 1;
+                        }
                     }
                 }
                 (bounds, counts)
@@ -3239,6 +3257,36 @@ fn size_bboxes(
                 (bounds, dst)
             },
         )
+}
+
+/// The parts of a feature with `bbox` that lie inside the ±180° longitude
+/// domain once wrapped (#342): its in-domain part as stored, plus each ±360°
+/// copy that overlaps the domain with positive width. A bbox already inside
+/// the domain comes back unchanged. These are what the archive advertises, so
+/// a cell stored as `x: 178 … 181` reports `[178, 180]` and `[-180, -179]`,
+/// never lng 181.
+fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
+    [0.0, -360.0, 360.0]
+        .into_iter()
+        .filter_map(move |shift: f64| {
+            let lo = bbox.lng_min + shift;
+            let hi = bbox.lng_max + shift;
+            let inside = if shift == 0.0 {
+                lo <= 180.0 && hi >= -180.0
+            } else {
+                lo < 180.0 && hi > -180.0
+            };
+            inside
+                .then(|| TileBounds::new(lo.max(-180.0), bbox.lat_min, hi.min(180.0), bbox.lat_max))
+        })
+}
+
+/// `true` when tile `tc` lies in `ranges`.
+#[inline]
+fn ranges_contain(ranges: &BboxTileRanges, tc: TileCoord) -> bool {
+    let within = |(lo, hi): (u32, u32), v: u32| lo <= v && v <= hi;
+    within(ranges.y, tc.y)
+        && (within(ranges.x, tc.x) || ranges.x2.is_some_and(|x2| within(x2, tc.x)))
 }
 
 /// Per-level scan oracle: reads level `level_idx`'s full render set (the
@@ -3357,14 +3405,20 @@ fn process_wave(
     // Row-group pruning is only valid when the file's coordinates (and thus its
     // row-group bbox statistics) are lon/lat. For 3857 files the stats are in
     // meters; skip pruning (correct, just unpruned). Prune to the *union* of the
-    // wave's partition bboxes.
-    let bbox = match ctx.crs {
+    // wave's partition bboxes, and of that union shifted ±360°: the export
+    // draws a feature stored one world width away at its wrapped position
+    // (#342, `wrap_shifts`), so its row group's stats sit there, not over the
+    // wave's tiles.
+    let bboxes = match ctx.crs {
         Crs::Epsg4326 => {
             let mut b = wave[0].bbox;
             for p in &wave[1..] {
                 b.expand(&p.bbox);
             }
-            Some([b.lng_min, b.lat_min, b.lng_max, b.lat_max])
+            Some(
+                [0.0, -360.0, 360.0]
+                    .map(|shift| [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]),
+            )
         }
         Crs::Epsg3857 => None,
     };
@@ -3397,8 +3451,11 @@ fn process_wave(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
             let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-                ctx.reader
-                    .read_level_with_batch_size(ctx.level_idx, bbox, EXPORT_BATCH_SIZE)
+                ctx.reader.read_level_any_bbox_with_batch_size(
+                    ctx.level_idx,
+                    bboxes.as_ref().map(|b| b.as_slice()),
+                    EXPORT_BATCH_SIZE,
+                )
             })?;
             loop {
                 let next = ExportTimers::time(&timers.band_read, || batch_reader.next());
@@ -3578,6 +3635,17 @@ fn collect_wave_members(
 /// `member_ranges(feature_bbox, zoom, opts) ∩ [key_lo, key_hi]`, minus the
 /// candidates the clip rejects. That keeps the scan pass's per-tile counts
 /// valid: every emitted key lies in a planned partition.
+///
+/// ## World-edge wrap (#342)
+///
+/// A feature whose bbox reaches past ±180°, or into the buffer of the tile
+/// column on the far side of the antimeridian, is tiled once per
+/// [`wrap_shifts`] copy: as stored, and shifted ±360°. Each copy goes through
+/// the same membership and clip as an ordinary feature, so a cell stored as
+/// `x: 178 … 181` keeps its 178°–180° part in the east-edge tile and draws its
+/// 180°–181° part at -180°…-179° in the west-edge tile. Where two copies land
+/// in one tile (z0 holds the whole world), their pieces join into one
+/// multi-geometry, so a feature still emits at most one member per key.
 fn feature_tile_members(
     geom: &Geometry<f64>,
     zoom: u8,
@@ -3589,6 +3657,166 @@ fn feature_tile_members(
         return Vec::new();
     };
     let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    // Ring simplicity survives a pure x translation, so one check covers every
+    // copy (issue #237, RC3).
+    let assume_simple = geometry_is_simple(geom);
+    let buffer = buffer_deg_at_zoom(zoom, opts);
+    let mut out = Vec::new();
+    if !near_world_edge(&bbox, buffer) {
+        copy_tile_members(
+            geom,
+            &bbox,
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            assume_simple,
+            &mut out,
+        );
+        return out;
+    }
+    let mut by_key: BTreeMap<u64, Geometry<f64>> = BTreeMap::new();
+    for shift in wrap_shifts(&bbox, buffer) {
+        let copy = shift_lng(geom, shift);
+        copy_tile_members(
+            &copy,
+            &shift_bbox(&bbox, shift),
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            assume_simple,
+            &mut out,
+        );
+        for (key, piece) in out.drain(..) {
+            match by_key.remove(&key) {
+                Some(prev) => by_key.insert(key, join_wrapped_pieces(prev, piece)),
+                None => by_key.insert(key, piece),
+            };
+        }
+    }
+    by_key.into_iter().collect()
+}
+
+/// Longitude shift of each world copy of a feature with `bbox` that reaches
+/// the tile grid at a zoom whose edge buffer is `buffer` degrees (#342).
+///
+/// The stored copy (shift 0) comes first, unless it lies wholly outside the
+/// world grown by the buffer: `expand_bbox` would collapse such a copy onto
+/// the edge column, where the clip drops it, so planning it only inflates
+/// that column's counts. A ±360° copy joins when it overlaps the buffered
+/// world with positive width: a feature past +180° draws its
+/// overhang at the west edge, a feature at 0..360 lands at its -180..0 twin,
+/// and a feature within `buffer` of +180° fills the west-edge tile's buffer.
+/// This is tippecanoe's world-edge rule: `clip_to_tile` at z0 appends a copy
+/// shifted by one world width whenever the feature's bbox reaches within the
+/// buffer of either edge (tile.cpp, "If the geometry extends off the edge of
+/// the world"), and the children inherit both copies. Testing against the
+/// zoom's own buffer rather than z0's skips only copies the clip would cut
+/// away anyway, so the tiles are the same. A copy that only touches the
+/// buffered world's edge holds no area inside it and is left out.
+fn wrap_shifts(bbox: &TileBounds, buffer: f64) -> impl Iterator<Item = f64> + '_ {
+    [0.0, -360.0, 360.0]
+        .into_iter()
+        .filter(move |&shift: &f64| {
+            let (lo, hi) = (bbox.lng_min + shift, bbox.lng_max + shift);
+            if shift == 0.0 {
+                // Edge contact counts for the stored copy, as it always has.
+                hi >= -180.0 - buffer && lo <= 180.0 + buffer
+            } else {
+                hi > -180.0 - buffer && lo < 180.0 + buffer
+            }
+        })
+}
+
+/// `false` when [`wrap_shifts`] yields only the stored copy: the bbox stays
+/// more than `buffer` inside both world edges. Every ±360° copy test implies
+/// this one, so it is the cheap gate that keeps ordinary features off the
+/// wrap path (no copy, no per-key join).
+#[inline]
+fn near_world_edge(bbox: &TileBounds, buffer: f64) -> bool {
+    bbox.lng_min < -180.0 + buffer || bbox.lng_max > 180.0 - buffer
+}
+
+/// `geom` moved `shift` degrees east. The stored copy borrows, so a large
+/// polygon on the world edge is not cloned for it.
+fn shift_lng(geom: &Geometry<f64>, shift: f64) -> std::borrow::Cow<'_, Geometry<f64>> {
+    if shift == 0.0 {
+        return std::borrow::Cow::Borrowed(geom);
+    }
+    std::borrow::Cow::Owned(geom.map_coords(|c| geo::Coord {
+        x: c.x + shift,
+        y: c.y,
+    }))
+}
+
+/// `bbox` moved `shift` degrees east.
+fn shift_bbox(bbox: &TileBounds, shift: f64) -> TileBounds {
+    TileBounds::new(
+        bbox.lng_min + shift,
+        bbox.lat_min,
+        bbox.lng_max + shift,
+        bbox.lat_max,
+    )
+}
+
+/// Join two world copies' pieces of one feature in one tile (#342). Pieces
+/// of one family join into its multi type; mixed families, which no clip of
+/// a single geometry produces, fall back to a collection, which the MVT
+/// encoder splits by kind.
+fn join_wrapped_pieces(a: Geometry<f64>, b: Geometry<f64>) -> Geometry<f64> {
+    use geo::{MultiLineString, MultiPoint, MultiPolygon};
+    fn polygons(g: &Geometry<f64>) -> Option<Vec<geo::Polygon<f64>>> {
+        match g {
+            Geometry::Polygon(p) => Some(vec![p.clone()]),
+            Geometry::MultiPolygon(m) => Some(m.0.clone()),
+            _ => None,
+        }
+    }
+    fn lines(g: &Geometry<f64>) -> Option<Vec<geo::LineString<f64>>> {
+        match g {
+            Geometry::LineString(l) => Some(vec![l.clone()]),
+            Geometry::MultiLineString(m) => Some(m.0.clone()),
+            _ => None,
+        }
+    }
+    fn points(g: &Geometry<f64>) -> Option<Vec<geo::Point<f64>>> {
+        match g {
+            Geometry::Point(p) => Some(vec![*p]),
+            Geometry::MultiPoint(m) => Some(m.0.clone()),
+            _ => None,
+        }
+    }
+    if let (Some(mut x), Some(y)) = (polygons(&a), polygons(&b)) {
+        x.extend(y);
+        return Geometry::MultiPolygon(MultiPolygon(x));
+    }
+    if let (Some(mut x), Some(y)) = (lines(&a), lines(&b)) {
+        x.extend(y);
+        return Geometry::MultiLineString(MultiLineString(x));
+    }
+    if let (Some(mut x), Some(y)) = (points(&a), points(&b)) {
+        x.extend(y);
+        return Geometry::MultiPoint(MultiPoint(x));
+    }
+    Geometry::GeometryCollection(geo::GeometryCollection(vec![a, b]))
+}
+
+/// One world copy's share of [`feature_tile_members`]: clip `geom` (whose
+/// bbox is `bbox`) into every tile it belongs to at `zoom` within
+/// `[key_lo, key_hi]`, appending to `out`.
+#[allow(clippy::too_many_arguments)]
+fn copy_tile_members(
+    geom: &Geometry<f64>,
+    bbox: &TileBounds,
+    zoom: u8,
+    opts: &ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    assume_simple: bool,
+    out: &mut Vec<(u64, Geometry<f64>)>,
+) {
+    let bbox = *bbox;
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
     // feature belongs to. Derived from the BUFFER-EXPANDED bbox so a feature
     // sitting in a neighbouring tile's buffer is a member of that tile; the
@@ -3596,7 +3824,6 @@ fn feature_tile_members(
     // candidates that turn out not to intersect the buffered tile are dropped
     // by the clip below.
     let ranges = member_ranges(&bbox, zoom, opts);
-    let mut out = Vec::new();
 
     // Dispatch on the *direct* path's cost — the ticket's own model,
     // `tiles_spanned × vertex_count`. The recursive cascade wins big when that
@@ -3609,14 +3836,12 @@ fn feature_tile_members(
     // keeps them byte-identical to the pre-#226 path and avoids a regression on
     // dense corpora, while the giant polygons that actually caused the DNF take
     // the cascade.
-    // Validate the feature's ring simplicity **once** here, then thread the
-    // result through every clip this feature performs (issue #237, RC3). The
-    // O(V²) self-intersection scan that `clip_polygon` used to run on *every*
-    // tile now runs a single time per feature; a continental polygon touching
-    // thousands of tiles pays it once instead of thousands of times. The clip
-    // output is unchanged — see `clip::clip_geometry_simple`.
-    let assume_simple = geometry_is_simple(geom);
-
+    // `assume_simple` is the feature's ring simplicity, validated **once** by
+    // the caller and threaded through every clip this feature performs (issue
+    // #237, RC3). The O(V²) self-intersection scan that `clip_polygon` used to
+    // run on *every* tile now runs a single time per feature; a continental
+    // polygon touching thousands of tiles pays it once instead of thousands of
+    // times. The clip output is unchanged — see `clip::clip_geometry_simple`.
     let direct_cost = tile_span(&ranges).saturating_mul(geom.coords_count() as u64);
     if direct_cost <= DIRECT_CLIP_BUDGET {
         feature_tile_members_direct(
@@ -3628,7 +3853,7 @@ fn feature_tile_members(
             key_hi,
             &ranges,
             assume_simple,
-            &mut out,
+            out,
         );
     } else {
         // Start the descent at the feature's covering tile (the deepest tile
@@ -3646,10 +3871,9 @@ fn feature_tile_members(
             key_hi,
             &ranges,
             assume_simple,
-            &mut out,
+            out,
         );
     }
-    out
 }
 
 /// Longitude degrees corresponding to the edge buffer at `zoom`, under the same
@@ -3695,9 +3919,9 @@ fn buffer_deg_at_zoom(zoom: u8, opts: &ExportOptions) -> f64 {
 /// 16,385 of them at z14, per feature, for a feature that ends up in none of
 /// them. So the edges are re-ordered back after clamping.
 ///
-/// Antimeridian seam continuity is deliberately out of scope: a feature at lng
-/// 179.99 does NOT become a member of tile x=0. Fixing that needs wrap-aware
-/// membership throughout, not a wider bbox.
+/// The clamp keeps each copy's membership on its own side of the
+/// antimeridian. Continuity across it comes from [`wrap_shifts`] instead: a
+/// feature at lng 179.99 reaches tile x=0 through its copy at -180.01 (#342).
 #[inline]
 fn expand_bbox(bbox: &TileBounds, buffer: f64) -> TileBounds {
     // A bbox that was ALREADY wrapped on the way in must stay wrapped; only a
@@ -6838,6 +7062,332 @@ mod tests {
             widened.lng_min > widened.lng_max,
             "a genuinely wrapped bbox must not be collapsed: {widened:?}"
         );
+    }
+
+    // ---- world-edge wrap (#342) ---------------------------------------------
+
+    /// A lon/lat rectangle as a polygon.
+    fn rect_polygon(lng_min: f64, lat_min: f64, lng_max: f64, lat_max: f64) -> Geometry<f64> {
+        Geometry::Polygon(geo::Polygon::new(
+            LineString::from(vec![
+                (lng_min, lat_min),
+                (lng_max, lat_min),
+                (lng_max, lat_max),
+                (lng_min, lat_max),
+                (lng_min, lat_min),
+            ]),
+            vec![],
+        ))
+    }
+
+    /// The lon/lat bbox of a member geometry.
+    fn member_bbox(g: &Geometry<f64>) -> TileBounds {
+        let r = g.bounding_rect().expect("member has a bbox");
+        TileBounds::new(r.min().x, r.min().y, r.max().x, r.max().y)
+    }
+
+    /// #342 reproducer: a cell stored as `x: 178 … 181` overhangs +180. The
+    /// 180°–181° part belongs on the west edge of the map, at -180°…-179°.
+    /// tippecanoe writes it to z2 tile (0, 1); tylertoo used to clip it away at
+    /// the world edge and write no west-edge tile at all.
+    #[test]
+    fn overhanging_polygon_wraps_onto_the_west_edge_tile() {
+        let opts = ExportOptions::default();
+        let zoom = 2;
+        let members = members_by_key(feature_tile_members(
+            &rect_polygon(178.0, 1.0, 181.0, 3.0),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+        ));
+        let east = members
+            .get(&tile_key(3, 1, zoom))
+            .expect("the in-range part stays in its own tile (3, 1)");
+        let west = members.get(&tile_key(0, 1, zoom)).unwrap_or_else(|| {
+            panic!(
+                "the overhanging part must wrap onto tile (0, 1); emitted tiles: {:?}",
+                members
+                    .keys()
+                    .map(|&k| key_to_xy(k, zoom))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        // The west piece is the 180°–181° sliver moved to -180°…-179°.
+        let w = member_bbox(west);
+        assert!(
+            (w.lng_max - -179.0).abs() < 1e-9,
+            "wrapped piece must end at -179°: {w:?}"
+        );
+        assert!(
+            w.lng_min < -179.0,
+            "wrapped piece reaches the map edge: {w:?}"
+        );
+        // The east piece keeps its in-range extent.
+        let e = member_bbox(east);
+        assert!(
+            (e.lng_min - 178.0).abs() < 1e-9,
+            "east piece starts at 178°: {e:?}"
+        );
+        // The buffer also reaches the row below; every member sits in one of
+        // the two edge columns.
+        let columns: HashSet<u32> = members.keys().map(|&k| key_to_xy(k, zoom).0).collect();
+        assert_eq!(
+            columns,
+            HashSet::from([0, 3]),
+            "only the two edge columns at z2"
+        );
+    }
+
+    /// A feature stored wholly past +180° (the 0..360 convention) is drawn at
+    /// its wrapped longitude, as tippecanoe draws it, instead of vanishing.
+    #[test]
+    fn out_of_domain_point_is_drawn_at_its_wrapped_longitude() {
+        let opts = ExportOptions::default();
+        for zoom in [0u8, 4, 10] {
+            let members = members_by_key(feature_tile_members(
+                &Geometry::Point(geo::Point::new(200.0, 10.0)),
+                zoom,
+                &opts,
+                0,
+                u64::MAX,
+            ));
+            let home = crate::tile::lng_lat_to_tile(-160.0, 10.0, zoom);
+            let Some(Geometry::Point(p)) = members.get(&tile_key(home.x, home.y, zoom)) else {
+                panic!(
+                    "z{zoom}: a point at lng 200 must land in the tile holding lng -160; \
+                     emitted {members:?}"
+                );
+            };
+            assert!((p.x() - -160.0).abs() < 1e-9, "z{zoom}: drawn at {p:?}");
+            assert_eq!(members.len(), 1, "z{zoom}: one tile only: {members:?}");
+        }
+    }
+
+    /// Tile buffers continue across the antimeridian. A point just west of
+    /// +180° sits inside the buffer of the westmost tile column, so that tile
+    /// carries it too. tippecanoe does the same: its z0 clip copies every
+    /// feature within the buffer of the world edge 360° to the other side.
+    #[test]
+    fn tile_buffer_continues_across_the_antimeridian() {
+        let opts = ExportOptions::default();
+        let zoom = 4;
+        let buffer = buffer_deg_at_zoom(zoom, &opts);
+        let lng = 180.0 - 0.5 * buffer;
+        let members = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(lng, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+        ));
+        let home = crate::tile::lng_lat_to_tile(lng, 10.0, zoom);
+        assert_eq!(home.x, 15);
+        assert!(members.contains_key(&tile_key(15, home.y, zoom)));
+        let Some(Geometry::Point(p)) = members.get(&tile_key(0, home.y, zoom)) else {
+            panic!("the point is in tile x=0's buffer; emitted {members:?}");
+        };
+        assert!(
+            (p.x() - (lng - 360.0)).abs() < 1e-9,
+            "the far-side copy is shifted by 360°: {p:?}"
+        );
+
+        // Beyond the buffer: no far-side copy.
+        let lng = 180.0 - 1.5 * buffer;
+        let members = members_by_key(feature_tile_members(
+            &Geometry::Point(geo::Point::new(lng, 10.0)),
+            zoom,
+            &opts,
+            0,
+            u64::MAX,
+        ));
+        assert_eq!(
+            members.len(),
+            1,
+            "{lng}° is beyond x=0's buffer: {members:?}"
+        );
+    }
+
+    /// When both copies of a feature reach the same tile (z0 holds the whole
+    /// world), the tile still gets ONE member: the pieces are joined into one
+    /// multi-geometry, as tippecanoe's concatenated copies are.
+    #[test]
+    fn both_wrapped_copies_in_one_tile_make_one_member() {
+        let opts = ExportOptions::default();
+        let out =
+            feature_tile_members(&rect_polygon(178.0, 1.0, 181.0, 3.0), 0, &opts, 0, u64::MAX);
+        assert_eq!(out.len(), 1, "one member per tile: {out:?}");
+        let Geometry::MultiPolygon(mp) = &out[0].1 else {
+            panic!("the two pieces join into a MultiPolygon: {:?}", out[0].1);
+        };
+        assert_eq!(mp.0.len(), 2, "east piece plus wrapped west piece: {mp:?}");
+        let b = member_bbox(&out[0].1);
+        assert!(b.lng_min < -179.0 && b.lng_max > 178.0, "{b:?}");
+
+        // Lines and points join within their own family.
+        let line = Geometry::LineString(LineString::from(vec![(178.0, 1.0), (181.0, 2.0)]));
+        let out = feature_tile_members(&line, 0, &opts, 0, u64::MAX);
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0].1, Geometry::MultiLineString(m) if m.0.len() == 2),
+            "{:?}",
+            out[0].1
+        );
+        let pt = Geometry::Point(geo::Point::new(179.99, 0.0));
+        let out = feature_tile_members(&pt, 0, &opts, 0, u64::MAX);
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0].1, Geometry::MultiPoint(m) if m.0.len() == 2),
+            "{:?}",
+            out[0].1
+        );
+    }
+
+    /// The scan plans a wrapped feature's tiles from the same copies the emit
+    /// clips, and counts a tile two copies share only once.
+    #[test]
+    fn scan_plans_wrapped_copies_and_counts_shared_tiles_once() {
+        use std::collections::HashSet;
+        let opts = ExportOptions::default();
+        let geoms = [
+            rect_polygon(178.0, -1.0, 181.0, 1.0),
+            rect_polygon(-182.0, 40.0, -175.0, 45.0),
+            Geometry::Point(geo::Point::new(200.0, 10.0)),
+            Geometry::Point(geo::Point::new(179.99, -30.0)),
+            // Whole-world polygon: both copies touch the buffered world.
+            rect_polygon(-180.0, -60.0, 180.0, -50.0),
+        ];
+        for zoom in [0u8, 2, 5, 9] {
+            for g in &geoms {
+                let bbox = member_bbox(g);
+                let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts);
+                assert!(
+                    counts.values().all(|&c| c == 1),
+                    "z{zoom}: a tile counted twice for one feature {g:?}"
+                );
+                let planned: HashSet<u64> = counts.keys().copied().collect();
+                for (key, _) in feature_tile_members(g, zoom, &opts, 0, u64::MAX) {
+                    assert!(
+                        planned.contains(&key),
+                        "z{zoom}: emitted key {:?} was not planned for {g:?}",
+                        key_to_xy(key, zoom)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The archive's advertised bounds are the wrapped data extent, inside
+    /// ±180°: a header saying lng 181 is not a valid PMTiles bbox.
+    #[test]
+    fn scan_bounds_wrap_into_the_lng_domain() {
+        let opts = ExportOptions::default();
+        let bounds = |b: TileBounds| size_bboxes(&[Some(b)], 4, &opts).0.expect("bounds");
+
+        let b = bounds(TileBounds::new(178.0, -1.0, 181.0, 1.0));
+        assert_eq!((b.lng_min, b.lng_max), (-180.0, 180.0), "{b:?}");
+        let b = bounds(TileBounds::new(200.0, 10.0, 210.0, 12.0));
+        assert_eq!((b.lng_min, b.lng_max), (-160.0, -150.0), "{b:?}");
+        // In-range bboxes are untouched, edge contact included.
+        for raw in [
+            TileBounds::new(10.0, -1.0, 12.0, 1.0),
+            TileBounds::new(170.0, -1.0, 180.0, 1.0),
+            TileBounds::new(-180.0, -60.0, 180.0, -50.0),
+        ] {
+            assert_eq!(bounds(raw), raw);
+        }
+    }
+
+    /// The duplicating-mode wave read prunes row groups by the wave's tile
+    /// bbox, which lies inside the ±180° domain. A wrapped copy is drawn in a
+    /// tile whose bbox is one world width away from the row group's stored
+    /// stats, so the prune must test the shifted wave bbox too, or the
+    /// wrapped piece is lost whenever its tile reads in a wave of its own.
+    #[test]
+    fn wave_row_group_prune_keeps_wrapped_copies() {
+        use crate::pmtiles_writer::{decode_directory, tile_id_to_zxy, Header};
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        // One feature per row group: the dateline cell, a 0..360 point and
+        // an ordinary point that keeps the row-group stats apart.
+        write_mode_fixture(
+            tin.path(),
+            &[(
+                vec![0, 1, 2],
+                vec![
+                    rect_polygon(178.0, 1.0, 181.0, 3.0),
+                    Geometry::Point(geo::Point::new(250.0, -40.0)),
+                    Geometry::Point(geo::Point::new(10.0, 10.0)),
+                ],
+            )],
+            Mode::Duplicating,
+            1,
+        );
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            partition_wave: 1,
+            ..Default::default()
+        };
+        export_pmtiles_with_partition_target(tin.path(), tout.path(), &opts, 1).unwrap();
+
+        let bytes = std::fs::read(tout.path()).unwrap();
+        let header = Header::from_bytes(&bytes).unwrap();
+        let root = crate::compression::decompress_capped(
+            &bytes[header.root_dir_offset as usize
+                ..(header.root_dir_offset + header.root_dir_length) as usize],
+            header.internal_compression,
+            crate::compression::MAX_INTERNAL_BYTES,
+        )
+        .unwrap();
+        let tiles: HashSet<(u8, u32, u32)> = decode_directory(&root)
+            .unwrap()
+            .iter()
+            .flat_map(|e| {
+                (0..u64::from(e.run_length)).map(move |i| tile_id_to_zxy(e.tile_id + i).unwrap())
+            })
+            .collect();
+        // The cell's 180°–181° part lands at -180°…-179°: z2 tile (0, 1).
+        assert!(tiles.contains(&(2, 0, 1)), "dateline overhang: {tiles:?}");
+        // The point at lng 250 lands at lng -110, in a row of its own.
+        let home = crate::tile::lng_lat_to_tile(-110.0, -40.0, 2);
+        assert_eq!((home.x, home.y), (0, 2));
+        assert!(
+            tiles.contains(&(2, home.x, home.y)),
+            "0..360 point: {tiles:?}"
+        );
+    }
+
+    /// A feature stored wholly past the buffered world (the 0..360
+    /// convention) is tiled through its wrapped copy alone. Its stored copy
+    /// reaches no tile, so the scan must not plan one for it: `expand_bbox`
+    /// would collapse that copy onto the east-edge column, where the clip
+    /// then drops it, and every such feature would inflate that column's
+    /// planned counts.
+    #[test]
+    fn stored_copy_outside_the_buffered_world_plans_no_tile() {
+        let opts = ExportOptions::default();
+        for zoom in [0u8, 4, 10] {
+            let bbox = TileBounds::new(200.0, 10.0, 200.0, 10.0);
+            let (_, counts) = size_bboxes(&[Some(bbox)], zoom, &opts);
+            let home = crate::tile::lng_lat_to_tile(-160.0, 10.0, zoom);
+            let planned: Vec<_> = counts.keys().map(|&k| key_to_xy(k, zoom)).collect();
+            assert_eq!(
+                planned,
+                vec![(home.x, home.y)],
+                "z{zoom}: only the wrapped copy's tile"
+            );
+        }
+        // Beyond one wrap nothing reaches the grid.
+        let far = TileBounds::new(600.0, 10.0, 600.0, 10.0);
+        assert!(size_bboxes(&[Some(far)], 4, &opts).1.is_empty());
+        assert!(feature_tile_members(
+            &Geometry::Point(geo::Point::new(600.0, 10.0)),
+            4,
+            &opts,
+            0,
+            u64::MAX
+        )
+        .is_empty());
     }
 
     /// The scan pass plans the partitions and the emit pass fills them; the

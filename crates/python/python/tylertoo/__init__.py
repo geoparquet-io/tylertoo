@@ -83,7 +83,8 @@ class OverviewReport(TypedDict):
         antimeridian_suspect_features: Features wider than 180° of
             longitude, usually a broken antimeridian crossing.
         out_of_range_features: Features dropped or clipped because
-            their coordinates are outside the valid range.
+            their coordinates are outside the valid range. Longitude
+            past ±180° but within ±540° wraps and is not counted.
         unprojectable_features: Features beyond ±85.05° latitude, which
             Web Mercator cannot tile.
     """

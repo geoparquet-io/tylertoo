@@ -341,16 +341,26 @@ impl OverviewReader {
     /// `bbox` = `[xmin, ymin, xmax, ymax]`. Row groups with missing statistics are
     /// **kept conservatively** (they cannot be safely pruned).
     pub fn row_groups_intersecting_bbox(&self, bbox: &[f64; 4]) -> Vec<usize> {
+        self.row_groups_intersecting_any(std::slice::from_ref(bbox))
+    }
+
+    /// Row groups whose covering bbox statistics intersect ANY of `bboxes`,
+    /// with missing statistics kept as in
+    /// [`Self::row_groups_intersecting_bbox`].
+    fn row_groups_intersecting_any(&self, bboxes: &[[f64; 4]]) -> Vec<usize> {
         let bounds = extract_row_group_bounds_from_metadata(&self.metadata).unwrap_or_default();
-        let filter = TileBounds {
-            lng_min: bbox[0],
-            lat_min: bbox[1],
-            lng_max: bbox[2],
-            lat_max: bbox[3],
-        };
+        let filters: Vec<TileBounds> = bboxes
+            .iter()
+            .map(|bbox| TileBounds {
+                lng_min: bbox[0],
+                lat_min: bbox[1],
+                lng_max: bbox[2],
+                lat_max: bbox[3],
+            })
+            .collect();
         (0..self.num_row_groups())
             .filter(|&i| match bounds.get(i) {
-                Some(Some(b)) => b.intersects(&filter),
+                Some(Some(b)) => filters.iter().any(|f| b.intersects(f)),
                 // Missing stats (or short vec): keep conservatively.
                 _ => true,
             })
@@ -370,12 +380,22 @@ impl OverviewReader {
         level_idx: usize,
         bbox: Option<[f64; 4]>,
     ) -> Result<Vec<usize>, ReaderError> {
+        self.selected_row_groups_any(level_idx, bbox.as_ref().map(std::slice::from_ref))
+    }
+
+    /// [`Self::selected_row_groups`] pruned by the union of several bboxes:
+    /// a row group is kept when its statistics intersect any of them.
+    fn selected_row_groups_any(
+        &self,
+        level_idx: usize,
+        bboxes: Option<&[[f64; 4]]>,
+    ) -> Result<Vec<usize>, ReaderError> {
         let level_rgs = self.row_groups_for_level(level_idx)?;
-        match bbox {
+        match bboxes {
             None => Ok(level_rgs),
-            Some(bb) => {
+            Some(bbs) => {
                 let pruned: HashSet<usize> =
-                    self.row_groups_intersecting_bbox(&bb).into_iter().collect();
+                    self.row_groups_intersecting_any(bbs).into_iter().collect();
                 Ok(level_rgs
                     .into_iter()
                     .filter(|r| pruned.contains(r))
@@ -419,7 +439,24 @@ impl OverviewReader {
         bbox: Option<[f64; 4]>,
         batch_size: usize,
     ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let selected = self.selected_row_groups(level_idx, bbox)?;
+        self.read_level_any_bbox_with_batch_size(
+            level_idx,
+            bbox.as_ref().map(std::slice::from_ref),
+            batch_size,
+        )
+    }
+
+    /// [`Self::read_level_with_batch_size`] pruned by the union of several
+    /// bboxes. The PMTiles export reads a wave this way so a feature stored
+    /// one world width from the wave's tiles, which the export draws there
+    /// wrapped (#342), is not pruned away.
+    pub(crate) fn read_level_any_bbox_with_batch_size(
+        &self,
+        level_idx: usize,
+        bboxes: Option<&[[f64; 4]]>,
+        batch_size: usize,
+    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+        let selected = self.selected_row_groups_any(level_idx, bboxes)?;
         let file = File::open(&self.path)?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups(selected)

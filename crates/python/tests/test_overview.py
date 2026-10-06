@@ -46,18 +46,30 @@ class TestRemoteInput:
 
 STREAMING_SMALL = FIXTURES_DIR / "streaming" / "multi-rowgroup-small.parquet"
 DATELINE = FIXTURES_DIR / "streaming" / "out-of-range-dateline.parquet"
+# DATELINE with row 7's longitude moved to 600.25, past the one-world wrap
+# the export applies (#342), and the stale `geo` bbox dropped.
+BEYOND_WRAP = FIXTURES_DIR / "streaming" / "out-of-range-beyond-wrap.parquet"
 
 
 class TestOutOfRangeExemplars:
     """#553: the report names where out-of-range features are, not only how many."""
 
-    def test_report_names_the_row_and_coordinate(self):
+    def test_dateline_overhang_is_not_out_of_range(self):
+        # #342: a longitude past +180° wraps at export, as in tippecanoe, so
+        # row 7's lon 190.25 is drawn at -169.75 rather than lost.
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "o.parquet"
             report = tylertoo.overview(str(DATELINE), str(out), max_zoom=4)
+            assert report["out_of_range_features"] == 0
+            assert report["out_of_range_exemplars"] == []
+
+    def test_report_names_the_row_and_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "o.parquet"
+            report = tylertoo.overview(str(BEYOND_WRAP), str(out), max_zoom=4)
             assert report["out_of_range_features"] == 1
             assert report["out_of_range_exemplars"] == [
-                {"part": None, "row": 7, "axis": "lon", "value": 190.25}
+                {"part": None, "row": 7, "axis": "lon", "value": 600.25}
             ]
 
 

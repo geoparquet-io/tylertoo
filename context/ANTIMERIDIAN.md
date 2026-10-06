@@ -25,6 +25,43 @@ rely on spec §7.2, and upgrade the user-facing surface (convert-time
 warning) rather than mutating geometry. Export-time splitting is the
 only defensible location if field evidence ever demands it.
 
+## Update: coordinates past ±180° wrap at export (#342)
+
+A feature stored past the antimeridian (an a5 dateline cell at
+`x: 178 … 181`, or a whole dataset on the 0..360 convention) is a
+different case from the inflated bbox below. Its bbox is compact; it
+sits in the wrong world copy. Export used to clip it at the world edge,
+so the 180°–181° part vanished and no west-edge tile was written.
+
+Export now follows tippecanoe. Its `clip_to_tile` at z0 appends a copy
+of the feature shifted by one world width whenever the bbox reaches
+within the buffer of either edge, and every child tile inherits both
+copies. tylertoo tiles each copy (`wrap_shifts` in
+`overview/export.rs`: as stored, and ±360° when that copy overlaps the
+buffered world) through the ordinary membership and clip. Pieces two
+copies put in one tile join into one multi-geometry. Three results:
+
+- The overhang is drawn at its wrapped position, on the far edge.
+- A 0..360 dataset tiles at -180..180.
+- Tile buffers continue across the antimeridian: a feature within the
+  buffer of +180° also reaches tile column 0.
+
+The scan pass plans the same copies, and the archive bounds advertise
+the wrapped extent inside ±180°. A copy wholly outside the buffered
+world is skipped, the stored one included, so a 0..360 feature plans
+no phantom tile on the east edge. The duplicating-mode wave read prunes
+row groups by the wave's bbox and by that bbox shifted ±360°. A row
+group's statistics describe the stored coordinates, one world width
+from the tiles its wrapped copies land in. Convert counts a feature as out of
+range only past ±540° longitude, the reach of one wrap, so wrapped
+features are neither warned about as lost nor fatal to the all-lost
+gate.
+
+None of this reinterprets the inflated bbox of F1–F3. A polygon with
+vertices at -179.9 and +179.9 still describes a band through lng 0,
+and export still draws that band. Pre-splitting at ±180° (spec §7.2)
+stays the producer's job.
+
 ## Findings
 
 Test fixture throughout: a polygon whose author intends a 0.2° × 0.2°
@@ -160,6 +197,20 @@ bbox/assignment/clip semantics.
 - `overview::hostile::antimeridian_polygon_export_smears_world_row`
 - `overview::hostile::antimeridian_suspect_features_warned_normal_inputs_clean`
   (convert-time detection counter, both streaming modes)
+
+World-edge wrap (#342):
+
+- `overview::export::tests::overhanging_polygon_wraps_onto_the_west_edge_tile`
+- `overview::export::tests::out_of_domain_point_is_drawn_at_its_wrapped_longitude`
+- `overview::export::tests::tile_buffer_continues_across_the_antimeridian`
+- `overview::export::tests::both_wrapped_copies_in_one_tile_make_one_member`
+- `overview::export::tests::scan_plans_wrapped_copies_and_counts_shared_tiles_once`
+- `overview::export::tests::scan_bounds_wrap_into_the_lng_domain`
+- `overview::export::tests::stored_copy_outside_the_buffered_world_plans_no_tile`
+- `overview::export::tests::wave_row_group_prune_keeps_wrapped_copies`
+- `overview::hostile::wrappable_longitude_overhang_is_in_range`
+- `overview_hostile::overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian`
+- `overview_hostile::zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes`
 
 Pre-existing (PR #186): `overview::hostile::antimeridian_and_pole_features_convert`
 (no-crash pin); `tile::tests::test_tiles_for_bbox_antimeridian_crossing`

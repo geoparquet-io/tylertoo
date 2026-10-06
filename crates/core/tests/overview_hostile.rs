@@ -1980,6 +1980,135 @@ fn antimeridian_polygon_export_smears_world_row() {
     );
 }
 
+// ============================================================================
+// Issue #342: coordinates past ±180° wrap, as in tippecanoe
+// ============================================================================
+
+/// A lon/lat rectangle as a polygon.
+fn lnglat_rect(lng_min: f64, lat_min: f64, lng_max: f64, lat_max: f64) -> Geometry<f64> {
+    Geometry::Polygon(Polygon::new(
+        LineString::from(vec![
+            (lng_min, lat_min),
+            (lng_max, lat_min),
+            (lng_max, lat_max),
+            (lng_min, lat_max),
+            (lng_min, lat_min),
+        ]),
+        vec![],
+    ))
+}
+
+/// The #342 reproducer end to end: a cell overhanging +180° plus a control.
+/// tippecanoe draws the overhang's 180°–181° part at the west edge of the
+/// map; tylertoo used to clip it away and write no west-edge tile at all.
+/// The convert must not count the cell as lost either, since nothing is.
+#[test]
+fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
+    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+
+    let geoms: Vec<Option<Geometry<f64>>> = vec![
+        Some(lnglat_rect(178.0, -1.0, 181.0, 1.0)), // id 0: overhangs
+        Some(lnglat_rect(10.0, -1.0, 12.0, 1.0)),   // id 1: control
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tovr = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        let convert = convert_to_overviews(tin.path(), tovr.path(), &opts(streaming)).unwrap();
+        assert_eq!(
+            convert.out_of_range_features, 0,
+            "streaming={streaming}: a wrapped overhang is not lost"
+        );
+        export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
+
+        let dec = tempfile::NamedTempFile::new().unwrap();
+        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+        let rows = read_decoded_rows(dec.path());
+        let lng_range = |g: &Geometry<f64>| {
+            use geo::BoundingRect;
+            let r = g.bounding_rect().unwrap();
+            (r.min().x, r.max().x)
+        };
+        let zooms: std::collections::BTreeSet<u8> = rows
+            .iter()
+            .filter(|(_, id, _)| *id == Some(0))
+            .map(|(z, _, _)| *z)
+            .collect();
+        assert!(
+            !zooms.is_empty(),
+            "streaming={streaming}: the cell is tiled"
+        );
+        for z in zooms {
+            let cell: Vec<(f64, f64)> = rows
+                .iter()
+                .filter(|(rz, id, _)| *rz == z && *id == Some(0))
+                .map(|(_, _, g)| lng_range(g))
+                .collect();
+            assert!(
+                cell.iter().any(|&(lo, _)| lo < -179.5),
+                "streaming={streaming} z{z}: the 180°–181° part must be drawn at the west \
+                 edge; decoded extents {cell:?}"
+            );
+            assert!(
+                cell.iter().any(|&(_, hi)| hi > 178.5),
+                "streaming={streaming} z{z}: the in-range part stays east; {cell:?}"
+            );
+        }
+        // The archive advertises a valid bbox, not lng 181.
+        let archive = tylertoo_core::archive_index::ArchiveIndex::open(tout.path()).unwrap();
+        let header = archive.header();
+        assert!(
+            header.max_lon <= 180.0 && header.min_lon >= -180.0,
+            "streaming={streaming}: header bounds {header:?}"
+        );
+    }
+}
+
+/// A dataset on the 0..360 longitude convention tiles at its wrapped
+/// position, as tippecanoe tiles it. Before #342 every feature counted as
+/// out of range and the convert failed with nothing left to tile.
+#[test]
+fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
+    use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
+
+    let geoms: Vec<Option<Geometry<f64>>> = [200.0, 250.0, 300.0, 350.0]
+        .iter()
+        .map(|&lng| Some(Geometry::Point(Point::new(lng, 10.0))))
+        .collect();
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tovr = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        let convert = convert_to_overviews(tin.path(), tovr.path(), &opts(streaming))
+            .unwrap_or_else(|e| panic!("streaming={streaming}: 0..360 input must convert: {e}"));
+        assert_eq!(convert.out_of_range_features, 0, "streaming={streaming}");
+        export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
+
+        let dec = tempfile::NamedTempFile::new().unwrap();
+        decode_pmtiles(tout.path(), dec.path(), &DecodeOptions::default()).unwrap();
+        let rows = read_decoded_rows(dec.path());
+        for (id, lng) in [(0, -160.0), (1, -110.0), (2, -60.0), (3, -10.0)] {
+            let drawn: Vec<&Geometry<f64>> = rows
+                .iter()
+                .filter(|(_, rid, _)| *rid == Some(id))
+                .map(|(_, _, g)| g)
+                .collect();
+            assert!(
+                !drawn.is_empty(),
+                "streaming={streaming}: feature {id} must be tiled"
+            );
+            assert!(
+                drawn
+                    .iter()
+                    .all(|g| matches!(g, Geometry::Point(p) if (p.x() - lng).abs() < 0.01)),
+                "streaming={streaming}: feature {id} must be drawn at lng {lng}: {drawn:?}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Property selection (#386)
 // ---------------------------------------------------------------------------

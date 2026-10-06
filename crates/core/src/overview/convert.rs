@@ -1159,11 +1159,14 @@ pub struct ConvertReport {
     /// about (one aggregate `log::warn!`), never mutated; see
     /// `context/ANTIMERIDIAN.md` (issue #188).
     pub antimeridian_suspect_features: usize,
-    /// Features whose bounding box falls outside the input CRS's coordinate
-    /// range — outside ±180°/±90° for EPSG:4326, outside the Web Mercator
-    /// world extent for EPSG:3857. The near-certain cause (when the values
-    /// are large) is projected coordinates stored under CRS84 metadata; such
-    /// features cannot be tiled and vanish at export. Warned about (one
+    /// Features whose bounding box falls outside the coordinate range the
+    /// tiler can draw — beyond ±90° latitude or ±540° longitude for
+    /// EPSG:4326, and the same multiples of the Web Mercator world extent for
+    /// EPSG:3857. Longitude past ±180° but within one wrap is not counted:
+    /// the export draws it at its wrapped position, as tippecanoe does
+    /// (#342). The near-certain cause (when the values are large) is
+    /// projected coordinates stored under CRS84 metadata; such features
+    /// cannot be tiled and vanish at export. Warned about (one
     /// aggregate `log::warn!`); see
     /// [`unprojectable_features`](Self::unprojectable_features) for the
     /// companion loss and the shared failure gate (#429).
@@ -3782,17 +3785,32 @@ pub(super) fn crs_coordinate_range(crs: Crs) -> CrsRange {
     }
 }
 
-/// Whether a feature bbox lies (even partly) outside the coordinate range its
-/// CRS admits (#429): beyond ±180°/±90° for EPSG:4326, beyond the Web Mercator
-/// world extent for EPSG:3857.
+/// Largest `|x|` the export still draws: one world width past either edge
+/// (±540° for EPSG:4326). The export tiles a feature as stored and shifted
+/// ±360°, tippecanoe's world-edge copies (#342), so an x overhang up to here
+/// lands at its wrapped position instead of being lost.
+fn wrapped_max_x(r: &CrsRange) -> f64 {
+    3.0 * r.max_x
+}
+
+/// Whether a feature bbox lies (even partly) outside the coordinate range the
+/// tiler can draw for its CRS (#429): beyond ±90° latitude or ±540° longitude
+/// for EPSG:4326, and the same multiples of the Web Mercator world extent for
+/// EPSG:3857.
 ///
-/// The bounds are INCLUSIVE: a feature touching exactly ±180° or ±90° is
-/// legitimate (a whole-world bbox, a pole, an antimeridian vertex) and must
-/// not be counted. Only a coordinate strictly beyond the edge — the signature
-/// of projected meters stored under geographic metadata — trips it.
+/// Longitude gets one world width of slack on each side because the export
+/// wraps it (#342): an a5 dateline cell stored as `x: 178 … 181`, or a whole
+/// dataset on the 0..360 convention, is drawn where it belongs, so counting
+/// it as lost would be a false warning, and on a 0..360 file a false failure.
+///
+/// The bounds are INCLUSIVE: a feature touching exactly ±90° (a pole) is
+/// legitimate and must not be counted. Only a coordinate strictly beyond the
+/// edge — the signature of projected meters stored under geographic
+/// metadata — trips it.
 pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
     let r = crs_coordinate_range(crs);
-    bbox[0] < -r.max_x || bbox[2] > r.max_x || bbox[1] < -r.max_y || bbox[3] > r.max_y
+    let max_x = wrapped_max_x(&r);
+    bbox[0] < -max_x || bbox[2] > max_x || bbox[1] < -r.max_y || bbox[3] > r.max_y
 }
 
 /// Whether a bbox is legal for its CRS yet lies wholly outside the Web
@@ -3875,9 +3893,10 @@ fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
 /// One #429 out-of-range feature's row and offending coordinate (#553).
 ///
 /// This is the exemplar a summary points investigators at instead of a bare count.
-/// Root-causing a real dateline case (a5 grid cells 0.6° past ±180°) used to
-/// require a separate DuckDB query against the input; this is what lets the
-/// message name the answer up front.
+/// Root-causing a real out-of-range case used to require a separate DuckDB
+/// query against the input; this is what lets the message name the answer up
+/// front. (#553's own case, a5 grid cells 0.6° past ±180°, is no longer out
+/// of range: the export wraps it, #342.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct OutOfRangeExemplar {
     /// Index of the input part (file) holding the feature, in the source's
@@ -3913,9 +3932,10 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
         Crs::Epsg4326 => ("lon", "lat"),
         Crs::Epsg3857 => ("x", "y"),
     };
+    let max_x = wrapped_max_x(&r);
     let candidates = [
-        (lon, bbox[0], (-r.max_x) - bbox[0]),
-        (lon, bbox[2], bbox[2] - r.max_x),
+        (lon, bbox[0], (-max_x) - bbox[0]),
+        (lon, bbox[2], bbox[2] - max_x),
         (lat, bbox[1], (-r.max_y) - bbox[1]),
         (lat, bbox[3], bbox[3] - r.max_y),
     ];
@@ -3929,7 +3949,7 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
 
 /// The suffix naming the first few out-of-range exemplars (#553).
 ///
-/// It reads "e.g. lon 180.548 (row 1041), lon 180.101 (row 2210)", or `""`
+/// It reads "e.g. lat 95.5 (row 1041), lat -91.2 (row 2210)", or `""`
 /// when there are none. Shared by the aggregate `log::warn!` (`out_of_range_warning`) and the
 /// CLI's `tiles` summary line, so both name where the loss came from instead
 /// of only how much was lost.
@@ -3951,13 +3971,15 @@ pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
 }
 
 /// An exemplar's coordinate as text: three decimals, unless rounding to
-/// three decimals would land it back on the range edge (180.0000001 as
-/// "180.000"), in which case the shortest exact form, which always shows
-/// the excess.
+/// three decimals would land it back on the range edge (540.0000001 as
+/// "540.000"), in which case the shortest exact form, which always shows
+/// the excess. The edges are [`bbox_out_of_crs_range`]'s: x and longitude
+/// carry the export's one-world wrap (#342).
 fn exemplar_value_text(axis: &str, value: f64) -> String {
     let limit = match axis {
-        "lon" => 180.0,
+        "lon" => 3.0 * 180.0,
         "lat" => 90.0,
+        "x" => 3.0 * WEBMERC_HALF_M,
         _ => WEBMERC_HALF_M,
     };
     let short = format!("{value:.3}");
@@ -3973,7 +3995,7 @@ fn exemplar_value_text(axis: &str, value: f64) -> String {
 ///
 /// `max_abs` is the largest `|coordinate|` among the offenders: the
 /// projected-CRS diagnosis (and its `gpio` hint) is gated on it, so one
-/// Pacific point at lng 180.001 gets neutral wording rather than being told
+/// stray point at lng 600 gets neutral wording rather than being told
 /// its whole file is in the wrong CRS (review S2-2). `exemplars` names the
 /// first few offending rows and coordinates (#553).
 pub(super) fn out_of_range_warning(
@@ -6443,24 +6465,36 @@ mod tests {
     /// the largest margin.
     #[test]
     fn out_of_range_coordinate_names_the_worst_edge() {
-        // A dateline a5 cell: only longitude is out of range (#553's real case).
+        // Longitude past the one-world wrap the export applies (#342).
         assert_eq!(
-            out_of_range_coordinate(&[179.0, 10.0, 180.548, 20.0], Crs::Epsg4326),
-            ("lon", 180.548)
+            out_of_range_coordinate(&[179.0, 10.0, 600.5, 20.0], Crs::Epsg4326),
+            ("lon", 600.5)
+        );
+        // A dateline a5 cell overhangs ±180° but wraps, so its longitude is
+        // no offence; the latitude is.
+        assert_eq!(
+            out_of_range_coordinate(&[179.0, 10.0, 180.548, 95.0], Crs::Epsg4326),
+            ("lat", 95.0)
+        );
+        // Even when the overhang is the bigger number: 10° past +180° wraps,
+        // 5° past -90° does not.
+        assert_eq!(
+            out_of_range_coordinate(&[-10.0, -95.0, 190.0, 10.0], Crs::Epsg4326),
+            ("lat", -95.0)
         );
         // Latitude out of range instead.
         assert_eq!(
             out_of_range_coordinate(&[-10.0, -95.0, 10.0, -80.0], Crs::Epsg4326),
             ("lat", -95.0)
         );
-        // Both edges violated: the larger excess wins (200 - 180 = 20 vs.
+        // Both edges violated: the larger excess wins (560 - 540 = 20 vs.
         // 95 - 90 = 5).
         assert_eq!(
-            out_of_range_coordinate(&[-10.0, -95.0, 200.0, 10.0], Crs::Epsg4326),
-            ("lon", 200.0)
+            out_of_range_coordinate(&[-10.0, -95.0, 560.0, 10.0], Crs::Epsg4326),
+            ("lon", 560.0)
         );
         // EPSG:3857 uses x/y, not lon/lat.
-        let over = WEBMERC_HALF_M + 1000.0;
+        let over = 3.0 * WEBMERC_HALF_M + 1000.0;
         assert_eq!(
             out_of_range_coordinate(&[0.0, 0.0, over, 0.0], Crs::Epsg3857),
             ("x", over)
@@ -6473,9 +6507,9 @@ mod tests {
     #[test]
     fn bbox_tally_caps_exemplars_and_names_rows() {
         let mut features = vec![point_feature(0, 10.0, 10.0)]; // in range
-                                                               // Five out-of-range dateline features at rows 1, 2, 3, 4, 5.
+                                                               // Five out-of-range features at rows 1, 2, 3, 4, 5.
         for row in 1..=5usize {
-            features.push(point_feature(row, 180.0 + row as f64 * 0.1, 10.0));
+            features.push(point_feature(row, 540.0 + row as f64 * 0.1, 10.0));
         }
         let mut tally = BboxTally::default();
         for f in &features {
@@ -6511,29 +6545,29 @@ mod tests {
                 part: None,
                 row: 1041,
                 axis: "lon",
-                value: 180.548,
+                value: 600.548,
             },
             OutOfRangeExemplar {
                 part: None,
                 row: 2210,
                 axis: "lon",
-                value: 180.101,
+                value: 600.101,
             },
         ];
         let note = out_of_range_exemplar_note(&exemplars);
-        assert!(note.contains("lon 180.548 (row 1041)"), "{note}");
-        assert!(note.contains("lon 180.101 (row 2210)"), "{note}");
+        assert!(note.contains("lon 600.548 (row 1041)"), "{note}");
+        assert!(note.contains("lon 600.101 (row 2210)"), "{note}");
 
         // The full aggregate warning includes it too.
         let msg =
-            out_of_range_warning(19, 1000, Crs::Epsg4326, 180.548, &exemplars).expect("warns");
+            out_of_range_warning(19, 1000, Crs::Epsg4326, 600.548, &exemplars).expect("warns");
         assert!(msg.contains("19 of 1000"), "{msg}");
-        assert!(msg.contains("lon 180.548 (row 1041)"), "{msg}");
+        assert!(msg.contains("lon 600.548 (row 1041)"), "{msg}");
     }
 
     /// #553 review: an exemplar just past the edge (float noise from a
-    /// reprojection, a dateline vertex at 180.0000001) must not print as
-    /// "lon 180.000", a value that reads as in range. Three decimals when
+    /// reprojection, a vertex at 540.0000001) must not print as
+    /// "lon 540.000", a value that reads as in range. Three decimals when
     /// they still show the excess, full precision when they do not.
     #[test]
     fn out_of_range_exemplar_note_never_rounds_back_into_range() {
@@ -6544,27 +6578,30 @@ mod tests {
             value,
         };
         assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 180.000_000_1)]),
-            " e.g. lon 180.0000001 (row 7)"
+            out_of_range_exemplar_note(&[ex("lon", 540.000_000_1)]),
+            " e.g. lon 540.0000001 (row 7)"
         );
         assert_eq!(
             out_of_range_exemplar_note(&[ex("lat", -90.000_2)]),
             " e.g. lat -90.0002 (row 7)"
         );
-        // 3857's edge (20037508.342789...) rounds UP at three decimals, so
-        // the short form already shows the excess.
+        // 3857's y edge (20037508.342789...) rounds UP at three decimals,
+        // so the short form already shows the excess.
         assert_eq!(
-            out_of_range_exemplar_note(&[ex("x", WEBMERC_HALF_M + 0.0001)]),
-            " e.g. x 20037508.343 (row 7)"
+            out_of_range_exemplar_note(&[ex("y", WEBMERC_HALF_M + 0.0001)]),
+            " e.g. y 20037508.343 (row 7)"
         );
+        // Its x edge (60112525.028367...) rounds DOWN, so the long form.
+        let note = out_of_range_exemplar_note(&[ex("x", 3.0 * WEBMERC_HALF_M + 0.0001)]);
+        assert!(note.starts_with(" e.g. x 60112525.0284"), "{note}");
         // Clearly out of range: the short form.
         assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 180.548_123)]),
-            " e.g. lon 180.548 (row 7)"
+            out_of_range_exemplar_note(&[ex("lon", 600.548_123)]),
+            " e.g. lon 600.548 (row 7)"
         );
         assert_eq!(
-            out_of_range_exemplar_note(&[ex("x", 30_000_000.0)]),
-            " e.g. x 30000000.000 (row 7)"
+            out_of_range_exemplar_note(&[ex("x", 70_000_000.0)]),
+            " e.g. x 70000000.000 (row 7)"
         );
     }
 
@@ -12381,7 +12418,7 @@ mod tests {
         let rows: Vec<AttrRow> = vec![
             ((0.0, 0.0), Some(0.1), Some("soy")),
             ((10.0, 10.0), Some(0.9), Some("corn")),
-            ((190.0, 20.0), Some(0.85), Some("soy")),
+            ((590.0, 20.0), Some(0.85), Some("soy")),
             ((30.0, 30.0), None, Some("rice")),
         ];
         write_multi_rg_attr_input(tin.path(), &rows);
@@ -12406,7 +12443,7 @@ mod tests {
 
                     row: 2,
                     axis: "lon",
-                    value: 190.0,
+                    value: 590.0,
                 }],
                 "streaming={streaming}"
             );
@@ -12427,7 +12464,7 @@ mod tests {
         ];
         let dirty: Vec<AttrRow> = vec![
             ((20.0, 20.0), Some(0.9), Some("soy")),
-            ((191.5, 20.0), Some(0.9), Some("soy")),
+            ((591.5, 20.0), Some(0.9), Some("soy")),
             ((30.0, 30.0), Some(0.9), Some("rice")),
         ];
         write_multi_rg_attr_input(&parts.join("part-000.parquet"), &clean);
@@ -12442,12 +12479,12 @@ mod tests {
                 part: Some(1),
                 row: 1,
                 axis: "lon",
-                value: 191.5,
+                value: 591.5,
             }]
         );
         assert_eq!(
             out_of_range_exemplar_note(&report.out_of_range_exemplars),
-            " e.g. lon 191.500 (part 1, row 1)"
+            " e.g. lon 591.500 (part 1, row 1)"
         );
     }
 
