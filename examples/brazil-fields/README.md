@@ -1,21 +1,21 @@
 # Brazil fields: cloud data to a sharded, two-layer map
 
 This tutorial starts from data you never download whole. The
-[Fields of the World](https://fieldsofthe.world/) predictions hold about
+[Fields of the World](https://fieldsofthe.world/) (FTW) predictions hold about
 3.2 billion field polygons, published on
 [Source Cooperative](https://source.coop/ftw/global-data) as one GeoParquet
-file per country subdivision. The goal is a map of the soy belt around
-Sorriso, Mato Grosso: field polygons up close, and a field-density grid when
-zoomed out, in one PMTiles archive.
+file per country subdivision. The goal is one PMTiles archive that maps the
+soy belt around Sorriso, Mato Grosso. It shows field polygons up close and a
+field-density grid when zoomed out.
 
 The tutorial uses tools the
 [Madagascar tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/madagascar/)
 does not:
 
-- remote reads with `--files-from`, `--bbox`, and `--filter`;
-- DuckDB and the `tylertoo` Python package, to derive a second layer;
-- a sharded build: `shard-plan`, a coarse job, four shard jobs, and `merge`;
-- `pyramid`, to put two layers with their own zoom ranges in one archive.
+- remote reads with `--files-from`, `--bbox`, and `--filter`
+- DuckDB and the `tylertoo` Python package, to derive a second layer
+- a sharded build: `shard-plan`, a coarse job, four shard jobs, and `merge`
+- `pyramid`, to put two layers with their own zoom ranges in one archive
 
 Each step is a script in
 [`examples/brazil-fields/`](https://github.com/geoparquet-io/tylertoo/tree/main/examples/brazil-fields).
@@ -31,15 +31,15 @@ checks that this page shows the same code and the same output.
 | `gpio` | `pip install geoparquet-io` | Row-group bounds for the shard plan |
 
 Run the steps in order from one empty working directory. Step 1 reads about
-120 MB over the network; the rest runs locally in seconds.
+120 MB over the network. The rest runs locally in seconds.
 
 ## 1. Extract a window from three remote files
 
 The Mato Grosso file alone is 1.1 GB, and the window you want covers about
 4% of it. tylertoo reads the Parquet footer of each file first, then
-fetches only the row groups whose bounding boxes touch `--bbox`. The FTW
-files are sorted in space and record each row group's bounds, which is what
-makes this pruning work.
+fetches only the row groups whose bounding boxes touch `--bbox`. FTW sorts
+its files in space and records each row group's bounds, which makes this
+pruning work.
 
 `--files-from` takes a list of inputs, local paths or URLs, and treats them
 as one dataset in the listed order. This step lists Goiás and Mato Grosso do
@@ -179,15 +179,15 @@ The build has four parts:
    did not write them.
 2. `shard-plan` cuts the tile space at a pivot zoom, here z10, into ranges of
    about equal row count.
-3. The coarse job builds the zooms below the pivot, z8 and z9, and saves
+3. The coarse job builds z8 and z9, the zooms below the pivot, and saves
    `convert.plan`. Every shard reads that plan, so all jobs generalize the
    data the same way.
 4. Each shard builds z10 to z14 for its own range. `merge` then concatenates
    the five archives. They hold disjoint tiles, so the merge copies tiles and
    recomputes nothing.
 
-The window is centered on the corner of four z10 tiles, so each shard gets a
-share of the work.
+The window's center falls on the corner of four z10 tiles, so each shard gets
+a share of the work.
 
 File: `03-shard.sh`
 
@@ -284,8 +284,8 @@ tylertoo stats brazil.pmtiles
 
 The density tiles stay near 3 KB at every zoom, since 266 squares is all they
 hold. The field tiles are heaviest at z11 and z12, where one tile still
-holds many whole fields, and shrink as the zoom increases. Drop `brazil.pmtiles` onto
-[pmtiles.io](https://pmtiles.io/) to see both layers.
+holds many whole fields, and shrink as the zoom increases. Drop
+`brazil.pmtiles` onto [pmtiles.io](https://pmtiles.io/) to see both layers.
 
 ## Run the whole workflow
 
@@ -307,7 +307,9 @@ done
   jobs on separate machines. The
   [scaling guide](https://geoparquet-io.github.io/tylertoo/guides/scaling/#sharded-builds)
   covers sizing the jobs and running them under a scheduler.
+- The [remote reads guide](https://geoparquet-io.github.io/tylertoo/guides/remote-reads/)
+  covers `--filter` syntax, `--files-from` manifests, and row-group pruning.
 - The [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
-  explains `--filter` syntax and every generalization knob.
+  explains every generalization knob.
 - The [Python reference](https://geoparquet-io.github.io/tylertoo/reference/python/)
   lists `overview`, `export_pmtiles`, and `validate`.

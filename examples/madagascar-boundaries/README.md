@@ -1,9 +1,9 @@
 # Madagascar boundaries: from a raw export to PMTiles
 
 This tutorial takes one real file from a raw export to a PMTiles archive you
-can drop on a map, using only the command line. Along the way it builds the
-artifact tylertoo is organized around: an **overview file**, a GeoParquet file
-that holds every zoom level of your data and stays queryable.
+can drop on a map. It uses only the command line. Along the way it builds the
+artifact at the center of tylertoo: an **overview file**. This GeoParquet
+file holds every zoom level of your data and stays queryable.
 
 The input is 17,465 admin-4 boundary polygons for Madagascar (28 MB), from
 the [fieldmaps.io](https://fieldmaps.io/) global boundaries. Each step below
@@ -27,14 +27,14 @@ the step before it wrote.
 
 ## 1. Prepare the input
 
-tylertoo reads WGS84 GeoParquet. It runs best when the file is Hilbert-sorted,
-so geographic neighbors sit near each other on disk, and packed into row
-groups of a few megabytes or more. A raw export from a database or a Spark job
-is rarely in that shape, and one preparation pass pays off at every zoom level
-that follows.
+tylertoo reads WGS84 GeoParquet. It runs faster on a Hilbert-sorted file,
+where geographic neighbors sit near each other on disk, packed into row groups
+of a few megabytes or more. Raw exports from databases and Spark jobs seldom
+arrive in that shape. One preparation pass pays off at every zoom level that
+follows.
 
-This export has a second problem. Its geometry column holds valid WKB, but the
-file carries no `geo` metadata, so GeoParquet tools cannot tell which column
+This export has a second problem. Its geometry column holds valid Well-Known
+Binary (WKB), but the file carries no `geo` metadata, so GeoParquet tools cannot tell which column
 is the geometry. A DuckDB round trip writes that metadata. Then
 [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) (`gpio`) sorts
 and repacks the file in one pass.
@@ -82,10 +82,11 @@ Bbox: [43.187051, -25.606140, 50.493403, -11.949812]
 ...
 ```
 
-`gpio inspect` confirms what tylertoo needs. The CRS is `OGC:CRS84`, which is
-lon/lat WGS84, and the rows sit in three ZSTD row groups. If your own data is
-in a projected CRS, add `gpio convert reproject input.parquet wgs84.parquet -d
-EPSG:4326` before the sort.
+`gpio inspect` confirms what tylertoo needs. The coordinate reference system
+is `OGC:CRS84`, which is lon/lat WGS84, and the rows sit in three
+Zstandard-compressed row groups. If your own data uses a projected coordinate
+system, add `gpio convert reproject input.parquet wgs84.parquet -d EPSG:4326`
+before the sort.
 
 ## 2. Preview one region
 
@@ -126,8 +127,9 @@ tylertoo overview prepared.parquet preview-ov.parquet \
 
 The box holds 943 of the 17,465 polygons. Read the table from the top: `gsd`
 is the ground sample distance, the size of one pixel in meters at that level.
-At z0 to z2 a pixel spans 10 to 40 km, and every polygon in the box is smaller
-than the visibility gate, so tylertoo leaves those levels out and says so. To
+At z0 to z2 a pixel spans 10 to 40 km. Every polygon in the box is smaller
+than the visibility gate there, so tylertoo leaves those levels out and says
+so. To
 keep small polygons visible as dots at coarse zooms, add `--collapse`. The
 [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
 covers that knob and the rest.
@@ -181,8 +183,8 @@ Validating madagascar-ov.parquet
 ```
 
 The table shows the idea in ten lines. At 19.6 km per pixel, 40 of the 17,465
-polygons survive. The count roughly doubles with each zoom, and level 9 holds
-all of them at full detail. The file is still ordinary GeoParquet, so any
+polygons survive. From level 2 to level 8 the count grows about 1.65 times per
+zoom, the default `--drop-rate`. Level 9 holds every polygon at full detail. The file is still ordinary GeoParquet, so any
 Parquet reader opens it. The [Brazil tutorial](https://geoparquet-io.github.io/tylertoo/tutorials/brazil/)
 queries one with DuckDB.
 
@@ -194,7 +196,7 @@ become the tiles. `--layer-name` sets the MVT source layer your map style
 refers to, and `--min-zoom 1` starts the archive at the overview's first zoom.
 
 `tylertoo stats` then reads the archive's directory and reports how heavy the
-tiles are at each zoom. Use it to find the zooms and tiles that will load
+tiles are at each zoom. Use it to find the zooms and tiles that load
 slowest.
 
 File: `04-export.sh`
@@ -231,21 +233,21 @@ Largest 10 tile(s):
 ...
 ```
 
-Tile features outnumber level features because a polygon that crosses a tile
-edge is clipped into every tile it touches. A few slivers from those clips
-shrink to nothing at the tile's 4096-unit grid; the export counts them as
-"collapsed at extent" and leaves them out. No tile exceeds the 500 KB default
+Tile features outnumber level features because the export clips a polygon
+that crosses a tile edge into every tile it touches. A few slivers from those
+clips shrink to nothing at the tile's 4096-unit grid. The export counts them
+as "collapsed at extent" and leaves them out. No tile exceeds the 500 KB default
 size limit, and the largest, at z10, is 88 KB.
 
 To see the result, drop `madagascar.pmtiles` onto
 [pmtiles.io](https://pmtiles.io/). Any server that honors HTTP range requests
-can host the file; there is no tile server to run.
+can host the file. There is no tile server to run.
 
 ## 5. Decode tiles back to GeoParquet
 
 `tylertoo decode` reads any PMTiles v3 vector archive, not only ones tylertoo
 wrote, and writes the features of the zooms you choose as GeoParquet. Use it
-to check what a map actually shows at a zoom, or to compare two archives in
+to check what a map shows at a zoom, or to compare two archives in
 SQL.
 
 File: `05-decode.sh`
@@ -265,9 +267,9 @@ Decoding madagascar.pmtiles → z8.parquet
 ✓ 8,268 features from 44 tiles (0 skipped as degenerate) in 0.13s
 ```
 
-The output is the tiled form of the data, not the source. Geometry is
-simplified and clipped at tile edges, and a feature that spans two tiles
-appears twice. The `zoom`, `layer`, and `mvt_id` columns record where each row
+The output is the tiled form of the data, not the source. Its geometry
+carries the tile simplification and the clips at tile edges. A feature that
+spans two tiles appears twice. The `zoom`, `layer`, and `mvt_id` columns record where each row
 came from.
 
 ## Run the whole workflow

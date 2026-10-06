@@ -22,7 +22,7 @@ same way.
 A remote convert stages the column chunks it touches to a local spill file,
 about one times the touched bytes. Both passes then read from disk instead of
 the network. The run downloads its data about once. Set `--spill-dir` to a
-volume with room for it; see [spill files](scaling.md#spill-files). Remote
+volume with room for it. See [spill files](scaling.md#spill-files). Remote
 inputs read with a single worker.
 
 ## What gets skipped
@@ -31,8 +31,9 @@ GeoParquet 1.1 covering statistics record each row group's bounding box in
 the footer. tylertoo checks them before it reads a data page, so a regional
 extract rules out most of a country file on footer metadata alone. On a
 remote input, the skipped byte ranges never cross the network. Without
-covering statistics every row group is read and the per-feature filter still
-applies: the output is the same, and only the pruning is lost.
+covering statistics, tylertoo reads every row group and applies the
+per-feature filter to each. The output is the same, and the run loses only
+the pruning.
 
 **What makes a source prunable.** Pruning needs row groups that are spatially
 sorted and covering statistics that describe them. In an unsorted collection
@@ -52,11 +53,11 @@ gpio sort hilbert raw.parquet sorted.parquet --add-bbox \
 - **`--bbox xmin,ymin,xmax,ymax`** keeps features whose bounding box
   intersects the box, in longitude and latitude degrees.
 - **`--filter <expr>`**, alias `--where`, keeps features that match a
-  SQL-WHERE predicate over the property columns, such as `confidence > 0.8`
+  SQL `WHERE` predicate over the property columns, such as `confidence > 0.8`
   or `crop_type IN ('soy', 'corn')`. It supports comparison operators, `IN`,
   `IS [NOT] NULL`, `AND`, `OR`, `NOT`, parentheses, quoted strings, numbers,
   quoted column names, and timestamp comparisons against date
-  strings read as UTC. Nulls follow SQL three-valued logic, so a row survives
+  strings read as Coordinated Universal Time (UTC). Nulls follow SQL three-valued logic, so a row survives
   only when the predicate is true.
 
 Both check row-group statistics first and skip any row group that cannot
@@ -74,8 +75,8 @@ Write `--bbox=` with an equals sign when the first coordinate is negative.
 ## Many files
 
 **`--files-from <manifest>`** reads the files listed in a text file, one
-local path or remote URL per line. Blank lines and `#` comments are skipped,
-and local and remote entries can mix. Each line must name one `.parquet`
+local path or remote URL per line. tylertoo skips blank lines and `#`
+comments, and local and remote entries can mix. Each line must name one `.parquet`
 file, not a directory or glob. Line order is the dataset's row order, so the
 same manifest gives the same output every run. With `--files-from`, give only
 the output path as a positional argument:
@@ -84,11 +85,11 @@ the output path as a positional argument:
 tylertoo tiles --files-from parts.txt fields.pmtiles
 ```
 
-**Hive layouts.** A directory input is walked recursively and a prefix lists
-every key below it, so a layout such as
-`year=2024/region=north/part-00000.parquet` reads every part file. Names
-starting with `.` or `_` (`_SUCCESS`, `.crc`, `_temporary/`) are skipped.
-tylertoo does not turn `key=value` path segments into columns, so
+**Hive layouts.** tylertoo walks a directory input recursively and lists
+every key below a prefix, so a layout such as
+`year=2024/region=north/part-00000.parquet` reads every part file. It skips
+names starting with `.` or `_` (`_SUCCESS`, `.crc`, `_temporary/`). It does
+not turn `key=value` path segments into columns, so
 `--filter`, `--include-property`, and the tile properties see only columns
 stored in the files. To use partition keys, write them into the files with
 DuckDB and re-sort with `gpio`:

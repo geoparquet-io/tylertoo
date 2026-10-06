@@ -57,7 +57,7 @@ class OutOfRangeExemplar(TypedDict):
 
     Attributes:
         part: Input file index, or None for a single file.
-        axis: "x" and "y" are for EPSG:3857 input.
+        axis: "x" and "y" mean Web Mercator (`EPSG:3857`) input.
     """
 
     part: int | None
@@ -83,7 +83,7 @@ class OverviewReport(TypedDict):
         antimeridian_suspect_features: Features wider than 180° of
             longitude, usually a broken antimeridian crossing.
         out_of_range_features: Features dropped or clipped for lying
-            outside the CRS range.
+            outside the valid coordinate range.
         unprojectable_features: Features beyond ±85.05° latitude, which
             Web Mercator cannot tile.
     """
@@ -132,9 +132,10 @@ class ExportReport(TypedDict):
         oversized_tiles: Tiles that shed features to fit
             `tile_size_limit`.
         encode_dropped_features: Features with nothing left after
-            clipping; above zero means lost content and a warning.
+            clipping. A count above zero means lost content and logs a
+            warning.
         encode_quantized_features: Features that collapsed at the tile
-            extent, usually edge slivers; normal.
+            extent, usually harmless edge slivers.
         skipped_property_columns: Columns MVT cannot encode, such as
             binary. Struct, list, and map columns become JSON strings.
     """
@@ -223,27 +224,27 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     """Build a GeoParquet overview file: one generalized level per zoom.
 
     Args:
-        input: A GeoParquet file, directory, glob, `s3://`, `gs://`, or
-            `https://` URL or prefix, or a list of files, in EPSG:4326
-            or EPSG:3857.
+        input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
+            (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
+            `gs://`, or `https://` URL or prefix, or a list of files.
         output: Overview file to write.
-        mode: `"duplicating"` makes each level a complete map;
+        mode: `"duplicating"` makes each level a complete map, and
             `"partitioning"` stores each feature once.
         min_zoom: Coarsest zoom.
         max_zoom: Finest zoom, or `"auto"` to estimate it (at most 16).
         gsds: Per-level GSDs in meters, coarse to fine, instead of
             zooms.
-        gsd_base: Pixels per tile edge when mapping zooms to GSDs;
-            larger is denser.
+        gsd_base: Pixels per tile edge when mapping zooms to GSDs. A
+            larger base keeps more detail.
         sort_key: Numeric column that decides which feature wins a cell.
         magnitude_ladder: Column whose values set each feature's first
             zoom, largest first.
         ladder_step: Zooms between `magnitude_ladder` values.
         sort_direction: Whether larger or smaller `sort_key` values win.
         class_rank_column: String column ranked by `class_ranks`.
-        class_ranks: Finite priority per class; higher wins.
-        class_rank_unknown: Priority of unlisted classes; None ranks
-            them last.
+        class_ranks: Finite priority per class, where higher wins.
+        class_rank_unknown: Priority of unlisted classes, or None to
+            rank them last.
         no_auto_rank: Skip automatic ranking of Overture roads and
             places.
         simplify_factor: Simplification tolerance, in GSDs.
@@ -253,8 +254,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             `"0-7:point,8-14:geom"`.
         cascade: Simplify each level from the next finer one, which is
             faster.
-        point_thinning: Point grid cell size in GSDs; None means 4, or
-            16 with `cluster`.
+        point_thinning: Point grid cell size in GSDs, or None for 4
+            (16 with `cluster`).
         line_thinning: Line grid cell size in GSDs.
         polygon_thinning: Polygon grid cell size in GSDs.
         line_visibility: Smallest line bounding-box diagonal kept, in
@@ -271,10 +272,11 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         coalesce_lines: Join touching same-class lines at coarse levels.
         coalesce_snap: Largest gap between joined line ends, in GSDs.
         coalesce_junction_angle: Largest turn through a junction, in
-            degrees; 0 stops at junctions.
-        coalesce_max_level_rows: Lines per level above which joining is
-            skipped, to bound memory.
-        cogp_compat: Also write the COGP compatibility footer key.
+            degrees. Set 0 to stop at every junction.
+        coalesce_max_level_rows: Skip joining on a level with more lines
+            than this, to bound memory.
+        cogp_compat: Also write the third-party `cogp` footer key, for
+            readers of that overview format.
         row_group_size: Most rows per output row group.
         full_column_stats: Keep Parquet statistics for every column.
         streaming: Read the input in batches. See
@@ -285,21 +287,22 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         filter: SQL-style predicate, such as `"confidence > 0.8"`.
         profile: Hold output in RAM, on disk, or choose per run. See
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>.
-        in_flight_batches: Batches processed at once; 0 sizes from the
-            CPU count. See
+        in_flight_batches: Batches processed at once, or 0 to size from
+            the CPU count. See
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
-        read_workers: Reader threads; 0 sizes from the CPU count. See
+        read_workers: Reader threads, or 0 to size from the CPU count.
+            See
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
-        spill_dir: Where a remote input is staged. See
+        spill_dir: Directory for staging a remote input. See
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
 
     Returns:
-        What was written, level by level.
+        A report on each level written.
 
     Raises:
         ValueError: Invalid or conflicting options, a missing or
-            mistyped column, an unsupported CRS, or almost nothing to
-            tile.
+            mistyped column, an unsupported projection, or almost
+            nothing to tile.
         MemoryError: Too little memory for this input.
         RuntimeError: Reading or writing failed.
 
@@ -337,11 +340,12 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         layer_name: MVT layer name.
         tile_buffer: Tile edge buffer in pixels, at most 256.
         extent: Tile resolution in MVT units.
-        tile_size_limit: Largest tile in bytes; 0 or None for no limit.
-        simple_clip_fastpath: Clip simple polygons faster; False gives
-            byte-stable output.
-        partition_wave: Partitions held in memory at once; 0 sizes it
-            from CPUs and RAM. See
+        tile_size_limit: Largest tile in bytes, or 0 or None for no
+            limit.
+        simple_clip_fastpath: Clip simple polygons on a fast path. False
+            gives byte-stable output.
+        partition_wave: Partitions held in memory at once, or 0 to size
+            it from CPUs and RAM. See
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
         feature_order: Paint order within a tile: `"input"`, or a
             property name with an optional `:asc` or `:desc`.
@@ -352,10 +356,10 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>.
 
     Returns:
-        What was written, zoom by zoom.
+        A report on each zoom written.
 
     Raises:
-        ValueError: `feature_order` is malformed.
+        ValueError: `feature_order` does not parse.
         RuntimeError: Not an overview file, an option is out of range,
             or reading or writing failed.
 
@@ -375,10 +379,11 @@ def validate(file: str) -> ValidationReport:
         file: Overview file to check.
 
     Returns:
-        Each check's result; a failed check is reported, not raised.
+        Each check's result. A failed check shows up here instead of
+        raising.
 
     Raises:
-        RuntimeError: The file could not be opened as Parquet.
+        RuntimeError: The file is not readable Parquet.
 
     Example:
         >>> validate("overview.parquet")["valid"]
@@ -407,7 +412,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         output: PMTiles archive to write.
         min_zoom: See `overview()`.
         max_zoom: See `overview()`.
-        layer_name: MVT layer name; None uses the input's name.
+        layer_name: MVT layer name, or None for the input's file stem.
         tile_size_limit: See `export_pmtiles()`.
         simple_clip_fastpath: See `export_pmtiles()`.
         feature_order: See `export_pmtiles()`.
