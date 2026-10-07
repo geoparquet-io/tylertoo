@@ -25,6 +25,8 @@ drift that no source change caused: `std::io::Error` began printing as
 `core::io::error::Error`, and every line mentioning it turned into a diff.
 Bump the pin on purpose, and regenerate this baseline in the same commit.
 
-Breaking changes are a separate gate: `cargo semver-checks` runs in the
-`audit` job and compares against main. Its baseline is a git revision, not
-crates.io, because tylertoo-core is unpublished.
+Breaking changes are a separate gate, `cargo semver-checks`, which is off
+until the API freeze (see the `audit` job in `ci.yml`). When it comes back,
+compare against the newest release on crates.io (the tool's default), not
+against main: a main baseline demands a new bump in every breaking PR, even
+when the last bump is still unreleased.
