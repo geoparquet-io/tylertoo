@@ -8,6 +8,7 @@ version = "0.8.0"
 description = "Fast GeoParquet to PMTiles converter"
 readme = "README.md"
 license = { text = "Apache-2.0" }
+license-files = ["NOTICE"]
 authors = [
     { name = "Nissim Lebovits", email = "nlebovits@pm.me" }
 ]
