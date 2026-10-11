@@ -154,6 +154,8 @@ fn convert(
         feature_id: None,
         // #427: likewise; `export_pmtiles(..., spill_dir=...)`.
         spill_dir: None,
+        // Publication metadata is not exposed on this deprecated facade.
+        metadata: Default::default(),
     };
 
     // Intermediate overview file next to the output (same filesystem);
@@ -697,6 +699,7 @@ fn export_pmtiles(
         zoom_ceiling: None,
         feature_id,
         spill_dir,
+        metadata: Default::default(),
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

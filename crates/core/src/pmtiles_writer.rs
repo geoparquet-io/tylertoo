@@ -10,6 +10,7 @@
 
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES};
 use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
+use crate::pmtiles_metadata::TilesetMetadata;
 use crate::tile::TileBounds;
 use crate::world_coord::MAX_LATITUDE;
 use crate::{Error, Result};
@@ -1246,6 +1247,61 @@ fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> 
     )
 }
 
+/// Assemble the archive's metadata JSON.
+///
+/// Shared by both writers so their metadata cannot drift. The structural keys
+/// keep their historical layout and order; publication fields follow them, so
+/// an archive without publication metadata is byte-identical to one written
+/// before those fields existed.
+fn metadata_json(
+    vector_layers: &str,
+    tilestats_json: &str,
+    publication: &TilesetMetadata,
+) -> String {
+    let mut json = format!(
+        r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo""#,
+        vector_layers, tilestats_json
+    );
+    publication.append_json_fields(&mut json);
+    json.push('}');
+    json
+}
+
+/// Compress the metadata JSON for the archive's metadata section.
+///
+/// # Errors
+///
+/// Returns [`Error::PMTilesWrite`] if compression fails, or if the raw JSON or
+/// the stored section exceeds [`MAX_INTERNAL_BYTES`], the ceiling this
+/// project's own readers apply to both.
+fn encode_metadata(json: &str, compression: Compression) -> Result<Vec<u8>> {
+    encode_metadata_capped(json, compression, MAX_INTERNAL_BYTES)
+}
+
+/// [`encode_metadata`] with the ceiling as a parameter, so tests can reach
+/// both limits without building 16 MiB of metadata.
+fn encode_metadata_capped(json: &str, compression: Compression, cap: u64) -> Result<Vec<u8>> {
+    // Checked before compressing: the reader would refuse to decompress it,
+    // so there is no point spending the time.
+    if json.len() as u64 > cap {
+        return Err(Error::PMTilesWrite(format!(
+            "metadata JSON is {} bytes, over the {cap}-byte limit readers accept; \
+             shorten the name, description or attribution",
+            json.len()
+        )));
+    }
+    let encoded = compression::compress(json.as_bytes(), compression)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+    // Compression can add framing; the reader caps the stored bytes too.
+    if encoded.len() as u64 > cap {
+        return Err(Error::PMTilesWrite(format!(
+            "metadata section is {} bytes stored, over the {cap}-byte limit readers accept",
+            encoded.len()
+        )));
+    }
+    Ok(encoded)
+}
+
 /// Tile entry with hash for deduplication
 #[derive(Debug, Clone)]
 struct TileEntry {
@@ -1287,6 +1343,8 @@ pub struct PmtilesWriter {
     /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
     /// set it replaces the single-layer entry the writer would otherwise build.
     vector_layers_json: Option<String>,
+    /// Top-level publication metadata (`name`, `description`, `attribution`).
+    metadata: TilesetMetadata,
 }
 
 impl PmtilesWriter {
@@ -1309,6 +1367,7 @@ impl PmtilesWriter {
             dedup_enabled: false,
             dedup_cache: DeduplicationCache::new(),
             vector_layers_json: None,
+            metadata: TilesetMetadata::default(),
         }
     }
 
@@ -1331,6 +1390,7 @@ impl PmtilesWriter {
             dedup_enabled: false,
             dedup_cache: DeduplicationCache::new(),
             vector_layers_json: None,
+            metadata: TilesetMetadata::default(),
         }
     }
 
@@ -1388,6 +1448,15 @@ impl PmtilesWriter {
     /// Field types should be MVT-style: "String", "Number", or "Boolean"
     pub fn set_fields(&mut self, fields: HashMap<String, String>) {
         self.fields = fields;
+    }
+
+    /// Set the archive's [`TilesetMetadata`], replacing any earlier value.
+    ///
+    /// These are the top-level `name`, `description` and `attribution`
+    /// strings, separate from the layer metadata [`Self::set_fields`] and
+    /// [`Self::set_layer_name`] describe.
+    pub fn set_metadata(&mut self, metadata: TilesetMetadata) {
+        self.metadata = metadata;
     }
 
     /// Build the fields JSON object string
@@ -1552,12 +1621,10 @@ impl PmtilesWriter {
     /// # Errors
     ///
     /// Returns [`Error::PMTilesWrite`] if the file cannot be created or
-    /// written, or if a directory or the metadata cannot be compressed.
+    /// written, if a directory or the metadata cannot be compressed, or if
+    /// the metadata exceeds the 16 MiB limit readers accept. A rejected
+    /// metadata section leaves `path` untouched.
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
-        let file = File::create(path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to create file: {}", e)))?;
-        let mut writer = BufWriter::new(file);
-
         // Build tile data buffer and directory entries with deduplication
         let mut tile_data_buf = Vec::new();
         let mut entries = Vec::new();
@@ -1699,13 +1766,8 @@ impl PmtilesWriter {
                 self.build_fields_json()
             ),
         };
-        let metadata = format!(
-            r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo"}}"#,
-            vector_layers, tilestats_json
-        );
-        let compressed_metadata =
-            compression::compress(metadata.as_bytes(), self.internal_compression)
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+        let metadata = metadata_json(&vector_layers, &tilestats_json, &self.metadata);
+        let compressed_metadata = encode_metadata(&metadata, self.internal_compression)?;
 
         // Calculate section offsets
         let root_dir_offset = 127u64;
@@ -1788,6 +1850,13 @@ impl PmtilesWriter {
             center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
             center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
         };
+
+        // Created only now, once everything that can be rejected (directories,
+        // metadata size) has been built: a rejected archive must neither
+        // truncate an existing output nor leave an empty new one behind.
+        let file = File::create(path)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to create file: {}", e)))?;
+        let mut writer = BufWriter::new(file);
 
         // Write all sections
         writer
@@ -1932,6 +2001,8 @@ pub struct StreamingPmtilesWriter {
     /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
     /// set it replaces the single-layer entry the writer would otherwise build.
     vector_layers_json: Option<String>,
+    /// Top-level publication metadata (`name`, `description`, `attribution`).
+    metadata: TilesetMetadata,
     /// Compression for tile data
     tile_compression: Compression,
     /// Compression for internal data (directories, metadata)
@@ -2231,6 +2302,7 @@ impl StreamingPmtilesWriter {
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
             vector_layers_json: None,
+            metadata: TilesetMetadata::default(),
             tile_compression: compression,
             internal_compression: compression,
             stats: StreamingWriteStats::default(),
@@ -2411,6 +2483,15 @@ impl StreamingPmtilesWriter {
     /// Set field metadata.
     pub fn set_fields(&mut self, fields: HashMap<String, String>) {
         self.fields = fields;
+    }
+
+    /// Set the archive's [`TilesetMetadata`], replacing any earlier value.
+    ///
+    /// These are the top-level `name`, `description` and `attribution`
+    /// strings, separate from the layer metadata [`Self::set_fields`] and
+    /// [`Self::set_layer_name`] describe.
+    pub fn set_metadata(&mut self, metadata: TilesetMetadata) {
+        self.metadata = metadata;
     }
 
     /// Replace the whole `vector_layers` array with a verbatim JSON array.
@@ -2863,9 +2944,7 @@ impl StreamingPmtilesWriter {
 
         // Build metadata JSON
         let metadata = self.build_metadata_json();
-        let compressed_metadata =
-            compression::compress(metadata.as_bytes(), self.internal_compression)
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+        let compressed_metadata = encode_metadata(&metadata, self.internal_compression)?;
 
         Ok(ArchiveSections {
             root_bytes: dir_layout.root_bytes,
@@ -3153,10 +3232,7 @@ impl StreamingPmtilesWriter {
             ),
         };
 
-        format!(
-            r#"{{"vector_layers":{},{}"format":"pbf","generator":"tylertoo"}}"#,
-            vector_layers, tilestats_json
-        )
+        metadata_json(&vector_layers, &tilestats_json, &self.metadata)
     }
 
     fn build_fields_json(&self) -> String {
@@ -6461,14 +6537,18 @@ mod tests {
         w
     }
 
-    fn streaming_fixture() -> StreamingPmtilesWriter {
-        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+    fn fill_streaming(w: &mut StreamingPmtilesWriter) {
         w.set_layer_name("parks");
         w.set_fields(pub_fields());
         w.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
         for (z, x, y, data, n) in PUB_TILES {
             w.add_tile_with_count(z, x, y, data, n).unwrap();
         }
+    }
+
+    fn streaming_fixture() -> StreamingPmtilesWriter {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        fill_streaming(&mut w);
         w
     }
 
@@ -6499,5 +6579,270 @@ mod tests {
         const PRE_PUBLICATION_XXH3: u64 = 2_244_932_714_967_856_363;
         assert_eq!(xxhash_rust::xxh3::xxh3_64(&b), PRE_PUBLICATION_XXH3);
         assert_eq!(xxhash_rust::xxh3::xxh3_64(&s), PRE_PUBLICATION_XXH3);
+    }
+
+    fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::from_str(&archive_metadata_json(bytes)).expect("metadata is JSON") {
+            serde_json::Value::Object(map) => map,
+            other => panic!("metadata root is not an object: {other}"),
+        }
+    }
+
+    fn all_publication() -> TilesetMetadata {
+        TilesetMetadata::new()
+            .with_name("Park Tiles 4")
+            .with_description("National park boundaries")
+            .with_attribution(crate::pmtiles_metadata::tests::HOSTILE)
+    }
+
+    /// The publication keys hold exactly `meta`, and every other key is what
+    /// the pre-publication writer produced.
+    fn assert_publication(bytes: &[u8], meta: &TilesetMetadata) {
+        let mut map = metadata_object(bytes);
+        for (key, want) in [
+            ("name", &meta.name),
+            ("description", &meta.description),
+            ("attribution", &meta.attribution),
+        ] {
+            let got = map.remove(key);
+            assert_eq!(
+                got.as_ref()
+                    .map(|v| v.as_str().expect("publication values are strings")),
+                want.as_deref(),
+                "{key}"
+            );
+        }
+        let structural: serde_json::Value = serde_json::from_str(PRE_PUBLICATION_METADATA).unwrap();
+        assert_eq!(serde_json::Value::Object(map), structural);
+    }
+
+    #[test]
+    fn buffered_writer_writes_publication_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.pmtiles");
+        let mut w = buffered_fixture();
+        w.set_metadata(all_publication());
+        w.write_to_file(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_publication(&bytes, &all_publication());
+        // Appended after the structural keys, in the documented order.
+        let json = archive_metadata_json(&bytes);
+        assert!(
+            json.starts_with(PRE_PUBLICATION_METADATA.trim_end_matches('}')),
+            "{json}"
+        );
+        // Tile payloads are untouched.
+        let path_default = dir.path().join("default.pmtiles");
+        buffered_fixture().write_to_file(&path_default).unwrap();
+        assert_eq!(
+            read_archive_tiles(&bytes),
+            read_archive_tiles(&fs::read(&path_default).unwrap())
+        );
+    }
+
+    #[test]
+    fn streaming_writer_matches_buffered_publication_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffered = dir.path().join("b.pmtiles");
+        let streaming = dir.path().join("s.pmtiles");
+        let mut b = buffered_fixture();
+        b.set_metadata(all_publication());
+        b.write_to_file(&buffered).unwrap();
+        let mut s = streaming_fixture();
+        s.set_metadata(all_publication());
+        s.finalize(&streaming).unwrap();
+        let s_bytes = fs::read(&streaming).unwrap();
+        assert_publication(&s_bytes, &all_publication());
+        assert_eq!(
+            archive_metadata_json(&s_bytes),
+            archive_metadata_json(&fs::read(&buffered).unwrap())
+        );
+    }
+
+    #[test]
+    fn publication_metadata_round_trips_every_internal_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        for codec in [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Brotli,
+            Compression::Zstd,
+        ] {
+            let path = dir.path().join(format!("{codec:?}.pmtiles"));
+            let mut w = PmtilesWriter::with_compression(codec);
+            w.set_metadata(all_publication());
+            w.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+            w.write_to_file(&path).unwrap();
+            let map = metadata_object(&fs::read(&path).unwrap());
+            assert_eq!(
+                map["attribution"],
+                crate::pmtiles_metadata::tests::HOSTILE,
+                "{codec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_publication_values_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.pmtiles");
+        let empty = TilesetMetadata::new()
+            .with_name("")
+            .with_description("")
+            .with_attribution("");
+        let mut w = streaming_fixture();
+        w.set_metadata(empty.clone());
+        w.finalize(&path).unwrap();
+        assert_publication(&fs::read(&path).unwrap(), &empty);
+    }
+
+    #[test]
+    fn publication_metadata_survives_structural_setters_and_is_replaced_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, sp) = (dir.path().join("b.pmtiles"), dir.path().join("s.pmtiles"));
+        let second = TilesetMetadata::new().with_description("second");
+
+        let mut b = PmtilesWriter::new();
+        b.set_metadata(all_publication());
+        b.set_metadata(second.clone());
+        let mut s = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        s.set_metadata(all_publication());
+        s.set_metadata(second.clone());
+        // Structural setters after the metadata must not erase it.
+        b.set_layer_name("parks");
+        b.set_fields(pub_fields());
+        b.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
+        for (z, x, y, data, n) in PUB_TILES {
+            b.add_tile_with_count(z, x, y, data, n).unwrap();
+        }
+        fill_streaming(&mut s);
+        b.write_to_file(&bp).unwrap();
+        s.finalize(&sp).unwrap();
+        assert_publication(&fs::read(&bp).unwrap(), &second);
+        assert_publication(&fs::read(&sp).unwrap(), &second);
+    }
+
+    #[test]
+    fn checkpoints_carry_publication_metadata_in_both_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut finals = Vec::new();
+        for (label, tail, checkpoints) in [
+            ("packed", false, false),
+            ("packed-ckpt", false, true),
+            ("tail", true, false),
+            ("tail-ckpt", true, true),
+        ] {
+            let out = dir.path().join(format!("{label}.pmtiles"));
+            let mut w = if tail {
+                StreamingPmtilesWriter::with_tail_layout(&out, Compression::Gzip).unwrap()
+            } else {
+                StreamingPmtilesWriter::new(Compression::Gzip).unwrap()
+            };
+            w.set_metadata(all_publication());
+            w.set_layer_name("parks");
+            for i in 0..12u32 {
+                let (z, x, y) = tail_coord(i);
+                w.add_tile(z, x, y, &tail_payload(i)).unwrap();
+                if checkpoints && i % 4 == 3 {
+                    w.checkpoint(&out).unwrap();
+                    let ckpt = fs::read(w.salvage_path().unwrap_or(&out)).unwrap();
+                    let map = metadata_object(&ckpt);
+                    assert_eq!(map["name"], "Park Tiles 4", "{label} checkpoint {i}");
+                    assert_eq!(
+                        map["attribution"],
+                        crate::pmtiles_metadata::tests::HOSTILE,
+                        "{label} checkpoint {i}"
+                    );
+                }
+            }
+            w.finalize(&out).unwrap();
+            finals.push((label, fs::read(&out).unwrap()));
+        }
+        let (_, packed) = &finals[0];
+        for (label, bytes) in &finals {
+            assert_eq!(
+                archive_metadata_json(bytes),
+                archive_metadata_json(packed),
+                "{label} metadata"
+            );
+        }
+        assert_eq!(
+            finals[0].1, finals[1].1,
+            "packed checkpoints change nothing"
+        );
+        assert_eq!(finals[2].1, finals[3].1, "tail checkpoints change nothing");
+    }
+
+    #[test]
+    fn zero_tile_archives_keep_publication_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bp, sp) = (dir.path().join("b.pmtiles"), dir.path().join("s.pmtiles"));
+        let mut b = PmtilesWriter::new();
+        b.set_metadata(all_publication());
+        b.write_to_file(&bp).unwrap();
+        let mut s = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        s.set_metadata(all_publication());
+        s.finalize(&sp).unwrap();
+        for bytes in [fs::read(&bp).unwrap(), fs::read(&sp).unwrap()] {
+            let map = metadata_object(&bytes);
+            assert_eq!(map["description"], "National park boundaries");
+            assert_eq!(map["attribution"], crate::pmtiles_metadata::tests::HOSTILE);
+        }
+    }
+
+    #[test]
+    fn metadata_encoding_enforces_the_reader_cap() {
+        // Uncompressed, the stored section is the raw JSON: exactly the cap
+        // is what the capped reader still accepts.
+        let at_cap = "x".repeat(64);
+        assert_eq!(
+            encode_metadata_capped(&at_cap, Compression::None, 64).unwrap(),
+            at_cap.as_bytes()
+        );
+        let err = encode_metadata_capped(&"x".repeat(65), Compression::None, 64).unwrap_err();
+        assert!(err.to_string().contains("65"), "{err}");
+        // Raw JSON within the cap whose gzip framing pushes the stored
+        // section over it.
+        let tiny = r#"{"a":"q8#Lz"}"#;
+        let gz = compression::compress(tiny.as_bytes(), Compression::Gzip).unwrap();
+        assert!(gz.len() > tiny.len());
+        let cap = gz.len() as u64 - 1;
+        assert!(tiny.len() as u64 <= cap);
+        let err = encode_metadata_capped(tiny, Compression::Gzip, cap).unwrap_err();
+        assert!(err.to_string().contains("stored"), "{err}");
+    }
+
+    /// One more byte of escaped attribution than the metadata cap allows,
+    /// counting the quotes the escaping adds.
+    fn oversized_publication() -> TilesetMetadata {
+        TilesetMetadata::new().with_attribution("\"".repeat(MAX_INTERNAL_BYTES as usize / 2))
+    }
+
+    #[test]
+    fn rejected_metadata_leaves_buffered_destination_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.pmtiles");
+        fs::write(&existing, b"previous archive").unwrap();
+        let absent = dir.path().join("absent.pmtiles");
+        for path in [&existing, &absent] {
+            let mut w = buffered_fixture();
+            w.set_metadata(oversized_publication());
+            let err = w.write_to_file(path).unwrap_err();
+            assert!(err.to_string().contains("metadata"), "{err}");
+        }
+        assert_eq!(fs::read(&existing).unwrap(), b"previous archive");
+        assert!(!absent.exists(), "no output created for rejected metadata");
+    }
+
+    #[test]
+    fn rejected_metadata_leaves_streaming_destination_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.pmtiles");
+        fs::write(&existing, b"previous archive").unwrap();
+        let mut w = streaming_fixture();
+        w.set_metadata(oversized_publication());
+        assert!(w.checkpoint(&existing).is_err());
+        assert!(w.finalize(&existing).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"previous archive");
     }
 }

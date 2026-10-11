@@ -2531,6 +2531,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #427: one scratch knob — the export's member spill goes where the
         // convert's spill (and the intermediate overview) go.
         spill_dir: args.tuning.spill_dir.clone(),
+        metadata: Default::default(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -3161,6 +3162,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         zoom_ceiling: args.zoom_ceiling,
         feature_id: args.feature_id.clone(),
         spill_dir: args.spill_dir.clone(),
+        metadata: Default::default(),
     };
 
     println!(
