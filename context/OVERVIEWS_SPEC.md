@@ -348,6 +348,9 @@ Provenance := {
                                // levels[].geometry_types remains the
                                // normative per-level type signal
   "ranking":      Ranking,     // OPTIONAL: cell-winner priority source
+  "entry_zoom":   EntryZoom,   // OPTIONAL: attribute-driven entry
+                               // zoom ladder; absent when none
+                               // applied
   "density_drop": DensityDrop, // OPTIONAL: per-level feature budget
   "clustering":   Clustering,  // OPTIONAL: point clustering (§12.4)
   "coalescing":   Coalescing,  // OPTIONAL: line coalescing (§13.4)
@@ -380,6 +383,20 @@ Ranking := {
   "unknown_rank": number       // OPTIONAL: priority of unlisted values
 }
 
+EntryZoom := {
+  "mode":   string,            // "dense-rank" (distinct values ranked
+                               // descending, one rung per `step`
+                               // zooms from the coarsest level's
+                               // zoom) or "explicit" (hand-placed)
+  "column": string,            // column read, as named in this file
+  "step":   integer,           // OPTIONAL: zooms between rungs
+                               // ("dense-rank" only)
+  "rungs":  { string: integer, ... }
+                               // OPTIONAL: JSON object map of value →
+                               // entry zoom ("explicit" only), e.g.
+                               // {"5000": 2, "250": 5}
+}
+
 DensityDrop := {
   "drop_rate":            number,  // each coarser level keeps 1/rate
   "gamma":                number,  // spatial-fairness exponent (>= 1)
@@ -387,7 +404,14 @@ DensityDrop := {
 }
 ```
 
-`Ranking` and `DensityDrop` record which mechanism a producer used
+`EntryZoom` records a ladder that set the first level at which each
+feature appears, bypassing the visibility gate and cell-winner
+thinning for the features it places. `Ranking` then describes only
+the features the ladder leaves to ordinary thinning, so a laddered
+file can carry `"ranking": {"mode": "size-fallback"}` alongside an
+`entry_zoom` block.
+
+`Ranking`, `EntryZoom`, and `DensityDrop` record which mechanism a producer used
 (FYI, never a contract); `Clustering` and `Coalescing` are defined in
 §12.4 and §13.4. `cascade` matters for reproducibility: with the same
 `levels[].simplify_tolerance_m`, cascaded and non-cascaded producers
@@ -1214,8 +1238,9 @@ requirements of this spec.
 
 - **Unreleased (additive, informative)**: `generalization.zoom_ceiling`
   marks a partial file (§3.5), and `coalescing.merged` records whether
-  coalescing merged anything across the whole level plan (§13.4). Both
-  OPTIONAL; files without them are unchanged.
+  coalescing merged anything across the whole level plan (§13.4).
+  `generalization.entry_zoom` records an attribute-driven entry-zoom
+  ladder (§3.5). All OPTIONAL; files without them are unchanged.
 - **v0.2.0 (2026-07-03)**: added the point clustering extension (§12:
   `point_count` column, numeric attribute accumulation,
   `generalization.clustering` metadata, duplicating-mode-only rule)

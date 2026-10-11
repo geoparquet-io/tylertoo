@@ -193,6 +193,20 @@ pub struct Generalization {
     /// this field existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ranking: Option<RankingProvenance>,
+    /// OPTIONAL entry-zoom ladder provenance (§3.5, additive; informative;
+    /// #446).
+    ///
+    /// Records the magnitude ladder (#364) that decided how early each
+    /// feature could appear. A ladder overrides the visibility gate and
+    /// cell-winner thinning for the features it places, so
+    /// [`ranking`](Self::ranking) alone misdescribes a laddered file: it still
+    /// names the tier that ranks the *unladdered* features (often
+    /// `size-fallback`). Absent when no ladder was requested, when the level
+    /// plan had no zooms to anchor one (a `--gsd` plan, where the ladder is
+    /// inert), or on files written before this field existed; readers MUST
+    /// tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_zoom: Option<EntryZoomProvenance>,
     /// OPTIONAL density-budget provenance (§3.5, additive; informative).
     ///
     /// Records the per-level density budget applied after cell-winner thinning
@@ -397,6 +411,30 @@ where
             RanksShape::LegacyPairs(pairs) => pairs.into_iter().collect(),
         }),
     )
+}
+
+/// How an entry-zoom ladder placed features for a conversion (#364, #446).
+///
+/// Additive, OPTIONAL, informative provenance embedded in [`Generalization`]
+/// (§3.5). Together with the source column's values and the footer's level
+/// zooms, it reproduces every feature's entry zoom.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntryZoomProvenance {
+    /// `dense-rank` (`--magnitude-ladder`: the column's distinct values ranked
+    /// descending, one rung per `step` zooms from the coarsest level's zoom)
+    /// or `explicit` (`--entry-zoom`: hand-placed rungs).
+    pub mode: String,
+    /// Column the ladder read, as named in this file (after any
+    /// reserved-column rename, see [`Generalization::renamed_columns`]).
+    pub column: String,
+    /// Zooms between consecutive rungs (`dense-rank` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u8>,
+    /// The requested `value → entry zoom` rungs (`explicit` only), echoed
+    /// when small enough to be useful. Serialized as a JSON object map keyed
+    /// by the rendered value, like `ranking.ranks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<BTreeMap<String, u8>>,
 }
 
 /// One zoom band of the representation-selector provenance (§3.5; #317 /
@@ -1036,6 +1074,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: None,
             clustering: None,
             coalescing: None,
@@ -1086,6 +1125,7 @@ mod tests {
                 ])),
                 unknown_rank: Some(0.0),
             }),
+            entry_zoom: None,
             density_drop: None,
             clustering: None,
             coalescing: None,
@@ -1105,6 +1145,63 @@ mod tests {
         assert_eq!(r.column.as_deref(), Some("road_class"));
         assert_eq!(r.unknown_rank, Some(0.0));
         assert_eq!(r.ranks.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn entry_zoom_provenance_roundtrip() {
+        // #446: the ladder block survives JSON round-trip, its rungs as an
+        // object map, and an absent block keeps older footers unchanged.
+        let mut meta = duplicating_example();
+        let mut g = Generalization {
+            engine: "tylertoo test".to_string(),
+            gsd_base: None,
+            cascade: None,
+            collapse: None,
+            representation: None,
+            levels: vec![],
+            ranking: None,
+            entry_zoom: Some(EntryZoomProvenance {
+                mode: "explicit".to_string(),
+                column: "magnitude".to_string(),
+                step: None,
+                rungs: Some(BTreeMap::from([
+                    ("250".to_string(), 5),
+                    ("5000".to_string(), 2),
+                ])),
+            }),
+            density_drop: None,
+            clustering: None,
+            coalescing: None,
+            renamed_columns: None,
+            zoom_ceiling: None,
+        };
+        meta.generalization = Some(g.clone());
+        let json = meta.to_json().unwrap();
+        assert!(
+            json.contains(
+                r#""entry_zoom":{"mode":"explicit","column":"magnitude","rungs":{"250":5,"5000":2}}"#
+            ),
+            "got {json}"
+        );
+        assert_eq!(OverviewsMeta::from_json(&json).unwrap(), meta);
+
+        g.entry_zoom = Some(EntryZoomProvenance {
+            mode: "dense-rank".to_string(),
+            column: "magnitude".to_string(),
+            step: Some(1),
+            rungs: None,
+        });
+        meta.generalization = Some(g.clone());
+        let json = meta.to_json().unwrap();
+        assert!(
+            json.contains(r#""entry_zoom":{"mode":"dense-rank","column":"magnitude","step":1}"#),
+            "got {json}"
+        );
+        assert_eq!(OverviewsMeta::from_json(&json).unwrap(), meta);
+
+        g.entry_zoom = None;
+        meta.generalization = Some(g);
+        assert!(!meta.to_json().unwrap().contains("entry_zoom"));
     }
 
     #[test]
@@ -1152,6 +1249,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: Some(DensityProvenance {
                 drop_rate: 1.8,
                 gamma: 1.5,
@@ -1195,6 +1293,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: None,
             clustering: None,
             coalescing: Some(CoalescingProvenance {
@@ -1277,6 +1376,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: None,
             clustering: Some(ClusteringProvenance {
                 enabled: true,

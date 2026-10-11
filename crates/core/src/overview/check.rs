@@ -1145,6 +1145,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: None,
             clustering: Some(ClusteringProvenance {
                 enabled: true,
@@ -1347,6 +1348,7 @@ mod tests {
             representation: None,
             levels: vec![],
             ranking: None,
+            entry_zoom: None,
             density_drop: None,
             clustering: None,
             coalescing: Some(CoalescingProvenance {

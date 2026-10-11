@@ -1558,6 +1558,107 @@ fn entry_zoom_ladder_is_identical_across_pipelines() {
     );
 }
 
+/// #446: the footer is the format's record of how a file was built, so a
+/// laddered conversion must say it was laddered. Before the fix the footer
+/// carried only `ranking: size-fallback`, which describes the unladdered
+/// features and hides the mechanism that placed the rest.
+#[test]
+fn entry_zoom_ladder_is_recorded_in_the_footer() {
+    use std::collections::BTreeMap;
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::overview::level::EntryZoomProvenance;
+
+    let dense = EntryZoomSpec {
+        column: "magnitude".to_string(),
+        kind: EntryZoomKind::DenseRank { step: 2 },
+    };
+    let explicit = EntryZoomSpec {
+        column: "magnitude".to_string(),
+        kind: EntryZoomKind::Explicit(vec![(5000.0, 2), (250.0, 5)]),
+    };
+    let cases = [
+        (
+            dense,
+            EntryZoomProvenance {
+                mode: "dense-rank".to_string(),
+                column: "magnitude".to_string(),
+                step: Some(2),
+                rungs: None,
+            },
+        ),
+        (
+            explicit,
+            EntryZoomProvenance {
+                mode: "explicit".to_string(),
+                column: "magnitude".to_string(),
+                step: None,
+                rungs: Some(BTreeMap::from([
+                    ("250".to_string(), 5),
+                    ("5000".to_string(), 2),
+                ])),
+            },
+        ),
+    ];
+    for streaming in [true, false] {
+        for (spec, want) in &cases {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_banded_input(tin.path(), 4);
+            let o = ConvertOptions {
+                entry_zoom: Some(spec.clone()),
+                ..opts(streaming)
+            };
+            convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let g = reader.meta().generalization.as_ref().unwrap();
+            assert_eq!(
+                g.entry_zoom.as_ref(),
+                Some(want),
+                "streaming={streaming}: the footer must record the ladder"
+            );
+            // The ranking block keeps its meaning: the cell-winner tier for
+            // the features the ladder leaves to ordinary thinning.
+            assert_eq!(
+                g.ranking.as_ref().map(|r| r.mode.as_str()),
+                Some("size-fallback"),
+                "streaming={streaming}"
+            );
+            let vr = validate_file(tout.path()).unwrap();
+            assert!(
+                vr.is_valid(),
+                "streaming={streaming}: {:?}",
+                vr.failures().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// A run without a ladder, and a `--gsd` plan where the ladder is inert,
+/// write no `entry_zoom` block: provenance names only what was applied.
+#[test]
+fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let laddered_gsd_plan = ConvertOptions {
+        entry_zoom: Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind: EntryZoomKind::DenseRank { step: 1 },
+        }),
+        levels: LevelPlan::Gsds(vec![20_000.0, 5_000.0, 1_000.0]),
+        ..opts(true)
+    };
+    for o in [opts(true), laddered_gsd_plan] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 4);
+        convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let g = reader.meta().generalization.as_ref().unwrap();
+        assert_eq!(g.entry_zoom, None, "levels={:?}", o.levels);
+    }
+}
+
 /// #364: the two engines must rank the same rows, not just agree on a fixture
 /// where every row survives.
 ///

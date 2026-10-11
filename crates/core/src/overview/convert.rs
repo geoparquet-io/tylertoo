@@ -70,11 +70,12 @@ use super::coalesce::{
     COALESCED_COUNT_COLUMN, COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
     DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
 };
-use super::ladder::{build_ladder, entry_levels, EntryZoomSpec};
+use super::ladder::{build_ladder, entry_levels, EntryZoomKind, EntryZoomLadder, EntryZoomSpec};
 use super::level::{
     gsd_with_base, zoom_for_gsd, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance,
-    Crs, DensityProvenance, Generalization, GeneralizationLevel, MemoryProfile, Mode,
-    RankingProvenance, RepresentationBandProvenance, GSD_TILE_BASE, METERS_PER_DEGREE,
+    Crs, DensityProvenance, EntryZoomProvenance, Generalization, GeneralizationLevel,
+    MemoryProfile, Mode, RankingProvenance, RepresentationBandProvenance, GSD_TILE_BASE,
+    METERS_PER_DEGREE,
 };
 use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
@@ -6031,6 +6032,7 @@ pub(super) fn build_generalization(
             )
         },
         ranking: Some(ranking),
+        entry_zoom: entry_zoom_provenance(options),
         // Record the density budget only when it was applied; a disabled run
         // omits the block so its footer matches pre-Q2 output.
         density_drop: if options.density.enabled {
@@ -6099,6 +6101,37 @@ pub(super) fn build_generalization(
         // actually truncated the level plan (see `Generalization::zoom_ceiling`).
         zoom_ceiling: None,
     }
+}
+
+/// The footer's entry-zoom ladder provenance (#446).
+///
+/// Built from the request rather than the resolved ladder: a `dense-rank`
+/// ladder is reproducible from the step, the column's values, and the footer's
+/// level zooms, and an `explicit` one from the rungs as written. `None` when
+/// no ladder was requested, or when a `--gsd` plan has no zooms to anchor one
+/// (`entry_levels` then leaves every feature unplaced), so a run the ladder
+/// did not touch keeps a byte-identical footer.
+fn entry_zoom_provenance(options: &ConvertOptions) -> Option<EntryZoomProvenance> {
+    let spec = options.entry_zoom.as_ref()?;
+    if !matches!(options.levels, LevelPlan::ZoomRange { .. }) {
+        return None;
+    }
+    let (mode, step, rungs) = match &spec.kind {
+        EntryZoomKind::DenseRank { step } => ("dense-rank", Some(*step), None),
+        EntryZoomKind::Explicit(pairs) => {
+            let rungs = (pairs.len() <= MAX_PROVENANCE_RANKS)
+                .then(|| EntryZoomLadder::explicit(pairs.iter().copied()).ok())
+                .flatten()
+                .map(|ladder| ladder.to_map());
+            ("explicit", None, rungs)
+        }
+    };
+    Some(EntryZoomProvenance {
+        mode: mode.to_string(),
+        column: spec.column.clone(),
+        step,
+        rungs,
+    })
 }
 
 /// Whether any chain table joined two or more segments (#379 / #541 review).
