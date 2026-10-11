@@ -1504,6 +1504,36 @@ pub enum ConvertError {
         /// The per-batch ceiling checked against.
         limit_bytes: u64,
     },
+    /// The in-memory reference path (`--no-streaming`) holds the whole
+    /// input in one arrow batch, and one byte-array column of the selected
+    /// row groups sums past the bytes arrow's `i32` offsets can address in
+    /// one batch (#606). Found from footer statistics before any data page
+    /// is read. The streaming pipeline reads such an input in smaller
+    /// batches.
+    #[error("{}", in_memory_byte_array_too_large_message(.largest, .limit_bytes))]
+    InMemoryByteArrayTooLarge {
+        /// The column whose total is too large.
+        largest: crate::input_set::LargestByteArrayColumn,
+        /// The per-batch ceiling checked against.
+        limit_bytes: u64,
+    },
+}
+
+/// The message body of [`ConvertError::InMemoryByteArrayTooLarge`] (#606).
+fn in_memory_byte_array_too_large_message(
+    largest: &crate::input_set::LargestByteArrayColumn,
+    limit_bytes: &u64,
+) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    format!(
+        "--no-streaming reads the whole input into one arrow batch, and column '{}' \
+         holds {:.2} GiB in the row groups to read, beyond the {:.2} GiB one batch can \
+         hold for it (i32 offsets). Drop --no-streaming: the streaming pipeline reads \
+         this input in smaller batches.",
+        largest.column,
+        largest.total_bytes as f64 / GIB,
+        *limit_bytes as f64 / GIB,
+    )
 }
 
 /// The message body of [`ConvertError::ByteArrayRowTooLarge`] (#563).
@@ -2586,6 +2616,46 @@ fn project_builder_to_selection(
     }
 }
 
+/// #606: every row the in-memory path reads lands in the one `RecordBatch`
+/// [`load_input_table`] concatenates, so a byte-array column's total over
+/// the `row_groups` to read must fit arrow's i32 offsets. Past that the
+/// concat fails with an opaque `Offset overflow error`. This check names the
+/// cause from footer statistics, before any data page is read. Unprojected
+/// columns, and columns the reader decodes with i64 offsets or views,
+/// cannot overflow and are not counted.
+fn check_in_memory_byte_array_total(
+    source: &ConvertSource,
+    builder: &parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
+        crate::input::InputReader,
+    >,
+    row_groups: Option<&[usize]>,
+    limit_bytes: u64,
+) -> Result<(), ConvertError> {
+    let keep = source.column_projection();
+    let fields = builder.schema().fields();
+    let counts = |root: usize| {
+        keep.is_none_or(|k| k.contains(&root))
+            && fields.get(root).is_none_or(|f| {
+                !matches!(
+                    f.data_type(),
+                    DataType::LargeBinary
+                        | DataType::LargeUtf8
+                        | DataType::BinaryView
+                        | DataType::Utf8View
+                )
+            })
+    };
+    match crate::input_set::largest_byte_array_column(builder.metadata(), row_groups, counts) {
+        Some(largest) if largest.total_bytes > limit_bytes => {
+            Err(ConvertError::InMemoryByteArrayTooLarge {
+                largest,
+                limit_bytes,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Intern the class-group column that line coalescing (Q3) groups chains by.
 ///
 /// `None` unless the resolved ranking is class-based, which is what supplies
@@ -2661,6 +2731,24 @@ fn load_input_table(
     source_single: &InputSource,
     options: &ConvertOptions,
 ) -> Result<LoadedInput, ConvertError> {
+    load_input_table_with_limit(
+        source,
+        source_single,
+        options,
+        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+    )
+}
+
+/// [`load_input_table`], parameterized on the #606 ceiling for one
+/// byte-array column's bytes across the whole table (test seam). Production
+/// passes [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]; tests pass a tiny
+/// one to prove the error fires from footer statistics alone.
+fn load_input_table_with_limit(
+    source: &ConvertSource,
+    source_single: &InputSource,
+    options: &ConvertOptions,
+    byte_array_limit: u64,
+) -> Result<LoadedInput, ConvertError> {
     // #543: the same footer-only pass-1 memory preflight the streaming path
     // runs, before the whole table is loaded.
     preflight_pass1_memory_probed(source, options)?;
@@ -2709,6 +2797,9 @@ fn load_input_table(
         bound_filter.as_ref(),
     );
     let read_selection = combined_sel.clone();
+
+    check_in_memory_byte_array_total(source, &builder, combined_sel.as_deref(), byte_array_limit)?;
+
     let (builder, row_groups_read) = match combined_sel {
         Some(sel) => {
             let n = sel.len();
@@ -7994,6 +8085,63 @@ mod tests {
             matches!(err, ConvertError::MultiPartitionRequiresStreaming),
             "expected MultiPartitionRequiresStreaming, got {err:?}"
         );
+    }
+
+    /// #606: the in-memory path concatenates every read row into one batch,
+    /// so a byte-array column whose total over the read row groups passes
+    /// the ceiling fails from footer statistics, naming the column and the
+    /// way out. A bbox that prunes the input under the ceiling reads it.
+    #[test]
+    fn in_memory_path_rejects_a_byte_array_column_past_the_batch_ceiling() {
+        let geoms = synthetic_geometries();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // 1302 bytes of WKB in three row groups of six rows: the points, then
+        // the lines and the first two polygons, then the last two polygons
+        // (186 bytes).
+        write_input_partition(&input, &geoms, 0..geoms.len(), Some(6));
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let ConvertSource::Single(single) = &source else {
+            panic!("one file resolves to a single source");
+        };
+        let limit = 1000;
+        let opts = ConvertOptions {
+            streaming: false,
+            ..multi_test_options()
+        };
+
+        let Err(err) = load_input_table_with_limit(&source, single.input(), &opts, limit) else {
+            panic!("the whole table passes the ceiling");
+        };
+        let ConvertError::InMemoryByteArrayTooLarge {
+            largest,
+            limit_bytes,
+        } = &err
+        else {
+            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
+        };
+        assert_eq!(largest.column, "geometry");
+        assert!(largest.total_bytes > limit, "{largest:?}");
+        assert_eq!(*limit_bytes, limit);
+        let msg = err.to_string();
+        assert!(msg.contains("'geometry'"), "names the column: {msg}");
+        assert!(
+            msg.contains("Drop --no-streaming"),
+            "names the way out: {msg}"
+        );
+
+        // Only the last row group's extent intersects this bbox.
+        let pruned = ConvertOptions {
+            bbox: Some([-30.0, -60.0, -20.0, -50.0]),
+            ..opts.clone()
+        };
+        let loaded = load_input_table_with_limit(&source, single.input(), &pruned, limit)
+            .expect("the pruned row groups fit the ceiling");
+        assert_eq!(loaded.row_groups_read, 1);
+
+        let unlimited = load_input_table_with_limit(&source, single.input(), &opts, u64::MAX)
+            .expect("the real ceiling reads a small input");
+        assert_eq!(unlimited.full.num_rows(), geoms.len());
     }
 
     /// Partitions disagreeing on CRS are rejected at resolve time with an

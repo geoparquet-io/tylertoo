@@ -29,7 +29,9 @@ preparing input with `gpio`. Pass 1 uses up to 42 bytes per row, reaching
 tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-coarse-jobs-memory).
 
 - **`--no-streaming`** decodes the whole dataset in memory. It can be slightly
-  faster on small inputs that fit in RAM.
+  faster on small inputs that fit in RAM. It holds the input in one Arrow
+  batch, so it refuses an input where one byte-array column (usually the
+  geometry) holds more than 2 GiB in total. Drop the flag for such inputs.
 - **`--read-batch-size <rows>`** sets the Arrow batch size for both passes
   (default 8192, maximum 1,048,576). Larger batches run slightly faster at
   proportionally more memory. tylertoo lowers it, with a warning, if a batch
