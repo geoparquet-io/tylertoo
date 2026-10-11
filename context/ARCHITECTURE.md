@@ -415,23 +415,39 @@ in one wave into one group, while the group's summed members stay within
 `level_group_member_cap`. That cap is one full ceiling-width wave of
 target-sized partitions (`ceiling × partition_target`), which is the most a
 serial wave already holds. On `auto` it also narrows to what fits in the
-#311 RAM budget. `export_level_group` encodes the group's levels in one
-Rayon section and then writes them in level order. Every tile id at zoom `z`
-is below every id at `z + 1`, so the writer still sees ascending ids and the
-archive is byte-identical (`concurrent_levels_are_byte_identical_to_serial`
-covers every pass-2 path). A multi-wave level, or a level that alone exceeds
-the cap, is a group of one and runs the unchanged wave loop. Checkpoints are
-taken only between groups, so they never cover a zoom that is still in
-flight.
+#311 RAM budget. The cap counts members only. A group can also hold the
+encoded tiles of a level that finished before a coarser one, and these are
+smaller than the members they come from.
 
-Inside a tile, `build_mvt` encodes member geometries in parallel once a tile
-holds `PARALLEL_ENCODE_MIN_MEMBERS` (512) members. A coarse zoom has a few
-very large tiles (one z3 tile on madagascar-adm4 is 489 KB), and the
-per-tile parallel section otherwise ran each one on a single thread. The
-geometry encode is pure per member. Tag interning stays serial in member
-order, so the key and value tables, and so the bytes, do not change. The
-gzip of one tile stays single-threaded, because a parallel deflate would
-change the compressed bytes.
+`export_level_group` collects the levels' members on the calling thread, one
+level at a time and in level order, as the serial loop does. Each collected
+level then encodes in its own Rayon task while the next level is collected.
+The collect stays off the Rayon pool because the legacy read blocks on a
+channel. In a Rayon task it would park a worker, and a worker waiting in a
+nested join could pick up another level's read and block under it.
+
+`GroupCommit` writes each level as soon as it and every coarser level of the
+group are encoded, then takes a due checkpoint. Every tile id at zoom `z` is
+below every id at `z + 1`, so the writer still sees ascending ids and the
+archive is byte-identical (`concurrent_levels_are_byte_identical_to_serial`
+and `level_groups_commit_and_checkpoint_every_level_in_order` cover every
+pass-2 path). A checkpoint after level `z` covers only levels that are fully
+written. When a level fails, every coarser level of its group is already
+written and, when due, checkpointed. A multi-wave level, or a level that
+alone exceeds the cap, is a group of one and runs the unchanged wave loop.
+
+Inside a tile, `build_mvt` encodes member geometries in parallel once the
+tile holds at least `PARALLEL_ENCODE_MIN_COORDS` (4,096) vertices over two or
+more members. A coarse zoom has a few very large tiles (one z3 tile on
+madagascar-adm4 is 489 KB), and the per-tile parallel section otherwise ran
+each one on a single thread. The threshold counts vertices because the
+encode cost follows them, so a tile of a few large polygons qualifies. On an
+idle 16-core pool the parallel encode broke even at about 500–1,000
+vertices and ran 1.4–3.5× faster at 4,096. The geometry encode is pure per
+member. Tag interning stays serial in member order, so the key and value
+tables, and so the bytes, do not change. The gzip of one tile stays
+single-threaded, because a parallel deflate would change the compressed
+bytes.
 
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in

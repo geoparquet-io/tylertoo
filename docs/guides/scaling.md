@@ -110,8 +110,8 @@ byte for byte.
 
 ### Interrupted exports
 
-After each finished zoom, or group of zooms, at most once a minute, export
-logs a checkpoint for `<output>.partial`. If the run stops before writing another tile, that
+After each finished zoom, at most once a minute, export logs a checkpoint
+for `<output>.partial`. If the run stops before writing another tile, that
 file is a valid archive of the completed zooms. You can serve or rename it.
 Further tile writes invalidate it until the next checkpoint. PMTiles readers
 reject the file in that state. If it opens, it is safe to use.
