@@ -1345,6 +1345,46 @@ pub(crate) fn is_bbox_covering_struct(field: &Field) -> bool {
     }
 }
 
+/// Whether `field` is the geometry's bbox covering rather than a property.
+///
+/// A covering is a `{xmin, ymin, xmax, ymax}` struct
+/// ([`is_bbox_covering_struct`]) that ALSO satisfies any of: its name is the
+/// one the file's `geo` metadata declares (`declared`); its name is a default
+/// spelling (`covering_name_for(geom)`, `<geom>_bbox`, `bbox`); or its four
+/// children are floats. The last rule is what catches a file with no `geo`
+/// metadata whose covering was named `geometry_bbox` (the madagascar
+/// fixture): before it, that struct was JSON-encoded into every feature as a
+/// ~60-byte unique string, which the tippecanoe parity gate flagged as +12%
+/// bytes at every zoom. A four-float struct of exactly that shape is never a
+/// real property.
+///
+/// Shared by the export's property set and the convert-time property
+/// selection (#401), so neither offers the covering as a property.
+pub(crate) fn is_covering_column(
+    field: &Field,
+    geom: Option<&str>,
+    declared: Option<&str>,
+) -> bool {
+    if !is_bbox_covering_struct(field) {
+        return false;
+    }
+    let name = field.name().as_str();
+    if declared == Some(name) || name == "bbox" {
+        return true;
+    }
+    if let Some(geom) = geom {
+        if name == covering_name_for(geom) || name == format!("{geom}_bbox") {
+            return true;
+        }
+    }
+    match field.data_type() {
+        DataType::Struct(children) => children
+            .iter()
+            .all(|c| matches!(c.data_type(), DataType::Float32 | DataType::Float64)),
+        _ => false,
+    }
+}
+
 /// Covering column name the encoder will produce for a geometry column, per its
 /// default rule (`bbox` for `geometry`/`geography`, else `{name}_bbox`).
 pub(crate) fn covering_name_for(column_name: &str) -> String {
@@ -2232,6 +2272,74 @@ mod tests {
             matches!(err, WriterError::AllLevelsEmpty { expected: 3 }),
             "got {err:?}"
         );
+    }
+
+    /// Each rule of [`is_covering_column`] on its own (#401 mutation gaps):
+    /// integer children defeat the float rule, so a name rule must carry
+    /// the verdict, and a custom name defeats every name rule, so the float
+    /// rule must.
+    #[test]
+    fn is_covering_column_rules_each_decide_alone() {
+        let bbox = |name: &str, dt: DataType| {
+            Field::new(
+                name,
+                DataType::Struct(
+                    ["xmin", "ymin", "xmax", "ymax"]
+                        .iter()
+                        .map(|c| Field::new(*c, dt.clone(), true))
+                        .collect(),
+                ),
+                true,
+            )
+        };
+        let geom = Some("geometry");
+
+        // `<geom>_bbox` alone: `covering_name_for("geometry")` is `bbox`.
+        assert!(is_covering_column(
+            &bbox("geometry_bbox", DataType::Int32),
+            geom,
+            None
+        ));
+        // `covering_name_for(geom)` alone, for a non-default geometry name.
+        assert!(is_covering_column(
+            &bbox("geom_bbox", DataType::Int32),
+            Some("geom"),
+            None
+        ));
+        // The declared name alone.
+        assert!(is_covering_column(
+            &bbox("extent", DataType::Int32),
+            geom,
+            Some("extent")
+        ));
+        // The float rule alone: no name rule matches `extent`.
+        assert!(is_covering_column(
+            &bbox("extent", DataType::Float64),
+            geom,
+            None
+        ));
+        assert!(is_covering_column(
+            &bbox("extent", DataType::Float32),
+            geom,
+            None
+        ));
+        // No rule matches: an integer struct under a custom name.
+        assert!(!is_covering_column(
+            &bbox("extent", DataType::Int32),
+            geom,
+            None
+        ));
+        assert!(!is_covering_column(
+            &bbox("extent", DataType::Int32),
+            None,
+            None
+        ));
+        // Not covering-shaped at all, whatever the name.
+        assert!(!is_covering_column(
+            &Field::new("bbox", DataType::Utf8, true),
+            geom,
+            Some("bbox")
+        ));
     }
 
     #[test]

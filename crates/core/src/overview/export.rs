@@ -743,6 +743,17 @@ pub enum ExportError {
     )]
     UnsupportedProperty { name: String, data_type: String },
 
+    /// `--include-property` names the geometry's bbox covering struct
+    /// (#401). The covering is index metadata, never a property, so it is
+    /// not exportable. Distinguished from [`Self::UnknownProperty`] because
+    /// the column IS in the file; "unknown" would send the caller looking
+    /// for a typo.
+    #[error(
+        "included property {name:?} is the geometry's bbox covering, not a property; \
+         the writer regenerates it, so it cannot be selected"
+    )]
+    CoveringProperty { name: String },
+
     #[error(
         "property {name:?} is excluded but {knob} reads it; keep it in the selection or \
          drop the knob"
@@ -5545,7 +5556,7 @@ struct PublishedNames {
     suppressed: HashSet<String>,
     /// The bbox covering column the file's `geo` metadata declares for the
     /// geometry column, when it declares one. A covering is never a
-    /// property (see [`is_covering_column`]); this is the declared spelling,
+    /// property (see [`super::writer::is_covering_column`]); this is the declared spelling,
     /// alongside the default names and the shape rule.
     covering: Option<String>,
 }
@@ -5743,8 +5754,8 @@ impl PublishedNames {
                     // the caller looking for a typo that is not there.
                     // Scanned over the same candidates `property_columns`
                     // draws from, so the bbox covering struct (index
-                    // metadata, never a property) falls through to
-                    // "unknown" rather than being called an unencodable
+                    // metadata, never a property) falls through to its own
+                    // check below rather than being called an unencodable
                     // struct.
                     if let Some((_, f)) = candidate_columns(schema, geom_idx, &self)
                         .find(|(_, f)| self.publish(f.name()) == name)
@@ -5753,6 +5764,15 @@ impl PublishedNames {
                             name: name.clone(),
                             data_type: format!("{:?}", f.data_type()),
                         });
+                    }
+                    // #401: the covering is in the file but is never a
+                    // property; say so, as the convert side does.
+                    let geom = schema.fields().get(geom_idx).map(|g| g.name().as_str());
+                    if schema.fields().iter().any(|f| {
+                        f.name() == name
+                            && super::writer::is_covering_column(f, geom, self.covering.as_deref())
+                    }) {
+                        return Err(ExportError::CoveringProperty { name: name.clone() });
                     }
                     return Err(ExportError::UnknownProperty {
                         name: name.clone(),
@@ -5874,7 +5894,7 @@ fn skipped_property_columns(
 }
 
 /// Every schema column that is a property candidate: not the geometry, not
-/// the `level` column, not a bbox covering struct ([`is_covering_column`]:
+/// the `level` column, not a bbox covering struct ([`super::writer::is_covering_column`]:
 /// index metadata, not user data -- so it is neither exported nor warned
 /// about), and not withheld by the selection.
 fn candidate_columns<'a>(
@@ -5891,46 +5911,9 @@ fn candidate_columns<'a>(
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
                 && !published.is_suppressed(f.name())
-                && !is_covering_column(f, geom, published.covering.as_deref())
+                && !super::writer::is_covering_column(f, geom, published.covering.as_deref())
         })
         .map(|(i, f)| (i, f.as_ref()))
-}
-
-/// Whether `field` is the geometry's bbox covering rather than a property.
-///
-/// A covering is a `{xmin, ymin, xmax, ymax}` struct
-/// ([`super::writer::is_bbox_covering_struct`]) that ALSO satisfies any of:
-/// its name is the one the file's `geo` metadata declares (`declared`); its
-/// name is a default spelling (`covering_name_for(geom)`, `<geom>_bbox`,
-/// `bbox`); or its four children are floats. The last rule is what catches
-/// a file with no `geo` metadata whose covering was named `geometry_bbox`
-/// (the madagascar fixture): before it, that struct was JSON-encoded into
-/// every feature as a ~60-byte unique string, which the tippecanoe parity
-/// gate flagged as +12% bytes at every zoom. A four-float struct of exactly
-/// that shape is never a real property.
-fn is_covering_column(
-    field: &arrow_schema::Field,
-    geom: Option<&str>,
-    declared: Option<&str>,
-) -> bool {
-    if !super::writer::is_bbox_covering_struct(field) {
-        return false;
-    }
-    let name = field.name().as_str();
-    if declared == Some(name) || name == "bbox" {
-        return true;
-    }
-    if let Some(geom) = geom {
-        if name == super::writer::covering_name_for(geom) || name == format!("{geom}_bbox") {
-            return true;
-        }
-    }
-    match field.data_type() {
-        DataType::Struct(children) => children
-            .iter()
-            .all(|c| matches!(c.data_type(), DataType::Float32 | DataType::Float64)),
-        _ => false,
-    }
 }
 
 /// The columns pass 2 attaches to each member: the exportable properties
@@ -9131,8 +9114,8 @@ mod tests {
     /// index metadata whatever it is called. A file with no `geo` metadata
     /// and a covering named `geometry_bbox` (the madagascar fixture) must
     /// not have that struct JSON-encoded into every feature, advertised, or
-    /// warned about -- and asking for it by name is "unknown", not
-    /// "unsupported".
+    /// warned about -- and asking for it by name is the covering error
+    /// (#401), not "unsupported".
     #[test]
     fn covering_struct_is_recognised_by_shape_whatever_its_name() {
         use arrow_schema::Fields;
@@ -9196,8 +9179,8 @@ mod tests {
                 )
                 .unwrap_err();
             assert!(
-                matches!(&err, ExportError::UnknownProperty { name: n, .. } if n == name),
-                "{name}: expected UnknownProperty, got {err:?}"
+                matches!(&err, ExportError::CoveringProperty { name: n } if n == name),
+                "{name}: expected CoveringProperty (#401), got {err:?}"
             );
         }
 
@@ -9754,8 +9737,11 @@ mod tests {
         }
 
         // The file's bbox covering struct is index metadata, not a
-        // property: asking for it is "unknown", never "an unencodable
-        // struct" -- structs ARE encodable, and that message would lie.
+        // property. Asking for it gets its own error (#401), as on the
+        // convert side: never "an unencodable struct" (structs ARE
+        // encodable, and that message would lie), and never "unknown",
+        // which sends the caller hunting for a typo in a column the file
+        // plainly has.
         let opts = ExportOptions {
             properties: PropertySelection {
                 include: Some(vec!["bbox".to_string()]),
@@ -9766,9 +9752,10 @@ mod tests {
         let tout = tempfile::NamedTempFile::new().unwrap();
         let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
         assert!(
-            matches!(&err, ExportError::UnknownProperty { name, .. } if name == "bbox"),
-            "the covering must be unknown as a property, got {err:?}"
+            matches!(&err, ExportError::CoveringProperty { name } if name == "bbox"),
+            "the covering must be named as the covering, got {err:?}"
         );
+        assert!(err.to_string().contains("regenerates"), "{err}");
     }
 
     /// #434 review: the map shape is decided from the key TYPE. A binary

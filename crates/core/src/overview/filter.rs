@@ -813,6 +813,26 @@ impl BoundFilter {
     }
 }
 
+/// The schema index a filter column name binds to: an exact match first,
+/// then a unique case-insensitive fallback. `None` when nothing matches or
+/// the fallback is ambiguous. Shared with the property selection's knob
+/// check (#401) so the two can never disagree on which column `--filter`
+/// reads.
+pub(crate) fn resolve_column(schema: &Schema, name: &str) -> Option<usize> {
+    schema.index_of(name).ok().or_else(|| {
+        let mut found = None;
+        for (i, f) in schema.fields().iter().enumerate() {
+            if f.name().eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(i);
+            }
+        }
+        found
+    })
+}
+
 fn bind_expr(
     expr: &FilterExpr,
     schema: &Schema,
@@ -829,20 +849,7 @@ fn bind_expr(
             Some((old, new)) => (new.clone(), old.clone()),
             None => (name.to_string(), name.to_string()),
         };
-        // Exact match first, then a unique case-insensitive fallback.
-        let idx = schema.index_of(&schema_name).ok().or_else(|| {
-            let mut found = None;
-            for (i, f) in schema.fields().iter().enumerate() {
-                if f.name().eq_ignore_ascii_case(&schema_name) {
-                    if found.is_some() {
-                        return None; // ambiguous
-                    }
-                    found = Some(i);
-                }
-            }
-            found
-        });
-        let Some(idx) = idx else {
+        let Some(idx) = resolve_column(schema, &schema_name) else {
             let available = schema
                 .fields()
                 .iter()

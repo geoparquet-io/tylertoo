@@ -1584,6 +1584,8 @@ pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
+pub tylertoo_core::overview::export::ExportError::CoveringProperty
+pub tylertoo_core::overview::export::ExportError::CoveringProperty::name: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::declared: u8
@@ -2457,6 +2459,8 @@ pub fn tylertoo_core::overview::level::gsd_with_base(u8, f64) -> f64
 pub fn tylertoo_core::overview::level::zoom_for_gsd(f64) -> f64
 pub mod tylertoo_core::overview::properties
 pub enum tylertoo_core::overview::properties::PropertySelectionError
+pub tylertoo_core::overview::properties::PropertySelectionError::CoveringColumn
+pub tylertoo_core::overview::properties::PropertySelectionError::CoveringColumn::name: alloc::string::String
 pub tylertoo_core::overview::properties::PropertySelectionError::GeometryColumn
 pub tylertoo_core::overview::properties::PropertySelectionError::GeometryColumn::name: alloc::string::String
 pub tylertoo_core::overview::properties::PropertySelectionError::RequiredByKnob

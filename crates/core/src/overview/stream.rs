@@ -3883,11 +3883,7 @@ fn build_rank_plan(schema: &Schema, options: &ConvertOptions) -> Result<RankPlan
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, f)| {
-                let lname = f.name().to_ascii_lowercase();
-                (lname == "road_class" || lname == "class")
-                    && matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-            })
+            .filter(|(_, f)| super::convert::is_road_class_candidate(f))
             .map(|(idx, f)| RoadCandidate {
                 idx,
                 ranking: overture_road_ranking(f.name().clone()),
@@ -3903,10 +3899,7 @@ fn build_rank_plan(schema: &Schema, options: &ConvertOptions) -> Result<RankPlan
             .fields()
             .iter()
             .enumerate()
-            .find(|(_, f)| {
-                f.name().eq_ignore_ascii_case("confidence")
-                    && matches!(f.data_type(), DataType::Float32 | DataType::Float64)
-            })
+            .find(|(_, f)| super::convert::is_confidence_candidate(f))
             .map(|(idx, f)| (idx, f.name().clone()));
         if !roads.is_empty() || confidence.is_some() {
             return Ok(RankPlan::Auto { roads, confidence });

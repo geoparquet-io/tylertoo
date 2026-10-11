@@ -2501,7 +2501,13 @@ fn check_mode_combinations(options: &ConvertOptions) -> Result<(), ConvertError>
 
 /// Columns the tuning knobs read, paired with the knob that reads them —
 /// these must survive the property selection (#386).
-fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
+///
+/// `--filter` columns resolve against `schema` exactly as the filter binder
+/// resolves them ([`super::filter::resolve_column`]: exact match, then a
+/// unique case-insensitive fallback, #401), so `--filter "NAME > 0"` guards
+/// the `name` column. A name the binder cannot resolve is passed through
+/// unchanged, and the binder reports it.
+fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(c) = &options.sort_key {
         out.push((c.clone(), "--sort-key".to_string()));
@@ -2524,11 +2530,97 @@ fn knob_columns(options: &ConvertOptions) -> Vec<(String, String)> {
         // contributes no required columns.
         if let Ok(expr) = super::filter::parse_filter(f) {
             for c in expr.column_names() {
+                let c = super::filter::resolve_column(schema, &c)
+                    .map_or(c, |i| schema.field(i).name().clone());
                 out.push((c, "--filter".to_string()));
             }
         }
     }
     out
+}
+
+/// Every column auto-rank probes (Q1 tier 3, as [`super::stream`]'s rank
+/// plan and [`resolve_ranking`] probe them), in probe order, with its tier:
+/// each Overture road-class candidate in schema order, then the first places
+/// `confidence` column. Schema-level only: the data gates (road vocabulary
+/// overlap, point majority) decide at ranking time which one, if any, ranks.
+fn auto_rank_candidates(schema: &Schema) -> Vec<(usize, &'static str)> {
+    let fields = || schema.fields().iter().enumerate();
+    fields()
+        .filter(|(_, f)| is_road_class_candidate(f))
+        .map(|(i, _)| (i, "Overture road classes"))
+        .chain(
+            fields()
+                .find(|(_, f)| is_confidence_candidate(f))
+                .map(|(i, _)| (i, "Overture places confidence")),
+        )
+        .collect()
+}
+
+/// Whether `field` is an auto-rank road-class candidate (`road_class` or
+/// `class`, any case, string-typed).
+pub(super) fn is_road_class_candidate(field: &arrow_schema::Field) -> bool {
+    let lname = field.name().to_ascii_lowercase();
+    (lname == "road_class" || lname == "class")
+        && matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+}
+
+/// Whether `field` is an auto-rank places-confidence candidate
+/// (`confidence`, any case, float-typed).
+pub(super) fn is_confidence_candidate(field: &arrow_schema::Field) -> bool {
+    field.name().eq_ignore_ascii_case("confidence")
+        && matches!(field.data_type(), DataType::Float32 | DataType::Float64)
+}
+
+/// The one-line note for when the property selection excludes a column
+/// auto-rank probes (#401): excluding `class` / `road_class` / `confidence`
+/// could otherwise change the ranking silently. `None` when auto-rank is not
+/// in play (`no_auto_rank`, or an explicit `--sort-key` / `--class-rank`
+/// outranks it) or no candidate is excluded.
+///
+/// The note names the candidates still in play but claims no tier. Which
+/// candidate ranks depends on the data gates, and an excluded column is
+/// never read, so this cannot tell whether it would have passed them (an
+/// Overture buildings `class` never does). The `overview ranking:` line
+/// reports what ran. Only when no candidate is left is the outcome certain.
+fn auto_rank_exclusion_note(
+    schema: &Schema,
+    keep: &[usize],
+    options: &ConvertOptions,
+) -> Option<String> {
+    if options.no_auto_rank || options.sort_key.is_some() || options.class_ranking.is_some() {
+        return None;
+    }
+    let (left, excluded): (Vec<_>, Vec<_>) = auto_rank_candidates(schema)
+        .into_iter()
+        .partition(|(i, _)| keep.contains(i));
+    if excluded.is_empty() {
+        return None;
+    }
+    let name = |i: usize| format!("{:?}", schema.field(i).name());
+    let it = if excluded.len() == 1 { "it" } else { "them" };
+    let excluded = excluded
+        .iter()
+        .map(|&(i, _)| name(i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = if left.is_empty() {
+        "no candidate column is left, so ranking falls back to feature size".to_string()
+    } else {
+        let left = left
+            .iter()
+            .map(|&(i, tier)| format!("{} ({tier})", name(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "it still considers {left}; the \"overview ranking:\" line names the column \
+             that ranks, if any"
+        )
+    };
+    Some(format!(
+        "auto-rank: the property selection excludes {excluded}, so auto-rank cannot rank \
+         on {it}; {rest}"
+    ))
 }
 
 /// Apply `options.properties` (#386) to `source`: resolve the selection
@@ -2560,19 +2652,39 @@ pub(super) fn apply_property_selection(
     let schema = source.file_schema()?;
     let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
     let mut warn = |msg: String| log::warn!("[convert] {msg}");
-    let keep = options
-        .properties
-        .resolve(&schema, geom_idx, &knob_columns(options), &mut warn)?;
+    let keep = options.properties.resolve(
+        &schema,
+        geom_idx,
+        &knob_columns(options, &schema),
+        &mut warn,
+    )?;
+    if let Some(note) = auto_rank_exclusion_note(&schema, &keep, options) {
+        log::info!("[convert] {note}");
+    }
+    log::info!(
+        "[convert] {}",
+        property_selection_summary(&schema, geom_idx, &keep)
+    );
+    source.restrict_columns(keep)?;
+    Ok(())
+}
+
+/// The one-line summary of a resolved selection: how many of the schema's
+/// property columns ([`super::properties::property_indices`]: neither the
+/// geometry nor its covering) `keep` retains, which ones, and how many it
+/// drops.
+fn property_selection_summary(schema: &Schema, geom_idx: usize, keep: &[usize]) -> String {
+    let properties = super::properties::property_indices(schema, geom_idx);
     let kept_names: Vec<&str> = keep
         .iter()
-        .filter(|&&i| i != geom_idx)
+        .filter(|i| properties.contains(i))
         .map(|&i| schema.field(i).name().as_str())
         .collect();
-    let dropped = schema.fields().len() - keep.len();
-    log::info!(
-        "[convert] property selection: keeping {} of {} property column(s) ({}), dropping {dropped}",
+    let dropped = properties.len() - kept_names.len();
+    format!(
+        "property selection: keeping {} of {} property column(s) ({}), dropping {dropped}",
         kept_names.len(),
-        schema.fields().len() - 1,
+        properties.len(),
         if kept_names.is_empty() {
             "none — geometry only".to_string()
         } else {
@@ -2582,9 +2694,281 @@ pub(super) fn apply_property_selection(
                 .collect::<Vec<_>>()
                 .join(", ")
         }
-    );
-    source.restrict_columns(keep)?;
-    Ok(())
+    )
+}
+
+#[cfg(test)]
+mod property_selection_tests {
+    use super::*;
+    use arrow_schema::Field;
+
+    fn schema(fields: &[(&str, DataType)]) -> Schema {
+        let mut v: Vec<Field> = fields
+            .iter()
+            .map(|(n, t)| Field::new(*n, t.clone(), true))
+            .collect();
+        v.push(Field::new("geometry", DataType::Binary, false));
+        Schema::new(v)
+    }
+
+    /// #401: `--filter` binds a column through a unique case-insensitive
+    /// fallback, so the knob check must resolve it the same way; otherwise
+    /// `--filter "NAME > 0" --exclude-property name` slips past the friendly
+    /// error and fails later at bind.
+    #[test]
+    fn knob_columns_resolve_filter_columns_case_insensitively() {
+        let s = schema(&[("name", DataType::Float64)]);
+        let options = ConvertOptions {
+            filter: Some("NAME > 0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            knob_columns(&options, &s),
+            vec![("name".to_string(), "--filter".to_string())]
+        );
+    }
+
+    /// An exact match wins over the fallback, and an ambiguous fallback
+    /// resolves to nothing, exactly as the binder treats them: the binder
+    /// then reports the unknown column itself.
+    #[test]
+    fn knob_columns_follow_the_binder_on_exact_and_ambiguous_names() {
+        let s = schema(&[("Name", DataType::Float64), ("name", DataType::Float64)]);
+        let exact = ConvertOptions {
+            filter: Some("Name > 0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            knob_columns(&exact, &s),
+            vec![("Name".to_string(), "--filter".to_string())]
+        );
+        let ambiguous = ConvertOptions {
+            filter: Some("NAME > 0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            knob_columns(&ambiguous, &s),
+            vec![("NAME".to_string(), "--filter".to_string())]
+        );
+    }
+
+    fn keep_without(s: &Schema, dropped: &[&str]) -> Vec<usize> {
+        (0..s.fields().len())
+            .filter(|&i| !dropped.contains(&s.field(i).name().as_str()))
+            .collect()
+    }
+
+    /// #401: excluding a column auto-rank would consider is logged once,
+    /// naming the excluded candidates and the ones still in play. The note
+    /// cannot know which candidate the data gates pick (an excluded column
+    /// is never read), so it claims no tier: it points at the
+    /// `overview ranking:` line instead.
+    #[test]
+    fn excluding_an_auto_rank_candidate_names_what_is_left() {
+        let s = schema(&[
+            ("class", DataType::Utf8),
+            ("road_class", DataType::Utf8),
+            ("confidence", DataType::Float64),
+        ]);
+        let options = ConvertOptions::default();
+
+        let note = auto_rank_exclusion_note(&s, &keep_without(&s, &["class"]), &options)
+            .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"class\""), "{note}");
+        assert!(
+            note.contains("\"road_class\" (Overture road classes)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("\"confidence\" (Overture places confidence)"),
+            "{note}"
+        );
+        assert!(note.contains("overview ranking:"), "{note}");
+        assert!(!note.contains("now uses"), "{note}");
+
+        // `class` comes first, but on non-road data (an Overture buildings
+        // `class`) the vocabulary gate skips it and `road_class` ranks, so
+        // excluding `road_class` can change the ranking. It is logged.
+        let note = auto_rank_exclusion_note(&s, &keep_without(&s, &["road_class"]), &options)
+            .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"road_class\""), "{note}");
+        assert!(note.contains("\"class\" (Overture road classes)"), "{note}");
+
+        let note =
+            auto_rank_exclusion_note(&s, &keep_without(&s, &["class", "road_class"]), &options)
+                .expect("candidates are excluded");
+        assert!(
+            note.contains("excludes \"class\", \"road_class\""),
+            "{note}"
+        );
+        assert!(
+            note.contains("\"confidence\" (Overture places confidence)"),
+            "{note}"
+        );
+
+        // With no candidate left, the outcome is certain: no auto-rank.
+        let only_conf = schema(&[("confidence", DataType::Float32)]);
+        let note = auto_rank_exclusion_note(
+            &only_conf,
+            &keep_without(&only_conf, &["confidence"]),
+            &options,
+        )
+        .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"confidence\""), "{note}");
+        assert!(note.contains("no candidate column is left"), "{note}");
+        assert!(note.contains("feature size"), "{note}");
+    }
+
+    /// No note when no candidate is excluded or auto-rank is not in play.
+    #[test]
+    fn auto_rank_note_only_when_a_candidate_is_excluded() {
+        let s = schema(&[
+            ("class", DataType::Utf8),
+            ("confidence", DataType::Float64),
+            ("other", DataType::Utf8),
+        ]);
+        let none = ConvertOptions::default();
+        assert_eq!(
+            auto_rank_exclusion_note(&s, &keep_without(&s, &["other"]), &none),
+            None
+        );
+        // Only the first `confidence` column (any case) is ever probed, so
+        // excluding a second one changes nothing.
+        let two_conf = schema(&[
+            ("confidence", DataType::Float64),
+            ("Confidence", DataType::Float64),
+        ]);
+        assert_eq!(
+            auto_rank_exclusion_note(&two_conf, &keep_without(&two_conf, &["Confidence"]), &none),
+            None
+        );
+        // A non-string `class` was never a candidate.
+        let numeric = schema(&[("class", DataType::Int64)]);
+        assert_eq!(
+            auto_rank_exclusion_note(&numeric, &keep_without(&numeric, &["class"]), &none),
+            None
+        );
+        // Auto-rank switched off, or outranked by an explicit ranking.
+        let off = ConvertOptions {
+            no_auto_rank: true,
+            ..Default::default()
+        };
+        let sorted = ConvertOptions {
+            sort_key: Some("confidence".to_string()),
+            ..Default::default()
+        };
+        let ranked = ConvertOptions {
+            class_ranking: Some(overture_road_ranking("other".to_string())),
+            ..Default::default()
+        };
+        for o in [&off, &sorted, &ranked] {
+            assert_eq!(
+                auto_rank_exclusion_note(&s, &keep_without(&s, &["class"]), o),
+                None
+            );
+        }
+    }
+
+    /// The note's pronoun follows the number of excluded candidates.
+    #[test]
+    fn auto_rank_note_pronoun_matches_the_excluded_count() {
+        let s = schema(&[
+            ("class", DataType::Utf8),
+            ("road_class", DataType::Utf8),
+            ("confidence", DataType::Float64),
+        ]);
+        let none = ConvertOptions::default();
+        let one = auto_rank_exclusion_note(&s, &keep_without(&s, &["class"]), &none).unwrap();
+        assert!(one.contains("cannot rank on it;"), "{one}");
+        let two = auto_rank_exclusion_note(&s, &keep_without(&s, &["class", "road_class"]), &none)
+            .unwrap();
+        assert!(two.contains("cannot rank on them;"), "{two}");
+    }
+
+    /// Both halves of each candidate predicate are required: the name
+    /// (any case) and the type.
+    #[test]
+    fn auto_rank_candidate_predicates_need_name_and_type() {
+        use arrow_schema::Field;
+        let f = |n: &str, t: DataType| Field::new(n, t, true);
+
+        assert!(is_confidence_candidate(&f("confidence", DataType::Float32)));
+        assert!(is_confidence_candidate(&f("Confidence", DataType::Float64)));
+        assert!(!is_confidence_candidate(&f("confidence", DataType::Int64)));
+        assert!(!is_confidence_candidate(&f("confidence", DataType::Utf8)));
+        assert!(!is_confidence_candidate(&f("score", DataType::Float64)));
+
+        assert!(is_road_class_candidate(&f("class", DataType::Utf8)));
+        assert!(is_road_class_candidate(&f(
+            "ROAD_CLASS",
+            DataType::LargeUtf8
+        )));
+        assert!(!is_road_class_candidate(&f("class", DataType::Int64)));
+        assert!(!is_road_class_candidate(&f("subclass", DataType::Utf8)));
+    }
+
+    /// The summary counts property columns only: the geometry and the bbox
+    /// covering are neither kept nor dropped properties.
+    #[test]
+    fn property_selection_summary_counts_properties_only() {
+        let float = |n: &str| Field::new(n, DataType::Float64, true);
+        let s = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                "bbox",
+                DataType::Struct(
+                    vec![float("xmin"), float("ymin"), float("xmax"), float("ymax")].into(),
+                ),
+                true,
+            ),
+        ]);
+        assert_eq!(
+            property_selection_summary(&s, 3, &[1, 3]),
+            "property selection: keeping 1 of 3 property column(s) (\"name\"), dropping 2"
+        );
+        assert_eq!(
+            property_selection_summary(&s, 3, &[3]),
+            "property selection: keeping 0 of 3 property column(s) (none — geometry only), \
+             dropping 3"
+        );
+        assert_eq!(
+            property_selection_summary(&s, 3, &[0, 1, 3]),
+            "property selection: keeping 2 of 3 property column(s) (\"id\", \"name\"), \
+             dropping 1"
+        );
+    }
+
+    /// The in-memory confidence tier: the first `confidence` candidate in
+    /// schema order, only on a point majority (ties count as a majority),
+    /// and never on an empty layer.
+    #[test]
+    fn find_confidence_column_needs_a_point_majority() {
+        use geo::{polygon, Point};
+        let s = schema(&[
+            ("name", DataType::Utf8),
+            ("confidence", DataType::Float64),
+            ("Confidence", DataType::Float64),
+        ]);
+        let pt = || Geometry::Point(Point::new(0.0, 0.0));
+        let poly =
+            || Geometry::Polygon(polygon![(x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 1.0, y: 1.0)]);
+
+        assert_eq!(
+            find_confidence_column(&s, &[pt(), pt(), poly()]),
+            Some((1, "confidence".to_string()))
+        );
+        assert_eq!(
+            find_confidence_column(&s, &[pt(), poly()]),
+            Some((1, "confidence".to_string()))
+        );
+        assert_eq!(find_confidence_column(&s, &[pt(), poly(), poly()]), None);
+        assert_eq!(find_confidence_column(&s, &[]), None);
+        let no_conf = schema(&[("score", DataType::Float64)]);
+        assert_eq!(find_confidence_column(&no_conf, &[pt()]), None);
+    }
 }
 
 /// Apply the property selection (#386) to the in-memory path's parquet
@@ -6423,11 +6807,7 @@ pub(super) fn extract_class_ranks(
 /// classes. Returns `(column index, column name)`.
 fn find_road_class_column(schema: &Schema, full: &RecordBatch) -> Option<(usize, String)> {
     for (idx, f) in schema.fields().iter().enumerate() {
-        let lname = f.name().to_ascii_lowercase();
-        if lname != "road_class" && lname != "class" {
-            continue;
-        }
-        if !matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        if !is_road_class_candidate(f) {
             continue;
         }
         if column_overlaps_road_vocab(full.column(idx)) {
@@ -6489,9 +6869,7 @@ fn find_confidence_column(
         return None;
     }
     for (idx, f) in schema.fields().iter().enumerate() {
-        if f.name().eq_ignore_ascii_case("confidence")
-            && matches!(f.data_type(), DataType::Float32 | DataType::Float64)
-        {
+        if is_confidence_candidate(f) {
             return Some((idx, f.name().clone()));
         }
     }
