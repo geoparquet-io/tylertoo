@@ -709,11 +709,14 @@ pub const IN_FLIGHT_BATCHES_MIN: usize = 4;
 
 /// Upper clamp for auto-sized in-flight batches.
 ///
-/// The single-threaded parquet
-/// writer (#264 follow-up) caps the achievable speedup, so pushing in-flight
-/// past this only grows the resident batch set (`in_flight × read_batch_size`
-/// rows) without a matching throughput gain. Power users can still pass a
-/// larger explicit value.
+/// In-flight depth is read-ahead only: the consumer takes one batch at a time
+/// and parallelizes inside it, so a deeper channel adds no compute
+/// parallelism. Re-measured for #648 (`corpus/SWEEPS.md`, Decision 7): on
+/// 16 threads, depths 4 through 64 gave the same wall time and peak RSS on
+/// Overture Germany segments and fieldmaps adm4. The ceiling is therefore a
+/// memory bound for wide machines. Without it a 128-core box would hold 128
+/// resident batches (`in_flight × read_batch_size` rows) for no throughput
+/// gain. Power users can still pass a larger explicit value.
 pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 
 /// Resolve a requested in-flight-batches value to a concrete depth.

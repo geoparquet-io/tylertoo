@@ -226,9 +226,13 @@ verbatim (spec §2.4).
    silently change which feature wins a cell.
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
-   reader thread streams batches over a bounded channel while a consumer
-   parallelizes every `(level × feature)` simplification across cores; each
-   level's output drains to the writer in level order, canonical last. A
+   reader streams batches over a bounded channel while a consumer simplifies
+   each batch across cores. On the default path (cascade on, duplicating
+   mode) the rayon tasks are per **feature**, and each task folds that
+   feature through every level fine→coarse in series
+   (`process_batch_cascade`). Only `--no-cascade` and partitioning mode fan
+   out per `(level × feature)`. Each level's output drains to the writer in
+   level order, canonical last. A
    serial engine that re-reads the input once per level is retained as the
    equivalence-tested reference.
 
@@ -384,8 +388,22 @@ bounds (bbox fast path skips the clip when fully inside), MVT-encode
 `StreamingPmtilesWriter`. No global external sort, no per-tile budget retry
 loop.
 
-Feature→tile splitting is a **top-down recursive quadtree cascade** (#226,
-tippecanoe's tiling model): starting from the feature's covering tile, each
+Feature→tile splitting takes one of two paths, chosen per feature by the
+direct path's cost, `tile_span × coords_count`, against
+`DIRECT_CLIP_BUDGET` (100,000 clip-vertex ops; `copy_tile_members` in
+`overview/export.rs`).
+
+- **At or under the budget**, the feature clips once per covered tile
+  (`feature_tile_members_direct`). Overview levels are pre-simplified, so
+  most deep-zoom features carry few vertices, and the cascade's per-node
+  overhead (an intermediate clip plus `TileCoord::bounds()` at every pyramid
+  node) would cost more than it saves. This path is byte-identical to the
+  pre-#226 loop and is the one most features take.
+- **Over the budget**, the feature takes the **top-down recursive quadtree
+  cascade** described below.
+
+The cascade (#226, tippecanoe's tiling model) starts from the feature's
+covering tile. Each
 pyramid level clips the parent's already-reduced geometry into its four child
 regions down to the target zoom. A vertex therefore takes part in `O(depth)`
 clips instead of `O(tiles_spanned)`, so cost scales with output size + depth
@@ -1171,8 +1189,11 @@ or *detectably* invalid rather than valid-looking and wrong (see the checkpoint
 section above). One `open`+`write` per checkpoint interval, not per tile.
 
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
-directory incrementally, and deduplicates tiles by XXH3 hash → file offset,
-so writer memory stays in the low MB regardless of tile count. Tiles are
+directory incrementally, and deduplicates tiles by XXH3 hash → file offset.
+Tile bytes never stay in memory, but the bookkeeping grows linearly with the
+archive. The writer keeps one 24 B directory entry per tile and one
+dedup-cache entry (hash → offset, length) per unique tile. At 100M tiles the
+directory entries alone take 2.4 GB. Tiles are
 gzip-compressed (the PMTiles-viewer-safe default; export has no compression
 knob).
 

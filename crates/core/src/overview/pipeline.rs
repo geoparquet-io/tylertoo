@@ -10,13 +10,19 @@
 //! This engine reads the input **once** and fans each batch to **all** buffered
 //! levels at once:
 //!
-//! - a dedicated reader thread streams the input in order over a bounded
-//!   channel (depth = `in_flight`, the read/compute-overlap and backpressure
-//!   knob), tagging each batch with its cumulative `row_offset`;
+//! - the read side streams the input in order over a bounded channel (depth =
+//!   `in_flight`, the read/compute-overlap and backpressure knob), tagging each
+//!   batch with its cumulative `row_offset`. It is one reader thread, or since
+//!   #494 several reader workers (auto-sized up to
+//!   [`super::convert::READ_WORKERS_MAX`]) whose segments [`read_in_order`]
+//!   merges back into the identical batch sequence;
 //! - the consumer processes one batch at a time (batches stay in read order, so
-//!   no reorder buffer is needed), but parallelizes across levels — every
-//!   `(level × feature)` simplification in the batch is a rayon task, so the
-//!   giant-geometry long pole at one level overlaps the other levels' work;
+//!   no reorder buffer is needed) and parallelizes within it. On the default
+//!   cascading-duplicating path each rayon task is one **feature**, folded
+//!   fine→coarse through every level in series ([`process_batch_cascade`]).
+//!   With the cascade off, or in partitioning mode, every `(level × feature)`
+//!   simplification is its own rayon task, so the giant-geometry long pole at
+//!   one level overlaps the other levels' work;
 //! - each level's finished output batches accumulate in an ordered **sink**
 //!   (RAM under the `speed` profile, spilled to a temporary Arrow IPC file under
 //!   `bounded` — by a dedicated per-level writer thread, so the consumer hands

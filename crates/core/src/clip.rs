@@ -286,9 +286,10 @@ pub fn clip_geometry(
 /// # `assume_simple` (issue #237, RC3)
 ///
 /// Pass `true` **only** when the source feature's rings have already been proven
-/// simple via [`geometry_is_simple`]. It skips the O(V²) self-intersection
-/// re-scan per clip; under its precondition that scan would always have returned
-/// "no issue", so the result is byte-identical to [`clip_geometry`].
+/// simple via [`geometry_is_simple`]. It skips the O((n + m) log n)
+/// self-intersection sweep per clip (`has_self_intersecting_edges`); under
+/// its precondition that sweep would always have returned "no issue", so the
+/// result is byte-identical to [`clip_geometry`].
 ///
 /// # `skip_boundary_fallback` (issue #239)
 ///
@@ -494,7 +495,7 @@ fn clip_polygon(
     // Check if input polygon has structural issues (self-intersecting, etc.)
     // If so, we MUST use i_overlay even for "fully inside" polygons because
     // i_overlay will repair the geometry while S-H cannot. When the feature was
-    // pre-validated as simple (issue #237), the O(V²) self-intersection scan is
+    // pre-validated as simple (issue #237), the self-intersection sweep is
     // skipped here — see `has_structural_issues`.
     let input_has_issues = has_structural_issues(poly, assume_simple);
 
@@ -514,7 +515,7 @@ fn clip_polygon(
 
     // Validate S-H output and fall back to i_overlay on structural issues or
     // boundary-connecting bridges. `assume_simple` (issue #237) only suppresses
-    // the O(V²) self-intersection re-scan inside `geometry_has_structural_issues`.
+    // the self-intersection re-sweep inside `geometry_has_structural_issues`.
     //
     // `skip_boundary_fallback` (issue #239) additionally suppresses the O(V)
     // `has_boundary_connecting_edges` gate, but ONLY when `assume_simple` — for a
