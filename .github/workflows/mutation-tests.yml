@@ -268,6 +268,13 @@ jobs:
         # anything older than ten minutes (no test run lasts that long:
         # cargo-mutants kills a mutant's tests well before), or a
         # 350-minute shard fills the runner's disk.
+        #
+        # cargo-mutants also reads TMPDIR: its scratch copies of the tree
+        # (cargo-mutants-tylertoo-XXXXXX.tmp) live there for the whole
+        # shard, and their top-level mtime stops changing once the copy is
+        # made. The sweep skips them. Deleting one mid-run made every
+        # worker fail with "... does not exist, refusing to create it"
+        # (#635).
         run: |
           sweep="$RUNNER_TEMP/mutants-tmp"
           mkdir -p "$sweep"
@@ -275,6 +282,7 @@ jobs:
           (
             while true; do
               find "$sweep" -mindepth 1 -maxdepth 1 -mmin +10 \
+                ! -name 'cargo-mutants-*' \
                 -exec rm -rf {} + 2>/dev/null
               sleep 300
             done
