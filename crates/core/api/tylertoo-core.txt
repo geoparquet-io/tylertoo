@@ -1993,6 +1993,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::ladder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::ladder::EntryZoomKind
 pub enum tylertoo_core::overview::ladder::LadderError
 pub tylertoo_core::overview::ladder::LadderError::Empty
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched::column: alloc::string::String
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched::requested: alloc::string::String
 pub tylertoo_core::overview::ladder::LadderError::NonFiniteValue(f64)
 pub tylertoo_core::overview::ladder::LadderError::ZeroStep
 impl core::clone::Clone for tylertoo_core::overview::ladder::LadderError
@@ -2267,6 +2270,32 @@ impl core::marker::Unpin for tylertoo_core::overview::level::DensityProvenance
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::level::DensityProvenance
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::level::DensityProvenance
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::DensityProvenance
+pub struct tylertoo_core::overview::level::EntryZoomProvenance
+pub tylertoo_core::overview::level::EntryZoomProvenance::base_zoom: core::option::Option<u8>
+pub tylertoo_core::overview::level::EntryZoomProvenance::column: alloc::string::String
+pub tylertoo_core::overview::level::EntryZoomProvenance::max_zoom: core::option::Option<u8>
+pub tylertoo_core::overview::level::EntryZoomProvenance::mode: alloc::string::String
+pub tylertoo_core::overview::level::EntryZoomProvenance::rung_count: usize
+pub tylertoo_core::overview::level::EntryZoomProvenance::rungs: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, u8>>
+pub tylertoo_core::overview::level::EntryZoomProvenance::step: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::overview::level::EntryZoomProvenance
+pub fn tylertoo_core::overview::level::EntryZoomProvenance::clone(&self) -> tylertoo_core::overview::level::EntryZoomProvenance
+impl core::cmp::PartialEq for tylertoo_core::overview::level::EntryZoomProvenance
+pub fn tylertoo_core::overview::level::EntryZoomProvenance::eq(&self, &tylertoo_core::overview::level::EntryZoomProvenance) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::level::EntryZoomProvenance
+pub fn tylertoo_core::overview::level::EntryZoomProvenance::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::EntryZoomProvenance
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::EntryZoomProvenance
+pub fn tylertoo_core::overview::level::EntryZoomProvenance::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::EntryZoomProvenance
+pub fn tylertoo_core::overview::level::EntryZoomProvenance::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::marker::Send for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::marker::Sync for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::marker::Unpin for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::level::EntryZoomProvenance
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::EntryZoomProvenance
 pub struct tylertoo_core::overview::level::Generalization
 pub tylertoo_core::overview::level::Generalization::cascade: core::option::Option<bool>
 pub tylertoo_core::overview::level::Generalization::clustering: core::option::Option<tylertoo_core::overview::level::ClusteringProvenance>
@@ -2274,6 +2303,7 @@ pub tylertoo_core::overview::level::Generalization::coalescing: core::option::Op
 pub tylertoo_core::overview::level::Generalization::collapse: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::level::Generalization::density_drop: core::option::Option<tylertoo_core::overview::level::DensityProvenance>
 pub tylertoo_core::overview::level::Generalization::engine: alloc::string::String
+pub tylertoo_core::overview::level::Generalization::entry_zoom: core::option::Option<tylertoo_core::overview::level::EntryZoomProvenance>
 pub tylertoo_core::overview::level::Generalization::gsd_base: core::option::Option<f64>
 pub tylertoo_core::overview::level::Generalization::levels: alloc::vec::Vec<tylertoo_core::overview::level::GeneralizationLevel>
 pub tylertoo_core::overview::level::Generalization::ranking: core::option::Option<tylertoo_core::overview::level::RankingProvenance>

@@ -108,7 +108,7 @@ use super::convert::{
     ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport,
     PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
-use super::level::{Crs, Mode, RankingProvenance};
+use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::pipe::scoped_pipe;
 use super::pipeline;
 use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
@@ -1430,6 +1430,8 @@ struct FooterFacts {
     /// The zoom ceiling, when it truncated the level plan
     /// (`Generalization::zoom_ceiling`).
     zoom_ceiling: Option<u8>,
+    /// The resolved entry-zoom ladder (`Generalization::entry_zoom`, #446).
+    entry_zoom: Option<EntryZoomProvenance>,
 }
 
 /// Whether line coalescing merged anything at ANY planned non-canonical level
@@ -1569,6 +1571,7 @@ fn create_level_writer(
     record_coalesce_merged(writer_opts.generalization.as_mut(), facts.coalesce_merged);
     if let Some(g) = writer_opts.generalization.as_mut() {
         g.zoom_ceiling = facts.zoom_ceiling;
+        g.entry_zoom = facts.entry_zoom;
     }
     // #507: `build_writer_options` may have raised the cap to fit parquet's
     // row-group ceiling. Record it before the options move into the writer.
@@ -2252,6 +2255,9 @@ struct PlanState {
     /// Resolved ranking provenance (§3.5); the writer stamps it into the
     /// footer.
     ranking_provenance: RankingProvenance,
+    /// Resolved entry-zoom ladder provenance (§3.5, #446), stamped into the
+    /// footer; carried by the plan artifact so a `--plan` run records it too.
+    entry_zoom: Option<EntryZoomProvenance>,
     /// Total input rows, INCLUDING skipped-geometry rows.
     num_rows: usize,
     /// Features that survived the scan.
@@ -2467,6 +2473,7 @@ fn run_pass1_and_assign(
         bbox_tally,
         areas,
         provenance: ranking_provenance,
+        entry_zoom,
         acc_values,
         coalesce: coalesce_scratch,
         line_tally,
@@ -2570,6 +2577,7 @@ fn run_pass1_and_assign(
             fingerprint.expect("captured for --save-plan"),
             &ranking_provenance,
             options.entry_zoom.as_ref(),
+            entry_zoom.as_ref(),
             totals,
         )?;
         plan.save(path)?;
@@ -2585,6 +2593,7 @@ fn run_pass1_and_assign(
     Ok(PlanState {
         tables,
         ranking_provenance,
+        entry_zoom,
         num_rows,
         num_features,
         geom_bytes,
@@ -2732,9 +2741,11 @@ fn load_plan_state(
         totals.point_ratio() * 100.0,
     );
     let ranking_provenance = plan.rank_provenance.clone();
+    let entry_zoom = plan.entry_zoom.clone();
     Ok(PlanState {
         tables: plan.into_winner_tables()?,
         ranking_provenance,
+        entry_zoom,
         num_rows: totals.n_rows,
         num_features: totals.n_features,
         geom_bytes: totals.geom_bytes,
@@ -2843,6 +2854,7 @@ pub(crate) fn convert_streaming_strategy(
                 finest,
             },
         ranking_provenance,
+        entry_zoom,
         num_rows,
         num_features,
         geom_bytes,
@@ -2910,6 +2922,7 @@ pub(crate) fn convert_streaming_strategy(
         FooterFacts {
             coalesce_merged,
             zoom_ceiling: truncated_at,
+            entry_zoom,
         },
     )?;
 
@@ -3990,6 +4003,9 @@ struct Pass1Output {
     areas: Vec<f32>,
     /// Resolved ranking provenance (§3.5).
     provenance: RankingProvenance,
+    /// Resolved entry-zoom ladder provenance (§3.5, #446); `None` when no
+    /// ladder placed a feature.
+    entry_zoom: Option<EntryZoomProvenance>,
     /// Per-accumulate-spec source values (Q4), parallel to `acc_cols`.
     acc_values: Vec<Vec<Option<f64>>>,
     /// Line geometries + groups for coalescing (Q3); `None` unless enabled
@@ -4152,6 +4168,8 @@ fn pass1_projection(
 /// engines place a feature identically. A spec that yields no ladder — an
 /// unusable column, a GSD-only plan — leaves every `entry_level` as `None`,
 /// which is the "no ladder opinion" case the assignment already handles.
+/// Returns the footer's ladder provenance, `None` when the ladder placed no
+/// feature (#446).
 ///
 /// Lifted out of [`run_pass1`] rather than inlined: pass 1 is already at the
 /// cognitive-complexity ceiling the workspace lints enforce, and this is a
@@ -4161,20 +4179,21 @@ fn apply_entry_levels(
     ladder_values: &[Option<f64>],
     num_rows: usize,
     features: &mut FeatureTable,
-) -> Result<(), ConvertError> {
+) -> Result<Option<EntryZoomProvenance>, ConvertError> {
     if options.entry_zoom.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     debug_assert_eq!(ladder_values.len(), num_rows);
     let level_specs = options.levels.resolve(options.gsd_base)?;
-    if let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
-    {
-        for pos in 0..features.len() {
-            let row = features.indices()[pos];
-            features.set_entry_level(pos, entry.get(row).copied().flatten());
-        }
+    let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
+    else {
+        return Ok(None);
+    };
+    for pos in 0..features.len() {
+        let row = features.indices()[pos];
+        features.set_entry_level(pos, entry.levels.get(row).copied().flatten());
     }
-    Ok(())
+    Ok(entry.provenance)
 }
 
 /// Upper bound on rows per pass-1 scan chunk (#460): each read batch is
@@ -5021,7 +5040,7 @@ fn run_pass1_with_chunk_rows(
         }
     }
 
-    apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
+    let entry_zoom = apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
 
     // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
     // `groups` are row-indexed; sort keys live on the features. `None` when
@@ -5038,6 +5057,7 @@ fn run_pass1_with_chunk_rows(
         bbox_tally,
         areas,
         provenance,
+        entry_zoom,
         acc_values,
         coalesce,
         line_tally,

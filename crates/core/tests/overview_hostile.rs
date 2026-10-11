@@ -1558,6 +1558,251 @@ fn entry_zoom_ladder_is_identical_across_pipelines() {
     );
 }
 
+/// Convert `input` with `options` and return the footer's `entry_zoom` block.
+fn footer_entry_zoom(
+    options: &ConvertOptions,
+    input: &Path,
+    output: &Path,
+) -> Option<tylertoo_core::overview::level::EntryZoomProvenance> {
+    convert_to_overviews(input, output, options).unwrap();
+    let reader = OverviewReader::open(output).unwrap();
+    reader
+        .meta()
+        .generalization
+        .as_ref()
+        .unwrap()
+        .entry_zoom
+        .clone()
+}
+
+/// #446: the footer is the format's record of how a file was built, so a
+/// laddered conversion must say it was laddered. Before the fix the footer
+/// carried only `ranking: size-fallback`, which describes the unladdered
+/// features and hides the mechanism that placed the rest.
+///
+/// The block records the ladder as RESOLVED, not as requested: the dense rank
+/// stops at the finest planned zoom (250 and 100 rank past z6 at step 2 and
+/// get no rung), and an explicit rung naming no value in the column (999) is
+/// dropped from the ladder and so from the footer.
+#[test]
+fn entry_zoom_ladder_is_recorded_in_the_footer() {
+    use std::collections::BTreeMap;
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+    use tylertoo_core::overview::level::EntryZoomProvenance;
+
+    let dense = EntryZoomSpec {
+        column: "magnitude".to_string(),
+        kind: EntryZoomKind::DenseRank { step: 2 },
+    };
+    let explicit = EntryZoomSpec {
+        column: "magnitude".to_string(),
+        kind: EntryZoomKind::Explicit(vec![(5000.0, 2), (250.0, 5), (999.0, 4)]),
+    };
+    let cases = [
+        (
+            dense,
+            EntryZoomProvenance {
+                mode: "dense-rank".to_string(),
+                column: "magnitude".to_string(),
+                step: Some(2),
+                base_zoom: Some(2),
+                max_zoom: Some(6),
+                rung_count: 3,
+                rungs: Some(BTreeMap::from([
+                    ("1500".to_string(), 4),
+                    ("5000".to_string(), 2),
+                    ("600".to_string(), 6),
+                ])),
+            },
+        ),
+        (
+            explicit,
+            EntryZoomProvenance {
+                mode: "explicit".to_string(),
+                column: "magnitude".to_string(),
+                step: None,
+                base_zoom: None,
+                max_zoom: None,
+                rung_count: 2,
+                rungs: Some(BTreeMap::from([
+                    ("250".to_string(), 5),
+                    ("5000".to_string(), 2),
+                ])),
+            },
+        ),
+    ];
+    for streaming in [true, false] {
+        for (spec, want) in &cases {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_banded_input(tin.path(), 4);
+            let o = ConvertOptions {
+                entry_zoom: Some(spec.clone()),
+                ..opts(streaming)
+            };
+            let got = footer_entry_zoom(&o, tin.path(), tout.path());
+            assert_eq!(
+                got.as_ref(),
+                Some(want),
+                "streaming={streaming}: the footer must record the resolved ladder"
+            );
+
+            let reader = OverviewReader::open(tout.path()).unwrap();
+            let g = reader.meta().generalization.as_ref().unwrap();
+            // The ranking block keeps its meaning: the cell-winner tier for
+            // the features the ladder leaves to ordinary thinning.
+            assert_eq!(
+                g.ranking.as_ref().map(|r| r.mode.as_str()),
+                Some("size-fallback"),
+                "streaming={streaming}"
+            );
+            let vr = validate_file(tout.path()).unwrap();
+            assert!(
+                vr.is_valid(),
+                "streaming={streaming}: {:?}",
+                vr.failures().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Provenance names only a ladder that placed something. No block when no
+/// ladder was requested, when a `--gsd` plan leaves it nothing to anchor to,
+/// or when the column holds no finite value to match (all NaN), whether the
+/// rungs are derived or written by hand.
+#[test]
+fn entry_zoom_provenance_is_absent_when_no_ladder_applies() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let ladder = |kind| {
+        Some(EntryZoomSpec {
+            column: "magnitude".to_string(),
+            kind,
+        })
+    };
+    let laddered_gsd_plan = ConvertOptions {
+        entry_zoom: ladder(EntryZoomKind::DenseRank { step: 1 }),
+        levels: LevelPlan::Gsds(vec![20_000.0, 5_000.0, 1_000.0]),
+        ..opts(true)
+    };
+    for streaming in [true, false] {
+        // On the banded input.
+        for o in [opts(streaming), laddered_gsd_plan.clone()] {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            write_banded_input(tin.path(), 4);
+            assert_eq!(
+                footer_entry_zoom(&o, tin.path(), tout.path()),
+                None,
+                "streaming={streaming} levels={:?}",
+                o.levels
+            );
+        }
+        // On a ladder column with no finite value.
+        for kind in [
+            EntryZoomKind::DenseRank { step: 1 },
+            EntryZoomKind::Explicit(vec![(5000.0, 2)]),
+        ] {
+            let tin = tempfile::NamedTempFile::new().unwrap();
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let (geoms, values) = nested_bands(4);
+            let nan = vec![f64::NAN; values.len()];
+            write_input_with_f64(tin.path(), &geoms, "magnitude", &nan);
+            let o = ConvertOptions {
+                entry_zoom: ladder(kind.clone()),
+                ..opts(streaming)
+            };
+            assert_eq!(
+                footer_entry_zoom(&o, tin.path(), tout.path()),
+                None,
+                "streaming={streaming} kind={kind:?}: an inert ladder records nothing"
+            );
+        }
+    }
+}
+
+/// The motivating ladder column is literally named `level`, which collides
+/// with a reserved column and is renamed `level_` in the output (#288). The
+/// block names the column as it appears in the file.
+#[test]
+fn entry_zoom_provenance_names_the_renamed_column() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        let (geoms, values) = nested_bands(4);
+        write_input_with_f64(tin.path(), &geoms, "level", &values);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "level".to_string(),
+                kind: EntryZoomKind::DenseRank { step: 1 },
+            }),
+            ..opts(streaming)
+        };
+        let got = footer_entry_zoom(&o, tin.path(), tout.path()).expect("ladder recorded");
+        assert_eq!(got.column, "level_", "streaming={streaming}");
+
+        let reader = OverviewReader::open(tout.path()).unwrap();
+        let g = reader.meta().generalization.as_ref().unwrap();
+        let renamed = g.renamed_columns.as_ref().expect("rename recorded");
+        assert_eq!(
+            renamed.get("level_").map(String::as_str),
+            Some("level"),
+            "streaming={streaming}: renamed_columns maps the block's column back"
+        );
+    }
+}
+
+/// A `--plan` run never sees the ladder column, so the saved plan carries the
+/// resolved block; and a zoom-ceilinged run records the PLANNED zoom span,
+/// not the footer's truncated one, so the dense rank stays reproducible.
+#[test]
+fn entry_zoom_provenance_survives_a_saved_plan_and_a_zoom_ceiling() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.parquet");
+    write_banded_input(&input, 4);
+    let plan = dir.path().join("convert.plan");
+    let ladder = Some(EntryZoomSpec {
+        column: "magnitude".to_string(),
+        kind: EntryZoomKind::DenseRank { step: 2 },
+    });
+
+    let capped = ConvertOptions {
+        entry_zoom: ladder.clone(),
+        save_plan: Some(plan.clone()),
+        zoom_ceiling: Some(4),
+        ..opts(true)
+    };
+    let capped_out = dir.path().join("capped.parquet");
+    let from_scan = footer_entry_zoom(&capped, &input, &capped_out).expect("ladder recorded");
+    assert_eq!(from_scan.base_zoom, Some(2));
+    assert_eq!(
+        from_scan.max_zoom,
+        Some(6),
+        "the planned finest zoom, not the ceiling"
+    );
+    assert_eq!(from_scan.rung_count, 3);
+    let reader = OverviewReader::open(&capped_out).unwrap();
+    let g = reader.meta().generalization.as_ref().unwrap();
+    assert_eq!(g.zoom_ceiling, Some(4));
+    assert!(reader.meta().levels.iter().all(|l| l.zoom <= Some(4)));
+
+    let replay = ConvertOptions {
+        entry_zoom: ladder,
+        plan: Some(plan),
+        ..opts(true)
+    };
+    let from_plan = footer_entry_zoom(&replay, &input, &dir.path().join("replay.parquet"));
+    assert_eq!(
+        from_plan,
+        Some(from_scan),
+        "the --plan run stamps the block the scan resolved"
+    );
+}
+
 /// #364: the two engines must rank the same rows, not just agree on a fixture
 /// where every row survives.
 ///
@@ -1714,6 +1959,38 @@ fn entry_zoom_missing_column_is_rejected() {
             matches!(err, ConvertError::InvalidConfig(ref m) if m.contains("nope")),
             "streaming={streaming}: got {err}"
         );
+    }
+}
+
+/// An explicit spec whose rungs all miss the column's values is reported as
+/// that: the column and the requested values, not "named no values", which
+/// sends the reader looking at a spec that did name values.
+#[test]
+fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 2);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
+            }),
+            ..opts(streaming)
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+        let ConvertError::InvalidConfig(m) = &err else {
+            panic!("streaming={streaming}: got {err}");
+        };
+        assert!(!m.contains("named no values"), "streaming={streaming}: {m}");
+        for want in ["magnitude", "999", "42.5"] {
+            assert!(
+                m.contains(want),
+                "streaming={streaming}: {want} missing from {m}"
+            );
+        }
     }
 }
 

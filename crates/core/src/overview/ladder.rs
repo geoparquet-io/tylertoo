@@ -44,6 +44,18 @@ pub enum LadderError {
     /// A non-finite value cannot be matched against column data.
     #[error("entry-zoom value {0} is not finite")]
     NonFiniteValue(f64),
+    /// An explicit spec whose every rung missed the column's values, so the
+    /// ladder would have no rung at all.
+    #[error(
+        "no entry-zoom rung matches a value in column {column:?} (requested: {requested}); \
+         check the spec against the column's actual values"
+    )]
+    NoRungMatched {
+        /// The ladder column.
+        column: String,
+        /// The requested rung values, comma-separated.
+        requested: String,
+    },
 }
 
 /// Maps a column value to the zoom at which features carrying it may first
@@ -222,7 +234,8 @@ pub struct EntryZoomSpec {
 /// # Errors
 ///
 /// Returns a [`LadderError`] in the cases [`EntryZoomLadder::explicit`] or
-/// [`EntryZoomLadder::dense_rank`] does.
+/// [`EntryZoomLadder::dense_rank`] does, and [`LadderError::NoRungMatched`]
+/// when the column has values but no explicit rung matches one.
 pub fn build_ladder(
     spec: &EntryZoomSpec,
     values: &[Option<f64>],
@@ -230,19 +243,48 @@ pub fn build_ladder(
 ) -> Result<EntryZoomLadder, LadderError> {
     match &spec.kind {
         EntryZoomKind::Explicit(pairs) => {
-            EntryZoomLadder::explicit(snap_to_observed(pairs, values, &spec.column))
+            let snapped = snap_to_observed(pairs, values, &spec.column);
+            if snapped.is_empty() && !pairs.is_empty() {
+                return Err(LadderError::NoRungMatched {
+                    column: spec.column.clone(),
+                    requested: render_requested(pairs),
+                });
+            }
+            EntryZoomLadder::explicit(snapped)
         }
         EntryZoomKind::DenseRank { step } => {
-            let base = level_zooms.iter().flatten().copied().min().unwrap_or(0);
-            let max = level_zooms
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(u8::MAX);
+            let (base, max) = dense_rank_span(level_zooms);
             EntryZoomLadder::dense_rank(values.iter().flatten().copied(), base, *step, max)
         }
     }
+}
+
+/// The `(base, max)` zooms a derived ladder spans over a level plan: rung 0
+/// at the coarsest planned zoom, no rung past the finest.
+///
+/// Taken over the PLANNED levels, which a footer does not always list (empty
+/// levels are omitted, and a zoom ceiling cuts the finest), so the footer
+/// records both (#446).
+pub(crate) fn dense_rank_span(level_zooms: &[Option<u8>]) -> (u8, u8) {
+    let zooms = || level_zooms.iter().flatten().copied();
+    (zooms().min().unwrap_or(0), zooms().max().unwrap_or(u8::MAX))
+}
+
+/// Most requested values an error message lists before eliding the rest.
+const MAX_LISTED_RUNGS: usize = 8;
+
+/// The requested rung values for an error message, eliding past
+/// [`MAX_LISTED_RUNGS`].
+fn render_requested(pairs: &[(f64, u8)]) -> String {
+    let mut out: Vec<String> = pairs
+        .iter()
+        .take(MAX_LISTED_RUNGS)
+        .map(|(v, _)| format_value(*v))
+        .collect();
+    if pairs.len() > MAX_LISTED_RUNGS {
+        out.push(format!("and {} more", pairs.len() - MAX_LISTED_RUNGS));
+    }
+    out.join(", ")
 }
 
 /// Relative tolerance for matching a hand-written rung against column data.
@@ -485,6 +527,18 @@ mod tests {
         assert_eq!(ladder.entry_zoom(Some(0.2)), Some(12));
     }
 
+    /// The no-match error lists up to 8 requested values, then counts the rest.
+    #[test]
+    fn no_rung_matched_lists_eight_values_then_counts() {
+        let eight: Vec<(f64, u8)> = (1..=8).map(|i| (f64::from(i), 3)).collect();
+        assert_eq!(render_requested(&eight), "1, 2, 3, 4, 5, 6, 7, 8");
+        let ten: Vec<(f64, u8)> = (1..=10).map(|i| (f64::from(i) + 0.5, 3)).collect();
+        assert_eq!(
+            render_requested(&ten),
+            "1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, and 2 more"
+        );
+    }
+
     /// Snapping must not pull a rung onto a value that is merely closest —
     /// only onto one within the f32-widening tolerance.
     #[test]
@@ -496,9 +550,11 @@ mod tests {
         };
         let err = build_ladder(&spec, &column, &[Some(8), Some(12)]).unwrap_err();
         assert!(
-            matches!(err, LadderError::Empty),
+            matches!(err, LadderError::NoRungMatched { .. }),
             "1.5 is nearest to both but matches neither: {err}"
         );
+        let msg = err.to_string();
+        assert!(msg.contains("\"level\"") && msg.contains("1.5"), "{msg}");
     }
 
     /// A value the ladder does not know is not an error and not a drop: the
