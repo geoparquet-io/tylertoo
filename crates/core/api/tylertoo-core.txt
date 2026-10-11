@@ -482,6 +482,24 @@ impl core::marker::Unpin for tylertoo_core::input_set::ConvertSource
 impl core::marker::UnsafeUnpin for tylertoo_core::input_set::ConvertSource
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::ConvertSource
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::ConvertSource
+pub struct tylertoo_core::input_set::LargestByteArrayColumn
+pub tylertoo_core::input_set::LargestByteArrayColumn::column: alloc::string::String
+pub tylertoo_core::input_set::LargestByteArrayColumn::total_bytes: u64
+impl core::clone::Clone for tylertoo_core::input_set::LargestByteArrayColumn
+pub fn tylertoo_core::input_set::LargestByteArrayColumn::clone(&self) -> tylertoo_core::input_set::LargestByteArrayColumn
+impl core::cmp::Eq for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::cmp::PartialEq for tylertoo_core::input_set::LargestByteArrayColumn
+pub fn tylertoo_core::input_set::LargestByteArrayColumn::eq(&self, &tylertoo_core::input_set::LargestByteArrayColumn) -> bool
+impl core::fmt::Debug for tylertoo_core::input_set::LargestByteArrayColumn
+pub fn tylertoo_core::input_set::LargestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::marker::Freeze for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::marker::Send for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::marker::Sync for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::marker::Unpin for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::marker::UnsafeUnpin for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::LargestByteArrayColumn
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::LargestByteArrayColumn
 pub struct tylertoo_core::input_set::MultiSource
 impl tylertoo_core::input_set::MultiSource
 pub fn tylertoo_core::input_set::MultiSource::from_sources(alloc::string::String, alloc::vec::Vec<tylertoo_core::input::InputSource>) -> core::result::Result<Self, tylertoo_core::input::InputError>
@@ -1220,6 +1238,9 @@ pub tylertoo_core::overview::convert::ConvertError::ClusterPartitioningUnsupport
 pub tylertoo_core::overview::convert::ConvertError::CoalescedCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::convert::ConvertError::Filter(tylertoo_core::overview::filter::FilterError)
+pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge
+pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge::largest: tylertoo_core::input_set::LargestByteArrayColumn
+pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge::limit_bytes: u64
 pub tylertoo_core::overview::convert::ConvertError::Input(tylertoo_core::input::InputError)
 pub tylertoo_core::overview::convert::ConvertError::InvalidConfig(alloc::string::String)
 pub tylertoo_core::overview::convert::ConvertError::InvalidLevels(alloc::string::String)

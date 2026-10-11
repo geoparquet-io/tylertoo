@@ -1383,6 +1383,13 @@ winners in pass 2, so small inputs may run slightly faster. Large inputs
 run slower and need far more RAM. This is the equivalence-tested reference
 implementation and a fallback, with no output-quality advantage.
 
+The whole table lives in one Arrow batch, and Arrow's `i32` offsets cap one
+byte-array column at 2 GiB per batch. When a byte-array column (WKB geometry
+or a string) sums past that over the row groups to read, `--no-streaming`
+fails before reading any data and names the column. The figure comes from
+footer statistics. A `--bbox` or `--filter` that prunes row groups lowers it.
+The streaming pipeline has no such limit.
+
 During pass 2, the winner table holds 1 byte per feature, about 0.6 MB for a
 632k-feature file.
 

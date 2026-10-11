@@ -227,6 +227,68 @@ pub(crate) fn widest_byte_array_column(
     widest
 }
 
+/// The byte-array column that holds the most decoded bytes in total over some
+/// row groups (#606): what decides whether one batch can hold all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargestByteArrayColumn {
+    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
+    pub column: String,
+    /// Decoded bytes summed over the row groups.
+    pub total_bytes: u64,
+}
+
+/// The byte-array leaf column of `meta` with the most decoded bytes summed
+/// over row groups `row_groups` (`None` = all), counting only leaves under a
+/// root column for which `root_counts` returns true. `None` when no counted
+/// leaf holds any bytes.
+///
+/// Footer-only. A chunk's size is its `unencoded_byte_array_data_bytes` size
+/// statistic when the writer recorded it, the exact length of the values the
+/// decoded array holds. Without it the chunk's `total_uncompressed_size`
+/// stands in. That figure counts a dictionary-encoded chunk's distinct values
+/// once, so the total can then fall short of the decoded size.
+pub(crate) fn largest_byte_array_column(
+    meta: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    root_counts: impl Fn(usize) -> bool,
+) -> Option<LargestByteArrayColumn> {
+    let descr = meta.file_metadata().schema_descr();
+    let groups = meta.row_groups();
+    let all: Vec<usize>;
+    let picked: &[usize] = match row_groups {
+        Some(p) => p,
+        None => {
+            all = (0..groups.len()).collect();
+            &all
+        }
+    };
+    let mut totals = vec![0u64; descr.num_columns()];
+    for &gi in picked {
+        let Some(rg) = groups.get(gi) else {
+            continue;
+        };
+        for (leaf, col) in rg.columns().iter().enumerate() {
+            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
+                continue;
+            }
+            let bytes = col
+                .unencoded_byte_array_data_bytes()
+                .unwrap_or_else(|| col.uncompressed_size())
+                .max(0) as u64;
+            totals[leaf] = totals[leaf].saturating_add(bytes);
+        }
+    }
+    totals
+        .iter()
+        .enumerate()
+        .filter(|&(leaf, &bytes)| bytes > 0 && root_counts(descr.get_column_root_idx(leaf)))
+        .max_by_key(|&(_, &bytes)| bytes)
+        .map(|(leaf, &total_bytes)| LargestByteArrayColumn {
+            column: descr.column(leaf).path().string(),
+            total_bytes,
+        })
+}
+
 /// Rows per batch that keep an average batch of the widest byte-array column
 /// at or under half of `limit` (#563), never below 1. The half is headroom
 /// for rows larger than their row group's average.
@@ -2816,6 +2878,57 @@ b.parquet
             .unwrap();
         assert_eq!(w.row_group, 0);
         assert!(w.avg_row_bytes < 64, "{w:?}");
+    }
+
+    /// The largest column is the one with the most bytes summed over the
+    /// selected row groups, counting only the roots the caller asks for.
+    #[test]
+    fn largest_byte_array_column_sums_the_selected_groups_and_counted_roots() {
+        use arrow_array::BinaryArray;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let dir = tmpdir();
+        let f = dir.path().join("geo.parquet");
+        // Row group 0: two 16-byte geometries. Row group 1: two 4096-byte
+        // geometries. `name` holds 1000 bytes per row in both groups, and
+        // `empty` holds only empty strings.
+        let blobs: Vec<Vec<u8>> = [16, 16, 4096, 4096].map(|n| vec![0u8; n]).into();
+        let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+        let names: Vec<String> = (0..4).map(|_| "n".repeat(1000)).collect();
+        write_parquet(
+            &f,
+            vec![
+                Field::new("geometry", DataType::Binary, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("empty", DataType::Utf8, false),
+            ],
+            vec![
+                Arc::new(BinaryArray::from_vec(refs)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(vec![""; 4])),
+            ],
+            Some(2),
+        );
+        let reader = SerializedFileReader::new(std::fs::File::open(&f).unwrap()).unwrap();
+        let meta = reader.metadata();
+
+        let all = largest_byte_array_column(meta, None, |_| true).unwrap();
+        assert_eq!(all.column, "geometry");
+        assert!(
+            (8224..8224 + 128).contains(&all.total_bytes),
+            "the sum over both groups: {all:?}"
+        );
+
+        let small = largest_byte_array_column(meta, Some(&[0]), |_| true).unwrap();
+        assert_eq!(small.column, "name", "2000 name bytes beat 32: {small:?}");
+
+        let names_only = largest_byte_array_column(meta, None, |root| root == 1).unwrap();
+        assert_eq!(names_only.column, "name");
+        assert!(largest_byte_array_column(meta, None, |_| false).is_none());
+        assert!(
+            largest_byte_array_column(meta, None, |root| root == 2).is_none(),
+            "a column holding no bytes is not a largest column"
+        );
     }
 
     /// The batch cap keeps an average batch at half the ceiling, never
