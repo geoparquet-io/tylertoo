@@ -2628,15 +2628,28 @@ pub(super) fn apply_property_selection(
     if let Some(note) = auto_rank_exclusion_note(&schema, &keep, options) {
         log::info!("[convert] {note}");
     }
-    let properties = super::properties::property_indices(&schema, geom_idx);
+    log::info!(
+        "[convert] {}",
+        property_selection_summary(&schema, geom_idx, &keep)
+    );
+    source.restrict_columns(keep)?;
+    Ok(())
+}
+
+/// The one-line summary of a resolved selection: how many of the schema's
+/// property columns ([`super::properties::property_indices`]: neither the
+/// geometry nor its covering) `keep` retains, which ones, and how many it
+/// drops.
+fn property_selection_summary(schema: &Schema, geom_idx: usize, keep: &[usize]) -> String {
+    let properties = super::properties::property_indices(schema, geom_idx);
     let kept_names: Vec<&str> = keep
         .iter()
         .filter(|i| properties.contains(i))
         .map(|&i| schema.field(i).name().as_str())
         .collect();
     let dropped = properties.len() - kept_names.len();
-    log::info!(
-        "[convert] property selection: keeping {} of {} property column(s) ({}), dropping {dropped}",
+    format!(
+        "property selection: keeping {} of {} property column(s) ({}), dropping {dropped}",
         kept_names.len(),
         properties.len(),
         if kept_names.is_empty() {
@@ -2648,9 +2661,7 @@ pub(super) fn apply_property_selection(
                 .collect::<Vec<_>>()
                 .join(", ")
         }
-    );
-    source.restrict_columns(keep)?;
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -2823,6 +2834,107 @@ mod property_selection_tests {
                 None
             );
         }
+    }
+
+    /// The note's pronoun follows the number of excluded candidates.
+    #[test]
+    fn auto_rank_note_pronoun_matches_the_excluded_count() {
+        let s = schema(&[
+            ("class", DataType::Utf8),
+            ("road_class", DataType::Utf8),
+            ("confidence", DataType::Float64),
+        ]);
+        let none = ConvertOptions::default();
+        let one = auto_rank_exclusion_note(&s, &keep_without(&s, &["class"]), &none).unwrap();
+        assert!(one.contains("cannot rank on it;"), "{one}");
+        let two = auto_rank_exclusion_note(&s, &keep_without(&s, &["class", "road_class"]), &none)
+            .unwrap();
+        assert!(two.contains("cannot rank on them;"), "{two}");
+    }
+
+    /// Both halves of each candidate predicate are required: the name
+    /// (any case) and the type.
+    #[test]
+    fn auto_rank_candidate_predicates_need_name_and_type() {
+        use arrow_schema::Field;
+        let f = |n: &str, t: DataType| Field::new(n, t, true);
+
+        assert!(is_confidence_candidate(&f("confidence", DataType::Float32)));
+        assert!(is_confidence_candidate(&f("Confidence", DataType::Float64)));
+        assert!(!is_confidence_candidate(&f("confidence", DataType::Int64)));
+        assert!(!is_confidence_candidate(&f("confidence", DataType::Utf8)));
+        assert!(!is_confidence_candidate(&f("score", DataType::Float64)));
+
+        assert!(is_road_class_candidate(&f("class", DataType::Utf8)));
+        assert!(is_road_class_candidate(&f(
+            "ROAD_CLASS",
+            DataType::LargeUtf8
+        )));
+        assert!(!is_road_class_candidate(&f("class", DataType::Int64)));
+        assert!(!is_road_class_candidate(&f("subclass", DataType::Utf8)));
+    }
+
+    /// The summary counts property columns only: the geometry and the bbox
+    /// covering are neither kept nor dropped properties.
+    #[test]
+    fn property_selection_summary_counts_properties_only() {
+        let float = |n: &str| Field::new(n, DataType::Float64, true);
+        let s = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                "bbox",
+                DataType::Struct(
+                    vec![float("xmin"), float("ymin"), float("xmax"), float("ymax")].into(),
+                ),
+                true,
+            ),
+        ]);
+        assert_eq!(
+            property_selection_summary(&s, 3, &[1, 3]),
+            "property selection: keeping 1 of 3 property column(s) (\"name\"), dropping 2"
+        );
+        assert_eq!(
+            property_selection_summary(&s, 3, &[3]),
+            "property selection: keeping 0 of 3 property column(s) (none — geometry only), \
+             dropping 3"
+        );
+        assert_eq!(
+            property_selection_summary(&s, 3, &[0, 1, 3]),
+            "property selection: keeping 2 of 3 property column(s) (\"id\", \"name\"), \
+             dropping 1"
+        );
+    }
+
+    /// The in-memory confidence tier: the first `confidence` candidate in
+    /// schema order, only on a point majority (ties count as a majority),
+    /// and never on an empty layer.
+    #[test]
+    fn find_confidence_column_needs_a_point_majority() {
+        use geo::{polygon, Point};
+        let s = schema(&[
+            ("name", DataType::Utf8),
+            ("confidence", DataType::Float64),
+            ("Confidence", DataType::Float64),
+        ]);
+        let pt = || Geometry::Point(Point::new(0.0, 0.0));
+        let poly =
+            || Geometry::Polygon(polygon![(x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 1.0, y: 1.0)]);
+
+        assert_eq!(
+            find_confidence_column(&s, &[pt(), pt(), poly()]),
+            Some((1, "confidence".to_string()))
+        );
+        assert_eq!(
+            find_confidence_column(&s, &[pt(), poly()]),
+            Some((1, "confidence".to_string()))
+        );
+        assert_eq!(find_confidence_column(&s, &[pt(), poly(), poly()]), None);
+        assert_eq!(find_confidence_column(&s, &[]), None);
+        let no_conf = schema(&[("score", DataType::Float64)]);
+        assert_eq!(find_confidence_column(&no_conf, &[pt()]), None);
     }
 }
 
