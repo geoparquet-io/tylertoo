@@ -1186,7 +1186,7 @@ fn resolve_and_log_partition_wave(requested: usize) -> usize {
 
 /// Arrow batch size for the partition read passes (the parquet reader default
 /// of 1024 rows makes the per-batch parallel clip sections too small to load-
-/// balance across cores; 16k rows amortizes decode and barrier overhead while
+/// balance across cores; 8k rows amortizes decode and barrier overhead while
 /// keeping per-batch memory modest).
 const EXPORT_BATCH_SIZE: usize = 8_192;
 
@@ -4404,8 +4404,9 @@ fn copy_tile_members(
     // the cascade.
     // `assume_simple` is the feature's ring simplicity, validated **once** by
     // the caller and threaded through every clip this feature performs (issue
-    // #237, RC3). The O(V²) self-intersection scan that `clip_polygon` used to
-    // run on *every* tile now runs a single time per feature; a continental
+    // #237, RC3). The O((n + m) log n) self-intersection sweep that
+    // `clip_polygon` used to run on *every* tile now runs a single time per
+    // feature; a continental
     // polygon touching thousands of tiles pays it once instead of thousands of
     // times. The clip output is unchanged — see `clip::clip_geometry_simple`.
     let direct_cost = tile_span(&ranges).saturating_mul(geom.coords_count() as u64);

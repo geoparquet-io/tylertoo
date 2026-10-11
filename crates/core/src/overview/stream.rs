@@ -5335,7 +5335,7 @@ fn write_level_streaming(
         verts: usize,
     }
 
-    // Overlap decode→process with the single-threaded parquet writer (#264,
+    // Overlap decode→process with the parquet writer (#264,
     // extending the #213 pipeline discipline to the streamed finest level): a
     // producer thread reads input batches and runs `process_level_batch`
     // (read + geometry decode + simplify + assemble), pushing finished output
@@ -5503,8 +5503,9 @@ pub(super) fn process_level_batch(
         // Simplification is >95% of pass-2 wall time (H3(c) profile) and
         // embarrassingly parallel per feature. `par_iter().map().collect()`
         // preserves within-batch order, so the output stays byte-identical to
-        // the serial path; the writer (our single caller) remains
-        // single-threaded, and memory stays bounded by one read batch.
+        // the serial path, and memory stays bounded by one read batch. The
+        // callers (the pass-2 engine and `write_level_streaming`) hand the
+        // result to a writer that parallelizes its own encode (#296, #304).
         // Chain reps substitute their merged, already-simplified geometry
         // (simplified once in `build_level_coalesce_table`, identically to
         // the in-memory path).
@@ -7560,8 +7561,8 @@ mod tests {
 
     /// The auto clamp itself, over core counts a single box cannot produce:
     /// a small box is lifted to the floor (a few cores stay fed, #213), a big
-    /// one is held at the ceiling (the single-threaded writer caps the
-    /// speedup, so more in flight only grows the resident batch set), and in
+    /// one is held at the ceiling (depth past it bought no throughput in the
+    /// #648 sweep, so more in flight only grows the resident batch set), and in
     /// between the depth IS the core count. Explicit requests ignore the core
     /// count entirely. Driven through the core-count seam, since the real
     /// count on the box running this is one fixed point of the table.

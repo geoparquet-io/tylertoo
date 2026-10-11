@@ -1187,7 +1187,7 @@ precision. Other positive values are accepted with a warning.
 `export-pmtiles --tile-size-limit`, also spelled
 `--max-tile-size` as on `tiles`, caps each tile's encoded MVT size. The
 default of 500K matches tippecanoe, and `0` disables the cap. A tile over the
-cap sheds features for that tile only, in one non-iterative pass. It drops
+cap sheds features for that tile only, in one non-iterative pass. It keeps
 the largest first for polygons and lines, and keeps a uniform spatial stride
 for point tiles.
 

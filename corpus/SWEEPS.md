@@ -246,3 +246,45 @@ recorded as future work in `context/ARCHITECTURE.md` (refs #85/#177,
 #246).
 
 Raw artifacts: `corpus/data/bigbench/sweep_scratch/` (not committed).
+
+---
+
+## Decision 7: auto `--in-flight-batches` stays clamped to 4–16 (issue #648)
+
+`IN_FLIGHT_BATCHES_MAX = 16` was justified by "the single-threaded parquet
+writer caps the achievable speedup". The writer has encoded row groups and
+WKB in parallel since #296 and #304, so that reason no longer held. The cap
+was re-measured instead of reworded.
+
+**What the knob controls.** `in_flight` is the depth of the bounded channel
+between the read side and the consumer, in both passes. The pass-2
+consumer takes one batch at a time and parallelizes inside it, so depth
+sets read-ahead only. It cannot add compute parallelism.
+
+**Sweep (2026-10-11):** `tylertoo overview` at `d7817bf` (release build),
+all knobs default except `--in-flight-batches` ∈ {4, 8, 16, 32, 64}. Three
+interleaved repetitions on a 16-thread AMD Ryzen 7 7840HS with 54 GB RAM
+and NVMe storage, where auto resolves to 16. Wall time and MaxRSS come from
+`/usr/bin/time`; values are the median of three.
+
+| input | rows | 4 | 8 | 16 | 32 | 64 |
+|---|--:|--:|--:|--:|--:|--:|
+| `overture-germany-segments` wall (s) | 19,243,535 | 16.6 | 16.4 | 16.0 | 16.2 | 16.2 |
+| `overture-germany-segments` MaxRSS (GiB) | | 1.75 | 1.76 | 1.77 | 1.77 | 1.80 |
+| `fieldmaps-adm4` wall (s) | 363,783 | 38.5 | 39.6 | 38.7 | 37.5 | 38.3 |
+| `fieldmaps-adm4` MaxRSS (GiB) | | 5.26 | 5.27 | 5.29 | 5.30 | 5.24 |
+
+Run-to-run spread was about ±1 s, plus one outlier per input (32.6 s at
+depth 64 on Germany, 63.3 s at depth 16 on adm4) that the median absorbs.
+Wall time is flat from 4 to 64 on both inputs. MaxRSS is flat
+too: the pass-1 tables and the pass-2 output sinks set peak memory, not
+the 8,192-row read batches.
+
+**Decision:** keep the clamp at `[4, 16]`. Depth past the core count
+bought no throughput, so the ceiling is a memory bound on wide machines.
+Without it a 128-core box would auto-size to 128 resident batches, which
+costs real memory when rows carry large geometries. An explicit
+`--in-flight-batches N` still goes past the cap.
+
+Raw artifacts: `corpus/data/bigbench/sweep_scratch/sweep.sh` and
+`sweep.tsv` (not committed).
