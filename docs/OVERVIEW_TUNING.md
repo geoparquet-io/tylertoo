@@ -639,6 +639,11 @@ level. The run reports how many it left out.
 from an explicit spec get no rung; their features use ordinary gates and
 thinning.
 
+The overview footer records the ladder the run resolved in
+`generalization.entry_zoom` (spec §3.5). The block lists each rung's value
+and entry zoom, up to 64 rungs. An explicit rung that matches no value in the
+column does not appear. A ladder that placed no feature leaves no block.
+
 ### Two mechanisms can still undo a ladder
 
 Two later stages can remove admitted features:

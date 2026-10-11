@@ -70,7 +70,9 @@ use super::coalesce::{
     COALESCED_COUNT_COLUMN, COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
     DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
 };
-use super::ladder::{build_ladder, entry_levels, EntryZoomKind, EntryZoomLadder, EntryZoomSpec};
+use super::ladder::{
+    build_ladder, dense_rank_span, entry_levels, EntryZoomKind, EntryZoomLadder, EntryZoomSpec,
+};
 use super::level::{
     gsd_with_base, zoom_for_gsd, AccumulatedColumn, ClusteringProvenance, CoalescingProvenance,
     Crs, DensityProvenance, EntryZoomProvenance, Generalization, GeneralizationLevel,
@@ -1847,7 +1849,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
     }
     // The last magic byte is the format version. Matching on the PREFIX and
     // reading that byte separately means a plan from a FUTURE tylertoo says
-    // so — "plan format v3" — instead of being reported as a corrupt file
+    // so — "plan format v4" — instead of being reported as a corrupt file
     // with "bad magic bytes", which sends the reader looking for the wrong
     // problem entirely.
     let version = magic[super::plan_state::PLAN_MAGIC_PREFIX.len()];
@@ -3154,7 +3156,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
             bbox,
             kind: feature_kind(g),
             sort_key: sort_keys[i],
-            entry_level: entry.as_ref().and_then(|e| e[i]),
+            entry_level: entry.as_ref().and_then(|e| e.levels[i]),
         });
     }
     let tallies = tally.finish(features.len(), crs, &|i| rows.locate(i))?;
@@ -3263,6 +3265,9 @@ pub(crate) fn convert_to_overviews_source_strategy(
         options,
     )?;
     record_emitted_merged(&mut writer_opts, &emitted);
+    if let Some(g) = writer_opts.generalization.as_mut() {
+        g.entry_zoom = entry.and_then(|e| e.provenance);
+    }
     // #507: `build_writer_options` may have raised the cap to fit parquet's
     // row-group ceiling. Record it before the options move into the writer.
     let effective_max_row_group_size = (writer_opts.max_row_group_size
@@ -5881,6 +5886,17 @@ pub(super) fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// A resolved entry-zoom ladder: what the assignment consumes and what the
+/// footer records (#364, #446).
+pub(super) struct ResolvedEntryZoom {
+    /// Entry level per input row, parallel to the ladder column's values;
+    /// `None` where the ladder has no opinion.
+    pub(super) levels: Vec<Option<u8>>,
+    /// The footer's `generalization.entry_zoom` block, or `None` when the
+    /// ladder placed no feature.
+    pub(super) provenance: Option<EntryZoomProvenance>,
+}
+
 /// Resolve the per-feature entry levels for a conversion (#364), or `None`
 /// when no ladder was requested.
 ///
@@ -5892,7 +5908,7 @@ pub(super) fn resolve_entry_levels(
     options: &ConvertOptions,
     column_values: &[Option<f64>],
     level_specs: &[(f64, Option<u8>)],
-) -> Result<Option<Vec<Option<u8>>>, ConvertError> {
+) -> Result<Option<ResolvedEntryZoom>, ConvertError> {
     let Some(spec) = &options.entry_zoom else {
         return Ok(None);
     };
@@ -5938,7 +5954,40 @@ pub(super) fn resolve_entry_levels(
              same column so the budget ranks the way the ladder does."
         );
     }
-    Ok(Some(levels))
+    let provenance = (placed > 0).then(|| entry_zoom_provenance(spec, &ladder, &level_zooms));
+    Ok(Some(ResolvedEntryZoom { levels, provenance }))
+}
+
+/// The footer's entry-zoom ladder provenance (#446), built from the RESOLVED
+/// ladder: the rungs that matched the column's data, keyed by the matched
+/// value, not the rungs as requested. A requested rung that named no value
+/// was dropped by [`build_ladder`] and does not appear.
+///
+/// A `dense-rank` block also carries the zoom span the ranks were laid over,
+/// taken from the planned levels, because the footer's own `levels` omit
+/// empty levels and a zoom ceiling's cut ones. The rung map is omitted past
+/// [`MAX_PROVENANCE_RANKS`] rungs, as `ranking.ranks` is; `rung_count` still
+/// says how many there were.
+fn entry_zoom_provenance(
+    spec: &EntryZoomSpec,
+    ladder: &EntryZoomLadder,
+    level_zooms: &[Option<u8>],
+) -> EntryZoomProvenance {
+    let (mode, step, span) = match spec.kind {
+        EntryZoomKind::DenseRank { step } => {
+            ("dense-rank", Some(step), Some(dense_rank_span(level_zooms)))
+        }
+        EntryZoomKind::Explicit(_) => ("explicit", None, None),
+    };
+    EntryZoomProvenance {
+        mode: mode.to_string(),
+        column: spec.column.clone(),
+        step,
+        base_zoom: span.map(|(base, _)| base),
+        max_zoom: span.map(|(_, max)| max),
+        rung_count: ladder.len(),
+        rungs: (ladder.len() <= MAX_PROVENANCE_RANKS).then(|| ladder.to_map()),
+    }
 }
 
 /// Extract the ladder column's values, by name, from an in-memory table.
@@ -6032,7 +6081,9 @@ pub(super) fn build_generalization(
             )
         },
         ranking: Some(ranking),
-        entry_zoom: entry_zoom_provenance(options),
+        // The resolved ladder is known only after pass 1 (or from a loaded
+        // plan); the engines stamp it once the writer options exist (#446).
+        entry_zoom: None,
         // Record the density budget only when it was applied; a disabled run
         // omits the block so its footer matches pre-Q2 output.
         density_drop: if options.density.enabled {
@@ -6101,37 +6152,6 @@ pub(super) fn build_generalization(
         // actually truncated the level plan (see `Generalization::zoom_ceiling`).
         zoom_ceiling: None,
     }
-}
-
-/// The footer's entry-zoom ladder provenance (#446).
-///
-/// Built from the request rather than the resolved ladder: a `dense-rank`
-/// ladder is reproducible from the step, the column's values, and the footer's
-/// level zooms, and an `explicit` one from the rungs as written. `None` when
-/// no ladder was requested, or when a `--gsd` plan has no zooms to anchor one
-/// (`entry_levels` then leaves every feature unplaced), so a run the ladder
-/// did not touch keeps a byte-identical footer.
-fn entry_zoom_provenance(options: &ConvertOptions) -> Option<EntryZoomProvenance> {
-    let spec = options.entry_zoom.as_ref()?;
-    if !matches!(options.levels, LevelPlan::ZoomRange { .. }) {
-        return None;
-    }
-    let (mode, step, rungs) = match &spec.kind {
-        EntryZoomKind::DenseRank { step } => ("dense-rank", Some(*step), None),
-        EntryZoomKind::Explicit(pairs) => {
-            let rungs = (pairs.len() <= MAX_PROVENANCE_RANKS)
-                .then(|| EntryZoomLadder::explicit(pairs.iter().copied()).ok())
-                .flatten()
-                .map(|ladder| ladder.to_map());
-            ("explicit", None, rungs)
-        }
-    };
-    Some(EntryZoomProvenance {
-        mode: mode.to_string(),
-        column: spec.column.clone(),
-        step,
-        rungs,
-    })
 }
 
 /// Whether any chain table joined two or more segments (#379 / #541 review).
@@ -7458,8 +7478,8 @@ mod tests {
         // A plan written by a FUTURE tylertoo: reported as the version skew
         // it is, not as "bad magic bytes", which sends whoever reads the
         // message looking for a corrupt file instead.
-        let future = dir.path().join("v3.plan");
-        let mut bytes = b"TTPLAN\x00\x03".to_vec();
+        let future = dir.path().join("v4.plan");
+        let mut bytes = b"TTPLAN\x00\x04".to_vec();
         bytes.extend_from_slice(&0u64.to_le_bytes());
         std::fs::write(&future, &bytes).unwrap();
         let msg = validate_options(&ConvertOptions {
@@ -7469,7 +7489,7 @@ mod tests {
         .expect_err("a future plan format must be rejected")
         .to_string();
         assert!(
-            msg.contains("format v3"),
+            msg.contains("format v4"),
             "names the version it found: {msg}"
         );
         assert!(!msg.contains("bad magic"), "{msg}");
@@ -9843,6 +9863,65 @@ mod tests {
     /// also the reserved overview column — so a `--magnitude-ladder level`
     /// must follow the rename, or the conversion fails with "column not found"
     /// on the very case the feature exists for.
+    #[test]
+    fn entry_zoom_provenance_caps_the_rung_map_and_keys_matched_values() {
+        // #446: the footer block describes the resolved ladder. Past 64 rungs
+        // the map is omitted and `rung_count` alone remains; under the cap the
+        // keys are the column values the rungs matched, so an `f32` column's
+        // `0.3` reads back as its widened value, which a reader can match
+        // exactly.
+        use super::super::ladder::{EntryZoomKind, EntryZoomSpec};
+
+        let specs: Vec<(f64, Option<u8>)> = (0..=6u8)
+            .map(|z| (1.0 / f64::from(z + 1), Some(z)))
+            .collect();
+        let explicit = |pairs: Vec<(f64, u8)>| ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "v".to_string(),
+                kind: EntryZoomKind::Explicit(pairs),
+            }),
+            ..Default::default()
+        };
+
+        let many: Vec<f64> = (0..70).map(f64::from).collect();
+        let values: Vec<Option<f64>> = many.iter().copied().map(Some).collect();
+        let options = explicit(many.iter().map(|&v| (v, 3)).collect());
+        let p = resolve_entry_levels(&options, &values, &specs)
+            .unwrap()
+            .unwrap()
+            .provenance
+            .expect("the ladder placed every row");
+        assert_eq!(p.rung_count, 70);
+        assert_eq!(
+            p.rungs, None,
+            "a 70-rung map is omitted, like ranking.ranks"
+        );
+
+        // Duplicate requests collapse before the cap is applied: 70 pairs
+        // naming 2 values give a 2-rung map.
+        let dupes = explicit((0..70).map(|i| (f64::from(i % 2), 3)).collect());
+        let p = resolve_entry_levels(&dupes, &values, &specs)
+            .unwrap()
+            .unwrap()
+            .provenance
+            .unwrap();
+        assert_eq!(p.rung_count, 2);
+        assert_eq!(p.rungs.map(|r| r.len()), Some(2));
+
+        let widened = f64::from(0.3_f32);
+        let p = resolve_entry_levels(&explicit(vec![(0.3, 2)]), &[Some(widened)], &specs)
+            .unwrap()
+            .unwrap()
+            .provenance
+            .unwrap();
+        assert_eq!(
+            p.rungs,
+            Some(std::collections::BTreeMap::from([(widened.to_string(), 2)])),
+            "keyed by the matched value"
+        );
+        assert_eq!(widened.to_string(), "0.30000001192092896");
+    }
+
     #[test]
     fn resolver_rewrites_the_entry_zoom_column() {
         use super::super::ladder::{EntryZoomKind, EntryZoomSpec};

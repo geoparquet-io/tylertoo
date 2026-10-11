@@ -233,16 +233,21 @@ pub fn build_ladder(
             EntryZoomLadder::explicit(snap_to_observed(pairs, values, &spec.column))
         }
         EntryZoomKind::DenseRank { step } => {
-            let base = level_zooms.iter().flatten().copied().min().unwrap_or(0);
-            let max = level_zooms
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .unwrap_or(u8::MAX);
+            let (base, max) = dense_rank_span(level_zooms);
             EntryZoomLadder::dense_rank(values.iter().flatten().copied(), base, *step, max)
         }
     }
+}
+
+/// The `(base, max)` zooms a derived ladder spans over a level plan: rung 0
+/// at the coarsest planned zoom, no rung past the finest.
+///
+/// Taken over the PLANNED levels, which a footer does not always list (empty
+/// levels are omitted, and a zoom ceiling cuts the finest), so the footer
+/// records both (#446).
+pub(crate) fn dense_rank_span(level_zooms: &[Option<u8>]) -> (u8, u8) {
+    let zooms = || level_zooms.iter().flatten().copied();
+    (zooms().min().unwrap_or(0), zooms().max().unwrap_or(u8::MAX))
 }
 
 /// Relative tolerance for matching a hand-written rung against column data.

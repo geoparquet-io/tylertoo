@@ -63,15 +63,14 @@
 //! row-group count and selected row groups for every part, plus mtime for a
 //! local file. See [`Fingerprint`].
 //!
-//! # Known gap (follow-up)
+//! # Entry-zoom ladder
 //!
-//! The entry-zoom ladder's *derived* rungs are not stored verbatim: they are
-//! computed inside pass 1 from the global column scan. They are fully baked
-//! into `min_levels` — which is what a shard consumes — and their inputs (the
-//! spec, and the input parts the values come from) are both fingerprinted, so
-//! a stale ladder cannot slip through. Capturing the resolved rungs for human
-//! provenance needs a pass-1 signature change and is deliberately left out of
-//! this change.
+//! The ladder's rungs are computed inside pass 1 from the global column scan
+//! and baked into `min_levels`, which is what a shard consumes. Their inputs
+//! (the spec, and the input parts the values come from) are fingerprinted, so
+//! a stale ladder cannot slip through. The plan also stores the resolved
+//! ladder's footer block (`entry_zoom`, #446): a `--plan` run never sees the
+//! column values, so it stamps the block it loaded.
 //!
 //! [`assign_levels_bounded`]: super::assign::assign_levels_bounded
 //! [`apply_density_budget`]: super::assign::apply_density_budget
@@ -101,7 +100,7 @@ use super::assign::FeatureKind;
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::convert::{ConvertError, ConvertOptions};
 use super::ladder::EntryZoomSpec;
-use super::level::RankingProvenance;
+use super::level::{EntryZoomProvenance, RankingProvenance};
 use super::stream::{CoalesceScratch, WinnerTables};
 
 /// Schema-metadata key under which the plan's JSON scalars travel.
@@ -111,8 +110,10 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// change to the section layout or the JSON block.
 ///
 /// v2 wrapped the Arrow IPC payload in the [`PLAN_MAGIC`] + checksum header
-/// (#512) and added the per-part row count to the fingerprint (#511).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 2;
+/// (#512) and added the per-part row count to the fingerprint (#511). v3
+/// added the resolved entry-zoom ladder (`entry_zoom`) to the JSON block
+/// (#446).
+pub(super) const PLAN_FORMAT_VERSION: u32 = 3;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -121,7 +122,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 2;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x02";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x03";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -963,7 +964,8 @@ impl RankPlanProvenance {
     }
 }
 
-/// The entry-zoom ladder's *inputs* (#364). See the module's "Known gap".
+/// The entry-zoom ladder's *inputs* (#364), for a reviewer. The resolved
+/// ladder travels separately as [`ConvertPlan::entry_zoom`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct LadderProvenance {
     /// Column the rungs are drawn from.
@@ -1018,6 +1020,9 @@ pub(super) struct ConvertPlan {
     pub rank_plan: RankPlanProvenance,
     /// The entry-zoom ladder inputs, when one applies.
     pub ladder: Option<LadderProvenance>,
+    /// The resolved ladder's footer block (§3.5, #446); `None` when no
+    /// ladder placed a feature.
+    pub entry_zoom: Option<EntryZoomProvenance>,
     /// Dataset-wide tallies.
     pub totals: PlanTotals,
 }
@@ -1030,6 +1035,7 @@ impl ConvertPlan {
         fingerprint: Fingerprint,
         rank_provenance: &RankingProvenance,
         ladder: Option<&EntryZoomSpec>,
+        entry_zoom: Option<&EntryZoomProvenance>,
         totals: PlanTotals,
     ) -> Result<ConvertPlan, ConvertError> {
         let coalesce = tables
@@ -1071,6 +1077,7 @@ impl ConvertPlan {
                 column: s.column.clone(),
                 kind: format!("{:?}", s.kind),
             }),
+            entry_zoom: entry_zoom.cloned(),
             totals,
         })
     }
@@ -1132,6 +1139,7 @@ struct PlanMeta {
     rank_provenance: RankingProvenance,
     rank_plan: RankPlanProvenance,
     ladder: Option<LadderProvenance>,
+    entry_zoom: Option<EntryZoomProvenance>,
     totals: PlanTotals,
 }
 
@@ -1201,6 +1209,7 @@ impl ConvertPlan {
             rank_provenance: self.rank_provenance.clone(),
             rank_plan: self.rank_plan.clone(),
             ladder: self.ladder.clone(),
+            entry_zoom: self.entry_zoom.clone(),
             totals: self.totals,
         };
         let meta_json = serde_json::to_string(&meta)
@@ -1531,6 +1540,7 @@ impl ConvertPlan {
             rank_provenance: meta.rank_provenance,
             rank_plan: meta.rank_plan,
             ladder: meta.ladder,
+            entry_zoom: meta.entry_zoom,
             totals: meta.totals,
         })
     }
@@ -1907,6 +1917,18 @@ mod tests {
             ladder: Some(LadderProvenance {
                 column: "pop".to_string(),
                 kind: "DenseRank { step: 1 }".to_string(),
+            }),
+            entry_zoom: Some(EntryZoomProvenance {
+                mode: "dense-rank".to_string(),
+                column: "pop".to_string(),
+                step: Some(1),
+                base_zoom: Some(5),
+                max_zoom: Some(7),
+                rung_count: 2,
+                rungs: Some(BTreeMap::from([
+                    ("0.5".to_string(), 6),
+                    ("3".to_string(), 5),
+                ])),
             }),
             totals: PlanTotals {
                 n_rows: 9,

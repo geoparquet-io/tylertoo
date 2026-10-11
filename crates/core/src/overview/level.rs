@@ -196,15 +196,15 @@ pub struct Generalization {
     /// OPTIONAL entry-zoom ladder provenance (§3.5, additive; informative;
     /// #446).
     ///
-    /// Records the magnitude ladder (#364) that decided how early each
-    /// feature could appear. A ladder overrides the visibility gate and
-    /// cell-winner thinning for the features it places, so
-    /// [`ranking`](Self::ranking) alone misdescribes a laddered file: it still
-    /// names the tier that ranks the *unladdered* features (often
-    /// `size-fallback`). Absent when no ladder was requested, when the level
-    /// plan had no zooms to anchor one (a `--gsd` plan, where the ladder is
-    /// inert), or on files written before this field existed; readers MUST
-    /// tolerate its absence.
+    /// Records the magnitude ladder (#364) as the run resolved it: the rungs
+    /// that matched the column's data, not the rungs requested. A ladder
+    /// exempts the features it places from the visibility gate and cell-winner
+    /// thinning, so [`ranking`](Self::ranking) alone misdescribes a laddered
+    /// file: it still names the tier that ranks the *unladdered* features
+    /// (often `size-fallback`). Absent when no ladder was requested, when the
+    /// ladder placed no feature (a `--gsd` plan with no zooms to anchor it, a
+    /// column with no matching value), or on files written before this field
+    /// existed; readers MUST tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_zoom: Option<EntryZoomProvenance>,
     /// OPTIONAL density-budget provenance (§3.5, additive; informative).
@@ -416,13 +416,18 @@ where
 /// How an entry-zoom ladder placed features for a conversion (#364, #446).
 ///
 /// Additive, OPTIONAL, informative provenance embedded in [`Generalization`]
-/// (§3.5). Together with the source column's values and the footer's level
-/// zooms, it reproduces every feature's entry zoom.
+/// (§3.5). Records the ladder as resolved against the column's data, so
+/// `rungs` gives every feature's entry zoom directly; when the map is omitted
+/// for size, a `dense-rank` ladder is still rebuilt from the column's values,
+/// `step`, `base_zoom`, and `max_zoom`.
+///
+/// `mode` stays a string, like [`RankingProvenance::mode`], so a reader
+/// keeps parsing a footer whose writer added a mode it does not know.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryZoomProvenance {
     /// `dense-rank` (`--magnitude-ladder`: the column's distinct values ranked
-    /// descending, one rung per `step` zooms from the coarsest level's zoom)
-    /// or `explicit` (`--entry-zoom`: hand-placed rungs).
+    /// descending, one rung per `step` zooms from `base_zoom`) or `explicit`
+    /// (`--entry-zoom`: hand-placed rungs).
     pub mode: String,
     /// Column the ladder read, as named in this file (after any
     /// reserved-column rename, see [`Generalization::renamed_columns`]).
@@ -430,9 +435,22 @@ pub struct EntryZoomProvenance {
     /// Zooms between consecutive rungs (`dense-rank` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<u8>,
-    /// The requested `value → entry zoom` rungs (`explicit` only), echoed
-    /// when small enough to be useful. Serialized as a JSON object map keyed
-    /// by the rendered value, like `ranking.ranks`.
+    /// Zoom of rung 0, the coarsest PLANNED level's zoom (`dense-rank` only).
+    /// Recorded because the footer's `levels` omit empty levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_zoom: Option<u8>,
+    /// Finest PLANNED level's zoom (`dense-rank` only). A value whose rank
+    /// lands past it gets no rung. Recorded because a zoom ceiling cuts the
+    /// footer's finest levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_zoom: Option<u8>,
+    /// Number of rungs in the resolved ladder, whether or not `rungs` lists
+    /// them.
+    pub rung_count: usize,
+    /// The resolved `value → entry zoom` rungs, present when there are at
+    /// most 64. Keys are the matched column values as shortest round-trip
+    /// decimals (an `f32` `0.3` appears as `"0.30000001192092896"`), in a JSON
+    /// object map like `ranking.ranks`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rungs: Option<BTreeMap<String, u8>>,
 }
@@ -1164,6 +1182,9 @@ mod tests {
                 mode: "explicit".to_string(),
                 column: "magnitude".to_string(),
                 step: None,
+                base_zoom: None,
+                max_zoom: None,
+                rung_count: 2,
                 rungs: Some(BTreeMap::from([
                     ("250".to_string(), 5),
                     ("5000".to_string(), 2),
@@ -1179,7 +1200,7 @@ mod tests {
         let json = meta.to_json().unwrap();
         assert!(
             json.contains(
-                r#""entry_zoom":{"mode":"explicit","column":"magnitude","rungs":{"250":5,"5000":2}}"#
+                r#""entry_zoom":{"mode":"explicit","column":"magnitude","rung_count":2,"rungs":{"250":5,"5000":2}}"#
             ),
             "got {json}"
         );
@@ -1189,12 +1210,18 @@ mod tests {
             mode: "dense-rank".to_string(),
             column: "magnitude".to_string(),
             step: Some(1),
+            base_zoom: Some(2),
+            max_zoom: Some(6),
+            // Past 64 rungs the map is omitted and only the count remains.
+            rung_count: 65,
             rungs: None,
         });
         meta.generalization = Some(g.clone());
         let json = meta.to_json().unwrap();
         assert!(
-            json.contains(r#""entry_zoom":{"mode":"dense-rank","column":"magnitude","step":1}"#),
+            json.contains(
+                r#""entry_zoom":{"mode":"dense-rank","column":"magnitude","step":1,"base_zoom":2,"max_zoom":6,"rung_count":65}"#
+            ),
             "got {json}"
         );
         assert_eq!(OverviewsMeta::from_json(&json).unwrap(), meta);

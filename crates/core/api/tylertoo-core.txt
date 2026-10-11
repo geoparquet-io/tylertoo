@@ -2247,8 +2247,11 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::level::DensityProven
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::level::DensityProvenance
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::DensityProvenance
 pub struct tylertoo_core::overview::level::EntryZoomProvenance
+pub tylertoo_core::overview::level::EntryZoomProvenance::base_zoom: core::option::Option<u8>
 pub tylertoo_core::overview::level::EntryZoomProvenance::column: alloc::string::String
+pub tylertoo_core::overview::level::EntryZoomProvenance::max_zoom: core::option::Option<u8>
 pub tylertoo_core::overview::level::EntryZoomProvenance::mode: alloc::string::String
+pub tylertoo_core::overview::level::EntryZoomProvenance::rung_count: usize
 pub tylertoo_core::overview::level::EntryZoomProvenance::rungs: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, u8>>
 pub tylertoo_core::overview::level::EntryZoomProvenance::step: core::option::Option<u8>
 impl core::clone::Clone for tylertoo_core::overview::level::EntryZoomProvenance

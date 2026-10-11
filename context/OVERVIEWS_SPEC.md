@@ -384,16 +384,21 @@ Ranking := {
 }
 
 EntryZoom := {
-  "mode":   string,            // "dense-rank" (distinct values ranked
-                               // descending, one rung per `step`
-                               // zooms from the coarsest level's
-                               // zoom) or "explicit" (hand-placed)
-  "column": string,            // column read, as named in this file
-  "step":   integer,           // OPTIONAL: zooms between rungs
+  "mode":       string,        // "dense-rank" (derived from the
+                               // column) or "explicit" (hand-placed)
+  "column":     string,        // column read, as named in this file
+  "step":       integer,       // OPTIONAL: zooms between rungs
                                // ("dense-rank" only)
-  "rungs":  { string: integer, ... }
-                               // OPTIONAL: JSON object map of value →
-                               // entry zoom ("explicit" only), e.g.
+  "base_zoom":  integer,       // OPTIONAL: zoom of rung 0, the
+                               // coarsest PLANNED level's zoom
+                               // ("dense-rank" only)
+  "max_zoom":   integer,       // OPTIONAL: finest PLANNED level's
+                               // zoom ("dense-rank" only)
+  "rung_count": integer,       // rungs in the resolved ladder
+  "rungs":      { string: integer, ... }
+                               // OPTIONAL: JSON object map of column
+                               // value → entry zoom, present when
+                               // rung_count <= 64, e.g.
                                // {"5000": 2, "250": 5}
 }
 
@@ -404,15 +409,38 @@ DensityDrop := {
 }
 ```
 
-`EntryZoom` records a ladder that set the first level at which each
-feature appears, bypassing the visibility gate and cell-winner
-thinning for the features it places. `Ranking` then describes only
-the features the ladder leaves to ordinary thinning, so a laddered
-file can carry `"ranking": {"mode": "size-fallback"}` alongside an
-`entry_zoom` block.
+`EntryZoom` records an attribute-driven ladder that admits each
+feature it places to the levels from its entry zoom inward. A feature
+with entry zoom `z` is first admitted to the coarsest level whose zoom
+is at least `z`, or to the finest level when no level qualifies. The
+ladder exempts the features it places from the visibility gate and
+cell-winner thinning. Later stages still apply. A feature that
+simplifies below a level's tolerance can be dropped there, and so can
+one that the density budget sheds. `Ranking` then
+describes only the features the ladder leaves to ordinary thinning,
+so a laddered file can carry `"ranking": {"mode": "size-fallback"}`
+alongside an `entry_zoom` block. The block is absent when the ladder
+placed no feature.
 
-`Ranking`, `EntryZoom`, and `DensityDrop` record which mechanism a producer used
-(FYI, never a contract); `Clustering` and `Coalescing` are defined in
+The block describes the ladder as resolved against the data, not as
+requested. A requested rung that matches no value in the column is
+dropped and does not appear. Each `rungs` key is the matched column
+value, written as the shortest decimal that round-trips to the same
+`f64`. A value stored as `f32` therefore appears widened: `0.3`
+appears as `"0.30000001192092896"`. A reader matches keys against
+column values exactly.
+
+A `"dense-rank"` ladder ranks the column's distinct finite values in
+descending order. The value of rank `r` enters at
+`base_zoom + r * step`, and a value whose zoom would pass `max_zoom`
+gets no rung. Both zooms come from the planned levels, which can
+differ from the footer's `levels`: an empty level is omitted from the
+file, and a zoom ceiling cuts the finest levels. A reader can rebuild
+a dense-rank ladder from these fields and the column even when
+`rungs` is omitted.
+
+`Ranking`, `EntryZoom`, and `DensityDrop` record which mechanism a
+producer used (FYI, never a contract); `Clustering` and `Coalescing` are defined in
 §12.4 and §13.4. `cascade` matters for reproducibility: with the same
 `levels[].simplify_tolerance_m`, cascaded and non-cascaded producers
 emit different coarse-level coordinates, so a producer that cascades
