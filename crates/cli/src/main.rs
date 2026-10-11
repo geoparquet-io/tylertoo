@@ -3391,6 +3391,7 @@ fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions
         },
         work_dir: args.work_dir.clone(),
         allow_missing_zooms: args.allow_missing_zooms,
+        metadata: Default::default(),
     }
 }
 
@@ -3589,6 +3590,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     );
     let opts = MergeOptions {
         work_dir: args.work_dir.clone(),
+        metadata: Default::default(),
     };
     let report = merge_shards(&args.inputs, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;

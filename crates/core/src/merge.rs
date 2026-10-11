@@ -59,10 +59,11 @@ use serde_json::Value;
 use crate::archive_index::{ArchiveIndex, TileRef};
 use crate::compression::Compression;
 use crate::dedup::TileHasher;
+use crate::pmtiles_metadata::MetadataCollector;
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType};
 use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
 use crate::tile::TileBounds;
-use crate::{Error, Result};
+use crate::{Error, Result, TilesetMetadata};
 
 /// Knobs for [`merge_shards`].
 #[derive(Debug, Clone, Default)]
@@ -72,6 +73,12 @@ pub struct MergeOptions {
     /// directory — worth setting for a shard merge, where the spool is the
     /// size of the output and `/tmp` is often a small tmpfs.
     pub work_dir: Option<PathBuf>,
+    /// The merged archive's `name`, `description` and `attribution`, each
+    /// overriding what the inputs carry for that field (`Some("")`
+    /// included). An unset field is inherited: one value the inputs agree
+    /// on is kept, differing names or descriptions are an error, and every
+    /// input's attribution credit is kept, joined with `" | "`.
+    pub metadata: TilesetMetadata,
 }
 
 /// What a [`merge_shards`] run produced.
@@ -163,12 +170,6 @@ pub fn merge_shards(
     // has to declare whatever the copied bodies actually are.
     let tile_compression = check_inputs_agree(&indexes)?;
 
-    let mut writer = match &options.work_dir {
-        Some(dir) => StreamingPmtilesWriter::with_temp_dir(tile_compression, dir.clone()),
-        None => StreamingPmtilesWriter::new(tile_compression),
-    }
-    .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
-
     // Computed once and reused: the same "did this input contribute anything"
     // question decides the zoom union AND which layer declarations are folded
     // in (see `collect_layers`).
@@ -191,6 +192,20 @@ pub fn merge_shards(
             );
         }
     }
+
+    // Each input's metadata, parsed once for both the layer union and the
+    // publication metadata.
+    let metas: Vec<Option<Value>> = indexes.iter().map(ArchiveIndex::metadata_json).collect();
+    // Resolved before any tile is copied, so a name conflict fails in
+    // milliseconds rather than after the whole copy.
+    let publication = resolve_publication(&indexes, &metas, &has_tiles, &options.metadata)?;
+
+    let mut writer = match &options.work_dir {
+        Some(dir) => StreamingPmtilesWriter::with_temp_dir(tile_compression, dir.clone()),
+        None => StreamingPmtilesWriter::new(tile_compression),
+    }
+    .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
+    writer.set_metadata(publication);
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
     // contract (debug assertion per add, release warn at finalize).
@@ -229,7 +244,7 @@ pub fn merge_shards(
     // otherwise produce byte-different archives whenever the inputs declare
     // more than one distinct layer between them. (With a single shared layer
     // — the normal shard case — order was already immaterial.)
-    let (mut layers, declared) = collect_layers(&indexes, &has_tiles);
+    let (mut layers, declared) = collect_layers(&indexes, &metas, &has_tiles);
     layers.sort_by(|a, b| a.id.cmp(&b.id));
 
     // The union of what the inputs *declare*, not of the zooms that happened
@@ -413,20 +428,21 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
 /// of a job that produced nothing.
 fn collect_layers(
     indexes: &[ArchiveIndex],
+    metas: &[Option<Value>],
     has_tiles: &[bool],
 ) -> (Vec<LayerMeta>, Option<(u8, u8)>) {
     let mut layers = Vec::new();
     let mut declared: Option<(u8, u8)> = None;
-    for (i, idx) in indexes.iter().enumerate() {
+    for (i, (idx, meta)) in indexes.iter().zip(metas).enumerate() {
         if !has_tiles.get(i).copied().unwrap_or(true) {
             continue;
         }
         let header = (idx.header().min_zoom, idx.header().max_zoom);
         let mut input_zooms: Vec<(u8, u8)> = Vec::new();
-        match idx.metadata_json() {
+        match meta {
             None => log::warn!(
                 "{}: metadata is absent or not valid JSON; its layers are not declared in the \
-                 merged archive",
+                 merged archive, and no name, description or attribution is inherited from it",
                 idx.path().display()
             ),
             Some(meta) => match meta.get("vector_layers").and_then(Value::as_array) {
@@ -463,6 +479,37 @@ fn collect_layers(
         });
     }
     (layers, declared)
+}
+
+/// The merged archive's publication metadata: `overrides`, field by field,
+/// over what every input carries (see [`MetadataCollector`]).
+///
+/// Tile-less inputs count too. An empty shard was exported with the same
+/// values as its siblings, and a merge of nothing but empty shards should
+/// still carry them.
+fn resolve_publication(
+    indexes: &[ArchiveIndex],
+    metas: &[Option<Value>],
+    has_tiles: &[bool],
+    overrides: &TilesetMetadata,
+) -> Result<TilesetMetadata> {
+    let mut collector = MetadataCollector::new(overrides);
+    for ((idx, meta), &tiles) in indexes.iter().zip(metas).zip(has_tiles) {
+        match meta {
+            Some(root) => collector
+                .add_json(&idx.path().display().to_string(), root)
+                .map_err(Error::InvalidConfig)?,
+            // A tile-holding input's loss is already in `collect_layers`'
+            // warning; say it once.
+            None if !tiles => log::warn!(
+                "{}: metadata is absent or not valid JSON; no name, description or attribution \
+                 is inherited from it",
+                idx.path().display()
+            ),
+            None => {}
+        }
+    }
+    collector.resolve().map_err(Error::InvalidConfig)
 }
 
 #[cfg(test)]
@@ -1084,5 +1131,228 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("at least one input"), "{err}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Publication metadata (name / description / attribution)
+    // -------------------------------------------------------------------------
+
+    /// A one-tile shard at z6 column `x` carrying `meta`.
+    fn write_published_shard(path: &Path, x: u32, meta: TilesetMetadata) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("l");
+        w.set_bounds(&TileBounds::new(0.0, 0.0, 1.0, 1.0));
+        w.set_metadata(meta);
+        w.add_tile(6, x, 0, &[0x1a, 0x02, 0x08, x as u8]).unwrap();
+        w.finalize(path).unwrap();
+    }
+
+    fn publication_of(path: &Path) -> (Option<Value>, Option<Value>, Option<Value>) {
+        let meta = metadata_of(path);
+        (
+            meta.get("name").cloned(),
+            meta.get("description").cloned(),
+            meta.get("attribution").cloned(),
+        )
+    }
+
+    fn merge_with(
+        inputs: &[PathBuf],
+        out: &Path,
+        metadata: TilesetMetadata,
+    ) -> Result<MergeReport> {
+        merge_shards(
+            inputs,
+            out,
+            &MergeOptions {
+                metadata,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn merge_inherits_shared_publication_metadata_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = TilesetMetadata::new()
+            .with_name("Park Tiles 4")
+            .with_description("")
+            .with_attribution(r#"<a href="https://www.nps.gov/">NPS</a>"#);
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        write_published_shard(&a, 0, meta.clone());
+        write_published_shard(&b, 1, meta);
+        let out = dir.path().join("out.pmtiles");
+        merge_with(&[a.clone(), b.clone()], &out, TilesetMetadata::new()).unwrap();
+        assert_eq!(
+            publication_of(&out),
+            (
+                Some(json!("Park Tiles 4")),
+                Some(json!("")),
+                Some(json!(r#"<a href="https://www.nps.gov/">NPS</a>"#))
+            )
+        );
+        // Same tiles as a merge of the same shards without any metadata.
+        let (pa, pb) = (dir.path().join("pa.pmtiles"), dir.path().join("pb.pmtiles"));
+        write_published_shard(&pa, 0, TilesetMetadata::new());
+        write_published_shard(&pb, 1, TilesetMetadata::new());
+        let plain = dir.path().join("plain.pmtiles");
+        merge_with(&[pa, pb], &plain, TilesetMetadata::new()).unwrap();
+        assert_eq!(tiles_of(&out), tiles_of(&plain));
+        assert_eq!(publication_of(&plain), (None, None, None));
+    }
+
+    #[test]
+    fn merge_combines_credits_in_any_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| dir.path().join(format!("{i}.pmtiles")))
+            .collect();
+        write_published_shard(
+            &paths[0],
+            0,
+            TilesetMetadata::new().with_attribution("USGS"),
+        );
+        // No credit: does not erase the others.
+        write_published_shard(&paths[1], 1, TilesetMetadata::new());
+        write_published_shard(&paths[2], 2, TilesetMetadata::new().with_attribution("NPS"));
+        let (fwd, rev) = (
+            dir.path().join("fwd.pmtiles"),
+            dir.path().join("rev.pmtiles"),
+        );
+        merge_with(&paths, &fwd, TilesetMetadata::new()).unwrap();
+        let reversed: Vec<PathBuf> = paths.iter().rev().cloned().collect();
+        merge_with(&reversed, &rev, TilesetMetadata::new()).unwrap();
+        assert_eq!(publication_of(&fwd).2, Some(json!("NPS | USGS")));
+        assert_eq!(std::fs::read(&fwd).unwrap(), std::fs::read(&rev).unwrap());
+    }
+
+    #[test]
+    fn empty_shards_keep_their_publication_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, empty) = (dir.path().join("d.pmtiles"), dir.path().join("e.pmtiles"));
+        write_published_shard(&data, 0, TilesetMetadata::new().with_name("Parks"));
+        crate::overview::export::write_empty_archive_with_metadata(
+            &empty,
+            "l",
+            6,
+            6,
+            &TilesetMetadata::new()
+                .with_name("Parks")
+                .with_attribution("NPS"),
+        )
+        .unwrap();
+        let out = dir.path().join("out.pmtiles");
+        let report =
+            merge_with(&[data.clone(), empty.clone()], &out, TilesetMetadata::new()).unwrap();
+        let (name, _, attribution) = publication_of(&out);
+        assert_eq!(name, Some(json!("Parks")));
+        assert_eq!(attribution, Some(json!("NPS")));
+        // Its structural treatment is unchanged: no bounds, no zoom vote.
+        assert_eq!(
+            report.inputs_without_bounds,
+            vec![empty.display().to_string()]
+        );
+
+        // Only empty inputs: still accepted, still carrying the values.
+        let all_empty = dir.path().join("all-empty.pmtiles");
+        merge_with(&[empty], &all_empty, TilesetMetadata::new()).unwrap();
+        assert_eq!(publication_of(&all_empty).2, Some(json!("NPS")));
+    }
+
+    #[test]
+    fn merge_overrides_win_field_by_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        let side = |n: &str| {
+            TilesetMetadata::new()
+                .with_name(n)
+                .with_description(n)
+                .with_attribution(n)
+        };
+        write_published_shard(&a, 0, side("East"));
+        write_published_shard(&b, 1, side("West"));
+        let out = dir.path().join("out.pmtiles");
+        merge_with(
+            &[a, b],
+            &out,
+            TilesetMetadata::new()
+                .with_name("Both")
+                .with_description("Combined regions")
+                .with_attribution(""),
+        )
+        .unwrap();
+        assert_eq!(
+            publication_of(&out),
+            (
+                Some(json!("Both")),
+                Some(json!("Combined regions")),
+                Some(json!(""))
+            )
+        );
+    }
+
+    #[test]
+    fn conflicting_names_fail_before_the_output_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        write_published_shard(&a, 0, TilesetMetadata::new().with_name("East region"));
+        write_published_shard(&b, 1, TilesetMetadata::new().with_name("West region"));
+        let existing = dir.path().join("existing.pmtiles");
+        std::fs::write(&existing, b"previous").unwrap();
+        let err = merge_with(&[a.clone(), b.clone()], &existing, TilesetMetadata::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--name"), "{err}");
+        assert!(
+            err.contains("a.pmtiles") && err.contains("b.pmtiles"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous");
+
+        // A non-string attribution in a foreign archive: same, unless overridden.
+        let odd = dir.path().join("odd.pmtiles");
+        write_shard(
+            &odd,
+            "l",
+            &[(6, 2, 0)],
+            TileBounds::new(0.0, 0.0, 1.0, 1.0),
+            &[],
+        );
+        let raw = std::fs::read(&odd).unwrap();
+        let header = Header::from_bytes(&raw).unwrap();
+        let mut meta = metadata_of(&odd);
+        meta["attribution"] = json!({"html": "<b>x</b>"});
+        let rewritten = rewrite_metadata(&raw, &header, &meta);
+        std::fs::write(&odd, rewritten).unwrap();
+        let out = dir.path().join("out.pmtiles");
+        let err = merge_with(&[a.clone(), odd.clone()], &out, TilesetMetadata::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("odd.pmtiles: attribution must be a string"),
+            "{err}"
+        );
+        assert!(!out.exists());
+        merge_with(
+            &[a, odd],
+            &out,
+            TilesetMetadata::new().with_attribution("credit"),
+        )
+        .unwrap();
+        assert_eq!(publication_of(&out).2, Some(json!("credit")));
+    }
+
+    /// `raw` with its metadata section replaced by gzip-compressed `meta`,
+    /// appended at the end of the file so no other offset moves.
+    fn rewrite_metadata(raw: &[u8], header: &Header, meta: &Value) -> Vec<u8> {
+        let gz =
+            crate::compression::compress(meta.to_string().as_bytes(), Compression::Gzip).unwrap();
+        let mut h = header.clone();
+        h.json_metadata_offset = raw.len() as u64;
+        h.json_metadata_length = gz.len() as u64;
+        let mut out = h.to_bytes().to_vec();
+        out.extend_from_slice(&raw[out.len()..]);
+        out.extend_from_slice(&gz);
+        out
     }
 }
