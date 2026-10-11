@@ -3,8 +3,11 @@
 //! tippecanoe has `-x` / `-X` (exclude) and `-y` (include) for this; here the
 //! same choice is [`PropertySelection`], resolved once against the input
 //! schema into the set of root columns to read. The geometry column is never
-//! a property and is always kept. Applied at *scan* time on `overview` /
-//! `tiles` (the excluded columns are not decoded, and the intermediate
+//! a property and is always kept. Neither is the geometry's bbox covering
+//! struct (#401): the writer regenerates it from the geometry, so a
+//! selection never reads the input's and cannot name it. Applied at *scan*
+//! time on `overview` / `tiles` (the excluded columns are not decoded, and
+//! the intermediate
 //! overview file only carries what was asked for) and at export time on
 //! `export-pmtiles` (the overview file is unchanged; the tiles carry the
 //! selection). The flags combine as tippecanoe's do: an include list is the
@@ -48,6 +51,15 @@ pub enum PropertySelectionError {
     /// The geometry column was named as a property.
     #[error("{name:?} is the geometry column, not a property; it is always kept")]
     GeometryColumn { name: String },
+
+    /// The geometry's bbox covering struct was named in an include list
+    /// (#401). The writer drops the input's covering and regenerates its
+    /// own, so including it would change nothing.
+    #[error(
+        "{name:?} is the geometry's bbox covering, not a property; the writer regenerates \
+         it, so it cannot be selected"
+    )]
+    CoveringColumn { name: String },
 
     /// A column a tuning knob reads was excluded.
     #[error(
@@ -110,19 +122,28 @@ impl PropertySelection {
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         let geom_name = names[geom_idx];
         let has = |n: &str| names.contains(&n);
+        let properties = property_indices(schema, geom_idx);
+        let is_covering = |n: &str| {
+            names
+                .iter()
+                .position(|c| *c == n)
+                .is_some_and(|i| i != geom_idx && !properties.contains(&i))
+        };
 
         if let Some(include) = &self.include {
             for name in include {
                 if name == geom_name {
                     return Err(PropertySelectionError::GeometryColumn { name: name.clone() });
                 }
+                if is_covering(name) {
+                    return Err(PropertySelectionError::CoveringColumn { name: name.clone() });
+                }
                 if !has(name) {
                     return Err(PropertySelectionError::UnknownInclude {
                         name: name.clone(),
-                        available: names
+                        available: properties
                             .iter()
-                            .filter(|n| **n != geom_name)
-                            .map(|n| format!("{n:?}"))
+                            .map(|&i| format!("{:?}", names[i]))
                             .collect::<Vec<_>>()
                             .join(", "),
                     });
@@ -133,7 +154,12 @@ impl PropertySelection {
             if name == geom_name {
                 return Err(PropertySelectionError::GeometryColumn { name: name.clone() });
             }
-            if !has(name) {
+            if is_covering(name) {
+                warn(format!(
+                    "excluded property {name:?} is the geometry's bbox covering, not a \
+                     property; the writer regenerates it, so it cannot be selected"
+                ));
+            } else if !has(name) {
                 warn(format!(
                     "excluded property {name:?} is not a column of the input; nothing to drop"
                 ));
@@ -148,14 +174,27 @@ impl PropertySelection {
             }
         }
 
-        let kept: BTreeSet<usize> = names
-            .iter()
-            .enumerate()
-            .filter(|&(i, n)| i == geom_idx || self.keeps(n))
-            .map(|(i, _)| i)
+        // The covering is not read: the writer builds its own from the
+        // geometry, so decoding the input's would only be thrown away.
+        let kept: BTreeSet<usize> = std::iter::once(geom_idx)
+            .chain(properties.iter().copied().filter(|&i| self.keeps(names[i])))
             .collect();
         Ok(kept.into_iter().collect())
     }
+}
+
+/// The indices of `schema`'s property columns: every column except the
+/// geometry and its bbox covering struct
+/// ([`super::writer::is_covering_column`], #401), in schema order.
+pub(crate) fn property_indices(schema: &Schema, geom_idx: usize) -> Vec<usize> {
+    let geom = schema.field(geom_idx).name().as_str();
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|&(i, f)| i != geom_idx && !super::writer::is_covering_column(f, Some(geom), None))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,5 +367,92 @@ mod tests {
         // schema is the knob's own problem to report.
         assert!(resolve(&sel, &[("id", "--sort-key")]).is_ok());
         assert!(resolve(&sel, &[("missing", "--sort-key")]).is_ok());
+    }
+
+    /// A GeoParquet input carrying its `bbox` covering struct (#401).
+    fn schema_with_covering() -> Schema {
+        let float = |n: &str| Field::new(n, DataType::Float64, true);
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                "bbox",
+                DataType::Struct(
+                    vec![float("xmin"), float("ymin"), float("xmax"), float("ymax")].into(),
+                ),
+                true,
+            ),
+        ])
+    }
+
+    /// #401: the writer regenerates the covering, so naming it in an
+    /// include list would change nothing. It is not a property, the way the
+    /// geometry is not, and asking for it is an error that says why.
+    #[test]
+    fn including_the_bbox_covering_is_an_error() {
+        let sel = PropertySelection {
+            include: Some(vec!["id".into(), "bbox".into()]),
+            ..Default::default()
+        };
+        let err = sel
+            .resolve(&schema_with_covering(), 1, &[], &mut |_| {})
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PropertySelectionError::CoveringColumn {
+                name: "bbox".into()
+            }
+        );
+        assert!(err.to_string().contains("regenerate"), "{err}");
+    }
+
+    /// #401: excluding the covering is harmless (it never reaches the tiles
+    /// as a property), so it warns rather than failing, and a selection
+    /// never reads the input covering: the writer builds its own.
+    #[test]
+    fn the_bbox_covering_is_outside_the_selectable_set() {
+        let sel = PropertySelection {
+            exclude: vec!["bbox".into()],
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        let kept = sel
+            .resolve(&schema_with_covering(), 1, &[], &mut |w| warnings.push(w))
+            .unwrap();
+        assert_eq!(kept, vec![0, 1]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("\"bbox\""), "{warnings:?}");
+        assert!(warnings[0].contains("regenerate"), "{warnings:?}");
+
+        // An unknown-include error does not offer the covering as a choice.
+        let sel = PropertySelection {
+            include: Some(vec!["nope".into()]),
+            ..Default::default()
+        };
+        match sel.resolve(&schema_with_covering(), 1, &[], &mut |_| {}) {
+            Err(PropertySelectionError::UnknownInclude { available, .. }) => {
+                assert_eq!(available, "\"id\"");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // A struct that merely shares the name but is not a covering stays
+        // an ordinary property.
+        let schema = Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                "bbox",
+                DataType::Struct(vec![Field::new("label", DataType::Utf8, true)].into()),
+                true,
+            ),
+        ]);
+        let sel = PropertySelection {
+            include: Some(vec!["bbox".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            sel.resolve(&schema, 0, &[], &mut |_| {}).unwrap(),
+            vec![0, 1]
+        );
     }
 }

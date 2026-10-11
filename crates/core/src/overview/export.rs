@@ -5545,7 +5545,7 @@ struct PublishedNames {
     suppressed: HashSet<String>,
     /// The bbox covering column the file's `geo` metadata declares for the
     /// geometry column, when it declares one. A covering is never a
-    /// property (see [`is_covering_column`]); this is the declared spelling,
+    /// property (see [`super::writer::is_covering_column`]); this is the declared spelling,
     /// alongside the default names and the shape rule.
     covering: Option<String>,
 }
@@ -5874,7 +5874,7 @@ fn skipped_property_columns(
 }
 
 /// Every schema column that is a property candidate: not the geometry, not
-/// the `level` column, not a bbox covering struct ([`is_covering_column`]:
+/// the `level` column, not a bbox covering struct ([`super::writer::is_covering_column`]:
 /// index metadata, not user data -- so it is neither exported nor warned
 /// about), and not withheld by the selection.
 fn candidate_columns<'a>(
@@ -5891,46 +5891,9 @@ fn candidate_columns<'a>(
             i != geom_idx
                 && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
                 && !published.is_suppressed(f.name())
-                && !is_covering_column(f, geom, published.covering.as_deref())
+                && !super::writer::is_covering_column(f, geom, published.covering.as_deref())
         })
         .map(|(i, f)| (i, f.as_ref()))
-}
-
-/// Whether `field` is the geometry's bbox covering rather than a property.
-///
-/// A covering is a `{xmin, ymin, xmax, ymax}` struct
-/// ([`super::writer::is_bbox_covering_struct`]) that ALSO satisfies any of:
-/// its name is the one the file's `geo` metadata declares (`declared`); its
-/// name is a default spelling (`covering_name_for(geom)`, `<geom>_bbox`,
-/// `bbox`); or its four children are floats. The last rule is what catches
-/// a file with no `geo` metadata whose covering was named `geometry_bbox`
-/// (the madagascar fixture): before it, that struct was JSON-encoded into
-/// every feature as a ~60-byte unique string, which the tippecanoe parity
-/// gate flagged as +12% bytes at every zoom. A four-float struct of exactly
-/// that shape is never a real property.
-fn is_covering_column(
-    field: &arrow_schema::Field,
-    geom: Option<&str>,
-    declared: Option<&str>,
-) -> bool {
-    if !super::writer::is_bbox_covering_struct(field) {
-        return false;
-    }
-    let name = field.name().as_str();
-    if declared == Some(name) || name == "bbox" {
-        return true;
-    }
-    if let Some(geom) = geom {
-        if name == super::writer::covering_name_for(geom) || name == format!("{geom}_bbox") {
-            return true;
-        }
-    }
-    match field.data_type() {
-        DataType::Struct(children) => children
-            .iter()
-            .all(|c| matches!(c.data_type(), DataType::Float32 | DataType::Float64)),
-        _ => false,
-    }
 }
 
 /// The columns pass 2 attaches to each member: the exportable properties

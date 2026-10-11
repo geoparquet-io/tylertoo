@@ -1505,6 +1505,11 @@ These flags select output properties, like tippecanoe's `-y`, `-x`, and
 written to the overview. Smaller tile properties leave room for more
 features under `--max-tile-size`. Geometry always stays.
 
+The GeoParquet `bbox` covering struct is not a property either. The writer
+builds a fresh covering from the output geometry, so a selection never reads
+the input's covering. `--include-property bbox` is an error, and
+`--exclude-property bbox` only warns.
+
 ```bash
 # Tiles carry only confidence and metrics:area
 tylertoo tiles fields.parquet fields.pmtiles --max-zoom 13 -f \
@@ -1536,7 +1541,14 @@ Without an include list, `--exclude-all-properties` keeps nothing and
 Columns used by these options must stay included:
 `--sort-key`, `--class-rank`, `--magnitude-ladder`, `--entry-zoom`,
 `--accumulate-attribute`, and `--filter`. Excluding one is an error naming
-the option that needs it.
+the option that needs it. The check matches `--filter` columns the way the
+filter does, so `--filter "NAME > 0" --exclude-property name` fails with the
+same error.
+
+Automatic ranking reads `class`, `road_class`, or `confidence` when present.
+Excluding the column it would use moves ranking to the next candidate, or
+turns it off. tylertoo logs one line naming the excluded column and the
+ranking now in effect.
 
 `export-pmtiles` applies the same flags to published tile property names,
 leaving the overview untouched. The `--feature-order` column must remain;

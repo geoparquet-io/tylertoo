@@ -2406,6 +2406,8 @@ pub fn tylertoo_core::overview::level::gsd_with_base(u8, f64) -> f64
 pub fn tylertoo_core::overview::level::zoom_for_gsd(f64) -> f64
 pub mod tylertoo_core::overview::properties
 pub enum tylertoo_core::overview::properties::PropertySelectionError
+pub tylertoo_core::overview::properties::PropertySelectionError::CoveringColumn
+pub tylertoo_core::overview::properties::PropertySelectionError::CoveringColumn::name: alloc::string::String
 pub tylertoo_core::overview::properties::PropertySelectionError::GeometryColumn
 pub tylertoo_core::overview::properties::PropertySelectionError::GeometryColumn::name: alloc::string::String
 pub tylertoo_core::overview::properties::PropertySelectionError::RequiredByKnob
