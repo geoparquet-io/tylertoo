@@ -1507,8 +1507,9 @@ features under `--max-tile-size`. Geometry always stays.
 
 The GeoParquet `bbox` covering struct is not a property either. The writer
 builds a fresh covering from the output geometry, so a selection never reads
-the input's covering. `--include-property bbox` is an error, and
-`--exclude-property bbox` only warns.
+the input's covering. `--include-property bbox` is an error on every
+command, and `--exclude-property bbox` only warns. A covering declared in the
+file's `geo` metadata counts under any name.
 
 ```bash
 # Tiles carry only confidence and metrics:area
@@ -1545,10 +1546,12 @@ the option that needs it. The check matches `--filter` columns the way the
 filter does, so `--filter "NAME > 0" --exclude-property name` fails with the
 same error.
 
-Automatic ranking reads `class`, `road_class`, or `confidence` when present.
-Excluding the column it would use moves ranking to the next candidate, or
-turns it off. tylertoo logs one line naming the excluded column and the
-ranking now in effect.
+Automatic ranking considers `class`, `road_class`, and `confidence` when
+present, and checks each column's values before it ranks on one. Excluding a
+candidate logs one line naming it and the candidates still in play. The
+excluded column is never read, so that line cannot say whether it would
+have ranked. The `overview ranking:` line reports the column that does. With
+no candidate left, ranking falls back to feature size.
 
 `export-pmtiles` applies the same flags to published tile property names,
 leaving the overview untouched. The `--feature-order` column must remain;

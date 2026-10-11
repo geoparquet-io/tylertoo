@@ -2295,6 +2295,82 @@ fn property_selection_rejects_knob_columns_and_typos() {
     );
 }
 
+/// #401 review: the covering the input's `geo` metadata declares is the
+/// covering whatever its name and child type. An integer-typed `extent`
+/// matches neither the default names nor the four-float rule, so this
+/// passes only if the declaration reaches the convert-side selection.
+#[test]
+fn property_selection_honours_the_declared_covering() {
+    use arrow_array::{Array, ArrayRef, Int32Array, StructArray};
+    use tylertoo_core::overview::properties::PropertySelection;
+
+    let wkb_point = |x: f64, y: f64| {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    };
+    let points: Vec<Vec<u8>> = (0..4)
+        .map(|i| wkb_point(-60.0 + f64::from(i) * 20.0, -30.0 + f64::from(i) * 12.0))
+        .collect();
+    let mut md = std::collections::HashMap::new();
+    md.insert(
+        "ARROW:extension:name".to_string(),
+        "geoarrow.wkb".to_string(),
+    );
+    let child = |n: &str| Arc::new(Field::new(n, DataType::Int32, true));
+    let int = |v: i32| Arc::new(Int32Array::from(vec![v; 4])) as ArrayRef;
+    let extent = StructArray::from(vec![
+        (child("xmin"), int(-60)),
+        (child("ymin"), int(-30)),
+        (child("xmax"), int(0)),
+        (child("ymax"), int(6)),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("geometry", DataType::Binary, true).with_metadata(md),
+        Field::new("extent", extent.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+            Arc::new(BinaryArray::from_iter_values(points.iter())),
+            Arc::new(extent),
+        ],
+    )
+    .unwrap();
+    let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":
+        {"encoding":"WKB","geometry_types":[],"covering":{"bbox":{
+        "xmin":["extent","xmin"],"ymin":["extent","ymin"],
+        "xmax":["extent","xmax"],"ymax":["extent","ymax"]}}}}}"#;
+    let tin = tempfile::NamedTempFile::new().unwrap();
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(tin.path()).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.append_key_value_metadata(KeyValue::new("geo".to_string(), geo.to_string()));
+    writer.close().unwrap();
+
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    for streaming in [false, true] {
+        let o = ConvertOptions {
+            properties: PropertySelection {
+                include: Some(vec!["id".to_string(), "extent".to_string()]),
+                ..Default::default()
+            },
+            ..opts(streaming)
+        };
+        let msg = convert_to_overviews(tin.path(), tout.path(), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("\"extent\"") && msg.contains("regenerates"),
+            "streaming={streaming} {msg}"
+        );
+    }
+}
+
 /// A `ConvertSource` is single-use once a selection has been applied: the
 /// projection lives on the source, so a second conversion through it — with
 /// any selection, the default included — must be refused rather than

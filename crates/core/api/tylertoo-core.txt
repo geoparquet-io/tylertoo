@@ -1563,6 +1563,8 @@ pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
+pub tylertoo_core::overview::export::ExportError::CoveringProperty
+pub tylertoo_core::overview::export::ExportError::CoveringProperty::name: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomAboveCeiling::declared: u8

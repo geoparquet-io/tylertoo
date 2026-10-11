@@ -2506,24 +2506,22 @@ fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, Strin
     out
 }
 
-/// The auto-rank tier the schema offers (Q1 tier 3, as
-/// [`super::stream`]'s rank plan and [`resolve_ranking`] probe it): the
-/// first Overture road-class candidate in schema order, else a places
-/// `confidence` column, else none. Schema-level only: the data gates
-/// (road vocabulary overlap, point majority) still decide at ranking time.
-fn auto_rank_candidate(
-    schema: &Schema,
-    kept: impl Fn(usize) -> bool,
-) -> Option<(&'static str, &str)> {
-    let fields = || schema.fields().iter().enumerate().filter(|&(i, _)| kept(i));
+/// Every column auto-rank probes (Q1 tier 3, as [`super::stream`]'s rank
+/// plan and [`resolve_ranking`] probe them), in probe order, with its tier:
+/// each Overture road-class candidate in schema order, then the first places
+/// `confidence` column. Schema-level only: the data gates (road vocabulary
+/// overlap, point majority) decide at ranking time which one, if any, ranks.
+fn auto_rank_candidates(schema: &Schema) -> Vec<(usize, &'static str)> {
+    let fields = || schema.fields().iter().enumerate();
     fields()
-        .find(|(_, f)| is_road_class_candidate(f))
-        .map(|(_, f)| ("Overture road classes", f.name().as_str()))
-        .or_else(|| {
+        .filter(|(_, f)| is_road_class_candidate(f))
+        .map(|(i, _)| (i, "Overture road classes"))
+        .chain(
             fields()
                 .find(|(_, f)| is_confidence_candidate(f))
-                .map(|(_, f)| ("Overture places confidence", f.name().as_str()))
-        })
+                .map(|(i, _)| (i, "Overture places confidence")),
+        )
+        .collect()
 }
 
 /// Whether `field` is an auto-rank road-class candidate (`road_class` or
@@ -2541,11 +2539,17 @@ pub(super) fn is_confidence_candidate(field: &arrow_schema::Field) -> bool {
         && matches!(field.data_type(), DataType::Float32 | DataType::Float64)
 }
 
-/// The one-line note for when the property selection moves auto-rank to
-/// another tier (#401): excluding `class` / `road_class` / `confidence`
-/// would otherwise change the ranking silently. `None` when auto-rank is not
+/// The one-line note for when the property selection excludes a column
+/// auto-rank probes (#401): excluding `class` / `road_class` / `confidence`
+/// could otherwise change the ranking silently. `None` when auto-rank is not
 /// in play (`no_auto_rank`, or an explicit `--sort-key` / `--class-rank`
-/// outranks it) or the selection leaves the tier unchanged.
+/// outranks it) or no candidate is excluded.
+///
+/// The note names the candidates still in play but claims no tier. Which
+/// candidate ranks depends on the data gates, and an excluded column is
+/// never read, so this cannot tell whether it would have passed them (an
+/// Overture buildings `class` never does). The `overview ranking:` line
+/// reports what ran. Only when no candidate is left is the outcome certain.
 fn auto_rank_exclusion_note(
     schema: &Schema,
     keep: &[usize],
@@ -2554,18 +2558,35 @@ fn auto_rank_exclusion_note(
     if options.no_auto_rank || options.sort_key.is_some() || options.class_ranking.is_some() {
         return None;
     }
-    let (_, before) = auto_rank_candidate(schema, |_| true)?;
-    let after = auto_rank_candidate(schema, |i| keep.contains(&i));
-    if after.is_some_and(|(_, col)| col == before) {
+    let (left, excluded): (Vec<_>, Vec<_>) = auto_rank_candidates(schema)
+        .into_iter()
+        .partition(|(i, _)| keep.contains(i));
+    if excluded.is_empty() {
         return None;
     }
-    let now = match after {
-        Some((tier, col)) => format!("{tier} on {col:?}"),
-        None => "off (size fallback)".to_string(),
+    let name = |i: usize| format!("{:?}", schema.field(i).name());
+    let it = if excluded.len() == 1 { "it" } else { "them" };
+    let excluded = excluded
+        .iter()
+        .map(|&(i, _)| name(i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = if left.is_empty() {
+        "no candidate column is left, so ranking falls back to feature size".to_string()
+    } else {
+        let left = left
+            .iter()
+            .map(|&(i, tier)| format!("{} ({tier})", name(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "it still considers {left}; the \"overview ranking:\" line names the column \
+             that ranks, if any"
+        )
     };
     Some(format!(
-        "auto-rank: {before:?} is excluded by the property selection, so auto-rank now \
-         uses {now}"
+        "auto-rank: the property selection excludes {excluded}, so auto-rank cannot rank \
+         on {it}; {rest}"
     ))
 }
 
@@ -2693,11 +2714,13 @@ mod property_selection_tests {
             .collect()
     }
 
-    /// #401: excluding the column auto-rank would pick moves the ranking to
-    /// the next tier. That change is logged once, naming the column and the
-    /// tier now in effect.
+    /// #401: excluding a column auto-rank would consider is logged once,
+    /// naming the excluded candidates and the ones still in play. The note
+    /// cannot know which candidate the data gates pick (an excluded column
+    /// is never read), so it claims no tier: it points at the
+    /// `overview ranking:` line instead.
     #[test]
-    fn excluding_the_auto_rank_column_names_the_new_tier() {
+    fn excluding_an_auto_rank_candidate_names_what_is_left() {
         let s = schema(&[
             ("class", DataType::Utf8),
             ("road_class", DataType::Utf8),
@@ -2706,43 +2729,73 @@ mod property_selection_tests {
         let options = ConvertOptions::default();
 
         let note = auto_rank_exclusion_note(&s, &keep_without(&s, &["class"]), &options)
-            .expect("tier changed");
-        assert!(note.contains("\"class\""), "{note}");
-        assert!(note.contains("road classes on \"road_class\""), "{note}");
+            .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"class\""), "{note}");
+        assert!(
+            note.contains("\"road_class\" (Overture road classes)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("\"confidence\" (Overture places confidence)"),
+            "{note}"
+        );
+        assert!(note.contains("overview ranking:"), "{note}");
+        assert!(!note.contains("now uses"), "{note}");
+
+        // `class` comes first, but on non-road data (an Overture buildings
+        // `class`) the vocabulary gate skips it and `road_class` ranks, so
+        // excluding `road_class` can change the ranking. It is logged.
+        let note = auto_rank_exclusion_note(&s, &keep_without(&s, &["road_class"]), &options)
+            .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"road_class\""), "{note}");
+        assert!(note.contains("\"class\" (Overture road classes)"), "{note}");
 
         let note =
             auto_rank_exclusion_note(&s, &keep_without(&s, &["class", "road_class"]), &options)
-                .expect("tier changed");
-        assert!(note.contains("\"class\""), "{note}");
-        assert!(note.contains("confidence on \"confidence\""), "{note}");
+                .expect("candidates are excluded");
+        assert!(
+            note.contains("excludes \"class\", \"road_class\""),
+            "{note}"
+        );
+        assert!(
+            note.contains("\"confidence\" (Overture places confidence)"),
+            "{note}"
+        );
 
+        // With no candidate left, the outcome is certain: no auto-rank.
         let only_conf = schema(&[("confidence", DataType::Float32)]);
         let note = auto_rank_exclusion_note(
             &only_conf,
             &keep_without(&only_conf, &["confidence"]),
             &options,
         )
-        .expect("tier changed");
-        assert!(note.contains("\"confidence\""), "{note}");
-        assert!(note.contains("off"), "{note}");
+        .expect("a candidate is excluded");
+        assert!(note.contains("excludes \"confidence\""), "{note}");
+        assert!(note.contains("no candidate column is left"), "{note}");
+        assert!(note.contains("feature size"), "{note}");
     }
 
-    /// No note when the tier is unchanged or auto-rank is not in play.
+    /// No note when no candidate is excluded or auto-rank is not in play.
     #[test]
-    fn auto_rank_note_only_when_the_exclusion_changes_the_tier() {
+    fn auto_rank_note_only_when_a_candidate_is_excluded() {
         let s = schema(&[
             ("class", DataType::Utf8),
             ("confidence", DataType::Float64),
             ("other", DataType::Utf8),
         ]);
         let none = ConvertOptions::default();
-        // Excluding a column auto-rank does not pick changes nothing.
-        assert_eq!(
-            auto_rank_exclusion_note(&s, &keep_without(&s, &["confidence"]), &none),
-            None
-        );
         assert_eq!(
             auto_rank_exclusion_note(&s, &keep_without(&s, &["other"]), &none),
+            None
+        );
+        // Only the first `confidence` column (any case) is ever probed, so
+        // excluding a second one changes nothing.
+        let two_conf = schema(&[
+            ("confidence", DataType::Float64),
+            ("Confidence", DataType::Float64),
+        ]);
+        assert_eq!(
+            auto_rank_exclusion_note(&two_conf, &keep_without(&two_conf, &["Confidence"]), &none),
             None
         );
         // A non-string `class` was never a candidate.

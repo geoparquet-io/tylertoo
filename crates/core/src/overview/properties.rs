@@ -186,15 +186,38 @@ impl PropertySelection {
 /// The indices of `schema`'s property columns: every column except the
 /// geometry and its bbox covering struct
 /// ([`super::writer::is_covering_column`], #401), in schema order.
+///
+/// The covering the schema's `geo` metadata declares for the geometry
+/// column counts under any name, as it does on export: parquet carries the
+/// file's key-value metadata into the Arrow schema.
 pub(crate) fn property_indices(schema: &Schema, geom_idx: usize) -> Vec<usize> {
     let geom = schema.field(geom_idx).name().as_str();
+    let declared = declared_covering(schema, geom);
     schema
         .fields()
         .iter()
         .enumerate()
-        .filter(|&(i, f)| i != geom_idx && !super::writer::is_covering_column(f, Some(geom), None))
+        .filter(|&(i, f)| {
+            i != geom_idx && !super::writer::is_covering_column(f, Some(geom), declared.as_deref())
+        })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// The top-level struct name of the covering that `schema`'s `geo`
+/// metadata declares for `geom` (the spec paths are `["bbox","xmin"]` and so
+/// on). `None` when there is no `geo` key, it does not parse, or it
+/// declares no covering for `geom`.
+fn declared_covering(schema: &Schema, geom: &str) -> Option<String> {
+    let json = schema
+        .metadata()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
+        .map(|(_, v)| v)?;
+    crate::covering::parse_covering_metadata(json, Some(geom))
+        .ok()
+        .flatten()
+        .and_then(|spec| spec.xmin_path.first().cloned())
 }
 
 #[cfg(test)]
@@ -454,5 +477,46 @@ mod tests {
             sel.resolve(&schema, 0, &[], &mut |_| {}).unwrap(),
             vec![0, 1]
         );
+    }
+
+    /// #401 review: the covering the file's `geo` metadata declares is the
+    /// covering under any name and child type, as export already treats it.
+    /// `extent` with integer children matches neither the default names nor
+    /// the four-float rule, so only the declaration identifies it.
+    #[test]
+    fn the_declared_covering_is_outside_the_selectable_set() {
+        let int = |n: &str| Field::new(n, DataType::Int32, true);
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":
+            {"encoding":"WKB","geometry_types":[],"covering":{"bbox":{
+            "xmin":["extent","xmin"],"ymin":["extent","ymin"],
+            "xmax":["extent","xmax"],"ymax":["extent","ymax"]}}}}}"#;
+        let fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                "extent",
+                DataType::Struct(vec![int("xmin"), int("ymin"), int("xmax"), int("ymax")].into()),
+                true,
+            ),
+        ];
+        let declared = Schema::new_with_metadata(
+            fields.clone(),
+            [("geo".to_string(), geo.to_string())].into(),
+        );
+        assert_eq!(property_indices(&declared, 1), vec![0]);
+        let sel = PropertySelection {
+            include: Some(vec!["extent".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            sel.resolve(&declared, 1, &[], &mut |_| {}),
+            Err(PropertySelectionError::CoveringColumn {
+                name: "extent".into()
+            })
+        );
+
+        // Without the declaration the same struct is an ordinary property.
+        let undeclared = Schema::new(fields);
+        assert_eq!(property_indices(&undeclared, 1), vec![0, 2]);
     }
 }
