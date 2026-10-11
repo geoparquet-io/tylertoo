@@ -129,9 +129,15 @@ pub struct DecodeReport {
 }
 
 /// Errors from [`decode_pmtiles`].
+///
+/// A variant that wraps an underlying error exposes it through
+/// [`std::error::Error::source`] and leaves it out of its own `Display`.
+/// The CLI prints the anyhow chain, so writing it in both places showed the
+/// cause twice (#396). Callers that want one line use `{:#}` on an
+/// `anyhow::Error`, or walk `source()`.
 #[derive(Debug, Error)]
 pub enum DecodeError {
-    #[error("IO error: {0}")]
+    #[error("I/O error")]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
@@ -143,7 +149,7 @@ pub enum DecodeError {
     #[error("archive does not contain vector tiles (tile type {0:?})")]
     NotVectorTiles(TileType),
 
-    #[error("failed to decompress {what} at byte offset {offset} ({length} bytes): {source}")]
+    #[error("failed to decompress {what} at byte offset {offset} ({length} bytes)")]
     Decompress {
         what: &'static str,
         offset: u64,
@@ -151,9 +157,7 @@ pub enum DecodeError {
         source: std::io::Error,
     },
 
-    #[error(
-        "failed to decompress tile z{z}/{x}/{y} at byte offset {offset} ({length} bytes): {source}"
-    )]
+    #[error("failed to decompress tile z{z}/{x}/{y} at byte offset {offset} ({length} bytes)")]
     TileDecompress {
         z: u8,
         x: u32,
@@ -163,7 +167,7 @@ pub enum DecodeError {
         source: std::io::Error,
     },
 
-    #[error("MVT protobuf decode failed for tile z{z}/{x}/{y}: {source}")]
+    #[error("MVT protobuf decode failed for tile z{z}/{x}/{y}")]
     Mvt {
         z: u8,
         x: u32,
@@ -185,10 +189,10 @@ pub enum DecodeError {
     )]
     ReservedColumn(String),
 
-    #[error("Arrow error: {0}")]
+    #[error("Arrow error")]
     Arrow(#[from] arrow_schema::ArrowError),
 
-    #[error("Parquet error: {0}")]
+    #[error("Parquet error")]
     Parquet(#[from] parquet::errors::ParquetError),
 
     #[error("GeoParquet write failed: {0}")]

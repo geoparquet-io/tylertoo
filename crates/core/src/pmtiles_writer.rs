@@ -235,12 +235,19 @@ impl Header {
         // every use. What is merely *sloppy* — a field nothing downstream
         // reads — is repaired and logged: rejecting it would lock out real
         // archives without protecting anything.
-        let internal_compression = Compression::from_code(bytes[97])
-            .filter(|c| *c != Compression::Unknown)
-            .ok_or_else(|| err(format!("invalid internal compression code {}", bytes[97])))?;
-        let tile_compression = Compression::from_code(bytes[98])
-            .filter(|c| *c != Compression::Unknown)
-            .ok_or_else(|| err(format!("invalid tile compression code {}", bytes[98])))?;
+        // Code 0 is in the spec's range: it tells the reader to sniff the
+        // codec from the bytes. No codec call here can do that, so refuse it
+        // with a message that says the archive is legal, not corrupt (#396).
+        let compression = |code: u8, field: &str| match Compression::from_code(code) {
+            Some(Compression::Unknown) => Err(err(format!(
+                "archive declares {field} compression 0 (unknown); \
+                 tylertoo does not sniff compression"
+            ))),
+            Some(c) => Ok(c),
+            None => Err(err(format!("invalid {field} compression code {code}"))),
+        };
+        let internal_compression = compression(bytes[97], "internal")?;
+        let tile_compression = compression(bytes[98], "tile")?;
         let tile_type = TileType::from_code(bytes[99])
             .ok_or_else(|| err(format!("invalid tile type code {}", bytes[99])))?;
 
@@ -4237,13 +4244,28 @@ mod tests {
             err.to_string().contains("internal compression"),
             "message must name the field, got: {err}"
         );
+        // The spec reads 0 as "reader must sniff" (#396). Say that we don't,
+        // so the reader of the message knows the archive is not corrupt.
+        assert!(
+            err.to_string().contains("sniff"),
+            "message must say why 0 is refused, got: {err}"
+        );
 
         let mut bytes = Header::default().to_bytes();
         bytes[98] = 0; // tile_compression
         let err = Header::from_bytes(&bytes).expect_err("unknown tile compression");
         assert!(
-            err.to_string().contains("tile compression"),
-            "message must name the field, got: {err}"
+            err.to_string().contains("tile compression") && err.to_string().contains("sniff"),
+            "message must name the field and the reason, got: {err}"
+        );
+
+        // A code past the spec's range is plain nonsense, not "unknown".
+        let mut bytes = Header::default().to_bytes();
+        bytes[98] = 9;
+        let err = Header::from_bytes(&bytes).expect_err("out-of-range tile compression");
+        assert!(
+            err.to_string().contains("invalid tile compression code 9"),
+            "got: {err}"
         );
     }
 
