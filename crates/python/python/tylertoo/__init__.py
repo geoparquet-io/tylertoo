@@ -329,6 +329,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     min_zoom: int | None = None,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
 
@@ -351,6 +354,11 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         feature_id: Integer column to use as the MVT feature ID.
         spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
             used when memory runs short.
+        name: Human-readable tileset name for the archive metadata.
+        description: Tileset description for the archive metadata.
+        attribution: Attribution text or HTML stored in the archive
+            metadata; MapLibre shows it in its attribution control.
+            Each value is stored as given, and `""` is kept as `""`.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.
@@ -364,6 +372,11 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
         >>> report["max_zoom"]
         10
+        >>> report = export_pmtiles(
+        ...     "overview.parquet",
+        ...     "out.pmtiles",
+        ...     attribution="\u00a9 Example contributors",
+        ... )
     """
     # Every argument goes to the extension unchanged, by keyword.
     return cast("ExportReport", _tylertoo.export_pmtiles(**locals()))
@@ -400,7 +413,8 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
 ) -> None:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
-    Use `overview()` followed by `export_pmtiles()` for all options.
+    Use `overview()` followed by `export_pmtiles()` for all options,
+    including the `name`, `description` and `attribution` metadata.
 
     Args:
         input: See `overview()`.

@@ -663,7 +663,7 @@ fn overview(
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None, spill_dir=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None, spill_dir=None, name=None, description=None, attribution=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -679,7 +679,14 @@ fn export_pmtiles(
     min_zoom: Option<u8>,
     feature_id: Option<String>,
     spill_dir: Option<PathBuf>,
+    name: Option<String>,
+    description: Option<String>,
+    attribution: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    let mut metadata = tylertoo_core::TilesetMetadata::new();
+    metadata.name = name;
+    metadata.description = description;
+    metadata.attribution = attribution;
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
         tile_buffer,
@@ -699,7 +706,7 @@ fn export_pmtiles(
         zoom_ceiling: None,
         feature_id,
         spill_dir,
-        metadata: Default::default(),
+        metadata,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();

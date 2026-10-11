@@ -6,6 +6,7 @@ output-file validity via the validate() checklist.
 """
 
 import gzip
+import inspect
 import json
 import struct
 import tempfile
@@ -810,3 +811,78 @@ class TestNestedProperties:
             tylertoo.overview(str(BUILDINGS), str(ovr), min_zoom=11, max_zoom=12)
             report = tylertoo.export_pmtiles(str(ovr), str(pm))
             assert report["skipped_property_columns"] == []
+
+
+class TestPublicationMetadata:
+    """`export_pmtiles(name=, description=, attribution=)` writes the three
+    top-level metadata strings, exactly as given, and nothing else changes.
+    """
+
+    KEYS = ("name", "description", "attribution")
+    HTML = '<a href="https://www.nps.gov/">© NPS</a> & "friends"\n☃'
+
+    @staticmethod
+    def _tiles(path):
+        """Every tile blob in the archive, keyed by file offset order."""
+        buf = Path(path).read_bytes()
+        data_off, data_len = struct.unpack_from("<QQ", buf, 56)
+        return buf[data_off : data_off + data_len]
+
+    @pytest.fixture
+    def overview_file(self, tmp_path):
+        ovr = tmp_path / "overview.parquet"
+        tylertoo.overview(str(BUILDINGS), str(ovr), min_zoom=11, max_zoom=12)
+        return ovr
+
+    @needs_buildings
+    def test_all_three_keywords_write_exact_values(self, overview_file, tmp_path):
+        plain, pm = tmp_path / "plain.pmtiles", tmp_path / "pm.pmtiles"
+        base = tylertoo.export_pmtiles(str(overview_file), str(plain))
+        report = tylertoo.export_pmtiles(
+            str(overview_file),
+            str(pm),
+            name="Buildings",
+            description="",
+            attribution=self.HTML,
+        )
+        meta = _archive_metadata(pm)
+        assert meta["name"] == "Buildings"
+        assert meta["description"] == ""
+        assert meta["attribution"] == self.HTML
+        assert report.keys() == base.keys()
+        assert self._tiles(pm) == self._tiles(plain)
+
+    @needs_buildings
+    def test_defaults_omit_all_three_keys(self, overview_file, tmp_path):
+        pm = tmp_path / "pm.pmtiles"
+        tylertoo.export_pmtiles(str(overview_file), str(pm))
+        assert not set(self.KEYS) & _archive_metadata(pm).keys()
+
+    @needs_buildings
+    @pytest.mark.parametrize("key", KEYS)
+    def test_each_keyword_alone(self, overview_file, tmp_path, key):
+        pm = tmp_path / "pm.pmtiles"
+        tylertoo.export_pmtiles(str(overview_file), str(pm), **{key: "x"})
+        meta = _archive_metadata(pm)
+        assert meta[key] == "x"
+        assert not (set(self.KEYS) - {key}) & meta.keys()
+
+    @needs_buildings
+    @pytest.mark.parametrize("key", KEYS)
+    def test_wrong_type_is_refused(self, overview_file, tmp_path, key):
+        with pytest.raises(TypeError):
+            tylertoo.export_pmtiles(
+                str(overview_file), str(tmp_path / "pm.pmtiles"), **{key: 1}
+            )
+
+    @needs_buildings
+    def test_keywords_are_keyword_only(self, overview_file, tmp_path):
+        with pytest.raises(TypeError):
+            tylertoo.export_pmtiles(
+                str(overview_file), str(tmp_path / "pm.pmtiles"), "x"
+            )  # type: ignore[call-arg]
+
+    @needs_buildings
+    def test_deprecated_convert_signature_is_unchanged(self):
+        params = inspect.signature(tylertoo.convert).parameters
+        assert not set(self.KEYS) & params.keys()
