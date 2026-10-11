@@ -119,7 +119,7 @@ use crate::batch_processor::extract_geometries_from_array;
 use crate::clip::{clip_geometry_simple, geometry_is_simple};
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
-use crate::mvt::{LayerBuilder, PropertyValue, TileBuilder};
+use crate::mvt::{EncodedFeatureGeometry, LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
 
@@ -1043,6 +1043,83 @@ fn memory_safe_level_wave(
     ceiling.min(safe)
 }
 
+/// The most members one concurrent level group (#647) may hold at once.
+///
+/// A serial export holds at most one wave of partitions. One full wave at
+/// the ceiling width, each partition at the planned target, is
+/// `ceiling × partition_target` members, so a group capped there holds no
+/// more than the serial loop already budgets for. When the mean member size
+/// and RAM are both known, the cap also narrows to the members that fit in
+/// the [`EXPORT_WAVE_RAM_FRACTION`] budget at [`MEMBER_MEMORY_INFLATION`],
+/// the same estimate [`memory_safe_level_wave`] uses.
+fn level_group_member_cap(
+    ceiling_wave: usize,
+    partition_target: usize,
+    mean_member_bytes: Option<u64>,
+    available_ram_bytes: Option<u64>,
+) -> usize {
+    let wave_cap = ceiling_wave.saturating_mul(partition_target);
+    let (Some(mean), Some(ram)) = (mean_member_bytes.filter(|&b| b > 0), available_ram_bytes)
+    else {
+        return wave_cap;
+    };
+    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
+    let per_member = mean.saturating_mul(MEMBER_MEMORY_INFLATION).max(1);
+    wave_cap.min(usize::try_from(budget / per_member).unwrap_or(usize::MAX))
+}
+
+/// Split the level plans into consecutive groups that export concurrently
+/// (#647).
+///
+/// Coarse levels hold one partition and a few hundred tiles at most, so a
+/// strictly serial level loop leaves most cores idle until each one
+/// finishes. A group runs its levels' encodes in one parallel section and
+/// then writes them in level order. Every tile id at zoom `z` is below every
+/// id at `z + 1`, so the writer still sees ascending ids and the archive is
+/// byte-identical.
+///
+/// A level joins the open group only if it fits in a single wave (empty
+/// levels count, with zero members) and the group's summed members stay
+/// within `member_cap`. A multi-wave level, or a level that alone exceeds
+/// the cap, is a group of one and exports through the unchanged wave loop.
+/// A `member_cap` of 0 is the serial schedule, one level per group.
+fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Range<usize>> {
+    if member_cap == 0 {
+        return (0..plans.len()).map(|i| i..i + 1).collect();
+    }
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut open: Option<(std::ops::Range<usize>, usize)> = None;
+    for (i, plan) in plans.iter().enumerate() {
+        let members: usize = plan.partitions.iter().map(|p| p.members).sum();
+        let single_wave = plan.partitions.len() <= plan.wave.max(1);
+        if let Some((range, sum)) = open.as_mut() {
+            if single_wave && sum.saturating_add(members) <= member_cap {
+                range.end = i + 1;
+                *sum += members;
+                continue;
+            }
+        }
+        if let Some((range, _)) = open.take() {
+            groups.push(range);
+        }
+        if single_wave && members <= member_cap {
+            open = Some((i..i + 1, members));
+        } else {
+            groups.push(i..i + 1);
+        }
+    }
+    groups.extend(open.map(|(range, _)| range));
+    groups
+}
+
+/// The zoom a checkpoint after `group` may cover, or `None` after the final
+/// group (`finalize` follows it). A checkpoint is only taken between groups,
+/// when every level up to the group's finest has all its tiles appended, so
+/// it never advertises a zoom that is still in flight (#647).
+fn checkpoint_zoom_after_group(group: &std::ops::Range<usize>, level_zooms: &[u8]) -> Option<u8> {
+    (group.end < level_zooms.len()).then(|| level_zooms[group.end - 1])
+}
+
 /// Resolve a requested partition-wave width to a concrete value.
 ///
 /// [`PARTITION_WAVE_AUTO`] (0) runs the memory-budget preflight (#303): the
@@ -1364,6 +1441,36 @@ fn export_pmtiles_impl(
     force_legacy_pass2: bool,
     backing_override: Option<SinkBacking>,
 ) -> Result<ExportReport, ExportError> {
+    export_pmtiles_run(
+        input_path,
+        output_path,
+        options,
+        partition_target,
+        &Pass2Knobs {
+            force_legacy_pass2,
+            backing_override,
+            concurrent_levels: true,
+        },
+    )
+}
+
+/// The pass-2 test knobs [`export_pmtiles_impl`] forwards, plus #647's
+/// `concurrent_levels`: `false` pins the strictly serial level loop, the
+/// byte-identity oracle for the coalesced level groups. Production runs
+/// `concurrent_levels: true`.
+struct Pass2Knobs {
+    force_legacy_pass2: bool,
+    backing_override: Option<SinkBacking>,
+    concurrent_levels: bool,
+}
+
+fn export_pmtiles_run(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: &ExportOptions,
+    partition_target: usize,
+    knobs: &Pass2Knobs,
+) -> Result<ExportReport, ExportError> {
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
     // for the standalone `export-pmtiles` path (which never runs convert's
     // own preflight); redundant but harmless in the `tiles` path.
@@ -1577,9 +1684,9 @@ fn export_pmtiles_impl(
     // sinks. Duplicating bands are self-contained — the per-level wave read
     // already touches each row group for exactly one level — so the legacy
     // path is kept there (and as the tests' byte-identity oracle).
-    let single_read = matches!(reader.mode(), Mode::Partitioning) && !force_legacy_pass2;
+    let single_read = matches!(reader.mode(), Mode::Partitioning) && !knobs.force_legacy_pass2;
     let mut store = if single_read {
-        let backing = backing_override.unwrap_or_else(|| {
+        let backing = knobs.backing_override.unwrap_or_else(|| {
             auto_fill_backing(&scans, num_levels, available_ram, mean_member_bytes)
         });
         // #571: entered only when the fill runs, so a duplicating-mode export
@@ -1609,41 +1716,46 @@ fn export_pmtiles_impl(
     progress.enter_phase("levels");
 
     let t_levels = Instant::now();
-    for (level_idx, plan) in plans.iter().enumerate() {
-        zooms.push(export_level(
-            &mut writer,
-            store.as_mut(),
-            &ExportLevelCtx {
-                reader: &reader,
-                scan: &scans[level_idx],
-                plan,
-                level_idx,
-                num_levels,
-                crs,
-                published: &published,
-                feature_id: feature_id.as_ref(),
-                options,
-                start,
-            },
-            &mut progress,
-        )?);
-
-        // Salvageable output (#229): snapshot a valid archive capped at this
-        // zoom so an interrupted run keeps its finished zooms. Throttled, and
-        // skipped on the last level since `finalize` immediately follows and
-        // produces the complete archive.
-        if level_idx + 1 < num_levels
-            && progress.checkpoint_throttle.elapsed() >= CHECKPOINT_INTERVAL
-        {
-            checkpoint_level(
-                &mut writer,
-                output_path.as_ref(),
-                coarsest_zoom,
-                plan.zoom,
-                &mut progress,
-            )?;
-        }
-    }
+    // #647: consecutive small levels run as one concurrent group. On `auto`
+    // the cap sizes from the same RAM budget as the #311 per-level guard.
+    // An explicit wave sizes the cap from its width alone, as #311 does.
+    // `concurrent_levels: false` (cap 0) is the serial test oracle.
+    let group_cap = level_group_member_cap(
+        ceiling_wave,
+        partition_target,
+        mean_member_bytes.filter(|_| auto_wave),
+        available_ram.filter(|_| auto_wave),
+    );
+    let group_cap = if knobs.concurrent_levels {
+        group_cap
+    } else {
+        0
+    };
+    let levels: Vec<ExportLevelCtx<'_>> = plans
+        .iter()
+        .enumerate()
+        .map(|(level_idx, plan)| ExportLevelCtx {
+            reader: &reader,
+            scan: &scans[level_idx],
+            plan,
+            level_idx,
+            num_levels,
+            crs,
+            published: &published,
+            feature_id: feature_id.as_ref(),
+            options,
+            start,
+        })
+        .collect();
+    zooms.extend(export_level_groups(
+        &mut writer,
+        store.as_mut(),
+        &levels,
+        &plan_level_groups(&plans, group_cap),
+        output_path.as_ref(),
+        coarsest_zoom,
+        &mut progress,
+    )?);
 
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
     progress.enter_phase("finalize");
@@ -1732,18 +1844,25 @@ fn resolve_level_zooms(meta: &OverviewsMeta, num_levels: usize) -> Result<Vec<u8
     Ok(level_zooms)
 }
 
-/// Snapshot a salvageable archive after a level (#229/#459's throttled
-/// checkpoint), logging the same line `export_pmtiles_impl`'s inline version
-/// used to. Pulled out of `export_pmtiles_impl` to keep it under clippy's
-/// function-length ceiling. Resets the checkpoint throttle clock, and records
-/// the checkpoint's duration and count in the profile.
-fn checkpoint_level(
+/// Snapshot a salvageable archive capped at `zoom` after a level group
+/// (#229/#459's throttled checkpoint), so an interrupted run keeps its
+/// finished zooms. A no-op when `zoom` is `None` (after the final group,
+/// where `finalize` immediately follows) or when less than
+/// [`CHECKPOINT_INTERVAL`] has passed since the last one. Pulled out of
+/// `export_pmtiles_run` to keep it under clippy's function-length ceiling.
+/// Resets the checkpoint throttle clock, and records the checkpoint's
+/// duration and count in the profile.
+fn checkpoint_if_due(
     writer: &mut StreamingPmtilesWriter,
     output_path: &Path,
     coarsest_zoom: u8,
-    zoom: u8,
+    zoom: Option<u8>,
     progress: &mut ExportProgress,
 ) -> Result<(), ExportError> {
+    let Some(zoom) = zoom else { return Ok(()) };
+    if progress.checkpoint_throttle.elapsed() < CHECKPOINT_INTERVAL {
+        return Ok(());
+    }
     let t_ckpt = Instant::now();
     writer.checkpoint(output_path)?;
     let dur = t_ckpt.elapsed();
@@ -1994,6 +2113,22 @@ struct ExportLevelCtx<'a> {
     start: Instant,
 }
 
+impl<'a> ExportLevelCtx<'a> {
+    /// The per-wave context [`process_wave`] reads.
+    fn level_ctx(&self, timers: &'a ExportTimers) -> LevelCtx<'a> {
+        LevelCtx {
+            reader: self.reader,
+            level_idx: self.level_idx,
+            crs: self.crs,
+            zoom: self.plan.zoom,
+            opts: self.options,
+            published: self.published,
+            feature_id: self.feature_id,
+            timers,
+        }
+    }
+}
+
 /// Render and write one level's tiles, then report what it produced.
 ///
 /// Partitions are processed in ascending tile order, and each finished
@@ -2008,16 +2143,12 @@ fn export_level(
     progress: &mut ExportProgress,
 ) -> Result<ZoomReport, ExportError> {
     let ExportLevelCtx {
-        reader,
-        scan,
         plan,
         level_idx,
         num_levels,
-        crs,
-        published,
-        feature_id,
         options,
         start,
+        ..
     } = *level;
     let zoom = plan.zoom;
     let partitions = &plan.partitions;
@@ -2025,23 +2156,8 @@ fn export_level(
     let timers = &progress.profile.timers;
 
     let t_tiles = Instant::now();
-    let ctx = LevelCtx {
-        reader,
-        level_idx,
-        crs,
-        zoom,
-        opts: options,
-        published,
-        feature_id,
-        timers,
-    };
-    let mut tile_count = 0usize;
-    let mut tile_feature_count = 0usize;
-    let mut oversized = 0usize;
-    let mut encode_dropped = 0usize;
-    let mut encode_quantized = 0usize;
-    let mut write_secs = 0f64;
-    let mut bytes_written = 0u64;
+    let ctx = level.level_ctx(timers);
+    let mut tally = LevelTally::default();
     let total_waves = partitions.len().div_ceil(partition_wave);
     // Within-level progress (#229): a long finest level is where runs get
     // stuck, so emit a throttled wave counter. If it advances the level is
@@ -2052,89 +2168,250 @@ fn export_level(
             Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options, timers)?,
             None => process_wave(&ctx, wave)?,
         };
-        let t_write = Instant::now();
-        for tiles in &results {
-            for t in tiles {
-                encode_dropped += t.encode_dropped;
-                encode_quantized += t.encode_quantized;
-                if t.feature_count == 0 {
-                    // #431: an all-dropped tile is a tally carrier, not a tile.
-                    continue;
-                }
-                tile_feature_count += t.feature_count;
-                bytes_written += t.data.len() as u64;
-                if t.oversized {
-                    oversized += 1;
-                }
-                writer.add_tile_precompressed(
-                    zoom,
-                    t.x,
-                    t.y,
-                    t.hash,
-                    &t.data,
-                    t.raw_len,
-                    t.feature_count,
-                )?;
-                tile_count += 1;
-            }
-        }
-        let write_dur = t_write.elapsed();
-        write_secs += write_dur.as_secs_f64();
-        // #535: `spool_write` is exactly this per-wave window — the serial
-        // per-tile `writer.add_tile_precompressed` calls above, same span
-        // `write_secs` already measures for the `[profile]` log below.
-        add_nanos(&timers.spool_write, write_dur);
+        write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
 
         if last_wave_log.elapsed() >= WAVE_LOG_INTERVAL {
             log::info!(
                 "[export] level {}/{num_levels} z{zoom}: wave {}/{total_waves}, \
-                 {tile_count} tiles, {:.0}s",
+                 {} tiles, {:.0}s",
                 level_idx + 1,
                 wave_idx + 1,
+                tally.tile_count,
                 start.elapsed().as_secs_f64(),
             );
             last_wave_log = Instant::now();
         }
     }
+    Ok(finish_level(
+        level,
+        &tally,
+        total_waves,
+        t_tiles.elapsed().as_secs_f64(),
+        progress,
+    ))
+}
+
+/// Export every level, one [`plan_level_groups`] group at a time, and take
+/// the throttled salvage checkpoints (#229) between groups. A checkpoint is
+/// never taken inside a group, so every zoom it covers has all of its tiles
+/// appended (#647).
+fn export_level_groups(
+    writer: &mut StreamingPmtilesWriter,
+    mut store: Option<&mut MemberStore>,
+    levels: &[ExportLevelCtx<'_>],
+    groups: &[std::ops::Range<usize>],
+    output_path: &Path,
+    coarsest_zoom: u8,
+    progress: &mut ExportProgress,
+) -> Result<Vec<ZoomReport>, ExportError> {
+    let level_zooms: Vec<u8> = levels.iter().map(|l| l.plan.zoom).collect();
+    let mut zooms = Vec::with_capacity(levels.len());
+    for group in groups {
+        zooms.extend(export_level_group(
+            writer,
+            store.as_deref_mut(),
+            &levels[group.clone()],
+            progress,
+        )?);
+        checkpoint_if_due(
+            writer,
+            output_path,
+            coarsest_zoom,
+            checkpoint_zoom_after_group(group, &level_zooms),
+            progress,
+        )?;
+    }
+    Ok(zooms)
+}
+
+/// Export a group of consecutive levels planned by [`plan_level_groups`]
+/// (#647): encode every level in one parallel section, then write them in
+/// level order.
+///
+/// A group of one is [`export_level`] unchanged. In a larger group every
+/// level fits in a single wave, so each level's members (the single-read
+/// store's wave 0, or one [`process_wave`] read) are encoded exactly as the
+/// serial wave loop would encode them. Only the schedule differs. Rayon
+/// spreads the group's tiles over every core, so a z3 tile no longer waits
+/// for the z2 tiles to finish. The writer then receives each level's tiles
+/// in the same ascending order as before, so the archive is byte-identical.
+fn export_level_group(
+    writer: &mut StreamingPmtilesWriter,
+    mut store: Option<&mut MemberStore>,
+    levels: &[ExportLevelCtx<'_>],
+    progress: &mut ExportProgress,
+) -> Result<Vec<ZoomReport>, ExportError> {
+    if let [level] = levels {
+        return Ok(vec![export_level(writer, store, level, progress)?]);
+    }
+    let timers = &progress.profile.timers;
+    let t_group = Instant::now();
+    // `take_wave` needs the store mutably, so drain every level's single wave
+    // before the parallel section. The group cap bounds what this holds.
+    let mut taken: Vec<Option<Vec<Member>>> = Vec::with_capacity(levels.len());
+    for level in levels {
+        taken.push(match store.as_deref_mut() {
+            Some(s) if !level.plan.partitions.is_empty() => {
+                Some(ExportTimers::time(&timers.spill_read, || {
+                    s.take_wave(level.level_idx, 0)
+                })?)
+            }
+            _ => None,
+        });
+    }
+    let encoded: Vec<(Vec<Vec<EncodedTile>>, f64)> = levels
+        .par_iter()
+        .zip(taken)
+        .map(|(level, members)| {
+            let plan = level.plan;
+            let tiles = match members {
+                _ if plan.partitions.is_empty() => Vec::new(),
+                Some(m) => {
+                    encode_wave_members(m, &plan.partitions, plan.zoom, level.options, timers)?
+                }
+                None => process_wave(&level.level_ctx(timers), &plan.partitions)?,
+            };
+            Ok((tiles, t_group.elapsed().as_secs_f64()))
+        })
+        .collect::<Result<_, ExportError>>()?;
+
+    let mut reports = Vec::with_capacity(levels.len());
+    for (level, (results, encode_secs)) in levels.iter().zip(encoded) {
+        let mut tally = LevelTally::default();
+        write_encoded_tiles(
+            writer,
+            level.plan.zoom,
+            &results,
+            &mut tally,
+            &progress.profile.timers,
+        )?;
+        let total_waves = level.plan.partitions.len().div_ceil(level.plan.wave);
+        let wall_secs = encode_secs + tally.write_secs;
+        reports.push(finish_level(
+            level,
+            &tally,
+            total_waves,
+            wall_secs,
+            progress,
+        ));
+    }
+    Ok(reports)
+}
+
+/// One level's running totals while its tiles go to the writer.
+#[derive(Default)]
+struct LevelTally {
+    tile_count: usize,
+    tile_feature_count: usize,
+    oversized: usize,
+    encode_dropped: usize,
+    encode_quantized: usize,
+    write_secs: f64,
+    bytes_written: u64,
+}
+
+/// Append one wave's encoded tiles to the writer in order, and add them to
+/// `tally`.
+fn write_encoded_tiles(
+    writer: &mut StreamingPmtilesWriter,
+    zoom: u8,
+    results: &[Vec<EncodedTile>],
+    tally: &mut LevelTally,
+    timers: &ExportTimers,
+) -> Result<(), ExportError> {
+    let t_write = Instant::now();
+    for t in results.iter().flatten() {
+        tally.encode_dropped += t.encode_dropped;
+        tally.encode_quantized += t.encode_quantized;
+        if t.feature_count == 0 {
+            // #431: an all-dropped tile is a tally carrier, not a tile.
+            continue;
+        }
+        tally.tile_feature_count += t.feature_count;
+        tally.bytes_written += t.data.len() as u64;
+        if t.oversized {
+            tally.oversized += 1;
+        }
+        writer.add_tile_precompressed(
+            zoom,
+            t.x,
+            t.y,
+            t.hash,
+            &t.data,
+            t.raw_len,
+            t.feature_count,
+        )?;
+        tally.tile_count += 1;
+    }
+    let write_dur = t_write.elapsed();
+    tally.write_secs += write_dur.as_secs_f64();
+    // #535: `spool_write` is exactly this per-wave window — the serial
+    // per-tile `writer.add_tile_precompressed` calls above, same span
+    // `write_secs` already measures for the `[profile]` log.
+    add_nanos(&timers.spool_write, write_dur);
+    Ok(())
+}
+
+/// Log a written level, record its profile entry, and build its report.
+/// `wall_secs` is the level's own wall: its wave loop in [`export_level`],
+/// or the group start to its encode finish plus its write in
+/// [`export_level_group`].
+fn finish_level(
+    level: &ExportLevelCtx<'_>,
+    tally: &LevelTally,
+    total_waves: usize,
+    wall_secs: f64,
+    progress: &mut ExportProgress,
+) -> ZoomReport {
+    let ExportLevelCtx {
+        scan,
+        plan,
+        level_idx,
+        num_levels,
+        start,
+        ..
+    } = *level;
+    let zoom = plan.zoom;
+    let tile_count = tally.tile_count;
     // Per-level summary at info so operators see progress without RUST_LOG
     // (env_logger defaults to info). Detailed clip/write split stays debug.
     log::info!(
         "[export] level {}/{num_levels} z{zoom} done: {} feats, {tile_count} tiles, \
-         {} partitions, {:.1}s (total {:.0}s)",
+         {} partitions, {wall_secs:.1}s (total {:.0}s)",
         level_idx + 1,
         scan.feature_count,
-        partitions.len(),
-        t_tiles.elapsed().as_secs_f64(),
+        plan.partitions.len(),
         start.elapsed().as_secs_f64(),
     );
     log::debug!(
         "[profile] z{zoom} (level {level_idx}, {} feats, {tile_count} tiles, {} partitions): \
-         clip+encode+gzip={:.2}s write={write_secs:.2}s",
+         clip+encode+gzip={:.2}s write={:.2}s",
         scan.feature_count,
-        partitions.len(),
-        t_tiles.elapsed().as_secs_f64() - write_secs,
+        plan.partitions.len(),
+        wall_secs - tally.write_secs,
+        tally.write_secs,
     );
 
     let profile = &mut progress.profile;
     profile.per_zoom.push(ExportZoomProfile {
         zoom,
-        wall_secs: t_tiles.elapsed().as_secs_f64(),
+        wall_secs,
         tiles: tile_count,
-        features: tile_feature_count,
-        bytes: bytes_written,
+        features: tally.tile_feature_count,
+        bytes: tally.bytes_written,
     });
     profile.waves_total += total_waves;
     progress.sample_boundary_rss();
-    Ok(ZoomReport {
+    ZoomReport {
         zoom,
         level: level_idx,
         level_feature_count: scan.feature_count,
         tile_count,
-        tile_feature_count,
-        oversized_tiles: oversized,
-        encode_dropped_features: encode_dropped,
-        encode_quantized_features: encode_quantized,
-    })
+        tile_feature_count: tally.tile_feature_count,
+        oversized_tiles: tally.oversized,
+        encode_dropped_features: tally.encode_dropped,
+        encode_quantized_features: tally.encode_quantized,
+    }
 }
 
 // ============================================================================
@@ -3030,6 +3307,18 @@ fn encode_wave_from_store(
     timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     let members = ExportTimers::time(&timers.spill_read, || store.take_wave(level_idx, wave_idx))?;
+    encode_wave_members(members, wave, zoom, opts, timers)
+}
+
+/// [`encode_wave_from_store`] after the take: bucket a wave's members per
+/// partition and encode the partitions in parallel, in ascending order.
+fn encode_wave_members(
+    members: Vec<Member>,
+    wave: &[Partition],
+    zoom: u8,
+    opts: &ExportOptions,
+    timers: &ExportTimers,
+) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     for m in members {
         buckets[route_partition(wave, m.key)].push(m);
@@ -4715,18 +5004,42 @@ fn select_kept_members(members: &[Member], keep: usize) -> Vec<&Member> {
     }
 }
 
+/// Members at which [`build_mvt`] encodes a tile's geometries in parallel
+/// (#647). Coarse zooms hold a few tiles with thousands of members each (a
+/// single z3 tile of the Madagascar fixture is 489 KB), and the per-tile
+/// parallel section in [`encode_members`] runs each of those on one thread.
+/// Below this size the fan-out costs more than it saves.
+const PARALLEL_ENCODE_MIN_MEMBERS: usize = 512;
+
 /// Build the MVT bytes for a sequence of tile members.
+///
+/// The geometry encode (projection, quantization, ring cleaning) is pure per
+/// member, so on a tile with [`PARALLEL_ENCODE_MIN_MEMBERS`] or more members
+/// it runs in parallel. Tag interning stays serial, in member order, which
+/// keeps the key/value tables and the bytes identical to the serial loop.
 fn build_mvt<'a>(
     members: impl IntoIterator<Item = &'a Member>,
     tb: &TileBounds,
     opts: &ExportOptions,
 ) -> TileMvt {
+    let members: Vec<&Member> = members.into_iter().collect();
+    let encoded: Vec<EncodedFeatureGeometry> = if members.len() >= PARALLEL_ENCODE_MIN_MEMBERS {
+        members
+            .par_iter()
+            .map(|m| EncodedFeatureGeometry::encode(&m.geom, tb, opts.extent))
+            .collect()
+    } else {
+        members
+            .iter()
+            .map(|m| EncodedFeatureGeometry::encode(&m.geom, tb, opts.extent))
+            .collect()
+    };
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
-    for (i, m) in members.into_iter().enumerate() {
+    for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
         // #443: a resolved `--feature-id` always wins; the no-flag default
         // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
         let id = m.id.unwrap_or(i as u64);
-        layer.add_feature(Some(id), &m.geom, &m.props, tb);
+        layer.add_encoded_feature(Some(id), geom, &m.props);
     }
     let features = layer.feature_count();
     let unencodable = layer.dropped_features();
@@ -6655,6 +6968,205 @@ mod tests {
             std::fs::read(t_wide.path()).unwrap(),
             "archive bytes diverge between wave widths 1 and 16"
         );
+    }
+
+    fn plan_with_members(zoom: u8, counts: &[usize], wave: usize) -> LevelPlan {
+        LevelPlan {
+            zoom,
+            partitions: partitions_with_members(counts),
+            wave,
+        }
+    }
+
+    /// #647: consecutive single-wave levels coalesce into one group while
+    /// their summed members fit the cap; a multi-wave level, or a level that
+    /// alone overshoots the cap, runs on its own exactly as before.
+    #[test]
+    fn plan_level_groups_coalesces_single_wave_levels_under_the_cap() {
+        let plans = vec![
+            plan_with_members(3, &[10], 6),
+            plan_with_members(4, &[], 6), // empty level: zero members
+            plan_with_members(5, &[30], 6),
+            plan_with_members(6, &[40, 20], 6),
+            plan_with_members(7, &[90], 6), // 40+20+90 > 100: starts a new group
+            plan_with_members(8, &[5; 7], 6), // 7 partitions / wave 6: multi-wave
+            plan_with_members(9, &[500], 6), // alone over the cap
+            plan_with_members(10, &[1], 6),
+        ];
+        assert_eq!(
+            plan_level_groups(&plans, 100),
+            vec![0..4, 4..5, 5..6, 6..7, 7..8],
+        );
+        // A cap of 0 (or 1) degenerates to the serial schedule.
+        assert_eq!(
+            plan_level_groups(&plans, 0),
+            (0..plans.len()).map(|i| i..i + 1).collect::<Vec<_>>(),
+        );
+        assert!(plan_level_groups(&[], 100).is_empty());
+    }
+
+    /// #647: the group cap is one full ceiling-width wave of target-sized
+    /// partitions, narrowed by the same RAM budget the #311 per-level guard
+    /// uses when the member size and RAM are both known.
+    #[test]
+    fn level_group_member_cap_respects_the_wave_ram_budget() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        // Unknown member size or RAM: the wave-shaped cap alone.
+        assert_eq!(
+            level_group_member_cap(6, 32_768, None, Some(GIB)),
+            6 * 32_768
+        );
+        assert_eq!(
+            level_group_member_cap(6, 32_768, Some(600), None),
+            6 * 32_768
+        );
+        // Roomy RAM never widens past the wave-shaped cap.
+        assert_eq!(
+            level_group_member_cap(6, 32_768, Some(100), Some(256 * GIB)),
+            6 * 32_768
+        );
+        // Tight RAM narrows it: 1 GiB × 0.5 / (1000 B × 2) = 268_435.
+        assert_eq!(
+            level_group_member_cap(16, 32_768, Some(1000), Some(GIB)),
+            (GIB / 2 / 2000) as usize
+        );
+    }
+
+    /// #647: a checkpoint may only follow a group whose tiles are all
+    /// appended, and it is capped at the group's finest zoom. The final group
+    /// never checkpoints, since `finalize` follows it.
+    #[test]
+    fn checkpoint_zoom_after_group_covers_only_finished_levels() {
+        let zooms = [3, 5, 7, 9];
+        assert_eq!(checkpoint_zoom_after_group(&(0..3), &zooms), Some(7));
+        assert_eq!(checkpoint_zoom_after_group(&(0..1), &zooms), Some(3));
+        assert_eq!(checkpoint_zoom_after_group(&(3..4), &zooms), None);
+        assert_eq!(checkpoint_zoom_after_group(&(1..4), &zooms), None);
+    }
+
+    /// #647: running a group of levels concurrently is scheduling only. Every
+    /// pass-2 path (duplicating per-wave reads, the partitioning legacy read,
+    /// and the single-read store under both backings) must write the same
+    /// bytes and report as the strictly serial level loop.
+    #[test]
+    fn concurrent_levels_are_byte_identical_to_serial() {
+        let t_dup = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(t_dup.path());
+        let t_part = tempfile::NamedTempFile::new().unwrap();
+        partitioning_equivalence_fixture(t_part.path());
+        let knob_sets = [
+            (true, None),
+            (false, Some(SinkBacking::Ram)),
+            (false, Some(SinkBacking::Spill)),
+        ];
+        for input in [t_dup.path(), t_part.path()] {
+            for (target, wave) in [(DEFAULT_PARTITION_TARGET, 6), (1, 16), (1, 1)] {
+                let opts = ExportOptions {
+                    layer_name: "ref".to_string(),
+                    partition_wave: wave,
+                    ..Default::default()
+                };
+                for (force_legacy_pass2, backing_override) in knob_sets {
+                    let run = |concurrent_levels: bool| {
+                        let out = tempfile::NamedTempFile::new().unwrap();
+                        let report = export_pmtiles_run(
+                            input,
+                            out.path(),
+                            &opts,
+                            target,
+                            &Pass2Knobs {
+                                force_legacy_pass2,
+                                backing_override,
+                                concurrent_levels,
+                            },
+                        )
+                        .unwrap();
+                        (std::fs::read(out.path()).unwrap(), report.zooms)
+                    };
+                    let (serial_bytes, serial_zooms) = run(false);
+                    let (concurrent_bytes, concurrent_zooms) = run(true);
+                    assert_eq!(
+                        concurrent_bytes, serial_bytes,
+                        "concurrent levels diverge (target {target}, wave {wave}, \
+                         legacy {force_legacy_pass2}, {backing_override:?})"
+                    );
+                    assert_eq!(concurrent_zooms, serial_zooms);
+                }
+            }
+        }
+    }
+
+    /// #647: a tile with many members encodes its geometries in parallel.
+    /// The bytes and tallies must match the serial `add_feature` loop: same
+    /// first-encounter key/value tables, same feature order, same counts of
+    /// empty and collapsed members.
+    #[test]
+    fn build_mvt_parallel_geometry_encode_matches_serial() {
+        let tb = TileCoord::new(0, 0, 1).bounds();
+        let opts = ExportOptions::default();
+        let n = PARALLEL_ENCODE_MIN_MEMBERS * 3;
+        let members: Vec<Member> = (0..n)
+            .map(|i| {
+                let x = -170.0 + (i % 300) as f64 * 0.5;
+                let y = 10.0 + (i / 300) as f64 * 0.5;
+                let geom = match i % 5 {
+                    0 => Geometry::Point(Point::new(x, y)),
+                    1 => Geometry::Polygon(geo::Polygon::new(
+                        LineString::from(vec![(x, y), (x + 0.4, y), (x + 0.4, y + 0.4), (x, y)]),
+                        vec![],
+                    )),
+                    // Collapses at the tile extent: a quantized drop.
+                    2 => Geometry::Polygon(geo::Polygon::new(
+                        LineString::from(vec![(x, y), (x + 1e-9, y), (x + 1e-9, y + 1e-9), (x, y)]),
+                        vec![],
+                    )),
+                    // No coordinates: an unencodable drop.
+                    3 => Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![])),
+                    _ => Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+                        Geometry::Point(Point::new(x, y)),
+                        Geometry::LineString(LineString::from(vec![(x, y), (x + 0.3, y + 0.2)])),
+                    ])),
+                };
+                let props = vec![
+                    (
+                        "name".to_string(),
+                        PropertyValue::String(format!("f{}", i % 37)),
+                    ),
+                    ("rank".to_string(), PropertyValue::Int((i % 11) as i64)),
+                ];
+                Member {
+                    key: 0,
+                    seq: i as u64,
+                    geom,
+                    props: Arc::new(props),
+                    id: None,
+                }
+            })
+            .collect();
+
+        let mut serial = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
+        for (i, m) in members.iter().enumerate() {
+            serial.add_feature(Some(i as u64), &m.geom, &m.props, &tb);
+        }
+        let (features, unencodable, quantized) = (
+            serial.feature_count(),
+            serial.dropped_features(),
+            serial.quantized_features(),
+        );
+        assert!(
+            unencodable > 0 && quantized > 0,
+            "fixture must exercise both drops"
+        );
+        let mut tile = TileBuilder::new();
+        tile.add_layer(serial.build());
+        let serial_bytes = tile.build().encode_to_vec();
+
+        let parallel = build_mvt(members.iter(), &tb, &opts);
+        assert_eq!(parallel.data, serial_bytes);
+        assert_eq!(parallel.features, features);
+        assert_eq!(parallel.unencodable, unencodable);
+        assert_eq!(parallel.quantized, quantized);
     }
 
     /// Rewrite overview file `src` to `dst` row group for row group (same

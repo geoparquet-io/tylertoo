@@ -407,6 +407,32 @@ tiles — where vertex count carries no signal — instead keep a uniform stride
 across member (Hilbert) order, so the surviving dots stay spatially spread
 rather than clumped in one corner.
 
+**Concurrent level groups (#647).** Levels used to export strictly one after
+another. A coarse level has one partition and at most a few hundred tiles, so
+on madagascar-adm4 z3–z10 ran at 1.1–1.7 of 4 cores, about a third of the
+export wall. `plan_level_groups` now joins consecutive levels that each fit
+in one wave into one group, while the group's summed members stay within
+`level_group_member_cap`. That cap is one full ceiling-width wave of
+target-sized partitions (`ceiling × partition_target`), which is the most a
+serial wave already holds. On `auto` it also narrows to what fits in the
+#311 RAM budget. `export_level_group` encodes the group's levels in one
+Rayon section and then writes them in level order. Every tile id at zoom `z`
+is below every id at `z + 1`, so the writer still sees ascending ids and the
+archive is byte-identical (`concurrent_levels_are_byte_identical_to_serial`
+covers every pass-2 path). A multi-wave level, or a level that alone exceeds
+the cap, is a group of one and runs the unchanged wave loop. Checkpoints are
+taken only between groups, so they never cover a zoom that is still in
+flight.
+
+Inside a tile, `build_mvt` encodes member geometries in parallel once a tile
+holds `PARALLEL_ENCODE_MIN_MEMBERS` (512) members. A coarse zoom has a few
+very large tiles (one z3 tile on madagascar-adm4 is 489 KB), and the
+per-tile parallel section otherwise ran each one on a single thread. The
+geometry encode is pure per member. Tag interning stays serial in member
+order, so the key and value tables, and so the bytes, do not change. The
+gzip of one tile stays single-threaded, because a parallel deflate would
+change the compressed bytes.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on
@@ -447,9 +473,10 @@ emits `[export]`-prefixed `log::info!` lines — visible under the CLI's default
 `done` summary (level *i/N*, zoom, feats, tiles, partitions, elapsed), and a
 throttled within-level **wave counter** (`WAVE_LOG_INTERVAL`, 30 s) so a stuck
 level is diagnosable in minutes (counter frozen) vs merely slow (counter
-advancing). After each finished level — throttled to `CHECKPOINT_INTERVAL`
-(60 s), so fast exports that finish in one `finalize` pay nothing —
-`writer.checkpoint()` snapshots a valid archive capped at that zoom, so an
+advancing). After each finished level group (#647), throttled to
+`CHECKPOINT_INTERVAL` (60 s) so fast exports that finish in one `finalize`
+pay nothing, `writer.checkpoint()` snapshots a valid archive capped at the
+group's finest zoom, so an
 interrupted run keeps its finished coarse zooms instead of losing hours of
 compute. `checkpoint` and `finalize` route through the same assembler, so the
 final archive is **byte-identical** whether or not any checkpoints were taken

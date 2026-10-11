@@ -1459,6 +1459,52 @@ impl ScalarKey {
     }
 }
 
+/// One input feature's encoded MVT geometry, before its tags are interned.
+/// See [`LayerBuilder::add_encoded_feature`].
+pub(crate) enum EncodedFeatureGeometry {
+    /// One `(commands, type)` per MVT feature to emit: one for a single
+    /// geometry, or one per geometry kind a `GeometryCollection` holds
+    /// (#431). Never empty.
+    Parts(Vec<(Vec<u32>, GeomType)>),
+    /// The input had no coordinates at all (#431).
+    Unencodable,
+    /// The input had coordinates that collapsed at the tile extent.
+    Quantized,
+}
+
+impl EncodedFeatureGeometry {
+    /// Encode `geometry` for a tile. Pure: it reads only its arguments.
+    ///
+    /// A `GeometryCollection` is split with [`flatten_geometry_collection`]
+    /// into one part per geometry kind present (polygons, lines, points, in
+    /// that draw order). Parts that encode to nothing are skipped, since MVT
+    /// 2.1 §4.2 requires a geometry.
+    pub(crate) fn encode(geometry: &Geometry, bounds: &TileBounds, extent: u32) -> Self {
+        let parts: Vec<(Vec<u32>, GeomType)> = match geometry {
+            Geometry::GeometryCollection(gc) => flatten_geometry_collection(gc)
+                .iter()
+                .map(|part| encode_geometry(part, bounds, extent))
+                .filter(|(commands, _)| !commands.is_empty())
+                .collect(),
+            _ => {
+                let encoded = encode_geometry(geometry, bounds, extent);
+                if encoded.0.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![encoded]
+                }
+            }
+        };
+        if !parts.is_empty() {
+            Self::Parts(parts)
+        } else if geometry.coords_count() == 0 {
+            Self::Unencodable
+        } else {
+            Self::Quantized
+        }
+    }
+}
+
 /// Builder for encoding features into an MVT layer.
 pub struct LayerBuilder {
     name: String,
@@ -1599,53 +1645,41 @@ impl LayerBuilder {
         properties: &[(String, PropertyValue)],
         bounds: &TileBounds,
     ) {
-        let emitted = match geometry {
-            Geometry::GeometryCollection(gc) => {
-                let mut tags: Option<Vec<u32>> = None;
-                let mut any = false;
-                for part in flatten_geometry_collection(gc) {
-                    let (commands, geom_type) = encode_geometry(&part, bounds, self.extent);
-                    if commands.is_empty() {
-                        continue;
-                    }
-                    // Intern the tags once, on the first part that survives.
-                    let tags = tags.get_or_insert_with(|| self.encode_tags(properties));
+        let encoded = EncodedFeatureGeometry::encode(geometry, bounds, self.extent);
+        self.add_encoded_feature(id, encoded, properties);
+    }
+
+    /// The order-dependent half of [`Self::add_feature`]: intern the tags and
+    /// push the features for a geometry already encoded by
+    /// [`EncodedFeatureGeometry::encode`].
+    ///
+    /// The geometry half is pure and depends only on the geometry, the tile
+    /// bounds and the extent, so a caller may encode a tile's geometries in
+    /// any order or in parallel. Calling this in member order then builds
+    /// exactly the bytes [`Self::add_feature`] builds, because key and value
+    /// indices come from first-encounter order here.
+    pub(crate) fn add_encoded_feature(
+        &mut self,
+        id: Option<u64>,
+        encoded: EncodedFeatureGeometry,
+        properties: &[(String, PropertyValue)],
+    ) {
+        match encoded {
+            EncodedFeatureGeometry::Parts(parts) => {
+                // Intern the tags once and share them across a collection's
+                // parts.
+                let tags = self.encode_tags(properties);
+                for (commands, geom_type) in parts {
                     self.features.push(Feature {
                         id,
                         tags: tags.clone(),
                         r#type: Some(geom_type as i32),
                         geometry: commands,
                     });
-                    any = true;
-                }
-                any
-            }
-            _ => {
-                let (commands, geom_type) = encode_geometry(geometry, bounds, self.extent);
-                // Skip empty geometries: polygons that quantize to nothing at
-                // this zoom (MVT 2.1 §4.2 requires a geometry).
-                if commands.is_empty() {
-                    false
-                } else {
-                    let tags = self.encode_tags(properties);
-                    self.features.push(Feature {
-                        id,
-                        tags,
-                        r#type: Some(geom_type as i32),
-                        geometry: commands,
-                    });
-                    true
                 }
             }
-        };
-        if !emitted {
-            // A geometry with no coordinates at all had nothing to encode;
-            // one with coordinates collapsed at this extent.
-            if geometry.coords_count() == 0 {
-                self.unencodable += 1;
-            } else {
-                self.quantized += 1;
-            }
+            EncodedFeatureGeometry::Unencodable => self.unencodable += 1,
+            EncodedFeatureGeometry::Quantized => self.quantized += 1,
         }
     }
 
