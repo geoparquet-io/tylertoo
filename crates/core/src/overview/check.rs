@@ -682,6 +682,22 @@ fn check_cluster_sum_invariant(
     }
 }
 
+/// Rows per batch for the cluster sum-invariant read (#607): the reader's
+/// default of 1024, lowered as [`super::reader::OverviewReader`] lowers its
+/// own so one batch of the widest byte-array column stays under arrow's
+/// 2 GiB offset limit. Without it a file whose geometries average over ~2 MB
+/// fails with "index overflow decoding byte array".
+fn cluster_read_batch_rows(metadata: &ParquetMetaData) -> usize {
+    crate::input_set::capped_batch_rows(
+        CLUSTER_READ_BATCH_ROWS,
+        crate::input_set::widest_byte_array_column(metadata, None, 0).as_ref(),
+    )
+}
+
+/// The parquet reader's default batch size, which the cluster sum-invariant
+/// read uses when no column is wide enough to need fewer rows.
+const CLUSTER_READ_BATCH_ROWS: usize = 1024;
+
 /// Per level: `(point-row count, Σ point_count over point rows)`, read from
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
@@ -715,8 +731,10 @@ fn cluster_sum_by_level(
     let geom_field = schema.field(geom_idx).clone();
 
     let mask = ProjectionMask::roots(builder.parquet_schema(), [geom_idx, pc_idx, level_idx]);
+    let batch_rows = cluster_read_batch_rows(builder.metadata());
     let reader = builder
         .with_projection(mask)
+        .with_batch_size(batch_rows)
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -1649,5 +1667,45 @@ mod tests {
         assert!(failed.contains(&"geoparquet_covering_declared"));
         assert!(failed.contains(&"overviews_key_present"));
         assert!(failed.contains(&"level_column"));
+    }
+
+    /// Writes a one-row-group file with `rows` rows of `row_bytes` bytes each
+    /// in a binary column, and returns its footer.
+    fn wide_rows_meta(rows: usize, row_bytes: usize) -> ParquetMetaData {
+        use arrow_array::BinaryArray;
+        use parquet::arrow::ArrowWriter;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            false,
+        )]));
+        let row = vec![7u8; row_bytes];
+        let values: Vec<&[u8]> = (0..rows).map(|_| row.as_slice()).collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(BinaryArray::from(values))])
+            .unwrap();
+        {
+            let file = File::create(tmp.path()).unwrap();
+            let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        meta_of(tmp.path())
+    }
+
+    #[test]
+    fn cluster_read_batch_rows_lowers_the_default_for_wide_rows() {
+        // #607: 4 MiB rows put 1024 of them at 4 GiB, past arrow's i32
+        // offsets. The clamp keeps a batch near 1 GiB: 256 rows.
+        let md = wide_rows_meta(4, 4 << 20);
+        let rows = cluster_read_batch_rows(&md);
+        assert!(rows < CLUSTER_READ_BATCH_ROWS, "{rows}");
+        assert!((rows as u64) * (4 << 20) <= 1 << 31, "{rows}");
+    }
+
+    #[test]
+    fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
+        let md = wide_rows_meta(16, 100);
+        assert_eq!(cluster_read_batch_rows(&md), CLUSTER_READ_BATCH_ROWS);
     }
 }
