@@ -103,6 +103,11 @@ sets fit in a fraction of available RAM, with a floor of 6, or a cap of 16
 when tylertoo cannot probe RAM. Export logs its choice at start. Pass a smaller
 number on a shared machine, or a larger one to keep more cores busy.
 
+Coarse zooms are too small to fill the cores one at a time, so export runs
+consecutive small zooms together. The group holds at most as many features as
+one full wave, so `--partition-wave` also bounds it. The archive is the same
+byte for byte.
+
 ### Interrupted exports
 
 After each finished zoom, at most once a minute, export logs a checkpoint

@@ -3680,6 +3680,10 @@ pub(super) struct ExportZoomProfile {
     /// partitioning-mode fill (`phase_walls.fill`, which does the band reads,
     /// decode and clip for every level up front) and the checkpoint after
     /// the level; in duplicating mode it includes the per-wave reads/clip.
+    /// In a concurrent level group (#647) it runs from the start of this
+    /// zoom's collect to the end of its write, including any wait for a
+    /// coarser zoom of the group. A group's zooms overlap and do not sum to
+    /// `phase_walls.levels`.
     pub(super) wall_secs: f64,
     pub(super) tiles: usize,
     pub(super) features: usize,

@@ -407,6 +407,48 @@ tiles — where vertex count carries no signal — instead keep a uniform stride
 across member (Hilbert) order, so the surviving dots stay spatially spread
 rather than clumped in one corner.
 
+**Concurrent level groups (#647).** Levels used to export strictly one after
+another. A coarse level has one partition and at most a few hundred tiles, so
+on madagascar-adm4 z3–z10 ran at 1.1–1.7 of 4 cores, about a third of the
+export wall. `plan_level_groups` now joins consecutive levels that each fit
+in one wave into one group, while the group's summed members stay within
+`level_group_member_cap`. That cap is one full ceiling-width wave of
+target-sized partitions (`ceiling × partition_target`), which is the most a
+serial wave already holds. On `auto` it also narrows to what fits in the
+#311 RAM budget. The cap counts members only. A group can also hold the
+encoded tiles of a level that finished before a coarser one, and these are
+smaller than the members they come from.
+
+`export_level_group` collects the levels' members on the calling thread, one
+level at a time and in level order, as the serial loop does. Each collected
+level then encodes in its own Rayon task while the next level is collected.
+The collect stays off the Rayon pool because the legacy read blocks on a
+channel. In a Rayon task it would park a worker, and a worker waiting in a
+nested join could pick up another level's read and block under it.
+
+`GroupCommit` writes each level as soon as it and every coarser level of the
+group are encoded, then takes a due checkpoint. Every tile id at zoom `z` is
+below every id at `z + 1`, so the writer still sees ascending ids and the
+archive is byte-identical (`concurrent_levels_are_byte_identical_to_serial`
+and `level_groups_commit_and_checkpoint_every_level_in_order` cover every
+pass-2 path). A checkpoint after level `z` covers only levels that are fully
+written. When a level fails, every coarser level of its group is already
+written and, when due, checkpointed. A multi-wave level, or a level that
+alone exceeds the cap, is a group of one and runs the unchanged wave loop.
+
+Inside a tile, `build_mvt` encodes member geometries in parallel once the
+tile holds at least `PARALLEL_ENCODE_MIN_COORDS` (4,096) vertices over two or
+more members. A coarse zoom has a few very large tiles (one z3 tile on
+madagascar-adm4 is 489 KB), and the per-tile parallel section otherwise ran
+each one on a single thread. The threshold counts vertices because the
+encode cost follows them, so a tile of a few large polygons qualifies. On an
+idle 16-core pool the parallel encode broke even at about 500–1,000
+vertices and ran 1.4–3.5× faster at 4,096. The geometry encode is pure per
+member. Tag interning stays serial in member order, so the key and value
+tables, and so the bytes, do not change. The gzip of one tile stays
+single-threaded, because a parallel deflate would change the compressed
+bytes.
+
 Border duplication is the expected delta between overview level counts and
 export per-zoom feature totals (a feature spanning a tile seam appears in
 every tile it touches): 0% while a level fits one tile, ~7% at z14 on
@@ -447,9 +489,10 @@ emits `[export]`-prefixed `log::info!` lines — visible under the CLI's default
 `done` summary (level *i/N*, zoom, feats, tiles, partitions, elapsed), and a
 throttled within-level **wave counter** (`WAVE_LOG_INTERVAL`, 30 s) so a stuck
 level is diagnosable in minutes (counter frozen) vs merely slow (counter
-advancing). After each finished level — throttled to `CHECKPOINT_INTERVAL`
-(60 s), so fast exports that finish in one `finalize` pay nothing —
-`writer.checkpoint()` snapshots a valid archive capped at that zoom, so an
+advancing). After each finished level group (#647), throttled to
+`CHECKPOINT_INTERVAL` (60 s) so fast exports that finish in one `finalize`
+pay nothing, `writer.checkpoint()` snapshots a valid archive capped at the
+group's finest zoom, so an
 interrupted run keeps its finished coarse zooms instead of losing hours of
 compute. `checkpoint` and `finalize` route through the same assembler, so the
 final archive is **byte-identical** whether or not any checkpoints were taken

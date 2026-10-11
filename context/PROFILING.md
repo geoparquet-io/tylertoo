@@ -510,6 +510,14 @@ band reads, decode, and clip for every level up front, in
 `phase_walls.fill`) and the checkpoint after the level. In duplicating mode
 it includes the per-wave reads and clip.
 
+A zoom in a concurrent level group (#647) reports the time from the start
+of its own collect to the end of its own write. This includes any wait for
+a coarser zoom of the group to be written first. The zooms of a group
+overlap, so their `wall_secs` values do **not** add up to
+`phase_walls.levels`. The debug `[profile]` line for such a zoom gives its
+own work as `clip+encode+gzip` (read, decode, clip, encode and gzip), without
+the write or the wait.
+
 `export.per_zoom[].bytes` is the **compressed** (gzipped) tile bytes the zoom
 produced, summed over every tile handed to the writer and counted **before
 the writer's content-hash dedup**. A duplicated tile (for example, an all-ocean tile)
