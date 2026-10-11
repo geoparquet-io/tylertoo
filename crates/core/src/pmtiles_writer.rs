@@ -6422,4 +6422,82 @@ mod tests {
         );
         assert!(!verify_clustered(&path).unwrap(), "and the file agrees");
     }
+
+    // -------------------------------------------------------------------------
+    // Publication metadata (name / description / attribution)
+    // -------------------------------------------------------------------------
+
+    /// The archive's metadata JSON, read the way a client does: header
+    /// offsets, then the header's declared internal codec.
+    fn archive_metadata_json(bytes: &[u8]) -> String {
+        let header = Header::from_bytes(bytes).expect("header must parse");
+        let start = header.json_metadata_offset as usize;
+        let end = start + header.json_metadata_length as usize;
+        let plain = compression::decompress(&bytes[start..end], header.internal_compression)
+            .expect("metadata must decompress");
+        String::from_utf8(plain).expect("metadata must be UTF-8")
+    }
+
+    /// Fixed tiles + structural setters shared by the publication tests, so a
+    /// buffered and a streaming archive describe the same content.
+    const PUB_TILES: [(u8, u32, u32, &[u8], usize); 3] = [
+        (0, 0, 0, &[0x1a, 0x05, b'h', b'e', b'l', b'l', b'o'], 2),
+        (1, 0, 0, &[0x1a, 0x03, b'a', b'b', b'c'], 1),
+        (1, 1, 1, &[0x1a, 0x03, b'x', b'y', b'z'], 1),
+    ];
+
+    fn pub_fields() -> HashMap<String, String> {
+        HashMap::from([("name".to_string(), "String".to_string())])
+    }
+
+    fn buffered_fixture() -> PmtilesWriter {
+        let mut w = PmtilesWriter::new();
+        w.set_layer_name("parks");
+        w.set_fields(pub_fields());
+        w.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
+        for (z, x, y, data, n) in PUB_TILES {
+            w.add_tile_with_count(z, x, y, data, n).unwrap();
+        }
+        w
+    }
+
+    fn streaming_fixture() -> StreamingPmtilesWriter {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name("parks");
+        w.set_fields(pub_fields());
+        w.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
+        for (z, x, y, data, n) in PUB_TILES {
+            w.add_tile_with_count(z, x, y, data, n).unwrap();
+        }
+        w
+    }
+
+    /// The metadata both writers emitted before publication metadata
+    /// existed. Pinned verbatim: comparing the two modified writers with
+    /// each other could not show that either preserved the old output.
+    const PRE_PUBLICATION_METADATA: &str = concat!(
+        r#"{"vector_layers":[{"id":"parks","minzoom":0,"maxzoom":1,"#,
+        r#""fields":{"name":"String"}}],"#,
+        r#""tilestats":{"layerCount":1,"layers":[{"layer":"parks","count":4,"attributeCount":1}]},"#,
+        r#""format":"pbf","generator":"tylertoo"}"#
+    );
+
+    #[test]
+    fn default_metadata_is_unchanged_from_pre_publication_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffered = dir.path().join("buffered.pmtiles");
+        let streaming = dir.path().join("streaming.pmtiles");
+        buffered_fixture().write_to_file(&buffered).unwrap();
+        streaming_fixture().finalize(&streaming).unwrap();
+
+        let b = fs::read(&buffered).unwrap();
+        let s = fs::read(&streaming).unwrap();
+        assert_eq!(archive_metadata_json(&b), PRE_PUBLICATION_METADATA);
+        assert_eq!(archive_metadata_json(&s), PRE_PUBLICATION_METADATA);
+        // Whole-archive checksum captured on the pre-feature writers, which
+        // agreed byte for byte on this fixture.
+        const PRE_PUBLICATION_XXH3: u64 = 2_244_932_714_967_856_363;
+        assert_eq!(xxhash_rust::xxh3::xxh3_64(&b), PRE_PUBLICATION_XXH3);
+        assert_eq!(xxhash_rust::xxh3::xxh3_64(&s), PRE_PUBLICATION_XXH3);
+    }
 }
