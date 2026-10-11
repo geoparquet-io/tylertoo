@@ -1972,6 +1972,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::ladder
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::ladder::EntryZoomKind
 pub enum tylertoo_core::overview::ladder::LadderError
 pub tylertoo_core::overview::ladder::LadderError::Empty
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched::column: alloc::string::String
+pub tylertoo_core::overview::ladder::LadderError::NoRungMatched::requested: alloc::string::String
 pub tylertoo_core::overview::ladder::LadderError::NonFiniteValue(f64)
 pub tylertoo_core::overview::ladder::LadderError::ZeroStep
 impl core::clone::Clone for tylertoo_core::overview::ladder::LadderError

@@ -1962,6 +1962,38 @@ fn entry_zoom_missing_column_is_rejected() {
     }
 }
 
+/// An explicit spec whose rungs all miss the column's values is reported as
+/// that: the column and the requested values, not "named no values", which
+/// sends the reader looking at a spec that did name values.
+#[test]
+fn entry_zoom_rungs_matching_no_value_are_rejected_by_name() {
+    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_banded_input(tin.path(), 2);
+        let o = ConvertOptions {
+            entry_zoom: Some(EntryZoomSpec {
+                column: "magnitude".to_string(),
+                kind: EntryZoomKind::Explicit(vec![(999.0, 2), (42.5, 4)]),
+            }),
+            ..opts(streaming)
+        };
+        let err = convert_to_overviews(tin.path(), tout.path(), &o).unwrap_err();
+        let ConvertError::InvalidConfig(m) = &err else {
+            panic!("streaming={streaming}: got {err}");
+        };
+        assert!(!m.contains("named no values"), "streaming={streaming}: {m}");
+        for want in ["magnitude", "999", "42.5"] {
+            assert!(
+                m.contains(want),
+                "streaming={streaming}: {want} missing from {m}"
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Class 8: zero-row levels after thinning (empty-level omission, all routes)
 // ============================================================================
