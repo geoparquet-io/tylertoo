@@ -1485,6 +1485,9 @@ struct Pass2Run {
     /// The zoom each checkpoint was capped at, in order.
     #[cfg_attr(not(test), allow(dead_code))]
     checkpoint_zooms: Vec<u8>,
+    /// Whether the levels read from the single-read member store (#235).
+    #[cfg_attr(not(test), allow(dead_code))]
+    single_read: bool,
 }
 
 fn export_pmtiles_run(
@@ -1818,6 +1821,7 @@ fn export_pmtiles_run(
         ),
         level_groups,
         checkpoint_zooms: progress.checkpoint_zooms,
+        single_read,
     })
 }
 
@@ -2245,15 +2249,11 @@ fn export_level(
             last_wave_log = Instant::now();
         }
     }
-    let wall_secs = t_tiles.elapsed().as_secs_f64();
     Ok(finish_level(
         level,
         &tally,
         total_waves,
-        LevelWalls {
-            wall_secs,
-            work_secs: wall_secs - tally.write_secs,
-        },
+        LevelWalls::serial(t_tiles.elapsed().as_secs_f64(), tally.write_secs),
         progress,
     ))
 }
@@ -2370,7 +2370,8 @@ fn export_level_group(
                 let encoded = tiles.map(|tiles| EncodedLevel {
                     tiles,
                     start,
-                    work_secs: collect_secs + t_encode.elapsed().as_secs_f64(),
+                    collect_secs,
+                    encode_secs: t_encode.elapsed().as_secs_f64(),
                 });
                 lock_commit(commit).finish(i, encoded);
             });
@@ -2421,9 +2422,10 @@ struct EncodedLevel {
     /// When the level's collect started: its wall in the profile runs from
     /// here to the end of its write.
     start: Instant,
-    /// The level's own collect and encode time, without the time it waited
-    /// for a coarser level.
-    work_secs: f64,
+    /// The level's collect time, on the calling thread.
+    collect_secs: f64,
+    /// The level's encode time, in its Rayon task.
+    encode_secs: f64,
 }
 
 /// The ordered write side of a concurrent level group (#647). Encode tasks
@@ -2494,10 +2496,11 @@ impl GroupCommit<'_> {
             level,
             &tally,
             level.plan.partitions.len().div_ceil(level.plan.wave),
-            LevelWalls {
-                wall_secs: encoded.start.elapsed().as_secs_f64(),
-                work_secs: encoded.work_secs,
-            },
+            LevelWalls::grouped(
+                encoded.start.elapsed().as_secs_f64(),
+                encoded.collect_secs,
+                encoded.encode_secs,
+            ),
             self.progress,
         );
         checkpoint_if_due(
@@ -2527,6 +2530,25 @@ struct LevelWalls {
     wall_secs: f64,
     /// Read, decode, clip, encode and gzip, without the write or any wait.
     work_secs: f64,
+}
+
+impl LevelWalls {
+    /// A level of the serial wave loop: all of its wall but the write.
+    fn serial(wall_secs: f64, write_secs: f64) -> Self {
+        Self {
+            wall_secs,
+            work_secs: wall_secs - write_secs,
+        }
+    }
+
+    /// A level of a concurrent group: its collect and its encode. The time
+    /// it waits for a coarser level, and its write, are not work.
+    fn grouped(wall_secs: f64, collect_secs: f64, encode_secs: f64) -> Self {
+        Self {
+            wall_secs,
+            work_secs: collect_secs + encode_secs,
+        }
+    }
 }
 
 /// One level's running totals while its tiles go to the writer.
@@ -7288,6 +7310,13 @@ mod tests {
             plan_with_members(5, &[1], 6),
         ];
         assert_eq!(plan_level_groups(&tiny, 1), vec![0..2, 2..3]);
+        // A multi-wave level under the cap does not open a group for the
+        // single-wave level after it.
+        let multi_first = vec![
+            plan_with_members(3, &[1; 7], 6),
+            plan_with_members(4, &[1], 6),
+        ];
+        assert_eq!(plan_level_groups(&multi_first, 100), vec![0..1, 1..2]);
         assert!(plan_level_groups(&[], 100).is_empty());
     }
 
@@ -7305,6 +7334,11 @@ mod tests {
         );
         assert_eq!(
             level_group_member_cap(6, 32_768, Some(600), None),
+            6 * 32_768
+        );
+        // A mean member size of 0 is unknown too, not a free member.
+        assert_eq!(
+            level_group_member_cap(6, 32_768, Some(0), Some(0)),
             6 * 32_768
         );
         // Roomy RAM never widens past the wave-shaped cap.
@@ -7375,6 +7409,11 @@ mod tests {
                     };
                     let (serial_bytes, serial) = run(false);
                     let (concurrent_bytes, concurrent) = run(true);
+                    // #235: only a partitioning export reads from the store,
+                    // and only when the test does not force the legacy read.
+                    let single_read = input == t_part.path() && !force_legacy_pass2;
+                    assert_eq!(serial.single_read, single_read, "{input:?}");
+                    assert_eq!(concurrent.single_read, single_read, "{input:?}");
                     assert!(
                         concurrent.level_groups.iter().any(|g| g.len() > 1),
                         "no level group formed (target {target}, wave {wave}): {:?}",
@@ -7496,6 +7535,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #229: a checkpoint is skipped until the throttle interval has passed
+    /// since the last one, after a serial level and after a level of a group.
+    #[test]
+    fn checkpoint_throttle_skips_levels_inside_the_interval() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        level_group_fixture(input.path(), Mode::Duplicating);
+        let opts = ExportOptions {
+            layer_name: "groups".to_string(),
+            partition_wave: 6,
+            ..Default::default()
+        };
+        for concurrent_levels in [false, true] {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                DEFAULT_PARTITION_TARGET,
+                &Pass2Knobs {
+                    checkpoint_interval: Duration::from_secs(3600),
+                    ..knobs(true, None, concurrent_levels)
+                },
+            )
+            .unwrap();
+            assert_eq!(run.report.zooms.len(), 4);
+            assert!(
+                run.checkpoint_zooms.is_empty(),
+                "concurrent {concurrent_levels}: {:?}",
+                run.checkpoint_zooms
+            );
+        }
+    }
+
+    /// #647: a level's work time is its own read, clip, encode and gzip. A
+    /// serial level's is its wall less its write. A grouped level's is its
+    /// collect plus its encode, without the wait for a coarser level.
+    #[test]
+    fn level_walls_count_only_the_level_own_work() {
+        let serial = LevelWalls::serial(5.0, 1.5);
+        assert_eq!((serial.wall_secs, serial.work_secs), (5.0, 3.5));
+        let grouped = LevelWalls::grouped(9.0, 2.0, 3.0);
+        assert_eq!((grouped.wall_secs, grouped.work_secs), (9.0, 5.0));
     }
 
     /// #647: when a level fails inside a group, the coarser levels of that
