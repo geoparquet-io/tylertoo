@@ -6798,12 +6798,45 @@ mod tests {
             .all(|&(_, mib)| mib <= true_anon));
     }
 
+    /// Runs the named test of this module alone in a child process. Returns
+    /// `true` inside that child, where the caller runs its body, and `false`
+    /// in the parent once the child has passed.
+    ///
+    /// RSS is per process. `cargo test --lib` (the Check job) runs every lib
+    /// test as a thread of one process, so another test that frees memory
+    /// mid-window shrinks the gap between a boundary sample and the sampled
+    /// peak below the margin these tests assert (#651). nextest already
+    /// gives each test its own process; the re-exec is harmless there.
+    fn run_alone(test: &str) -> bool {
+        const CHILD: &str = "TYLERTOO_RSS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let (_, module) = module_path!().split_once("::").expect("crate::module path");
+        let name = format!("{module}::{test}");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{name} failed in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
     /// #627: the anonymous peak is SAMPLED, not a boundary snapshot. An
     /// allocation that lives and dies inside one phase is invisible to the
     /// end-of-phase breakdown but must show in `phase_anon_peaks_mib` —
     /// the number an operator sizes a job from.
     #[test]
     fn rss_sampler_anon_peak_catches_an_allocation_the_boundary_snapshot_misses() {
+        if !run_alone("rss_sampler_anon_peak_catches_an_allocation_the_boundary_snapshot_misses") {
+            return;
+        }
         if read_proc_status().and_then(|m| m.anon_kib).is_none() {
             return; // no RssAnon on this platform
         }
@@ -7032,6 +7065,9 @@ mod tests {
     /// sampled without waiting out the production 250 ms cadence.
     #[test]
     fn rss_sampler_catches_a_peak_that_lives_and_dies_inside_one_phase() {
+        if !run_alone("rss_sampler_catches_a_peak_that_lives_and_dies_inside_one_phase") {
+            return;
+        }
         let sampler = RssSampler::start_if_with_interval(true, "phase-a", Duration::from_millis(5))
             .expect("profiling_on=true always starts a sampler");
 

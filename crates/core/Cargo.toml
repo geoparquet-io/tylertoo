@@ -63,8 +63,9 @@ log = { workspace = true }
 memory-stats = { workspace = true }
 flate2 = "1"
 # brotli and zstd follow parquet's majors (8 / 0.13) so each compiles once (#435).
-brotli = "9"
-zstd = "0.14"
+# Dependabot ignores newer majors; move them only with parquet (#649).
+brotli = "8"
+zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde = { workspace = true }
 serde_json = "1"
