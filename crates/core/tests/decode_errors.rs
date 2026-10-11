@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use tylertoo_core::archive_index::ArchiveIndex;
 use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES};
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
-use tylertoo_core::pmtiles_writer::{encode_directory, DirEntry, Header, MAX_LEAF_DIRECTORIES};
+use tylertoo_core::pmtiles_writer::{
+    encode_directory, tile_id, DirEntry, Header, MAX_LEAF_DIRECTORIES,
+};
 use tylertoo_core::{Compression, StreamingPmtilesWriter};
 
 /// A minimal MVT tile: one layer `t` with one point feature at (1, 1).
@@ -49,6 +51,32 @@ fn decode_err(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> DecodeError 
         .expect_err("damaged archive must fail to decode")
 }
 
+/// The error and every `source()` beneath it, joined the way anyhow's `{:#}`
+/// joins them. `DecodeError`'s own `Display` leaves the cause to the chain
+/// (#396), so assertions about the underlying codec error read this.
+fn chain(err: &DecodeError) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cur: Option<&dyn std::error::Error> = std::error::Error::source(err);
+    while let Some(e) = cur {
+        parts.push(e.to_string());
+        cur = e.source();
+    }
+    parts.join(": ")
+}
+
+/// #396: a variant that carries a `source` must not also print it in its own
+/// `Display`, or the CLI's anyhow chain shows the cause twice
+/// (`…: incomplete deflate stream` then `Caused by: incomplete deflate stream`).
+fn assert_cause_printed_once(err: &DecodeError) {
+    let source = std::error::Error::source(err)
+        .unwrap_or_else(|| panic!("{err:?} must expose its cause as source()"));
+    let cause = source.to_string();
+    assert!(
+        !err.to_string().contains(&cause),
+        "Display repeats the source; the chain would print {cause:?} twice: {err}"
+    );
+}
+
 #[test]
 fn directory_decompression_failure_names_section_and_offset() {
     let dir = tempfile::tempdir().unwrap();
@@ -78,10 +106,16 @@ fn directory_decompression_failure_names_section_and_offset() {
         msg.contains(&format!("{} bytes", damaged.root_dir_length)),
         "message must give the length, got: {msg}"
     );
+    let full = chain(&err);
     assert!(
-        msg.contains("deflate") || msg.contains("gzip") || msg.contains("corrupt"),
-        "message must keep the underlying decompression error, got: {msg}"
+        full.contains("deflate") || full.contains("gzip") || full.contains("corrupt"),
+        "the chain must keep the underlying decompression error, got: {full}"
     );
+    assert!(
+        matches!(&err, DecodeError::Decompress { .. }),
+        "got: {err:?}"
+    );
+    assert_cause_printed_once(&err);
 }
 
 #[test]
@@ -105,6 +139,64 @@ fn tile_decompression_failure_names_tile_and_offset() {
         msg.contains(&format!("offset {first_tile}")),
         "message must give the byte offset, got: {msg}"
     );
+    assert!(
+        matches!(&err, DecodeError::TileDecompress { .. }),
+        "got: {err:?}"
+    );
+    assert_cause_printed_once(&err);
+}
+
+#[test]
+fn undecodable_mvt_names_the_tile_and_prints_the_cause_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+
+    // Replace the tile data with one gzip stream that inflates fine but holds
+    // a truncated protobuf: field 3 (layers) claims 0x7F bytes, none follow.
+    let bad = compress(&[0x1A, 0x7F], header.tile_compression).unwrap();
+    let mut out = bytes[..header.tile_data_offset as usize].to_vec();
+    out.extend_from_slice(&bad);
+    let root = [DirEntry {
+        tile_id: tile_id(5, 0, 7),
+        offset: 0,
+        length: bad.len() as u32,
+        run_length: 1,
+    }];
+    let enc = compress(&encode_directory(&root), header.internal_compression).unwrap();
+    header.tile_data_length = bad.len() as u64;
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = enc.len() as u64;
+    out.extend_from_slice(&enc);
+    out[..127].copy_from_slice(&header.to_bytes());
+
+    let err = decode_err(&dir, "bad-mvt.pmtiles", &out);
+    assert!(
+        matches!(
+            &err,
+            DecodeError::Mvt {
+                z: 5,
+                x: 0,
+                y: 7,
+                ..
+            }
+        ),
+        "expected an MVT decode error for z5/0/7, got: {err:?}"
+    );
+    assert_cause_printed_once(&err);
+}
+
+#[test]
+fn missing_input_prints_the_io_cause_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = decode_pmtiles(
+        dir.path().join("absent.pmtiles"),
+        dir.path().join("out.parquet"),
+        &DecodeOptions::default(),
+    )
+    .expect_err("a missing input must fail");
+    assert!(matches!(&err, DecodeError::Io(_)), "got: {err:?}");
+    assert_cause_printed_once(&err);
 }
 
 /// Append a hand-built root directory (and optionally a leaf directory) to a
@@ -283,7 +375,7 @@ fn directory_decompression_bomb_is_capped() {
         bomb.len()
     );
     let err = decode_err(&dir, "bomb.pmtiles", &with_raw_root(&bytes, &bomb));
-    let msg = err.to_string();
+    let msg = chain(&err);
     assert!(
         msg.contains("root directory") && msg.contains("exceeds"),
         "expected a capped-decompression error naming the section, got: {msg}"
@@ -390,7 +482,7 @@ fn tile_body_decompression_bomb_is_capped() {
     out[..127].copy_from_slice(&header.to_bytes());
 
     let err = decode_err(&dir, "tile-bomb.pmtiles", &out);
-    let msg = err.to_string();
+    let msg = chain(&err);
     assert!(
         matches!(&err, DecodeError::TileDecompress { .. }) && msg.contains("exceeds"),
         "expected a capped tile decompression naming the tile, got: {msg}"
