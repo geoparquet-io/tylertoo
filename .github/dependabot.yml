@@ -77,6 +77,18 @@ updates:
       - dependency-name: "parquet"
         update-types: ["version-update:semver-major"]
 
+      # brotli and zstd track the majors parquet depends on (8 and 0.13 for
+      # parquet 59), so each codec, and zstd-sys's C build, compiles once.
+      # A grouped bump past them (#624) linked two copies of each (#649).
+      # Raise these ceilings together with parquet when arrow-rs moves.
+      #
+      # These use version ranges, not update-types: Dependabot calls
+      # 0.13 -> 0.14 a minor bump, although Cargo treats it as breaking.
+      - dependency-name: "brotli"
+        versions: [">= 9"]
+      - dependency-name: "zstd"
+        versions: [">= 0.14"]
+
   # Python dev tooling (crates/python: pyproject.toml + uv.lock; the shipped
   # wheel has no Python runtime deps, so this is all dev/lint tooling)
   - package-ecosystem: "pip"
