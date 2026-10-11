@@ -1,4 +1,6 @@
-# tylertoo
+<p align="center">
+  <img src="https://raw.githubusercontent.com/geoparquet-io/tylertoo/main/docs/assets/logo-full.png" alt="tylertoo" width="320">
+</p>
 
 [![CI](https://github.com/geoparquet-io/tylertoo/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/tylertoo/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/geoparquet-io/tylertoo/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/tylertoo)
