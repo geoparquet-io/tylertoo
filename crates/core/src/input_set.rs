@@ -2890,7 +2890,8 @@ b.parquet
         let dir = tmpdir();
         let f = dir.path().join("geo.parquet");
         // Row group 0: two 16-byte geometries. Row group 1: two 4096-byte
-        // geometries. `name` holds 1000 bytes per row in both groups.
+        // geometries. `name` holds 1000 bytes per row in both groups, and
+        // `empty` holds only empty strings.
         let blobs: Vec<Vec<u8>> = [16, 16, 4096, 4096].map(|n| vec![0u8; n]).into();
         let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
         let names: Vec<String> = (0..4).map(|_| "n".repeat(1000)).collect();
@@ -2899,10 +2900,12 @@ b.parquet
             vec![
                 Field::new("geometry", DataType::Binary, false),
                 Field::new("name", DataType::Utf8, false),
+                Field::new("empty", DataType::Utf8, false),
             ],
             vec![
                 Arc::new(BinaryArray::from_vec(refs)),
                 Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(vec![""; 4])),
             ],
             Some(2),
         );
@@ -2922,6 +2925,10 @@ b.parquet
         let names_only = largest_byte_array_column(meta, None, |root| root == 1).unwrap();
         assert_eq!(names_only.column, "name");
         assert!(largest_byte_array_column(meta, None, |_| false).is_none());
+        assert!(
+            largest_byte_array_column(meta, None, |root| root == 2).is_none(),
+            "a column holding no bytes is not a largest column"
+        );
     }
 
     /// The batch cap keeps an average batch at half the ceiling, never

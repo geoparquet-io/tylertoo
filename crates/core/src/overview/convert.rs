@@ -8142,6 +8142,80 @@ mod tests {
         let unlimited = load_input_table_with_limit(&source, single.input(), &opts, u64::MAX)
             .expect("the real ceiling reads a small input");
         assert_eq!(unlimited.full.num_rows(), geoms.len());
+
+        // The ceiling is inclusive: a total equal to it fits one batch.
+        let at_limit =
+            load_input_table_with_limit(&source, single.input(), &opts, largest.total_bytes)
+                .expect("a total equal to the ceiling fits");
+        assert_eq!(at_limit.full.num_rows(), geoms.len());
+    }
+
+    /// #606: the message reports both sizes in GiB.
+    #[test]
+    fn in_memory_byte_array_message_reports_sizes_in_gib() {
+        let largest = crate::input_set::LargestByteArrayColumn {
+            column: "geometry".into(),
+            total_bytes: 5 << 29,
+        };
+        let msg = in_memory_byte_array_too_large_message(
+            &largest,
+            &crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        );
+        assert!(msg.contains("'geometry' holds 2.50 GiB"), "{msg}");
+        assert!(msg.contains("beyond the 2.00 GiB"), "{msg}");
+    }
+
+    /// #606: the in-memory total counts only the columns the reader decodes
+    /// with i32 offsets. A `LargeUtf8` column, and a column the source's
+    /// projection leaves out, cannot overflow the concat.
+    #[test]
+    fn in_memory_byte_array_check_skips_large_and_unprojected_columns() {
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let n = 4;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("notes", DataType::LargeUtf8, false),
+        ]));
+        let geometry = arrow_array::BinaryArray::from_vec(vec![&[0u8; 10][..]; n]);
+        let label = StringArray::from(vec!["l".repeat(500); n]);
+        let notes = arrow_array::LargeStringArray::from(vec!["n".repeat(2000); n]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(geometry), Arc::new(label), Arc::new(notes)],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let limit = 1000;
+
+        // `label` (2000 bytes) passes the ceiling; `notes` (8000) is larger
+        // but decodes with i64 offsets.
+        let all = ConvertSource::resolve_path(&input).unwrap();
+        let ConvertSource::Single(single) = &all else {
+            panic!("one file resolves to a single source");
+        };
+        let builder = single.input().open().unwrap();
+        let err = check_in_memory_byte_array_total(&all, &builder, None, limit).unwrap_err();
+        let ConvertError::InMemoryByteArrayTooLarge { largest, .. } = &err else {
+            panic!("expected InMemoryByteArrayTooLarge, got {err:?}");
+        };
+        assert_eq!(largest.column, "label");
+
+        // Without `label`, nothing counted passes the ceiling.
+        let projected = ConvertSource::resolve_path(&input).unwrap();
+        projected.restrict_columns(vec![0, 2]).unwrap();
+        let ConvertSource::Single(single) = &projected else {
+            panic!("one file resolves to a single source");
+        };
+        let builder = single.input().open().unwrap();
+        check_in_memory_byte_array_total(&projected, &builder, None, limit)
+            .expect("an unprojected column and a LargeUtf8 column are not counted");
     }
 
     /// Partitions disagreeing on CRS are rejected at resolve time with an
