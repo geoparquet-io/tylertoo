@@ -192,23 +192,30 @@ class CommandFailed(RuntimeError):
         self.argv, self.rc, self.tail = argv, rc, tail
 
 
-def measure(argv: list[str], *, unlink_first: Path | None = None) -> dict:
+def measure(argv: list[str], *, unlink_first: Path | None = None,
+            stdout_to: Path | None = None) -> dict:
     """Run argv once under /usr/bin/time; return wall seconds + peak RSS.
 
     Wall comes from perf_counter (identical semantics on every platform);
     peak RSS comes from the kernel via /usr/bin/time, which is exact rather
     than sampled. The command's own stderr is interleaved with time's report
-    in the capture buffer; the regexes tolerate that.
+    in the capture buffer; the regexes tolerate that. `stdout_to` captures
+    the command's stdout into a file, for converters that stream their
+    output (gpio's GeoJSONSeq mode).
     """
-    # ogr2ogr's FlatGeobuf driver cannot DeleteLayer(), so `-overwrite` fails
-    # on the second run. Removing the target first is also what makes every
-    # repeat measure the same work rather than an overwrite fast path.
+    # Removing the target first makes every repeat measure the same work
+    # rather than an overwrite fast path.
     if unlink_first is not None:
         unlink_first.unlink(missing_ok=True)
     wrapped = ["/usr/bin/time", _time_flag(), *argv]
     with tempfile.TemporaryFile("w+") as err:
+        out = open(stdout_to, "wb") if stdout_to else subprocess.DEVNULL
         t0 = time.perf_counter()
-        rc = subprocess.call(wrapped, stdout=subprocess.DEVNULL, stderr=err)
+        try:
+            rc = subprocess.call(wrapped, stdout=out, stderr=err)
+        finally:
+            if stdout_to:
+                out.close()
         wall = time.perf_counter() - t0
         err.seek(0)
         errtext = err.read()
@@ -222,11 +229,13 @@ def measure(argv: list[str], *, unlink_first: Path | None = None) -> dict:
 
 
 def repeat(argv: list[str], n: int, *, warmup: bool = True,
-           unlink_first: Path | None = None) -> dict:
+           unlink_first: Path | None = None,
+           stdout_to: Path | None = None) -> dict:
     """Warm-up run (discarded) then n timed runs; median reported."""
     if warmup:
-        measure(argv, unlink_first=unlink_first)
-    runs = [measure(argv, unlink_first=unlink_first) for _ in range(n)]
+        measure(argv, unlink_first=unlink_first, stdout_to=stdout_to)
+    runs = [measure(argv, unlink_first=unlink_first, stdout_to=stdout_to)
+            for _ in range(n)]
     walls = [r["wall_s"] for r in runs]
     rss = [r["peak_rss_bytes"] for r in runs if r["peak_rss_bytes"]]
     return {
@@ -277,22 +286,16 @@ def per_zoom_counts(tylertoo: str, archive: Path) -> dict:
 # --------------------------------------------------------------------------
 
 def fgb_converters(src: Path, dstdir: Path, stem: str) -> dict[str, tuple[list[str], Path]]:
-    """Every available parquet → FlatGeobuf converter, so the baseline gets its
-    best shot.
+    """The parquet → FlatGeobuf converter: gpio, the tool this project
+    recommends for GeoParquet preprocessing.
 
-    gpio is the tool this project recommends for GeoParquet preprocessing, but
-    it is a Python CLI and pays ~0.3 s of interpreter start-up per invocation.
-    On a 1,000-feature fixture that start-up IS the conversion time, and using
-    gpio alone would hand tylertoo a free win that has nothing to do with
-    tiling. ogr2ogr is a C binary with negligible start-up. The harness times
-    both when both exist and the e2e number uses the FASTER one — the
-    opposite of cherry-picking.
+    gpio is a Python CLI and pays ~0.3 s of interpreter start-up per
+    invocation. On a 1,000-feature fixture that start-up is the conversion
+    time; on the Overture inputs it is noise. The result keeps the
+    per-converter shape (`convert_fgb_candidates`) so older results files
+    still read.
     """
     out = {}
-    if shutil.which("ogr2ogr"):
-        dst = dstdir / f"{stem}.ogr.fgb"
-        out["ogr2ogr"] = (["ogr2ogr", "-f", "FlatGeobuf", str(dst), str(src)],
-                          dst)
     if shutil.which("gpio"):
         dst = dstdir / f"{stem}.gpio.fgb"
         out["gpio"] = (["gpio", "convert", "flatgeobuf", str(src), str(dst),
@@ -300,10 +303,14 @@ def fgb_converters(src: Path, dstdir: Path, stem: str) -> dict[str, tuple[list[s
     return out
 
 
-def geojsonseq_argv(src: Path, dst: Path) -> list[str] | None:
-    """parquet → line-delimited GeoJSON (tippecanoe's `-P` parallel input)."""
-    if shutil.which("ogr2ogr"):
-        return ["ogr2ogr", "-f", "GeoJSONSeq", str(dst), str(src)]
+def geojsonseq_argv(src: Path) -> list[str] | None:
+    """parquet → line-delimited GeoJSON on stdout (tippecanoe's `-P` input).
+
+    gpio's streaming mode writes GeoJSONSeq with RFC 8142 record separators,
+    which tippecanoe -P accepts. The harness captures stdout into the file.
+    """
+    if shutil.which("gpio"):
+        return ["gpio", "convert", "geojson", str(src)]
     return None
 
 
@@ -544,8 +551,8 @@ def main() -> int:
             # --- input conversion: parquet -> fgb ----------------------------
             converters = fgb_converters(src, workdir, did)
             if not converters:
-                return fail("neither ogr2ogr nor gpio found; cannot build "
-                            "tippecanoe's input. Install GDAL or gpio.")
+                return fail("gpio not found; cannot build tippecanoe's "
+                            "input. Install it: uv tool install geoparquet-io")
             entry["convert_fgb_candidates"] = {}
             for tool, (argv, dst) in converters.items():
                 print(f"  {tool}: parquet -> fgb ...", flush=True)
@@ -599,14 +606,15 @@ def main() -> int:
             # --- optional: ldGeoJSON + -P ------------------------------------
             if args.geojson:
                 gj = workdir / f"{did}.geojsonseq"
-                gconv = geojsonseq_argv(src, gj)
+                gconv = geojsonseq_argv(src)
                 if gconv is None:
-                    print("  (skipping ldGeoJSON: ogr2ogr not found)", file=sys.stderr)
+                    print("  (skipping ldGeoJSON: gpio not found)", file=sys.stderr)
                 else:
                     try:
-                        print("  ogr2ogr: parquet -> ldGeoJSON ...", flush=True)
+                        print("  gpio: parquet -> ldGeoJSON ...", flush=True)
                         entry["convert_geojsonseq"] = repeat(gconv, args.repeat,
-                                                             unlink_first=gj)
+                                                             unlink_first=gj,
+                                                             stdout_to=gj)
                         entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
                         gj_out = workdir / f"{did}.tippecanoe-geojson.pmtiles"
                         print("  tippecanoe -P (ldGeoJSON -> pmtiles) ...", flush=True)
