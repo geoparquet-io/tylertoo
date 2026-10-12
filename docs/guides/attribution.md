@@ -43,7 +43,10 @@ application decides how to render the markup, so write only attribution HTML
 you trust.
 
 An unset flag leaves its key out of the archive. This differs from tippecanoe,
-which fills `name` and `description` with the output filename when you give none.
+which names the tileset after the output file when `-n` is unset and copies the
+name into `description` when `-N` is unset. A tippecanoe command with `-n` but
+no `-N` therefore writes the name twice; pass `--description` with the same
+value to keep that.
 An empty value (`--attribution ''`) is a real value: tylertoo writes an empty
 string.
 

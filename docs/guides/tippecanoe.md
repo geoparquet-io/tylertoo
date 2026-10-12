@@ -21,7 +21,7 @@ For admin boundaries, parcels, or a choropleth, use `--verbatim` or raise
 | `-zg` guess the maximum zoom | `--max-zoom auto` | Uses a bounded sample of feature extents and spacing at 256 px per tile, capped at z16. Inspired by `-zg`; the algorithm differs. Both reject input with nothing to measure |
 | `-l` layer name | `--layer-name` | Set at export |
 | `-L` one layer per input | `pyramid --band LO-HI:INPUT:LAYER …` with bands sharing a zoom range | Each band has its own ladder; tiles at shared zooms contain every layer |
-| `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive; tippecanoe fills name and description with the output filename. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
+| `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder. tylertoo anchors on the full canonical count, so the default differs |
