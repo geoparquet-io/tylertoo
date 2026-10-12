@@ -253,8 +253,7 @@ enum Command {
     GenReferenceDocs,
 }
 
-/// The archive's top-level publication metadata (tippecanoe's `-n`, `-N`
-/// and `-A`), shared by every command that writes a PMTiles archive.
+/// Top-level publication metadata for a PMTiles archive.
 ///
 /// `--layer-name` names the MVT layer; these describe the tileset. Each is
 /// stored exactly as given, and an empty string is kept as one.
