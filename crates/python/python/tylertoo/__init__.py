@@ -354,8 +354,8 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         feature_id: Integer column to use as the MVT feature ID.
         spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
             used when memory runs short.
-        name: Human-readable tileset name for the archive metadata.
-        description: Tileset description for the archive metadata.
+        name: Human-readable tileset name, stored in the metadata.
+        description: Description of the tileset, stored in the metadata.
         attribution: Attribution text or HTML stored in the archive
             metadata; MapLibre shows it in its attribution control.
             Each value is stored as given, and `""` is kept as `""`.

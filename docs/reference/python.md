@@ -167,6 +167,9 @@ export_pmtiles(
     min_zoom: int | None = None,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> ExportReport
 ```
 
@@ -186,6 +189,9 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `min_zoom`: Coarsest zoom to declare when the coarsest levels are empty.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
+* `name`: Human-readable tileset name, stored in the metadata.
+* `description`: Description of the tileset, stored in the metadata.
+* `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 
 ### Returns
 
@@ -202,6 +208,11 @@ Export an overview file to a PMTiles archive, one zoom per level.
 >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
 >>> report["max_zoom"]
 10
+>>> report = export_pmtiles(
+...     "overview.parquet",
+...     "out.pmtiles",
+...     attribution="© Example contributors",
+... )
 ```
 
 ## `validate`
@@ -250,7 +261,7 @@ convert(
 
 Convert GeoParquet to PMTiles in one call (deprecated).
 
-Use `overview()` followed by `export_pmtiles()` for all options.
+Use `overview()` followed by `export_pmtiles()` for all options, including the `name`, `description` and `attribution` metadata.
 
 ### Parameters
 

@@ -73,6 +73,7 @@ nav:
   - Guides:
       - Scaling: guides/scaling.md
       - Remote reads: guides/remote-reads.md
+      - Attribution: guides/attribution.md
       - Coming from tippecanoe: guides/tippecanoe.md
   - Reference:
       - CLI: reference/cli.md

@@ -597,6 +597,7 @@ pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometr
 pub fn tylertoo_core::ioverlay_clip::union_polygons_ioverlay(&[geo_types::geometry::polygon::Polygon<f64>]) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub mod tylertoo_core::merge
 pub struct tylertoo_core::merge::MergeOptions
+pub tylertoo_core::merge::MergeOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::merge::MergeOptions::work_dir: core::option::Option<std::path::PathBuf>
 impl core::clone::Clone for tylertoo_core::merge::MergeOptions
 pub fn tylertoo_core::merge::MergeOptions::clone(&self) -> tylertoo_core::merge::MergeOptions
@@ -1744,6 +1745,7 @@ pub tylertoo_core::overview::export::ExportOptions::extent: u32
 pub tylertoo_core::overview::export::ExportOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::export::ExportOptions::layer_name: alloc::string::String
+pub tylertoo_core::overview::export::ExportOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Option<u8>
 pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
@@ -1849,6 +1851,7 @@ pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
 pub fn tylertoo_core::overview::export::write_empty_archive(&std::path::Path, &str, u8, u8) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
+pub fn tylertoo_core::overview::export::write_empty_archive_with_metadata(&std::path::Path, &str, u8, u8, &tylertoo_core::TilesetMetadata) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::zoom_for_level(&tylertoo_core::overview::level::OverviewsMeta, usize) -> core::result::Result<u8, tylertoo_core::overview::export::ExportError>
 pub mod tylertoo_core::overview::filter
 pub enum tylertoo_core::overview::filter::CmpOp
@@ -2965,6 +2968,7 @@ pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_bounds(&mut self, &tyle
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_internal_compression(&mut self, tylertoo_core::compression::Compression)
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_layer_name(&mut self, &str)
+pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_metadata(&mut self, tylertoo_core::TilesetMetadata)
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_tile_compression(&mut self, tylertoo_core::compression::Compression)
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
 pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::tile_compression(&self) -> tylertoo_core::compression::Compression
@@ -2995,6 +2999,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_z
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_metadata(&mut self, tylertoo_core::TilesetMetadata)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::stats(&self) -> &tylertoo_core::pmtiles_writer::StreamingWriteStats
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::temp_path(&self) -> &std::path::Path
@@ -3087,6 +3092,7 @@ pub struct tylertoo_core::pyramid::PyramidOptions
 pub tylertoo_core::pyramid::PyramidOptions::allow_missing_zooms: bool
 pub tylertoo_core::pyramid::PyramidOptions::convert: tylertoo_core::overview::convert::ConvertOptions
 pub tylertoo_core::pyramid::PyramidOptions::export: tylertoo_core::overview::export::ExportOptions
+pub tylertoo_core::pyramid::PyramidOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::pyramid::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
 impl core::clone::Clone for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::clone(&self) -> tylertoo_core::pyramid::PyramidOptions
@@ -3120,6 +3126,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidRep
 pub fn tylertoo_core::pyramid::build_pyramid(&[tylertoo_core::pyramid::Band], &std::path::Path, &tylertoo_core::pyramid::PyramidOptions) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::classify_band_input(&std::path::Path) -> tylertoo_core::pyramid::BandSource
 pub fn tylertoo_core::pyramid::merge_bands(&[tylertoo_core::pyramid::Band], &std::path::Path) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
+pub fn tylertoo_core::pyramid::merge_bands_with_metadata(&[tylertoo_core::pyramid::Band], &std::path::Path, bool, &tylertoo_core::TilesetMetadata) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::merge_bands_with_options(&[tylertoo_core::pyramid::Band], &std::path::Path, bool) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::validate_bands(&[tylertoo_core::pyramid::Band]) -> core::result::Result<(), alloc::string::String>
 pub mod tylertoo_core::quality
@@ -3843,6 +3850,7 @@ pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_declared_min_z
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_expect_clustered(&mut self, bool)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_layer_name(&mut self, &str)
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_metadata(&mut self, tylertoo_core::TilesetMetadata)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::stats(&self) -> &tylertoo_core::pmtiles_writer::StreamingWriteStats
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::temp_path(&self) -> &std::path::Path
@@ -3878,6 +3886,32 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::StreamingWriteStats
+#[non_exhaustive] pub struct tylertoo_core::TilesetMetadata
+pub tylertoo_core::TilesetMetadata::attribution: core::option::Option<alloc::string::String>
+pub tylertoo_core::TilesetMetadata::description: core::option::Option<alloc::string::String>
+pub tylertoo_core::TilesetMetadata::name: core::option::Option<alloc::string::String>
+impl tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::new() -> Self
+pub fn tylertoo_core::TilesetMetadata::with_attribution(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn tylertoo_core::TilesetMetadata::with_description(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn tylertoo_core::TilesetMetadata::with_name(self, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::clone::Clone for tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::clone(&self) -> tylertoo_core::TilesetMetadata
+impl core::cmp::Eq for tylertoo_core::TilesetMetadata
+impl core::cmp::PartialEq for tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::eq(&self, &tylertoo_core::TilesetMetadata) -> bool
+impl core::default::Default for tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::default() -> tylertoo_core::TilesetMetadata
+impl core::fmt::Debug for tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::TilesetMetadata
+impl core::marker::Freeze for tylertoo_core::TilesetMetadata
+impl core::marker::Send for tylertoo_core::TilesetMetadata
+impl core::marker::Sync for tylertoo_core::TilesetMetadata
+impl core::marker::Unpin for tylertoo_core::TilesetMetadata
+impl core::marker::UnsafeUnpin for tylertoo_core::TilesetMetadata
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesetMetadata
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesetMetadata
 pub fn tylertoo_core::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
 pub type tylertoo_core::Result<T> = core::result::Result<T, tylertoo_core::Error>

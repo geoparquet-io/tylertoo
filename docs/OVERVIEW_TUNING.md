@@ -1265,6 +1265,11 @@ the archive. Set it when the output is large and `/tmp` is a small tmpfs.
 overlapping archives, such as different data at different zooms or several
 layers over the same zooms, use [`tylertoo pyramid`](#several-inputs-one-archive-tylertoo-pyramid).
 
+`merge` and `pyramid` also take `--name`, `--description`, and `--attribution`;
+an unset field is inherited from the inputs. The
+[attribution guide](guides/attribution.md#merged-and-pyramid-archives) has the
+rules.
+
 ### `tylertoo stats`
 
 For each zoom, `stats` prints the tile count and the total,
