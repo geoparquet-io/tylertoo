@@ -10,7 +10,8 @@
 #   ./overture.sh prep places        # gpio: Overture release -> sorted input
 #   ./overture.sh run places         # run_e2e.py, defaults + quality-matched
 #   ./overture.sh render places      # render_parity.py on both archive pairs
-#   ./overture.sh publish places S3  # archives + results + renders to S3
+#   ./overture.sh publish places     # archives + results + renders to
+#                                    # source coop ($PUBLISH overrides)
 #   ./overture.sh all places         # prep, run, render
 #
 # Everything lands under $DATA (default /data), which `setup` mounts on the
@@ -31,6 +32,12 @@ OVERTURE_RELEASE="2026-09-23.1"
 OVERTURE="s3://overturemaps-us-west-2/release/$OVERTURE_RELEASE"
 GPIO_VERSION="1.6.0"
 REPEAT="${REPEAT:-3}"
+# One tippecanoe run on 81M points takes on the order of an hour, so the
+# baseline side (gpio conversion + tippecanoe) runs once with no warm-up.
+# tylertoo keeps REPEAT timed runs after a warm-up. BASELINE_ONCE=0 restores
+# REPEAT for both sides.
+BASELINE_ONCE="${BASELINE_ONCE:-1}"
+PUBLISH="${PUBLISH:-s3://us-west-2.opendata.source.coop/nlebovits/tylertoo-benchmarks/overture-$OVERTURE_RELEASE}"
 RENDER_ZOOMS="${RENDER_ZOOMS:-2,4,6}"
 
 # --- datasets ----------------------------------------------------------------
@@ -159,8 +166,10 @@ cmd_run() {
   [ -f "$src" ] || { echo "run prep $1 first" >&2; exit 1; }
   mkdir -p "$work" "$DATA/results"
   provenance "$1" > "$DATA/results/provenance-$1.json"
+  local extra=()
+  [ "$BASELINE_ONCE" = 1 ] && extra+=(--baseline-once)
   log "run_e2e.py on $src"
-  python3 "$HERE/run_e2e.py" \
+  python3 "$HERE/run_e2e.py" "${extra[@]}" \
     --dataset "$1=$src" --only "$1" \
     --quality-matched --repeat "$REPEAT" \
     --work "$work" --keep \
@@ -182,6 +191,7 @@ provenance() {
   P_columns="$COLS" \
   P_where="$WHERE" \
   P_instance_type="$(md instance-type)" \
+  P_instance_lifecycle="$(md instance-life-cycle)" \
   P_availability_zone="$(md placement/availability-zone)" \
   P_ami="$(md ami-id)" \
   P_kernel="$(uname -r)" \
@@ -219,7 +229,7 @@ cmd_render() {
 
 # --- publish -----------------------------------------------------------------
 cmd_publish() {
-  local dest="${2:?usage: publish <dataset> s3://bucket/prefix}"
+  local dest="${2:-$PUBLISH}"
   local work="$DATA/work/$1"
   for f in "$work/$1".*.pmtiles; do
     aws s3 cp "$f" "$dest/$1/$(basename "$f")"

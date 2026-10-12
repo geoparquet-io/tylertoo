@@ -398,6 +398,12 @@ def machine_info() -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--baseline-once", action="store_true",
+                    help="run the gpio conversion and tippecanoe once each, "
+                         "with no warm-up; tylertoo keeps --repeat. For "
+                         "inputs where one tippecanoe run takes an hour and "
+                         "its run-to-run spread is small next to that. The "
+                         "results file records it")
     ap.add_argument("--repeat", type=int, default=3,
                     help="timed runs per measurement (median reported); default 3")
     ap.add_argument("--only", action="append", default=None,
@@ -460,6 +466,9 @@ def main() -> int:
     tyler_version = subprocess.check_output([tylertoo, "--version"],
                                             text=True).strip()
     tip_extra = args.tippecanoe_extra.split()
+    # The baseline side (gpio conversion + tippecanoe) under --baseline-once.
+    base_n = 1 if args.baseline_once else args.repeat
+    base_warm = not args.baseline_once
 
     # --- datasets ---------------------------------------------------------
     datasets = dict(DATASETS)
@@ -496,6 +505,7 @@ def main() -> int:
                 "min_zoom": args.min_zoom, "max_zoom": args.max_zoom,
                 "tile_buffer": TILE_BUFFER, "max_tile_bytes": MAX_TILE_BYTES,
                 "repeat": args.repeat, "warm_cache": True,
+                "baseline_repeat": base_n, "baseline_warmup": base_warm,
                 "tippecanoe_extra": tip_extra,
             },
             "datasets": {},
@@ -557,7 +567,8 @@ def main() -> int:
             for tool, (argv, dst) in converters.items():
                 print(f"  {tool}: parquet -> fgb ...", flush=True)
                 try:
-                    m = repeat(argv, args.repeat, unlink_first=dst)
+                    m = repeat(argv, base_n, warmup=base_warm,
+                               unlink_first=dst)
                 except CommandFailed as exc:
                     # A converter that cannot handle this dataset is a fact about
                     # the dataset, recorded rather than fatal — as long as one
@@ -587,7 +598,7 @@ def main() -> int:
             entry["tippecanoe_fgb"] = repeat(
                 tippecanoe_argv(tippecanoe, fgb, tp_out, ds["layer"],
                                 args.min_zoom, args.max_zoom, False, tip_extra),
-                args.repeat)
+                base_n, warmup=base_warm)
             entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
             entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
 
@@ -612,7 +623,8 @@ def main() -> int:
                 else:
                     try:
                         print("  gpio: parquet -> ldGeoJSON ...", flush=True)
-                        entry["convert_geojsonseq"] = repeat(gconv, args.repeat,
+                        entry["convert_geojsonseq"] = repeat(gconv, base_n,
+                                                             warmup=base_warm,
                                                              unlink_first=gj,
                                                              stdout_to=gj)
                         entry["convert_geojsonseq"]["output_bytes"] = gj.stat().st_size
@@ -621,7 +633,7 @@ def main() -> int:
                         entry["tippecanoe_geojsonseq"] = repeat(
                             tippecanoe_argv(tippecanoe, gj, gj_out, ds["layer"],
                                             args.min_zoom, args.max_zoom, True, tip_extra),
-                            args.repeat)
+                            base_n, warmup=base_warm)
                         entry["tippecanoe_geojsonseq"]["output_bytes"] = \
                             gj_out.stat().st_size
                         entry["tippecanoe_geojsonseq"]["per_zoom"] = \
@@ -811,9 +823,12 @@ def markdown_table(results: dict) -> str:
                  f"{results['tippecanoe']['version']} "
                  f"(pinned {results['tippecanoe']['sha']})")
     s = results["settings"]
+    runs = f"median of {s['repeat']} warm runs"
+    if s.get("baseline_warmup") is False:
+        runs = (f"tylertoo: {runs}; gpio + tippecanoe: "
+                f"{s['baseline_repeat']} run, no warm-up")
     lines.append(f"z{s['min_zoom']}–z{s['max_zoom']}, buffer {s['tile_buffer']}, "
-                 f"max tile {s['max_tile_bytes']} B, median of {s['repeat']} "
-                 f"warm runs")
+                 f"max tile {s['max_tile_bytes']} B, {runs}")
     lines.append("")
     lines.append("| dataset | tylertoo e2e | tylertoo e2e (quality-matched) | "
                  "tippecanoe e2e (convert+tile) | "
