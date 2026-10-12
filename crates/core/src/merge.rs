@@ -1304,6 +1304,53 @@ mod tests {
     }
 
     #[test]
+    fn merge_with_work_dir_preserves_publication_metadata_and_tiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pmtiles");
+        let out = dir.path().join("out.pmtiles");
+        let work_dir = dir.path().join("spool");
+        std::fs::create_dir(&work_dir).unwrap();
+        write_published_shard(&input, 0, TilesetMetadata::new().with_attribution("NPS"));
+
+        merge_shards(
+            std::slice::from_ref(&input),
+            &out,
+            &MergeOptions {
+                work_dir: Some(work_dir.clone()),
+                metadata: TilesetMetadata::new().with_name("Parks"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tiles_of(&out), tiles_of(&input));
+        assert_eq!(
+            publication_of(&out),
+            (Some(json!("Parks")), None, Some(json!("NPS")))
+        );
+        assert_eq!(std::fs::read_dir(&work_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn merge_metadata_skips_invalid_layer_ids_and_keeps_valid_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.pmtiles");
+        let out = dir.path().join("out.pmtiles");
+        write_shard_without_layers(
+            &input,
+            &[(6, 0, 0)],
+            r#"[null,{}, {"id":7}, {"id":"parks","minzoom":3,"maxzoom":8,"fields":{"area":"Number"}}]"#,
+        );
+        let report =
+            merge_with(std::slice::from_ref(&input), &out, TilesetMetadata::new()).unwrap();
+        assert_eq!(tiles_of(&out), tiles_of(&input));
+        assert_eq!((report.min_zoom, report.max_zoom), (3, 8));
+        assert_eq!(
+            metadata_of(&out)["vector_layers"],
+            json!([{"id":"parks","minzoom":3,"maxzoom":8,"fields":{"area":"Number"}}])
+        );
+    }
+
+    #[test]
     fn conflicting_names_fail_before_the_output_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));

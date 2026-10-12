@@ -12581,10 +12581,7 @@ mod tests {
         let start = header.json_metadata_offset as usize;
         let raw = &bytes[start..start + header.json_metadata_length as usize];
         let plain = compression::decompress(raw, header.internal_compression).unwrap();
-        match serde_json::from_slice(&plain).unwrap() {
-            serde_json::Value::Object(map) => map,
-            other => panic!("metadata root is not an object: {other}"),
-        }
+        serde_json::from_slice(&plain).expect("archive metadata must be a JSON object")
     }
 
     /// Every addressed tile's stored (compressed) bytes, by tile id.

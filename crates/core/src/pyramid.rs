@@ -4351,6 +4351,77 @@ mod tests {
     }
 
     #[test]
+    fn oversized_band_metadata_fails_before_touching_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("oversized.pmtiles");
+        write_published_band(&input, "parks", &[(3, 0, 0)], meta());
+        let mut raw = std::fs::read(&input).unwrap();
+        let mut header = Header::from_bytes(&raw).unwrap();
+        header.json_metadata_length = MAX_INTERNAL_BYTES + 1;
+        raw[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        std::fs::write(&input, raw).unwrap();
+
+        let existing = dir.path().join("existing.pmtiles");
+        std::fs::write(&existing, b"previous archive").unwrap();
+        let absent = dir.path().join("absent.pmtiles");
+        for output in [&existing, &absent] {
+            let err = merge_bands(&[band(&input, "parks", 3, 3)], output).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, Error::PMTilesWrite(_)), "{msg}");
+            assert!(msg.contains("oversized.pmtiles"), "{msg}");
+            assert!(
+                msg.contains(&format!("metadata claims {} bytes", MAX_INTERNAL_BYTES + 1)),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("{MAX_INTERNAL_BYTES}-byte ceiling")),
+                "{msg}"
+            );
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous archive");
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn unparseable_band_metadata_keeps_tiles_and_explicit_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("invalid-json.pmtiles");
+        let out = dir.path().join("out.pmtiles");
+        write_published_band(
+            &input,
+            "parks",
+            &[(3, 0, 0)],
+            meta().with_attribution("discarded"),
+        );
+        let mut raw = std::fs::read(&input).unwrap();
+        let mut header = Header::from_bytes(&raw).unwrap();
+        let gz = compression::compress(b"{", header.internal_compression).unwrap();
+        header.json_metadata_offset = raw.len() as u64;
+        header.json_metadata_length = gz.len() as u64;
+        raw[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        raw.extend_from_slice(&gz);
+        std::fs::write(&input, raw).unwrap();
+
+        let expected = meta().with_name("Parks").with_attribution("NPS");
+        merge_bands_with_metadata(&[band(&input, "parks", 3, 3)], &out, false, &expected).unwrap();
+        assert_eq!(publication(&out), expected);
+        let source = crate::archive_index::ArchiveIndex::open(&input).unwrap();
+        let merged = crate::archive_index::ArchiveIndex::open(&out).unwrap();
+        let source_tile = source.tiles().next().unwrap().unwrap();
+        let merged_tile = merged.tiles().next().unwrap().unwrap();
+        assert_eq!((merged_tile.z, merged_tile.x, merged_tile.y), (3, 0, 0));
+        assert_eq!(merged.tiles().count(), 1);
+        assert_eq!(
+            merged.read_range(merged_tile.range).unwrap(),
+            source.read_range(source_tile.range).unwrap()
+        );
+        assert_eq!(
+            merged.metadata_json().unwrap()["vector_layers"][0]["fields"],
+            json!({})
+        );
+    }
+
+    #[test]
     fn disjoint_bands_inherit_publication_metadata_in_any_order() {
         let dir = tempfile::tempdir().unwrap();
         let (coarse, fine) = (dir.path().join("c.pmtiles"), dir.path().join("f.pmtiles"));

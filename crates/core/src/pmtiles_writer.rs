@@ -6582,10 +6582,8 @@ mod tests {
     }
 
     fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
-        match serde_json::from_str(&archive_metadata_json(bytes)).expect("metadata is JSON") {
-            serde_json::Value::Object(map) => map,
-            other => panic!("metadata root is not an object: {other}"),
-        }
+        serde_json::from_str(&archive_metadata_json(bytes))
+            .expect("archive metadata must be a JSON object")
     }
 
     fn all_publication() -> TilesetMetadata {

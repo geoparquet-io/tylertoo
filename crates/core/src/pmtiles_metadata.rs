@@ -366,10 +366,19 @@ pub(crate) mod tests {
         let mut json = String::from(r#"{"generator":"tylertoo""#);
         meta.append_json_fields(&mut json);
         json.push('}');
-        match serde_json::from_str(&json).expect("appended fields must be valid JSON") {
-            serde_json::Value::Object(map) => map,
-            other => panic!("expected an object, got {other}"),
-        }
+        serde_json::from_str(&json).expect("appended fields must form a JSON object")
+    }
+
+    #[test]
+    fn metadata_byte_counter_flush_preserves_written_length() {
+        use std::io::Write;
+
+        let mut counter = ByteCounter(0);
+        counter.write_all(b"first").unwrap();
+        counter.flush().unwrap();
+        counter.write_all("\u{a9}".as_bytes()).unwrap();
+        counter.flush().unwrap();
+        assert_eq!(counter.0, 7);
     }
 
     #[test]
