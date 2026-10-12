@@ -1,10 +1,10 @@
 # Name, description, and attribution
 
 A PMTiles archive can carry a human-readable name, a description, and an
-attribution string. Viewers read the attribution and show it on the map, so
-data licenses that require a credit (OpenStreetMap, national agencies, open
-data portals) are met by the archive itself rather than by every page that
-embeds it.
+attribution string. The archive carries the credit; a viewer has to be set up
+to read and display it (see [MapLibre](#showing-the-attribution-in-maplibre)).
+A map that doesn't load the metadata shows no credit, so check what your data
+license requires of the page, not only of the file.
 
 Three flags set them. Each takes one string and is optional:
 
@@ -51,7 +51,15 @@ tylertoo doesn't infer a credit from the input file, its properties, or its
 GeoParquet metadata. State it yourself.
 
 An archive's metadata is limited to 16 MiB, before and after compression.
-A value that cannot fit is refused before any conversion starts.
+tylertoo checks early that your three values fit on their own, before any
+conversion work. That is only a lower bound: the structural metadata
+(`vector_layers` and the rest) adds bytes, and the compressed section is
+checked again when the archive is written, so a value near the limit can still
+be refused during writing.
+
+`tiles --plan-only` writes no archive, so it ignores these flags and reports
+them as ignored. It still checks their size, so a fleet's preflight catches a
+value no job could write.
 
 ## Merged and pyramid archives
 
@@ -75,6 +83,11 @@ all are kept. An already-joined credit stays one string and isn't split, so
 merging a merged archive can repeat a source's name. Pass an explicit
 `--attribution` for the final archive if that matters.
 
+An input's empty attribution (`""`) counts only when no input carries a
+credit: with any non-empty credit present, the empty ones are discarded. If
+every input's attribution is empty, the result is an empty string. An explicit
+`--attribution ''` is different: it replaces the whole inherited result.
+
 Sorting uses plain byte order, so the result doesn't depend on the order you
 list the inputs.
 
@@ -93,18 +106,16 @@ feature.
 
 ## Showing the attribution in MapLibre
 
-The PMTiles protocol for MapLibre GL JS reads the archive's metadata only when
-you ask it to. Without `metadata: true`, the map never sees the attribution:
+The PMTiles protocol for MapLibre GL JS reads an archive's metadata only when
+you ask it to. Create the protocol with the `metadata: true` option. Without
+it, the map never sees the attribution, and its attribution control shows
+only MapLibre's own credit. Leave the vector source's own `attribution`
+unset and MapLibre shows the archive's in that control, with links intact.
 
-```javascript
-const protocol = new pmtiles.Protocol({ metadata: true });
-maplibregl.addProtocol("pmtiles", protocol.tile);
-```
-
-Leave the vector source's own `attribution` unset and MapLibre shows the
-archive's, in its attribution control, with links intact. See the official
+The official
 [PMTiles for MapLibre GL JS](https://docs.protomaps.com/pmtiles/maplibre)
-example for a complete page.
+page has a complete example, including the protocol setup. tylertoo's docs
+tests don't run JavaScript, so this guide ships no script of its own.
 
 The archive's metadata is also what `pmtiles show` prints and what
 `PMTiles.getMetadata()` and `getTileJson()` return.
