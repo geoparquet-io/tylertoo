@@ -1658,11 +1658,15 @@ impl LayerBuilder {
     /// any order or in parallel. Calling this in member order then builds
     /// exactly the bytes [`Self::add_feature`] builds, because key and value
     /// indices come from first-encounter order here.
-    pub(crate) fn add_encoded_feature(
+    ///
+    /// Generic over the key type so the export can pass its per-schema
+    /// interned `Arc<str>` names (#461) without materializing a `String` per
+    /// feature; [`Self::add_feature`] passes `String` keys.
+    pub(crate) fn add_encoded_feature<K: AsRef<str>>(
         &mut self,
         id: Option<u64>,
         encoded: EncodedFeatureGeometry,
-        properties: &[(String, PropertyValue)],
+        properties: &[(K, PropertyValue)],
     ) {
         match encoded {
             EncodedFeatureGeometry::Parts(parts) => {
@@ -1684,10 +1688,10 @@ impl LayerBuilder {
     }
 
     /// Encode tags as `[key_idx, value_idx, key_idx, value_idx, ...]`.
-    fn encode_tags(&mut self, properties: &[(String, PropertyValue)]) -> Vec<u32> {
+    fn encode_tags<K: AsRef<str>>(&mut self, properties: &[(K, PropertyValue)]) -> Vec<u32> {
         let mut tags = Vec::with_capacity(properties.len() * 2);
         for (key, value) in properties {
-            let key_idx = self.get_or_insert_key(key);
+            let key_idx = self.get_or_insert_key(key.as_ref());
             let value_idx = self.get_or_insert_value(value);
             tags.push(key_idx);
             tags.push(value_idx);
