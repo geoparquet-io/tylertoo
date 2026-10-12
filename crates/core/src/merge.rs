@@ -172,7 +172,7 @@ pub fn merge_shards(
 
     // Computed once and reused: the same "did this input contribute anything"
     // question decides the zoom union AND which layer declarations are folded
-    // in (see `collect_layers`).
+    // in (see `read_input_metadata`).
     //
     // An input holding NO tiles is excluded, the same way a bounds-less one
     // is excluded from the bounds union. The writer stamps z0..z0 into an
@@ -193,12 +193,16 @@ pub fn merge_shards(
         }
     }
 
-    // Each input's metadata, parsed once for both the layer union and the
-    // publication metadata.
-    let metas: Vec<Option<Value>> = indexes.iter().map(ArchiveIndex::metadata_json).collect();
+    // Layers, zoom range and publication metadata come from one pass over the
+    // inputs, each metadata document parsed, folded in and dropped before the
+    // next is read: peak memory is one input's metadata, not all of them.
     // Resolved before any tile is copied, so a name conflict fails in
     // milliseconds rather than after the whole copy.
-    let publication = resolve_publication(&indexes, &metas, &has_tiles, &options.metadata)?;
+    let InputMetadata {
+        mut layers,
+        declared,
+        publication,
+    } = read_input_metadata(&indexes, &has_tiles, &options.metadata)?;
 
     let mut writer = match &options.work_dir {
         Some(dir) => StreamingPmtilesWriter::with_temp_dir(tile_compression, dir.clone()),
@@ -244,7 +248,6 @@ pub fn merge_shards(
     // otherwise produce byte-different archives whenever the inputs declare
     // more than one distinct layer between them. (With a single shared layer
     // — the normal shard case — order was already immaterial.)
-    let (mut layers, declared) = collect_layers(&indexes, &metas, &has_tiles);
     layers.sort_by(|a, b| a.id.cmp(&b.id));
 
     // The union of what the inputs *declare*, not of the zooms that happened
@@ -410,10 +413,23 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
     ))
 }
 
+/// What [`read_input_metadata`] folds out of the inputs' metadata.
+struct InputMetadata {
+    layers: Vec<LayerMeta>,
+    declared: Option<(u8, u8)>,
+    publication: TilesetMetadata,
+}
+
 /// Every `vector_layers` entry every input declares, in input order (the
-/// caller sorts), and the union of every tile-holding input's declared zoom
-/// range (header widened by its layers, see [`declared_zoom_range`]); `None`
-/// when no input holds a tile.
+/// caller sorts), the union of every tile-holding input's declared zoom
+/// range (header widened by its layers, see [`declared_zoom_range`]; `None`
+/// when no input holds a tile), and the merged archive's publication
+/// metadata: `overrides`, field by field, over what every input carries (see
+/// [`MetadataCollector`]).
+///
+/// Each input's metadata is parsed, folded into all three results and
+/// dropped before the next is read, so ignored fields and repeated credits
+/// never accumulate.
 ///
 /// Unparseable or absent metadata is not fatal — the tiles are still
 /// copyable, they just describe no fields — but it is worth a warning, since
@@ -422,85 +438,27 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
 /// declared union.
 ///
 /// `has_tiles[i]` says whether input `i` contributed any tile; a tile-less
-/// one is skipped entirely (#498). An empty shard's header and metadata carry
-/// the writer's z0..z0 sentinel, and folding that in drags the merged minzoom
-/// to z0 — the layer then claims zooms the build never produced, on the word
-/// of a job that produced nothing.
-fn collect_layers(
+/// one declares no layers or zooms (#498). An empty shard's header and
+/// metadata carry the writer's z0..z0 sentinel, and folding that in drags the
+/// merged minzoom to z0 — the layer then claims zooms the build never
+/// produced, on the word of a job that produced nothing. Its publication
+/// values do count, though: an empty shard was exported with the same values
+/// as its siblings, and a merge of nothing but empty shards should still
+/// carry them.
+fn read_input_metadata(
     indexes: &[ArchiveIndex],
-    metas: &[Option<Value>],
-    has_tiles: &[bool],
-) -> (Vec<LayerMeta>, Option<(u8, u8)>) {
-    let mut layers = Vec::new();
-    let mut declared: Option<(u8, u8)> = None;
-    for (i, (idx, meta)) in indexes.iter().zip(metas).enumerate() {
-        if !has_tiles.get(i).copied().unwrap_or(true) {
-            continue;
-        }
-        let header = (idx.header().min_zoom, idx.header().max_zoom);
-        let mut input_zooms: Vec<(u8, u8)> = Vec::new();
-        match meta {
-            None => log::warn!(
-                "{}: metadata is absent or not valid JSON; its layers are not declared in the \
-                 merged archive, and no name, description or attribution is inherited from it",
-                idx.path().display()
-            ),
-            Some(meta) => match meta.get("vector_layers").and_then(Value::as_array) {
-                None => log::warn!(
-                    "{}: metadata declares no vector_layers; its layers are not declared in the \
-                     merged archive",
-                    idx.path().display()
-                ),
-                Some(arr) => {
-                    for l in arr {
-                        let Some(id) = l.get("id").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let (minzoom, maxzoom) = layer_zoom_range(l, header, idx.path());
-                        input_zooms.push((minzoom, maxzoom));
-                        layers.push(LayerMeta {
-                            id: id.to_string(),
-                            minzoom,
-                            maxzoom,
-                            fields: l
-                                .get("fields")
-                                .filter(|f| f.is_object())
-                                .cloned()
-                                .unwrap_or_else(|| Value::Object(Default::default())),
-                        });
-                    }
-                }
-            },
-        }
-        let (lo, hi) = declared_zoom_range(header, true, input_zooms);
-        declared = Some(match declared {
-            Some((a, b)) => (a.min(lo), b.max(hi)),
-            None => (lo, hi),
-        });
-    }
-    (layers, declared)
-}
-
-/// The merged archive's publication metadata: `overrides`, field by field,
-/// over what every input carries (see [`MetadataCollector`]).
-///
-/// Tile-less inputs count too. An empty shard was exported with the same
-/// values as its siblings, and a merge of nothing but empty shards should
-/// still carry them.
-fn resolve_publication(
-    indexes: &[ArchiveIndex],
-    metas: &[Option<Value>],
     has_tiles: &[bool],
     overrides: &TilesetMetadata,
-) -> Result<TilesetMetadata> {
+) -> Result<InputMetadata> {
     let mut collector = MetadataCollector::new(overrides);
-    for ((idx, meta), &tiles) in indexes.iter().zip(metas).zip(has_tiles) {
-        match meta {
+    let mut layers = Vec::new();
+    let mut declared: Option<(u8, u8)> = None;
+    for (idx, &tiles) in indexes.iter().zip(has_tiles) {
+        let meta = idx.metadata_json();
+        match &meta {
             Some(root) => collector
                 .add_json(&idx.path().display().to_string(), root)
                 .map_err(Error::InvalidConfig)?,
-            // A tile-holding input's loss is already in `collect_layers`'
-            // warning; say it once.
             None if !tiles => log::warn!(
                 "{}: metadata is absent or not valid JSON; no name, description or attribution \
                  is inherited from it",
@@ -508,8 +466,62 @@ fn resolve_publication(
             ),
             None => {}
         }
+        if tiles {
+            let (found, zooms) = input_layers(idx, meta.as_ref());
+            layers.extend(found);
+            declared = Some(match declared {
+                Some((a, b)) => (a.min(zooms.0), b.max(zooms.1)),
+                None => zooms,
+            });
+        }
     }
-    collector.resolve().map_err(Error::InvalidConfig)
+    let publication = collector.resolve().map_err(Error::InvalidConfig)?;
+    Ok(InputMetadata {
+        layers,
+        declared,
+        publication,
+    })
+}
+
+/// The layers one tile-holding input declares and its declared zoom range.
+fn input_layers(idx: &ArchiveIndex, meta: Option<&Value>) -> (Vec<LayerMeta>, (u8, u8)) {
+    let header = (idx.header().min_zoom, idx.header().max_zoom);
+    let mut layers = Vec::new();
+    let mut input_zooms: Vec<(u8, u8)> = Vec::new();
+    match meta {
+        None => log::warn!(
+            "{}: metadata is absent or not valid JSON; its layers are not declared in the \
+             merged archive, and no name, description or attribution is inherited from it",
+            idx.path().display()
+        ),
+        Some(meta) => match meta.get("vector_layers").and_then(Value::as_array) {
+            None => log::warn!(
+                "{}: metadata declares no vector_layers; its layers are not declared in the \
+                 merged archive",
+                idx.path().display()
+            ),
+            Some(arr) => {
+                for l in arr {
+                    let Some(id) = l.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let (minzoom, maxzoom) = layer_zoom_range(l, header, idx.path());
+                    input_zooms.push((minzoom, maxzoom));
+                    layers.push(LayerMeta {
+                        id: id.to_string(),
+                        minzoom,
+                        maxzoom,
+                        fields: l
+                            .get("fields")
+                            .filter(|f| f.is_object())
+                            .cloned()
+                            .unwrap_or_else(|| Value::Object(Default::default())),
+                    });
+                }
+            }
+        },
+    }
+    (layers, declared_zoom_range(header, true, input_zooms))
 }
 
 #[cfg(test)]

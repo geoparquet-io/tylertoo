@@ -11,6 +11,7 @@ import json
 import struct
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -862,7 +863,8 @@ class TestPublicationMetadata:
     @pytest.mark.parametrize("key", KEYS)
     def test_each_keyword_alone(self, overview_file, tmp_path, key):
         pm = tmp_path / "pm.pmtiles"
-        tylertoo.export_pmtiles(str(overview_file), str(pm), **{key: "x"})
+        kwargs: dict[str, Any] = {key: "x"}
+        tylertoo.export_pmtiles(str(overview_file), str(pm), **kwargs)
         meta = _archive_metadata(pm)
         assert meta[key] == "x"
         assert not (set(self.KEYS) - {key}) & meta.keys()
@@ -870,17 +872,18 @@ class TestPublicationMetadata:
     @needs_buildings
     @pytest.mark.parametrize("key", KEYS)
     def test_wrong_type_is_refused(self, overview_file, tmp_path, key):
+        kwargs: dict[str, Any] = {key: 1}
         with pytest.raises(TypeError):
             tylertoo.export_pmtiles(
-                str(overview_file), str(tmp_path / "pm.pmtiles"), **{key: 1}
+                str(overview_file), str(tmp_path / "pm.pmtiles"), **kwargs
             )
 
     @needs_buildings
     def test_keywords_are_keyword_only(self, overview_file, tmp_path):
         with pytest.raises(TypeError):
-            tylertoo.export_pmtiles(
+            tylertoo.export_pmtiles(  # type: ignore[misc]
                 str(overview_file), str(tmp_path / "pm.pmtiles"), "x"
-            )  # type: ignore[call-arg]
+            )
 
     @needs_buildings
     def test_deprecated_convert_signature_is_unchanged(self):
