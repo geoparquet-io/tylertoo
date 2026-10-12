@@ -10944,6 +10944,30 @@ mod tests {
         assert_eq!(w0[0].props[0].1, PropertyValue::Int(0));
     }
 
+    /// The fill-phase budget's per-member cost: 48 B of headers, 16 B per
+    /// coordinate, and per property a 16 B name handle plus the value
+    /// payload (string bytes, else 8 B). The name text is not charged: it
+    /// lives once in the per-schema table (#461).
+    #[test]
+    fn member_bytes_estimate_charges_handles_and_payloads() {
+        let m = |props: Vec<(Arc<str>, PropertyValue)>| Member {
+            key: 0,
+            seq: 0,
+            geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
+            props: Arc::new(props),
+            id: None,
+        };
+        assert_eq!(member_bytes_estimate(&m(vec![])), 48 + 2 * 16);
+        let long_name: Arc<str> = "a_very_long_property_name".into();
+        assert_eq!(
+            member_bytes_estimate(&m(vec![
+                (long_name, PropertyValue::String("hello world!".into())),
+                ("rank".into(), PropertyValue::Int(7)),
+            ])),
+            48 + 2 * 16 + (16 + 12) + (16 + 8)
+        );
+    }
+
     /// #461: a wave read back from the spill shares one `Arc<str>` per
     /// distinct property name, across members and across segments, instead
     /// of allocating a name per property per member. Members whose nulls
