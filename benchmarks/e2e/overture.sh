@@ -93,7 +93,7 @@ cmd_setup() {
   sudo apt-get update -q
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq \
     build-essential git curl time pkg-config mdadm \
-    libsqlite3-dev zlib1g-dev python3 unzip
+    libsqlite3-dev zlib1g-dev python3 unzip protobuf-compiler
   mount_nvme
 
   if ! command -v cargo >/dev/null; then
