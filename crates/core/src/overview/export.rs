@@ -106,6 +106,7 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
+use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Schema};
 use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
@@ -125,6 +126,7 @@ use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
+use super::convert::find_geometry_column;
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::pipe::scoped_pipe;
 use super::pipeline::{auto_backing, available_memory_bytes, SinkBacking};
@@ -5532,18 +5534,23 @@ fn decode_batch(batch: &RecordBatch, crs: Crs, out: &mut Vec<Feature>) -> Result
     Ok(())
 }
 
-/// The index of the primary geometry column (`geometry`, else first `geom*`).
+/// The index of the overview file's geometry column.
+///
+/// The overview writer marks its geometry field with a `geoarrow.*` extension
+/// type, so that marker decides first, whatever the column is called (`SHAPE`
+/// from an Esri file geodatabase, for example). Files without it fall back to
+/// [`find_geometry_column`]: the `geo` metadata's `primary_column`, then the
+/// name heuristic, the same resolution convert applies to its input.
 fn geometry_index(schema: &Schema) -> Option<usize> {
     schema
         .fields()
         .iter()
-        .position(|f| f.name() == "geometry")
-        .or_else(|| {
-            schema
-                .fields()
-                .iter()
-                .position(|f| f.name().contains("geom"))
+        .position(|f| {
+            f.metadata()
+                .get(EXTENSION_TYPE_NAME_KEY)
+                .is_some_and(|name| name.starts_with("geoarrow"))
         })
+        .or_else(|| find_geometry_column(schema))
 }
 
 /// The MVT property key each overview-file column is published under (#359).
