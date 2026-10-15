@@ -28,7 +28,7 @@ tylertoo reads outside data and the target that covers it.
 | `remote_footer` † | `input::fuzz_remote_footer` — a remote GeoParquet object through `RemoteSource` over an in-memory object store: the ranged footer fetch and its range checks (#430, #586), row-group staging, a full read. Needs `--features remote` | three small GeoParquet files, one of them an overview |
 | `shard_plan` | `fuzz::fuzz_shard_plan` → `ShardPlan::load` and every range query `tiles --shard` makes of a plan | a 4-shard plan from `tylertoo shard-plan` |
 | `decompress` | `fuzz::fuzz_decompress` → `compression::decompress_capped` — every directory, metadata block and tile body of an input archive; the first byte picks the codec. Panics if the output passes the 1 MiB cap | a small JSON body under each codec |
-| `cli_args` | `fuzz::fuzz_cli_args` — the core parsers behind CLI and Python flags: `covering::parse_bounds`, `parse_representation_spec`, `pyramid::Band::parse`, `TileRange::parse`, `ShardRole::parse`, `MaxZoom` and `FeatureOrder` `FromStr`, `input::url_scheme` | one valid value per parser, and #681's overflow input |
+| `cli_args` | `fuzz::fuzz_cli_args` — the core parsers behind CLI and Python flags, and the public `covering::parse_bounds`: `parse_representation_spec`, `pyramid::Band::parse`, `TileRange::parse`, `ShardRole::parse`, `MaxZoom` and `FeatureOrder` `FromStr`, `input::url_scheme` | one valid value per parser, and #681's overflow input |
 
 † Not in the nightly matrix yet: each finds an upstream panic within a
 minute, and a target that crashes every night finds nothing else.
@@ -78,8 +78,8 @@ the command typed them) and are covered because it is cheap.
 | Archive metadata `vector_layers` (`pyramid`, `merge`) | `pyramid::parse_layers` / `layer_zoom_range` / `declared_zoom_range` / `vector_layers_json`, `merge::collect_layers` | `layer_zooms`. `merge`'s cross-archive agreement checks compare values already parsed by the readers above |
 | `merge`'s output check | `pmtiles_writer::verify_clustered` | None: it reads the archive tylertoo just wrote. Its directory walk is the one `band_archive` covers |
 | `--filter` | `overview::filter::parse_filter` | `filter_expr`; pushdown in `parquet_footer` |
-| Core string flags (`--bounds`, `--representation`, `--band`, `--tile-range`, `--shard`, `--max-zoom`, `--feature-order`, input URL schemes) | see `cli_args` above | `cli_args` |
-| `--accumulate` operator, `--tile-compression` | `cluster::AccumulateOp::parse`, `Compression::from_str` | None: a fixed keyword match with no other logic |
+| Core string flags (`--representation`, `--band`, `--tile-range`, `--shard`, `--max-zoom`, `--feature-order`, input URL schemes), and the public `covering::parse_bounds` (no caller in the CLI today) | see `cli_args` above | `cli_args` |
+| The `--accumulate` operator name; the public `Compression::from_str` | `cluster::AccumulateOp::parse`, `compression::Compression::from_str` | None: a fixed keyword match with no other logic |
 | CLI-only flag parsers (`parse_size_bytes`, `parse_bbox`, `parse_read_workers`, ...) | private functions in `crates/cli/src/main.rs` | None: the binary crate has no library target the fuzz crate can call, and the input is typed by the person running the command |
 | Python binding strings (`parse_feature_order`, `accumulate_specs`) | `crates/python/src/lib.rs` | None: strings from the caller, handed to the core parsers above. No Python entry point takes bytes |
 | `--files-from` manifests, globs, directory inputs | `input_set::ConvertSource::from_manifest` / `resolve`, `list_parquet_files` | None: each line or match becomes a path or URL that then goes through the readers above; the URL scheme sniff is in `cli_args` |
