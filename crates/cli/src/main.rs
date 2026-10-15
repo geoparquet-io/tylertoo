@@ -1568,91 +1568,6 @@ fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: u8) {
     );
 }
 
-/// Finish an empty data shard: a valid tile-less archive, a clear line about
-/// why, and exit 0 (#498).
-///
-/// See [`tylertoo_core::overview::export::write_empty_archive`] for why this
-/// is a success rather than a failure.
-fn write_empty_shard(
-    output: &std::path::Path,
-    layer_name: &str,
-    job: &ShardJob,
-    range: tylertoo_core::shard::TileRange,
-    max_zoom: u8,
-    why: &tylertoo_core::overview::convert::ConvertError,
-) -> Result<()> {
-    tylertoo_core::overview::export::write_empty_archive(
-        output,
-        layer_name,
-        range.pivot_zoom(),
-        max_zoom,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to write the empty shard archive: {e}"))?;
-    log::info!(
-        "[tiles] shard {} owns no input rows ({why}); wrote an empty archive",
-        job.role
-    );
-    println!(
-        "✓ shard {} owns no input rows; wrote an empty archive at {}",
-        job.role,
-        output.display()
-    );
-    println!(
-        "  z{}..z{max_zoom} declared, 0 tiles. This is normal for a cut whose data is \
-         concentrated elsewhere — `tylertoo merge` skips a tile-less input.",
-        range.pivot_zoom(),
-    );
-    Ok(())
-}
-
-/// Finish an empty coarse job: a valid tile-less archive over the zooms it
-/// owns (`--min-zoom` up to just below the pivot), and exit 0 (#541 review).
-///
-/// The coarse job's convert-plan (`--save-plan`) has already been written by
-/// the time this runs, so the fleet is intact; the coarse half simply holds
-/// no tile. `tylertoo merge` skips a tile-less input.
-fn write_empty_coarse(
-    output: &std::path::Path,
-    layer_name: &str,
-    job: &ShardJob,
-    min_zoom: u8,
-    why: &tylertoo_core::overview::convert::ConvertError,
-) -> Result<()> {
-    let max_zoom = job.pivot.saturating_sub(1);
-    tylertoo_core::overview::export::write_empty_archive(output, layer_name, min_zoom, max_zoom)
-        .map_err(|e| anyhow::anyhow!("failed to write the empty coarse archive: {e}"))?;
-    log::info!(
-        "[tiles] shard job {} has nothing to write ({why}); wrote an empty archive",
-        job.role
-    );
-    println!(
-        "✓ coarse job has no features at z{min_zoom}..z{max_zoom}; wrote an empty archive at {}",
-        output.display()
-    );
-    println!(
-        "  Every feature first appears at or past the pivot z{}, so the data shards hold \
-         all of it. Any --save-plan was written as usual; `tylertoo merge` skips a \
-         tile-less input.",
-        job.pivot
-    );
-    Ok(())
-}
-
-/// `true` when a convert failed only because it had nothing to write.
-///
-/// Two spellings of the same outcome, depending on how far the run got before
-/// it noticed: `NoData` when no level has a winner, `AllLevelsEmpty` when
-/// every declared level turned out empty at write time. Both mean "zero rows
-/// reached the output", which for a data shard is not an error at all.
-fn convert_produced_nothing(e: &tylertoo_core::overview::convert::ConvertError) -> bool {
-    use tylertoo_core::overview::convert::ConvertError;
-    use tylertoo_core::overview::writer::WriterError;
-    matches!(
-        e,
-        ConvertError::NoData | ConvertError::Writer(WriterError::AllLevelsEmpty { .. })
-    )
-}
-
 /// Resolve `--max-zoom auto` (#444) for a run whose `options` were built with
 /// [`MaxZoom::plan_zoom`] and whose cheap checks have all passed. Core owns
 /// the whole rule ([`MaxZoom::resolve`]); a `Fixed` zoom returns verbatim
@@ -1694,135 +1609,6 @@ fn resolve_level_plan(
     }
 }
 
-/// Where the removed-after-export intermediate overview of a `tiles` run
-/// lives (#314): `--spill-dir` if given (one knob for everything tylertoo
-/// puts on scratch disk), else an explicitly-set non-empty `$TMPDIR`, else
-/// next to the output (same filesystem as the final artifact), else the
-/// process temp dir. Pure — the env value is injected — so the precedence
-/// is unit-testable.
-fn resolve_intermediate_dir(
-    spill_dir: Option<&std::path::Path>,
-    tmpdir_env: Option<&std::ffi::OsStr>,
-    output: &std::path::Path,
-) -> PathBuf {
-    if let Some(dir) = spill_dir {
-        return dir.to_path_buf();
-    }
-    if let Some(tmpdir) = tmpdir_env.filter(|t| !t.is_empty()) {
-        return PathBuf::from(tmpdir);
-    }
-    output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// Lower-bound estimate of the intermediate overview's size for the #314
-/// free-space preflight: the local input bytes. A duplicating overview
-/// embeds the finest level verbatim on top of the coarse levels, so it is
-/// at least input-sized. Local file → its size; local directory → sum of
-/// its top-level `.parquet` entries; `--files-from` manifest → sum of the
-/// entries that resolve as local files. Remote/glob shapes return `None`
-/// (the preflight stays quiet rather than guessing).
-fn estimate_local_input_bytes(spec: &InputSpec) -> Option<u64> {
-    fn file_len(p: &std::path::Path) -> Option<u64> {
-        std::fs::metadata(p)
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-    }
-    match spec {
-        InputSpec::Path(p) => {
-            let meta = std::fs::metadata(p).ok()?;
-            if meta.is_file() {
-                return Some(meta.len());
-            }
-            if !meta.is_dir() {
-                return None;
-            }
-            let sum: u64 = std::fs::read_dir(p)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
-                .filter_map(|e| file_len(&e.path()))
-                .sum();
-            (sum > 0).then_some(sum)
-        }
-        InputSpec::Manifest(m) => {
-            let text = std::fs::read_to_string(m).ok()?;
-            let sum: u64 = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .filter_map(|l| file_len(std::path::Path::new(l)))
-                .sum();
-            (sum > 0).then_some(sum)
-        }
-    }
-}
-
-/// #314 preflight safety margin, matching the remote-spill preflight
-/// (#272): warn when free space is below the estimate plus 1/20th (5%).
-const INTERMEDIATE_MARGIN_DENOM: u64 = 20;
-
-/// #314 free-space preflight decision + message (pure, unit-testable).
-/// Returns the warning to emit when the estimated intermediate overview
-/// (a lower bound — the local input bytes) plus a 5% margin exceeds
-/// `available_bytes` on the volume holding `dir`, or `None` when it fits
-/// (or the estimate is unknown/zero).
-fn intermediate_space_warning(
-    estimated_bytes: u64,
-    available_bytes: u64,
-    dir: &std::path::Path,
-) -> Option<String> {
-    if estimated_bytes == 0 {
-        return None;
-    }
-    let need = estimated_bytes + estimated_bytes / INTERMEDIATE_MARGIN_DENOM;
-    if available_bytes >= need {
-        return None;
-    }
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    Some(format!(
-        "the intermediate overview `tiles` materializes (≥ ~{:.1} GiB — a \
-         duplicating overview is at least as large as the input, whose local \
-         size is the estimate) may not fit: {} has {:.1} GiB free ({:.1} GiB \
-         short, including a 5% margin). Point --spill-dir (or --keep-overview) \
-         at a roomier volume, or free up space first.",
-        gib(estimated_bytes),
-        dir.display(),
-        gib(available_bytes),
-        gib(need - available_bytes),
-    ))
-}
-
-/// Emit the #314 intermediate free-space preflight warning, if warranted:
-/// probe the volume holding `dir` and compare against the local-input-bytes
-/// estimate. Quiet when either side is unknowable (remote input, exotic
-/// filesystem) rather than crying wolf.
-fn warn_intermediate_space(spec: &InputSpec, dir: &std::path::Path) {
-    let Some(estimated) = estimate_local_input_bytes(spec) else {
-        return;
-    };
-    let Ok(available) = fs4::available_space(dir) else {
-        return;
-    };
-    if let Some(msg) = intermediate_space_warning(estimated, available, dir) {
-        log::warn!("{msg}");
-    }
-}
-
-/// Run `tylertoo tiles`: the one-shot GeoParquet → PMTiles facade.
-///
-/// Chains the two product pipelines through a materialized intermediate
-/// overview file (`overview` convert → `export-pmtiles`) — this is NOT
-/// zero-disk. The intermediate is retained at `--keep-overview PATH` when
-/// given; otherwise it is a temp file (in `--spill-dir` / `$TMPDIR` / the
-/// output directory, in that order) removed on both success and failure
-/// via [`tempfile::TempPath`]'s drop guard. Its path and size are
-/// always logged, and a free-space preflight warns when the chosen volume
-/// looks too small for it (#314).
 /// Which job of a sharded fleet this `tiles` run is, and the slice of the
 /// tile space it owns (#498).
 #[derive(Debug, Clone)]
@@ -1977,45 +1763,21 @@ fn check_spill_dir(spill_dir: Option<&Path>) -> Result<()> {
 
 /// `--feature-order`'s and `--feature-id`'s (#443) columns are read at
 /// export, after `tiles`' own convert step has already applied the property
-/// selection — an excluded column is gone from the intermediate before
-/// export ever sees it, so this is checked here, before any work is done,
-/// rather than after running the whole convert and quietly falling back
-/// (same wording as export's `PropertyRequiredByKnob`).
+/// selection — so this is checked before any work is done. The rule lives in
+/// core ([`tylertoo_core::overview::tiles::check_knob_columns`], #439), and
+/// `convert_to_pmtiles` checks it again; this early call keeps the
+/// milliseconds-not-hours timing for `--plan-only` too (#600).
 fn reject_excluded_knob_columns(
     options: &tylertoo_core::overview::convert::ConvertOptions,
     feature_order: &FeatureOrder,
     feature_id: Option<&String>,
 ) -> Result<()> {
-    if let FeatureOrder::Column { name, .. } = feature_order {
-        anyhow::ensure!(
-            options.properties.keeps(name),
-            "property {name:?} is excluded but --feature-order reads it; keep it in the \
-             selection or drop the knob"
-        );
-    }
-    // #443: convert-time-only. This does not apply to export-pmtiles's OWN
-    // --include-property/--exclude-property, which `ExportOptions::feature_id`
-    // always overrides regardless (the column already exists in the
-    // intermediate file either way).
-    if let Some(name) = feature_id {
-        anyhow::ensure!(
-            options.properties.keeps(name),
-            "property {name:?} is excluded but --feature-id reads it; keep it in the \
-             selection or drop the flag"
-        );
-        // A clustered point's accumulated value is a sum/min/max/mean of
-        // several ids -- the id of no feature. Export rejects it from the
-        // file's clustering provenance too; checking here saves the convert.
-        if let Some(spec) = options.accumulate.iter().find(|a| a.column == *name) {
-            anyhow::bail!(
-                "--feature-id column {name:?} is also --accumulate-attribute {name}:{}; a \
-                 cluster's aggregated value identifies no single feature, so accumulate a \
-                 different column",
-                spec.op.as_str()
-            );
-        }
-    }
-    Ok(())
+    tylertoo_core::overview::tiles::check_knob_columns(
+        options,
+        feature_order,
+        feature_id.map(String::as_str),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 /// The convert half of `tiles`: the [`ConvertOptions`] the facade runs, the
@@ -2360,8 +2122,20 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run `tylertoo tiles`: the one-shot GeoParquet → PMTiles facade.
+///
+/// The policy — intermediate-overview lifecycle and preflights, the #380
+/// declaration rule, empty shard/coarse outcomes, the combined report —
+/// lives in core ([`tylertoo_core::overview::tiles`], #439). This maps the
+/// parsed arguments onto [`TilesOptions`] and prints.
+///
+/// [`TilesOptions`]: tylertoo_core::overview::tiles::TilesOptions
 fn run_tiles(args: TilesArgs) -> Result<()> {
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+    use tylertoo_core::overview::convert::ConvertReport;
+    use tylertoo_core::overview::tiles::{
+        self, IntermediateOverview, TilesInput, TilesObserver, TilesOptions, TilesOutcome,
+        TilesShard,
+    };
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -2381,167 +2155,109 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     // #433: the export knobs that need no file are checked before the
     // convert, which on a large input runs for minutes before the export
-    // would otherwise refuse them.
+    // would otherwise refuse them. Core re-checks inside the facade; this
+    // early call also parses `--tile-range`, which is argument mapping.
     let manual_range = preflight_export_flags(&args)?;
-
-    // Derive the layer name from the input if not given: file stem for a
-    // single file, last path segment for a directory or s3://gs:// prefix,
-    // last literal segment for a glob, manifest stem for --files-from
-    // (core owns the rules — see input_set::derive_layer_name).
-    let layer_name = args.layer_name.clone().unwrap_or_else(|| {
-        let p = match &spec {
-            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
-        };
-        tylertoo_core::input_set::derive_layer_name(&p.to_string_lossy())
-    });
 
     let (options, shard, max_zoom) = tiles_convert_options(&args, &spec)?;
 
-    // A data shard's range prunes the convert's reads as well as the export;
-    // a hand-written `--tile-range` restricts the export only (the two flags
-    // conflict, so at most one is set).
-    let tile_range = match &shard {
-        Some(job) => job.range,
-        None => manual_range,
-    };
-
-    // The data shard's own range, kept past `tile_range`'s move into
-    // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
-    let shard_range = shard.as_ref().and_then(|job| job.range);
-
-    // Intermediate overview file (#314): retained at --keep-overview when
-    // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
-    // directory, removed on drop — success or failure alike. A TempPath, not
-    // an open NamedTempFile: convert publishes by renaming a sibling over
-    // this path, which Windows refuses while a handle to it is open (#678).
-    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::TempPath>) =
-        match &args.keep_overview {
-            // Its directory was checked by `preflight_export_flags`.
-            Some(path) => (path.clone(), None),
-            None => {
-                let dir = resolve_intermediate_dir(
-                    args.tuning.spill_dir.as_deref(),
-                    std::env::var_os("TMPDIR").as_deref(),
-                    &output,
-                );
-                let tmp = tempfile::Builder::new()
-                    .prefix(".tylertoo-overview-")
-                    .suffix(".parquet")
-                    .tempfile_in(&dir)
-                    .with_context(|| {
-                        format!(
-                            "failed to create the intermediate overview file in {} \
-                             (location precedence: --spill-dir, $TMPDIR, the output \
-                             directory)",
-                            dir.display()
-                        )
-                    })?
-                    .into_temp_path();
-                (tmp.to_path_buf(), Some(tmp))
-            }
-        };
-
-    // #314 free-space preflight: the intermediate is at least input-sized,
-    // so warn up front when the chosen volume looks too small.
-    let overview_dir = overview_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    warn_intermediate_space(&spec, &overview_dir);
-
-    let convert_report = match run_convert_typed(&spec, &overview_path, &options) {
-        Ok(report) => report,
-        // #498: a shard whose range owns no input rows is a legal outcome of
-        // a legal cut, not a failure. `shard-plan` deliberately cuts N ranges
-        // whatever the data looks like — an empty RANGE is legal while a gap
-        // is not — so a concentrated dataset routinely leaves some shards
-        // with nothing. Failing them would mean an array job with red squares
-        // in it that mean "correct", and a merge the operator has to
-        // hand-edit. Write the valid empty archive the merge already tolerates
-        // and exit 0.
-        Err(e) if shard_range.is_some() && convert_produced_nothing(&e) => {
-            let job = shard.as_ref().expect("a range implies a shard job");
-            let range = shard_range.expect("checked by the guard");
-            return write_empty_shard(&output, &layer_name, job, range, max_zoom, &e);
-        }
-        // #541 review: the coarse job's counterpart. Its convert stops at the
-        // pivot, and when every feature first appears finer than that (#211
-        // auto-clamp took every coarse level) there is nothing for it to
-        // write — but pass 1, the assignment and `--save-plan` all ran and
-        // are valid, and the shards still have their work. Same legal
-        // outcome as an empty data shard, same answer.
-        Err(e @ tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling { .. }) => {
-            let job = shard.as_ref().expect("only the coarse job sets a ceiling");
-            return write_empty_coarse(&output, &layer_name, job, args.min_zoom, &e);
-        }
-        Err(e) => anyhow::bail!("overview conversion failed: {e}"),
-    };
-
-    // #314: the disk cost of the one-shot facade must not be silent — name
-    // the intermediate's path and size, and its fate.
-    let overview_bytes = std::fs::metadata(&overview_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    println!(
-        "  intermediate overview: {} ({}{})",
-        overview_path.display(),
-        HumanBytes(overview_bytes),
-        if overview_tmp.is_some() {
-            ", removed after export; --keep-overview PATH retains it"
-        } else {
-            ", retained"
-        }
-    );
-
-    if args.verbose {
-        println!(
-            "Overview: {} input features → {} rows across {} levels in {:.2}s",
-            format_number(convert_report.input_features as u64),
-            format_number(convert_report.total_rows as u64),
-            convert_report.levels.len(),
-            convert_report.duration_secs
-        );
-    }
-
-    let export_opts = ExportOptions {
-        layer_name,
+    let tiles_options = TilesOptions {
+        convert: options,
+        // `None` lets core derive the layer name from the input: file stem
+        // for a single file, last path segment for a directory or
+        // `s3://`/`gs://` prefix, last literal segment for a glob, manifest
+        // stem for --files-from (core owns the rules).
+        layer_name: args.layer_name.clone(),
+        keep_overview: args.keep_overview.clone(),
+        min_zoom: args.min_zoom,
+        max_zoom,
+        shard: shard.map(|job| TilesShard {
+            role: job.role,
+            range: job.range,
+            pivot_zoom: job.pivot,
+        }),
+        tile_range: manual_range,
         tile_buffer: args.tile_buffer,
-        extent: 4096,
         tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
-        // #380: the archive's `vector_layers` declares the zoom range that was
-        // asked for, even when the coarsest levels generalized to nothing and
-        // were omitted from the overview (the header stays the actual tiles,
-        // #529/#522). Only a zoom plan has a requested minimum zoom.
-        //
-        // #498: a data shard owns no zoom coarser than the pivot, so that is
-        // what it declares — claiming the coarse job's half would misdescribe
-        // an archive that holds none of it.
-        min_zoom: args.gsd.is_none().then_some(match tile_range {
-            Some(r) => r.pivot_zoom(),
-            None => args.min_zoom,
-        }),
-
-        // The property selection was applied on convert (#386): the
-        // intermediate overview already carries only the kept columns.
-        properties: Default::default(),
-
-        // #498: the two complementary halves of a sharded build. A data shard
-        // (or a hand-written --tile-range) takes its range; the coarse job
-        // takes everything below the pivot.
-        tile_range,
-        zoom_ceiling: shard
-            .and_then(|job| job.range.is_none().then(|| job.pivot.saturating_sub(1))),
         feature_id: args.feature_id.clone(),
-        // #427: one scratch knob — the export's member spill goes where the
-        // convert's spill (and the intermediate overview) go.
-        spill_dir: args.tuning.spill_dir.clone(),
     };
-    let export_report = export_pmtiles(&overview_path, &output, &export_opts)
-        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+    let input = match &spec {
+        InputSpec::Path(p) => TilesInput::Path(p.clone()),
+        InputSpec::Manifest(m) => TilesInput::Manifest(m.clone()),
+    };
+
+    // #314: the disk cost of the one-shot facade must not be silent — name
+    // the intermediate's path, size and fate between the two halves, so a
+    // failed export has already said where the file is.
+    struct Printer {
+        verbose: bool,
+    }
+    impl TilesObserver for Printer {
+        fn overview_written(&mut self, intermediate: &IntermediateOverview, c: &ConvertReport) {
+            println!(
+                "  intermediate overview: {} ({}{})",
+                intermediate.path.display(),
+                HumanBytes(intermediate.bytes),
+                if intermediate.retained {
+                    ", retained"
+                } else {
+                    ", removed after export; --keep-overview PATH retains it"
+                }
+            );
+            if self.verbose {
+                println!(
+                    "Overview: {} input features → {} rows across {} levels in {:.2}s",
+                    format_number(c.input_features as u64),
+                    format_number(c.total_rows as u64),
+                    c.levels.len(),
+                    c.duration_secs
+                );
+            }
+        }
+    }
+    let mut printer = Printer {
+        verbose: args.verbose,
+    };
+
+    let report =
+        match tiles::convert_to_pmtiles_observed(&input, &output, &tiles_options, &mut printer)? {
+            // #498 / #541: an empty data shard and an empty coarse job are
+            // legal outcomes — core wrote the valid tile-less archive; this
+            // only reports it.
+            TilesOutcome::EmptyShard(info) => {
+                println!(
+                    "✓ shard {} owns no input rows; wrote an empty archive at {}",
+                    info.role,
+                    output.display()
+                );
+                println!(
+                    "  z{}..z{} declared, 0 tiles. This is normal for a cut whose data is \
+                     concentrated elsewhere — `tylertoo merge` skips a tile-less input.",
+                    info.min_zoom, info.max_zoom,
+                );
+                return Ok(());
+            }
+            TilesOutcome::EmptyCoarse(info) => {
+                println!(
+                    "✓ coarse job has no features at z{}..z{}; wrote an empty archive at {}",
+                    info.min_zoom,
+                    info.max_zoom,
+                    output.display()
+                );
+                println!(
+                    "  Every feature first appears at or past the pivot z{}, so the data shards \
+                     hold all of it. Any --save-plan was written as usual; `tylertoo merge` \
+                     skips a tile-less input.",
+                    info.pivot_zoom
+                );
+                return Ok(());
+            }
+            TilesOutcome::Converted(report) => report,
+        };
+    let (convert_report, export_report) = (&report.convert, &report.export);
 
     if args.verbose {
         for z in &export_report.zooms {
@@ -2581,10 +2297,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // the header always reflects the zooms that actually hold a tile) — say
     // which zooms in the requested range hold nothing rather than let the
     // summary imply they do.
-    let empty_zooms: Vec<String> = convert_report
-        .skipped_empty_levels
+    let empty_zooms: Vec<String> = report
+        .empty_declared_zooms()
         .iter()
-        .filter_map(|l| l.zoom)
         .map(|z| format!("z{z}"))
         .collect();
     if !empty_zooms.is_empty() {
@@ -2606,19 +2321,16 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         }
     }
 
-    if let Some(note) = row_group_autoscale_note(&convert_report) {
+    if let Some(note) = row_group_autoscale_note(convert_report) {
         println!("{note}");
     }
 
-    // A combined report so the one-step run captures both halves the two-step
-    // chain would write (`overview --report` + `export-pmtiles --report`).
+    // The combined report so the one-step run captures both halves the
+    // two-step chain would write (`overview --report` + `export-pmtiles
+    // --report`). Core owns its shape ({"convert", "export"}).
     if let Some(report_path) = &args.report {
-        let combined = serde_json::json!({
-            "convert": convert_report,
-            "export": export_report,
-        });
         let json =
-            serde_json::to_string_pretty(&combined).context("failed to serialize tiles report")?;
+            serde_json::to_string_pretty(&*report).context("failed to serialize tiles report")?;
         std::fs::write(report_path, json)
             .with_context(|| format!("failed to write report to {}", report_path.display()))?;
         println!("  report written to {}", report_path.display());
@@ -4206,113 +3918,6 @@ mod tests {
         assert!(parse_tiles(&[]).keep_overview.is_none());
         let a = parse_tiles(&["--keep-overview", "ov.parquet"]);
         assert_eq!(a.keep_overview, Some(PathBuf::from("ov.parquet")));
-    }
-
-    /// Intermediate-overview directory precedence (#314): `--spill-dir`
-    /// beats an explicitly-set `$TMPDIR`, which beats the output's own
-    /// directory; a bare output filename with no `$TMPDIR` falls back to
-    /// the process temp dir.
-    #[test]
-    fn resolve_intermediate_dir_precedence() {
-        use std::ffi::OsStr;
-        let out = std::path::Path::new("/data/out/tiles.pmtiles");
-
-        // --spill-dir wins over everything.
-        assert_eq!(
-            resolve_intermediate_dir(
-                Some(std::path::Path::new("/spill")),
-                Some(OsStr::new("/tmpdir")),
-                out
-            ),
-            PathBuf::from("/spill")
-        );
-        // $TMPDIR (explicitly set, non-empty) beats the output directory.
-        assert_eq!(
-            resolve_intermediate_dir(None, Some(OsStr::new("/tmpdir")), out),
-            PathBuf::from("/tmpdir")
-        );
-        // An empty $TMPDIR is ignored.
-        assert_eq!(
-            resolve_intermediate_dir(None, Some(OsStr::new("")), out),
-            PathBuf::from("/data/out")
-        );
-        // Default: next to the output (same filesystem as the final artifact).
-        assert_eq!(
-            resolve_intermediate_dir(None, None, out),
-            PathBuf::from("/data/out")
-        );
-        // Bare output filename: process temp dir fallback.
-        assert_eq!(
-            resolve_intermediate_dir(None, None, std::path::Path::new("tiles.pmtiles")),
-            std::env::temp_dir()
-        );
-    }
-
-    /// #314 free-space preflight: quiet when the estimated intermediate
-    /// (plus the 5% margin) fits, a warning naming the directory, the
-    /// shortfall, and the `--spill-dir` escape hatch when it does not.
-    #[test]
-    fn intermediate_space_warning_thresholds() {
-        let dir = std::path::Path::new("/some/volume");
-        let gib = 1024u64 * 1024 * 1024;
-
-        // Fits comfortably: no warning.
-        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir).is_none());
-        // Exactly the estimate + 5% margin still fits.
-        let est = 20 * gib;
-        assert!(intermediate_space_warning(est, est + est / 20, dir).is_none());
-        // One byte short of the margin: warn, naming dir and remedies.
-        let msg =
-            intermediate_space_warning(est, est + est / 20 - 1, dir).expect("shortfall must warn");
-        assert!(msg.contains("/some/volume"), "names the directory: {msg}");
-        assert!(msg.contains("--spill-dir"), "names the remedy: {msg}");
-        assert!(msg.contains("--keep-overview"), "names the remedy: {msg}");
-        // Zero estimate (unknown/empty input): never warns.
-        assert!(intermediate_space_warning(0, 0, dir).is_none());
-    }
-
-    /// The intermediate size estimate is the local input bytes: file size
-    /// for a file, the sum of top-level .parquet sizes for a directory,
-    /// the sum of existing local manifest entries for --files-from.
-    #[test]
-    fn estimate_local_input_bytes_shapes() {
-        let dir = tempfile::tempdir().unwrap();
-        let f1 = dir.path().join("a.parquet");
-        let f2 = dir.path().join("b.parquet");
-        std::fs::write(&f1, vec![0u8; 100]).unwrap();
-        std::fs::write(&f2, vec![0u8; 50]).unwrap();
-        std::fs::write(dir.path().join("ignored.txt"), vec![0u8; 999]).unwrap();
-
-        // Single file.
-        assert_eq!(
-            estimate_local_input_bytes(&InputSpec::Path(f1.clone())),
-            Some(100)
-        );
-        // Directory: only .parquet entries count.
-        assert_eq!(
-            estimate_local_input_bytes(&InputSpec::Path(dir.path().to_path_buf())),
-            Some(150)
-        );
-        // Nonexistent / remote-looking path: quiet None.
-        assert_eq!(
-            estimate_local_input_bytes(&InputSpec::Path(PathBuf::from("s3://bucket/x.parquet"))),
-            None
-        );
-        // Manifest: sum of existing local entries; comments/blanks skipped.
-        let manifest = dir.path().join("m.txt");
-        std::fs::write(
-            &manifest,
-            format!(
-                "# comment\n{}\n\n{}\ns3://bucket/remote.parquet\n",
-                f1.display(),
-                f2.display()
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            estimate_local_input_bytes(&InputSpec::Manifest(manifest)),
-            Some(150)
-        );
     }
 
     /// #317 / #279: the representation selector and the square disposition
