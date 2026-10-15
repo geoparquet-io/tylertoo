@@ -15,7 +15,13 @@ fi
 echo "Format check passed!"
 
 echo "Running cargo clippy..."
-if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -20; then
+# A pipeline's exit status is its LAST command's, and `tail` always succeeds,
+# so `clippy | tail` can never fail the hook (#695). Capture clippy's own
+# status instead; the `||` keeps `set -e` from exiting before we can report.
+CLIPPY_STATUS=0
+CLIPPY_OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1) || CLIPPY_STATUS=$?
+printf '%s\n' "$CLIPPY_OUT" | tail -20
+if [ "$CLIPPY_STATUS" -ne 0 ]; then
     echo ""
     echo "ERROR: Clippy found issues. Fix them before committing."
     echo ""
