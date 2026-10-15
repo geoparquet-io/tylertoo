@@ -1190,7 +1190,11 @@ section above). One `open`+`write` per checkpoint interval, not per tile.
 
 Export's PMTiles v3 writer streams tile data to a temp file, builds the
 directory incrementally, and deduplicates tiles by XXH3 hash → file offset.
-Tile bytes never stay in memory, but the bookkeeping grows linearly with the
+A hash hit is a candidate only (#531). The writer compares the candidate's
+bytes with the stored tile, read back from the spool, before the new entry
+aliases it. xxh3-64 is not collision-resistant, and `tylertoo merge` hashes
+tiles from shards someone else may have written. A colliding tile with other
+bytes is stored as a new tile. Tile bytes never stay in memory, but the bookkeeping grows linearly with the
 archive. The writer keeps one 24 B directory entry per tile and one
 dedup-cache entry (hash → offset, length) per unique tile. At 100M tiles the
 directory entries alone take 2.4 GB. Tiles are
