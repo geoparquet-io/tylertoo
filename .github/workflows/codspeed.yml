@@ -95,13 +95,22 @@ jobs:
             cargo install cargo-codspeed --version 5.0.3 --locked --force
           fi
 
+      # Each bench binary is a fat-LTO link (lto = true, codegen-units = 1)
+      # peaking near 8 GB, and cargo's default parallelism links several at
+      # once: on the 16 GB runner that ends in exit 143. So compile the
+      # dependencies in parallel through the first bench, then link the set
+      # with -j 1. (One build call per bench does not work: each call
+      # replaces the binaries the previous one collected.)
       - name: Build benches
         run: |
+          benches=$(scripts/criterion_compare.sh --list)
           bench_args=()
-          for b in $(scripts/criterion_compare.sh --list); do
+          for b in $benches; do
             bench_args+=(--bench "$b")
           done
-          cargo codspeed build -m simulation -p tylertoo-core --all-features --locked "${bench_args[@]}"
+          build=(cargo codspeed build -m simulation -p tylertoo-core --all-features --locked)
+          "${build[@]}" --bench "${benches%% *}"
+          "${build[@]}" -j 1 "${bench_args[@]}"
 
       - name: Run benches
         uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
