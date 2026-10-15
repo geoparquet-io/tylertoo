@@ -1,0 +1,36 @@
+{
+  "format": "tylertoo-shard-plan",
+  "version": 1,
+  "pivot_zoom": 6,
+  "ranges": [
+    {
+      "lo": 1365,
+      "hi": 2391,
+      "estimated_rows": 361
+    },
+    {
+      "lo": 2392,
+      "hi": 3413,
+      "estimated_rows": 360
+    },
+    {
+      "lo": 3414,
+      "hi": 4438,
+      "estimated_rows": 360
+    },
+    {
+      "lo": 4439,
+      "hi": 5460,
+      "estimated_rows": 359
+    }
+  ],
+  "inputs": [
+    {
+      "path": "/home/ubuntu/tylertoo/tests/fixtures/streaming/sharding-grid.parquet",
+      "num_rows": 1440,
+      "row_groups": 20
+    }
+  ],
+  "estimated_rows_total": 1440,
+  "unplaced_rows": 0
+}

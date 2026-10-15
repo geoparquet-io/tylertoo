@@ -551,6 +551,46 @@ impl OverviewReader {
     }
 }
 
+/// Fuzz hook (#633): treat `bytes` as an overview file handed to `tylertoo
+/// export` or `validate`, and run what each reads.
+///
+/// [`OverviewReader::open`] (footer, `geo:overviews` parse and `validate`,
+/// batch-size cap), then for every level its band, a zoom and gsd lookup, a
+/// bbox-pruned selection, the column-statistic queries, and a full read of
+/// the band; then [`super::check::validate_file`]. The file goes through a
+/// temp file because both readers open a path. Returns the rows read. Only
+/// the `fuzz/` crate calls this; the `fuzzing` feature is never on in a
+/// normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
+    use std::io::Write as _;
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(bytes)?;
+    file.flush()?;
+
+    let _ = super::check::validate_file(file.path());
+    let reader = OverviewReader::open(file.path())?;
+    let _ = reader.geo_metadata_json();
+    let _ = reader.finest_level_mean_row_bytes();
+    let _ = reader.int_column_max(super::writer::LEVEL_COLUMN);
+    let _ = reader.level_for_zoom(0);
+    let _ = reader.level_for_zoom(31);
+    let _ = reader.row_groups_intersecting_bbox(&[-10.0, -10.0, 10.0, 10.0]);
+    let mut rows = 0;
+    for k in 0..reader.num_levels() {
+        let _ = reader.level_for_gsd(reader.meta().levels[k].gsd);
+        let _ = reader.row_groups_for_level(k)?;
+        let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
+        for batch in reader.read_band_with_batch_size(k, 256)? {
+            rows += batch
+                .map_err(parquet::errors::ParquetError::from)?
+                .num_rows();
+        }
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

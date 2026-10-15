@@ -47,6 +47,9 @@ pub mod covering;
 pub mod decode;
 pub mod dedup;
 pub mod fs_probe;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
 pub mod input;
 pub mod input_set;
 pub mod ioverlay_clip;

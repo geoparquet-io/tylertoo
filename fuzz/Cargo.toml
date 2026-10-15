@@ -11,6 +11,11 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 tylertoo-core = { path = "../crates/core", features = ["fuzzing"] }
 
+[features]
+# Only the `remote_footer` target needs it (object_store, tokio); the other
+# targets build without it so their sanitizer build stays lean.
+remote = ["tylertoo-core/remote"]
+
 [[bin]]
 name = "footer_json"
 path = "fuzz_targets/footer_json.rs"
@@ -63,6 +68,84 @@ bench = false
 [[bin]]
 name = "filter_expr"
 path = "fuzz_targets/filter_expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geo_metadata"
+path = "fuzz_targets/geo_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plan_file"
+path = "fuzz_targets/plan_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_archive"
+path = "fuzz_targets/decode_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_index"
+path = "fuzz_targets/archive_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layer_zooms"
+path = "fuzz_targets/layer_zooms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parquet_footer"
+path = "fuzz_targets/parquet_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "overview_file"
+path = "fuzz_targets/overview_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_footer"
+path = "fuzz_targets/remote_footer.rs"
+test = false
+doc = false
+bench = false
+required-features = ["remote"]
+
+[[bin]]
+name = "shard_plan"
+path = "fuzz_targets/shard_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
 test = false
 doc = false
 bench = false

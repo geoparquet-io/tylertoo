@@ -765,12 +765,13 @@ pub(crate) fn extract_row_group_bounds_tiered(
 /// # Errors
 ///
 /// Returns [`Error::InvalidConfig`] if `input` is neither a valid `z/x/y` tile
-/// nor four comma-separated numbers, or if the bbox has `xmin >= xmax` or
-/// `ymin >= ymax`.
+/// nor four comma-separated numbers, if the tile is outside its zoom (`z` past
+/// 31, or `x`/`y` at or past `2^z`), or if the bbox has a non-finite value,
+/// `xmin >= xmax` or `ymin >= ymax`.
 pub fn parse_bounds(input: &str) -> Result<TileBounds, Error> {
     // Try z/x/y format first
     if let Some(bounds) = parse_tile_coords(input) {
-        return Ok(bounds);
+        return bounds;
     }
 
     // Fall back to xmin,ymin,xmax,ymax format
@@ -778,7 +779,11 @@ pub fn parse_bounds(input: &str) -> Result<TileBounds, Error> {
 }
 
 /// Parse tile coordinates in z/x/y format and convert to WGS84 bounds.
-fn parse_tile_coords(input: &str) -> Option<TileBounds> {
+///
+/// `None` when `input` is not shaped like `z/x/y` (the caller then tries the
+/// bbox form); `Some(Err)` when it is, but names no tile: a zoom past 31 or
+/// an `x`/`y` outside the zoom's `2^z` tiles (#681).
+fn parse_tile_coords(input: &str) -> Option<Result<TileBounds, Error>> {
     let parts: Vec<&str> = input.split('/').collect();
     if parts.len() != 3 {
         return None;
@@ -788,7 +793,19 @@ fn parse_tile_coords(input: &str) -> Option<TileBounds> {
     let x: u32 = parts[1].parse().ok()?;
     let y: u32 = parts[2].parse().ok()?;
 
-    Some(tile_to_bounds(z, x, y))
+    if z > 31 {
+        return Some(Err(Error::InvalidConfig(format!(
+            "Invalid tile '{input}': zoom {z} is past the maximum of 31"
+        ))));
+    }
+    let tiles = 1u64 << z;
+    if u64::from(x) >= tiles || u64::from(y) >= tiles {
+        return Some(Err(Error::InvalidConfig(format!(
+            "Invalid tile '{input}': x and y must be below {tiles} at zoom {z}"
+        ))));
+    }
+
+    Some(Ok(tile_to_bounds(z, x, y)))
 }
 
 /// Convert tile coordinates to WGS84 bounds using Web Mercator projection.
@@ -798,11 +815,13 @@ pub fn tile_to_bounds(z: u8, x: u32, y: u32) -> TileBounds {
     let n = 2f64.powi(z as i32);
 
     let lng_min = x as f64 / n * 360.0 - 180.0;
-    let lng_max = (x + 1) as f64 / n * 360.0 - 180.0;
+    // In f64, so an out-of-range x or y from a direct caller can't overflow
+    // the `+ 1` (#681).
+    let lng_max = (f64::from(x) + 1.0) / n * 360.0 - 180.0;
 
     // Note: y=0 is at the top (north), so lat_max uses y, lat_min uses y+1
     let lat_max = (PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan().to_degrees();
-    let lat_min = (PI * (1.0 - 2.0 * (y + 1) as f64 / n))
+    let lat_min = (PI * (1.0 - 2.0 * (f64::from(y) + 1.0) / n))
         .sinh()
         .atan()
         .to_degrees();
@@ -860,7 +879,13 @@ fn parse_bbox(input: &str) -> Result<TileBounds, Error> {
         Error::InvalidConfig(format!("Invalid ymax value '{}' in bounds", parts[3]))
     })?;
 
-    // Validate bounds
+    // Validate bounds. NaN fails every comparison below, so reject
+    // non-finite values first (#681).
+    if ![xmin, ymin, xmax, ymax].iter().all(|v| v.is_finite()) {
+        return Err(Error::InvalidConfig(format!(
+            "Invalid bounds '{input}': every value must be a finite number"
+        )));
+    }
     if xmin >= xmax {
         return Err(Error::InvalidConfig(format!(
             "xmin ({}) must be less than xmax ({})",
@@ -1159,6 +1184,37 @@ mod tests {
         // ymin >= ymax
         let result = parse_bounds("-122.5,40.0,-122.3,37.9");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bounds_rejects_out_of_range_tile_coords() {
+        // #681: x + 1 overflowed u32 (a panic in debug and fuzz builds)
+        assert!(parse_bounds("0/4294967295/0").is_err());
+        assert!(parse_bounds("0/0/4294967295").is_err());
+        // x or y past the 2^z tiles of the zoom
+        assert!(parse_bounds("1/2/0").is_err());
+        assert!(parse_bounds("1/0/2").is_err());
+        // zooms past 31 have no u32 tile grid
+        assert!(parse_bounds("32/0/0").is_err());
+        // the last tile of a zoom is still valid
+        assert!(parse_bounds("1/1/1").is_ok());
+        assert!(parse_bounds("31/2147483647/2147483647").is_ok());
+    }
+
+    #[test]
+    fn test_parse_bounds_rejects_non_finite_bbox() {
+        // #681: NaN fails every comparison, so it slipped past xmin < xmax
+        assert!(parse_bounds("nan,0,1,1").is_err());
+        assert!(parse_bounds("0,nan,1,1").is_err());
+        assert!(parse_bounds("0,0,inf,1").is_err());
+        assert!(parse_bounds("-inf,0,1,1").is_err());
+    }
+
+    #[test]
+    fn test_tile_to_bounds_does_not_overflow() {
+        // A direct caller with an out-of-range tile gets bounds, not a panic.
+        let bounds = tile_to_bounds(0, u32::MAX, u32::MAX);
+        assert!(bounds.lng_max > bounds.lng_min);
     }
 
     // -------------------------------------------------------------------------

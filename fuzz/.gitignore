@@ -7,3 +7,4 @@ artifacts/
 coverage/
 Cargo.lock
 fuzz-*.log
+target-lld/
