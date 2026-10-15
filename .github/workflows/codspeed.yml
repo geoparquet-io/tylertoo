@@ -1,0 +1,110 @@
+# CodSpeed (#614) — per-PR benchmark signal from instruction counts.
+#
+# Builds the criterion benches with cargo-codspeed and runs them under
+# CodSpeed's simulation mode, which counts instructions (cache-weighted)
+# instead of timing wall-clock. The count does not depend on the runner's
+# load, so unlike bench-regression.yml this runs on EVERY PR, and CodSpeed
+# comments per-bench deltas against the base branch. The `push: main` runs
+# are what those deltas compare against.
+#
+# The benches build against `codspeed-criterion-compat` (renamed to
+# `criterion` in crates/core/Cargo.toml), so their code is unchanged and plain
+# `cargo bench` still runs ordinary criterion locally and in bench.yml.
+#
+# Bench set: scripts/criterion_compare.sh --list, the same gated set as the
+# regression job (`assign_scaling` is a wall-clock harness, not criterion).
+#
+# bench-regression.yml stays as the wall-clock cross-check behind the
+# `benchmark` label: instruction counts miss effects such as memory-bandwidth
+# or thread-scaling changes that only show up in time.
+#
+# Auth: OIDC (`id-token: write`), no token secret; this needs the CodSpeed
+# GitHub app installed on the repo. See DEVELOPMENT.md, "CodSpeed".
+
+name: CodSpeed
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  codspeed:
+    name: CodSpeed benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # Own key: cargo-codspeed builds into target/codspeed with its own
+      # instrumentation cfg, so sharing bench.yml's entry would only thrash it.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-codspeed
+            target
+          key: ${{ runner.os }}-cargo-codspeed-${{ hashFiles('**/Cargo.lock') }}
+
+      # Keep in step with codspeed-criterion-compat in crates/core/Cargo.toml.
+      - name: Install cargo-codspeed
+        run: |
+          if [ "$(cargo codspeed --version 2>/dev/null)" != "cargo-codspeed 5.0.3" ]; then
+            cargo install cargo-codspeed --version 5.0.3 --locked --force
+          fi
+
+      - name: Build benches
+        run: |
+          bench_args=()
+          for b in $(scripts/criterion_compare.sh --list); do
+            bench_args+=(--bench "$b")
+          done
+          cargo codspeed build -m simulation -p tylertoo-core --all-features --locked "${bench_args[@]}"
+
+      - name: Run benches
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
+        with:
+          mode: simulation
+          run: cargo codspeed run -m simulation -p tylertoo-core
