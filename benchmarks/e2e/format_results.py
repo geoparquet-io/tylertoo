@@ -74,15 +74,24 @@ def quality_matched(r) -> str:
     return "\n".join(out)
 
 
+def cpu(v):
+    """CPU utilisation; >100% means multi-core. Recorded from run_e2e.py's
+    /usr/bin/time wrap (older results files predate the field)."""
+    return "—" if v is None else f"{v:.0f}%"
+
+
 def memory_and_size(r) -> str:
     out = ["| dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS "
+           "| tylertoo CPU | tippecanoe CPU "
            "| tylertoo archive | tippecanoe archive | archive ratio |",
-           "|---|---|---|---|---|---|---|"]
+           "|---|---|---|---|---|---|---|---|---|"]
     for did, e in r["datasets"].items():
         out.append(
             f"| `{did}` | {mb(e['tylertoo']['peak_rss_bytes'])} "
             f"| {mb(e['tippecanoe_fgb']['peak_rss_bytes'])} "
             f"| {mb(e['convert_fgb'].get('peak_rss_bytes'))} "
+            f"| {cpu(e['tylertoo'].get('cpu_pct'))} "
+            f"| {cpu(e['tippecanoe_fgb'].get('cpu_pct'))} "
             f"| {mbf(e['tylertoo']['output_bytes'])} "
             f"| {mbf(e['tippecanoe_fgb']['output_bytes'])} "
             f"| {e['ratios']['archive_size_ratio_tylertoo_over_tippecanoe']:.2f}× |")
@@ -157,10 +166,25 @@ def provenance(r) -> str:
         f"- **Settings** — z{s_['min_zoom']}–z{s_['max_zoom']}, tile buffer "
         f"{s_['tile_buffer']}, per-tile cap {s_['max_tile_bytes']:,} bytes",
         f"- **Method** — median of {s_['repeat']} timed runs after one "
-        f"discarded warm-up; warm page cache; no other load on the machine",
+        f"discarded warm-up; warm page cache (machine load during the run is "
+        f"a caveat the write-up must state; the script cannot know it)",
         f"- **Recorded** — {r['generated_at']} → "
         f"`{r.get('_source_file', 'results.json')}`",
     ])
+
+
+def dataset_flags(r) -> str:
+    """Per-dataset zoom range and recorded tippecanoe flags (corpus rows carry
+    the flags from corpus/manifest.json; fixture rows carry none)."""
+    out = ["| dataset | zooms | tippecanoe flags beyond the parity set |",
+           "|---|---|---|"]
+    for did, e in r["datasets"].items():
+        flags = " ".join(e.get("tippecanoe_dataset_flags") or []) or "—"
+        zmin = e.get("min_zoom", r["settings"]["min_zoom"])
+        zmax = e.get("max_zoom", r["settings"]["max_zoom"])
+        out.append(f"| `{did}` | z{zmin}–z{zmax} | `{flags}` |"
+                   .replace("`—`", "—"))
+    return "\n".join(out)
 
 
 SECTIONS = {
@@ -169,6 +193,7 @@ SECTIONS = {
     "memory": memory_and_size,
     "input": input_cost,
     "phases": phases,
+    "flags": dataset_flags,
     "provenance": provenance,
 }
 

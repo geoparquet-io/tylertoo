@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/tylertoo?color=blue)](https://crates.io/crates/tylertoo)
 [![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
-GeoParquet to PMTiles with a Rust engine, CLI, and Python API. ~7.5× faster than tippecanoe (see [benchmarks](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md)). Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
+GeoParquet to PMTiles with a Rust engine, CLI, and Python API. 8.6–21.6× faster than tippecanoe end-to-end on 300k–800k-feature point, line, and polygon datasets at each tool's production settings — 2.4–16.3× with tylertoo's feature thinning switched off, and at higher peak memory (see [benchmarks](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md) for methods and caveats). Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
 
 ## Install
 

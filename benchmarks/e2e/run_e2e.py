@@ -107,6 +107,23 @@ REPO = HERE.parent.parent
 # --------------------------------------------------------------------------
 FIXTURES = REPO / "tests" / "fixtures" / "realdata"
 
+# The corpus tier (--corpus): the datasets corpus/manifest.json defines, read
+# from the gpio-optimized copies (Hilbert-sorted, bbox-covered GeoParquet 1.1
+# — the input contract tylertoo documents). These are the engine-scale rows
+# (280k–650k features) the fixture set lacks; build them with
+# `corpus/fetch.sh && corpus/optimize.sh` (~2–3 GB download).
+#
+# On the tippecanoe side each corpus dataset carries the manifest's RECORDED
+# tippecanoe flags (the same flags corpus/goldens.sh uses), appended to the
+# settings-parity set and written into the results file. tylertoo runs its own
+# defaults against them: both tools in their production configuration for that
+# data, rather than both at bare defaults — a 650k-building z14 run without
+# density dropping is a configuration nobody ships. The per-zoom tile counts
+# are recorded for both archives either way, so the output difference is on
+# the record next to the timing.
+CORPUS_MANIFEST = REPO / "corpus" / "manifest.json"
+CORPUS_GPIO = REPO / "corpus" / "data" / "gpio"
+
 DATASETS = {
     "madagascar-adm4": {
         "path": FIXTURES / "fieldmaps-madagascar-adm4.parquet",
@@ -124,6 +141,38 @@ DATASETS = {
         "note": "1,000 LineString road detections, 90 KB",
     },
 }
+
+
+def corpus_datasets() -> dict:
+    """Dataset entries for every corpus/manifest.json dataset (--corpus).
+
+    The path is the gpio-optimized copy; a dataset whose copy has not been
+    built is skipped at run time with the fetch recipe, not an error, so
+    `--corpus` works with whatever subset of the corpus is on disk.
+    """
+    if not CORPUS_MANIFEST.exists():
+        raise FileNotFoundError(f"corpus manifest not found: {CORPUS_MANIFEST}")
+    manifest = json.loads(CORPUS_MANIFEST.read_text())
+    out = {}
+    for ds in manifest["datasets"]:
+        did = ds["id"]
+        tc = ds.get("tippecanoe", {})
+        feats = ds.get("expected_features")
+        feats_s = f"~{feats:,} features" if isinstance(feats, int) else "features: ?"
+        out[did] = {
+            "path": CORPUS_GPIO / f"{did}.parquet",
+            "layer": did,
+            "note": f"corpus {ds.get('class')}/{ds.get('tier')}: "
+                    f"{ds.get('region')} ({feats_s})",
+            "min_zoom": tc.get("minzoom"),
+            "max_zoom": tc.get("maxzoom"),
+            # The manifest's recorded tippecanoe flags for this dataset —
+            # the same ones corpus/goldens.sh passes — appended to the
+            # parity set and recorded in the results file.
+            "tippecanoe_flags": tc.get("flags", "").split(),
+            "fetch_hint": "cd corpus && ./fetch.sh && ./optimize.sh",
+        }
+    return out
 
 # --------------------------------------------------------------------------
 # Settings parity
@@ -186,6 +235,23 @@ def _parse_peak_rss(text: str) -> int | None:
     return None
 
 
+def _parse_cpu_pct(text: str) -> float | None:
+    """CPU utilisation (%) from /usr/bin/time output (GNU or BSD/Darwin).
+
+    GNU time prints it directly; Darwin prints real/user/sys on one line and
+    the percentage is (user + sys) / real. >100% means multi-core."""
+    m = re.search(r"Percent of CPU this job got:\s*(\d+)\s*%", text)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"^\s*([\d.]+)\s+real\s+([\d.]+)\s+user\s+([\d.]+)\s+sys",
+                  text, re.M)
+    if m:
+        real, user, sys_ = (float(g) for g in m.groups())
+        if real > 0:
+            return round(100.0 * (user + sys_) / real, 1)
+    return None
+
+
 class CommandFailed(RuntimeError):
     def __init__(self, argv, rc, tail):
         super().__init__(f"exit {rc}: {' '.join(argv)}")
@@ -217,6 +283,7 @@ def measure(argv: list[str], *, unlink_first: Path | None = None) -> dict:
     return {
         "wall_s": wall,
         "peak_rss_bytes": _parse_peak_rss(errtext),
+        "cpu_pct": _parse_cpu_pct(errtext),
         "argv": argv,
     }
 
@@ -229,6 +296,7 @@ def repeat(argv: list[str], n: int, *, warmup: bool = True,
     runs = [measure(argv, unlink_first=unlink_first) for _ in range(n)]
     walls = [r["wall_s"] for r in runs]
     rss = [r["peak_rss_bytes"] for r in runs if r["peak_rss_bytes"]]
+    cpu = [r["cpu_pct"] for r in runs if r["cpu_pct"] is not None]
     return {
         "argv": argv,
         "runs": n,
@@ -236,6 +304,8 @@ def repeat(argv: list[str], n: int, *, warmup: bool = True,
         "wall_min_s": min(walls),
         "wall_max_s": max(walls),
         "peak_rss_bytes": max(rss) if rss else None,
+        # Median utilisation across the repeats; >100% means multi-core.
+        "cpu_pct": round(statistics.median(cpu), 1) if cpu else None,
         "wall_all_s": walls,
     }
 
@@ -398,6 +468,12 @@ def main() -> int:
     ap.add_argument("--dataset", action="append", default=[],
                     metavar="ID=PATH",
                     help="register an extra GeoParquet dataset (cluster-scale runs)")
+    ap.add_argument("--corpus", action="store_true",
+                    help="also register every corpus/manifest.json dataset "
+                         "(gpio-optimized copies; build them with "
+                         "corpus/fetch.sh && corpus/optimize.sh). Each carries "
+                         "the manifest's recorded tippecanoe flags and zoom "
+                         "range; datasets not on disk are skipped")
     ap.add_argument("--min-zoom", type=int, default=DEFAULT_MIN_ZOOM)
     ap.add_argument("--max-zoom", type=int, default=DEFAULT_MAX_ZOOM)
     ap.add_argument("--tylertoo", default=os.environ.get(
@@ -456,6 +532,11 @@ def main() -> int:
 
     # --- datasets ---------------------------------------------------------
     datasets = dict(DATASETS)
+    if args.corpus:
+        try:
+            datasets.update(corpus_datasets())
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
+            return fail(f"--corpus: cannot read the corpus manifest: {exc}")
     for spec in args.dataset:
         if "=" not in spec:
             return fail(f"--dataset expects ID=PATH, got {spec!r}")
@@ -497,16 +578,28 @@ def main() -> int:
         for did, ds in datasets.items():
             src = Path(ds["path"])
             if not src.exists():
-                print(f"skip {did}: {src} not found "
-                      f"(fetch: gh release download fixtures-v1 "
-                      f"--dir tests/fixtures/realdata/)", file=sys.stderr)
+                hint = ds.get("fetch_hint",
+                              "fetch: gh release download fixtures-v1 "
+                              "--dir tests/fixtures/realdata/")
+                print(f"skip {did}: {src} not found ({hint})", file=sys.stderr)
                 continue
+            zmin = ds.get("min_zoom") if ds.get("min_zoom") is not None \
+                else args.min_zoom
+            zmax = ds.get("max_zoom") if ds.get("max_zoom") is not None \
+                else args.max_zoom
+            # The manifest's recorded flags for this dataset (corpus rows),
+            # appended to the parity set on tippecanoe's side and recorded.
+            ds_tip_flags = ds.get("tippecanoe_flags") or []
+            tip_all = tip_extra + ds_tip_flags
             print(f"\n=== {did} ===", flush=True)
             entry = {
                 "input": str(src),
                 "input_bytes": src.stat().st_size,
                 "note": ds.get("note"),
                 "layer": ds["layer"],
+                "min_zoom": zmin,
+                "max_zoom": zmax,
+                "tippecanoe_dataset_flags": ds_tip_flags,
             }
 
             # --- A. tylertoo: parquet -> pmtiles -----------------------------
@@ -515,7 +608,7 @@ def main() -> int:
             print("  tylertoo tiles (parquet -> pmtiles) ...", flush=True)
             entry["tylertoo"] = repeat(
                 tylertoo_argv(tylertoo, src, tt_out, ds["layer"],
-                              args.min_zoom, args.max_zoom, tt_report),
+                              zmin, zmax, tt_report),
                 args.repeat)
             entry["tylertoo"]["output_bytes"] = tt_out.stat().st_size
             entry["tylertoo"]["per_zoom"] = per_zoom_counts(tylertoo, tt_out)
@@ -530,7 +623,7 @@ def main() -> int:
                       f"({' '.join(QUALITY_MATCHED_FLAGS)}) ...", flush=True)
                 entry["tylertoo_quality_matched"] = repeat(
                     tylertoo_argv(tylertoo, src, qm_out, ds["layer"],
-                                  args.min_zoom, args.max_zoom, qm_report,
+                                  zmin, zmax, qm_report,
                                   QUALITY_MATCHED_FLAGS),
                     args.repeat)
                 entry["tylertoo_quality_matched"]["output_bytes"] = \
@@ -579,7 +672,7 @@ def main() -> int:
             print("  tippecanoe (fgb -> pmtiles) ...", flush=True)
             entry["tippecanoe_fgb"] = repeat(
                 tippecanoe_argv(tippecanoe, fgb, tp_out, ds["layer"],
-                                args.min_zoom, args.max_zoom, False, tip_extra),
+                                zmin, zmax, False, tip_all),
                 args.repeat)
             entry["tippecanoe_fgb"]["output_bytes"] = tp_out.stat().st_size
             entry["tippecanoe_fgb"]["per_zoom"] = per_zoom_counts(tylertoo, tp_out)
@@ -612,7 +705,7 @@ def main() -> int:
                         print("  tippecanoe -P (ldGeoJSON -> pmtiles) ...", flush=True)
                         entry["tippecanoe_geojsonseq"] = repeat(
                             tippecanoe_argv(tippecanoe, gj, gj_out, ds["layer"],
-                                            args.min_zoom, args.max_zoom, True, tip_extra),
+                                            zmin, zmax, True, tip_all),
                             args.repeat)
                         entry["tippecanoe_geojsonseq"]["output_bytes"] = \
                             gj_out.stat().st_size
