@@ -15,6 +15,7 @@ from typing import Literal, TypedDict, cast
 from tylertoo import _tylertoo
 
 __all__ = [
+    "ConvertReport",
     "ExportReport",
     "LevelReport",
     "OutOfRangeExemplar",
@@ -151,6 +152,17 @@ class ExportReport(TypedDict):
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
+
+
+class ConvertReport(TypedDict):
+    """The combined report of a one-shot `convert()` run.
+
+    Both halves of the chain, keyed like the CLI's `tiles --report`
+    JSON: the overview conversion and the PMTiles export.
+    """
+
+    convert: OverviewReport
+    export: ExportReport
 
 
 class ValidationCheck(TypedDict):
@@ -397,10 +409,13 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     feature_order: Literal["input"] | str = "input",
-) -> None:
+) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
     Use `overview()` followed by `export_pmtiles()` for all options.
+    Runs the same core facade as `tylertoo tiles`, so the chain — the
+    removed-after-export intermediate overview, its free-space
+    preflight, and the declared zoom range — matches the CLI.
 
     Args:
         input: See `overview()`.
@@ -412,6 +427,10 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         simple_clip_fastpath: See `export_pmtiles()`.
         feature_order: See `export_pmtiles()`.
 
+    Returns:
+        Both halves' reports, keyed `"convert"` and `"export"` like the
+        CLI's `tiles --report` JSON.
+
     Raises:
         ValueError: Invalid zoom range or options.
         MemoryError: Too little memory for this input.
@@ -421,4 +440,4 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         >>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
     """
     # Every argument goes to the extension unchanged, by keyword.
-    _tylertoo.convert(**locals())
+    return cast("ConvertReport", _tylertoo.convert(**locals()))

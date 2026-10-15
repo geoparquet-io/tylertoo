@@ -291,3 +291,72 @@ class TestConvertIntegration:
 
             leftovers = [p for p in Path(tmpdir).iterdir() if "overview" in p.name]
             assert leftovers == [], f"temp overview leaked: {leftovers}"
+
+
+PROPERTIES_FIXTURE = FIXTURES_DIR / "properties" / "overture-names.parquet"
+
+
+@pytest.mark.skipif(
+    not PROPERTIES_FIXTURE.exists(),
+    reason="overture-names.parquet fixture not available",
+)
+class TestConvertCombinedReport:
+    """convert() returns the combined report the CLI's `tiles --report`
+    writes (#439): both halves of the chain, keyed "convert" and "export".
+
+    This is the drift the shared core facade ends: convert() used to
+    re-implement the chain with no report, no free-space preflight and no
+    knob guards.
+    """
+
+    def test_convert_returns_combined_report(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            report = tylertoo.convert(
+                input=str(PROPERTIES_FIXTURE),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+            )
+
+            assert output.exists()
+            assert isinstance(report, dict)
+            assert set(report) == {"convert", "export"}
+
+            convert_half = report["convert"]
+            assert convert_half["input_features"] > 0
+            assert convert_half["levels"], "per-level stats present"
+
+            export_half = report["export"]
+            # #380: the requested minimum zoom is declared even when the
+            # coarsest levels generalized away.
+            assert export_half["min_zoom"] == 0
+            assert export_half["max_zoom"] == 4
+            assert export_half["total_tiles"] >= 1
+            assert "duration_secs" in export_half
+
+    def test_convert_report_matches_two_step_reports(self):
+        """The combined report's halves carry the same keys the two-step
+        overview() and export_pmtiles() reports do."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            one_shot = tylertoo.convert(
+                input=str(PROPERTIES_FIXTURE),
+                output=str(Path(tmpdir) / "one.pmtiles"),
+                min_zoom=0,
+                max_zoom=4,
+            )
+
+            ov = Path(tmpdir) / "ov.parquet"
+            overview_report = tylertoo.overview(
+                input=str(PROPERTIES_FIXTURE), output=str(ov), min_zoom=0, max_zoom=4
+            )
+            export_report = tylertoo.export_pmtiles(
+                input=str(ov),
+                output=str(Path(tmpdir) / "two.pmtiles"),
+                layer_name="overture-names",
+                min_zoom=0,
+            )
+
+            assert set(one_shot["convert"]) == set(overview_report)
+            assert set(one_shot["export"]) == set(export_report)

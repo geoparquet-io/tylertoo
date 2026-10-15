@@ -19,11 +19,14 @@ use tylertoo_core::overview::convert::{
     ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
 use tylertoo_core::overview::export::{
-    export_pmtiles as export_pmtiles_core, ExportOptions, FeatureOrder,
+    export_pmtiles as export_pmtiles_core, ExportOptions, ExportReport, FeatureOrder,
 };
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::overview::tiles::{
+    convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
+};
 
 /// Parse the `feature_order` kwarg into the core enum, surfacing a bad
 /// spelling as a Python `ValueError` rather than a panic (#361).
@@ -90,6 +93,12 @@ fn resolve_max_zoom_py(
 ///
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
+///
+/// Delegates the whole chain to core's tiles facade
+/// ([`tylertoo_core::overview::tiles::convert_to_pmtiles`], #439), so the
+/// policy — intermediate lifecycle and spill precedence, free-space
+/// preflight, knob guards, the #380 declaration, the combined report — can
+/// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
     signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"),
@@ -106,85 +115,86 @@ fn convert(
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
     feature_order: &str,
-) -> PyResult<()> {
+) -> PyResult<Py<PyDict>> {
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
 
-    // Derive the layer name from the input if not provided: file stem for a
-    // single file, last path segment for a directory or s3://gs:// prefix,
-    // last literal segment for a glob (core owns the rules).
-    let layer_name =
-        layer_name.unwrap_or_else(|| tylertoo_core::input_set::derive_layer_name(input));
-
     // #444: built with `auto`'s placeholder, then resolved (a fixed zoom is
     // its own placeholder and comes back verbatim, with no I/O).
-    let mut options = ConvertOptions {
+    let mut convert_options = ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom,
             max_zoom: max_zoom.plan_zoom(),
         },
         ..ConvertOptions::default()
     };
-    resolve_max_zoom_py(py, max_zoom, &mut options, || {
+    let max_zoom = resolve_max_zoom_py(py, max_zoom, &mut convert_options, || {
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
-    let export_options = ExportOptions {
+    let options = TilesOptions {
+        convert: convert_options,
+        // `None` lets core derive the layer name from the input: file stem
+        // for a single file, last path segment for a directory or
+        // `s3://`/`gs://` prefix, last literal segment for a glob (core owns
+        // the rules).
         layer_name,
+        // #314: not exposed on this deprecated one-shot facade; use
+        // `overview()` + `export_pmtiles()` instead.
+        keep_overview: None,
+        min_zoom,
+        max_zoom,
+        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
+        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
+        // and `export-pmtiles --tile-range`.
+        shard: None,
+        tile_range: None,
         tile_buffer: 8,
-        extent: 4096,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
         feature_order: parse_feature_order(feature_order)?,
-        // #380: the archive's `vector_layers` declares the requested range
-        // even when the coarsest levels generalized to nothing (the header
-        // stays the actual tiles, #529/#522).
-        min_zoom: Some(min_zoom),
-        properties: Default::default(),
-        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
-        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
-        // and `export-pmtiles --tile-range`.
-        tile_range: None,
-        zoom_ceiling: None,
-        // #443: not exposed on this deprecated one-shot facade; use
-        // `overview()` + `export_pmtiles(..., feature_id=...)` instead.
+        // #443: not exposed here; `export_pmtiles(..., feature_id=...)`.
         feature_id: None,
-        // #427: likewise; `export_pmtiles(..., spill_dir=...)`.
-        spill_dir: None,
     };
 
-    // Intermediate overview file next to the output (same filesystem);
-    // TempPath removes it on drop — success or failure alike. Only the path
-    // is kept, not an open handle: convert publishes its output by renaming
-    // a sibling over this path, which Windows refuses while a handle to the
-    // destination is open ("Access is denied", #678).
-    let tmp_dir = output_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    let overview_tmp = tempfile::Builder::new()
-        .prefix(".tylertoo-overview-")
-        .suffix(".parquet")
-        .tempfile_in(&tmp_dir)
-        .map_err(|e| {
-            PyErr::new::<PyRuntimeError, _>(format!(
-                "failed to create temporary overview file: {}",
-                e
-            ))
-        })?
-        .into_temp_path();
-
     // Release the GIL while the Rust pipelines run.
-    py.detach(|| convert_to_overviews(&input_path, &overview_tmp, &options))
-        .map_err(convert_error_to_py)?;
-    py.detach(|| export_pmtiles_core(&overview_tmp, &output_path, &export_options))
-        .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
+    let outcome = py
+        .detach(|| convert_to_pmtiles(&TilesInput::Path(input_path), &output_path, &options))
+        .map_err(tiles_error_to_py)?;
+    let report = match outcome {
+        TilesOutcome::Converted(report) => report,
+        // Unreachable without a shard job, which this facade never sets.
+        other => {
+            return Err(PyErr::new::<PyRuntimeError, _>(format!(
+                "unexpected tiles outcome: {other:?}"
+            )))
+        }
+    };
 
-    Ok(())
+    // The combined report (#439): the two halves the two-step chain's own
+    // reports would carry, keyed like the CLI's `tiles --report` JSON.
+    let dict = PyDict::new(py);
+    dict.set_item("convert", convert_report_to_dict(py, &report.convert)?)?;
+    dict.set_item("export", export_report_to_dict(py, &report.export)?)?;
+    Ok(dict.into())
+}
+
+/// Map a [`TilesError`] to the Python exception type it deserves: the
+/// convert half keeps [`convert_error_to_py`]'s mapping; preflight refusals
+/// (a bad `keep_overview` directory, the #386/#443 knob guards) are
+/// `ValueError`; everything else is `RuntimeError`.
+fn tiles_error_to_py(e: TilesError) -> PyErr {
+    match e {
+        TilesError::Convert(inner) => convert_error_to_py(inner),
+        TilesError::KeepOverviewDirMissing { .. }
+        | TilesError::FeatureOrderColumnExcluded { .. }
+        | TilesError::FeatureIdColumnExcluded { .. }
+        | TilesError::FeatureIdAccumulated { .. } => PyErr::new::<PyValueError, _>(format!("{e}")),
+        other => PyErr::new::<PyRuntimeError, _>(format!("{other}")),
+    }
 }
 
 /// Map a [`ConvertError`] to the Python exception type it deserves:
@@ -709,6 +719,12 @@ fn export_pmtiles(
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
 
+    export_report_to_dict(py, &report)
+}
+
+/// Convert an [`ExportReport`] to a Python dict (shared by
+/// `export_pmtiles()` and the `convert()` facade's combined report, #439).
+fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("mode", &report.mode)?;
     dict.set_item("min_zoom", report.min_zoom)?;
