@@ -110,7 +110,10 @@ prost-build = { workspace = true }
 [dev-dependencies]
 # Only for constructing i256 test values (Decimal256 coverage).
 arrow-buffer = { workspace = true }
-criterion = { version = "0.8", features = ["html_reports"] }
+# CodSpeed drop-in for criterion: plain `cargo bench` still runs regular
+# criterion (walltime, same CLI/output), while `cargo codspeed` builds the
+# benches with CodSpeed instrumentation (see .github/workflows/codspeed.yml).
+criterion = { version = "5.0.3", features = ["html_reports"], package = "codspeed-criterion-compat" }
 serde_json = "1"
 proptest = { workspace = true }
 

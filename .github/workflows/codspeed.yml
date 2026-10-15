@@ -1,0 +1,102 @@
+# CodSpeed continuous benchmarking.
+#
+# Runs the criterion micro-benches in crates/core/benches/ under CodSpeed's
+# CPU simulation instrument, which counts instructions instead of timing them,
+# so results are stable enough to compare across shared runners and to report
+# on every PR. `criterion` in crates/core is the codspeed-criterion-compat
+# drop-in: a plain `cargo bench` (bench.yml, bench-regression.yml) still runs
+# regular criterion; only `cargo codspeed build` adds the instrumentation.
+#
+# Bench set: the gated list from scripts/criterion_compare.sh plus
+# hostile_geometry (needs the geometry-test-data submodule). assign_scaling is
+# left out: it is a wall-clock thread-scaling harness, not criterion.
+
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets CodSpeed trigger backtest runs to build initial history.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC authentication with CodSpeed
+
+concurrency:
+  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A bench whose fixture is missing panics instead of silently skipping.
+  TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
+
+jobs:
+  codspeed:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-codspeed@5.0.3
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-codspeed-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-codspeed-
+
+      # -j 2: every bench binary is a fat-LTO link with debuginfo; linking
+      # them all in parallel can exhaust the runner's memory.
+      - name: Build the benchmark targets
+        run: |
+          benches=""
+          for b in $(scripts/criterion_compare.sh --list) hostile_geometry; do
+            benches="$benches --bench $b"
+          done
+          # shellcheck disable=SC2086  # $benches is a list of flags
+          cargo codspeed build -m simulation -p tylertoo-core -j 2 $benches
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
+        with:
+          mode: simulation
+          run: cargo codspeed run -p tylertoo-core
