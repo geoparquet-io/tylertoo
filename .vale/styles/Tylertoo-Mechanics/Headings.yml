@@ -9,6 +9,7 @@ exceptions:
   - Arrow
   - CI
   - CLI
+  - CodSpeed
   - Criterion
   - DuckDB
   - EPSG
