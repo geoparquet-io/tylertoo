@@ -881,9 +881,12 @@ documented f64 limit of 2^500, where the `geo` path returned an empty
 result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
 below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
 engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
-a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
-not changed by #435 and carry no such guard; whether they need one is a
-separate question.
+a panic. Since #692 the polygon entry points (`clip_polygon_ioverlay`,
+`clip_multipolygon_ioverlay`, `union_polygons_ioverlay`,
+`repair_polygon_ioverlay`) run the same per-coordinate check and return
+`None` — the "doesn't intersect" / "could not trace" result their callers
+already handle — because export reaches them over overview files this
+process did not write.
 
 **Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
 0.33.1 (the latest release at the time of writing) depends on it
