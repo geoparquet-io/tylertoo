@@ -1574,6 +1574,9 @@ pub fn tylertoo_core::overview::convert::convert_to_overviews_source(&tylertoo_c
 pub fn tylertoo_core::overview::convert::convert_to_overviews_sources(&tylertoo_core::input_set::ConvertSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::out_of_range_exemplar_note(&[tylertoo_core::overview::convert::OutOfRangeExemplar]) -> alloc::string::String
 pub fn tylertoo_core::overview::convert::overture_road_ranking(alloc::string::String) -> tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::parse_accumulate(&str) -> core::result::Result<tylertoo_core::overview::cluster::AccumulateSpec, alloc::string::String>
+pub fn tylertoo_core::overview::convert::parse_class_rank(&str) -> core::result::Result<tylertoo_core::overview::convert::ClassRanking, alloc::string::String>
+pub fn tylertoo_core::overview::convert::parse_entry_zoom(&str) -> core::result::Result<tylertoo_core::overview::ladder::EntryZoomSpec, alloc::string::String>
 pub fn tylertoo_core::overview::convert::parse_representation_spec(&str) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, alloc::string::String>
 pub fn tylertoo_core::overview::convert::read_workers_ceiling() -> usize
 pub fn tylertoo_core::overview::convert::resolve_in_flight_batches(usize) -> usize
@@ -2712,6 +2715,183 @@ pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometr
 pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation) -> tylertoo_core::overview::simplify::Simplified
 pub fn tylertoo_core::overview::simplify::validation_skip_count() -> u64
 pub fn tylertoo_core::overview::simplify::world_tolerance(f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> f64
+pub mod tylertoo_core::overview::tiles
+#[non_exhaustive] pub enum tylertoo_core::overview::tiles::TilesError
+pub tylertoo_core::overview::tiles::TilesError::Convert(tylertoo_core::overview::convert::ConvertError)
+pub tylertoo_core::overview::tiles::TilesError::EmptyCoarseArchive(tylertoo_core::overview::export::ExportError)
+pub tylertoo_core::overview::tiles::TilesError::EmptyShardArchive(tylertoo_core::overview::export::ExportError)
+pub tylertoo_core::overview::tiles::TilesError::Export(tylertoo_core::overview::export::ExportError)
+pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated
+pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::name: alloc::string::String
+pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::op: alloc::string::String
+pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded
+pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded
+pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate
+pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::dir: std::path::PathBuf
+pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::source: core::io::error::Error
+pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing
+pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing::dir: std::path::PathBuf
+impl core::error::Error for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesError
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesError
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesError
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesError
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesError
+pub enum tylertoo_core::overview::tiles::TilesInput
+pub tylertoo_core::overview::tiles::TilesInput::Manifest(std::path::PathBuf)
+pub tylertoo_core::overview::tiles::TilesInput::Path(std::path::PathBuf)
+impl tylertoo_core::overview::tiles::TilesInput
+pub fn tylertoo_core::overview::tiles::TilesInput::derive_layer_name(&self) -> alloc::string::String
+impl core::clone::Clone for tylertoo_core::overview::tiles::TilesInput
+pub fn tylertoo_core::overview::tiles::TilesInput::clone(&self) -> tylertoo_core::overview::tiles::TilesInput
+impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesInput
+impl core::cmp::PartialEq for tylertoo_core::overview::tiles::TilesInput
+pub fn tylertoo_core::overview::tiles::TilesInput::eq(&self, &tylertoo_core::overview::tiles::TilesInput) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesInput
+pub fn tylertoo_core::overview::tiles::TilesInput::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::TilesInput
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesInput
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesInput
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesInput
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesInput
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesInput
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesInput
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesInput
+pub enum tylertoo_core::overview::tiles::TilesOutcome
+pub tylertoo_core::overview::tiles::TilesOutcome::Converted(alloc::boxed::Box<tylertoo_core::overview::tiles::TilesReport>)
+pub tylertoo_core::overview::tiles::TilesOutcome::EmptyCoarse(tylertoo_core::overview::tiles::EmptyArchive)
+pub tylertoo_core::overview::tiles::TilesOutcome::EmptyShard(tylertoo_core::overview::tiles::EmptyArchive)
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesOutcome
+pub fn tylertoo_core::overview::tiles::TilesOutcome::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesOutcome
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesOutcome
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesOutcome
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesOutcome
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesOutcome
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
+pub struct tylertoo_core::overview::tiles::EmptyArchive
+pub tylertoo_core::overview::tiles::EmptyArchive::max_zoom: u8
+pub tylertoo_core::overview::tiles::EmptyArchive::min_zoom: u8
+pub tylertoo_core::overview::tiles::EmptyArchive::pivot_zoom: u8
+pub tylertoo_core::overview::tiles::EmptyArchive::role: tylertoo_core::shard::ShardRole
+pub tylertoo_core::overview::tiles::EmptyArchive::why: alloc::string::String
+impl core::clone::Clone for tylertoo_core::overview::tiles::EmptyArchive
+pub fn tylertoo_core::overview::tiles::EmptyArchive::clone(&self) -> tylertoo_core::overview::tiles::EmptyArchive
+impl core::cmp::Eq for tylertoo_core::overview::tiles::EmptyArchive
+impl core::cmp::PartialEq for tylertoo_core::overview::tiles::EmptyArchive
+pub fn tylertoo_core::overview::tiles::EmptyArchive::eq(&self, &tylertoo_core::overview::tiles::EmptyArchive) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::tiles::EmptyArchive
+pub fn tylertoo_core::overview::tiles::EmptyArchive::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::EmptyArchive
+impl core::marker::Freeze for tylertoo_core::overview::tiles::EmptyArchive
+impl core::marker::Send for tylertoo_core::overview::tiles::EmptyArchive
+impl core::marker::Sync for tylertoo_core::overview::tiles::EmptyArchive
+impl core::marker::Unpin for tylertoo_core::overview::tiles::EmptyArchive
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::EmptyArchive
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::EmptyArchive
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::EmptyArchive
+pub struct tylertoo_core::overview::tiles::IntermediateOverview
+pub tylertoo_core::overview::tiles::IntermediateOverview::bytes: u64
+pub tylertoo_core::overview::tiles::IntermediateOverview::path: std::path::PathBuf
+pub tylertoo_core::overview::tiles::IntermediateOverview::retained: bool
+impl core::clone::Clone for tylertoo_core::overview::tiles::IntermediateOverview
+pub fn tylertoo_core::overview::tiles::IntermediateOverview::clone(&self) -> tylertoo_core::overview::tiles::IntermediateOverview
+impl core::cmp::Eq for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::cmp::PartialEq for tylertoo_core::overview::tiles::IntermediateOverview
+pub fn tylertoo_core::overview::tiles::IntermediateOverview::eq(&self, &tylertoo_core::overview::tiles::IntermediateOverview) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::tiles::IntermediateOverview
+pub fn tylertoo_core::overview::tiles::IntermediateOverview::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::marker::Freeze for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::marker::Send for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::marker::Sync for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::marker::Unpin for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
+pub struct tylertoo_core::overview::tiles::TilesOptions
+pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
+pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
+pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::overview::tiles::TilesOptions::layer_name: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::tiles::TilesOptions::max_zoom: u8
+pub tylertoo_core::overview::tiles::TilesOptions::min_zoom: u8
+pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
+pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
+pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
+pub tylertoo_core::overview::tiles::TilesOptions::tile_buffer: u32
+pub tylertoo_core::overview::tiles::TilesOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
+pub tylertoo_core::overview::tiles::TilesOptions::tile_size_limit: core::option::Option<usize>
+impl core::clone::Clone for tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::clone(&self) -> tylertoo_core::overview::tiles::TilesOptions
+impl core::default::Default for tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesOptions
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesOptions
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesOptions
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesOptions
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesOptions
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesOptions
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesOptions
+pub struct tylertoo_core::overview::tiles::TilesReport
+pub tylertoo_core::overview::tiles::TilesReport::convert: tylertoo_core::overview::convert::ConvertReport
+pub tylertoo_core::overview::tiles::TilesReport::export: tylertoo_core::overview::export::ExportReport
+pub tylertoo_core::overview::tiles::TilesReport::intermediate: tylertoo_core::overview::tiles::IntermediateOverview
+impl tylertoo_core::overview::tiles::TilesReport
+pub fn tylertoo_core::overview::tiles::TilesReport::empty_declared_zooms(&self) -> alloc::vec::Vec<u8>
+impl core::clone::Clone for tylertoo_core::overview::tiles::TilesReport
+pub fn tylertoo_core::overview::tiles::TilesReport::clone(&self) -> tylertoo_core::overview::tiles::TilesReport
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesReport
+pub fn tylertoo_core::overview::tiles::TilesReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::tiles::TilesReport
+pub fn tylertoo_core::overview::tiles::TilesReport::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesReport
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesReport
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesReport
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesReport
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesReport
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesReport
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesReport
+pub struct tylertoo_core::overview::tiles::TilesShard
+pub tylertoo_core::overview::tiles::TilesShard::pivot_zoom: u8
+pub tylertoo_core::overview::tiles::TilesShard::range: core::option::Option<tylertoo_core::shard::TileRange>
+pub tylertoo_core::overview::tiles::TilesShard::role: tylertoo_core::shard::ShardRole
+impl core::clone::Clone for tylertoo_core::overview::tiles::TilesShard
+pub fn tylertoo_core::overview::tiles::TilesShard::clone(&self) -> tylertoo_core::overview::tiles::TilesShard
+impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesShard
+impl core::cmp::PartialEq for tylertoo_core::overview::tiles::TilesShard
+pub fn tylertoo_core::overview::tiles::TilesShard::eq(&self, &tylertoo_core::overview::tiles::TilesShard) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesShard
+pub fn tylertoo_core::overview::tiles::TilesShard::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::Send for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::Sync for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesShard
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesShard
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesShard
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesShard
+pub trait tylertoo_core::overview::tiles::TilesObserver
+pub fn tylertoo_core::overview::tiles::TilesObserver::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
+impl tylertoo_core::overview::tiles::TilesObserver for ()
+pub fn ()::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
+pub fn tylertoo_core::overview::tiles::check_knob_columns(&tylertoo_core::overview::convert::ConvertOptions, &tylertoo_core::overview::export::FeatureOrder, core::option::Option<&str>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::convert_to_pmtiles(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::convert_to_pmtiles_observed(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, &mut dyn tylertoo_core::overview::tiles::TilesObserver) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
 pub mod tylertoo_core::overview::writer
 pub enum tylertoo_core::overview::writer::LevelWriteOutcome
 pub tylertoo_core::overview::writer::LevelWriteOutcome::SkippedEmpty
