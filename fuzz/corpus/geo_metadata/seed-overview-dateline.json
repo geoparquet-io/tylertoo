@@ -1,0 +1,1 @@
+{"columns":{"geometry":{"bbox":[-120.0,40.0,190.25,40.9],"covering":{"bbox":{"xmax":["bbox","xmax"],"xmin":["bbox","xmin"],"ymax":["bbox","ymax"],"ymin":["bbox","ymin"]}},"encoding":"WKB","geometry_types":["Point"]}},"primary_column":"geometry","version":"1.1.0"}

@@ -657,8 +657,9 @@ fn decode_tile_features(
 /// stream, ring assembly, tag lookup — reached with the archive framing
 /// (directory walk, decompression) stripped away so libFuzzer spends its
 /// budget on the parser rather than on gzip. Decompression is fuzzed on its
-/// own through the `band_archive` target. Only the `fuzz/` crate calls this;
-/// the `fuzzing` feature is never on in a normal build.
+/// own through the `decompress` target, and the whole chain through
+/// [`fuzz_decode_archive`]. Only the `fuzz/` crate calls this; the `fuzzing`
+/// feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_decode_tile(
@@ -681,6 +682,45 @@ pub fn fuzz_decode_tile(
     let decoded = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
     let with_geometry = decoded.iter().filter(|(_, f)| f.geometry.is_some()).count();
     Ok((decoded.len(), with_geometry))
+}
+
+/// Fuzz hook (#633): [`decode_pmtiles`] on an in-memory archive, minus the
+/// GeoParquet writer.
+///
+/// Runs everything `decode` does to an archive it reads: the header, the
+/// tile-type check, the directory walk with its leaf/entry/run-length budgets
+/// ([`collect_tile_refs`]), and for every addressed tile the capped
+/// decompression and MVT decode, the reserved-column check and the property
+/// type union. [`fuzz_decode_tile`] reaches only the last step. Returns
+/// `(tiles, features)`. Only the `fuzz/` crate calls this; the `fuzzing`
+/// feature is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> {
+    let options = DecodeOptions::default();
+    let header = Header::from_bytes(bytes)?;
+    if header.tile_type != TileType::Mvt {
+        return Err(DecodeError::NotVectorTiles(header.tile_type));
+    }
+    let tiles = collect_tile_refs(bytes, &header, &options)?;
+    let mut col_types: BTreeMap<String, ColType> = BTreeMap::new();
+    let mut features = 0;
+    for tile in &tiles {
+        for (_layer, feature) in decode_tile_features(bytes, &header, tile, &options)? {
+            features += 1;
+            for (key, value) in &feature.props {
+                if RESERVED_COLUMNS.contains(&key.as_str()) {
+                    return Err(DecodeError::ReservedColumn(key.clone()));
+                }
+                let t = ColType::of(value);
+                col_types
+                    .entry(key.clone())
+                    .and_modify(|e| *e = e.unify(t))
+                    .or_insert(t);
+            }
+        }
+    }
+    Ok((tiles.len(), features))
 }
 
 // ============================================================================

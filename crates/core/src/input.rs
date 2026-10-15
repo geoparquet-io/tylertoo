@@ -1808,6 +1808,47 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     )
 }
 
+/// Fuzz hook (#633): read `bytes` as a remote GeoParquet object, through the
+/// same [`remote::RemoteSource`] a `s3://`/`gs://`/`https://` input uses, with
+/// an in-memory object store standing in for the network.
+///
+/// Covers the ranged footer fetch and its chunk-range checks (#430, #586),
+/// row-group staging, and a full read of every row group through the
+/// readahead-clamped reader. Returns the rows read. Only the `fuzz/` crate
+/// calls this; the `fuzzing` and `remote` features are never both on in a
+/// normal build.
+#[cfg(all(feature = "fuzzing", feature = "remote"))]
+#[doc(hidden)]
+pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::ObjectStoreExt;
+    use std::sync::{Arc, OnceLock};
+
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime for the fuzz hook")
+    });
+    let store = Arc::new(InMemory::new());
+    let location = ObjectPath::from("fuzz.parquet");
+    rt.block_on(store.put(&location, bytes.to_vec().into()))
+        .expect("an in-memory put cannot fail");
+    let source = InputSource::Remote(remote::RemoteSource::from_store(
+        store,
+        location,
+        "memory://fuzz.parquet".to_string(),
+    )?);
+    source.stage_row_groups(None)?;
+    let mut rows = 0;
+    for batch in source.open()?.with_batch_size(256).build()? {
+        rows += batch?.num_rows();
+    }
+    source.release_read_cache();
+    Ok(rows)
+}
+
 /// Test-only: a multi-partition [`crate::input_set::ConvertSource`] over ONE
 /// in-memory object store — `objects` are `(basename, bytes)` pairs placed
 /// under a `set/` prefix and resolved through the REAL prefix-listing path

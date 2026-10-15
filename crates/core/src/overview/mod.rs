@@ -27,6 +27,9 @@ pub mod level;
 mod pipe;
 mod pipeline;
 mod plan_state;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use plan_state::fuzz_convert_plan;
 mod procmem;
 pub mod properties;
 pub mod reader;

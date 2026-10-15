@@ -933,6 +933,97 @@ fn parse_semver_major(v: &str) -> Option<u64> {
     parts[0].parse().ok()
 }
 
+/// Fuzz hook (#633): decode `thrift` as a Parquet footer (the bytes before
+/// the trailing length and `PAR1`) and put it through every tylertoo reader
+/// that works on footer metadata alone.
+///
+/// That is: this module's §6.2 checklist ([`validate_metadata`], which keeps
+/// going past a failed `validate()`), the `geo:overviews` parse and
+/// `validate` that [`super::reader::OverviewReader::open`] runs, the
+/// row-group bbox readers (covering columns and native geo statistics), the
+/// spill-size and batch-size heuristics, and `--filter` pushdown over the
+/// footer's column statistics, with a few filters bound to the footer's own
+/// columns. The footer decode itself is parquet-rs's, and the embedded
+/// `ARROW:schema` is left to the whole-file targets. Only the `fuzz/` crate
+/// calls this; the `fuzzing` feature is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parquet_footer(
+    thrift: &[u8],
+) -> Result<ValidationReport, parquet::errors::ParquetError> {
+    use super::filter::{BoundFilter, CmpOp, FilterExpr, Literal};
+    use super::level::Crs;
+    use parquet::file::metadata::ParquetMetaDataReader;
+
+    let md = ParquetMetaDataReader::decode_metadata(thrift)?;
+    let report = validate_metadata(&md);
+
+    let n = md.num_row_groups();
+    if let Some(json) = md
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|kv| kv.key == OVERVIEWS_KEY))
+        .and_then(|kv| kv.value.as_deref())
+    {
+        if let Ok(meta) = OverviewsMeta::from_json(json) {
+            let _ = meta.validate(n as i64);
+        }
+    }
+
+    let _ = crate::covering::extract_row_group_bounds_from_metadata(&md);
+    let geom = crate::covering::resolve_geometry_column_name(&md);
+    for crs in [Crs::Epsg4326, Crs::Epsg3857] {
+        let _ = crate::covering::extract_row_group_bounds_tiered(&md, crs, geom.as_deref());
+    }
+
+    let some: Vec<usize> = (0..n).step_by(2).collect();
+    for selected in [None, Some(some.as_slice())] {
+        let _ = crate::input::selected_compressed_bytes(&md, selected);
+        let widest = crate::input_set::widest_byte_array_column(&md, selected, 0);
+        let _ = crate::input_set::capped_batch_rows(8192, widest.as_ref());
+        let _ = crate::input_set::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
+    }
+
+    // Without the key-value metadata: the embedded `ARROW:schema` hint is
+    // arrow-ipc's to decode (and it panics on a crafted one, #683);
+    // `overview_file` and `remote_footer` reach that through the real open.
+    // Here the filters only need column names and types.
+    if let Ok(schema) =
+        parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), None)
+    {
+        for field in schema.fields() {
+            let column = field.name().clone();
+            let filters = [
+                FilterExpr::IsNull {
+                    column: column.clone(),
+                    negated: true,
+                },
+                FilterExpr::Compare {
+                    column: column.clone(),
+                    op: CmpOp::Gt,
+                    value: Literal::Number(0.0),
+                },
+                FilterExpr::Compare {
+                    column: column.clone(),
+                    op: CmpOp::Le,
+                    value: Literal::String("m".into()),
+                },
+                FilterExpr::In {
+                    column,
+                    values: vec![Literal::Bool(true), Literal::Timestamp(0)],
+                    negated: false,
+                },
+            ];
+            for f in filters {
+                if let Ok(bound) = BoundFilter::bind(&f, &schema, &[]) {
+                    let _ = bound.select_row_groups(&md);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

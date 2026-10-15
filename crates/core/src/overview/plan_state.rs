@@ -1596,6 +1596,29 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
     Ok(())
 }
 
+/// Fuzz hook (#633): read `ipc_payload` back as a saved `--plan` file.
+///
+/// The checksum in the header rejects almost every mutation before any byte
+/// reaches arrow or serde, so the hook writes a *valid* header (magic plus
+/// the payload's xxh3-64, as the tests' `forge` does) and lets the payload
+/// itself be the fuzzed input: the Arrow IPC decode, the `PlanMeta` JSON, the
+/// section-shape checks of [`ConvertPlan::load`] (#512), and the WKB and
+/// table rebuild in [`ConvertPlan::into_winner_tables`]. The fingerprint
+/// checks that follow in `stream::load_plan_state` compare against real
+/// input files and are not reached. Only the `fuzz/` crate calls this; the
+/// `fuzzing` feature is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_convert_plan(ipc_payload: &[u8]) -> Result<(), ConvertError> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    file.write_all(PLAN_MAGIC)?;
+    file.write_all(&xxhash_rust::xxh3::xxh3_64(ipc_payload).to_le_bytes())?;
+    file.write_all(ipc_payload)?;
+    file.flush()?;
+    ConvertPlan::load(file.path())?.into_winner_tables()?;
+    Ok(())
+}
+
 /// Decode a geometry-kind byte. Unknown codes are **rejected**: silently
 /// folding them to `Point` (#512) would reroute Q3 coalescing and the
 /// polygon carriers on a byte the checksum had not yet caught.

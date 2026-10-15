@@ -3998,6 +3998,36 @@ pub(crate) fn detect_crs_from_kv(
     }
 }
 
+/// Fuzz hook (#633): run one GeoParquet `geo` key-value string through every
+/// reader of it, as an input file's footer hands it over verbatim.
+///
+/// Covers CRS detection ([`detect_crs_from_kv`] →
+/// [`crate::quality::crs_info_from_kv_metadata`] and the shared classifiers,
+/// #518), the bbox covering parse with and without a named column, the
+/// `primary_column` lookup in [`find_geometry_column`], and the bare
+/// identifier classifier that a GeoParquet 2.0 `LogicalType::Geometry(crs)`
+/// string reaches. Only the `fuzz/` crate calls this; the `fuzzing` feature
+/// is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
+    let _ = crate::covering::parse_covering_metadata(geo_json, None);
+    let _ = crate::covering::parse_covering_metadata(geo_json, Some("geometry"));
+    let _ = crate::quality::classify_crs_identifier(geo_json);
+    let schema = Schema::new_with_metadata(
+        ["geometry", "geom_shape", "centroid", "bbox"]
+            .map(|name| Field::new(name, DataType::Binary, true))
+            .to_vec(),
+        [("geo".to_string(), geo_json.to_string())].into(),
+    );
+    let _ = find_geometry_column(&schema);
+    let kv = vec![parquet::file::metadata::KeyValue::new(
+        "geo".to_string(),
+        geo_json.to_string(),
+    )];
+    detect_crs_from_kv(Some(&kv))
+}
+
 /// Half the Web Mercator world extent in meters (`±` = the x/y range of
 /// EPSG:3857). Matches the constant used by the export reprojection.
 const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;

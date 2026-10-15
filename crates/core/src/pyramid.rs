@@ -1909,6 +1909,81 @@ pub fn fuzz_band_archive(bytes: &[u8]) -> Result<u64, Error> {
     Ok(tiles)
 }
 
+/// Fuzz hook (#633): read `bytes` as an input archive's metadata JSON, the
+/// way `pyramid` and `merge` read its `vector_layers`.
+///
+/// The first two bytes are the archive header's `(min_zoom, max_zoom)`,
+/// folded into the range `Header::from_bytes` guarantees (`lo <= hi <=
+/// MAX_TILE_ID_ZOOM`); the rest is the JSON. Runs the `--band` metadata parse
+/// ([`parse_layers`], both with no label and with the first layer's id), then
+/// `merge`'s layer collection: [`layer_zoom_range`] on every entry,
+/// [`declared_zoom_range`], and [`vector_layers_json`] over the layers twice
+/// so every id collides and [`union_fields`] runs. Panics if any range that
+/// comes back is not a zoom range. Only the `fuzz/` crate calls this; the
+/// `fuzzing` feature is never on in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, Error> {
+    let check = |(lo, hi): (u8, u8)| {
+        assert!(
+            lo <= hi && hi <= MAX_TILE_ID_ZOOM,
+            "z{lo}..z{hi} is not a zoom range"
+        );
+    };
+    let [a, b, json @ ..] = bytes else {
+        return Err(Error::PMTilesWrite("short input".into()));
+    };
+    let (a, b) = (a % (MAX_TILE_ID_ZOOM + 1), b % (MAX_TILE_ID_ZOOM + 1));
+    let header = (a.min(b), a.max(b));
+    let path = Path::new("fuzz.pmtiles");
+
+    let parsed = parse_layers(json, Compression::None, header, path, "")?;
+    parsed.zooms.iter().copied().for_each(check);
+    check(declared_zoom_range(header, true, parsed.zooms.clone()));
+    check(declared_zoom_range(header, false, parsed.zooms));
+    if let Some(first) = parsed.ids.first() {
+        parse_layers(json, Compression::None, header, path, first)?;
+    }
+
+    let Ok(meta) = serde_json::from_slice::<Value>(json) else {
+        return Ok(Value::Null);
+    };
+    let mut layers = Vec::new();
+    for l in meta
+        .get("vector_layers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = l.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let (minzoom, maxzoom) = layer_zoom_range(l, header, path);
+        check((minzoom, maxzoom));
+        layers.push(LayerMeta {
+            id: id.to_string(),
+            minzoom,
+            maxzoom,
+            fields: l
+                .get("fields")
+                .filter(|f| f.is_object())
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
+        });
+    }
+    check(declared_zoom_range(
+        header,
+        true,
+        layers.iter().map(|l| (l.minzoom, l.maxzoom)),
+    ));
+    let doubled = layers
+        .iter()
+        .cloned()
+        .chain(layers.iter().cloned())
+        .collect();
+    Ok(vector_layers_json(doubled))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
