@@ -218,7 +218,63 @@ cargo bench --package tylertoo-core \
 ```
 
 `benchmarks/overview/` scripts the corpus-scale storage, access, and
-conversion benchmarks. `context/PROFILING.md` covers profiling.
+conversion benchmarks. `context/PROFILING.md` covers profiling, including
+the `profiling` Cargo profile and sampling profilers such as samply.
+
+#### CodSpeed
+
+`.github/workflows/codspeed.yml` runs the gated benches under
+[CodSpeed](https://codspeed.io). CodSpeed's simulation mode counts
+instructions, weighted by estimated cache cost, rather than timing
+wall-clock. The count does not depend on how busy the shared runner is,
+so unlike the timing gate below it needs no opt-in label. CodSpeed
+comments on the PR with each bench's change against the base branch, and
+its dashboard keeps the history of `main`.
+
+Simulation runs every bench under Valgrind, which is slow, so a PR runs
+only what it can move:
+
+- A PR that touches neither `crates/core/` nor the build doesn't start
+  the workflow.
+- Otherwise `scripts/codspeed_benches.sh` maps the PR's changed files to
+  the benches whose code they touch, and only those build and run.
+  CodSpeed reports the rest as "skipped", with their baseline numbers.
+  A PR that touches only code no bench covers passes without building.
+- A change to `Cargo.lock`, a manifest, the crate root, the bench
+  harness, or the workflow runs every bench.
+- Every push to `main` runs every bench, so each bench keeps a current
+  baseline.
+
+The map in `scripts/codspeed_benches.sh` is kept by hand: each bench's
+entry modules and their direct dependencies. A change that moves a bench
+only through a more distant module shows up in the next run on `main`
+rather than on the PR. When you add a bench, add its entry there; until
+you do, it runs on every `crates/core/` change. To see what a branch
+would run:
+
+```bash
+git diff --name-only origin/main...HEAD | scripts/codspeed_benches.sh
+```
+
+The benches build against `codspeed-criterion-compat`, renamed to
+`criterion` in `crates/core/Cargo.toml`, so bench code still writes
+`use criterion::…`. Outside `cargo codspeed` it is ordinary criterion,
+so the commands above and the regression gate work unchanged. To check
+that the benches build and run the way CI runs them:
+
+```bash
+cargo install cargo-codspeed --version 5.0.3 --locked
+cargo codspeed build -m simulation -p tylertoo-core --all-features
+cargo codspeed run -m simulation -p tylertoo-core
+```
+
+Locally this only checks each bench; measurement needs CodSpeed's
+runner. The workflow authenticates through OIDC, which requires the
+CodSpeed GitHub app on the repository.
+
+Instruction counts miss what only wall time shows: memory bandwidth,
+lock contention, and thread scaling. That is what the label-gated
+regression job below is kept for.
 
 #### Criterion regression gate
 
@@ -259,6 +315,44 @@ uv run python scripts/criterion_gate.py --check \
   --criterion-dir target/criterion-compare \
   --baseline base --warn 10 --fail 25
 ```
+
+### Hotspots
+
+`scripts/hotspots.py` ranks functions by cyclomatic complexity times
+churn. That gives a starting list for refactoring instead of a choice by
+feel. It runs lizard over `crates/*/src` for each function's complexity
+(CCN), counts the commits that touched each file in
+`git log --since=18.months`, and prints the top functions by
+`CCN × commits`:
+
+```bash
+uv run --script scripts/hotspots.py                  # top 25
+uv run --script scripts/hotspots.py --top 50 --since 6.months
+uv run --script scripts/hotspots.py --min-ccn 10 crates/core/src
+```
+
+```text
+ score  ccn commits  nloc  location  function
+  4524   52      87   179  crates/core/src/overview/convert.rs:1631  validate_options
+  4026   33     122   180  crates/cli/src/main.rs:2358  run_tiles
+```
+
+How to read it:
+
+- **High score**: complex code that keeps changing. Each change
+  costs the most here and is the most likely to break something, so
+  splitting or simplifying it pays off soonest.
+- **High CCN, low churn**: complex but stable. Leave it alone
+  unless you have to change it anyway.
+- **Churn is per file**: every function in a file shares its commit
+  count, so a large, busy file such as `crates/cli/src/main.rs`
+  lifts all of its functions. Read the CCN column to tell the
+  function that matters from its neighbours.
+- **Renames are not followed**: a file renamed inside the window
+  counts only the commits since the rename.
+
+It is a local triage tool, not a CI gate. uv installs lizard from
+the script's inline metadata.
 
 ## CI gates — and how to run them locally
 

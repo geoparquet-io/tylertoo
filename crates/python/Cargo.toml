@@ -8,6 +8,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+# Ships as a wheel via maturin, never to crates.io; this also blocks an
+# accidental `cargo publish --workspace`.
+publish = false
 
 [lib]
 name = "tylertoo"

@@ -24,6 +24,8 @@
 #
 # This file is the single list of gated benches. `assign_scaling` is left out
 # on purpose: it is a wall-clock thread-scaling harness, not criterion.
+# A new bench here also wants an entry in scripts/codspeed_benches.sh, which
+# maps source paths to these names for CodSpeed's per-PR selection.
 set -euo pipefail
 
 BENCHES="${CRITERION_BENCHES:-clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup}"

@@ -8,7 +8,8 @@
 #                   via uploaded reports. NOT a PR gate (push/dispatch only)
 #                   so no permanently-skipped job clutters PR check lists.
 #                   The numeric regression gate (#448) is a separate,
-#                   opt-in workflow: bench-regression.yml.
+#                   opt-in workflow: bench-regression.yml. The per-PR
+#                   instruction-count signal is codspeed.yml (#614).
 #
 # The convert regression guard (benchmarks/overview/ci_guard.py) used to be
 # a second job here; it now runs through export and lives in e2e.yml

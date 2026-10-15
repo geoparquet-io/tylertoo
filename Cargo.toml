@@ -87,6 +87,11 @@ proptest = "1"
 # - cargo-mutants (mutation testing)
 # - cargo-watch (auto-run tests)
 
+# cargo-codspeed builds the benches with `--cfg codspeed` (#614); declare it
+# so `cfg!(codspeed)` in a bench is not an unexpected_cfgs warning.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(codspeed)"] }
+
 # Curated lint gates shared by every crate (each crate opts in with
 # `[lints] workspace = true`). CI runs clippy with `-D warnings`, so every
 # "warn" below is a hard failure on PRs. The full clippy::pedantic group is
@@ -155,6 +160,16 @@ overflow-checks = false
 
 [profile.bench]
 inherits = "release"
+
+# Release code generation with symbols, for sampling profilers (#614):
+# `cargo build --profile profiling`, then samply/perf/cargo-flamegraph on
+# target/profiling/tylertoo. The release binary stays stripped; without this,
+# profiler stacks show addresses instead of function names. See
+# context/PROFILING.md, "Sampling profilers".
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
 
 # Build profile for cargo-mutants (.cargo/mutants.toml sets `profile =
 # "mutants"`; nextest gets it as `--cargo-profile=mutants`). Every mutant

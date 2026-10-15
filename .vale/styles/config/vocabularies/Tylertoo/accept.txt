@@ -28,6 +28,9 @@ Slurm
 [Cc]lippy
 dhat
 mimalloc
+CodSpeed('s)?
+samply
+Valgrind
 musl('s)?
 nextest('s)?
 trycmd
@@ -67,6 +70,9 @@ auto-clamp(ed)?
 
 # Systems and build
 maturin
+[Pp]rofilers?
+[Hh]otspots?
+cyclomatic
 pydocstyle
 pydoclint
 [Dd]octests?
