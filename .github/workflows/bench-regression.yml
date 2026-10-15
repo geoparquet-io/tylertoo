@@ -30,8 +30,8 @@
 # measures noise. Kept in its own workflow so label events don't re-run
 # bench.yml's convert-guard.
 #
-# Cost: one run is ~50 min of ubuntu-latest (48 min on #432, almost all of it
-# the two bench passes), on PRs that touch BENCHED only.
+# Cost: one run is 41-48 min of ubuntu-latest (#432, and the #678 A/A runs;
+# almost all of it the two bench passes), on PRs that touch BENCHED only.
 #
 # Gate: see the "Check for regressions" step for the thresholds and the
 # noise data behind them, and DEVELOPMENT.md, "Criterion regression gate".

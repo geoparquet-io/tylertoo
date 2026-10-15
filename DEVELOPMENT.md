@@ -295,7 +295,7 @@ The gate runs in these cases, never on a schedule:
   on another branch against its merge-base with `origin/main`.
 
 On a PR the base is the merge-base with the PR's base branch. A run
-takes about 50 minutes of runner time.
+takes 41 to 48 minutes of runner time.
 
 `scripts/criterion_compare.sh <base-rev>` does the two runs, the base
 in a temporary git worktree. It writes to `target/criterion-compare/`,
