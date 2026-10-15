@@ -4802,7 +4802,9 @@ pub(super) fn spill_space_warning(
     available_bytes: u64,
     spill_dir: &Path,
 ) -> Option<String> {
-    let need = estimated_spill_bytes + estimated_spill_bytes / SPILL_MARGIN_DENOM;
+    // Saturating: the estimate is footer-declared and may itself be
+    // saturated (#686).
+    let need = estimated_spill_bytes.saturating_add(estimated_spill_bytes / SPILL_MARGIN_DENOM);
     if available_bytes >= need {
         return None;
     }
@@ -7312,6 +7314,16 @@ mod tests {
         let need = est + est / 20;
         assert!(spill_space_warning(est, need, dir).is_none());
         assert!(spill_space_warning(est, need - 1, dir).is_some());
+    }
+
+    /// #686: the estimate is a sum of footer-declared sizes, saturated at
+    /// `u64::MAX` for a footer that claims more; adding the margin to it must
+    /// not overflow (a panic in release, #432).
+    #[test]
+    fn spill_space_warning_survives_a_saturated_estimate() {
+        let dir = Path::new("/tmp");
+        assert!(spill_space_warning(u64::MAX, u64::MAX - 1, dir).is_some());
+        assert!(spill_space_warning(u64::MAX, 0, dir).is_some());
     }
 
     /// #272: local inputs never spill, so the free-space probe must not

@@ -992,7 +992,8 @@ impl ConvertSource {
                     selection.map(|s| s.0[pi].as_slice()),
                 )
             })
-            .sum())
+            // Saturating: each part's figure is footer-declared (#686).
+            .fold(0, u64::saturating_add))
     }
 
     /// The widest byte-array column chunk among the `selected` row groups of
