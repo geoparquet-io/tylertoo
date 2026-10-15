@@ -181,14 +181,38 @@ the `profiling` Cargo profile and sampling profilers such as samply.
 
 #### CodSpeed
 
-`.github/workflows/codspeed.yml` runs the gated benches on every PR and
-every push to `main` under [CodSpeed](https://codspeed.io). CodSpeed's
-simulation mode counts instructions, weighted by estimated cache cost,
-rather than timing wall-clock. The count does not depend on how busy the
-shared runner is, which is why this runs on every PR and the timing
-gate below does not. CodSpeed comments on the PR with each bench's
-change against the base branch, and its dashboard keeps the history of
-`main`.
+`.github/workflows/codspeed.yml` runs the gated benches under
+[CodSpeed](https://codspeed.io). CodSpeed's simulation mode counts
+instructions, weighted by estimated cache cost, rather than timing
+wall-clock. The count does not depend on how busy the shared runner is,
+so unlike the timing gate below it needs no opt-in label. CodSpeed
+comments on the PR with each bench's change against the base branch, and
+its dashboard keeps the history of `main`.
+
+Simulation runs every bench under Valgrind, which is slow, so a PR runs
+only what it can move:
+
+- A PR that touches neither `crates/core/` nor the build doesn't start
+  the workflow.
+- Otherwise `scripts/codspeed_benches.sh` maps the PR's changed files to
+  the benches whose code they touch, and only those build and run.
+  CodSpeed reports the rest as "skipped", with their baseline numbers.
+  A PR that touches only code no bench covers passes without building.
+- A change to `Cargo.lock`, a manifest, the crate root, the bench
+  harness, or the workflow runs every bench.
+- Every push to `main` runs every bench, so each bench keeps a current
+  baseline.
+
+The map in `scripts/codspeed_benches.sh` is kept by hand: each bench's
+entry modules and their direct dependencies. A change that moves a bench
+only through a more distant module shows up in the next run on `main`
+rather than on the PR. When you add a bench, add its entry there; until
+you do, it runs on every `crates/core/` change. To see what a branch
+would run:
+
+```bash
+git diff --name-only origin/main...HEAD | scripts/codspeed_benches.sh
+```
 
 The benches build against `codspeed-criterion-compat`, renamed to
 `criterion` in `crates/core/Cargo.toml`, so bench code still writes

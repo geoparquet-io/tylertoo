@@ -30,6 +30,7 @@ dhat
 mimalloc
 CodSpeed('s)?
 samply
+Valgrind
 musl('s)?
 nextest('s)?
 stubtest

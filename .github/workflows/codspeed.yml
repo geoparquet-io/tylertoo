@@ -3,9 +3,18 @@
 # Builds the criterion benches with cargo-codspeed and runs them under
 # CodSpeed's simulation mode, which counts instructions (cache-weighted)
 # instead of timing wall-clock. The count does not depend on the runner's
-# load, so unlike bench-regression.yml this runs on EVERY PR, and CodSpeed
-# comments per-bench deltas against the base branch. The `push: main` runs
-# are what those deltas compare against.
+# load, so unlike bench-regression.yml this needs no opt-in label, and
+# CodSpeed comments per-bench deltas against the base branch.
+#
+# What runs when (simulation is slow: every bench runs under Valgrind):
+#   pull_request  only PRs touching crates/core or the build (`paths`), and
+#                 only the benches whose code the PR touches, as chosen by
+#                 scripts/codspeed_benches.sh. CodSpeed reports the others
+#                 as "skipped" with their baseline numbers (partial runs).
+#                 A PR touching no benched code skips every step and passes.
+#   push (main)   every bench, on every push: these runs are the baselines,
+#                 and a bench skipped here would compare PRs against stale
+#                 numbers.
 #
 # The benches build against `codspeed-criterion-compat` (renamed to
 # `criterion` in crates/core/Cargo.toml), so their code is unchanged and plain
@@ -25,6 +34,14 @@ name: CodSpeed
 
 on:
   pull_request:
+    # Keep in step with GLOBAL and the bench map in scripts/codspeed_benches.sh.
+    paths:
+      - "crates/core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codspeed.yml"
+      - "scripts/criterion_compare.sh"
+      - "scripts/codspeed_benches.sh"
   push:
     branches: [main]
   workflow_dispatch:
@@ -48,11 +65,30 @@ jobs:
     env:
       TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
     steps:
+      # Depth 2: on a PR, HEAD is GitHub's merge commit and HEAD^1 the base
+      # branch tip, so `git diff HEAD^1 HEAD` is exactly the PR's change.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
+      - name: Select benches
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "Changed files:"
+            git diff --name-only HEAD^1 HEAD | sed 's/^/  /'
+            benches=$(git diff --name-only HEAD^1 HEAD | scripts/codspeed_benches.sh)
+          else
+            benches=$(scripts/codspeed_benches.sh --all)
+          fi
+          echo "Selected benches: ${benches:-none (no benched code changed)}"
+          echo "benches=$benches" >> "$GITHUB_OUTPUT"
+
       - name: Cache test fixtures
+        if: steps.select.outputs.benches != ''
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -60,18 +96,20 @@ jobs:
           key: fixtures-v1-${{ runner.os }}
 
       - name: Download test fixtures
-        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        if: steps.select.outputs.benches != '' && steps.fixture-cache.outputs.cache-hit != 'true'
         run: |
           gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Install Rust
+        if: steps.select.outputs.benches != ''
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
 
       - name: Install protoc
+        if: steps.select.outputs.benches != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
@@ -79,6 +117,7 @@ jobs:
       # Own key: cargo-codspeed builds into target/codspeed with its own
       # instrumentation cfg, so sharing bench.yml's entry would only thrash it.
       - name: Cache cargo
+        if: steps.select.outputs.benches != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -90,6 +129,7 @@ jobs:
 
       # Keep in step with codspeed-criterion-compat in crates/core/Cargo.toml.
       - name: Install cargo-codspeed
+        if: steps.select.outputs.benches != ''
         run: |
           if [ "$(cargo codspeed --version 2>/dev/null)" != "cargo-codspeed 5.0.3" ]; then
             cargo install cargo-codspeed --version 5.0.3 --locked --force
@@ -98,21 +138,28 @@ jobs:
       # Each bench binary is a fat-LTO link (lto = true, codegen-units = 1)
       # peaking near 8 GB, and cargo's default parallelism links several at
       # once: on the 16 GB runner that ends in exit 143. So compile the
-      # dependencies in parallel through the first bench, then link the set
+      # dependencies in parallel through the first bench, then link the rest
       # with -j 1. (One build call per bench does not work: each call
       # replaces the binaries the previous one collected.)
       - name: Build benches
+        if: steps.select.outputs.benches != ''
+        env:
+          BENCHES: ${{ steps.select.outputs.benches }}
         run: |
-          benches=$(scripts/criterion_compare.sh --list)
+          read -ra benches <<<"$BENCHES"
           bench_args=()
-          for b in $benches; do
+          for b in "${benches[@]}"; do
             bench_args+=(--bench "$b")
           done
           build=(cargo codspeed build -m simulation -p tylertoo-core --all-features --locked)
-          "${build[@]}" --bench "${benches%% *}"
-          "${build[@]}" -j 1 "${bench_args[@]}"
+          "${build[@]}" --bench "${benches[0]}"
+          if [ "${#benches[@]}" -gt 1 ]; then
+            "${build[@]}" -j 1 "${bench_args[@]}"
+          fi
 
+      # Runs whatever the build step collected, i.e. the selected benches.
       - name: Run benches
+        if: steps.select.outputs.benches != ''
         uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: simulation
