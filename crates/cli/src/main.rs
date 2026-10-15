@@ -1820,7 +1820,7 @@ fn warn_intermediate_space(spec: &InputSpec, dir: &std::path::Path) {
 /// zero-disk. The intermediate is retained at `--keep-overview PATH` when
 /// given; otherwise it is a temp file (in `--spill-dir` / `$TMPDIR` / the
 /// output directory, in that order) removed on both success and failure
-/// via [`tempfile::NamedTempFile`]'s drop guard. Its path and size are
+/// via [`tempfile::TempPath`]'s drop guard. Its path and size are
 /// always logged, and a free-space preflight warns when the chosen volume
 /// looks too small for it (#314).
 /// Which job of a sharded fleet this `tiles` run is, and the slice of the
@@ -2411,8 +2411,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     // Intermediate overview file (#314): retained at --keep-overview when
     // given; otherwise a temp file in --spill-dir / $TMPDIR / the output
-    // directory, removed on drop — success or failure alike.
-    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::NamedTempFile>) =
+    // directory, removed on drop — success or failure alike. A TempPath, not
+    // an open NamedTempFile: convert publishes by renaming a sibling over
+    // this path, which Windows refuses while a handle to it is open (#678).
+    let (overview_path, overview_tmp): (PathBuf, Option<tempfile::TempPath>) =
         match &args.keep_overview {
             // Its directory was checked by `preflight_export_flags`.
             Some(path) => (path.clone(), None),
@@ -2433,8 +2435,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                              directory)",
                             dir.display()
                         )
-                    })?;
-                (tmp.path().to_path_buf(), Some(tmp))
+                    })?
+                    .into_temp_path();
+                (tmp.to_path_buf(), Some(tmp))
             }
         };
 

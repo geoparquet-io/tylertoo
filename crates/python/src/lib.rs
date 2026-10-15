@@ -157,7 +157,10 @@ fn convert(
     };
 
     // Intermediate overview file next to the output (same filesystem);
-    // NamedTempFile removes it on drop — success or failure alike.
+    // TempPath removes it on drop — success or failure alike. Only the path
+    // is kept, not an open handle: convert publishes its output by renaming
+    // a sibling over this path, which Windows refuses while a handle to the
+    // destination is open ("Access is denied", #678).
     let tmp_dir = output_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -172,12 +175,13 @@ fn convert(
                 "failed to create temporary overview file: {}",
                 e
             ))
-        })?;
+        })?
+        .into_temp_path();
 
     // Release the GIL while the Rust pipelines run.
-    py.detach(|| convert_to_overviews(&input_path, overview_tmp.path(), &options))
+    py.detach(|| convert_to_overviews(&input_path, &overview_tmp, &options))
         .map_err(convert_error_to_py)?;
-    py.detach(|| export_pmtiles_core(overview_tmp.path(), &output_path, &export_options))
+    py.detach(|| export_pmtiles_core(&overview_tmp, &output_path, &export_options))
         .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
 
     Ok(())
