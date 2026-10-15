@@ -132,6 +132,48 @@ exclusion in `[profile.default]`, which `quick` inherits. The other is
 the matching `[[profile.default.overrides]]` filter, which gives slow
 tests a longer timeout. `full` picks the test up with no edit.
 
+#### Updating CLI snapshots
+
+`crates/cli/tests/cli_snapshots.rs` uses
+[trycmd](https://docs.rs/trycmd) to pin what the CLI shows a user. Each
+`crates/cli/tests/cmd/*.md` case is a list of `$ tylertoo ...` console
+blocks with the expected stdout and stderr, plus a `? N` line for a
+nonzero exit code. The binary runs as a black box with `RUST_LOG=off`,
+so log lines stay out of the snapshots. `NO_COLOR=1` keeps a
+`CLICOLOR_FORCE` in your shell from adding color codes, and
+`RUST_LIB_BACKTRACE=0` keeps a `RUST_BACKTRACE=1` from adding a
+backtrace to each `Error:` line. The test also sets
+`TYLERTOO_DHAT=off`: CI tests with `--all-features`, and a `dhat-heap`
+build otherwise prints a heap summary on exit. The test runs in the
+`quick` tier.
+
+- **Inputs.** A case that only reads names committed fixtures by a
+  path relative to `crates/cli`, for example
+  `../../tests/fixtures/golden/road-detections.pmtiles`. A case that
+  writes files runs in a sandbox: `<case>.in/` holds copies of its
+  inputs, and the sandbox is on only when `<case>.out/` exists. A
+  second test in `cli_snapshots.rs` checks that each copy still
+  matches the fixture it came from.
+  trycmd checks that every file in `<case>.out/` matches the sandbox
+  after the run. An empty `.keep` in both directories turns the
+  sandbox on without asserting anything.
+- **Wildcards.** `[..]` matches any text within one line, and `...`
+  on a line of its own matches any run of lines. Use them for anything a run varies: durations,
+  temp paths, and Parquet byte sizes, which change with the
+  `parquet` crate.
+
+When a CLI change alters its output, rewrite the cases in place, then
+review the diff:
+
+```bash
+TRYCMD=overwrite cargo test -p tylertoo --test cli_snapshots
+git diff crates/cli/tests/cmd
+```
+
+Overwrite drops the wildcards on any line it rewrites, so put them
+back. **Review every rewritten block by hand before you commit.** A
+wrong capture pins a bug as correct behavior.
+
 ### Benchmarks
 
 `crates/core/benches/` holds Criterion benchmarks of the hot paths. The
@@ -501,6 +543,10 @@ uv run --project crates/python --only-group docs \
 To change a tutorial, edit its script, run the docs tests, and paste the
 new script and output into the README. A failing test names the step and
 the lines that differ.
+
+The docs tests check pages against the CLI. The Rust snapshot cases in
+`crates/cli/tests/cmd` pin the output of the CLI itself (see
+[Updating CLI snapshots](#updating-cli-snapshots)).
 
 ### Docs prose
 

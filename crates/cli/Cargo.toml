@@ -17,7 +17,7 @@ default = []
 dhat-heap = ["tylertoo-core/dhat-heap", "dhat"]
 # Off by default: compiles the hidden `gen-reference-docs` subcommand (and its
 # clap-markdown dependency) out of production builds. CI enables it to
-# regenerate docs-next/reference/cli.md and diff-guard the committed copy.
+# regenerate docs/reference/cli.md and diff-guard the committed copy.
 gen-docs = ["dep:clap-markdown"]
 
 [[bin]]
@@ -65,6 +65,8 @@ tempfile = "3"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 parquet = { workspace = true }
+# Snapshot tests of the CLI's stdout/stderr/exit code (tests/cmd, #613).
+trycmd = "1.2.1"
 
 [lints]
 workspace = true

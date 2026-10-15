@@ -1327,9 +1327,14 @@ struct TilesArgs {
 fn main() -> Result<()> {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
-    // dhat-heap.json on Drop (program exit)
+    // dhat-heap.json on Drop (program exit). TYLERTOO_DHAT=off skips it:
+    // CI's `--all-features` test runs compile this in, and the CLI snapshot
+    // tests (tests/cli_snapshots.rs) pin stderr, which dhat's exit summary
+    // would change.
     #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
+    let _profiler = (std::env::var_os("TYLERTOO_DHAT").as_deref()
+        != Some(std::ffi::OsStr::new("off")))
+    .then(dhat::Profiler::new_heap);
 
     // Backward-compatible bare invocation: `tylertoo input.parquet out.pmtiles`
     // is rewritten to `tylertoo tiles input.parquet out.pmtiles` when the first
