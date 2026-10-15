@@ -61,7 +61,6 @@ jobs:
           - decode_archive
           - archive_index
           - layer_zooms
-          - parquet_footer
           - shard_plan
           - decompress
           - cli_args
@@ -72,6 +71,8 @@ jobs:
           #   remote_footer - also #687 (parquet-rs panics on a crafted
           #     page's definition levels)
           #   plan_file - #684 (arrow-ipc panics on a crafted IPC buffer)
+          #   parquet_footer - #690 (parquet-rs reserves ~12 GB for a crafted
+          #     schema's child count; libFuzzer's malloc limit calls it an OOM)
           # Their seeds still replay on every PR (crates/core/tests/fuzz_seeds.rs).
           # remote_footer needs a fuzz-crate feature; re-add it as
           #   include:
@@ -230,8 +231,13 @@ jobs:
           (not duplicated) on every failing nightly run; close it once a run
           completes green._"
 
+          # Match on the title this job opens with, not the label alone:
+          # people file fuzz-found bugs and fuzz work under the `fuzz` label
+          # too (#633 was), and the first of those would otherwise have its
+          # body replaced.
           EXISTING=$(gh issue list --label fuzz --state open \
-            --json number --jq '.[0].number // empty')
+            --json number,title \
+            --jq 'map(select(.title == "Nightly fuzz run is failing")) | .[0].number // empty')
 
           if [ -n "$EXISTING" ]; then
             echo "Updating existing issue #$EXISTING"

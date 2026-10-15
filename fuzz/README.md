@@ -23,7 +23,7 @@ tylertoo reads outside data and the target that covers it.
 | `decode_archive` | `decode::fuzz_decode_archive` — `decode_pmtiles` on an in-memory archive short of writing GeoParquet: header, directory walk and budgets, capped tile decompression, MVT decode, the reserved-column check and the property type union | `open-buildings.pmtiles` and a 29 KB archive tiled from `overture-names.parquet` |
 | `archive_index` | `fuzz::fuzz_archive_index` → `ArchiveIndex::open`, metadata, every tile body, `stats::compute_stats` — an archive handed to `stats` or `merge`. Unlike `band_archive`, an archive that is not gzip MVT gets past the open | as `decode_archive` |
 | `layer_zooms` | `pyramid::fuzz_layer_zooms` — an input archive's `vector_layers` as `pyramid` (`parse_layers`) and `merge` (`layer_zoom_range`, `declared_zoom_range`, `vector_layers_json`) read it; two leading bytes are the header's zoom range. Panics if a range comes back out of order or past z31 | the header zooms and metadata of the three golden archives |
-| `parquet_footer` | `overview::check::fuzz_parquet_footer` — every footer-only reader: `check::validate_metadata`, `geo:overviews` `validate`, the row-group bbox readers (covering columns, native geo statistics), the spill and batch sizing heuristics (`selected_compressed_bytes`, `widest`/`largest_byte_array_column`), and `--filter` pushdown on column statistics. The input is the thrift footer, without its length and `PAR1` | the footers of nine real and overview files |
+| `parquet_footer` † | `overview::check::fuzz_parquet_footer` — every footer-only reader: `check::validate_metadata`, `geo:overviews` `validate`, the row-group bbox readers (covering columns, native geo statistics), the spill and batch sizing heuristics (`selected_compressed_bytes`, `widest`/`largest_byte_array_column`), and `--filter` pushdown on column statistics. The input is the thrift footer, without its length and `PAR1` | the footers of nine real and overview files |
 | `overview_file` † | `overview::reader::fuzz_overview_file` — a whole overview file through `OverviewReader::open`, every level's band, lookups, pruning and a full read, and `check::validate_file` | two small overview files from `tylertoo overview` |
 | `remote_footer` † | `input::fuzz_remote_footer` — a remote GeoParquet object through `RemoteSource` over an in-memory object store: the ranged footer fetch and its range checks (#430, #586), row-group staging, a full read. Needs `--features remote` | three small GeoParquet files, one of them an overview |
 | `shard_plan` | `fuzz::fuzz_shard_plan` → `ShardPlan::load` and every range query `tiles --shard` makes of a plan | a 4-shard plan from `tylertoo shard-plan` |
@@ -36,8 +36,10 @@ minute, and a target that crashes every night finds nothing else.
 crafted `ARROW:schema` footer key; fixed in arrow 60, which geoarrow 0.9
 blocks), `remote_footer` also on #687 (parquet-rs panics decoding a crafted
 page's definition levels), `plan_file` on #684 (arrow-ipc panics on a
-crafted IPC buffer offset). Their seeds still replay on every PR, and they run locally as
-usual. Re-add each to `.github/workflows/fuzz.yml` when its issue closes.
+crafted IPC buffer offset), `parquet_footer` on #690 (parquet-rs reserves
+memory for a crafted schema's child count, about 12 GB from a 162-byte
+footer, which libFuzzer's malloc limit reports as an OOM). Their seeds still
+replay on every PR, and they run locally as usual. Re-add each to `.github/workflows/fuzz.yml` when its issue closes.
 
 Most targets call a `#[doc(hidden)]` hook in core gated on the `fuzzing`
 cargo feature (`crates/core/Cargo.toml`). Hooks next to a private parser
@@ -61,7 +63,7 @@ the command typed them) and are covered because it is cheap.
 |---|---|---|
 | GeoParquet WKB geometry values | `batch_processor` → geoarrow → `wkb` crate, behind `wkb_column::check_wkb_value` | `geoparquet_wkb` |
 | GeoParquet `geo` JSON and CRS | `covering::get_geo_metadata` / `parse_covering_metadata` / `resolve_geometry_column_name`, `convert::detect_crs_from_kv` / `find_geometry_column`, `quality::crs_info_from_kv_metadata` / `classify_crs_projjson` / `classify_crs_identifier`, `properties::declared_covering` | `geo_metadata`; `parquet_footer` reaches the same readers from a footer |
-| Parquet footer metadata (row-group stats, sizes, key-value metadata) | `check::validate_metadata`, `covering::extract_row_group_bounds_from_metadata` / `_tiered`, `input::selected_compressed_bytes`, `input_set::widest_byte_array_column` / `largest_byte_array_column`, `filter::BoundFilter::select_row_groups` | `parquet_footer`. The thrift decode itself is parquet-rs's |
+| Parquet footer metadata (row-group stats, sizes, key-value metadata) | `check::validate_metadata`, `covering::extract_row_group_bounds_from_metadata` / `_tiered`, `input::selected_compressed_bytes`, `input_set::widest_byte_array_column` / `largest_byte_array_column`, `filter::BoundFilter::select_row_groups` | `parquet_footer` † (#690). The thrift decode itself is parquet-rs's, and #690 is in it |
 | The embedded `ARROW:schema` key-value (every Parquet open) | parquet-rs `get_arrow_schema_from_metadata` → arrow-ipc | Upstream code, but a panic there aborts every command (#683). Reached by `overview_file` † and `remote_footer` † |
 | Overview files as input (`export-pmtiles`, `validate`) | `overview::reader::OverviewReader::open` and its band reads, `check::validate_file` | `overview_file` † (#683); `footer_json` for the `geo:overviews` JSON alone, `parquet_footer` for the footer |
 | GeoParquet data pages and property columns | parquet-rs / arrow-rs page decoding | Upstream code, but a panic there aborts tylertoo (#687). `remote_footer` † and `overview_file` † read every page of their input. Every tylertoo reader of what the pages decode to has its own row |
@@ -180,7 +182,7 @@ updates a pinned `fuzz` issue, the same way `mutation-tests.yml` does. A new
 target goes in the matrix; one that needs a fuzz-crate feature goes under
 `include:` with `features:` (the workflow has `remote_footer`'s entry
 commented out, ready for when #683 closes). A crash a new target
-finds gets its own issue, as #623, #681, #683, #684, #686 and #687 did.
+finds gets its own issue, as #623, #681, #683, #684, #686, #687 and #690 did.
 
 ```bash
 gh workflow run fuzz.yml                        # 300 s per target
