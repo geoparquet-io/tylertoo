@@ -245,12 +245,12 @@ convert(
     tile_size_limit: int | None = 512_000,
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
-) -> None
+) -> ConvertReport
 ```
 
 Convert GeoParquet to PMTiles in one call (deprecated).
 
-Use `overview()` followed by `export_pmtiles()` for all options.
+Use `overview()` followed by `export_pmtiles()` for all options. Runs the same core facade as `tylertoo tiles`, so the chain — the removed-after-export intermediate overview, its free-space preflight, and the declared zoom range — matches the CLI.
 
 ### Parameters
 
@@ -262,6 +262,10 @@ Use `overview()` followed by `export_pmtiles()` for all options.
 * `tile_size_limit`: See `export_pmtiles()`.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
+
+### Returns
+
+[`ConvertReport`](#convertreport): Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON.
 
 ### Raises
 
@@ -429,4 +433,14 @@ class ValidationCheck(TypedDict):
     name: str
     passed: bool
     message: str
+```
+
+### `ConvertReport`
+
+The combined report of a one-shot `convert()` run.
+
+```python
+class ConvertReport(TypedDict):
+    convert: OverviewReport
+    export: ExportReport
 ```

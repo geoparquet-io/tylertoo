@@ -50,6 +50,7 @@ TYPE_ORDER = [
     "SkippedPropertyColumn",
     "ValidationReport",
     "ValidationCheck",
+    "ConvertReport",
 ]
 
 # Integer defaults at least this large print with `_` separators.
