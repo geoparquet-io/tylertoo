@@ -253,6 +253,36 @@ enum Command {
     GenReferenceDocs,
 }
 
+/// Top-level publication metadata for a PMTiles archive.
+///
+/// `--layer-name` names the MVT layer; these describe the tileset. Each is
+/// stored exactly as given, and an empty string is kept as one.
+#[derive(Args, Debug, Clone, Default)]
+pub struct TilesetMetadataArgs {
+    /// Human-readable name stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub name: Option<String>,
+
+    /// Description stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Attribution text or HTML stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub attribution: Option<String>,
+}
+
+impl TilesetMetadataArgs {
+    /// The core value these flags describe.
+    fn to_metadata(&self) -> tylertoo_core::TilesetMetadata {
+        let mut meta = tylertoo_core::TilesetMetadata::new();
+        meta.name.clone_from(&self.name);
+        meta.description.clone_from(&self.description);
+        meta.attribution.clone_from(&self.attribution);
+        meta
+    }
+}
+
 /// Arguments for `tylertoo pyramid`.
 ///
 /// The band rules are documented in the pyramid section of
@@ -269,6 +299,11 @@ pub struct PyramidArgs {
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
+
+    /// Publication metadata for the output. An unset field is inherited from
+    /// the band archives.
+    #[command(flatten)]
+    pub publication: TilesetMetadataArgs,
 
     /// Generalize each GeoParquet band instead of tiling it verbatim. Use
     /// for raw features spanning several zooms.
@@ -315,6 +350,11 @@ pub struct MergeArgs {
     /// `vector_layers` are the union of the inputs'.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
+
+    /// Publication metadata for the output. An unset field is inherited from
+    /// the inputs.
+    #[command(flatten)]
+    pub publication: TilesetMetadataArgs,
 
     /// Directory for the spool file that holds tile data until the archive
     /// is complete. Defaults to the system temp directory.
@@ -445,6 +485,9 @@ struct ExportPmtilesArgs {
     /// MVT layer name written into every tile.
     #[arg(long, default_value = "overview")]
     layer_name: String,
+
+    #[command(flatten)]
+    publication: TilesetMetadataArgs,
 
     /// Minimum zoom in archive metadata, including empty coarse overview
     /// levels. Defaults to the coarsest level's zoom.
@@ -1232,6 +1275,9 @@ struct TilesArgs {
     #[arg(long)]
     layer_name: Option<String>,
 
+    #[command(flatten)]
+    publication: TilesetMetadataArgs,
+
     /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
     /// (default 500K, or no cap with `--verbatim`). A tile over the cap drops
     /// features until it fits.
@@ -1579,13 +1625,15 @@ fn write_empty_shard(
     job: &ShardJob,
     range: tylertoo_core::shard::TileRange,
     max_zoom: u8,
+    metadata: &tylertoo_core::TilesetMetadata,
     why: &tylertoo_core::overview::convert::ConvertError,
 ) -> Result<()> {
-    tylertoo_core::overview::export::write_empty_archive(
+    tylertoo_core::overview::export::write_empty_archive_with_metadata(
         output,
         layer_name,
         range.pivot_zoom(),
         max_zoom,
+        metadata,
     )
     .map_err(|e| anyhow::anyhow!("failed to write the empty shard archive: {e}"))?;
     log::info!(
@@ -1616,11 +1664,14 @@ fn write_empty_coarse(
     layer_name: &str,
     job: &ShardJob,
     min_zoom: u8,
+    metadata: &tylertoo_core::TilesetMetadata,
     why: &tylertoo_core::overview::convert::ConvertError,
 ) -> Result<()> {
     let max_zoom = job.pivot.saturating_sub(1);
-    tylertoo_core::overview::export::write_empty_archive(output, layer_name, min_zoom, max_zoom)
-        .map_err(|e| anyhow::anyhow!("failed to write the empty coarse archive: {e}"))?;
+    tylertoo_core::overview::export::write_empty_archive_with_metadata(
+        output, layer_name, min_zoom, max_zoom, metadata,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to write the empty coarse archive: {e}"))?;
     log::info!(
         "[tiles] shard job {} has nothing to write ({why}); wrote an empty archive",
         job.role
@@ -2128,8 +2179,9 @@ fn tiles_convert_options(
 }
 
 /// The export knobs `tiles` can check without reading anything (#433): the
-/// `--tile-buffer` cap, the `--tile-range` syntax, and the `--keep-overview`
-/// directory. Returns the parsed `--tile-range`.
+/// `--tile-buffer` cap, the size of the publication metadata, the
+/// `--tile-range` syntax, and the `--keep-overview` directory. Returns the
+/// parsed `--tile-range`.
 ///
 /// Shared by the full run and `--plan-only` (#600): plan-only ignores these
 /// flags, but it is the fleet's preflight, so a value the coarse job would
@@ -2143,6 +2195,7 @@ fn preflight_export_flags(args: &TilesArgs) -> Result<Option<tylertoo_core::shar
     // values that are already known.
     ExportOptions {
         tile_buffer: args.tile_buffer,
+        metadata: args.publication.to_metadata(),
         ..ExportOptions::default()
     }
     .validate()
@@ -2184,6 +2237,9 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
 
     [
         ("--layer-name", args.layer_name.is_some()),
+        ("--name", args.publication.name.is_some()),
+        ("--description", args.publication.description.is_some()),
+        ("--attribution", args.publication.attribution.is_some()),
         ("--max-tile-size", args.max_tile_size.is_some()),
         ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
         (
@@ -2460,7 +2516,15 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         Err(e) if shard_range.is_some() && convert_produced_nothing(&e) => {
             let job = shard.as_ref().expect("a range implies a shard job");
             let range = shard_range.expect("checked by the guard");
-            return write_empty_shard(&output, &layer_name, job, range, max_zoom, &e);
+            return write_empty_shard(
+                &output,
+                &layer_name,
+                job,
+                range,
+                max_zoom,
+                &args.publication.to_metadata(),
+                &e,
+            );
         }
         // #541 review: the coarse job's counterpart. Its convert stops at the
         // pivot, and when every feature first appears finer than that (#211
@@ -2470,7 +2534,14 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // outcome as an empty data shard, same answer.
         Err(e @ tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling { .. }) => {
             let job = shard.as_ref().expect("only the coarse job sets a ceiling");
-            return write_empty_coarse(&output, &layer_name, job, args.min_zoom, &e);
+            return write_empty_coarse(
+                &output,
+                &layer_name,
+                job,
+                args.min_zoom,
+                &args.publication.to_metadata(),
+                &e,
+            );
         }
         Err(e) => anyhow::bail!("overview conversion failed: {e}"),
     };
@@ -2536,6 +2607,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // #427: one scratch knob — the export's member spill goes where the
         // convert's spill (and the intermediate overview) go.
         spill_dir: args.tuning.spill_dir.clone(),
+        metadata: args.publication.to_metadata(),
     };
     let export_report = export_pmtiles(&overview_path, &output, &export_opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
@@ -3166,6 +3238,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         zoom_ceiling: args.zoom_ceiling,
         feature_id: args.feature_id.clone(),
         spill_dir: args.spill_dir.clone(),
+        metadata: args.publication.to_metadata(),
     };
 
     println!(
@@ -3394,6 +3467,9 @@ fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions
         },
         work_dir: args.work_dir.clone(),
         allow_missing_zooms: args.allow_missing_zooms,
+        // The final archive's overrides; the band exports write none, so
+        // GeoParquet bands contribute no inherited value.
+        metadata: args.publication.to_metadata(),
     }
 }
 
@@ -3592,6 +3668,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     );
     let opts = MergeOptions {
         work_dir: args.work_dir.clone(),
+        metadata: args.publication.to_metadata(),
     };
     let report = merge_shards(&args.inputs, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
@@ -5463,5 +5540,207 @@ mod tests {
         std::fs::write(&existing, b"keep me").unwrap();
         preflight_writable(&existing).unwrap();
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    // --- Publication metadata (--name / --description / --attribution) ----
+
+    const PUBLICATION_FLAGS: [&str; 3] = ["name", "description", "attribution"];
+
+    /// Which of the three flags `cmd` shows, in `PUBLICATION_FLAGS` order.
+    fn publication_flags_of(cmd: &clap::Command) -> Vec<bool> {
+        PUBLICATION_FLAGS
+            .iter()
+            .map(|flag| {
+                cmd.get_arguments()
+                    .any(|a| a.get_long() == Some(flag) && !a.is_hide_set())
+            })
+            .collect()
+    }
+
+    /// The flags are on every command that writes a PMTiles archive, as one
+    /// optional single string each, and on no command that does not.
+    #[test]
+    fn publication_flags_are_on_every_producer_and_no_other_command() {
+        use clap::CommandFactory;
+        for (label, cmd) in [
+            ("tiles", TilesArgs::command()),
+            ("export-pmtiles", ExportPmtilesArgs::command()),
+            ("pyramid", PyramidArgs::command()),
+            ("merge", MergeArgs::command()),
+        ] {
+            assert_eq!(publication_flags_of(&cmd), [true; 3], "{label}");
+            for arg in cmd
+                .get_arguments()
+                .filter(|a| a.get_long().is_some_and(|l| PUBLICATION_FLAGS.contains(&l)))
+            {
+                assert!(!arg.is_required_set(), "{label} {arg:?}");
+                assert!(matches!(arg.get_action(), clap::ArgAction::Set), "{label}");
+            }
+        }
+        for (label, cmd) in [
+            ("overview", OverviewArgs::command()),
+            ("validate", ValidateArgs::command()),
+            ("decode", DecodeArgs::command()),
+            ("stats", StatsArgs::command()),
+            ("shard-plan", ShardPlanArgs::command()),
+        ] {
+            assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
+        }
+    }
+
+    #[test]
+    fn publication_flags_keep_values_exactly() {
+        use tylertoo_core::TilesetMetadata;
+        let html = "<a href=\"https://www.nps.gov/\">\u{a9} NPS</a>\nline";
+        let a = parse_tiles(&[
+            "--name",
+            "tiles",
+            "--description",
+            "",
+            "--attribution",
+            html,
+        ]);
+        assert_eq!(
+            a.publication.to_metadata(),
+            TilesetMetadata::new()
+                .with_name("tiles")
+                .with_description("")
+                .with_attribution(html)
+        );
+        assert_eq!(
+            parse_tiles(&[]).publication.to_metadata(),
+            TilesetMetadata::new()
+        );
+        // A value that looks like a flag needs the `=` form.
+        assert_eq!(
+            parse_tiles(&["--name=--help"]).publication.name.as_deref(),
+            Some("--help")
+        );
+        // One value per flag: clap's ordinary refusal, no appending.
+        assert!(Cli::try_parse_from([
+            "tylertoo",
+            "tiles",
+            "in.parquet",
+            "out.pmtiles",
+            "--name",
+            "a",
+            "--name",
+            "b"
+        ])
+        .is_err());
+        // The bare form with the flags after INPUT OUTPUT, even with a value
+        // that names a subcommand.
+        let argv = rewrite_bare_args(
+            ["tylertoo", "in.parquet", "out.pmtiles", "--name", "tiles"].map(Into::into),
+        );
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Tiles(a) => assert_eq!(a.publication.name.as_deref(), Some("tiles")),
+            other => panic!("expected tiles, got {other:?}"),
+        }
+    }
+
+    /// `--plan-only` writes no archive, so the three flags are reported as
+    /// ignored, in `--help` order, and change nothing about the plan.
+    #[test]
+    fn plan_only_names_publication_flags_as_ignored() {
+        for (argv, name) in [
+            (&["--name", ""][..], "--name"),
+            (&["--description", "d"][..], "--description"),
+            (&["--attribution", ""][..], "--attribution"),
+        ] {
+            let a = parse_plan_only(argv).unwrap();
+            assert_eq!(ignored_export_options(&a), vec![name], "{argv:?}");
+        }
+        let a = parse_plan_only(&[
+            "--attribution",
+            "a",
+            "--force",
+            "--layer-name",
+            "x",
+            "--name",
+            "n",
+        ])
+        .unwrap();
+        assert_eq!(
+            ignored_export_options(&a),
+            vec!["--layer-name", "--name", "--attribution", "--force"]
+        );
+    }
+
+    /// Too large for any archive's metadata: refused by the preflight, on a
+    /// full run and on `--plan-only` alike, before anything is converted.
+    #[test]
+    fn oversized_publication_values_fail_the_export_preflight() {
+        let huge = "\"".repeat(tylertoo_core::compression::MAX_INTERNAL_BYTES as usize / 2);
+        let err = preflight_export_flags(&parse_tiles(&["--attribution", &huge]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("attribution"), "{err}");
+        let a = parse_plan_only(&["--description", &huge]).unwrap();
+        let err = preflight_export_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("description"), "{err}");
+    }
+
+    /// The empty-job shortcuts write the same publication metadata a job
+    /// with data would.
+    #[test]
+    fn empty_shard_and_coarse_archives_carry_publication_metadata() {
+        use tylertoo_core::overview::convert::ConvertError;
+        use tylertoo_core::shard::{ShardPlan, ShardRole, TileRange};
+        use tylertoo_core::TilesetMetadata;
+
+        let plan = ShardPlan {
+            format: String::new(),
+            version: 1,
+            pivot_zoom: 3,
+            ranges: Vec::new(),
+            inputs: Vec::new(),
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        let job = |role| ShardJob {
+            role,
+            range: None,
+            pivot: 3,
+            cut_digest: String::new(),
+            plan: plan.clone(),
+        };
+        let meta = TilesetMetadata::new()
+            .with_name("Grid")
+            .with_attribution("<b>Survey</b>");
+        let dir = tempfile::tempdir().unwrap();
+        let (shard, coarse) = (dir.path().join("s.pmtiles"), dir.path().join("c.pmtiles"));
+        write_empty_shard(
+            &shard,
+            "grid",
+            &job(ShardRole::Shard {
+                index: 0,
+                shards: 2,
+            }),
+            // All of z3 (tile ids 21..=84).
+            TileRange::new(3, 21, 84).unwrap(),
+            5,
+            &meta,
+            &ConvertError::NoData,
+        )
+        .unwrap();
+        write_empty_coarse(
+            &coarse,
+            "grid",
+            &job(ShardRole::Coarse),
+            0,
+            &meta,
+            &ConvertError::NoData,
+        )
+        .unwrap();
+        for path in [&shard, &coarse] {
+            let json = tylertoo_core::archive_index::ArchiveIndex::open(path)
+                .unwrap()
+                .metadata_json()
+                .unwrap();
+            assert_eq!(json["name"], "Grid", "{}", path.display());
+            assert_eq!(json["attribution"], "<b>Survey</b>", "{}", path.display());
+            assert!(json.get("description").is_none());
+        }
     }
 }

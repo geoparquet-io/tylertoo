@@ -123,6 +123,7 @@ use crate::dedup::TileHasher;
 use crate::mvt::{EncodedFeatureGeometry, LayerBuilder, PropertyValue, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
+use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
@@ -359,6 +360,12 @@ pub struct ExportOptions {
     /// The PMTiles archive itself is never spilled here: it is assembled in
     /// place at `<output>.partial` beside the output (#459).
     pub spill_dir: Option<PathBuf>,
+    /// Top-level `name`, `description` and `attribution` written to the
+    /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
+    ///
+    /// Unset fields are left out rather than derived from a filename, and
+    /// nothing here changes the tiles. Default: none set.
+    pub metadata: TilesetMetadata,
 }
 
 impl Default for ExportOptions {
@@ -377,13 +384,15 @@ impl Default for ExportOptions {
             zoom_ceiling: None,
             feature_id: None,
             spill_dir: None,
+            metadata: TilesetMetadata::default(),
         }
     }
 }
 
 impl ExportOptions {
     /// Check the option values that need no input file (#433): `extent`
-    /// must be positive and `tile_buffer` at most [`MAX_TILE_BUFFER_PX`].
+    /// must be positive, `tile_buffer` at most [`MAX_TILE_BUFFER_PX`], and
+    /// `metadata` small enough for an archive.
     ///
     /// [`export_pmtiles`] runs this first, before the overview file is
     /// opened, so a bad knob fails before any I/O. A front end that does
@@ -397,9 +406,11 @@ impl ExportOptions {
     ///
     /// # Errors
     ///
-    /// Returns [`ExportError::InvalidExtent`] if `extent` is 0, or
+    /// Returns [`ExportError::InvalidExtent`] if `extent` is 0,
     /// [`ExportError::TileBufferTooWide`] if `tile_buffer` is above
-    /// [`MAX_TILE_BUFFER_PX`].
+    /// [`MAX_TILE_BUFFER_PX`], [`ExportError::SpillDirNotDirectory`] for a
+    /// missing spill directory, or [`ExportError::Core`] if `metadata` is too
+    /// large for an archive's metadata.
     pub fn validate(&self) -> Result<(), ExportError> {
         if self.extent == 0 {
             return Err(ExportError::InvalidExtent {
@@ -426,8 +437,18 @@ impl ExportOptions {
                 return Err(ExportError::SpillDirNotDirectory(dir.clone()));
             }
         }
-        Ok(())
+        // Publication strings that cannot fit an archive's metadata would
+        // otherwise fail only when the first checkpoint is assembled.
+        check_metadata_size(&self.metadata)
     }
+}
+
+/// [`TilesetMetadata`] too large for any archive's metadata, as an
+/// [`ExportError`].
+fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ExportError> {
+    metadata
+        .check_size()
+        .map_err(|msg| ExportError::Core(crate::Error::InvalidConfig(msg)))
 }
 
 /// Per-zoom statistics in an [`ExportReport`].
@@ -1337,12 +1358,41 @@ pub fn write_empty_archive(
     min_zoom: u8,
     max_zoom: u8,
 ) -> Result<(), ExportError> {
+    write_empty_archive_with_metadata(
+        output,
+        layer_name,
+        min_zoom,
+        max_zoom,
+        &TilesetMetadata::default(),
+    )
+}
+
+/// [`write_empty_archive`] carrying publication metadata.
+///
+/// An empty shard or coarse job writes the same `name`, `description` and
+/// `attribution` as its siblings, so the merged archive keeps them whether
+/// or not this job received any data.
+///
+/// # Errors
+///
+/// Returns an [`ExportError`] if `metadata` is too large for an archive's
+/// metadata (checked before `output` is touched), or if the archive cannot
+/// be created or written at `output`.
+pub fn write_empty_archive_with_metadata(
+    output: &Path,
+    layer_name: &str,
+    min_zoom: u8,
+    max_zoom: u8,
+    metadata: &TilesetMetadata,
+) -> Result<(), ExportError> {
+    check_metadata_size(metadata)?;
     // Gzip and the tail layout, matching `export_pmtiles` exactly —
     // `merge_shards` refuses inputs whose tile compression disagrees, so an
     // empty shard written any other way would break the very merge it exists
     // to keep working.
     let mut writer = StreamingPmtilesWriter::with_tail_layout(output, Compression::Gzip)?;
     writer.set_layer_name(layer_name);
+    writer.set_metadata(metadata.clone());
     writer.set_declared_min_zoom(min_zoom);
     writer.set_declared_max_zoom(max_zoom);
     writer.finalize(output)?;
@@ -1626,6 +1676,8 @@ fn export_pmtiles_run(
     // archive.
     writer.set_expect_clustered(true);
     writer.set_layer_name(&options.layer_name);
+    // Before the first level, so every checkpoint carries it too.
+    writer.set_metadata(options.metadata.clone());
     writer.set_declared_min_zoom(min_zoom);
     // #361: a `--feature-order` column that names nothing is a no-op, and an
     // indistinguishable one — every member's key is `Missing`, so they all
@@ -12517,5 +12569,176 @@ mod tests {
                 "single-read ({backing:?}) diverges from legacy with --feature-id"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Publication metadata (name / description / attribution)
+    // -------------------------------------------------------------------------
+
+    /// The archive's metadata JSON object, read from the header's offsets.
+    fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+        let header = crate::pmtiles_writer::Header::from_bytes(bytes).unwrap();
+        let start = header.json_metadata_offset as usize;
+        let raw = &bytes[start..start + header.json_metadata_length as usize];
+        let plain = compression::decompress(raw, header.internal_compression).unwrap();
+        serde_json::from_slice(&plain).expect("archive metadata must be a JSON object")
+    }
+
+    /// Every addressed tile's stored (compressed) bytes, by tile id.
+    fn stored_tiles(bytes: &[u8]) -> std::collections::BTreeMap<u64, Vec<u8>> {
+        use crate::pmtiles_writer::{read_all_entries, Header};
+        let header = Header::from_bytes(bytes).unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for e in read_all_entries(bytes, &header).unwrap() {
+            let start = (header.tile_data_offset + e.offset) as usize;
+            for r in 0..u64::from(e.run_length) {
+                out.insert(
+                    e.tile_id + r,
+                    bytes[start..start + e.length as usize].to_vec(),
+                );
+            }
+        }
+        out
+    }
+
+    const PUBLICATION_KEYS: [&str; 3] = ["name", "description", "attribution"];
+
+    fn park_metadata() -> TilesetMetadata {
+        TilesetMetadata::new()
+            .with_name("Park Tiles 4")
+            .with_description("")
+            .with_attribution(r#"<a href="https://www.nps.gov/">National Park Service</a> ©"#)
+    }
+
+    fn assert_park_metadata(map: &serde_json::Map<String, serde_json::Value>, ctx: &str) {
+        assert_eq!(map["name"], "Park Tiles 4", "{ctx}");
+        assert_eq!(map["description"], "", "{ctx}");
+        assert_eq!(
+            map["attribution"], r#"<a href="https://www.nps.gov/">National Park Service</a> ©"#,
+            "{ctx}"
+        );
+    }
+
+    #[test]
+    fn export_writes_publication_metadata_without_touching_tiles() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        level_group_fixture(input.path(), Mode::Duplicating);
+        let dir = tempfile::tempdir().unwrap();
+        let plain = ExportOptions {
+            layer_name: "parks".to_string(),
+            ..Default::default()
+        };
+        let published = ExportOptions {
+            metadata: park_metadata(),
+            ..plain.clone()
+        };
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        let report_a = export_pmtiles(input.path(), &a, &plain).unwrap();
+        let report_b = export_pmtiles(input.path(), &b, &published).unwrap();
+        assert_eq!(
+            report_a.zooms, report_b.zooms,
+            "publication metadata changes no tile"
+        );
+
+        let (a, b) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let (mut meta_a, mut meta_b) = (metadata_object(&a), metadata_object(&b));
+        for key in PUBLICATION_KEYS {
+            assert!(!meta_a.contains_key(key), "default export adds no {key}");
+        }
+        assert_park_metadata(&meta_b, "export");
+        for key in PUBLICATION_KEYS {
+            meta_b.remove(key);
+        }
+        meta_a.remove("generator");
+        meta_b.remove("generator");
+        assert_eq!(meta_a, meta_b, "structural metadata keeps its meaning");
+        assert_eq!(
+            stored_tiles(&a),
+            stored_tiles(&b),
+            "tile payloads unchanged"
+        );
+    }
+
+    #[test]
+    fn interrupted_export_salvage_keeps_publication_metadata() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        level_group_fixture(input.path(), Mode::Duplicating);
+        let opts = ExportOptions {
+            layer_name: "groups".to_string(),
+            partition_wave: 6,
+            metadata: park_metadata(),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("failed.pmtiles");
+        let err = export_pmtiles_run(
+            input.path(),
+            &out,
+            &opts,
+            DEFAULT_PARTITION_TARGET,
+            &Pass2Knobs {
+                fail_level: Some(3),
+                ..knobs(true, None, false)
+            },
+        )
+        .err()
+        .expect("the injected fault must fail the export");
+        assert!(err.to_string().contains("injected"), "{err}");
+        let partial = std::fs::read(out.with_extension("pmtiles.partial")).unwrap();
+        assert_park_metadata(&metadata_object(&partial), "checkpoint");
+    }
+
+    #[test]
+    fn empty_archive_helpers_write_requested_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, published) = (
+            dir.path().join("plain.pmtiles"),
+            dir.path().join("published.pmtiles"),
+        );
+        write_empty_archive(&plain, "parks", 3, 9).unwrap();
+        write_empty_archive_with_metadata(&published, "parks", 3, 9, &park_metadata()).unwrap();
+
+        let mut plain = metadata_object(&std::fs::read(&plain).unwrap());
+        let mut published = metadata_object(&std::fs::read(&published).unwrap());
+        for key in PUBLICATION_KEYS {
+            assert!(
+                !plain.contains_key(key),
+                "default empty archive adds no {key}"
+            );
+        }
+        assert_park_metadata(&published, "empty archive");
+        for key in PUBLICATION_KEYS {
+            published.remove(key);
+        }
+        plain.remove("generator");
+        published.remove("generator");
+        assert_eq!(
+            plain, published,
+            "declared layer and zooms keep their meaning"
+        );
+    }
+
+    #[test]
+    fn oversized_publication_metadata_fails_before_reading_input() {
+        let opts = ExportOptions {
+            // Fits before JSON escaping, not after: each quote becomes `\"`.
+            metadata: TilesetMetadata::new()
+                .with_description("\"".repeat(compression::MAX_INTERNAL_BYTES as usize / 2)),
+            ..Default::default()
+        };
+        let err = opts.validate().unwrap_err();
+        assert!(err.to_string().contains("description"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-overview.parquet");
+        let out = dir.path().join("out.pmtiles");
+        let err = export_pmtiles(&missing, &out, &opts).unwrap_err();
+        assert!(err.to_string().contains("description"), "{err}");
+        assert!(!out.exists());
+
+        let err =
+            write_empty_archive_with_metadata(&out, "parks", 0, 4, &opts.metadata).unwrap_err();
+        assert!(err.to_string().contains("description"), "{err}");
+        assert!(!out.exists() && !out.with_extension("pmtiles.partial").exists());
     }
 }

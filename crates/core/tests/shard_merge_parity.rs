@@ -439,6 +439,7 @@ fn assert_sharded_build_matches_monolithic(input: &Path, build: Build) {
         &merged,
         &MergeOptions {
             work_dir: Some(dir.to_path_buf()),
+            ..Default::default()
         },
     )
     .expect("merge coarse + shards");
