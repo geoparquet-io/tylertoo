@@ -1674,6 +1674,28 @@ For multi-GB partitioning inputs, `speed` can exhaust RAM: buffered output
 may approach input size. `auto` selects `bounded` for large partitioning
 and over-budget runs. Watch peak RSS if you explicitly choose `speed`.
 
+### Remote staging (env)
+
+Pass 0 stages a remote input's selected row groups to the local disk spill
+up front, one coalesced range request per row group with several in flight
+([#286](https://github.com/geoparquet-io/tylertoo/issues/286)/[#287](https://github.com/geoparquet-io/tylertoo/issues/287)).
+Two of its heuristics accept **experimental environment overrides** so the
+[#290](https://github.com/geoparquet-io/tylertoo/issues/290) host sweep
+(source.coop vs real S3) can vary them per run without rebuilding. They are
+sweep knobs, not stable API — deliberately env-only, no CLI flags — and may
+change or disappear once #290 lands swept defaults. They alter request
+*scheduling* only; the staged bytes, batch order, and output are identical.
+
+| Variable | Default | Bounds | Effect |
+|----------|---------|--------|--------|
+| `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on row-group range requests in flight per part |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest row-group span)` |
+
+A value that fails to parse warns and keeps the default; an out-of-range
+value warns and clamps to the bound. The effective values log once at staging start —
+at info when an override is set (so a sweep run records what it tested),
+debug otherwise.
+
 ---
 
 ## Reusing a plan: `--save-plan`, `--plan`
