@@ -128,7 +128,8 @@ fn exercise_tile_range(range: &TileRange) -> u64 {
 /// `s` as the value of each string flag the CLI and Python bindings hand
 /// to a core parser.
 ///
-/// Those are `--representation`, `--band`, `--tile-range`, `--shard`,
+/// Those are `--representation`, `--entry-zoom`, `--class-rank`,
+/// `--accumulate-attribute`, `--band`, `--tile-range`, `--shard`,
 /// `--max-zoom`, `--feature-order`, and the URL scheme sniff every input path
 /// goes through, plus the public [`crate::covering::parse_bounds`]. They take
 /// what the person running the command typed rather than a file, but a crash
@@ -136,6 +137,9 @@ fn exercise_tile_range(range: &TileRange) -> u64 {
 pub fn fuzz_cli_args(s: &str) {
     let _ = crate::covering::parse_bounds(s);
     let _ = crate::overview::convert::parse_representation_spec(s);
+    let _ = crate::overview::convert::parse_entry_zoom(s);
+    let _ = crate::overview::convert::parse_class_rank(s);
+    let _ = crate::overview::convert::parse_accumulate(s);
     let _ = crate::pyramid::Band::parse(s);
     if let Ok(range) = TileRange::parse(s) {
         exercise_tile_range(&range);

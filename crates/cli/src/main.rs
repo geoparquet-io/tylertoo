@@ -2924,132 +2924,27 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
 
 /// Parse an `--entry-zoom` spec: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` (#364).
 ///
-/// Mirrors [`parse_class_rank`]'s grammar so the two read alike; the payload
-/// differs (a zoom, not a priority) because a rung places a feature rather
-/// than ordering it.
+/// Grammar, validation and messages live in core (#439); this adapts the
+/// error for anyhow.
 fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::EntryZoomSpec> {
-    use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
-
-    let (column, rest) = spec.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!(
-            "--entry-zoom {spec:?}: expected COLUMN:VALUE=ZOOM,VALUE=ZOOM,... \
-             (e.g. \"level:0.5=8,0.2=12\")"
-        )
-    })?;
-    if column.is_empty() {
-        anyhow::bail!("--entry-zoom {spec:?}: empty column name");
-    }
-    let mut rungs = Vec::new();
-    for pair in rest.split(',').filter(|p| !p.trim().is_empty()) {
-        let (value, zoom) = pair.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}")
-        })?;
-        let value: f64 = value
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
-        let zoom: u8 = zoom
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("--entry-zoom {spec:?}: {zoom:?} is not a zoom level"))?;
-        rungs.push((value, zoom));
-    }
-    if rungs.is_empty() {
-        anyhow::bail!("--entry-zoom {spec:?}: no VALUE=ZOOM pairs");
-    }
-    Ok(EntryZoomSpec {
-        column: column.to_string(),
-        kind: EntryZoomKind::Explicit(rungs),
-    })
+    tylertoo_core::overview::convert::parse_entry_zoom(spec).map_err(anyhow::Error::msg)
 }
 
 /// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
 ///
-/// `unknown_rank` (the priority for present-but-unlisted values) is derived as
-/// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
-/// value while still beating null/missing values (which lose to any rank).
-///
-/// Ranks must be finite (#428). `f64::from_str` happily accepts `nan` and
-/// `inf`, and either one breaks this flag's contract: a NaN is not ordered
-/// (the ranking comparator answers "does not beat" in both directions, so the
-/// cell incumbent silently keeps the cell), and `min(ranks)` computed with
-/// `f64::min` *ignores* NaN — one `nan` entry would leave `unknown_rank` at
-/// `+inf - 1.0 = +inf`, making unlisted values outrank every named class,
-/// the exact inverse of what this flag documents.
+/// Grammar, validation and messages live in core (#439); this adapts the
+/// error for anyhow.
 fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::ClassRanking> {
-    use tylertoo_core::overview::convert::ClassRanking;
-
-    let (column, rest) = spec.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid --class-rank '{spec}': expected COLUMN:VALUE=RANK,... (missing ':')"
-        )
-    })?;
-    let column = column.trim();
-    if column.is_empty() {
-        anyhow::bail!("invalid --class-rank '{spec}': empty column name");
-    }
-
-    let mut ranks: Vec<(String, f64)> = Vec::new();
-    for pair in rest.split(',') {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        let (value, rank) = pair.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("invalid --class-rank entry '{pair}': expected VALUE=RANK")
-        })?;
-        let value = value.trim();
-        if value.is_empty() {
-            anyhow::bail!("invalid --class-rank entry '{pair}': empty value");
-        }
-        let rank: f64 = rank
-            .trim()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid rank in '{pair}': {e}"))?;
-        if !rank.is_finite() {
-            anyhow::bail!(
-                "invalid rank in '{pair}': ranks must be finite numbers \
-                 (NaN and infinity cannot be ordered against other classes)"
-            );
-        }
-        ranks.push((value.to_string(), rank));
-    }
-    if ranks.is_empty() {
-        anyhow::bail!("invalid --class-rank '{spec}': no VALUE=RANK entries");
-    }
-
-    // Unknown values must lose to every named class but beat nulls.
-    let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
-    Ok(ClassRanking {
-        column: column.to_string(),
-        ranks,
-        unknown_rank: min_rank - 1.0,
-    })
+    tylertoo_core::overview::convert::parse_class_rank(spec).map_err(anyhow::Error::msg)
 }
 
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
 /// `sum`, `max`, `min`, `mean` (case-insensitive).
+///
+/// Grammar, validation and messages live in core (#439); this adapts the
+/// error for anyhow.
 fn parse_accumulate(spec: &str) -> Result<tylertoo_core::overview::cluster::AccumulateSpec> {
-    use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
-
-    let (column, op) = spec.rsplit_once(':').ok_or_else(|| {
-        anyhow::anyhow!("invalid --accumulate-attribute '{spec}': expected COL:OP (missing ':')")
-    })?;
-    let column = column.trim();
-    if column.is_empty() {
-        anyhow::bail!("invalid --accumulate-attribute '{spec}': empty column name");
-    }
-    let op = AccumulateOp::parse(op.trim()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid --accumulate-attribute '{spec}': unknown op {:?} \
-             (expected sum, max, min, or mean)",
-            op.trim()
-        )
-    })?;
-    Ok(AccumulateSpec {
-        column: column.to_string(),
-        op,
-    })
+    tylertoo_core::overview::convert::parse_accumulate(spec).map_err(anyhow::Error::msg)
 }
 
 /// Run `tylertoo validate`: check a GeoParquet overview file (spec §6.2).
@@ -3823,41 +3718,6 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tylertoo_core::overview::cluster::AccumulateOp;
-
-    /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one
-    /// breaks `--class-rank`'s contract. A NaN is not ordered, so the cell
-    /// incumbent would silently keep every cell it contests; worse, the
-    /// `unknown_rank` derivation uses `f64::min`, which IGNORES NaN — one
-    /// `nan` entry leaves the fold at `+inf`, so unlisted values would
-    /// outrank every named class, the inverse of the documented rule. The
-    /// parser rejects them with an explanation rather than producing that.
-    #[test]
-    fn class_rank_rejects_non_finite_ranks() {
-        for spec in [
-            "cls:motorway=nan,trunk=2",
-            "cls:motorway=NaN",
-            "cls:motorway=inf,trunk=2",
-            "cls:motorway=-inf",
-            "cls:motorway=infinity",
-        ] {
-            let err = parse_class_rank(spec)
-                .unwrap_err()
-                .to_string()
-                .to_ascii_lowercase();
-            assert!(
-                err.contains("finite"),
-                "'{spec}' must be rejected as non-finite, got: {err}"
-            );
-        }
-
-        // Control: ordinary ranks still parse, and the unknown rank is
-        // min(ranks) - 1 — below every named class, above a null.
-        let cr = parse_class_rank("cls:motorway=3,trunk=2,primary=1").unwrap();
-        assert_eq!(cr.column, "cls");
-        assert_eq!(cr.unknown_rank, 0.0);
-        assert_eq!(cr.ranks.len(), 3);
-    }
 
     // --- single-file-only rejections (v0.7 PR-C) -----------------------------
 
@@ -3913,31 +3773,6 @@ mod tests {
                 .to_string();
         assert!(err.contains("remote"), "{err}");
         assert!(err.contains("aws s3 cp"), "{err}");
-    }
-
-    #[test]
-    fn parse_accumulate_valid_specs() {
-        let s = parse_accumulate("population:sum").unwrap();
-        assert_eq!(s.column, "population");
-        assert_eq!(s.op, AccumulateOp::Sum);
-
-        // Case-insensitive op, trimmed parts.
-        let s = parse_accumulate(" confidence : MEAN ").unwrap();
-        assert_eq!(s.column, "confidence");
-        assert_eq!(s.op, AccumulateOp::Mean);
-
-        let s = parse_accumulate("x:min").unwrap();
-        assert_eq!(s.op, AccumulateOp::Min);
-        let s = parse_accumulate("x:max").unwrap();
-        assert_eq!(s.op, AccumulateOp::Max);
-    }
-
-    #[test]
-    fn parse_accumulate_rejects_bad_specs() {
-        assert!(parse_accumulate("population").is_err(), "missing op");
-        assert!(parse_accumulate(":sum").is_err(), "empty column");
-        assert!(parse_accumulate("pop:median").is_err(), "unknown op");
-        assert!(parse_accumulate("pop:").is_err(), "empty op");
     }
 
     // --- --files-from (v0.7 multi-partition) ---------------------------------
@@ -4733,44 +4568,6 @@ mod tests {
                 false,
             )
             .unwrap()
-    }
-
-    /// The `--entry-zoom` grammar, which had no tests despite +116 lines of
-    /// new surface and a mandatory-TDD policy.
-    #[test]
-    fn entry_zoom_spec_grammar() {
-        use tylertoo_core::overview::ladder::EntryZoomKind;
-
-        let ok = |spec: &str| parse_entry_zoom(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
-
-        let s = ok("density:5000=4,1000=6,200=8");
-        assert_eq!(s.column, "density");
-        match &s.kind {
-            EntryZoomKind::Explicit(pairs) => {
-                assert_eq!(pairs, &[(5000.0, 4), (1000.0, 6), (200.0, 8)]);
-            }
-            other => panic!("expected explicit rungs, got {other:?}"),
-        }
-
-        // Whitespace and a trailing comma are tolerated.
-        let s = ok("density: 5000 = 4 , 200 = 8 ,");
-        match &s.kind {
-            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(5000.0, 4), (200.0, 8)]),
-            other => panic!("{other:?}"),
-        }
-
-        for bad in [
-            "density",          // no ':'
-            ":5000=4",          // empty column
-            "density:",         // no pairs
-            "density:5000",     // missing '='
-            "density:x=4",      // value not a number
-            "density:5000=z",   // zoom not a number
-            "density:5000=-1",  // negative zoom
-            "density:5000=999", // beyond u8
-        ] {
-            assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
-        }
     }
 
     /// #364: a ladder implies collapse-to-point, and that is applied in CORE so
