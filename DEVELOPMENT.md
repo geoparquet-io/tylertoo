@@ -132,6 +132,41 @@ exclusion in `[profile.default]`, which `quick` inherits. The other is
 the matching `[[profile.default.overrides]]` filter, which gives slow
 tests a longer timeout. `full` picks the test up with no edit.
 
+#### Updating CLI snapshots
+
+`crates/cli/tests/cli_snapshots.rs` uses
+[trycmd](https://docs.rs/trycmd) to pin what the CLI shows a user. Each
+`crates/cli/tests/cmd/*.md` case is a list of `$ tylertoo ...` console
+blocks with the expected stdout and stderr, plus a `? N` line for a
+nonzero exit code. The binary runs as a black box with `RUST_LOG=off`,
+so log lines stay out of the snapshots. The test runs in the `quick`
+tier.
+
+- **Inputs.** A case that only reads names committed fixtures by a
+  path relative to `crates/cli`, for example
+  `../../tests/fixtures/golden/road-detections.pmtiles`. A case that
+  writes files runs in a sandbox: `<case>.in/` holds copies of its
+  inputs, and the sandbox is on only when `<case>.out/` exists.
+  trycmd checks that every file in `<case>.out/` matches the sandbox
+  after the run. An empty `.keep` in both directories turns the
+  sandbox on without asserting anything.
+- **Wildcards.** `[..]` matches the rest of a line and `...` matches
+  any run of lines. Use them for anything a run varies: durations,
+  temp paths, and Parquet byte sizes, which change with the
+  `parquet` crate.
+
+When a CLI change alters its output, rewrite the cases in place, then
+review the diff:
+
+```bash
+TRYCMD=overwrite cargo test -p tylertoo --test cli_snapshots
+git diff crates/cli/tests/cmd
+```
+
+Overwrite drops the wildcards on any line it rewrites, so put them
+back. **Review every rewritten block by hand before you commit.** A
+wrong capture pins a bug as correct behaviour.
+
 ### Benchmarks
 
 `crates/core/benches/` holds Criterion benchmarks of the hot paths. The
@@ -501,6 +536,10 @@ uv run --project crates/python --only-group docs \
 To change a tutorial, edit its script, run the docs tests, and paste the
 new script and output into the README. A failing test names the step and
 the lines that differ.
+
+The docs tests check pages against the CLI. The CLI's own output is
+pinned separately, by the Rust snapshot cases in `crates/cli/tests/cmd`
+(see [Updating CLI snapshots](#updating-cli-snapshots)).
 
 ### Docs prose
 
