@@ -15,11 +15,15 @@
 #   Python Quality  ruff check/format (docstrings: pydocstyle, pydoclint,
 #                   W505), mypy + stubtest, ty, doctests, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
+#   Python Tests    the binding's pytest suite on macOS and Windows, the
+#                   other two wheel platforms (Linux runs in Python Quality)
 #   Docs            the committed CLI + Python reference (docs/reference/)
 #                   matches regeneration from source; rustdoc -D warnings;
 #                   tests/docs runs both tutorials, the README quickstart,
 #                   the --help flag check, and the strict site build
-#   Coverage        cargo-llvm-cov -> lcov -> codecov (informational)
+#   Coverage        cargo-llvm-cov -> lcov; scripts/coverage_gate.py fails
+#                   below the line-coverage floor; codecov gets the report
+#                   (informational)
 #   Profiling       dhat-heap feature keeps compiling
 #   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
 #   Docs Prose      Vale + proselint on the handwritten docs, via
@@ -549,6 +553,78 @@ jobs:
           uv export --no-emit-project --format requirements-txt -o /tmp/requirements.txt
           uv run pip-audit -r /tmp/requirements.txt --disable-pip
 
+  # The binding's pytest suite on the other two wheel platforms (#678).
+  # Release builds macOS and Windows wheels but only import-checks them;
+  # this runs the Python API on both before merge. Python Quality keeps the
+  # lint/type/audit steps, which do not depend on the OS, on Linux only.
+  python-tests:
+    name: Python Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        # bash on every OS: Windows defaults to pwsh, where the bash syntax
+        # below fails or means something else.
+        shell: bash
+        working-directory: crates/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
+      - name: Cache cargo (pyo3 build)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: crates/python/uv.lock
+
+      # Same fixture cache + release download as Python Quality; see the
+      # note there on git-LFS pointers.
+      - name: Cache test fixtures
+        id: fixture-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/fixtures/realdata
+          key: fixtures-v1-${{ runner.os }}
+
+      - name: Download test fixtures
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Sync environment (builds the extension module)
+        run: uv sync --locked
+
+      - name: pytest
+        run: uv run --no-sync pytest tests/ -v
+
   # Docs: the reference pages, the rustdoc, and every example the site shows.
   #
   # - The CLI and Python reference pages are generated from the clap help
@@ -744,12 +820,25 @@ jobs:
           --exclude tylertoo-python
           --lcov --output-path lcov.info
 
+      # The coverage gate (#678). It reads the lcov total here rather than
+      # waiting on Codecov: the codecov/project status never posted on this
+      # repo, so the 80% target in codecov.yml gated nothing. Same file set
+      # as Codecov (the script's defaults mirror codecov.yml's `ignore:`).
+      # Main was at 95.6% (Codecov, 2026-10-15) when the floor went in.
+      # RATCHET: raise the floor as coverage grows — never lower it.
+      - name: Coverage floor
+        run: python3 scripts/coverage_gate.py --check lcov.info --min 94
+
+      # Report only: the per-file view and the PR comment. The gate is the
+      # step above, so a Codecov outage or a missing token (fork PRs) must
+      # not fail the job.
       - name: Upload coverage to Codecov
+        if: always()
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false  # Don't fail if token not configured
+          fail_ci_if_error: false
 
   # Profiling features compile check
   profiling:

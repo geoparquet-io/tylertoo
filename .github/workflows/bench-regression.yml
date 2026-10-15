@@ -1,4 +1,4 @@
-# Criterion regression gate (#448) — opt-in, same-runner base-vs-head.
+# Criterion regression gate (#448) — same-runner base-vs-head.
 #
 # One job on one runner: build and run the criterion benches at the base
 # revision (`--save-baseline base`), then at the head revision
@@ -14,15 +14,27 @@
 #                       the last release"); on any other branch, its merge-base
 #                       with origin/main.
 #
-# Triggers: NOT every PR. Only PRs carrying the `benchmark` label (applying the
-# label starts it; later pushes re-run it while the label stays) and manual
-# dispatch. There is no schedule: main-vs-main on a timer compares a revision
-# against itself and only measures noise. Kept in its own workflow so label
-# events don't re-run bench.yml's convert-guard.
+# Triggers (#678):
+#   pull_request        every PR that changes what the benches measure: the
+#                       paths in BENCHED below (crates/core, the build, this
+#                       gate's own workflow and scripts). The `changes` job
+#                       decides; a PR touching none of them skips the gate.
+#                       The `benchmark` label still starts it on any PR
+#                       (applying the label starts it; later pushes re-run it
+#                       while the label stays).
+#   workflow_dispatch   manual, with the optional `base` input.
+# The paths are checked in a job rather than with an `on.pull_request.paths`
+# filter: that filter applies to `labeled` events too, so the label could
+# never start the gate on a PR outside the paths. There is no schedule:
+# main-vs-main on a timer compares a revision against itself and only
+# measures noise. Kept in its own workflow so label events don't re-run
+# bench.yml's convert-guard.
 #
-# Gate: fail if the 95% CI lower bound of a bench's mean change is >= +25%;
-# warn if the point estimate is >= +10%. See DEVELOPMENT.md, "Criterion
-# regression gate".
+# Cost: one run is 41-48 min of ubuntu-latest (#432, and the #678 A/A runs;
+# almost all of it the two bench passes), on PRs that touch BENCHED only.
+#
+# Gate: see the "Check for regressions" step for the thresholds and the
+# noise data behind them, and DEVELOPMENT.md, "Criterion regression gate".
 
 name: Bench regression
 
@@ -39,23 +51,69 @@ on:
 permissions:
   contents: read
 
+# One run per PR: a new push cancels the old run. A `labeled` event for some
+# other label gets its own group, so adding an unrelated label to a PR can't
+# cancel a gate run in flight (that event's run skips the gate anyway). Each
+# dispatch is its own group: two dispatches may name different bases.
 concurrency:
-  group: bench-regression-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    bench-regression-${{ github.event.pull_request.number || github.run_id }}${{
+    github.event.action == 'labeled' && github.event.label.name != 'benchmark'
+    && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Benched paths changed?
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      benched: ${{ steps.diff.outputs.benched }}
+    steps:
+      # Depth 2: on a PR, HEAD is GitHub's merge commit and HEAD^1 the base
+      # branch tip, so `git diff HEAD^1 HEAD` is exactly the PR's change.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Diff against the base branch
+        id: diff
+        run: |
+          # BENCHED: what the benches measure, or how they are run and gated.
+          # Wider than codspeed.yml's per-bench selection on purpose: any
+          # crates/core change runs every bench, so a regression that reaches
+          # a bench through some distant module is still caught on the PR.
+          BENCHED='^(crates/core/.*|Cargo\.toml|Cargo\.lock|\.github/workflows/bench-regression\.yml|scripts/criterion_compare\.sh|scripts/criterion_gate\.py)$'
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          echo "Changed files:"
+          sed 's/^/  /' <<<"$changed"
+          if grep -qE "$BENCHED" <<<"$changed"; then
+            echo "benched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No benched path changed; the gate skips unless the PR has the benchmark label."
+            echo "benched=false" >> "$GITHUB_OUTPUT"
+          fi
+
   criterion-regression:
     name: Criterion regression gate
+    needs: changes
     runs-on: ubuntu-latest
-    # On a PR: only with the `benchmark` label, and on a `labeled` event only
-    # when that label is the one just added.
+    # Dispatch: always. PR: when it changes a benched path or carries the
+    # `benchmark` label. A `labeled` event runs it only when that label is
+    # `benchmark` (any other label changes nothing worth re-benching).
+    # `!cancelled()` because a dispatch skips `changes`, and a skipped need
+    # would otherwise skip this job too.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (contains(github.event.pull_request.labels.*.name, 'benchmark') &&
-       (github.event.action != 'labeled' || github.event.label.name == 'benchmark'))
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'benchmark') ||
+       (github.event.action != 'labeled' &&
+        (needs.changes.outputs.benched == 'true' ||
+         contains(github.event.pull_request.labels.*.name, 'benchmark'))))
     timeout-minutes: 90
     env:
       TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
@@ -138,10 +196,31 @@ jobs:
           scripts/criterion_compare.sh "$BASE_SHA"
         timeout-minutes: 75
 
+      # Thresholds, from measured noise (#678). Four A/A runs on this job
+      # (38776884521, 38776888984, 38777309254, 38784871499: no benched code
+      # changed between the two sides), 52 benches each, 208 comparisons:
+      #   |change| median 1.0%, p90 4.9%, p95 6.5%, max 26.9%.
+      #   CI lower bound: max +6.1% outside the Sutherland–Hodgman benches.
+      #   Inside them: +26.2% (wide_polygon_clip/sutherland_hodgman/316000),
+      #   +14.9% (sutherland_hodgman/316000), +14.2% (sutherland_hodgman/
+      #   1000), +12.5% (wide_polygon_clip/sutherland_hodgman/10000), each
+      #   with an interval under 3 points wide.
+      # Criterion's interval only covers noise within one run, and those
+      # benches move between runs of the same code. The old flat +25% failed
+      # the fourth run on no change. Hence: fail at a +10% lower bound, and
+      # +50% (about twice the worst A/A result) for the --noisy family, a
+      # backstop for gross regressions only; CodSpeed's instruction counts
+      # are the finer signal there.
+      # Replayed on #432 (overflow checks in release, 36328559030), this
+      # fails clip_geometry/100000 at +12.9%; the old +25% passed it.
+      # Re-measure with A/A dispatches (a branch whose only change is outside
+      # BENCHED) before tightening further.
       - name: Check for regressions
         run: >-
           python3 scripts/criterion_gate.py --check
-          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 25
+          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10
+          --noisy 'sutherland_hodgman/*' --noisy 'wide_polygon_clip/sutherland_hodgman/*'
+          --noisy-fail 50
 
       - name: Upload comparison report
         if: always()

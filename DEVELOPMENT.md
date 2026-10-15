@@ -273,8 +273,8 @@ runner. The workflow authenticates through OIDC, which requires the
 CodSpeed GitHub app on the repository.
 
 Instruction counts miss what only wall time shows: memory bandwidth,
-lock contention, and thread scaling. That is what the label-gated
-regression job below is kept for.
+lock contention, and thread scaling. That is what the wall-clock
+regression gate below is kept for.
 
 #### Criterion regression gate
 
@@ -283,14 +283,19 @@ runner, base revision first and head second, and gates the difference.
 A baseline from another VM would mostly measure the VM. Two runs on one
 machine, minutes apart, give a comparison that shared runners support.
 
-The gate runs in two cases, never on a schedule:
+The gate runs in these cases, never on a schedule:
 
-- On a PR with the **`benchmark` label**. Adding the label starts it, and
-  later pushes rerun it while the label stays. The base is the
-  merge-base with the PR's base branch.
+- On each PR that changes `crates/core/`, `Cargo.toml`, `Cargo.lock`, or
+  the gate's own workflow and scripts. No label is needed. The
+  workflow's `changes` job holds the path list.
+- On any other PR with the **`benchmark` label**. Adding the label
+  starts it, and later pushes rerun it while the label stays.
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
   on another branch against its merge-base with `origin/main`.
+
+On a PR the base is the merge-base with the PR's base branch. A run
+takes 41 to 48 minutes of runner time.
 
 `scripts/criterion_compare.sh <base-rev>` does the two runs, the base
 in a temporary git worktree. It writes to `target/criterion-compare/`,
@@ -298,9 +303,14 @@ so your `target/criterion/` history stays out of it.
 `scripts/criterion_gate.py` then reads the relative change of each
 bench's mean, with its 95% confidence interval, and applies these rules:
 
-- **Fail** when the interval's lower bound is +25% or more. The
-  regression is at least that large even at the optimistic end, so noise
-  alone is an unlikely cause.
+- **Fail** when the interval's lower bound is +10% or more. The
+  regression is at least that large even at the optimistic end. In
+  four runs that compared the same code with itself, no lower bound
+  reached +10% outside the Sutherland–Hodgman benches.
+- **Fail at +50% instead** for a bench that matches a `--noisy` glob.
+  The `sutherland_hodgman` benches moved by up to 27% between two runs
+  of the same code, with tight intervals, so +10% would fail them on
+  noise. The workflow step lists the measurements.
 - **Warn** when the point estimate is +10% or more.
 - Report a bench with no base result as "new (no baseline)", and one with
   no head result as "not run at head". Neither counts toward the gate.
@@ -313,7 +323,9 @@ To run the same check locally:
 scripts/criterion_compare.sh origin/main
 uv run python scripts/criterion_gate.py --check \
   --criterion-dir target/criterion-compare \
-  --baseline base --warn 10 --fail 25
+  --baseline base --warn 10 --fail 10 \
+  --noisy 'sutherland_hodgman/*' \
+  --noisy 'wide_polygon_clip/sutherland_hodgman/*' --noisy-fail 50
 ```
 
 ### Hotspots
@@ -422,12 +434,14 @@ python3 benchmarks/overview/ci_guard.py --check
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
-# Coverage (informational; CI uploads to Codecov)
+# Coverage: CI fails below the floor in the Coverage job's
+# "Coverage floor" step, then uploads to Codecov (report only)
 cargo install cargo-llvm-cov    # once
 rustup component add llvm-tools-preview
 cargo llvm-cov nextest --all-features --workspace \
   --exclude tylertoo-python \
   --lcov --output-path lcov.info
+python3 scripts/coverage_gate.py --check lcov.info --min 94
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
@@ -438,7 +452,8 @@ Some thresholds are **ratchets**, set at the current code's level and
 marked `RATCHET` in the source. They are cognitive complexity 30 and
 too-many-lines 200 in `clippy.toml`, the similarity-rs threshold 0.95,
 and xenon's max-absolute C. Lower them as the code improves, and never
-raise them.
+raise them. The line-coverage floor in `ci.yml` (94%) is a ratchet in
+the other direction: raise it as coverage grows, and never lower it.
 
 `cargo shear` also inspects `[workspace.dependencies]`. To keep a
 dependency that no code references, such as a transitive version pin,
