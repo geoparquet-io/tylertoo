@@ -593,20 +593,80 @@ Merging the two into one object would mean either:
 A standalone `export-pmtiles` run writes exactly one `"phase": "export"`
 line, the same shape as the second line of a `tiles` run.
 
-## Wall-time profiling with cargo-flamegraph
+## Sampling profilers
+
+The phase timers say which phase is slow; a sampling profiler says which
+functions inside it. `[profile.release]` strips symbols, so a release
+binary profiles as bare addresses. Profile the `profiling` build instead:
+release code generation with debug info and symbols kept.
+
+```bash
+cargo build --profile profiling --package tylertoo
+# binary: target/profiling/tylertoo
+```
+
+Expect simplification (RDP and ring validation) to dominate convert on
+polygon-heavy data, and clipping and encoding to dominate export. Both
+are rayon-parallel, so read per-thread widths, not just the total.
+
+### samply (start here)
+
+[samply](https://github.com/mstange/samply) runs on Linux and macOS,
+needs no root, and opens the result in the Firefox Profiler, with call
+tree, flame graph, and a per-thread timeline.
+
+```bash
+cargo install --locked samply
+
+samply record ./target/profiling/tylertoo \
+  tiles input.parquet output.pmtiles --max-zoom 10
+```
+
+`samply record --save-only -o profile.json.gz …` writes the profile
+without opening a browser; load it later with `samply load`. On Linux,
+samply needs `kernel.perf_event_paranoid <= 1` (see the note below).
+
+### perf (Linux detail)
+
+`perf` gives hardware counters, annotated assembly, and scripting.
+
+```bash
+# May need: sudo sysctl kernel.perf_event_paranoid=1
+perf record -g --call-graph dwarf -o perf.data \
+  ./target/profiling/tylertoo tiles input.parquet output.pmtiles
+perf report -i perf.data
+```
+
+`--call-graph dwarf` unwinds from the debug info, which works without
+frame pointers but writes large `perf.data` files. Keep the input small.
+
+### cargo-flamegraph
+
+[cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph) wraps
+`perf` (Linux) or `dtrace` (macOS) and writes a `flamegraph.svg`:
 
 ```bash
 cargo install flamegraph
 
-# Profile a conversion (requires perf; may need
-# kernel.perf_event_paranoid <= 1)
-cargo flamegraph --release --package tylertoo -- \
-  overview input.parquet output.parquet
+cargo flamegraph --profile profiling --package tylertoo -- \
+  tiles input.parquet output.pmtiles
 ```
 
-Expect simplification (RDP + ring validation) to dominate convert on
-polygon-heavy data, and clipping/encoding to dominate export — both are
-rayon-parallel, so look at per-thread flame widths.
+### hyperfine (end-to-end wall time)
+
+Profilers show where the time goes; [hyperfine](https://github.com/sharkdp/hyperfine)
+checks whether a change moved the total. It runs warmup passes, repeats,
+and reports mean, spread, and the relative difference between commands:
+
+```bash
+hyperfine --warmup 1 --runs 5 \
+  './target/release/tylertoo tiles input.parquet /tmp/a.pmtiles' \
+  './before/tylertoo tiles input.parquet /tmp/b.pmtiles'
+```
+
+Time the `release` build here, since that is what ships; the `profiling`
+build differs only in debug info and symbols, so its numbers should
+match closely.
 
 ## Memory profiling with dhat
 
@@ -651,8 +711,10 @@ mv dhat-heap.json dhat-heap-before.json
 
 ## Criterion benchmarks
 
-Micro-benchmarks for the clipping hot path live in
-`crates/core/benches/` (`clipping`, `bbox_containment`):
+Micro-benchmarks of the hot paths live in `crates/core/benches/`.
+DEVELOPMENT.md, "Benchmarks", lists them. It also covers CodSpeed's
+per-PR instruction-count comment and the opt-in wall-clock regression
+gate.
 
 ```bash
 cargo bench --package tylertoo-core --bench clipping
