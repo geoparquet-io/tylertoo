@@ -87,6 +87,11 @@ proptest = "1"
 # - cargo-mutants (mutation testing)
 # - cargo-watch (auto-run tests)
 
+# cargo-codspeed builds the benches with `--cfg codspeed` (#614); declare it
+# so `cfg!(codspeed)` in a bench is not an unexpected_cfgs warning.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(codspeed)"] }
+
 # Curated lint gates shared by every crate (each crate opts in with
 # `[lints] workspace = true`). CI runs clippy with `-D warnings`, so every
 # "warn" below is a hard failure on PRs. The full clippy::pedantic group is

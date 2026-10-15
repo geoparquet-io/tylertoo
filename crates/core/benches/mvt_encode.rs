@@ -83,7 +83,12 @@ fn bench_encode_polygon(c: &mut Criterion) {
         });
     }
 
-    if let Some(poly) = load_antarctica_polygon() {
+    // Not under CodSpeed: one call takes ~7 s natively and ~20 min in
+    // simulation (Valgrind), over 90% of the whole CodSpeed job (#614). The
+    // wall-clock runs (bench.yml, the regression gate) still time it.
+    if cfg!(codspeed) {
+        eprintln!("mvt_encode: antarctica_316k_over_cap skipped under CodSpeed");
+    } else if let Some(poly) = load_antarctica_polygon() {
         let verts = poly.exterior().0.len() as u64;
         group.throughput(Throughput::Elements(verts));
         // Named for what it measures: the over-cap early-out in `node_ring`
