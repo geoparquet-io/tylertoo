@@ -196,10 +196,27 @@ jobs:
           scripts/criterion_compare.sh "$BASE_SHA"
         timeout-minutes: 75
 
+      # Thresholds, from measured noise (#678). Three A/A runs on this job
+      # (38776884521, 38776888984, 38777309254: the same code on both sides),
+      # 52 benches each, 156 comparisons:
+      #   |change| median 0.9%, p90 4.8%, p95 6.2%, max 16.1%.
+      #   CI lower bound: max +6.1% outside the Sutherland–Hodgman benches;
+      #   inside them +14.9% (sutherland_hodgman/316000) and +14.2%
+      #   (sutherland_hodgman/1000), with intervals under 3 points wide.
+      # Criterion's interval only covers noise within one run, so those two
+      # benches move between runs of the same code with a tight interval
+      # anyway. Hence: fail at a +10% lower bound, but +25% for the --noisy
+      # Sutherland–Hodgman family (wide_polygon_clip's too: +13.5% on #432).
+      # Replayed on #432 (overflow checks in release, 36328559030), this
+      # fails clip_geometry/100000 at +12.9%; the old +25% passed it.
+      # Re-measure with A/A dispatches (a branch whose only change is outside
+      # crates/core) before tightening further.
       - name: Check for regressions
         run: >-
           python3 scripts/criterion_gate.py --check
-          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 25
+          --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10
+          --noisy 'sutherland_hodgman/*' --noisy 'wide_polygon_clip/sutherland_hodgman/*'
+          --noisy-fail 25
 
       - name: Upload comparison report
         if: always()

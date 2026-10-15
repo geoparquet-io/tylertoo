@@ -9,12 +9,19 @@ deleted) and fails on a gross per-bench regression.
 Verdict per bench, from criterion's own `change/estimates.json` (the relative
 change of the mean, with a bootstrap confidence interval):
   FAIL  the CI *lower bound* of the change is >= --fail  (we are confident the
-        regression is at least that large, not just a noisy point estimate)
+        regression is at least that large, not just a noisy point estimate),
+        or >= --noisy-fail for a bench matching a --noisy glob
   warn  the point estimate is >= --warn
   ok    otherwise
 A bench with a `new/` result but no `<baseline>/` result is reported as
 "new (no baseline)" and does not fail. A bench with a baseline but no `new/`
 result was not run at head (removed or renamed) and is reported, not failed.
+
+--noisy exists because criterion's interval only covers noise *within* one
+run. Some benches also move between two runs of the same code (code layout,
+cache placement), with an interval just as tight, so a single --fail low
+enough for the rest would fail them on no change at all. The workflow names
+them, with the measurements, next to its thresholds.
 
 Exits non-zero when no bench is comparable at all: a requested comparison that
 compared nothing is a broken run, not a pass.
@@ -27,12 +34,14 @@ DEVELOPMENT.md's "Criterion regression gate".
 
 Usage:
   criterion_gate.py --check --criterion-dir target/criterion-compare --baseline base
-  criterion_gate.py --check ... --warn 10 --fail 25
+  criterion_gate.py --check ... --warn 10 --fail 10 \
+      --noisy 'sutherland_hodgman/*' --noisy-fail 25
 
 Directory layout this reads (criterion's own):
   <criterion-dir>/<group>/<function>[/<value>]/{<baseline>,new,change}/estimates.json
 """
 import argparse
+import fnmatch
 import json
 import os
 import sys
@@ -105,6 +114,14 @@ def main() -> int:
     ap.add_argument("--baseline", default="base", help="named baseline directory to compare against")
     ap.add_argument("--warn", type=float, default=10.0, help="warn when the point estimate regresses >= this %%")
     ap.add_argument("--fail", type=float, default=25.0, help="fail when the CI lower bound regresses >= this %%")
+    ap.add_argument(
+        "--noisy",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="bench name glob gated at --noisy-fail instead of --fail (repeatable)",
+    )
+    ap.add_argument("--noisy-fail", type=float, default=25.0, help="--fail for benches matching --noisy")
     args = ap.parse_args()
 
     if not args.check:
@@ -136,12 +153,16 @@ def main() -> int:
         compared += 1
         pct, lo, hi = change
         flag = ""
-        if lo >= args.fail:
+        noisy = any(fnmatch.fnmatchcase(name, g) for g in args.noisy)
+        fail_at = args.noisy_fail if noisy else args.fail
+        if lo >= fail_at:
             flag = "FAIL"
-            failures.append((name, pct, lo))
+            failures.append((name, pct, lo, fail_at))
         elif pct >= args.warn:
             flag = "warn"
             warnings.append((name, pct, lo))
+        if noisy:
+            flag = (flag + " (noisy)").strip()
         ci = f"[{lo:+.1f}, {hi:+.1f}]%"
         print(f"{name:<52} {base_ns:>13.0f} {new_ns:>13.0f} {pct:>+7.1f}%  {ci:>17} {flag}")
 
@@ -162,9 +183,9 @@ def main() -> int:
             print(f"  - {name}")
         status = 1
     if failures:
-        print(f"FAIL: {len(failures)} bench(es) regressed with CI lower bound >= +{args.fail}%:")
-        for name, pct, lo in failures:
-            print(f"  - {name}: {pct:+.1f}% (CI lower bound {lo:+.1f}%)")
+        print(f"FAIL: {len(failures)} bench(es) regressed with CI lower bound at or past the fail threshold:")
+        for name, pct, lo, fail_at in failures:
+            print(f"  - {name}: {pct:+.1f}% (CI lower bound {lo:+.1f}% >= +{fail_at}%)")
         status = 1
     if compared == 0:
         print(
@@ -174,7 +195,8 @@ def main() -> int:
         )
         return 1
     if status == 0:
-        print(f"OK: {compared} bench(es) compared; none regressed past +{args.fail}% (CI lower bound).")
+        noisy_note = f", +{args.noisy_fail}% for --noisy benches" if args.noisy else ""
+        print(f"OK: {compared} bench(es) compared; none regressed past +{args.fail}%{noisy_note} (CI lower bound).")
     return status
 
 

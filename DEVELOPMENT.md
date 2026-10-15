@@ -303,9 +303,14 @@ so your `target/criterion/` history stays out of it.
 `scripts/criterion_gate.py` then reads the relative change of each
 bench's mean, with its 95% confidence interval, and applies these rules:
 
-- **Fail** when the interval's lower bound is +25% or more. The
-  regression is at least that large even at the optimistic end, so noise
-  alone is an unlikely cause.
+- **Fail** when the interval's lower bound is +10% or more. The
+  regression is at least that large even at the optimistic end. In
+  three runs that compared the same code with itself, no lower bound
+  reached +10% outside the Sutherland–Hodgman benches.
+- **Fail at +25% instead** for a bench that matches a `--noisy` glob.
+  The `sutherland_hodgman` benches moved by up to 16% between two runs
+  of the same code, with tight intervals, so +10% would fail them on
+  noise. The workflow step lists the measurements.
 - **Warn** when the point estimate is +10% or more.
 - Report a bench with no base result as "new (no baseline)", and one with
   no head result as "not run at head". Neither counts toward the gate.
@@ -318,7 +323,9 @@ To run the same check locally:
 scripts/criterion_compare.sh origin/main
 uv run python scripts/criterion_gate.py --check \
   --criterion-dir target/criterion-compare \
-  --baseline base --warn 10 --fail 25
+  --baseline base --warn 10 --fail 10 \
+  --noisy 'sutherland_hodgman/*' \
+  --noisy 'wide_polygon_clip/sutherland_hodgman/*' --noisy-fail 25
 ```
 
 ### Hotspots
