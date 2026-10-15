@@ -30,6 +30,7 @@ dhat
 mimalloc
 musl('s)?
 nextest('s)?
+trycmd
 stubtest
 uv
 fmt
@@ -40,6 +41,7 @@ tilestats
 CI's
 PR's
 URL's
+CLI's
 
 # Geometry and tiling
 [Aa]ntimeridian
@@ -79,6 +81,8 @@ pushdown
 preflights
 pipelined
 subprocess
+stdout
+stderr
 [Ss]ubcommands?
 subtrees
 debuginfo
