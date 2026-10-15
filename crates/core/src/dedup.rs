@@ -7,8 +7,9 @@
 //!
 //! 1. Hash tile content BEFORE compression (raw MVT bytes)
 //! 2. Track seen hashes → (offset, length) in deduplication cache
-//! 3. For consecutive identical tiles, use `run_length` encoding
-//! 4. Track statistics: original count, unique count, savings %
+//! 3. On a hash hit, compare the bytes before reusing the stored tile (#531)
+//! 4. For consecutive identical tiles, use `run_length` encoding
+//! 5. Track statistics: original count, unique count, savings %
 
 use std::collections::HashMap;
 
@@ -47,8 +48,12 @@ impl DeduplicationStats {
 
 /// Fast tile content hasher using XXH3 (64-bit)
 ///
-/// XXH3 is a non-cryptographic hash optimized for speed.
-/// Collision resistance is sufficient for deduplication (not security).
+/// XXH3 is a non-cryptographic hash optimized for speed. It is not
+/// collision-resistant: two different tiles can share a hash by chance
+/// (~3e-4 per archive at 10^8 unique tiles) or by construction, when someone
+/// else supplies the tiles. A matching hash therefore marks a candidate
+/// duplicate only. The PMTiles writers compare the bytes before they reuse a
+/// stored tile (#531).
 pub struct TileHasher;
 
 impl TileHasher {
@@ -76,7 +81,9 @@ impl DeduplicationCache {
 
     /// Check if tile content has been seen before
     ///
-    /// Returns Some((offset, length)) if duplicate, None if new
+    /// Returns Some((offset, length)) if a tile with this hash was recorded,
+    /// None if new. A hit is a candidate duplicate: compare the bytes before
+    /// reusing the stored tile, since [`TileHasher`] is not collision-resistant.
     pub fn check(&self, hash: u64) -> Option<(u64, u32)> {
         self.seen.get(&hash).copied()
     }

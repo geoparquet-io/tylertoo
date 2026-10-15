@@ -292,7 +292,10 @@ pub fn merge_shards(
         // keys on is unavailable. Conservative in the right direction —
         // identical compressed bytes are certainly identical tiles, so this
         // can miss a duplicate (two shards written with different gzip
-        // settings) but never invents one.
+        // settings) but never invents one. The shards are untrusted input, and
+        // xxh3-64 collisions can be built on purpose, so the writer treats a
+        // hash hit as a candidate and compares the bytes before it aliases
+        // this tile to a stored body (#531).
         let hash = TileHasher::hash(&data);
         writer
             .add_tile_precompressed(t.z, t.x, t.y, hash, &data, data.len(), 0)
