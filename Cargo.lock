@@ -4397,7 +4397,6 @@ dependencies = [
  "clap-markdown",
  "dhat",
  "env_logger",
- "fs4",
  "indicatif",
  "log",
  "mimalloc",
