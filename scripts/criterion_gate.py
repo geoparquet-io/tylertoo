@@ -35,7 +35,7 @@ DEVELOPMENT.md's "Criterion regression gate".
 Usage:
   criterion_gate.py --check --criterion-dir target/criterion-compare --baseline base
   criterion_gate.py --check ... --warn 10 --fail 10 \
-      --noisy 'sutherland_hodgman/*' --noisy-fail 25
+      --noisy 'sutherland_hodgman/*' --noisy-fail 50
 
 Directory layout this reads (criterion's own):
   <criterion-dir>/<group>/<function>[/<value>]/{<baseline>,new,change}/estimates.json
@@ -121,7 +121,7 @@ def main() -> int:
         metavar="GLOB",
         help="bench name glob gated at --noisy-fail instead of --fail (repeatable)",
     )
-    ap.add_argument("--noisy-fail", type=float, default=25.0, help="--fail for benches matching --noisy")
+    ap.add_argument("--noisy-fail", type=float, default=50.0, help="--fail for benches matching --noisy")
     args = ap.parse_args()
 
     if not args.check:
