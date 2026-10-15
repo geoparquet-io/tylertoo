@@ -273,8 +273,8 @@ runner. The workflow authenticates through OIDC, which requires the
 CodSpeed GitHub app on the repository.
 
 Instruction counts miss what only wall time shows: memory bandwidth,
-lock contention, and thread scaling. That is what the label-gated
-regression job below is kept for.
+lock contention, and thread scaling. That is what the wall-clock
+regression gate below is kept for.
 
 #### Criterion regression gate
 
@@ -283,14 +283,19 @@ runner, base revision first and head second, and gates the difference.
 A baseline from another VM would mostly measure the VM. Two runs on one
 machine, minutes apart, give a comparison that shared runners support.
 
-The gate runs in two cases, never on a schedule:
+The gate runs in these cases, never on a schedule:
 
-- On a PR with the **`benchmark` label**. Adding the label starts it, and
-  later pushes rerun it while the label stays. The base is the
-  merge-base with the PR's base branch.
+- On each PR that changes `crates/core/`, `Cargo.toml`, `Cargo.lock`, or
+  the gate's own workflow and scripts. No label is needed. The
+  workflow's `changes` job holds the path list.
+- On any other PR with the **`benchmark` label**. Adding the label
+  starts it, and later pushes rerun it while the label stays.
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
   on another branch against its merge-base with `origin/main`.
+
+On a PR the base is the merge-base with the PR's base branch. A run
+takes about 50 minutes of runner time.
 
 `scripts/criterion_compare.sh <base-rev>` does the two runs, the base
 in a temporary git worktree. It writes to `target/criterion-compare/`,
@@ -422,12 +427,14 @@ python3 benchmarks/overview/ci_guard.py --check
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
-# Coverage (informational; CI uploads to Codecov)
+# Coverage: CI fails below the floor in the Coverage job's
+# "Coverage floor" step, then uploads to Codecov (report only)
 cargo install cargo-llvm-cov    # once
 rustup component add llvm-tools-preview
 cargo llvm-cov nextest --all-features --workspace \
   --exclude tylertoo-python \
   --lcov --output-path lcov.info
+python3 scripts/coverage_gate.py --check lcov.info --min 94
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
@@ -438,7 +445,8 @@ Some thresholds are **ratchets**, set at the current code's level and
 marked `RATCHET` in the source. They are cognitive complexity 30 and
 too-many-lines 200 in `clippy.toml`, the similarity-rs threshold 0.95,
 and xenon's max-absolute C. Lower them as the code improves, and never
-raise them.
+raise them. The line-coverage floor in `ci.yml` (94%) is a ratchet in
+the other direction: raise it as coverage grows, and never lower it.
 
 `cargo shear` also inspects `[workspace.dependencies]`. To keep a
 dependency that no code references, such as a transitive version pin,

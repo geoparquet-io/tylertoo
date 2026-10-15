@@ -19,10 +19,11 @@ result was not run at head (removed or renamed) and is reported, not failed.
 Exits non-zero when no bench is comparable at all: a requested comparison that
 compared nothing is a broken run, not a pass.
 
-This is not a per-PR gate: shared-runner timing is noisy (see ci_guard.py for
-why *that* guard stays structural). It runs from
-.github/workflows/bench-regression.yml on dispatch or on a PR carrying the
-`benchmark` label; see DEVELOPMENT.md's "Criterion regression gate".
+Shared-runner timing is noisy (see ci_guard.py for why *that* guard stays
+structural), so this only ever compares two runs from one runner. It runs
+from .github/workflows/bench-regression.yml on each PR that touches benched
+code, on a PR carrying the `benchmark` label, and on dispatch; see
+DEVELOPMENT.md's "Criterion regression gate".
 
 Usage:
   criterion_gate.py --check --criterion-dir target/criterion-compare --baseline base
