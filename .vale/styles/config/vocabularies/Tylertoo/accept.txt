@@ -83,6 +83,7 @@ pipelined
 subprocess
 stdout
 stderr
+backtraces?
 [Ss]ubcommands?
 subtrees
 debuginfo

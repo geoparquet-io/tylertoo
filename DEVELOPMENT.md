@@ -140,7 +140,9 @@ tests a longer timeout. `full` picks the test up with no edit.
 blocks with the expected stdout and stderr, plus a `? N` line for a
 nonzero exit code. The binary runs as a black box with `RUST_LOG=off`,
 so log lines stay out of the snapshots. `NO_COLOR=1` keeps a
-`CLICOLOR_FORCE` in your shell from adding color codes. The test also sets
+`CLICOLOR_FORCE` in your shell from adding color codes, and
+`RUST_LIB_BACKTRACE=0` keeps a `RUST_BACKTRACE=1` from adding a
+backtrace to each `Error:` line. The test also sets
 `TYLERTOO_DHAT=off`: CI tests with `--all-features`, and a `dhat-heap`
 build otherwise prints a heap summary on exit. The test runs in the
 `quick` tier.

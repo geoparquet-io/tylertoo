@@ -18,6 +18,10 @@ fn cli_snapshots() {
         // A CLICOLOR_FORCE=1 inherited from the caller's shell would put ANSI
         // escapes in clap's help and errors; NO_COLOR takes precedence.
         .env("NO_COLOR", "1")
+        // CI exports RUST_BACKTRACE=1, under which anyhow appends a stack
+        // backtrace to every `Error: ...`. This turns off error backtraces
+        // only: a panic in a case still prints one.
+        .env("RUST_LIB_BACKTRACE", "0")
         // CI runs this under `--all-features`, which compiles in the dhat
         // profiler: on exit it prints a heap summary to stderr and writes
         // dhat-heap.json into the working directory (crates/cli, for the
