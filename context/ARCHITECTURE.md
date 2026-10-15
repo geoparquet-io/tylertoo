@@ -1194,10 +1194,15 @@ A hash hit is a candidate only (#531). The writer compares the candidate's
 bytes with the stored tile, read back from the spool, before the new entry
 aliases it. xxh3-64 is not collision-resistant, and `tylertoo merge` hashes
 tiles from shards someone else may have written. A colliding tile with other
-bytes is stored as a new tile. Tile bytes never stay in memory, but the bookkeeping grows linearly with the
-archive. The writer keeps one 24 B directory entry per tile and one
-dedup-cache entry (hash → offset, length) per unique tile. At 100M tiles the
-directory entries alone take 2.4 GB. Tiles are
+bytes is stored as a new tile. At most 8 such bodies per hash stay open to
+dedup, so crafted collisions cannot make each add scan every earlier one.
+
+The writer keeps one copy of the last stored tile a hit matched, so a repeat
+of a tile that recurs across a zoom level costs a memory compare, not a
+spool read. No other tile bytes stay in memory, but the bookkeeping grows
+linearly with the archive. The writer keeps one 24 B directory entry per
+tile and one dedup-cache entry (hash → offset, length) per unique tile. At
+100M tiles the directory entries alone take 2.4 GB. Tiles are
 gzip-compressed (the PMTiles-viewer-safe default; export has no compression
 knob).
 

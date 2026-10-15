@@ -1075,6 +1075,17 @@ const MAX_ROOT_DIR_BYTES: usize = 16384 - 127;
 /// re-copying every tile byte.
 pub const TAIL_LAYOUT_PREFIX_BYTES: u64 = 16384;
 
+/// How many bodies past the first one [`StreamingPmtilesWriter`] keeps
+/// offering for dedup under one hash (#531).
+///
+/// A hash hit costs a byte compare against each body stored under that hash
+/// with the candidate's length, and a compare can cost a spool read. Chance
+/// collisions never come near this bound. A shard author who builds xxh3-64
+/// collisions on purpose could otherwise make each new body scan every
+/// earlier one, so N crafted tiles would cost N² reads. A body past the bound
+/// is stored, and its repeats are stored again rather than deduplicated.
+const MAX_COLLIDING_BODIES: usize = 8;
+
 /// Initial leaf size when partitioning entries (matches tippecanoe)
 const INITIAL_LEAF_SIZE: usize = 4096;
 
@@ -1641,8 +1652,9 @@ impl PmtilesWriter {
             // First carrier wins: more than one tile can hold data for the
             // same key (`add_tile_compressed` stores bytes even when they
             // match an earlier body, so two identical pre-compressed blobs
-            // both arrive carrying bytes, under one key). Storing each of them and letting the last
-            // `insert` win would append dead bytes nothing references and
+            // both arrive carrying bytes, under one key). Storing each of
+            // them and letting the last `insert` win would append dead bytes
+            // nothing references and
             // leave `tile_contents_count` above the directory's distinct
             // offset count -- which go-pmtiles `verify` rejects outright.
             // Skipping the later carriers deduplicates them instead.
@@ -1964,12 +1976,20 @@ pub struct StreamingPmtilesWriter {
     /// Further bodies stored under a hash already in `dedup_cache`, whose
     /// bytes differ from it (#531). Empty unless xxh3-64 collided, or a
     /// caller of [`Self::add_tile_precompressed`] passed one hash for two
-    /// bodies; it keeps the common case at one map entry per body.
+    /// bodies; it keeps the common case at one map entry per body. At most
+    /// [`MAX_COLLIDING_BODIES`] per hash.
     dedup_collisions: HashMap<u64, Vec<(u64, u32)>>,
     /// Read handle on the spool for verifying dedup hits, opened on the first
     /// hit. The spool's own handle cannot serve: under the tail layout it is
     /// write-only.
     spool_reader: Option<File>,
+    /// Offset of the stored body that `verified_body` holds a copy of. A
+    /// stored body never changes, so a later hit on the same body compares
+    /// against the copy and skips the spool read.
+    verified_offset: Option<u64>,
+    /// The bytes of the body at `verified_offset`. Its allocation is reused
+    /// as the read buffer for the next body read back from the spool.
+    verified_body: Vec<u8>,
     /// Current write offset in temp file
     current_offset: u64,
     /// Min zoom level seen
@@ -2291,6 +2311,8 @@ impl StreamingPmtilesWriter {
             dedup_cache: HashMap::new(),
             dedup_collisions: HashMap::new(),
             spool_reader: None,
+            verified_offset: None,
+            verified_body: Vec::new(),
             current_offset: 0,
             min_zoom: 255,
             max_zoom: 0,
@@ -2680,11 +2702,12 @@ impl StreamingPmtilesWriter {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert((offset, compressed_len));
             }
-            std::collections::hash_map::Entry::Occupied(_) => self
-                .dedup_collisions
-                .entry(hash)
-                .or_default()
-                .push((offset, compressed_len)),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                let more = self.dedup_collisions.entry(hash).or_default();
+                if more.len() < MAX_COLLIDING_BODIES {
+                    more.push((offset, compressed_len));
+                }
+            }
         }
         self.entries.push(StreamingDirEntry {
             tile_id: id,
@@ -2706,8 +2729,8 @@ impl StreamingPmtilesWriter {
     /// shards to `tylertoo merge` can build two bodies with one hash on
     /// purpose. Aliasing on the hash alone would serve one tile's bytes for
     /// the other with nothing downstream to notice (#531). So a hit costs one
-    /// length compare and, when the lengths agree, one read of the stored
-    /// bytes from the spool.
+    /// length compare and, when the lengths agree, one byte compare against
+    /// the stored body ([`Self::spool_holds`]).
     fn find_stored(&mut self, hash: u64, compressed: &[u8]) -> std::io::Result<Option<(u64, u32)>> {
         let Some(&first) = self.dedup_cache.get(&hash) else {
             return Ok(None);
@@ -2731,11 +2754,14 @@ impl StreamingPmtilesWriter {
 
     /// Whether the spool holds exactly `candidate` at `(offset, length)`.
     ///
-    /// The stored bytes may sit in the file, in the `BufWriter` not yet
-    /// flushed, or across both. They are read from where they are rather
-    /// than flushed first: the commonest duplicate is a run of identical
-    /// tiles whose body was the last one appended, and a flush per hit would
-    /// turn the buffer into one small write per tile.
+    /// The stored bytes are compared where they are, in the `BufWriter` not
+    /// yet flushed or in the file, rather than flushed first: a flush per hit
+    /// would turn the buffer into one small write per tile.
+    ///
+    /// The body last seen to match is kept in memory. Interior tiles of one
+    /// large polygon recur all through a zoom level, with other tiles between
+    /// them, and long after their body left the buffer. Without the copy,
+    /// each repeat would cost a seek, a read and an allocation.
     fn spool_holds(
         &mut self,
         (offset, length): (u64, u32),
@@ -2744,34 +2770,44 @@ impl StreamingPmtilesWriter {
         if candidate.len() != length as usize {
             return Ok(false);
         }
+        if self.verified_offset == Some(offset) {
+            return Ok(self.verified_body == candidate);
+        }
         let spool = self
             .temp_file
             .as_ref()
             .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
         let pending = spool.buffer();
         let flushed = self.current_offset - pending.len() as u64;
-        // `candidate[..in_file]` is compared against the file, the rest
-        // against the buffer.
-        let in_file = flushed.saturating_sub(offset).min(u64::from(length)) as usize;
-        let (file_part, buffer_part) = candidate.split_at(in_file);
-        if !buffer_part.is_empty() {
-            let start = (offset + in_file as u64 - flushed) as usize;
-            if pending[start..start + buffer_part.len()] != *buffer_part {
+        if offset >= flushed {
+            let start = (offset - flushed) as usize;
+            if pending[start..start + candidate.len()] != *candidate {
                 return Ok(false);
             }
-        }
-        if file_part.is_empty() {
+            self.verified_body.clear();
+            self.verified_body.extend_from_slice(candidate);
+            self.verified_offset = Some(offset);
             return Ok(true);
         }
+        // The body starts in the file, so it lies wholly there:
+        // `BufWriter::write_all` either buffers a write whole or flushes the
+        // buffer and then places the write whole. Only a flush that failed part
+        // way can leave a body across both. Such a body reads back short or as
+        // other bytes, so the add fails or stores the candidate anew. It never
+        // aliases the candidate to the wrong bytes.
         let position = self.spool_data_start() + offset;
         let reader = match &mut self.spool_reader {
             Some(reader) => reader,
             slot @ None => slot.insert(File::open(&self.temp_path)?),
         };
+        // Cleared first, so a failed read cannot leave the copy labelled
+        // with the offset of the body it held before.
+        self.verified_offset = None;
+        self.verified_body.resize(candidate.len(), 0);
         reader.seek(SeekFrom::Start(position))?;
-        let mut stored = vec![0u8; file_part.len()];
-        reader.read_exact(&mut stored)?;
-        Ok(stored == file_part)
+        reader.read_exact(&mut self.verified_body)?;
+        self.verified_offset = Some(offset);
+        Ok(self.verified_body == candidate)
     }
 
     /// Finalize the PMTiles file.
@@ -2791,8 +2827,9 @@ impl StreamingPmtilesWriter {
         // open so we can close it deterministically below.
         let mode = self.write_archive(output_path)?;
 
-        // Close the spool handle before touching the file by path.
+        // Close the spool handles before touching the file by path.
         drop(self.temp_file.take());
+        drop(self.spool_reader.take());
 
         match mode {
             // Tail layout: the spool already *is* the finished archive, sitting
@@ -6708,5 +6745,112 @@ mod tests {
         assert_eq!(tiles[&tile_id(2, 0, 0)], body_c);
         assert_eq!(tiles[&tile_id(2, 1, 1)], body_a);
         assert_eq!(tiles[&tile_id(0, 0, 0)], body_b);
+    }
+
+    /// `add_tile_compressed` stores its bytes either way, but it must still
+    /// register a new body as a carrier. Otherwise a later colliding body
+    /// gets the same ordinal and the write pass folds it into this one.
+    #[test]
+    fn in_memory_precompressed_body_takes_its_own_ordinal() {
+        // `Compression::None`, so a raw body and its "compressed" bytes are
+        // the same and both entry points hash to one value.
+        let mut writer = PmtilesWriter::with_compression(Compression::None);
+        writer.enable_deduplication(true);
+
+        let body_a = vec![0xA1u8; 300];
+        let body_b = vec![0xB2u8; 300];
+        let body_c = vec![0xC3u8; 300];
+        let hash = TileHasher::hash(&body_b);
+        writer
+            .add_tile_with_hash(1, 0, 0, &body_a, hash, 0)
+            .unwrap();
+        writer.add_tile_compressed(1, 0, 1, body_b.clone()).unwrap();
+        writer
+            .add_tile_with_hash(1, 1, 1, &body_c, hash, 0)
+            .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writer.write_to_file(tmp.path()).unwrap();
+        let bytes = fs::read(tmp.path()).unwrap();
+        assert_eq!(Header::from_bytes(&bytes).unwrap().tile_contents_count, 3);
+        let tiles = read_archive_tiles(&bytes);
+        assert_eq!(tiles[&tile_id(1, 0, 0)], body_a);
+        assert_eq!(tiles[&tile_id(1, 0, 1)], body_b);
+        assert_eq!(
+            tiles[&tile_id(1, 1, 1)],
+            body_c,
+            "C must not be served B's bytes"
+        );
+    }
+
+    /// Past [`MAX_COLLIDING_BODIES`] a colliding body is stored but no longer
+    /// offered for dedup, so its repeat is stored again. Every tile still
+    /// reads back as its own bytes.
+    #[test]
+    fn streaming_dedup_bounds_the_bodies_offered_under_one_hash() {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        // The first body, the bodies the collision list holds, and one more.
+        let bodies: Vec<Vec<u8>> = (0..MAX_COLLIDING_BODIES + 2)
+            .map(|i| vec![i as u8; 10])
+            .collect();
+
+        let mut expected = HashMap::new();
+        // Every body, then every body again.
+        for (i, body) in (0u32..).zip(bodies.iter().chain(&bodies)) {
+            let (z, x, y) = tail_coord(i);
+            w.add_tile_precompressed(z, x, y, FORCED_HASH, body, body.len(), 0)
+                .unwrap();
+            expected.insert(tile_id(z, x, y), body.clone());
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let stats = w.finalize(tmp.path()).unwrap();
+        assert_eq!(
+            stats.unique_tiles,
+            bodies.len() as u64 + 1,
+            "every repeat dedups except the one of the body past the bound"
+        );
+        assert_eq!(read_archive_tiles(&fs::read(tmp.path()).unwrap()), expected);
+    }
+
+    /// Two bodies that recur in turn after both left the spool's buffer. The
+    /// copy kept from the last verified hit must stay tied to its offset, so
+    /// a hit on the other body reads that body rather than comparing against
+    /// the copy.
+    #[test]
+    fn streaming_dedup_alternating_repeats_of_flushed_bodies() {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        let body_a = vec![0xA1u8; 300];
+        let body_d = vec![0xD4u8; 300];
+        let filler_tile = vec![0x5Fu8; 1000];
+        let filler_tiles = 200u32; // 200 KB, past the 64 KiB buffer
+
+        let mut next = 0u32;
+        let mut add = |w: &mut StreamingPmtilesWriter, hash: u64, body: &[u8]| {
+            let (z, x, y) = tail_coord(next);
+            next += 1;
+            w.add_tile_precompressed(z, x, y, hash, body, body.len(), 0)
+                .unwrap();
+            tile_id(z, x, y)
+        };
+
+        let mut expected = HashMap::new();
+        expected.insert(add(&mut w, 1, &body_a), body_a.clone());
+        expected.insert(add(&mut w, 2, &body_d), body_d.clone());
+        for i in 0..filler_tiles {
+            expected.insert(
+                add(&mut w, u64::from(i) + 100, &filler_tile),
+                filler_tile.clone(),
+            );
+        }
+        for _ in 0..3 {
+            expected.insert(add(&mut w, 1, &body_a), body_a.clone());
+            expected.insert(add(&mut w, 2, &body_d), body_d.clone());
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let stats = w.finalize(tmp.path()).unwrap();
+        assert_eq!(stats.unique_tiles, 2 + u64::from(filler_tiles));
+        assert_eq!(read_archive_tiles(&fs::read(tmp.path()).unwrap()), expected);
     }
 }
