@@ -53,7 +53,10 @@ The `geo:overviews` provenance in the footer records a non-default base as
 
 `--max-zoom auto` estimates the finest zoom from the input's own features, as
 tippecanoe's `-zg` does. tylertoo reads the bounding boxes of a deterministic
-sample of at most 200,000 rows, honoring `--bbox` and `--filter`. It picks the
+sample of at most 200,000 rows, honoring `--bbox` and `--filter`. On
+gpio-optimized input the sample reads only the f64 bbox covering column, never
+the geometry bytes, which makes the estimate near-free — on remote input
+especially (#693); without a covering it reads the geometry column. It picks the
 zoom where one pixel of a 256 px tile resolves about half the smaller of two
 measures, in Web Mercator meters:
 

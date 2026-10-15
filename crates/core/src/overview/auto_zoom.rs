@@ -22,11 +22,27 @@
 //!
 //! The estimate honors `--bbox` and `--filter` exactly as the conversion does
 //! (footer-statistics row-group pruning, then the per-feature tests), reads
-//! only the geometry column (plus the filter's columns), and computes a bbox
-//! for at most 200,000 systematically sampled rows (`AUTO_ZOOM_SAMPLE_CAP`)
-//! straight from the GeoArrow scalars — non-sampled rows are never converted.
-//! That bounds memory and geometry work, not I/O: the selected row groups'
-//! geometry column is still read once.
+//! only ONE bbox-bearing column (plus the filter's columns), and computes a
+//! bbox for at most 200,000 systematically sampled rows
+//! (`AUTO_ZOOM_SAMPLE_CAP`) — non-sampled rows are never converted.
+//!
+//! Which column that is depends on the input (#693). When the file declares a
+//! GeoParquet 1.1 bbox covering whose four fields are all `f64`
+//! ([`find_f64_covering`]), the sample projects ONLY the covering struct and
+//! takes each sampled row's bbox from it — no geometry bytes are read at all,
+//! which on gpio-optimized input (the documented input contract) turns the
+//! pre-conversion read from the file's dominant column into its smallest.
+//! Otherwise the geometry column is projected and the bbox is computed
+//! straight from the GeoArrow scalars. Both signals are pure functions of the
+//! f64 bboxes, so the two paths resolve the IDENTICAL zoom for the same rows;
+//! an `f32` covering (spec-legal; Overture writes one) is rounded relative to
+//! the geometry-derived f64 bboxes and is therefore NOT used. A null covering
+//! value skips the row, exactly as a null geometry does — the spec ties the
+//! two ("a row MUST contain a bounding box value if and only if the row
+//! contains a geometry value").
+//!
+//! Either way that bounds memory and geometry work, not I/O: the selected
+//! row groups' sampled column is still read once.
 //!
 //! How this differs from tippecanoe's method (4096-unit resolution, vertex
 //! spacing, quadkey deltas) and why the whole-file footer statistics are not
@@ -35,6 +51,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use arrow_array::{Array, ArrayRef, Float64Array, StructArray};
+use arrow_schema::{DataType, Schema};
 use geo_traits::to_geo::ToGeoGeometry;
 use geo_traits::{
     CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait, LineTrait,
@@ -45,6 +63,7 @@ use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArrayAccessor;
 
 use crate::batch_processor::{visit_geoarrow_array, GeoArrowVisitor};
+use crate::covering::parse_covering_metadata;
 use crate::input_set::{ConvertSource, ReadPlan};
 use crate::world_coord::MAX_LATITUDE;
 
@@ -75,7 +94,8 @@ pub(crate) const AUTO_ZOOM_SAMPLE_CAP: usize = 200_000;
 /// tolerance, a different question.
 const AUTO_ZOOM_TILE_PIXELS: f64 = 256.0;
 
-/// Rows per record batch while sampling (the geometry column only).
+/// Rows per record batch while sampling (one bbox-bearing column only: the
+/// covering struct, or the geometry).
 const AUTO_ZOOM_BATCH_ROWS: usize = 8192;
 
 /// A `--max-zoom` value: an explicit zoom, or `auto` (#444).
@@ -210,6 +230,10 @@ pub struct AutoZoomEvidence {
     pub min_zoom: u8,
     /// The ceiling `chosen_zoom` was clamped to.
     pub ceiling: u8,
+    /// Whether the sampled bboxes were read from the file's f64 bbox covering
+    /// struct instead of the geometry scalars (#693). Diagnostic only — the
+    /// two paths resolve the identical zoom for the same rows.
+    pub(crate) sampled_from_covering: bool,
 }
 
 impl AutoZoomEvidence {
@@ -219,7 +243,7 @@ impl AutoZoomEvidence {
         log::info!(
             "--max-zoom auto: chose z{} (clamped to [{}, {}]) from {} sampled features of {} \
              rows read; typical feature extent ~{:.1}m, nearby spacing ~{:.1}m, resolvable \
-             distance ~{:.1}m (Web Mercator meters)",
+             distance ~{:.1}m (Web Mercator meters){}",
             self.chosen_zoom,
             self.min_zoom,
             self.ceiling,
@@ -228,6 +252,11 @@ impl AutoZoomEvidence {
             self.typical_extent_m,
             self.nearby_spacing_m,
             self.resolvable_m,
+            if self.sampled_from_covering {
+                "; bboxes read from the covering column (#693)"
+            } else {
+                ""
+            },
         );
     }
 }
@@ -357,6 +386,7 @@ pub(crate) fn choose_auto_max_zoom(
         chosen_zoom,
         min_zoom,
         ceiling,
+        sampled_from_covering: false,
     })
 }
 
@@ -481,6 +511,113 @@ impl GeoArrowVisitor for SampledBboxes<'_> {
     }
 }
 
+/// A usable bbox covering for the auto-zoom sample (#693): the root (schema)
+/// index of the covering struct column and its four child-field names, in
+/// `xmin, ymin, xmax, ymax` order as spelled in the file's own schema.
+///
+/// `None` — and the estimator then reads the geometry scalars — unless ALL of:
+///
+/// - the schema carries "geo" metadata whose covering belongs to the geometry
+///   column the conversion reads ([`parse_covering_metadata`] enforces the
+///   per-column ownership, #519);
+/// - every covering path is `[struct, field]` on one shared top-level struct
+///   (the only shape the GeoParquet 1.1 spec describes);
+/// - all four fields are `Float64`. The spec allows `FLOAT` too (Overture
+///   writes f32), but an f32 bound is rounded to the nearest float32, NOT
+///   bit-identical to the f64 bbox the geometry scalars yield — centers and
+///   diagonals would shift and could move a marginal zoom. gpio (the
+///   documented input contract) writes f64, so the fast path covers it; an
+///   f32 covering simply keeps the exact geometry path.
+///
+/// Name matching is case-insensitive, like
+/// [`crate::covering::find_bbox_column_indices`] on the pruning side.
+fn find_f64_covering(schema: &Schema, geom_idx: usize) -> Option<(usize, [String; 4])> {
+    let geo_json = schema
+        .metadata()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
+        .map(|(_, v)| v.as_str())?;
+    let spec = parse_covering_metadata(geo_json, Some(schema.field(geom_idx).name())).ok()??;
+    let paths = [
+        &spec.xmin_path,
+        &spec.ymin_path,
+        &spec.xmax_path,
+        &spec.ymax_path,
+    ];
+    if paths.iter().any(|p| p.len() != 2) {
+        return None;
+    }
+    let root = &paths[0][0];
+    if paths.iter().any(|p| &p[0] != root) {
+        return None;
+    }
+    let (idx, field) = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.name().eq_ignore_ascii_case(root))?;
+    let DataType::Struct(children) = field.data_type() else {
+        return None;
+    };
+    let mut names: [String; 4] = Default::default();
+    for (slot, p) in names.iter_mut().zip(paths) {
+        let child = children
+            .iter()
+            .find(|c| c.name().eq_ignore_ascii_case(&p[1]))?;
+        if *child.data_type() != DataType::Float64 {
+            return None;
+        }
+        *slot = child.name().clone();
+    }
+    Some((idx, names))
+}
+
+/// The bbox of each row in `rows` (batch-local indices), read from the f64
+/// covering struct `col` with child fields `names` (`xmin, ymin, xmax, ymax`
+/// order). `None` — the row is skipped, exactly as the geometry path skips a
+/// null/empty/non-finite geometry — for a null struct entry or child value
+/// (the spec ties bbox nulls to geometry nulls), a non-finite bound, or an
+/// inverted envelope (`xmin > xmax` / `ymin > ymax`: the spec's antimeridian
+/// wraparound form, which is not the planar bbox the signals measure).
+fn covering_bboxes(
+    col: &ArrayRef,
+    names: &[String; 4],
+    rows: &[usize],
+) -> crate::Result<Vec<Option<[f64; 4]>>> {
+    let strukt = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        crate::Error::GeoParquetRead("bbox covering column is not a struct".into())
+    })?;
+    let field = |name: &String| -> crate::Result<&Float64Array> {
+        strukt
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| {
+                crate::Error::GeoParquetRead(format!("bbox covering field {name} is not Float64"))
+            })
+    };
+    let [xmin, ymin, xmax, ymax] = [
+        field(&names[0])?,
+        field(&names[1])?,
+        field(&names[2])?,
+        field(&names[3])?,
+    ];
+    Ok(rows
+        .iter()
+        .map(|&i| {
+            if strukt.is_null(i)
+                || xmin.is_null(i)
+                || ymin.is_null(i)
+                || xmax.is_null(i)
+                || ymax.is_null(i)
+            {
+                return None;
+            }
+            let b = [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)];
+            (b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3]).then_some(b)
+        })
+        .collect())
+}
+
 /// Estimate `--max-zoom auto` for a conversion of `source` under `options`.
 ///
 /// The module docs describe the method. The minimum zoom comes from
@@ -556,15 +693,20 @@ pub(crate) fn estimate_with(
     // Ceil, so the sample never exceeds the cap.
     let stride = rows_read.div_ceil(AUTO_ZOOM_SAMPLE_CAP as u64).max(1);
 
-    let mut cols = vec![geom_idx];
+    // Sample bboxes from the f64 covering struct when the file declares one
+    // (#693) — the geometry column is then never projected at all — else from
+    // the geometry scalars.
+    let covering = find_f64_covering(&schema, geom_idx);
+    let sample_idx = covering.as_ref().map_or(geom_idx, |(idx, _)| *idx);
+    let mut cols = vec![sample_idx];
     if let Some(f) = &bound_filter {
         cols.extend_from_slice(f.columns());
     }
     cols.sort_unstable();
     cols.dedup();
-    let geom_pos = cols
-        .binary_search(&geom_idx)
-        .expect("the geometry column is projected");
+    let sample_pos = cols
+        .binary_search(&sample_idx)
+        .expect("the sampled bbox column is projected");
     let proj = |c: usize| cols.binary_search(&c).expect("filter column is projected");
 
     let stream = source.open_stream(&ReadPlan {
@@ -593,10 +735,16 @@ pub(crate) fn estimate_with(
             let mask = f.eval_mask(&batch, &proj);
             picks.retain(|&i| mask[i] == Some(true));
         }
-        let garr = from_arrow_array(batch.column(geom_pos).as_ref(), &geom_field).map_err(|e| {
-            crate::Error::GeoParquetRead(format!("auto max-zoom geometry decode: {e}"))
-        })?;
-        let bboxes = visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?;
+        let bboxes = match &covering {
+            Some((_, names)) => covering_bboxes(batch.column(sample_pos), names, &picks)?,
+            None => {
+                let garr = from_arrow_array(batch.column(sample_pos).as_ref(), &geom_field)
+                    .map_err(|e| {
+                        crate::Error::GeoParquetRead(format!("auto max-zoom geometry decode: {e}"))
+                    })?;
+                visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?
+            }
+        };
         for bb in bboxes.into_iter().flatten() {
             if bbox_units
                 .as_ref()
@@ -620,7 +768,7 @@ pub(crate) fn estimate_with(
         })
         .collect();
 
-    choose_auto_max_zoom(
+    let mut evidence = choose_auto_max_zoom(
         rows_read,
         sampled_count,
         diags_m,
@@ -628,7 +776,9 @@ pub(crate) fn estimate_with(
         1.0 / stride as f64,
         min_zoom,
         ceiling,
-    )
+    )?;
+    evidence.sampled_from_covering = covering.is_some();
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -684,6 +834,303 @@ mod tests {
 
     fn estimate(source: &ConvertSource, min_zoom: u8) -> Result<AutoZoomEvidence, ConvertError> {
         estimate_with(source, min_zoom, AUTO_MAX_ZOOM_CEILING, None, None)
+    }
+
+    /// Like [`write`], but with a bbox covering column generated and declared
+    /// (the geoparquet writer's own f64 covering, what gpio writes).
+    fn write_covered(
+        dir: &tempfile::TempDir,
+        name: &str,
+        geoms: &[Option<Geometry<f64>>],
+    ) -> ConvertSource {
+        let path = dir.path().join(name);
+        super::super::testutil::write_input(&path, geoms, true, None);
+        ConvertSource::resolve_path(&path).unwrap()
+    }
+
+    /// Write a GeoParquet file whose bbox covering struct is built BY THE
+    /// TEST: `f64_fields` toggles Float64 vs Float32 children, and
+    /// `null_bbox_rows` leaves the covering value null at those rows whatever
+    /// the geometry holds (a non-conformant writer; the spec ties bbox nulls
+    /// to geometry nulls).
+    fn write_manual_covering(
+        dir: &tempfile::TempDir,
+        name: &str,
+        geoms: &[Option<Geometry<f64>>],
+        f64_fields: bool,
+        null_bbox_rows: &[usize],
+    ) -> ConvertSource {
+        use arrow_array::{ArrayRef, Float32Array, Float64Array, Int64Array, StructArray};
+        use arrow_schema::{DataType, Field, Fields, Schema};
+        use geo::BoundingRect;
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType as GaGeometryType;
+        use geoarrow_array::GeoArrowArray;
+        use geoparquet::writer::{
+            GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use std::sync::Arc;
+
+        let n = geoms.len();
+        let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let typ = GaGeometryType::new(Default::default());
+        let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+        b.extend_from_iter(geoms.iter().map(|g| g.as_ref()));
+        let geom_arr = b.finish();
+        let geom_field = geom_arr.data_type().to_field("geometry", true);
+
+        let rects: Vec<Option<geo::Rect<f64>>> = geoms
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                if null_bbox_rows.contains(&i) {
+                    return None;
+                }
+                g.as_ref().and_then(|g| g.bounding_rect())
+            })
+            .collect();
+        let field_type = if f64_fields {
+            DataType::Float64
+        } else {
+            DataType::Float32
+        };
+        let mk = |pick: fn(&geo::Rect<f64>) -> f64| -> ArrayRef {
+            if f64_fields {
+                Arc::new(Float64Array::from(
+                    rects
+                        .iter()
+                        .map(|r| r.as_ref().map(pick))
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                Arc::new(Float32Array::from(
+                    rects
+                        .iter()
+                        .map(|r| r.as_ref().map(|r| pick(r) as f32))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        };
+        let children: Fields = ["xmin", "ymin", "xmax", "ymax"]
+            .iter()
+            .map(|n| Arc::new(Field::new(*n, field_type.clone(), true)))
+            .collect();
+        let arrays = vec![
+            mk(|r| r.min().x),
+            mk(|r| r.min().y),
+            mk(|r| r.max().x),
+            mk(|r| r.max().y),
+        ];
+        let validity = arrow_buffer::NullBuffer::from(
+            rects.iter().map(Option::is_some).collect::<Vec<bool>>(),
+        );
+        let bbox_arr = StructArray::new(children.clone(), arrays, Some(validity));
+
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(Field::new("bbox", DataType::Struct(children), true)),
+            Arc::new(geom_field),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id), Arc::new(bbox_arr), geom_arr.to_array_ref()],
+        )
+        .unwrap();
+
+        let gpq_options = GeoParquetWriterOptionsBuilder::default()
+            .set_encoding(GeoParquetWriterEncoding::WKB)
+            .build();
+        let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
+        let target_schema = encoder.target_schema();
+        let path = dir.path().join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+        writer
+            .write(&encoder.encode_record_batch(&batch).unwrap())
+            .unwrap();
+        // Declare the covering by hand (the encoder was told not to generate
+        // one, since the column is the test's own).
+        let kv = encoder.into_keyvalue().unwrap();
+        let mut geo: serde_json::Value =
+            serde_json::from_str(kv.value.as_deref().unwrap()).unwrap();
+        geo["columns"]["geometry"]["covering"] = serde_json::json!({
+            "bbox": {
+                "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
+                "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]
+            }
+        });
+        writer.append_key_value_metadata(KeyValue::new(kv.key, geo.to_string()));
+        writer.close().unwrap();
+        ConvertSource::resolve_path(&path).unwrap()
+    }
+
+    /// #693 equivalence: the covering path and the geometry path are the same
+    /// pure function of the same f64 bboxes, so on identical rows the whole
+    /// evidence — not just the zoom — must match bit for bit.
+    #[test]
+    fn covering_path_matches_the_geometry_path_bit_for_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms = polygon_row(40, 0.009);
+        geoms.extend(point_grid(10, 0.001));
+        let covered = estimate(&write_covered(&dir, "cov.parquet", &geoms), 0).unwrap();
+        let plain = estimate(&write(&dir, "plain.parquet", &geoms), 0).unwrap();
+        assert!(covered.sampled_from_covering, "covering path not taken");
+        assert!(!plain.sampled_from_covering);
+        let mut normalized = covered;
+        normalized.sampled_from_covering = false;
+        assert_eq!(normalized, plain);
+    }
+
+    /// Null geometries carry null covering values (the spec ties the two), so
+    /// both paths skip the same rows.
+    #[test]
+    fn null_geometries_are_skipped_identically_on_the_covering_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms = polygon_row(20, 0.009);
+        geoms.insert(3, None);
+        geoms.push(None);
+        let covered = estimate(&write_covered(&dir, "cov.parquet", &geoms), 0).unwrap();
+        let plain = estimate(&write(&dir, "plain.parquet", &geoms), 0).unwrap();
+        assert!(covered.sampled_from_covering);
+        assert_eq!(covered.sampled_count, 20);
+        let mut normalized = covered;
+        normalized.sampled_from_covering = false;
+        assert_eq!(normalized, plain);
+    }
+
+    /// An f32 covering (spec-legal, Overture-style) is NOT bit-identical to
+    /// the geometry-derived f64 bboxes, so it is not used: the geometry path
+    /// keeps the resolved zoom identical to an uncovered read.
+    #[test]
+    fn f32_covering_falls_back_to_the_geometry_scalars() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(30, 0.009);
+        let f32_cov = write_manual_covering(&dir, "f32.parquet", &geoms, false, &[]);
+        let evidence = estimate(&f32_cov, 0).unwrap();
+        assert!(
+            !evidence.sampled_from_covering,
+            "an f32 covering must fall back to the geometry path"
+        );
+        let plain = estimate(&write(&dir, "plain.parquet", &geoms), 0).unwrap();
+        let mut normalized = evidence;
+        normalized.sampled_from_covering = false;
+        assert_eq!(normalized, plain);
+
+        // The same file with f64 fields takes the covering path.
+        let f64_cov = write_manual_covering(&dir, "f64.parquet", &geoms, true, &[]);
+        assert!(estimate(&f64_cov, 0).unwrap().sampled_from_covering);
+    }
+
+    /// A covering value that is null where the geometry is not (a
+    /// non-conformant writer) skips that row, exactly as a null geometry
+    /// would — never a panic, never a zero-sized bbox.
+    #[test]
+    fn covering_nulls_on_nonnull_geometries_skip_those_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(20, 0.009);
+        let source = write_manual_covering(&dir, "nulls.parquet", &geoms, true, &[2, 7]);
+        let evidence = estimate(&source, 0).unwrap();
+        assert!(evidence.sampled_from_covering);
+        assert_eq!(evidence.rows_read, 20);
+        assert_eq!(evidence.sampled_count, 18);
+    }
+
+    /// `--bbox` and `--filter` scope the covering path exactly as they scope
+    /// the geometry path (row-group pruning and the per-feature tests).
+    #[test]
+    fn bbox_and_filter_scope_the_covering_path_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut geoms = point_grid(20, 0.0001); // dense, near (0, 0)
+        geoms.extend(point_grid(10, 0.1).into_iter().map(|g| {
+            g.map(|g| match g {
+                Geometry::Point(p) => Geometry::Point(Point::new(p.x() + 10.0, p.y() + 10.0)),
+                other => other,
+            })
+        }));
+        let covered = write_covered(&dir, "cov.parquet", &geoms);
+        let plain = write(&dir, "plain.parquet", &geoms);
+
+        let bbox = Some([9.5, 9.5, 12.0, 12.0]);
+        let cov_bbox =
+            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
+        let plain_bbox =
+            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
+        assert!(cov_bbox.sampled_from_covering);
+        assert_eq!(cov_bbox.sampled_count, 100);
+        let mut normalized = cov_bbox;
+        normalized.sampled_from_covering = false;
+        assert_eq!(normalized, plain_bbox);
+
+        let cov_filter =
+            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        let plain_filter =
+            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        assert!(cov_filter.sampled_from_covering);
+        assert_eq!(cov_filter.sampled_count, 100);
+        let mut normalized = cov_filter;
+        normalized.sampled_from_covering = false;
+        assert_eq!(normalized, plain_filter);
+    }
+
+    /// Real data: `open-buildings.parquet` already carries an f64 bbox struct
+    /// column, just without the 1.1 covering declaration. Declaring it must
+    /// not move the pinned zoom (z14), and the covering path must be taken.
+    #[test]
+    fn declared_covering_on_a_real_fixture_keeps_the_pinned_zoom() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use std::sync::Arc;
+
+        let src = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !src.exists() {
+            eprintln!("skipping: fixture not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("ob-covered.parquet");
+
+        let file = std::fs::File::open(src).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let kv = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .clone();
+        // Strip the schema-embedded metadata: ArrowWriter would re-emit the
+        // original (covering-less) "geo" beside the patched one below.
+        let schema = Arc::new(arrow_schema::Schema::new(builder.schema().fields().clone()));
+        let reader = builder.build().unwrap();
+        let out = std::fs::File::create(&dst).unwrap();
+        let mut writer = ArrowWriter::try_new(out, schema, None).unwrap();
+        for batch in reader {
+            writer.write(&batch.unwrap()).unwrap();
+        }
+        for pair in kv {
+            if pair.key.eq_ignore_ascii_case("geo") {
+                let mut geo: serde_json::Value =
+                    serde_json::from_str(pair.value.as_deref().unwrap()).unwrap();
+                let primary = geo["primary_column"].as_str().unwrap().to_string();
+                geo["columns"][primary.as_str()]["covering"] = serde_json::json!({
+                    "bbox": {
+                        "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
+                        "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"]
+                    }
+                });
+                writer.append_key_value_metadata(KeyValue::new(pair.key, geo.to_string()));
+            } else {
+                writer.append_key_value_metadata(pair);
+            }
+        }
+        writer.close().unwrap();
+
+        let covered = ConvertSource::resolve_path(&dst).unwrap();
+        let evidence = estimate(&covered, 0).unwrap();
+        assert!(evidence.sampled_from_covering, "{evidence:?}");
+        assert_eq!(evidence.chosen_zoom, BUILDINGS_Z, "{evidence:?}");
     }
 
     #[test]
