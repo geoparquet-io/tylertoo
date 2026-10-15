@@ -28,11 +28,10 @@ fn temp_file(bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
     Ok(file)
 }
 
-/// `bytes` as a PMTiles archive handed to `stats`, `merge` or `--band`,
-/// through [`ArchiveIndex`] alone.
+/// `bytes` as a PMTiles archive handed to `stats`, `merge` or `--band`.
 ///
-/// That covers the header, the directory walk, the metadata JSON, every
-/// addressed tile body, and [`crate::stats::compute_stats`].
+/// Reached through [`ArchiveIndex`] alone: header, directory walk, metadata
+/// JSON, every addressed tile body, and [`crate::stats::compute_stats`].
 ///
 /// `band_archive` reaches [`ArchiveIndex::open`] too, but `pyramid` rejects
 /// an archive that is not gzip MVT right after it, so the rest of the index
