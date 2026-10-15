@@ -1,11 +1,11 @@
 # Nightly Fuzz — cargo-fuzz (libFuzzer) on the untrusted-bytes parsers.
 #
-# Purpose: the parsers in tylertoo-core that consume third-party bytes (a
-# PMTiles header and directory, an MVT tile body, a whole `--band` archive,
-# the footer JSON, WKB, the `--filter` grammar) get five minutes of libFuzzer
-# each, every night, seeded from fuzz/corpus/<target>/ (#424). #397's class
-# of bug — an archive-controlled count sizing an allocation — is what this
-# finds in minutes.
+# Purpose: every reader in tylertoo-core that consumes third-party bytes gets
+# five minutes of libFuzzer each, every night, seeded from
+# fuzz/corpus/<target>/ (#424). fuzz/README.md's Coverage table lists each
+# outside input and its target (#633). #397's class of bug — an
+# archive-controlled count sizing an allocation — is what this finds in
+# minutes.
 #
 # The fuzz crate is a standalone workspace (fuzz/Cargo.toml), so nothing
 # here touches the per-PR build. One matrix job per target keeps a crash in
@@ -57,6 +57,26 @@ jobs:
           - footer_json
           - wkb
           - geoparquet_wkb
+          - geo_metadata
+          - decode_archive
+          - archive_index
+          - layer_zooms
+          - parquet_footer
+          - shard_plan
+          - decompress
+          - cli_args
+          # Held out until the upstream panics they find are fixed, so they
+          # don't keep the run red (a crashing target finds nothing else):
+          #   overview_file, remote_footer - #683 (arrow-ipc panics on a
+          #     crafted ARROW:schema footer key; fixed in arrow 60)
+          #   remote_footer - also #687 (parquet-rs panics on a crafted
+          #     page's definition levels)
+          #   plan_file - #684 (arrow-ipc panics on a crafted IPC buffer)
+          # Their seeds still replay on every PR (crates/core/tests/fuzz_seeds.rs).
+          # remote_footer needs a fuzz-crate feature; re-add it as
+          #   include:
+          #     - target: remote_footer
+          #       features: remote
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,13 +108,15 @@ jobs:
         # The fuzz crate has its own target dir (it is its own workspace) and
         # its build is the expensive part: core with sanitizer
         # instrumentation. Keyed on the nightly and the core sources, so a
-        # core change rebuilds and a corpus-only change does not.
+        # core change rebuilds and a corpus-only change does not; and on the
+        # feature set, so a job built with a fuzz-crate feature (a different
+        # core) neither replaces nor is restored as everyone else's.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/target
-          key: ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/core/**', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**') }}
+          key: ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-${{ matrix.features || 'default' }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/core/**', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**') }}
           restore-keys: |
-            ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-
+            ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-${{ matrix.features || 'default' }}-
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
@@ -105,6 +127,7 @@ jobs:
         id: fuzz
         env:
           TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
           MAX_TOTAL_TIME: ${{ inputs.max_total_time || '300' }}
         # The corpus dir is the committed seeds plus whatever this run
         # discovers; it is not persisted between runs (a seed worth keeping
@@ -116,6 +139,7 @@ jobs:
         # musl build fails before fuzzing starts (#620).
         run: |
           cargo "+$NIGHTLY" fuzz run "$TARGET" \
+            ${FEATURES:+--features "$FEATURES"} \
             --target x86_64-unknown-linux-gnu -- \
             -max_total_time="$MAX_TOTAL_TIME" \
             -timeout=60 \
