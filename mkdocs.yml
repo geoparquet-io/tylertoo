@@ -79,5 +79,7 @@ nav:
       - Python: reference/python.md
       - Rust (docs.rs): https://docs.rs/tylertoo-core
       - Tuning knobs: OVERVIEW_TUNING.md
+  - Specification:
+      - "geo:overviews": spec/overviews.md
   - Contributing: contributing.md
   - Changelog: changelog.md
