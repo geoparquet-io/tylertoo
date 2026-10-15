@@ -37,4 +37,5 @@ pub mod simplify;
 mod stream;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod tiles;
 pub mod writer;
