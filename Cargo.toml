@@ -156,6 +156,16 @@ overflow-checks = false
 [profile.bench]
 inherits = "release"
 
+# Release code generation with symbols, for sampling profilers (#614):
+# `cargo build --profile profiling`, then samply/perf/cargo-flamegraph on
+# target/profiling/tylertoo. The release binary stays stripped; without this,
+# profiler stacks show addresses instead of function names. See
+# context/PROFILING.md, "Sampling profilers".
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
 # Build profile for cargo-mutants (.cargo/mutants.toml sets `profile =
 # "mutants"`; nextest gets it as `--cargo-profile=mutants`). Every mutant
 # recompiles tylertoo-core and relinks its test binaries, so this profile
