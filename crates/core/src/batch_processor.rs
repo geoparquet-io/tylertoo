@@ -176,6 +176,10 @@ fn check_wkb_array(wkb: &dyn GeoArrowArray) -> Result<()> {
 /// reports it. The reader is not called on the values the walk rejects for a
 /// count, the nesting cap or a MultiPoint member overrun: those are the
 /// inputs that abort it.
+///
+/// On a value the reader decodes, it also checks pass 1's in-place scan
+/// ([`crate::overview::convert::scan_feature_traits`], #650) against
+/// decode-then-scan, to the bit, and panics if they differ.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
@@ -204,7 +208,20 @@ pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
     }
     let mut out = Vec::with_capacity(1);
     extract_geometries_opt_from_array(&array, &mut out)?;
-    Ok(out.pop().flatten())
+    let decoded = out.pop().flatten();
+    // #650: pass 1 scans the value in place instead of decoding it. The two
+    // must agree, to the bit, on every value the decoder accepts.
+    let wkb = array.value(0).expect("the value just decoded");
+    let in_place = crate::overview::convert::scan_feature_traits(&wkb);
+    let via_decode = decoded
+        .as_ref()
+        .and_then(crate::overview::convert::scan_feature);
+    assert_eq!(
+        in_place.map(|(k, b)| (k, b.map(f64::to_bits))),
+        via_decode.map(|(k, b)| (k, b.map(f64::to_bits))),
+        "the in-place pass-1 scan disagrees with decode-then-scan"
+    );
+    Ok(decoded)
 }
 
 /// [`extract_geometries_opt_from_array`]'s visitor: one row-aligned
