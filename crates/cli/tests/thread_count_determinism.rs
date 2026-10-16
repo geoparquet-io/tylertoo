@@ -296,7 +296,8 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
 
 /// #494: byte-determinism across `--read-workers`.
 ///
-/// Pass 2 can now read the input with several threads at once, each owning a
+/// Both passes (pass 2 since #494, pass 1 since #717) can read the input with
+/// several threads at once, each owning a
 /// disjoint run of row groups, and merge their batches back into read order.
 /// The merge re-chunks, because batch boundaries are not cosmetic: the
 /// overview writer issues one column-writer call per slice it is handed and
@@ -312,6 +313,10 @@ fn parallel_pass1_output_is_byte_identical_across_thread_counts() {
 /// then reads it back with a read batch size that divides neither the row
 /// group nor the segment: every worker seam then lands mid-batch, which is
 /// exactly the case the merge has to splice.
+///
+/// The convert plan is compared too (#717): pass 1's measured geometry weight
+/// lands in it, and that measurement once summed the Arrow memory of the
+/// batches read, which depends on how many readers produced them.
 #[test]
 fn pmtiles_output_is_byte_identical_across_read_worker_counts() {
     let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
@@ -346,23 +351,32 @@ fn pmtiles_output_is_byte_identical_across_read_worker_counts() {
     // Read batch size 13: coprime with the 50-row row groups, so no segment
     // boundary can accidentally land on a batch boundary.
     let mut baseline: Option<(u32, Vec<u8>, Vec<u8>)> = None;
+    let mut base_plan: Option<(u32, Vec<u8>)> = None;
     for workers in [1u32, 2, 4] {
         let out = dir.path().join(format!("rw{workers}.pmtiles"));
         let overview_out = dir.path().join(format!("rw{workers}-overview.parquet"));
-        let (bytes, overview_bytes) = run_tiles(
-            &multi,
-            &out,
-            &overview_out,
-            4,
-            false,
-            8,
-            &[
-                "--read-workers",
-                &workers.to_string(),
-                "--read-batch-size",
-                "13",
-            ],
-        );
+        let workers_arg = workers.to_string();
+        let read_args = [
+            "--read-workers",
+            workers_arg.as_str(),
+            "--read-batch-size",
+            "13",
+        ];
+        let (bytes, overview_bytes) =
+            run_tiles(&multi, &out, &overview_out, 4, false, 8, &read_args);
+        let plan = dir.path().join(format!("rw{workers}.plan"));
+        let plan_bytes = run_plan_only(&multi, &plan, 4, 8, &read_args);
+        match &base_plan {
+            None => base_plan = Some((workers, plan_bytes)),
+            Some((base_workers, base_plan_bytes)) => assert!(
+                base_plan_bytes == &plan_bytes,
+                "convert plan differs between --read-workers {base_workers} \
+                 ({} bytes) and --read-workers {workers} ({} bytes) — #717 \
+                 regression: pass 1's reader count leaked into the plan",
+                base_plan_bytes.len(),
+                plan_bytes.len()
+            ),
+        }
         match &baseline {
             None => baseline = Some((workers, bytes, overview_bytes)),
             Some((base_workers, base_bytes, base_overview_bytes)) => {

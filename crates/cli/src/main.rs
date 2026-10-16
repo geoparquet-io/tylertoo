@@ -880,7 +880,7 @@ struct ConvertTuningArgs {
     )]
     in_flight_batches: usize,
 
-    /// Reader threads for the second pass, or `auto` for a quarter of the
+    /// Reader threads for both passes, or `auto` for a quarter of the
     /// cores, up to 4. See
     /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>.
     #[arg(

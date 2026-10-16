@@ -65,7 +65,7 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
   Each pass logs its choice. Pass 2 processes up to half of them at the same
   time. More batches keep more cores busy and consume more memory. The passes
   do not overlap.
-- **`--read-workers N|auto`** sets pass 2's reader threads. `auto` uses a
+- **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses a
   quarter of the cores, at most 4. tylertoo honors an explicit value up to
   twice the core count. Remote inputs always use one reader, even when staged
   to disk: concurrent readers would evict each other's shared chunk cache.
@@ -74,7 +74,8 @@ Resident batches include those in flight, each worker's read-ahead queue,
 and, under `bounded`, up to three per level in spill writers. Read-ahead gets
 10% of available RAM, so smaller machines get fewer workers. `bounded`
 halves each queue. The estimate allows about 4 KiB per row plus twice its
-measured geometry bytes. Unlike the pass-2 buffers, tylertoo sizes the read-ahead
+measured geometry bytes. Pass 1 has measured nothing yet, so it assumes
+1 KiB of geometry per row. Unlike the pass-2 buffers, tylertoo sizes the read-ahead
 before pass 2 reads a row, so it cannot correct itself. Wide schemas with
 large strings can exceed it.
 Measure memory use if headroom is tight, or use `--read-workers 1`.

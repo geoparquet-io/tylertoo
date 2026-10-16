@@ -877,6 +877,53 @@ impl ConvertSource {
             .sum())
     }
 
+    /// Bytes of one root column over the selected row groups (all of them
+    /// when `selected` is `None`), straight from the footers: every leaf under
+    /// the column, each counted as its uncompressed size or, for a byte-array
+    /// leaf whose footer records it, its unencoded data bytes if larger (the
+    /// #563 rule in [`widest_byte_array_column`]).
+    ///
+    /// `column` indexes the schema this source exposes, as a
+    /// [`ReadPlan::projection`] does. Pass 1 reports this as the geometry
+    /// column's weight (#305). It used to sum the Arrow memory of every batch
+    /// it read, but that counts buffer capacity, and a zero-copy slice counts
+    /// its parent's whole buffer, so the total depended on how the rows were
+    /// read and spliced (#717). Footer bytes cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read.
+    pub(crate) fn selected_column_bytes(
+        &self,
+        selected: Option<&RowGroupSelection>,
+        column: usize,
+    ) -> Result<u64, InputError> {
+        let root = self.column_projection().map_or(column, |p| p[column]);
+        let mut total = 0u64;
+        for (i, m) in self.metas()?.iter().enumerate() {
+            let descr = m.parquet.file_metadata().schema_descr();
+            let leaves: Vec<usize> = (0..descr.num_columns())
+                .filter(|&leaf| descr.get_column_root_idx(leaf) == root)
+                .collect();
+            let groups = m.parquet.row_groups();
+            let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(i)) {
+                Some(p) => p.clone(),
+                None => (0..groups.len()).collect(),
+            };
+            for rg in picked.iter().filter_map(|&g| groups.get(g)) {
+                for &leaf in &leaves {
+                    let col = rg.column(leaf);
+                    let bytes = col
+                        .uncompressed_size()
+                        .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
+                        .max(0) as u64;
+                    total = total.saturating_add(bytes);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Per-part, per-row-group bboxes straight from the footers — the input
     /// the shard planner (#498) balances its cut on.
     ///
@@ -1193,10 +1240,11 @@ impl ConvertSource {
     /// Expressed as an ordinary [`ReadPlan`] whose row-group selection is
     /// empty for every part but the segment's, so the reader construction,
     /// projection composition and part skipping are the single-stream ones —
-    /// there is no second way to open an input. The plan's own projection is
-    /// always `None`: the source's `column_projection` (#386) is what restricts
-    /// the columns, and `open_stream` composes it, exactly as it does for the
-    /// sequential read this must reproduce.
+    /// there is no second way to open an input. `projection` is the caller's
+    /// [`ReadPlan::projection`], and `open_stream` composes it with the
+    /// source's `column_projection` (#386) exactly as it does for the
+    /// sequential read this must reproduce: `None` for pass 2's every column,
+    /// pass 1's geometry and flag columns otherwise (#717).
     ///
     /// Callers running several of these CONCURRENTLY over the same source must
     /// be local-only: `SourceStream` releases a part's in-memory read cache
@@ -1205,6 +1253,7 @@ impl ConvertSource {
     pub(crate) fn open_segment(
         &self,
         segment: &ReadSegment,
+        projection: Option<&[usize]>,
         batch_size: usize,
     ) -> Result<SourceStream<'_>, InputError> {
         let mut per_part = vec![Vec::new(); self.parts().len()];
@@ -1212,7 +1261,7 @@ impl ConvertSource {
         let selection = RowGroupSelection::from_parts(per_part);
         self.open_stream(&ReadPlan {
             batch_size,
-            projection: None,
+            projection,
             row_groups: Some(&selection),
         })
     }
@@ -2209,6 +2258,69 @@ mod tests {
         assert_eq!(segments[0].row_groups, vec![0, 1]);
         assert_eq!(segments[1].part, 2);
         assert_eq!(segments[1].row_groups, vec![2]);
+    }
+
+    /// #717: a root column's bytes come from the footer, summed over every
+    /// leaf under it (a nested column has several) and over the selected row
+    /// groups only, so they cannot depend on how the rows are read.
+    #[test]
+    fn selected_column_bytes_sums_leaves_over_the_selection() {
+        use arrow_array::{Float64Array, StructArray};
+
+        let dir = tmpdir();
+        let path = dir.path().join("p0.parquet");
+        let n = 400usize;
+        let xs = Float64Array::from((0..n).map(|i| i as f64).collect::<Vec<_>>());
+        let ys = Float64Array::from((0..n).map(|i| -(i as f64)).collect::<Vec<_>>());
+        let pt_fields = vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ];
+        let pt = StructArray::new(
+            pt_fields.clone().into(),
+            vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+            None,
+        );
+        write_parquet(
+            &path,
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("pt", DataType::Struct(pt_fields.into()), false),
+                Field::new("name", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(pt),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("r{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+            Some(100),
+        );
+        let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+
+        // Leaves 1 and 2 (pt.x, pt.y) sit under root column 1.
+        let reader =
+            parquet::file::serialized_reader::SerializedFileReader::new(File::open(&path).unwrap())
+                .unwrap();
+        let meta = parquet::file::reader::FileReader::metadata(&reader);
+        assert_eq!(meta.num_row_groups(), 4);
+        let rg_bytes = |g: usize| -> u64 {
+            let rg = meta.row_group(g);
+            (rg.column(1).uncompressed_size() + rg.column(2).uncompressed_size()) as u64
+        };
+
+        assert_eq!(
+            src.selected_column_bytes(None, 1).unwrap(),
+            (0..4).map(rg_bytes).sum::<u64>()
+        );
+        let selection = RowGroupSelection::from_parts(vec![vec![1, 3]]);
+        assert_eq!(
+            src.selected_column_bytes(Some(&selection), 1).unwrap(),
+            rg_bytes(1) + rg_bytes(3)
+        );
+        let none = RowGroupSelection::from_parts(vec![Vec::new()]);
+        assert_eq!(src.selected_column_bytes(Some(&none), 1).unwrap(), 0);
     }
 
     #[test]
