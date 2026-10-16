@@ -15,12 +15,25 @@ fi
 echo "Format check passed!"
 
 echo "Running cargo clippy..."
-if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -20; then
+# A pipeline's exit status is its LAST command's, and `tail` always succeeds,
+# so `clippy | tail` can never fail the hook (#695). Capture clippy's own
+# status instead; the `||` keeps `set -e` from exiting before we can report.
+CLIPPY_STATUS=0
+CLIPPY_OUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1) || CLIPPY_STATUS=$?
+if [ "$CLIPPY_STATUS" -ne 0 ]; then
+    # The whole output on failure, not tail -20: under `-D warnings` across
+    # the workspace the tail is per-crate "generated N warnings" summaries
+    # plus "could not compile", so the file:line diagnostic that actually
+    # blocked the commit scrolls out of view. Harmless while the status was
+    # ignored; now it is the failure UX.
+    printf '%s\n' "$CLIPPY_OUT"
     echo ""
-    echo "ERROR: Clippy found issues. Fix them before committing."
+    echo "ERROR: Clippy failed -- lints found, or clippy could not run."
+    echo "       See the output above; fix it before committing."
     echo ""
     exit 1
 fi
+printf '%s\n' "$CLIPPY_OUT" | tail -20
 echo "Clippy check passed!"
 
 # Lint the prose of staged, in-scope docs with Vale and proselint. The script
