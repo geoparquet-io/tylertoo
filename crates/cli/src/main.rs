@@ -2270,6 +2270,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     if let Some(note) = encode_quantized_note(export_report.encode_quantized_features) {
         println!("  {note}");
     }
+    if let Some(note) = wrapped_note_line(
+        convert_report.wrapped_features,
+        convert_report.input_features,
+    ) {
+        println!("  {note}");
+    }
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
     // the header always reflects the zooms that actually hold a tile) — say
@@ -2435,6 +2441,23 @@ fn encode_quantized_note(encode_quantized: usize) -> Option<String> {
     })
 }
 
+/// The informational note for features drawn wrapped across the antimeridian
+/// (#644), if any. Not part of the summary line's losses: wrapped data (0..360
+/// longitudes, dateline cells) is valid input and nothing was dropped. It is
+/// shown because a file in a projected CRS but labeled lon/lat, with
+/// `|x| ≤ 540`, would otherwise tile silently at the wrong place.
+fn wrapped_note_line(wrapped: usize, input_features: usize) -> Option<String> {
+    (wrapped > 0).then(|| {
+        format!(
+            "note: {} of {} input features reach past \u{b1}180\u{b0} longitude and were \
+             drawn wrapped across the antimeridian \u{2014} expected for 0..360 data and \
+             dateline cells; otherwise check the real CRS with `gpio inspect <input>`",
+            format_number(wrapped as u64),
+            format_number(input_features as u64)
+        )
+    })
+}
+
 /// The pyramid build's skipped-tile line, if any (#514 S3).
 ///
 /// `report.skipped` counts every tile a band's archive held outside that
@@ -2579,6 +2602,9 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             format_number(report.unprojectable_features as u64),
             format_number(report.input_features as u64)
         );
+    }
+    if let Some(note) = wrapped_note_line(report.wrapped_features, report.input_features) {
+        println!("  {note}");
     }
     if !report.skipped_empty_levels.is_empty() {
         let planned: Vec<String> = report
@@ -4669,6 +4695,20 @@ mod tests {
         assert!(
             note.contains("2 tile feature(s) collapsed at the tile extent")
                 && note.contains("lines of fewer than two points")
+                && !note.contains("dropped"),
+            "{note}"
+        );
+    }
+
+    /// #644: wrapped features are valid input, so they get their own note,
+    /// never a loss in the summary line, and nothing at zero.
+    #[test]
+    fn wrapped_note_line_is_separate_and_silent_at_zero() {
+        assert_eq!(wrapped_note_line(0, 10), None);
+        let note = wrapped_note_line(1234, 5000).unwrap();
+        assert!(
+            note.contains("1,234 of 5,000 input features reach past \u{b1}180\u{b0}")
+                && note.contains("drawn wrapped across the antimeridian")
                 && !note.contains("dropped"),
             "{note}"
         );

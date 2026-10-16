@@ -62,12 +62,16 @@ class TestOutOfRangeExemplars:
             report = tylertoo.overview(str(DATELINE), str(out), max_zoom=4)
             assert report["out_of_range_features"] == 0
             assert report["out_of_range_exemplars"] == []
+            # #644: reported as wrapped instead.
+            assert report["wrapped_features"] == 1
 
     def test_report_names_the_row_and_coordinate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "o.parquet"
             report = tylertoo.overview(str(BEYOND_WRAP), str(out), max_zoom=4)
             assert report["out_of_range_features"] == 1
+            # Lost, so not also counted as wrapped (#644).
+            assert report["wrapped_features"] == 0
             assert report["out_of_range_exemplars"] == [
                 {"part": None, "row": 7, "axis": "lon", "value": 600.25}
             ]
@@ -293,6 +297,8 @@ class TestOverviewIntegration:
             # #451: this fixture declares its CRS, so the assume-WGS84
             # fallback must not be flagged (the field is always present).
             assert report["crs_assumed_wgs84"] is False
+            # #644: in-range input, but the key is always present.
+            assert report["wrapped_features"] == 0
             # z0..z6 requested; coarse levels where every (tiny) building falls
             # below the visibility gate are omitted, so <= 7 levels survive and
             # the canonical (finest) one is always z6 with every input feature.

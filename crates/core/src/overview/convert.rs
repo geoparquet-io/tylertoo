@@ -1207,6 +1207,15 @@ pub struct ConvertReport {
     /// of range, or when the run replayed a `--plan` artifact (whose saved
     /// totals do not carry exemplars).
     pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
+    /// Features whose bbox reaches past ±180° longitude (past the Web
+    /// Mercator world edge in x, for EPSG:3857) but stays within one wrap
+    /// (#644). The export draws them at their wrapped position (#342), so
+    /// they are not lost: a 0..360 dataset or a dateline cell counts here.
+    /// Reported because a file in a projected CRS but labeled lon/lat, with
+    /// `|x| ≤ 540`, would otherwise tile silently at the wrong place. One
+    /// aggregate `log::info!` names the first few rows. Informational only:
+    /// it never joins the #429 all-lost failure gate.
+    pub wrapped_features: usize,
     /// Whether the input declared no CRS at all (no `geo` metadata, or an
     /// explicit `crs: null`) and the reader *assumed* WGS84 lon/lat (#451).
     /// `false` whenever the CRS was declared — including by the GeoParquet
@@ -3989,6 +3998,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         out_of_range_features: tallies.out_of_range,
         unprojectable_features: tallies.unprojectable,
         out_of_range_exemplars: tallies.out_of_range_exemplars,
+        wrapped_features: tallies.wrapped,
         crs_assumed_wgs84,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
@@ -4596,6 +4606,60 @@ pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
     bbox[0] < -max_x || bbox[2] > max_x || bbox[1] < -r.max_y || bbox[3] > r.max_y
 }
 
+/// Whether a feature bbox reaches past ±180° longitude (the Web Mercator
+/// world edge in x, for EPSG:3857), so the export draws it, or part of it,
+/// at its wrapped position (#342, #644).
+///
+/// Wrapped data is valid input (a 0..360 dataset, a dateline cell at
+/// `x: 178 … 181`), but so is nothing else that looks like it: a file in a
+/// projected CRS labeled lon/lat, with `|x| ≤ 540`, lands here too. The
+/// convert reports it rather than gating on it. Only meaningful for a bbox
+/// [`bbox_out_of_crs_range`] passes; [`BboxTally::observe`] asks it of
+/// nothing else.
+pub(super) fn bbox_wraps(bbox: &[f64; 4], crs: Crs) -> bool {
+    let r = crs_coordinate_range(crs);
+    bbox[0] < -r.max_x || bbox[2] > r.max_x
+}
+
+/// The coordinate of a [`bbox_wraps`] bbox that lies past the world edge,
+/// by the larger overhang when it reaches past both (#644).
+fn wrapped_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
+    let r = crs_coordinate_range(crs);
+    let axis = match crs {
+        Crs::Epsg4326 => "lon",
+        Crs::Epsg3857 => "x",
+    };
+    let (west, east) = ((-r.max_x) - bbox[0], bbox[2] - r.max_x);
+    (axis, if east >= west { bbox[2] } else { bbox[0] })
+}
+
+/// #644 message (pure, so it is unit-testable without capturing logs): the
+/// one aggregate info line for `count` of `total` features drawn wrapped
+/// across the antimeridian, or `None` to stay quiet. `exemplars` names the
+/// first few rows, in the out-of-range warning's format.
+pub(super) fn wrapped_note(
+    count: usize,
+    total: usize,
+    crs: Crs,
+    exemplars: &[OutOfRangeExemplar],
+) -> Option<String> {
+    if count == 0 || total == 0 {
+        return None;
+    }
+    let edge = match crs {
+        Crs::Epsg4326 => "±180° longitude",
+        Crs::Epsg3857 => "the ±20037508.34 m world edge in x",
+    };
+    let pct = count as f64 / total as f64 * 100.0;
+    let exemplar = exemplar_note(exemplars, ExemplarEdge::Wrap);
+    Some(format!(
+        "{count} of {total} feature(s) ({pct:.1}%) reach past {edge} and are drawn \
+         wrapped across the antimeridian.{exemplar} That is expected for 0..360 data \
+         and dateline cells; otherwise check that the coordinates really are the \
+         declared CRS."
+    ))
+}
+
 /// Whether a bbox is legal for its CRS yet lies wholly outside the Web
 /// Mercator TILING domain (#429, review S1-3).
 ///
@@ -4737,13 +4801,45 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
 /// CLI's `tiles` summary line, so both name where the loss came from instead
 /// of only how much was lost.
 pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
+    exemplar_note(exemplars, ExemplarEdge::OutOfRange)
+}
+
+/// The range edge an exemplar's coordinate lies past, which sets where
+/// [`exemplar_value_text`] must not round it back to.
+#[derive(Debug, Clone, Copy)]
+enum ExemplarEdge {
+    /// [`bbox_out_of_crs_range`]'s edges: x and longitude carry the export's
+    /// one-world wrap (#342).
+    OutOfRange,
+    /// [`bbox_wraps`]'s edge: the world's own ±180° (#644).
+    Wrap,
+}
+
+impl ExemplarEdge {
+    /// The `|value|` an exemplar on `axis` lies beyond.
+    fn limit(self, axis: &str) -> f64 {
+        let wrap = match self {
+            Self::OutOfRange => 3.0,
+            Self::Wrap => 1.0,
+        };
+        match axis {
+            "lon" => wrap * 180.0,
+            "lat" => 90.0,
+            "x" => wrap * WEBMERC_HALF_M,
+            _ => WEBMERC_HALF_M,
+        }
+    }
+}
+
+/// [`out_of_range_exemplar_note`] for exemplars past `edge`.
+fn exemplar_note(exemplars: &[OutOfRangeExemplar], edge: ExemplarEdge) -> String {
     if exemplars.is_empty() {
         return String::new();
     }
     let parts: Vec<String> = exemplars
         .iter()
         .map(|e| {
-            let value = exemplar_value_text(e.axis, e.value);
+            let value = exemplar_value_text(e.value, edge.limit(e.axis));
             match e.part {
                 None => format!("{} {value} (row {})", e.axis, e.row),
                 Some(p) => format!("{} {value} (part {p}, row {})", e.axis, e.row),
@@ -4754,17 +4850,10 @@ pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
 }
 
 /// An exemplar's coordinate as text: three decimals, unless rounding to
-/// three decimals would land it back on the range edge (540.0000001 as
-/// "540.000"), in which case the shortest exact form, which always shows
-/// the excess. The edges are [`bbox_out_of_crs_range`]'s: x and longitude
-/// carry the export's one-world wrap (#342).
-fn exemplar_value_text(axis: &str, value: f64) -> String {
-    let limit = match axis {
-        "lon" => 3.0 * 180.0,
-        "lat" => 90.0,
-        "x" => 3.0 * WEBMERC_HALF_M,
-        _ => WEBMERC_HALF_M,
-    };
+/// three decimals would land it back on the range edge `limit` (540.0000001
+/// as "540.000"), in which case the shortest exact form, which always shows
+/// the excess.
+fn exemplar_value_text(value: f64, limit: f64) -> String {
     let short = format!("{value:.3}");
     match short.parse::<f64>() {
         Ok(rounded) if rounded.abs() > limit => short,
@@ -4839,6 +4928,13 @@ pub(super) struct BboxTallies {
     /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] out-of-range features' rows
     /// and offending coordinates (#553).
     pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
+    /// Features past ±180° longitude but within one wrap, which the export
+    /// draws wrapped (#644). Disjoint from the losses and outside
+    /// [`Self::lost`]: wrapped data is valid input.
+    pub wrapped: usize,
+    /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features' rows and
+    /// the coordinate past the edge.
+    pub wrapped_exemplars: Vec<OutOfRangeExemplar>,
 }
 
 impl BboxTallies {
@@ -4923,6 +5019,12 @@ pub(super) struct BboxTally {
     /// at the end of the scan — the row locator is not available (nor
     /// thread-safe to call) inside a scan task.
     exemplars: Vec<(usize, &'static str, f64)>,
+    /// Features past ±180° but within the wrap (#644).
+    wrapped: usize,
+    /// `(feature index, axis, value)` for the first
+    /// [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features, resolved like
+    /// `exemplars`.
+    wrapped_exemplars: Vec<(usize, &'static str, f64)>,
 }
 
 impl BboxTally {
@@ -4942,6 +5044,12 @@ impl BboxTally {
             }
         } else if bbox_unprojectable(bbox, crs) {
             self.unprojectable += 1;
+        } else if bbox_wraps(bbox, crs) {
+            self.wrapped += 1;
+            if self.wrapped_exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
+                let (axis, value) = wrapped_coordinate(bbox, crs);
+                self.wrapped_exemplars.push((index, axis, value));
+            }
         }
     }
 
@@ -4955,11 +5063,18 @@ impl BboxTally {
         self.out_of_range += other.out_of_range;
         self.unprojectable += other.unprojectable;
         self.max_abs_out_of_range = self.max_abs_out_of_range.max(other.max_abs_out_of_range);
-        for &(index, axis, value) in &other.exemplars {
-            if self.exemplars.len() >= OUT_OF_RANGE_EXEMPLAR_CAP {
-                break;
-            }
-            self.exemplars.push((index + index_base, axis, value));
+        self.wrapped += other.wrapped;
+        for (mine, theirs) in [
+            (&mut self.exemplars, &other.exemplars),
+            (&mut self.wrapped_exemplars, &other.wrapped_exemplars),
+        ] {
+            let room = OUT_OF_RANGE_EXEMPLAR_CAP.saturating_sub(mine.len());
+            mine.extend(
+                theirs
+                    .iter()
+                    .take(room)
+                    .map(|&(index, axis, value)| (index + index_base, axis, value)),
+            );
         }
     }
 
@@ -4968,7 +5083,9 @@ impl BboxTally {
     ///
     /// `locate` turns a feature's index (its position in the pruned read
     /// stream) into the `(part, file row)` an exemplar names (#553); it is
-    /// called at most [`OUT_OF_RANGE_EXEMPLAR_CAP`] times.
+    /// called at most twice [`OUT_OF_RANGE_EXEMPLAR_CAP`] times (out-of-range
+    /// and wrapped exemplars). Wrapped features (#644) get one `log::info!`
+    /// and never count toward the all-lost failure.
     ///
     /// DIVERGENCE FROM THE TICKET'S WORDING: the all-lost check fires at the
     /// end of pass 1 rather than "at the end of convert". Pass 1 already knows
@@ -4980,13 +5097,8 @@ impl BboxTally {
         crs: Crs,
         locate: &dyn Fn(usize) -> (Option<usize>, usize),
     ) -> Result<BboxTallies, ConvertError> {
-        let t = BboxTallies {
-            antimeridian_suspect: self.antimeridian_suspect,
-            out_of_range: self.out_of_range,
-            unprojectable: self.unprojectable,
-            max_abs_out_of_range: self.max_abs_out_of_range,
-            out_of_range_exemplars: self
-                .exemplars
+        let resolve = |exemplars: Vec<(usize, &'static str, f64)>| -> Vec<OutOfRangeExemplar> {
+            exemplars
                 .into_iter()
                 .map(|(index, axis, value)| {
                     let (part, row) = locate(index);
@@ -4997,7 +5109,16 @@ impl BboxTally {
                         value,
                     }
                 })
-                .collect(),
+                .collect()
+        };
+        let t = BboxTallies {
+            antimeridian_suspect: self.antimeridian_suspect,
+            out_of_range: self.out_of_range,
+            unprojectable: self.unprojectable,
+            max_abs_out_of_range: self.max_abs_out_of_range,
+            out_of_range_exemplars: resolve(self.exemplars),
+            wrapped: self.wrapped,
+            wrapped_exemplars: resolve(self.wrapped_exemplars),
         };
         warn_antimeridian_suspects(t.antimeridian_suspect);
         if let Some(msg) = out_of_range_warning(
@@ -5011,6 +5132,9 @@ impl BboxTally {
         }
         if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
             log::warn!("{msg}");
+        }
+        if let Some(msg) = wrapped_note(t.wrapped, total, crs, &t.wrapped_exemplars) {
+            log::info!("{msg}");
         }
         match all_lost_error(&t, total, crs) {
             Some(e) => Err(e),
@@ -7526,6 +7650,82 @@ mod tests {
             out_of_range_exemplar_note(&[ex("x", 70_000_000.0)]),
             " e.g. x 70000000.000 (row 7)"
         );
+    }
+
+    /// #644: [`BboxTally`] counts the features past ±180° that the export
+    /// wraps, apart from the losses, and names the first few in file order
+    /// across merged chunks.
+    #[test]
+    fn bbox_tally_counts_wrapped_features_apart_from_losses() {
+        let mut features = vec![point_feature(0, 10.0, 10.0)]; // in range
+        for row in 1..=4usize {
+            features.push(point_feature(row, 180.0 + row as f64, 10.0));
+        }
+        features.push(point_feature(5, -181.5, 10.0)); // west overhang
+        features.push(point_feature(6, 600.0, 10.0)); // lost, not wrapped
+        let mut tally = BboxTally::default();
+        for f in &features {
+            tally.observe(&f.bbox, Crs::Epsg4326, f.index);
+        }
+        let t = tally
+            .clone()
+            .finish(features.len(), Crs::Epsg4326, &|i| (None, i))
+            .expect("not all lost");
+        assert_eq!((t.wrapped, t.out_of_range), (5, 1));
+        let named: Vec<(usize, &str, f64)> = t
+            .wrapped_exemplars
+            .iter()
+            .map(|e| (e.row, e.axis, e.value))
+            .collect();
+        assert_eq!(
+            named,
+            vec![(1, "lon", 181.0), (2, "lon", 182.0), (3, "lon", 183.0)]
+        );
+
+        // Merged chunks keep file order and the cap.
+        let mut first = BboxTally::default();
+        first.observe(&[-181.5, 0.0, -181.5, 0.0], Crs::Epsg4326, 0);
+        let mut merged = BboxTally::default();
+        merged.merge(&first, 0);
+        merged.merge(&tally, 10);
+        let t = merged
+            .finish(17, Crs::Epsg4326, &|i| (None, i))
+            .expect("not all lost");
+        assert_eq!(t.wrapped, 6);
+        let rows: Vec<usize> = t.wrapped_exemplars.iter().map(|e| e.row).collect();
+        assert_eq!(rows, vec![0, 11, 12]);
+        assert_eq!(t.wrapped_exemplars[0].value, -181.5, "the west edge");
+    }
+
+    /// #644: the wrapped note is quiet at zero, and otherwise names the count,
+    /// the edge, and the first rows, with the same exemplar format as the
+    /// out-of-range warning.
+    #[test]
+    fn wrapped_note_names_rows_and_stays_quiet_at_zero() {
+        let ex = |part, row, axis: &'static str, value| OutOfRangeExemplar {
+            part,
+            row,
+            axis,
+            value,
+        };
+        assert_eq!(wrapped_note(0, 10, Crs::Epsg4326, &[]), None);
+
+        let msg = wrapped_note(1, 10, Crs::Epsg4326, &[ex(None, 7, "lon", 190.25)])
+            .expect("a wrapped feature is noted");
+        assert!(msg.contains("1 of 10 feature(s)"), "{msg}");
+        assert!(msg.contains("±180° longitude"), "{msg}");
+        assert!(msg.contains("e.g. lon 190.250 (row 7)"), "{msg}");
+
+        let msg = wrapped_note(2, 4, Crs::Epsg4326, &[ex(Some(1), 3, "lon", -180.5)]).unwrap();
+        assert!(msg.contains("lon -180.500 (part 1, row 3)"), "{msg}");
+
+        // Just past the edge prints in full, never as "180.000".
+        let msg = wrapped_note(1, 1, Crs::Epsg4326, &[ex(None, 0, "lon", 180.000_000_1)]).unwrap();
+        assert!(msg.contains("lon 180.0000001 (row 0)"), "{msg}");
+
+        let msg = wrapped_note(1, 1, Crs::Epsg3857, &[ex(None, 0, "x", 30_000_000.0)]).unwrap();
+        assert!(msg.contains("±20037508.34 m"), "{msg}");
+        assert!(msg.contains("x 30000000.000 (row 0)"), "{msg}");
     }
 
     /// The filter path reads the same columns but must NOT lose ±inf: it is a

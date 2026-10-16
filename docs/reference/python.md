@@ -307,6 +307,7 @@ class OverviewReport(TypedDict):
     unprojectable_features: int
     crs_assumed_wgs84: bool
     out_of_range_exemplars: list[OutOfRangeExemplar]
+    wrapped_features: int
     duration_secs: float
     remote_fetch: RemoteFetch | None
 ```
@@ -316,6 +317,7 @@ class OverviewReport(TypedDict):
 * `antimeridian_suspect_features`: Features wider than 180° of longitude, usually a broken antimeridian crossing.
 * `out_of_range_features`: Features dropped or clipped because their coordinates are outside the valid range. Longitude past ±180° but within ±540° wraps and is not counted.
 * `unprojectable_features`: Features beyond ±85.05° latitude, which Web Mercator cannot tile.
+* `wrapped_features`: Features past ±180° longitude but within ±540°, drawn wrapped across the antimeridian. Expected for 0..360 data; otherwise the declared CRS may be wrong. Not a loss.
 * `crs_assumed_wgs84`: True when the input declared no CRS and lon/lat WGS84 was assumed. If the coordinates are not lon/lat degrees, the output is misplaced.
 
 ### `LevelReport`

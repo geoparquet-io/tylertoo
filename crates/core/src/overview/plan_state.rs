@@ -922,6 +922,10 @@ pub(super) struct PlanTotals {
     pub out_of_range: usize,
     /// Features valid for the CRS but outside the Web Mercator tiling domain.
     pub unprojectable: usize,
+    /// Features drawn wrapped across the antimeridian (#644). Defaults to 0
+    /// so a plan saved before the field existed still loads.
+    #[serde(default)]
+    pub wrapped: usize,
 }
 
 impl PlanTotals {
@@ -1964,8 +1968,19 @@ mod tests {
                 antimeridian_suspect: 1,
                 out_of_range: 0,
                 unprojectable: 2,
+                wrapped: 3,
             },
         }
+    }
+
+    /// #644: a plan saved before `wrapped` existed still loads, as 0.
+    #[test]
+    fn plan_totals_without_wrapped_load_as_zero() {
+        let mut json = serde_json::to_value(tiny_plan().totals).unwrap();
+        json.as_object_mut().unwrap().remove("wrapped");
+        let totals: PlanTotals = serde_json::from_value(json).unwrap();
+        assert_eq!(totals.wrapped, 0);
+        assert_eq!(totals.unprojectable, 2);
     }
 
     /// The oracle for the artifact itself: every field survives a save/load
@@ -2753,6 +2768,10 @@ mod tests {
         assert_eq!(report_a.levels.len(), report_b.levels.len(), "{name}");
         assert_eq!(
             report_a.antimeridian_suspect_features, report_b.antimeridian_suspect_features,
+            "{name}"
+        );
+        assert_eq!(
+            report_a.wrapped_features, report_b.wrapped_features,
             "{name}"
         );
         assert!(report_a.total_rows > 0, "{name}: the fixture produced rows");

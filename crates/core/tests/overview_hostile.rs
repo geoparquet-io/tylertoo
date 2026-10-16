@@ -2218,6 +2218,10 @@ fn antimeridian_suspect_features_warned_normal_inputs_clean() {
             report.antimeridian_suspect_features, 0,
             "streaming={streaming}: sub-180° extents are not flagged"
         );
+        assert_eq!(
+            report.wrapped_features, 0,
+            "streaming={streaming}: nothing reaches past ±180°"
+        );
     }
 }
 
@@ -2296,6 +2300,10 @@ fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
         assert_eq!(
             convert.out_of_range_features, 0,
             "streaming={streaming}: a wrapped overhang is not lost"
+        );
+        assert_eq!(
+            convert.wrapped_features, 1,
+            "streaming={streaming}: the overhang is reported as wrapped (#644)"
         );
         export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
 
@@ -2388,6 +2396,10 @@ fn zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes() {
         let convert = convert_to_overviews(tin.path(), tovr.path(), &opts(streaming))
             .unwrap_or_else(|e| panic!("streaming={streaming}: 0..360 input must convert: {e}"));
         assert_eq!(convert.out_of_range_features, 0, "streaming={streaming}");
+        assert_eq!(
+            convert.wrapped_features, 4,
+            "streaming={streaming}: every 0..360 feature is reported as wrapped (#644)"
+        );
         export_pmtiles(tovr.path(), tout.path(), &ExportOptions::default()).unwrap();
 
         let dec = tempfile::NamedTempFile::new().unwrap();

@@ -2580,6 +2580,7 @@ fn run_pass1_and_assign(
             antimeridian_suspect: tallies.antimeridian_suspect,
             out_of_range: tallies.out_of_range,
             unprojectable: tallies.unprojectable,
+            wrapped: tallies.wrapped,
         };
         let plan = ConvertPlan::from_winner_tables(
             &tables,
@@ -2770,6 +2771,9 @@ fn load_plan_state(
             // honestly but without the "e.g. lon ... (row ...)" detail the
             // original scan had.
             out_of_range_exemplars: Vec::new(),
+            wrapped: totals.wrapped,
+            // Same as the out-of-range exemplars: the count only (#644).
+            wrapped_exemplars: Vec::new(),
         },
         pass1_stage_secs: Pass1StageSecs::default(),
         // The load stands in for the scan; the assignment did not run at all.
@@ -3111,6 +3115,7 @@ fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
         out_of_range_features: inputs.tallies.out_of_range,
         unprojectable_features: inputs.tallies.unprojectable,
         out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
+        wrapped_features: inputs.tallies.wrapped,
         crs_assumed_wgs84: inputs.crs_assumed_wgs84,
         duration_secs: inputs.start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(inputs.source),

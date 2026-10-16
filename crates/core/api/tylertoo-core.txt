@@ -1407,6 +1407,7 @@ pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::total_vertices: usize
 pub tylertoo_core::overview::convert::ConvertReport::unprojectable_features: usize
+pub tylertoo_core::overview::convert::ConvertReport::wrapped_features: usize
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertReport
 pub fn tylertoo_core::overview::convert::ConvertReport::clone(&self) -> tylertoo_core::overview::convert::ConvertReport
 impl core::cmp::PartialEq for tylertoo_core::overview::convert::ConvertReport
