@@ -276,6 +276,9 @@ fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py
         exemplars.append(d)?;
     }
     dict.set_item("out_of_range_exemplars", exemplars)?;
+    // #451: the input declared no CRS at all and WGS84 lon/lat was assumed —
+    // the same visibility the Rust report (and its warning) gives.
+    dict.set_item("crs_assumed_wgs84", report.crs_assumed_wgs84)?;
     dict.set_item("duration_secs", report.duration_secs)?;
     // Remote-input fetch counters (#210); None for local inputs.
     match &report.remote_fetch {

@@ -2004,6 +2004,9 @@ struct Preflight {
     selected_row_groups: Option<RowGroupSelection>,
     row_groups_total: usize,
     row_groups_read: usize,
+    /// The input declared no CRS and WGS84 was assumed (#451); carried to
+    /// the report.
+    crs_assumed_wgs84: bool,
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -2051,7 +2054,10 @@ fn convert_preflight_with_memory_limit(
 
     // CRS detection + rejection (spec Q3) — footer metadata only.
     let kv = source.key_value_metadata()?;
-    let crs = super::convert::detect_crs_from_kv(kv.as_ref())?;
+    let (crs, crs_assumed_wgs84) = super::convert::detect_crs_from_kv_assumed(kv.as_ref())?;
+    if crs_assumed_wgs84 {
+        super::convert::warn_assumed_wgs84(&source.display_name());
+    }
 
     // Reserved-column collisions (#288) are resolved BEFORE row-group
     // selection so the attribute filter (#315) can bind against the final
@@ -2194,6 +2200,7 @@ fn convert_preflight_with_memory_limit(
         selected_row_groups,
         row_groups_total,
         row_groups_read,
+        crs_assumed_wgs84,
         pass1_memory,
     })
 }
@@ -2837,6 +2844,7 @@ pub(crate) fn convert_streaming_strategy(
         selected_row_groups,
         row_groups_total,
         row_groups_read,
+        crs_assumed_wgs84,
         pass1_memory: preflight_report,
     } = preflight;
     let options = &resolved_options;
@@ -3061,6 +3069,7 @@ pub(crate) fn convert_streaming_strategy(
         tallies,
         start,
         effective_max_row_group_size,
+        crs_assumed_wgs84,
     }))
 }
 
@@ -3081,6 +3090,8 @@ struct ConvertReportInputs<'a> {
     tallies: BboxTallies,
     start: Instant,
     effective_max_row_group_size: Option<usize>,
+    /// The input declared no CRS and WGS84 was assumed (#451).
+    crs_assumed_wgs84: bool,
 }
 
 fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
@@ -3098,6 +3109,7 @@ fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
         out_of_range_features: inputs.tallies.out_of_range,
         unprojectable_features: inputs.tallies.unprojectable,
         out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
+        crs_assumed_wgs84: inputs.crs_assumed_wgs84,
         duration_secs: inputs.start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(inputs.source),
         effective_max_row_group_size: inputs.effective_max_row_group_size,

@@ -1192,6 +1192,13 @@ pub struct ConvertReport {
     /// of range, or when the run replayed a `--plan` artifact (whose saved
     /// totals do not carry exemplars).
     pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
+    /// Whether the input declared no CRS at all (no `geo` metadata, or an
+    /// explicit `crs: null`) and the reader *assumed* WGS84 lon/lat (#451).
+    /// `false` whenever the CRS was declared — including by the GeoParquet
+    /// spec's "omitted `crs` means OGC:CRS84" rule. When `true`, a
+    /// `log::warn!` naming the input was also emitted; this field keeps the
+    /// assumption visible after the log has scrolled by.
+    pub crs_assumed_wgs84: bool,
     /// Wall-clock conversion duration in seconds.
     pub duration_secs: f64,
     /// Remote-input fetch counters (#210): range requests issued and bytes
@@ -3111,6 +3118,8 @@ struct LoadedInput {
     rows: InMemoryRows,
     row_groups_total: usize,
     row_groups_read: usize,
+    /// The input declared no CRS and WGS84 was assumed (#451).
+    crs_assumed_wgs84: bool,
 }
 
 fn load_input_table(
@@ -3147,7 +3156,11 @@ fn load_input_table_with_limit(
     let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
-    let crs = detect_crs_from_kv(builder.metadata().file_metadata().key_value_metadata())?;
+    let (crs, crs_assumed_wgs84) =
+        detect_crs_from_kv_assumed(builder.metadata().file_metadata().key_value_metadata())?;
+    if crs_assumed_wgs84 {
+        warn_assumed_wgs84(&source_single.display_name());
+    }
 
     // Reserved-column collisions (#288): rename any input column named `level`
     // / `point_count` / `coalesced_count` (case-insensitive) out of the way
@@ -3257,6 +3270,7 @@ fn load_input_table_with_limit(
         },
         row_groups_total,
         row_groups_read,
+        crs_assumed_wgs84,
     })
 }
 
@@ -3528,6 +3542,19 @@ fn normalize_convert_options(
 /// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
 /// Runs the full option normalization (validation, cluster/accumulate checks,
 /// the partitioning-coalesce-inert rewrite) before dispatching.
+/// #517: the profile dump is emitted by the streaming pipeline only — the
+/// in-memory reference path has no `Pass2Timers`/phase-wall instrumentation
+/// to dump. Say so rather than exiting 0 with an empty (or untouched) file
+/// and letting an operator conclude the knob is broken.
+fn warn_profile_json_not_streaming() {
+    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
+        log::warn!(
+            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
+             covers the streaming pipeline; --no-streaming writes no dump"
+        );
+    }
+}
+
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
@@ -3549,16 +3576,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
     }
 
-    // #517: the profile dump is emitted by the streaming pipeline only — the
-    // in-memory reference path has no `Pass2Timers`/phase-wall instrumentation
-    // to dump. Say so rather than exiting 0 with an empty (or untouched) file
-    // and letting an operator conclude the knob is broken.
-    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
-        log::warn!(
-            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
-             covers the streaming pipeline; --no-streaming writes no dump"
-        );
-    }
+    warn_profile_json_not_streaming();
 
     // The in-memory reference path below predates multi-partition input
     // (v0.7) and reads through one parquet builder; multi sources are
@@ -3589,6 +3607,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         rows,
         row_groups_total,
         row_groups_read,
+        crs_assumed_wgs84,
     } = load_input_table(source, source_single, options)?;
     let options = &resolved_options;
     let num_features = full.num_rows();
@@ -3798,6 +3817,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         out_of_range_features: tallies.out_of_range,
         unprojectable_features: tallies.unprojectable,
         out_of_range_exemplars: tallies.out_of_range_exemplars,
+        crs_assumed_wgs84,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
         effective_max_row_group_size,
@@ -3974,6 +3994,16 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
 ) -> Result<Crs, ConvertError> {
+    detect_crs_from_kv_assumed(kv).map(|(crs, _)| crs)
+}
+
+/// [`detect_crs_from_kv`], also reporting whether the WGS84 answer was the
+/// missing-metadata *assumption* rather than a declaration (#451 — see
+/// [`crate::quality::CrsInfo::assumed_wgs84`]), so the convert paths can
+/// warn naming the input and record the assumption on the [`ConvertReport`].
+pub(crate) fn detect_crs_from_kv_assumed(
+    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
 
     let info = crate::quality::crs_info_from_kv_metadata(kv)?;
@@ -3987,8 +4017,8 @@ pub(crate) fn detect_crs_from_kv(
     // and leaves `name` unset for every other shape, so `identifier: None`
     // implies `name: None`. The branch was unreachable.
     match crate::quality::classify_crs_info(&info) {
-        CrsKind::Wgs84 => Ok(Crs::Epsg4326),
-        CrsKind::WebMercator => Ok(Crs::Epsg3857),
+        CrsKind::Wgs84 => Ok((Crs::Epsg4326, info.assumed_wgs84)),
+        CrsKind::WebMercator => Ok((Crs::Epsg3857, false)),
         CrsKind::Unknown => Err(ConvertError::UnsupportedCrs {
             crs: info
                 .identifier
@@ -3996,6 +4026,18 @@ pub(crate) fn detect_crs_from_kv(
                 .unwrap_or_else(|| "unknown".to_string()),
         }),
     }
+}
+
+/// #451: tell the user, BY NAME, that this input's CRS is an assumption. The
+/// once-per-process warnings in [`crate::quality`] describe the exact
+/// metadata quirk; this one names the file and the consequence, once per
+/// conversion, from both pipelines.
+pub(super) fn warn_assumed_wgs84(input_name: &str) {
+    log::warn!(
+        "input {input_name}: no CRS declared in the GeoParquet metadata; assuming WGS84 \
+         lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will \
+         be misplaced \u{2014} check the input with `gpio inspect {input_name}`"
+    );
 }
 
 /// Fuzz hook (#633): run one GeoParquet `geo` key-value string through every
@@ -8304,6 +8346,101 @@ mod tests {
         writer.write(&encoded).unwrap();
         writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
         writer.close().unwrap();
+    }
+
+    // --- #451: the assume-WGS84 fallback must be visible ---------------------
+
+    /// Write a parquet file with WKB points whose geometry column is found
+    /// by NAME only: no `geo` key-value metadata at all — the shape that
+    /// makes the reader assume WGS84.
+    fn write_input_without_geo_metadata(path: &Path, coords: &[(f64, f64)]) {
+        use arrow_array::BinaryArray;
+
+        fn point_wkb(x: f64, y: f64) -> Vec<u8> {
+            let mut v = Vec::with_capacity(21);
+            v.push(1u8); // little-endian
+            v.extend_from_slice(&1u32.to_le_bytes()); // wkbPoint
+            v.extend_from_slice(&x.to_le_bytes());
+            v.extend_from_slice(&y.to_le_bytes());
+            v
+        }
+
+        let payloads: Vec<Vec<u8>> = coords.iter().map(|&(x, y)| point_wkb(x, y)).collect();
+        let md: std::collections::HashMap<String, String> = [(
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkb".to_string(),
+        )]
+        .into();
+        let geom_field = Field::new("geometry", DataType::Binary, true).with_metadata(md);
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(geom_field),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..coords.len() as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(BinaryArray::from_iter_values(payloads.iter())),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// #451: when the input declares no CRS at all the reader assumes WGS84,
+    /// and the report must say so — in BOTH pipelines — so the assumption
+    /// stays visible after the warning has scrolled by.
+    #[test]
+    fn report_flags_the_assumed_wgs84_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let coords: Vec<(f64, f64)> = (0..8).map(|i| (i as f64 * 4.0, i as f64 * 2.0)).collect();
+        write_input_without_geo_metadata(&input, &coords);
+
+        for streaming in [true, false] {
+            let out = dir.path().join(format!("out-{streaming}.parquet"));
+            let report = convert_to_overviews(
+                &input,
+                &out,
+                &ConvertOptions {
+                    streaming,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                report.crs_assumed_wgs84,
+                "streaming={streaming}: the WGS84 assumption must surface on the report"
+            );
+        }
+    }
+
+    /// #451 counterpart: a file that *declares* its CRS — explicitly or via
+    /// the spec's omitted-crs-means-CRS84 rule — is never flagged.
+    #[test]
+    fn report_does_not_flag_a_declared_crs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        write_input(&input, &synthetic_geometries(), false, None);
+
+        for streaming in [true, false] {
+            let out = dir.path().join(format!("out-{streaming}.parquet"));
+            let report = convert_to_overviews(
+                &input,
+                &out,
+                &ConvertOptions {
+                    streaming,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(!report.crs_assumed_wgs84, "streaming={streaming}");
+        }
     }
 
     /// Read (id, name, rank, geometry) for a single level from an overview file.
