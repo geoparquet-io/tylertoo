@@ -1,0 +1,63 @@
+/* Brand palette: white #fefdf3, dark green #05221d, orange #e85017.
+   mkdocs.yml sets primary and accent to `custom`, so these variables
+   replace the theme's built-in colors. */
+
+:root {
+  --md-primary-fg-color: #05221d;
+  --md-primary-fg-color--light: #0f3d35;
+  --md-primary-fg-color--dark: #021411;
+  --md-primary-bg-color: #fefdf3;
+  --md-primary-bg-color--light: #fefdf3b3;
+
+  --md-accent-fg-color: #e85017;
+  --md-accent-fg-color--transparent: #e850171a;
+  --md-accent-bg-color: #fefdf3;
+  --md-accent-bg-color--light: #fefdf3b3;
+}
+
+/* Light scheme: green text on the white page. */
+[data-md-color-scheme="default"] {
+  --md-default-fg-color: #05221dde;
+  --md-default-fg-color--light: #05221d8c;
+  --md-default-fg-color--lighter: #05221d52;
+  --md-default-fg-color--lightest: #05221d0d;
+  --md-default-bg-color: #fefdf3;
+  --md-default-bg-color--light: #fefdf3b3;
+  --md-default-bg-color--lighter: #fefdf34d;
+  --md-default-bg-color--lightest: #fefdf31f;
+
+  --md-code-bg-color: #f3f1e2;
+  --md-code-bg-color--light: #f3f1e2b3;
+  --md-code-bg-color--lighter: #f3f1e24d;
+
+  --md-typeset-a-color: #e85017;
+  --md-footer-bg-color: #05221d;
+  --md-footer-bg-color--dark: #021411;
+}
+
+/* Dark scheme: white text on the green page. The theme derives code,
+   table, and footer shades from --md-hue, and 170 is the green's hue. */
+[data-md-color-scheme="slate"] {
+  --md-hue: 170;
+
+  --md-default-fg-color: #fefdf3de;
+  --md-default-fg-color--light: #fefdf38c;
+  --md-default-fg-color--lighter: #fefdf352;
+  --md-default-fg-color--lightest: #fefdf31f;
+  --md-default-bg-color: #05221d;
+  --md-default-bg-color--light: #05221d8a;
+  --md-default-bg-color--lighter: #05221d42;
+  --md-default-bg-color--lightest: #05221d12;
+
+  --md-typeset-a-color: #e85017;
+}
+
+[data-md-color-scheme="slate"] .md-header__title,
+[data-md-color-scheme="slate"] .md-typeset h1,
+[data-md-color-scheme="slate"] .md-typeset h2,
+[data-md-color-scheme="slate"] .md-typeset h3,
+[data-md-color-scheme="slate"] .md-typeset h4,
+[data-md-color-scheme="slate"] .md-typeset h5,
+[data-md-color-scheme="slate"] .md-typeset h6 {
+  color: #fefdf3;
+}
