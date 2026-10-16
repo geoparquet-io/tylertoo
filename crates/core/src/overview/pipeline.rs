@@ -2519,6 +2519,17 @@ mod backing_tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// #665: on Linux `/proc/meminfo` always answers, so export's dense-tile
+    /// refusal always has a figure, and never cgroup `memory.high`, which
+    /// throttles rather than kills.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_oom_memory_limit_reads_the_machine_without_memory_high() {
+        let limit = probe_oom_memory_limit().expect("Linux has /proc/meminfo");
+        assert!(limit.bytes > 0);
+        assert_ne!(limit.source, MemoryLimitSource::CgroupHigh);
+    }
+
     #[test]
     fn explicit_profiles_ignore_workload() {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.

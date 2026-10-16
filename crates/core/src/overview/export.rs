@@ -7452,6 +7452,8 @@ mod tests {
             16,
             "a degenerate zero member size falls back to the ceiling"
         );
+        // Even when RAM is tiny: zero is unknown, not one byte per member.
+        assert_eq!(memory_safe_level_wave(16, &dense, Some(0), Some(8)), 16);
         assert_eq!(
             memory_safe_level_wave(16, &dense, dense_bytes, None),
             16,
