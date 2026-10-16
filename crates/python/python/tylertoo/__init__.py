@@ -444,7 +444,9 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         RuntimeError: Conversion or export failed.
 
     Example:
-        >>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+        >>> report = convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+        >>> sorted(report)
+        ['convert', 'export']
     """
     # Every argument goes to the extension unchanged, by keyword.
     return cast("ConvertReport", _tylertoo.convert(**locals()))
