@@ -537,7 +537,7 @@ pub fn get_geo_metadata(metadata: &ParquetMetaData) -> Result<Option<String>, Er
 // parsed unconditionally by the vendored `parquet` crate regardless of any
 // cargo feature). [`extract_row_group_bounds_tiered`] adds this as a second
 // tier, tried per row group only where covering-column stats (tier 1) are
-// unavailable; [`crate::overview::convert::select_input_row_groups`] is the
+// unavailable; [`crate::overview::convert::select_input_row_groups_any`] is the
 // production entry point that calls it.
 
 /// The geometry column the rest of the conversion will actually read,

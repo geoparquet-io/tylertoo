@@ -571,8 +571,8 @@ struct OverviewArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Convert features whose bbox intersects this lon/lat box. Skips row
-    /// groups outside the box.
+    /// Convert features whose bbox intersects this lon/lat box, or would
+    /// one ±360° wrap away (0..360 data). Skips row groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 
@@ -1223,8 +1223,8 @@ struct TilesArgs {
     #[arg(long, value_name = "GSDS")]
     gsd: Option<String>,
 
-    /// Convert features whose bbox intersects this lon/lat box. Skips row
-    /// groups outside the box.
+    /// Convert features whose bbox intersects this lon/lat box, or would
+    /// one ±360° wrap away (0..360 data). Skips row groups outside the box.
     #[arg(long, value_name = "XMIN,YMIN,XMAX,YMAX")]
     bbox: Option<String>,
 

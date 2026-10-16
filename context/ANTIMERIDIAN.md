@@ -57,6 +57,14 @@ range only past ±540° longitude, the reach of one wrap, so wrapped
 features are neither warned about as lost nor fatal to the all-lost
 gate.
 
+Convert's `--bbox` follows the same rule (#643). A feature matches when
+it, or its copy shifted ±360°, intersects the box: `BboxQuery` in
+`overview/convert.rs` holds the box and its two shifted copies, and both
+the row-group prune and the per-feature filter test all three, in both
+engines and in the `--max-zoom auto` estimate. EPSG:3857 shifts by one
+world width in metres. The `--shard` tile ranges still compare against
+the stored coordinates.
+
 None of this reinterprets the inflated bbox of F1–F3. A polygon with
 vertices at -179.9 and +179.9 still describes a band through lng 0,
 and export still draws that band. Pre-splitting at ±180° (spec §7.2)

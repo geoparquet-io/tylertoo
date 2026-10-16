@@ -1435,6 +1435,11 @@ tylertoo overview madagascar.parquet antananarivo.parquet \
 ```
 
 Use degrees even for EPSG:3857 input; the converter reprojects the box.
+A feature also matches when its copy one world width away (±360°)
+intersects the box, because export draws it there. So
+`--bbox -170,0,-150,20` selects a 0..360 feature stored at longitude 200,
+and a box around longitude 179.5° W selects a cell stored at
+`x: 178 … 181`.
 Without covering statistics, every row group is read before the same
 per-feature test. Compare `ConvertReport.row_groups_read` with
 `row_groups_total` to check pruning.

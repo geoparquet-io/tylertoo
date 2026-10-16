@@ -298,7 +298,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
         read_batch_size: Rows per
             [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
-        bbox: Keep features that intersect this lon/lat box.
+        bbox: Keep features that intersect this lon/lat box, also one
+            ±360° wrap away, as for 0..360 data.
         filter: SQL-style predicate, such as `"confidence > 0.8"`.
         profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
             `"speed"` holds output in RAM, `"bounded"` uses disk, and

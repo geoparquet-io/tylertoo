@@ -556,7 +556,10 @@ pub struct ConvertOptions {
     /// (closed-interval AABB test): input row groups whose GeoParquet 1.1
     /// bbox covering statistics don't intersect are skipped at the parquet
     /// footer level (their data pages are never read), and features of the
-    /// surviving row groups are filtered exactly by their own bbox. Inputs
+    /// surviving row groups are filtered exactly by their own bbox. A
+    /// feature also matches when its copy shifted ±360° intersects the
+    /// region, since export draws it there (#342, #643): `-170,0,-150,20`
+    /// selects a 0..360 feature stored at lng 200. Inputs
     /// without covering statistics degrade gracefully — every row group is
     /// read and only the exact per-feature filter applies, so the output is
     /// identical either way. Default `None` (full-extent conversion,
@@ -2441,14 +2444,14 @@ pub(crate) fn convert_to_overviews_strategy(
 /// Decode every geometry in `full` (row-aligned to the batch) and drop the rows
 /// that cannot participate in level assignment: a null/empty/non-finite
 /// geometry, or — under a regional extract (#102) — one whose bbox misses
-/// `bbox_units`. The batch and the geometry vec are filtered together so every
+/// `bbox_query`. The batch and the geometry vec are filtered together so every
 /// downstream index stays aligned. Returns the filtered batch and its surviving
 /// geometries.
 fn decode_and_filter_geometries(
     full: RecordBatch,
     geom_idx: usize,
     geom_field: &Field,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter_mask: Option<&[Option<bool>]>,
 ) -> Result<DecodedInput, ConvertError> {
     let geom_array: Arc<dyn GeoArrowArray> =
@@ -2471,7 +2474,7 @@ fn decode_and_filter_geometries(
             match g.as_ref().filter(|g| usable_geometry(g)) {
                 // Regional extract (#102): drop features whose bbox misses the
                 // requested region exactly, independent of row-group pruning.
-                Some(g) => bbox_units.is_none_or(|bb| bboxes_intersect(&geometry_bbox(g), bb)),
+                Some(g) => bbox_query.is_none_or(|q| q.intersects(&geometry_bbox(g))),
                 None => {
                     geom_skipped += 1;
                     false
@@ -3359,10 +3362,10 @@ fn load_input_table_with_limit(
     // compose by intersection. Groups without stats are kept; the exact
     // per-feature filters below guarantee identical output either way.
     let row_groups_total = builder.metadata().num_row_groups();
-    let bbox_units = options.bbox.map(|b| bbox_to_crs_units(&b, crs));
+    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
     let combined_sel = select_input_row_groups_combined(
         builder.metadata(),
-        bbox_units.as_ref(),
+        bbox_query.as_ref(),
         bound_filter.as_ref(),
     );
     let read_selection = combined_sel.clone();
@@ -3372,7 +3375,7 @@ fn load_input_table_with_limit(
     let (builder, row_groups_read) = match combined_sel {
         Some(sel) => {
             let n = sel.len();
-            let what = pruning_label(bbox_units.is_some(), bound_filter.is_some());
+            let what = pruning_label(bbox_query.is_some(), bound_filter.is_some());
             log::info!("{what} filter: reading {n}/{row_groups_total} input row groups");
             (builder.with_row_groups(sel), n)
         }
@@ -3405,7 +3408,7 @@ fn load_input_table_with_limit(
         full,
         geom_idx,
         &geom_field,
-        bbox_units.as_ref(),
+        bbox_query.as_ref(),
         filter_mask.as_deref(),
     )?;
     let row_locator = source.stream_row_locator(
@@ -4271,6 +4274,47 @@ pub(super) fn bbox_to_crs_units(bbox: &[f64; 4], crs: Crs) -> [f64; 4] {
     }
 }
 
+/// A [`ConvertOptions::bbox`] query in the input's CRS units, with its copies
+/// shifted one world width west and east (#643).
+///
+/// Export draws a feature within ±540° at its wrapped position (#342), so a
+/// feature matches when it, or its copy shifted ±360° (±2 × `WEBMERC_HALF_M`
+/// for EPSG:3857), intersects the bbox. Shifting the query box instead of
+/// each feature is the same test. Export's wave read builds the same three
+/// boxes (`collect_wave`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BboxQuery {
+    /// The bbox as given, then shifted one world width west, then east.
+    boxes: [[f64; 4]; 3],
+}
+
+impl BboxQuery {
+    /// Build the query from a lon/lat-degree bbox for an input in `crs`.
+    pub(crate) fn new(bbox_deg: &[f64; 4], crs: Crs) -> Self {
+        let world = match crs {
+            Crs::Epsg4326 => 360.0,
+            // `lnglat_to_webmerc` is linear in x, so one world is exact.
+            Crs::Epsg3857 => 2.0 * WEBMERC_HALF_M,
+        };
+        let base = bbox_to_crs_units(bbox_deg, crs);
+        let shift = |dx: f64| [base[0] + dx, base[1], base[2] + dx, base[3]];
+        Self {
+            boxes: [base, shift(-world), shift(world)],
+        }
+    }
+
+    /// The three boxes to test, in CRS units.
+    pub(crate) fn boxes(&self) -> &[[f64; 4]; 3] {
+        &self.boxes
+    }
+
+    /// Whether a feature bbox, or its copy one world width away, intersects
+    /// the query ([`bboxes_intersect`] semantics).
+    pub(crate) fn intersects(&self, fbbox: &[f64; 4]) -> bool {
+        self.boxes.iter().any(|b| bboxes_intersect(fbbox, b))
+    }
+}
+
 /// Closed-interval AABB intersection of two `[xmin, ymin, xmax, ymax]` boxes
 /// (touching edges count as intersecting, matching
 /// [`crate::covering::RowGroupBounds::intersects`]).
@@ -4296,8 +4340,9 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
     }
 }
 
-/// Row groups of the input whose bbox statistics intersect `bbox_units`
-/// (`[xmin, ymin, xmax, ymax]` in the file's CRS units).
+/// Row groups of the input whose bbox statistics intersect any of `boxes`
+/// (`[xmin, ymin, xmax, ymax]` in the file's CRS units). A [`BboxQuery`]
+/// passes its bbox and the bbox shifted one world width each way (#643).
 ///
 /// Statistics-only: operates purely on the parsed parquet footer, tiered
 /// (#497) between GeoParquet 1.1 covering-column stats and GeoParquet 2.0
@@ -4309,7 +4354,7 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 ///
 /// The session CRS is re-derived from `metadata` itself
 /// (footer-metadata-only, no I/O — the same detection that already
-/// produced `bbox_units` via [`bbox_to_crs_units`]) so tier 2 can refuse to
+/// produced `boxes` via [`bbox_to_crs_units`]) so tier 2 can refuse to
 /// prune when the geometry column's declared CRS doesn't agree with it
 /// (never guess). An undetectable CRS here (shouldn't happen — the pipeline
 /// already errored out earlier if so) just skips tier 2, same as any other
@@ -4320,28 +4365,40 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// [`find_geometry_column`]) and threaded into tier 2, so a file with more
 /// than one geometry column can never be pruned on an envelope the reader
 /// will not read (#518).
-pub(crate) fn select_input_row_groups(
+pub(crate) fn select_input_row_groups_any(
     metadata: &parquet::file::metadata::ParquetMetaData,
-    bbox_units: &[f64; 4],
+    boxes: &[[f64; 4]],
 ) -> Vec<usize> {
     let bounds = input_row_group_bounds(metadata);
-    let filter = crate::tile::TileBounds {
-        lng_min: bbox_units[0],
-        lat_min: bbox_units[1],
-        lng_max: bbox_units[2],
-        lat_max: bbox_units[3],
-    };
+    let filters: Vec<crate::tile::TileBounds> = boxes
+        .iter()
+        .map(|b| crate::tile::TileBounds {
+            lng_min: b[0],
+            lat_min: b[1],
+            lng_max: b[2],
+            lat_max: b[3],
+        })
+        .collect();
     (0..metadata.num_row_groups())
         .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
-            Some(b) => b.intersects(&filter),
+            Some(b) => filters.iter().any(|f| b.intersects(f)),
             None => true, // no stats — must read to stay correct
         })
         .collect()
 }
 
+/// [`select_input_row_groups_any`] for a single box.
+#[cfg(test)]
+pub(crate) fn select_input_row_groups(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    bbox_units: &[f64; 4],
+) -> Vec<usize> {
+    select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
+}
+
 /// Per-row-group bboxes for one part, from footer metadata only.
 ///
-/// The extraction half of [`select_input_row_groups`], split out because the
+/// The extraction half of [`select_input_row_groups_any`], split out because the
 /// shard planner (#498) wants the same bboxes for a different purpose: it
 /// spreads each group's rows over the pivot tiles the bbox covers to balance
 /// the cut. Both callers therefore see exactly the same view of the input,
@@ -4395,10 +4452,11 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
 /// (#315). `None` when neither pruning is active (read everything).
 fn select_input_row_groups_combined(
     metadata: &parquet::file::metadata::ParquetMetaData,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
 ) -> Option<Vec<usize>> {
-    let bbox_sel: Option<Vec<usize>> = bbox_units.map(|bb| select_input_row_groups(metadata, bb));
+    let bbox_sel: Option<Vec<usize>> =
+        bbox_query.map(|q| select_input_row_groups_any(metadata, q.boxes()));
     let filter_sel: Option<Vec<usize>> = filter.map(|f| f.select_row_groups(metadata));
     match (bbox_sel, filter_sel) {
         (Some(a), Some(b)) => Some(a.into_iter().filter(|i| b.contains(i)).collect()),
@@ -14281,6 +14339,36 @@ mod tests {
             let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
             assert_eq!(ids, vec![0], "streaming={streaming}");
         }
+    }
+
+    #[test]
+    fn bbox_query_tests_the_box_and_its_world_width_copies() {
+        let q = BboxQuery::new(&[-165.0, 15.0, -155.0, 25.0], Crs::Epsg4326);
+        assert_eq!(
+            q.boxes(),
+            &[
+                [-165.0, 15.0, -155.0, 25.0],
+                [-525.0, 15.0, -515.0, 25.0],
+                [195.0, 15.0, 205.0, 25.0],
+            ]
+        );
+        assert!(q.intersects(&[-160.0, 20.0, -160.0, 20.0]), "as stored");
+        assert!(q.intersects(&[200.0, 20.0, 200.0, 20.0]), "one wrap east");
+        assert!(q.intersects(&[-520.0, 20.0, -520.0, 20.0]), "one wrap west");
+        assert!(!q.intersects(&[-160.0, 30.0, -160.0, 30.0]), "latitude");
+        assert!(!q.intersects(&[0.0, 20.0, 0.0, 20.0]), "elsewhere");
+
+        let q = BboxQuery::new(&[-161.0, 9.0, -159.0, 11.0], Crs::Epsg3857);
+        let [base, west, east] = *q.boxes();
+        let world = 2.0 * WEBMERC_HALF_M;
+        assert_eq!(
+            base,
+            bbox_to_crs_units(&[-161.0, 9.0, -159.0, 11.0], Crs::Epsg3857)
+        );
+        assert_eq!(west, [base[0] - world, base[1], base[2] - world, base[3]]);
+        assert_eq!(east, [base[0] + world, base[1], base[2] + world, base[3]]);
+        let (x, y) = lnglat_to_webmerc(200.0, 10.0);
+        assert!(q.intersects(&[x, y, x, y]));
     }
 
     /// #553 review: an out-of-range exemplar's `row` is the row in the
