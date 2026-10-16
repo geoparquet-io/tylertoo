@@ -501,44 +501,37 @@ tables via `format_duckdb_knobs.py`; recipe in
 
 ---
 
-## 3. Conversion cost (wall time + peak RSS)
+## 3. Conversion cost — the tippecanoe head-to-head lives in `benchmarks/e2e/` now
 
-> **Stale — kept for the record.** These numbers predate the streaming
-> converter (H3) and the parallel/validation optimization levers: the
-> Moldova row below is the old in-memory pipeline. Current numbers
-> (convert ~55 s / ~320 MB peak RSS on the same file) and the change
-> history are in [`PROFILE.md`](./PROFILE.md).
->
-> **For a head-to-head against tippecanoe, use
-> [`benchmarks/e2e/`](../e2e/README.md) instead** (#447). The table below
-> compares `tylertoo overview` (which writes an overview *GeoParquet*)
-> against tippecanoe (which writes a *tileset*) — different artifacts, so
-> the ratio was never meaningful, and tippecanoe's version was whatever
-> happened to be on `$PATH`. The e2e harness pins tippecanoe by tag and
-> SHA, compares PMTiles to PMTiles, and reports the input-conversion share
-> separately.
+The table that used to sit here compared `tylertoo overview` (which writes an
+overview *GeoParquet*) against whatever `tippecanoe` was on `$PATH` (which
+writes a *tileset*) — different artifacts, so the ratio was never meaningful,
+and its Moldova row (the pre-H3, in-memory pipeline: 10:57 wall, 5.4 GB peak
+RSS, **3.6× slower** than tippecanoe) predated the streaming converter. That
+run is preserved in git history (`git log -- benchmarks/overview/RESULTS.md`,
+pre-#447) and the change history since is in [`PROFILE.md`](./PROFILE.md).
 
-`tylertoo overview` (duplicating, default knobs, z0..14, reads GeoParquet
-natively) vs the golden tippecanoe workflow `gpio convert geojson <src> |
-tippecanoe -P <recorded flags>`. Both wrapped in `/usr/bin/time -v`. The
-tippecanoe column **includes** the mandatory GeoParquet→GeoJSON decode
-(tippecanoe cannot read GeoParquet in v2.49) — a step the native overview
-path avoids; peak RSS is the largest single process in the pipe.
+The replacement (#447) is the **end-to-end** comparison — GeoParquet in,
+PMTiles out, same artifact on both sides, tippecanoe pinned by tag + verified
+SHA, the manifest's recorded flags on tippecanoe's side — measured by
+[`benchmarks/e2e/run_corpus.sh`](../e2e/run_corpus.sh) on the same corpus
+datasets. Full tables, provenance and caveats (starting with "the machine was
+not idle"): [`benchmarks/e2e/RESULTS.md`](../e2e/RESULTS.md) §1b. The
+headline, from `benchmarks/e2e/corpus_results.json` (tylertoo 0.8.0 @
+`5885c17` vs tippecanoe v2.79.0, Apple M3 Pro, 2026-10-15):
 
-| dataset | overview wall | overview peak RSS | tippecanoe(+gpio) wall | tippecanoe(+gpio) peak RSS |
-|---|---|---|---|---|
-| lines-portland-medium | 0:01.62 | 507 MB | 0:28.52 | 681 MB |
-| polygons-portland-medium | 0:03.54 | 1305 MB | 1:25.55 | 1251 MB |
-| polygons-ftw-moldova-large | 10:57.23 | 5437 MB | 3:03.62 | 1155 MB |
+| dataset | features | tylertoo e2e (parquet→pmtiles) | tippecanoe e2e (convert+tile) | e2e speedup | tylertoo / tippecanoe peak RSS |
+|---|---|---|---|---|---|
+| points-nyc-medium | 597,782 | 1.39 s | 30.03 s | **21.6×** | 600 MB / 519 MB |
+| lines-portland-medium | 301,609 | 1.40 s | 28.30 s | **20.2×** | 1,611 MB / 652 MB |
+| polygons-portland-medium | 813,456 | 2.69 s | 57.22 s | **21.3×** | 999 MB / 967 MB |
+| polygons-ftw-moldova-large | 631,910 | 13.87 s | 119.28 s | **8.6×** | 1,848 MB / 926 MB |
 
-On the medium datasets the overview converter is **18–24× faster** at
-comparable or lower memory. On the large dense Moldova set it is **3.6×
-slower and 4.7× heavier** than tippecanoe: the v1 overview pipeline is
-fully in-memory and rebuilds/decodes geometry per level, so 631 k polygons
-with 38 M vertices duplicated across 12 levels blow memory to 5.4 GB. This
-was the exact motivation for the V4/H3 streaming refactor — since
-shipped as the default pipeline (see `PROFILE.md`; the plan is archived
-at `context/archive/OVERVIEWS_PLAN.md`).
+The Moldova row — the exact file the old table lost 3.6× on — is now **8.6×
+faster** end-to-end at a third of the old pipeline's memory, though still
+2× tippecanoe's RSS. tylertoo's speed is parallelism (6–7 cores busy vs
+tippecanoe's 1.6–2.6) plus the native columnar read, bought with the larger
+working set.
 
 ---
 

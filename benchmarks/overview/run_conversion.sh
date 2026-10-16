@@ -2,6 +2,13 @@
 #
 # run_conversion.sh - conversion-cost table: wall time + peak RSS.
 #
+# SUPERSEDED for the tippecanoe head-to-head (#447): this compares different
+# artifacts (overview GeoParquet vs a tileset) against whatever tippecanoe is
+# on PATH, and the GNU-only `/usr/bin/time -v` / `grep -oP` make it
+# Linux-only. The end-to-end, pinned, portable comparison is
+# benchmarks/e2e/run_corpus.sh. This script remains for the overview-regen
+# timing it reuses.
+#
 #   overview  : `tylertoo overview` (duplicating, default knobs, z0..14)
 #               reading the gpio GeoParquet NATIVELY.
 #   tippecanoe: the documented golden workflow -- `gpio convert geojson
