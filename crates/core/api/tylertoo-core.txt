@@ -2750,6 +2750,7 @@ pub enum tylertoo_core::overview::tiles::TilesInput
 pub tylertoo_core::overview::tiles::TilesInput::Manifest(std::path::PathBuf)
 pub tylertoo_core::overview::tiles::TilesInput::Path(std::path::PathBuf)
 impl tylertoo_core::overview::tiles::TilesInput
+pub fn tylertoo_core::overview::tiles::TilesInput::convert(&self, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::tiles::TilesInput::derive_layer_name(&self) -> alloc::string::String
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesInput
 pub fn tylertoo_core::overview::tiles::TilesInput::clone(&self) -> tylertoo_core::overview::tiles::TilesInput
@@ -2804,6 +2805,7 @@ pub struct tylertoo_core::overview::tiles::IntermediateOverview
 pub tylertoo_core::overview::tiles::IntermediateOverview::bytes: u64
 pub tylertoo_core::overview::tiles::IntermediateOverview::path: std::path::PathBuf
 pub tylertoo_core::overview::tiles::IntermediateOverview::retained: bool
+pub tylertoo_core::overview::tiles::IntermediateOverview::space_warning: core::option::Option<alloc::string::String>
 impl core::clone::Clone for tylertoo_core::overview::tiles::IntermediateOverview
 pub fn tylertoo_core::overview::tiles::IntermediateOverview::clone(&self) -> tylertoo_core::overview::tiles::IntermediateOverview
 impl core::cmp::Eq for tylertoo_core::overview::tiles::IntermediateOverview
@@ -2825,8 +2827,6 @@ pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Opti
 pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::tiles::TilesOptions::layer_name: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::tiles::TilesOptions::max_zoom: u8
-pub tylertoo_core::overview::tiles::TilesOptions::min_zoom: u8
 pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
 pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
 pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
@@ -2866,9 +2866,13 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesReport
 pub struct tylertoo_core::overview::tiles::TilesShard
+pub tylertoo_core::overview::tiles::TilesShard::cut_digest: alloc::string::String
 pub tylertoo_core::overview::tiles::TilesShard::pivot_zoom: u8
 pub tylertoo_core::overview::tiles::TilesShard::range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::tiles::TilesShard::role: tylertoo_core::shard::ShardRole
+impl tylertoo_core::overview::tiles::TilesShard
+pub fn tylertoo_core::overview::tiles::TilesShard::apply_selection(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
+pub fn tylertoo_core::overview::tiles::TilesShard::apply_to_convert(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::clone(&self) -> tylertoo_core::overview::tiles::TilesShard
 impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesShard
@@ -2876,7 +2880,6 @@ impl core::cmp::PartialEq for tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::eq(&self, &tylertoo_core::overview::tiles::TilesShard) -> bool
 impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for tylertoo_core::overview::tiles::TilesShard
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::TilesShard
 impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesShard
 impl core::marker::Send for tylertoo_core::overview::tiles::TilesShard
@@ -2889,6 +2892,7 @@ pub trait tylertoo_core::overview::tiles::TilesObserver
 pub fn tylertoo_core::overview::tiles::TilesObserver::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
 impl tylertoo_core::overview::tiles::TilesObserver for ()
 pub fn ()::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
+pub fn tylertoo_core::overview::tiles::check_keep_overview(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::check_knob_columns(&tylertoo_core::overview::convert::ConvertOptions, &tylertoo_core::overview::export::FeatureOrder, core::option::Option<&str>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles_observed(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, &mut dyn tylertoo_core::overview::tiles::TilesObserver) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>

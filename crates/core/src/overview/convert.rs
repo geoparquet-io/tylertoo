@@ -2077,6 +2077,16 @@ pub fn parse_entry_zoom(spec: &str) -> Result<crate::overview::ladder::EntryZoom
             .trim()
             .parse()
             .map_err(|_| format!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+        // #428, same rule as `parse_class_rank`: `f64::from_str` accepts
+        // `nan` and `inf`. A NaN rung is not ordered against any column
+        // value, and an `inf` rung snaps the match to the SMALLEST observed
+        // value — the exact inverse of the ladder this flag documents.
+        if !value.is_finite() {
+            return Err(format!(
+                "--entry-zoom {spec:?}: {value:?} is not a finite number (NaN and infinity \
+                 cannot be ordered against the column's values)"
+            ));
+        }
         let zoom: u8 = zoom
             .trim()
             .parse()
@@ -5020,18 +5030,12 @@ pub(super) fn spill_space_check(
 
 /// Free bytes available to the current user on the volume holding `dir`
 /// (statvfs / `GetDiskFreeSpaceEx` via `fs4`), or `None` if the probe fails.
-/// Compiled to a stub without the `remote` feature — nothing spills there,
-/// and [`spill_space_check`] never probes for a local input.
-fn probe_available_space(dir: &Path) -> Option<u64> {
-    #[cfg(feature = "remote")]
-    {
-        fs4::available_space(dir).ok()
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = dir;
-        None
-    }
+/// Unconditional since #439: the tiles facade's #314 preflight guards a
+/// LOCAL intermediate, so the probe can no longer ride the `remote` feature
+/// (`fs4` is a plain dependency now). Shared with that preflight
+/// ([`crate::overview::tiles`]).
+pub(crate) fn probe_available_space(dir: &Path) -> Option<u64> {
+    fs4::available_space(dir).ok()
 }
 
 /// Emit the #272 spill free-space preflight warning, if warranted. Thin
@@ -10152,6 +10156,24 @@ mod tests {
             "density:5000=999", // beyond u8
         ] {
             assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
+        }
+
+        // #428's class-rank rule applies to rungs too: `f64::from_str`
+        // accepts `nan`/`inf`, a NaN rung is unordered against every value,
+        // and an `inf` rung snaps to the SMALLEST observed value — the
+        // inverse of the ladder this flag documents.
+        for bad in [
+            "density:nan=4",
+            "density:NaN=4",
+            "density:inf=4",
+            "density:-inf=4,100=8",
+            "density:infinity=4",
+        ] {
+            let err = parse_entry_zoom(bad).unwrap_err().to_ascii_lowercase();
+            assert!(
+                err.contains("finite"),
+                "{bad:?} must be rejected as non-finite, got: {err}"
+            );
         }
     }
 

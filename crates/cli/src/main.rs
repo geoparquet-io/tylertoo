@@ -1520,38 +1520,28 @@ fn resolve_io_for_planning(
 /// Convert via the core pipeline, dispatching on the input shape: a path
 /// (file/dir/glob/URL/prefix, resolved by core) or a `--files-from`
 /// manifest (explicit ordered file list, order preserved verbatim).
+///
+/// The dispatch itself is core's ([`TilesInput::convert`], #439) — the
+/// `tiles` facade routes both shapes the same way, and two copies of that
+/// would drift. This only adds `overview`'s `anyhow` context.
+///
+/// [`TilesInput::convert`]: tylertoo_core::overview::tiles::TilesInput::convert
 fn run_convert(
     spec: &InputSpec,
     output: &std::path::Path,
     options: &tylertoo_core::overview::convert::ConvertOptions,
 ) -> Result<tylertoo_core::overview::convert::ConvertReport> {
-    run_convert_typed(spec, output, options)
+    tiles_input(spec)
+        .convert(output, options)
         .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
 }
 
-/// [`run_convert`] keeping the typed error.
-///
-/// `tiles --shard` has to tell "this shard owns no rows" (a legal, expected
-/// outcome) apart from every other failure, and the `anyhow` wrapper above
-/// erases exactly that distinction.
-fn run_convert_typed(
-    spec: &InputSpec,
-    output: &std::path::Path,
-    options: &tylertoo_core::overview::convert::ConvertOptions,
-) -> std::result::Result<
-    tylertoo_core::overview::convert::ConvertReport,
-    tylertoo_core::overview::convert::ConvertError,
-> {
-    use tylertoo_core::input_set::ConvertSource;
-    use tylertoo_core::overview::convert::{
-        convert_to_overviews, convert_to_overviews_sources, ConvertError,
-    };
-
+/// The core-side view of a resolved input shape.
+fn tiles_input(spec: &InputSpec) -> tylertoo_core::overview::tiles::TilesInput {
+    use tylertoo_core::overview::tiles::TilesInput;
     match spec {
-        InputSpec::Path(p) => convert_to_overviews(p, output, options),
-        InputSpec::Manifest(m) => ConvertSource::from_manifest(m)
-            .map_err(ConvertError::from)
-            .and_then(|source| convert_to_overviews_sources(&source, output, options)),
+        InputSpec::Path(p) => TilesInput::Path(p.clone()),
+        InputSpec::Manifest(m) => TilesInput::Manifest(m.clone()),
     }
 }
 
@@ -1623,6 +1613,20 @@ struct ShardJob {
     /// The bound plan, kept so a `--max-zoom auto` run can re-check the
     /// pivot once the real zoom is known (#444).
     plan: tylertoo_core::shard::ShardPlan,
+}
+
+impl ShardJob {
+    /// The core-side view of this job: everything the facade needs, without
+    /// the bound plan the CLI keeps for its own `--max-zoom auto` re-check.
+    /// Core owns every consequence of it (#439).
+    fn as_tiles_shard(&self) -> tylertoo_core::overview::tiles::TilesShard {
+        tylertoo_core::overview::tiles::TilesShard {
+            role: self.role,
+            range: self.range,
+            pivot_zoom: self.pivot,
+            cut_digest: self.cut_digest.clone(),
+        }
+    }
 }
 
 /// Resolve `--shard` / `--shard-plan` into a [`ShardJob`], failing fast on
@@ -1796,7 +1800,6 @@ fn tiles_convert_options(
 ) -> Result<(
     tylertoo_core::overview::convert::ConvertOptions,
     Option<ShardJob>,
-    u8,
 )> {
     use tylertoo_core::overview::level::Mode;
 
@@ -1830,28 +1833,14 @@ fn tiles_convert_options(
         args.plan_only,
     )?;
     if let Some(job) = &shard {
-        options.shard = job.range;
-        // #498: fingerprinted, unlike `shard` itself — the cut is fleet-wide,
-        // this job's slice of it is not. The coarse job writes it into the
-        // plan; every shard has to present the same one.
-        options.shard_plan_digest = Some(job.cut_digest.clone());
-        // #541: the coarse job builds only the levels it exports. Its pass 1
-        // and level assignment stay full-range, so the plan it saves is
-        // byte-identical to a full run's and every data shard consumes it
-        // unchanged. `resolve_shard_job` has already refused a pivot at or
-        // below --min-zoom, and a GSD ladder has no zoom to cap against.
-        //
-        // Only on the streaming pipeline: `--no-streaming` (the in-memory
-        // reference path) builds every planned level, so the coarse job falls
-        // back to the uncapped convert there. Its tiles are identical either
-        // way — the export's own ceiling below is what bounds them — it just
-        // pays for the finer levels, which is what the user opted into.
-        //
-        // #560: and not at all under --plan-only, which materializes no level
-        // whatsoever — core refuses a ceiling it has no pass 2 to apply it to.
-        if !args.plan_only && job.range.is_none() && args.gsd.is_none() && options.streaming {
-            options.zoom_ceiling = Some(job.pivot.saturating_sub(1));
-        }
+        // #498/#541: core owns what a sharded job does to its convert
+        // (#439). Only the fleet-wide selection here — the row-pruning range
+        // and the fingerprinted cut digest — because this builder is shared
+        // with `--plan-only` (#560), which materializes no level and so must
+        // carry no ceiling core would refuse for having no pass 2.
+        // `convert_to_pmtiles` applies the coarse job's ceiling itself for
+        // the runs that do build tiles.
+        job.as_tiles_shard().apply_selection(&mut options);
     }
 
     // #386/#443: the property selection is applied at convert, so an excluded
@@ -1886,7 +1875,7 @@ fn tiles_convert_options(
             log_shard_job(job, args.min_zoom, max_zoom);
         }
     }
-    Ok((options, shard, max_zoom))
+    Ok((options, shard))
 }
 
 /// The export knobs `tiles` can check without reading anything (#433): the
@@ -1916,15 +1905,11 @@ fn preflight_export_flags(args: &TilesArgs) -> Result<Option<tylertoo_core::shar
         .map(tylertoo_core::shard::TileRange::parse)
         .transpose()?;
 
-    if let Some(path) = &args.keep_overview {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            anyhow::ensure!(
-                parent.is_dir(),
-                "--keep-overview directory {} does not exist",
-                parent.display()
-            );
-        }
-    }
+    // Core's guard, not a second copy of it (#439): the facade re-checks
+    // this anyway, and two hand-synced copies of one message is the drift
+    // this refactor exists to end. Here so a `--plan-only` run — which
+    // never reaches the facade — still refuses it in milliseconds.
+    tylertoo_core::overview::tiles::check_keep_overview(args.keep_overview.as_deref())?;
     Ok(tile_range)
 }
 
@@ -1996,7 +1981,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     // #600: export flags are ignored here, but not unchecked.
     preflight_export_flags(&args)?;
 
-    let (options, shard, _max_zoom) = tiles_convert_options(&args, &spec)?;
+    let (options, shard) = tiles_convert_options(&args, &spec)?;
     // A data shard reads a subset of the input, so a plan it wrote would
     // describe only that subset. Core refuses the pairing too (--shard with
     // --save-plan); named here against the flag the user actually typed.
@@ -2133,8 +2118,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::convert::ConvertReport;
     use tylertoo_core::overview::tiles::{
-        self, IntermediateOverview, TilesInput, TilesObserver, TilesOptions, TilesOutcome,
-        TilesShard,
+        self, IntermediateOverview, TilesObserver, TilesOptions, TilesOutcome,
     };
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -2159,7 +2143,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // early call also parses `--tile-range`, which is argument mapping.
     let manual_range = preflight_export_flags(&args)?;
 
-    let (options, shard, max_zoom) = tiles_convert_options(&args, &spec)?;
+    let (options, shard) = tiles_convert_options(&args, &spec)?;
 
     let tiles_options = TilesOptions {
         convert: options,
@@ -2169,13 +2153,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // stem for --files-from (core owns the rules).
         layer_name: args.layer_name.clone(),
         keep_overview: args.keep_overview.clone(),
-        min_zoom: args.min_zoom,
-        max_zoom,
-        shard: shard.map(|job| TilesShard {
-            role: job.role,
-            range: job.range,
-            pivot_zoom: job.pivot,
-        }),
+        // The declared zoom range comes from `convert.levels`, which
+        // `tiles_convert_options` has already resolved (`--max-zoom auto`
+        // included); core reads it there rather than from a second copy.
+        shard: shard.as_ref().map(ShardJob::as_tiles_shard),
         tile_range: manual_range,
         tile_buffer: args.tile_buffer,
         tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
@@ -2184,10 +2165,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         feature_order: args.feature_order.clone(),
         feature_id: args.feature_id.clone(),
     };
-    let input = match &spec {
-        InputSpec::Path(p) => TilesInput::Path(p.clone()),
-        InputSpec::Manifest(m) => TilesInput::Manifest(m.clone()),
-    };
+    let input = tiles_input(&spec);
 
     // #314: the disk cost of the one-shot facade must not be silent — name
     // the intermediate's path, size and fate between the two halves, so a

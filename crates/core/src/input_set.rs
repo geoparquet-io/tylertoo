@@ -1600,7 +1600,7 @@ where
 /// pairs: entries are trimmed; blank lines and lines whose first non-space
 /// character is `#` are skipped. Order is preserved verbatim (see
 /// [`ConvertSource::from_manifest`]).
-fn manifest_entries(text: &str) -> Vec<(usize, &str)> {
+pub(crate) fn manifest_entries(text: &str) -> Vec<(usize, &str)> {
     text.lines()
         .enumerate()
         .filter_map(|(i, line)| {

@@ -409,6 +409,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     feature_order: Literal["input"] | str = "input",
+    spill_dir: str | os.PathLike[str] | None = None,
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
@@ -426,6 +427,12 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         tile_size_limit: See `export_pmtiles()`.
         simple_clip_fastpath: See `export_pmtiles()`.
         feature_order: See `export_pmtiles()`.
+        spill_dir: Scratch directory for the intermediate overview and
+            the export's spill (the CLI's `--spill-dir`). The
+            intermediate is at least input-sized; without this it goes
+            to `$TMPDIR`, then the output's directory. Set it when
+            `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
+            when the chosen volume looks too small.
 
     Returns:
         Both halves' reports, keyed `"convert"` and `"export"` like the

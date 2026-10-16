@@ -360,3 +360,54 @@ class TestConvertCombinedReport:
 
             assert set(one_shot["convert"]) == set(overview_report)
             assert set(one_shot["export"]) == set(export_report)
+
+
+class TestConvertSpillDir:
+    """The `spill_dir` kwarg (#439 review).
+
+    The one-shot facade puts its intermediate overview in `spill_dir`,
+    then `$TMPDIR`, then the output's directory. Before this kwarg a
+    Python caller could not redirect an at-least-input-sized file away
+    from `$TMPDIR`, which is a small tmpfs in many containers.
+    """
+
+    def test_convert_honors_spill_dir(self):
+        """The intermediate goes to spill_dir, and is cleaned up."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            spill = Path(tmpdir) / "spill"
+            spill.mkdir()
+
+            report = tylertoo.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                spill_dir=str(spill),
+            )
+
+            assert output.exists()
+            assert set(report) == {"convert", "export"}
+            # The temp intermediate is removed after the export, so the
+            # directory it was created in is empty again.
+            assert list(spill.iterdir()) == [], "the intermediate must be cleaned up"
+
+    def test_convert_rejects_missing_spill_dir(self):
+        """A spill_dir that does not exist is an error, not a silent fallback."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            missing = Path(tmpdir) / "nope" / "deeper"
+
+            with pytest.raises((ValueError, RuntimeError)) as exc_info:
+                tylertoo.convert(
+                    input=str(input_file),
+                    output=str(output),
+                    min_zoom=0,
+                    max_zoom=6,
+                    spill_dir=str(missing),
+                )
+            assert "nope" in str(exc_info.value), str(exc_info.value)

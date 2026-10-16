@@ -2,10 +2,11 @@
 //!
 //! This module exposes the tylertoo-core functionality to Python via pyo3.
 
-use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use tylertoo_core::input_set::ConvertSource;
 use tylertoo_core::overview::assign::{
@@ -101,8 +102,8 @@ fn resolve_max_zoom_py(
 /// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input')"
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
@@ -115,6 +116,7 @@ fn convert(
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
     feature_order: &str,
+    spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
@@ -126,9 +128,17 @@ fn convert(
             min_zoom,
             max_zoom: max_zoom.plan_zoom(),
         },
+        // #439: the scratch knob the CLI spells `--spill-dir`. It also picks
+        // where the intermediate overview lands (precedence: this, then
+        // `$TMPDIR`, then the output's directory), which is why this facade
+        // exposes it: `$TMPDIR` is tmpfs in many containers, and the
+        // intermediate is at least input-sized.
+        spill_dir,
         ..ConvertOptions::default()
     };
-    let max_zoom = resolve_max_zoom_py(py, max_zoom, &mut convert_options, || {
+    // Resolves `auto` and writes the chosen zoom back into `levels`, which
+    // is where the facade reads the declared range from.
+    resolve_max_zoom_py(py, max_zoom, &mut convert_options, || {
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
@@ -142,8 +152,6 @@ fn convert(
         // #314: not exposed on this deprecated one-shot facade; use
         // `overview()` + `export_pmtiles()` instead.
         keep_overview: None,
-        min_zoom,
-        max_zoom,
         // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
         // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
         // and `export-pmtiles --tile-range`.
@@ -174,6 +182,20 @@ fn convert(
         }
     };
 
+    // #314: the CLI shows this preflight as a `log::warn`, which these
+    // bindings have no bridge for — so a Python caller would hit ENOSPC
+    // mid-run with nothing said. Raise it as a warning instead, after the
+    // run (the warning is advisory; the convert either succeeded or already
+    // failed with its own error).
+    if let Some(msg) = &report.intermediate.space_warning {
+        PyErr::warn(
+            py,
+            &py.get_type::<PyUserWarning>(),
+            &CString::new(&**msg)?,
+            1,
+        )?;
+    }
+
     // The combined report (#439): the two halves the two-step chain's own
     // reports would carry, keyed like the CLI's `tiles --report` JSON.
     let dict = PyDict::new(py);
@@ -192,9 +214,26 @@ fn tiles_error_to_py(e: TilesError) -> PyErr {
         TilesError::KeepOverviewDirMissing { .. }
         | TilesError::FeatureOrderColumnExcluded { .. }
         | TilesError::FeatureIdColumnExcluded { .. }
-        | TilesError::FeatureIdAccumulated { .. } => PyErr::new::<PyValueError, _>(format!("{e}")),
-        other => PyErr::new::<PyRuntimeError, _>(format!("{other}")),
+        | TilesError::FeatureIdAccumulated { .. } => {
+            PyErr::new::<PyValueError, _>(with_sources(&e))
+        }
+        other => PyErr::new::<PyRuntimeError, _>(with_sources(&other)),
     }
+}
+
+/// `Display` plus the `#[source]` chain, `": "`-joined — what the CLI shows
+/// through anyhow's `Caused by:` and what a Python message would otherwise
+/// drop (an I/O error's "Permission denied (os error 13)" lives in
+/// `source()`, which `Display` alone omits).
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        use std::fmt::Write as _;
+        let _ = write!(out, ": {c}");
+        cause = c.source();
+    }
+    out
 }
 
 /// Map a [`ConvertError`] to the Python exception type it deserves:
@@ -494,6 +533,13 @@ fn overview(
             "sort_key and class_rank_column are mutually exclusive; supply at most one",
         ));
     }
+    // TODO(#445): the two rules below — the #428 finite check and the
+    // `unknown_rank = min(ranks) - 1.0` derivation — are also in core's
+    // `parse_class_rank`, which #439 made the one home for the *string*
+    // grammar. This dict-shaped input cannot reuse that parser, so the
+    // consolidation is a shared fallible constructor (e.g.
+    // `ClassRanking::with_ranks`) called by both. Behaviourally identical
+    // today; raised by the #439 review.
     let class_ranking = match (class_rank_column, class_ranks) {
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => {

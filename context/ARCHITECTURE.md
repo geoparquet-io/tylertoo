@@ -1230,6 +1230,10 @@ crates/core/src/
 │   ├── plan_state.rs   #   Convert plan artifact (--save-plan/--plan): the persisted
 │   │                   #   pass-1 + assignment result, Arrow IPC + fingerprint
 │   ├── stream.rs       #   Two-pass streaming orchestration (pass-1 scan; pass-2 → pipeline.rs)
+│   ├── tiles.rs        #   The one-shot GeoParquet → PMTiles facade (#439): convert →
+│   │                   #   intermediate overview → export, owning the whole product
+│   │                   #   policy (intermediate lifecycle, preflights, shard outcomes,
+│   │                   #   combined report). CLI `tiles` and Python convert() are callers
 │   └── writer.rs       #   Level-banded GeoParquet writer
 ├── input.rs            # Input source abstraction: local file or remote
 │                       # object (s3/https/gs) via byte-range reads (#210)

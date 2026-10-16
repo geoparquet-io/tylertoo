@@ -20,6 +20,7 @@
 //! The chain is `overview` convert → `export-pmtiles` through a materialized
 //! intermediate overview file — this is NOT zero-disk.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -59,10 +60,17 @@ impl TilesInput {
         crate::input_set::derive_layer_name(&p.to_string_lossy())
     }
 
-    /// Run the convert half against this input, keeping the typed error —
-    /// the empty-shard handling has to tell "this shard owns no rows" apart
-    /// from every other failure.
-    fn convert(
+    /// Run the convert half against this input, dispatching on the input
+    /// shape and keeping the typed [`ConvertError`] — the facade's
+    /// empty-shard handling (and any caller that routes both shapes) has to
+    /// tell "this shard owns no rows" apart from every other failure.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`convert_to_overviews`] /
+    /// [`convert_to_overviews_sources`] return, plus the manifest's own
+    /// resolution errors for [`TilesInput::Manifest`].
+    pub fn convert(
         &self,
         output: &Path,
         options: &ConvertOptions,
@@ -80,10 +88,13 @@ impl TilesInput {
 /// it owns (#498).
 ///
 /// Resolving `--shard`/`--shard-plan` *strings* into this is
-/// the caller's argument mapping ([`crate::shard::resolve_range`]); the
-/// consequences — the export range, the ceiling, the declaration, the
-/// empty-archive outcomes — are this module's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the caller's argument mapping ([`crate::shard::resolve_range`]); every
+/// consequence — the convert's row pruning and digest stamp, the coarse
+/// job's convert ceiling, the export range, the declaration, the
+/// empty-archive outcomes — is the facade's
+/// ([`convert_to_pmtiles`] applies them to its own copy of
+/// [`TilesOptions::convert`], so callers never hand-sync the two).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilesShard {
     /// Coarse job or data shard.
     pub role: ShardRole,
@@ -92,18 +103,74 @@ pub struct TilesShard {
     pub range: Option<TileRange>,
     /// The fleet's pivot zoom ([`crate::shard::ShardPlan::pivot_zoom`]).
     pub pivot_zoom: u8,
+    /// [`crate::shard::ShardPlan::cut_digest_hex`] — the fleet-wide identity
+    /// of the cut, stamped into the convert plan's fingerprint so the fleet
+    /// is bound to one `shards.json` by construction. The coarse job writes
+    /// it into the plan; every data shard must present the same one.
+    pub cut_digest: String,
+}
+
+impl TilesShard {
+    /// What *every* job of a fleet applies to its convert, whether or not it
+    /// goes on to build tiles (#498): the data shard's row-pruning range and
+    /// the fleet's cut digest. The digest is fingerprinted and the range is
+    /// not — the cut is fleet-wide, this job's slice of it is not.
+    ///
+    /// Separate from [`TilesShard::apply_to_convert`] because a `--plan-only`
+    /// run (#560) applies exactly this much: it materializes no level, so it
+    /// must not carry a ceiling core would refuse for having no pass 2 to
+    /// apply it to.
+    pub fn apply_selection(&self, convert: &mut ConvertOptions) {
+        convert.shard = self.range;
+        convert.shard_plan_digest = Some(self.cut_digest.clone());
+    }
+
+    /// Every convert-side consequence of a tile-building job (#498/#541):
+    /// [`TilesShard::apply_selection`] plus, for the coarse job of a
+    /// streaming zoom-plan run, the build ceiling just below the pivot
+    /// (#541: pass 1 and the level assignment stay full-range, so any saved
+    /// plan is byte-identical to a full run's; `--no-streaming` builds every
+    /// level and the export ceiling alone bounds the tiles).
+    ///
+    /// [`convert_to_pmtiles`] applies this to its own copy of
+    /// [`TilesOptions::convert`], so a caller never hand-syncs the two.
+    /// Idempotent, so a caller that has already applied it (the CLI, which
+    /// shares one options builder with its `--plan-only` path) is unaffected.
+    pub fn apply_to_convert(&self, convert: &mut ConvertOptions) {
+        self.apply_selection(convert);
+        if self.range.is_none()
+            && matches!(convert.levels, LevelPlan::ZoomRange { .. })
+            && convert.streaming
+        {
+            convert.zoom_ceiling = Some(self.pivot_zoom.saturating_sub(1));
+        }
+    }
 }
 
 /// Options for [`convert_to_pmtiles`]: the convert half's options plus the
 /// export knobs and the facade's own policy inputs.
+///
+/// The declared zoom range (#380) is read from `convert.levels`: a
+/// [`LevelPlan::ZoomRange`]'s requested minimum is declared even when the
+/// coarsest levels generalized to nothing, and its (resolved — `--max-zoom
+/// auto` is the caller's to resolve first, via
+/// [`super::auto_zoom::MaxZoom::resolve`], which writes the chosen zoom back
+/// into the plan) maximum declares an empty data shard's archive. A GSD
+/// ladder declares no requested range.
+///
+/// Note: #436 will freeze this shape (`#[non_exhaustive]` + a builder);
+/// construct it with `..TilesOptions::default()` so that lands as a
+/// non-event.
 #[derive(Debug, Clone)]
 pub struct TilesOptions {
     /// The convert half ([`super::convert::convert_to_overviews`]). The
     /// facade reads `spill_dir` from here for the intermediate's location
-    /// and the export's member spill (#427 — one scratch knob), and
-    /// `properties` for the knob-column guard. For a sharded run the caller
-    /// has already set `shard`, `shard_plan_digest` and `zoom_ceiling` on
-    /// these options to match [`TilesOptions::shard`].
+    /// and the export's member spill (#427 — one scratch knob), `properties`
+    /// for the knob-column guard, and `levels` for the declared zoom range.
+    /// For a sharded run the facade itself applies
+    /// [`TilesOptions::shard`]'s convert-side consequences (`shard`,
+    /// `shard_plan_digest`, the coarse `zoom_ceiling`) to its own copy, so
+    /// leave those fields alone.
     pub convert: ConvertOptions,
     /// MVT layer name; `None` derives it from the input
     /// ([`TilesInput::derive_layer_name`]).
@@ -111,17 +178,6 @@ pub struct TilesOptions {
     /// Retain the intermediate overview at this path instead of a removed
     /// temp file (#314). Its parent directory must exist.
     pub keep_overview: Option<PathBuf>,
-    /// The requested minimum zoom, declared in the archive's
-    /// `vector_layers` even when the coarsest levels generalized to nothing
-    /// (#380). Ignored for declarations when [`TilesOptions::convert`] holds
-    /// a GSD ladder (only a zoom plan has a requested minimum zoom). Keep it
-    /// equal to the zoom plan's `min_zoom`.
-    pub min_zoom: u8,
-    /// The finest zoom, resolved (`--max-zoom auto` is the caller's to
-    /// resolve first — [`super::auto_zoom::MaxZoom::resolve`]). Declares an
-    /// empty data shard's archive. Keep it equal to the zoom plan's
-    /// `max_zoom`.
-    pub max_zoom: u8,
     /// The sharded-fleet job, if any (#498).
     pub shard: Option<TilesShard>,
     /// A hand-written export tile range. Mutually exclusive with a
@@ -149,8 +205,6 @@ impl Default for TilesOptions {
             convert: ConvertOptions::default(),
             layer_name: None,
             keep_overview: None,
-            min_zoom: 0,
-            max_zoom: 14,
             shard: None,
             tile_range: None,
             tile_buffer: export.tile_buffer,
@@ -178,6 +232,12 @@ pub struct IntermediateOverview {
     /// `true` when [`TilesOptions::keep_overview`] retains it; `false` for a
     /// temp file removed after the export.
     pub retained: bool,
+    /// The #314 free-space preflight's warning, when the volume holding the
+    /// intermediate looked too small for it. Already logged (`log::warn`);
+    /// carried here so a binding without a log bridge can surface it (the
+    /// Python `convert()` raises it as a `UserWarning`). `None` when the
+    /// volume fits or either side of the comparison is unknowable.
+    pub space_warning: Option<String>,
 }
 
 /// The combined report of a full [`convert_to_pmtiles`] run.
@@ -337,6 +397,31 @@ pub enum TilesError {
     },
 }
 
+/// The `keep_overview` directory preflight (#433): a retained intermediate
+/// into a missing directory is refused before any work, not after a
+/// minutes-long convert.
+///
+/// Shared by [`convert_to_pmtiles`] and the CLI's own early preflight (which
+/// runs it before the output path is even resolved), so the wording exists
+/// once.
+///
+/// # Errors
+///
+/// Returns [`TilesError::KeepOverviewDirMissing`] when `keep_overview` names
+/// a path whose parent directory does not exist.
+pub fn check_keep_overview(keep_overview: Option<&Path>) -> Result<(), TilesError> {
+    if let Some(path) = keep_overview {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if !parent.is_dir() {
+                return Err(TilesError::KeepOverviewDirMissing {
+                    dir: parent.to_path_buf(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The feature-order / feature-id vs property-selection guard (#386/#443).
 ///
 /// Shared by [`convert_to_pmtiles`] and the CLI's `--plan-only` preflight
@@ -422,15 +507,7 @@ pub fn convert_to_pmtiles_observed(
     }
     .validate()
     .map_err(TilesError::Export)?;
-    if let Some(path) = &options.keep_overview {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if !parent.is_dir() {
-                return Err(TilesError::KeepOverviewDirMissing {
-                    dir: parent.to_path_buf(),
-                });
-            }
-        }
-    }
+    check_keep_overview(options.keep_overview.as_deref())?;
     // #386/#443: the property selection is applied at convert, so an
     // excluded column is already gone from the intermediate before export
     // would sort or id by it — refused before any work is done.
@@ -439,6 +516,29 @@ pub fn convert_to_pmtiles_observed(
         &options.feature_order,
         options.feature_id.as_deref(),
     )?;
+
+    // #498/#541: the convert-side consequences of a sharded job are the
+    // facade's, not the caller's. Applied to our own copy, so a Rust caller
+    // that sets only `TilesOptions::shard` still gets the data shard's row
+    // pruning, the fleet digest the merge binding needs, and the coarse
+    // job's ceiling — and the CLI, which applies the same rules to build its
+    // `--plan-only` options, is unaffected (the application is idempotent).
+    let convert_options = match &options.shard {
+        Some(job) => {
+            let mut convert = options.convert.clone();
+            job.apply_to_convert(&mut convert);
+            Cow::Owned(convert)
+        }
+        None => Cow::Borrowed(&options.convert),
+    };
+
+    // The declared zoom range (#380): only a zoom plan has one. `None` for a
+    // GSD ladder — it declares no requested range, and the empty-archive
+    // outcomes below fall back to the pivot it inherently knows.
+    let zoom_plan = match convert_options.levels {
+        LevelPlan::ZoomRange { min_zoom, max_zoom } => Some((min_zoom, max_zoom)),
+        LevelPlan::Gsds(_) => None,
+    };
 
     // Derive the layer name from the input if not given (core owns the
     // rules — see input_set::derive_layer_name).
@@ -488,15 +588,17 @@ pub fn convert_to_pmtiles_observed(
         };
 
     // #314 free-space preflight: the intermediate is at least input-sized,
-    // so warn up front when the chosen volume looks too small.
+    // so warn up front when the chosen volume looks too small. The message
+    // is also carried on the report's `IntermediateOverview` for callers
+    // without a log bridge.
     let overview_dir = overview_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    warn_intermediate_space(input, &overview_dir);
+    let space_warning = warn_intermediate_space(input, &overview_dir);
 
-    let convert_report = match input.convert(&overview_path, &options.convert) {
+    let convert_report = match input.convert(&overview_path, &convert_options) {
         Ok(report) => report,
         Err(e) => {
             // #498: a shard whose range owns no input rows is a legal
@@ -510,7 +612,10 @@ pub fn convert_to_pmtiles_observed(
             // succeed.
             if convert_produced_nothing(&e) {
                 if let (Some(job), Some(range)) = (&options.shard, shard_range) {
-                    write_empty_archive(output, &layer_name, range.pivot_zoom(), options.max_zoom)
+                    // The shard owns [pivot, finest]; a GSD ladder has no
+                    // finest zoom to declare, so the pivot stands alone.
+                    let max_zoom = zoom_plan.map_or_else(|| range.pivot_zoom(), |(_, max)| max);
+                    write_empty_archive(output, &layer_name, range.pivot_zoom(), max_zoom)
                         .map_err(TilesError::EmptyShardArchive)?;
                     log::info!(
                         "[tiles] shard {} owns no input rows ({e}); wrote an empty archive",
@@ -520,7 +625,7 @@ pub fn convert_to_pmtiles_observed(
                         role: job.role,
                         pivot_zoom: job.pivot_zoom,
                         min_zoom: range.pivot_zoom(),
-                        max_zoom: options.max_zoom,
+                        max_zoom,
                         why: e.to_string(),
                     }));
                 }
@@ -533,8 +638,11 @@ pub fn convert_to_pmtiles_observed(
             // Same legal outcome as an empty data shard, same answer.
             if matches!(e, ConvertError::NothingAtOrBelowCeiling { .. }) {
                 if let Some(job) = options.shard.as_ref().filter(|job| job.range.is_none()) {
+                    // A ceiling needs a zoom plan (core refuses it on a GSD
+                    // ladder), so the fallback is unreachable in practice.
+                    let min_zoom = zoom_plan.map_or(0, |(min, _)| min);
                     let max_zoom = job.pivot_zoom.saturating_sub(1);
-                    write_empty_archive(output, &layer_name, options.min_zoom, max_zoom)
+                    write_empty_archive(output, &layer_name, min_zoom, max_zoom)
                         .map_err(TilesError::EmptyCoarseArchive)?;
                     log::info!(
                         "[tiles] shard job {} has nothing to write ({e}); wrote an empty archive",
@@ -543,7 +651,7 @@ pub fn convert_to_pmtiles_observed(
                     return Ok(TilesOutcome::EmptyCoarse(EmptyArchive {
                         role: job.role,
                         pivot_zoom: job.pivot_zoom,
-                        min_zoom: options.min_zoom,
+                        min_zoom,
                         max_zoom,
                         why: e.to_string(),
                     }));
@@ -563,6 +671,7 @@ pub fn convert_to_pmtiles_observed(
         path: overview_path.clone(),
         bytes: overview_bytes,
         retained: overview_tmp.is_none(),
+        space_warning,
     };
     observer.overview_written(&intermediate, &convert_report);
 
@@ -583,12 +692,10 @@ pub fn convert_to_pmtiles_observed(
         // #498: a data shard owns no zoom coarser than the pivot, so that is
         // what it declares — claiming the coarse job's half would
         // misdescribe an archive that holds none of it.
-        min_zoom: (!matches!(options.convert.levels, LevelPlan::Gsds(_))).then_some(
-            match tile_range {
-                Some(r) => r.pivot_zoom(),
-                None => options.min_zoom,
-            },
-        ),
+        min_zoom: zoom_plan.map(|(min, _)| match tile_range {
+            Some(r) => r.pivot_zoom(),
+            None => min,
+        }),
 
         // The property selection was applied on convert (#386): the
         // intermediate overview already carries only the kept columns.
@@ -658,10 +765,13 @@ fn resolve_intermediate_dir(
 /// Lower-bound estimate of the intermediate overview's size for the #314
 /// free-space preflight: the local input bytes. A duplicating overview
 /// embeds the finest level verbatim on top of the coarse levels, so it is
-/// at least input-sized. Local file → its size; local directory → sum of
-/// its top-level `.parquet` entries; manifest → sum of the entries that
-/// resolve as local files. Remote/glob shapes return `None` (the preflight
-/// stays quiet rather than guessing).
+/// at least input-sized. Local file → its size; local directory → the sum
+/// of its `.parquet` files, recursively, through the same listing the
+/// convert itself reads ([`crate::input_set::list_parquet_files`] — a
+/// hive-partitioned set is estimated by what will actually be read, not by
+/// its empty top level); manifest → the sum of the entries that resolve as
+/// local files. Remote/glob shapes return `None` (the preflight stays quiet
+/// rather than guessing).
 fn estimate_local_input_bytes(input: &TilesInput) -> Option<u64> {
     fn file_len(p: &Path) -> Option<u64> {
         std::fs::metadata(p)
@@ -678,22 +788,19 @@ fn estimate_local_input_bytes(input: &TilesInput) -> Option<u64> {
             if !meta.is_dir() {
                 return None;
             }
-            let sum: u64 = std::fs::read_dir(p)
+            let sum: u64 = crate::input_set::list_parquet_files(p)
                 .ok()?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
-                .filter_map(|e| file_len(&e.path()))
-                .sum();
+                .iter()
+                .filter_map(|f| file_len(f))
+                .fold(0u64, u64::saturating_add);
             (sum > 0).then_some(sum)
         }
         TilesInput::Manifest(m) => {
             let text = std::fs::read_to_string(m).ok()?;
-            let sum: u64 = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .filter_map(|l| file_len(Path::new(l)))
-                .sum();
+            let sum: u64 = crate::input_set::manifest_entries(&text)
+                .iter()
+                .filter_map(|(_, entry)| file_len(Path::new(entry)))
+                .fold(0u64, u64::saturating_add);
             (sum > 0).then_some(sum)
         }
     }
@@ -716,7 +823,9 @@ fn intermediate_space_warning(
     if estimated_bytes == 0 {
         return None;
     }
-    let need = estimated_bytes + estimated_bytes / INTERMEDIATE_MARGIN_DENOM;
+    // Saturating, like the #272 spill preflight's math (#686): an absurd
+    // estimate must degrade to "warn", never to an overflow panic.
+    let need = estimated_bytes.saturating_add(estimated_bytes / INTERMEDIATE_MARGIN_DENOM);
     if available_bytes >= need {
         return None;
     }
@@ -730,48 +839,29 @@ fn intermediate_space_warning(
         gib(estimated_bytes),
         dir.display(),
         gib(available_bytes),
-        gib(need - available_bytes),
+        gib(need.saturating_sub(available_bytes)),
     ))
 }
 
-/// Emit the #314 intermediate free-space preflight warning, if warranted:
-/// probe the volume holding `dir` and compare against the local-input-bytes
-/// estimate. Quiet when either side is unknowable (remote input, exotic
-/// filesystem) rather than crying wolf.
-fn warn_intermediate_space(input: &TilesInput, dir: &Path) {
-    let Some(estimated) = estimate_local_input_bytes(input) else {
-        return;
-    };
-    let Some(available) = probe_available_space(dir) else {
-        return;
-    };
-    if let Some(msg) = intermediate_space_warning(estimated, available, dir) {
-        log::warn!("{msg}");
-    }
-}
-
-/// Free bytes available to the current user on the volume holding `dir`
-/// (statvfs / `GetDiskFreeSpaceEx` via `fs4`), or `None` if the probe fails.
-/// Compiled to a stub without the `remote` feature, which is what gates the
-/// `fs4` dependency (the CLI and the Python bindings both enable it); the
-/// preflight then stays quiet, exactly as it does when the probe fails.
-fn probe_available_space(dir: &Path) -> Option<u64> {
-    #[cfg(feature = "remote")]
-    {
-        fs4::available_space(dir).ok()
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = dir;
-        None
-    }
+/// Emit the #314 intermediate free-space preflight warning, if warranted,
+/// and return it for the report: probe the volume holding `dir`
+/// ([`crate::overview::convert`]'s shared `fs4` probe, the one the #272
+/// remote-spill preflight uses) and compare against the local-input-bytes
+/// estimate. Quiet (`None`) when either side is unknowable (remote input,
+/// exotic filesystem) rather than crying wolf.
+fn warn_intermediate_space(input: &TilesInput, dir: &Path) -> Option<String> {
+    let estimated = estimate_local_input_bytes(input)?;
+    let available = super::convert::probe_available_space(dir)?;
+    let msg = intermediate_space_warning(estimated, available, dir)?;
+    log::warn!("{msg}");
+    Some(msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::overview::testutil::write_input;
-    use geo::{Geometry, Point};
+    use geo::{Geometry, LineString, Point, Polygon};
 
     fn points_input(path: &Path) {
         let geoms: Vec<Option<Geometry<f64>>> = vec![
@@ -788,10 +878,223 @@ mod tests {
                 levels: LevelPlan::ZoomRange { min_zoom, max_zoom },
                 ..ConvertOptions::default()
             },
-            min_zoom,
-            max_zoom,
             ..TilesOptions::default()
         }
+    }
+
+    /// #498: a data shard whose range owns none of the input's rows is a
+    /// legal outcome, not a failure — a valid tile-less archive and
+    /// [`TilesOutcome::EmptyShard`] declaring `[pivot, finest]`, so `merge`
+    /// can exclude it by reading it. Exercised here and not only through
+    /// the CLI's `sharded_builds`, which the quick tier does not run.
+    #[test]
+    fn an_empty_data_shard_writes_a_tile_less_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // A bbox covering, so the shard's range can prune this row group
+        // away entirely — which is what leaves the convert with no rows at
+        // all, the condition this outcome is about.
+        let geoms: Vec<Option<Geometry<f64>>> = vec![
+            Some(Geometry::Point(Point::new(0.5, 0.5))),
+            Some(Geometry::Point(Point::new(10.0, 20.0))),
+            Some(Geometry::Point(Point::new(-30.0, -10.0))),
+        ];
+        write_input(&input, &geoms, true, None);
+        let output = dir.path().join("out.pmtiles");
+
+        // #498: every job of a fleet consumes ONE dataset-global plan, so
+        // the shard below needs a real one — written here by the run that
+        // reads the whole input, under the same cut digest the shard
+        // presents (the fingerprint binds the two).
+        let plan = dir.path().join("convert.plan");
+        let digest = "0123456789abcdef".to_string();
+        let fleet_convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 6,
+            },
+            shard_plan_digest: Some(digest.clone()),
+            ..ConvertOptions::default()
+        };
+        super::super::convert::convert_to_overviews(
+            &input,
+            dir.path().join("plan-run.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan.clone()),
+                ..fleet_convert.clone()
+            },
+        )
+        .expect("the plan-writing run must succeed");
+
+        // The fixture's points all sit near the middle of the world; the
+        // Hilbert curve starts in a corner, so the first pivot-zoom ids own
+        // none of them.
+        let base = crate::tile::hilbert_zoom_base(4);
+        let range = TileRange::new(4, base, base + 1).expect("a valid pivot range");
+        let options = TilesOptions {
+            convert: ConvertOptions {
+                plan: Some(plan),
+                ..fleet_convert
+            },
+            shard: Some(TilesShard {
+                role: ShardRole::Shard {
+                    index: 3,
+                    shards: 4,
+                },
+                range: Some(range),
+                pivot_zoom: 4,
+                cut_digest: digest,
+            }),
+            ..TilesOptions::default()
+        };
+
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &output, &options)
+            .expect("an empty shard must succeed");
+
+        let TilesOutcome::EmptyShard(empty) = outcome else {
+            panic!("expected an empty data shard, got {outcome:?}");
+        };
+        assert_eq!(
+            empty.role,
+            ShardRole::Shard {
+                index: 3,
+                shards: 4
+            }
+        );
+        assert_eq!(empty.pivot_zoom, 4);
+        // A data shard owns [pivot, finest]: the pivot it was cut at, and
+        // the zoom plan's maximum — never the plan's minimum, which belongs
+        // to the coarse job.
+        assert_eq!(empty.min_zoom, 4, "declares the pivot, not the plan's min");
+        assert_eq!(empty.max_zoom, 6, "declares the zoom plan's maximum");
+        assert!(!empty.why.is_empty(), "carries the convert's own words");
+
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
+    }
+
+    /// #541: a coarse job whose ceiling sits below every level the data
+    /// reaches writes the same kind of archive, declaring `[plan min,
+    /// pivot-1]` — the half a data shard does not own. The ceiling itself
+    /// comes from the shard the facade was handed (#439), which is what
+    /// makes this outcome reachable without the caller setting it.
+    #[test]
+    fn an_empty_coarse_job_writes_a_tile_less_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        // Tiny polygons: auto-clamped (#211) out of every coarse level, so
+        // a z0..z2 ceiling has nothing at or below it.
+        let geoms: Vec<Option<Geometry<f64>>> = (0..20)
+            .map(|k| {
+                let (x, y) = (f64::from(k) * 0.01, 0.0);
+                Some(Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.0001, y),
+                        (x + 0.0001, y + 0.0001),
+                        (x, y + 0.0001),
+                        (x, y),
+                    ]),
+                    vec![],
+                )))
+            })
+            .collect();
+        write_input(&input, &geoms, false, None);
+        let output = dir.path().join("out.pmtiles");
+
+        // Pivot 3 ⇒ the facade caps the convert at z2, which this fixture
+        // reaches no level at or below. The coarse job needs no plan: it
+        // reads the whole input and is the run that would write one.
+        let options = TilesOptions {
+            shard: Some(TilesShard {
+                role: ShardRole::Coarse,
+                range: None,
+                pivot_zoom: 3,
+                cut_digest: "0123456789abcdef".to_string(),
+            }),
+            ..zoomed_options(0, 14)
+        };
+
+        let outcome = convert_to_pmtiles(&TilesInput::Path(input), &output, &options)
+            .expect("an empty coarse job must succeed");
+
+        let TilesOutcome::EmptyCoarse(empty) = outcome else {
+            panic!("expected an empty coarse job, got {outcome:?}");
+        };
+        assert_eq!(empty.role, ShardRole::Coarse);
+        assert_eq!(empty.pivot_zoom, 3);
+        assert_eq!(empty.min_zoom, 0, "declares the zoom plan's minimum");
+        assert_eq!(empty.max_zoom, 2, "declares up to just below the pivot");
+
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
+    }
+
+    /// #439/#498: the facade applies the shard's convert-side consequences
+    /// itself, so a caller that sets only `TilesOptions::shard` still gets
+    /// the row pruning, the fingerprinted cut digest and the coarse job's
+    /// ceiling — the three fields callers used to hand-sync.
+    #[test]
+    fn the_facade_applies_the_shards_convert_side_consequences() {
+        let mut convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            ..ConvertOptions::default()
+        };
+        assert!(convert.streaming, "the ceiling is streaming-only");
+
+        let coarse = TilesShard {
+            role: ShardRole::Coarse,
+            range: None,
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+        };
+        coarse.apply_to_convert(&mut convert);
+        assert_eq!(convert.shard, None, "the coarse job prunes no rows");
+        assert_eq!(convert.shard_plan_digest.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            convert.zoom_ceiling,
+            Some(4),
+            "#541: the coarse job builds only up to just below the pivot"
+        );
+
+        // A data shard prunes rows and takes no ceiling.
+        let base5 = crate::tile::hilbert_zoom_base(5);
+        let range = TileRange::new(5, base5, base5 + 7).unwrap();
+        let mut convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            ..ConvertOptions::default()
+        };
+        TilesShard {
+            role: ShardRole::Shard {
+                index: 3,
+                shards: 4,
+            },
+            range: Some(range),
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+        }
+        .apply_to_convert(&mut convert);
+        assert_eq!(convert.shard, Some(range));
+        assert_eq!(convert.zoom_ceiling, None, "only the coarse job is capped");
+
+        // #560: `apply_selection` is the subset a plan-only run applies —
+        // the selection without a ceiling it has no pass 2 for.
+        let mut convert = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            ..ConvertOptions::default()
+        };
+        coarse.apply_selection(&mut convert);
+        assert_eq!(convert.shard_plan_digest.as_deref(), Some("deadbeef"));
+        assert_eq!(convert.zoom_ceiling, None);
     }
 
     /// The facade's happy path: a PMTiles archive, a combined report whose
@@ -999,8 +1302,6 @@ mod tests {
                 ..ConvertOptions::default()
             },
             feature_id: Some("name".to_string()),
-            min_zoom: 0,
-            max_zoom: 2,
             ..TilesOptions::default()
         };
         let err = convert_to_pmtiles(&TilesInput::Path(input), &output, &options).unwrap_err();
