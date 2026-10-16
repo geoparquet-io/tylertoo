@@ -416,6 +416,25 @@ pub(super) struct MemoryLimit {
 /// On a tie the hard limit is reported. `None` when nothing could be probed
 /// (e.g. macOS without the override).
 pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
+    probe_uncached_memory_limit(true)
+}
+
+/// Uncached figure past which the process is killed rather than throttled,
+/// for export's dense-tile refusal (#665): the override, else the smaller of
+/// `MemAvailable` and the cgroup hard-limit headroom.
+///
+/// Uncached because in a `tiles` run [`available_memory_bytes`] was frozen
+/// during convert's pass 1, before convert freed that memory. cgroup
+/// `memory.high` is left out: going over it throttles and reclaims, it does
+/// not kill.
+pub(super) fn probe_oom_memory_limit() -> Option<MemoryLimit> {
+    probe_uncached_memory_limit(false)
+}
+
+/// The two uncached probes above: the override, else the binding term of
+/// `MemAvailable`, cgroup `memory.max` and, when `with_memory_high`, cgroup
+/// `memory.high`.
+fn probe_uncached_memory_limit(with_memory_high: bool) -> Option<MemoryLimit> {
     if let Some(bytes) = auto_mem_limit_override() {
         return Some(MemoryLimit {
             bytes,
@@ -431,34 +450,7 @@ pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
     } else {
         [None, None]
     };
-    binding_memory_limit([machine, cg_max, cg_high])
-}
-
-/// Uncached figure past which the process is killed rather than throttled,
-/// for export's dense-tile refusal (#665): the override, else the smaller of
-/// `MemAvailable` and the cgroup hard-limit headroom.
-///
-/// Uncached because in a `tiles` run [`available_memory_bytes`] was frozen
-/// during convert's pass 1, before convert freed that memory. cgroup
-/// `memory.high` is left out: going over it throttles and reclaims, it does
-/// not kill.
-pub(super) fn probe_oom_memory_limit() -> Option<MemoryLimit> {
-    if let Some(bytes) = auto_mem_limit_override() {
-        return Some(MemoryLimit {
-            bytes,
-            source: MemoryLimitSource::Override,
-        });
-    }
-    let machine = read_proc_mem_available().map(|bytes| MemoryLimit {
-        bytes,
-        source: MemoryLimitSource::MemAvailable,
-    });
-    let [cg_max, _] = if cfg!(target_os = "linux") {
-        read_cgroup_memory_limits_by_source(std::path::Path::new("/"))
-    } else {
-        [None, None]
-    };
-    binding_memory_limit([machine, cg_max, None])
+    binding_memory_limit([machine, cg_max, cg_high.filter(|_| with_memory_high)])
 }
 
 /// The smallest of the probed figures (a hard limit wins a tie).
