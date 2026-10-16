@@ -180,9 +180,13 @@ pub struct TilesOptions {
     pub keep_overview: Option<PathBuf>,
     /// The sharded-fleet job, if any (#498).
     pub shard: Option<TilesShard>,
-    /// A hand-written export tile range. Mutually exclusive with a
-    /// [`TilesShard::range`] (a data shard's range takes precedence; callers
-    /// enforce the flag conflict).
+    /// A hand-written export tile range, restricting the export only (a
+    /// data shard's range prunes the convert's reads too).
+    ///
+    /// A [`TilesShard::range`] takes precedence where it is set, which is
+    /// data shards only; a coarse shard has none, so this applies there.
+    /// The CLI and the Python bindings keep the two mutually exclusive, so
+    /// in practice at most one is ever set.
     pub tile_range: Option<TileRange>,
     /// Per-tile edge buffer in tile pixels ([`ExportOptions::tile_buffer`]).
     pub tile_buffer: u32,
@@ -209,11 +213,30 @@ impl Default for TilesOptions {
             tile_range: None,
             tile_buffer: export.tile_buffer,
             tile_size_limit: export.tile_size_limit,
-            simple_clip_fastpath: true,
+            simple_clip_fastpath: export.simple_clip_fastpath,
             partition_wave: export.partition_wave,
             feature_order: FeatureOrder::default(),
             feature_id: None,
         }
+    }
+}
+
+/// The export tile range for a run: a shard's own range where it has one,
+/// otherwise the caller's hand-written [`TilesOptions::tile_range`].
+///
+/// A data shard's range prunes the convert's reads as well as the export, so
+/// it wins. A *coarse* shard has `range: None`, so matching on the shard
+/// alone discarded an explicitly-set `tile_range` for every coarse job —
+/// the "accepts a parameter and ignores it" shape this facade exists to
+/// remove. Unreachable from the CLI (clap `conflicts_with`) and from Python
+/// (both always `None`), but `TilesOptions` is public API.
+fn resolve_tile_range(
+    shard: Option<&TilesShard>,
+    tile_range: Option<TileRange>,
+) -> Option<TileRange> {
+    match shard {
+        Some(job) => job.range.or(tile_range),
+        None => tile_range,
     }
 }
 
@@ -550,10 +573,7 @@ pub fn convert_to_pmtiles_observed(
     // A data shard's range prunes the convert's reads as well as the export;
     // a hand-written range restricts the export only (callers keep the two
     // flags mutually exclusive, so at most one is set).
-    let tile_range = match &options.shard {
-        Some(job) => job.range,
-        None => options.tile_range,
-    };
+    let tile_range = resolve_tile_range(options.shard.as_ref(), options.tile_range);
 
     // The data shard's own range, kept past `tile_range`'s move into
     // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
@@ -678,7 +698,7 @@ pub fn convert_to_pmtiles_observed(
     let export_opts = ExportOptions {
         layer_name,
         tile_buffer: options.tile_buffer,
-        extent: 4096,
+        extent: ExportOptions::default().extent,
         tile_size_limit: options.tile_size_limit,
         simple_clip_fastpath: options.simple_clip_fastpath,
         partition_wave: options.partition_wave,
@@ -1032,6 +1052,48 @@ mod tests {
 
     /// #439/#498: the facade applies the shard's convert-side consequences
     /// itself, so a caller that sets only `TilesOptions::shard` still gets
+    #[test]
+    fn a_coarse_shard_keeps_an_explicit_tile_range() {
+        let base5 = crate::tile::hilbert_zoom_base(5);
+        let explicit = TileRange::new(5, base5, base5 + 7).unwrap();
+
+        // No shard: the caller's range passes through.
+        assert_eq!(resolve_tile_range(None, Some(explicit)), Some(explicit));
+        assert_eq!(resolve_tile_range(None, None), None);
+
+        // A coarse shard has no range of its own, so the caller's applies
+        // rather than being silently dropped.
+        let coarse = TilesShard {
+            role: ShardRole::Coarse,
+            range: None,
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+        };
+        assert_eq!(
+            resolve_tile_range(Some(&coarse), Some(explicit)),
+            Some(explicit),
+            "a coarse shard must not discard the caller's tile_range"
+        );
+        assert_eq!(resolve_tile_range(Some(&coarse), None), None);
+
+        // A data shard's own range prunes the convert too, so it wins.
+        let shard_range = TileRange::new(5, base5 + 2, base5 + 3).unwrap();
+        let data = TilesShard {
+            role: ShardRole::Shard {
+                index: 3,
+                shards: 4,
+            },
+            range: Some(shard_range),
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+        };
+        assert_eq!(
+            resolve_tile_range(Some(&data), Some(explicit)),
+            Some(shard_range),
+            "a data shard's range takes precedence"
+        );
+    }
+
     /// the row pruning, the fingerprinted cut digest and the coarse job's
     /// ceiling — the three fields callers used to hand-sync.
     #[test]
