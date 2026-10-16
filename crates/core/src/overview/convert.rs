@@ -721,7 +721,7 @@ pub const IN_FLIGHT_BATCHES_MIN: usize = 4;
 /// Germany segments and fieldmaps adm4. At the time in-flight depth was
 /// read-ahead only, because the consumer took one batch at a time. Since
 /// #494 half of it is the consumer's compute window
-/// ([`super::pipe::split_in_flight`]), so 16 means 8 batches processed at
+/// (`pipe::split_in_flight`), so 16 means 8 batches processed at
 /// once; the cap stands until Decision 7 is re-swept. The ceiling is also a
 /// memory bound for wide machines. Without it a 128-core box would hold 128
 /// resident batches (`in_flight × read_batch_size` rows). Power users can
@@ -11506,9 +11506,10 @@ mod tests {
         // The reference is the single sequential reader at the smallest
         // chunking, which is the shape every other arm must reproduce. Its
         // `in_flight_batches` of 1 is also a compute window of 1 (#494): the
-        // one-batch-at-a-time consumer, which the wide-window arms below
-        // (16 → 8 batches at once, 5 → an uneven 3 + 2 split, 32 → 16) must
-        // match byte for byte.
+        // one-batch-at-a-time consumer, which the wide-window arm below
+        // (16 → 8 batches at once) must match byte for byte. Each arm is a
+        // full convert, so the uneven splits (5 → 3 + 2) and wider windows
+        // are left to the CLI's `thread_count_determinism` (slow tier).
         let reference = convert(7, 1, 1);
         // `ifb`/`workers` of 0 are the AUTO sentinels: they must produce the
         // same output as any explicit value (auto only changes overlap and
@@ -11520,8 +11521,6 @@ mod tests {
             (7, 4, 4),
             (7, 2, 0),
             (7, 16, 1),
-            (7, 5, 2),
-            (7, 32, 4),
             (64, 4, 3),
             (4096, 8, 2),
             (8192, 0, 0),

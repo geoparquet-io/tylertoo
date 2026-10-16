@@ -5359,6 +5359,15 @@ impl LevelStreamCtx<'_> {
     }
 }
 
+/// Depth cap on [`write_level_streaming`]'s output channel (processed batches
+/// waiting for the writer). The window already holds its finished outputs in
+/// hand while it sends them, so a channel a full window deep would double
+/// them. Measured on FTW Ukraine z0–13 under `bounded` (#494, auto depth 16,
+/// window 8): a window-deep channel and a depth of 2 took the same wall time,
+/// and depth 2 had about 4% lower peak RSS. Depth 1 also saved memory but was
+/// about 0.6% slower, because the writer sometimes waited for the next batch.
+const STREAMED_OUTPUT_DEPTH: usize = 2;
+
 /// Stream one level from the input file into the writer. Returns the writer
 /// outcome (a level whose every candidate collapses during simplification is
 /// skipped, #211), `(rows_written, vertex_count)`, plus this level's own
@@ -5413,10 +5422,15 @@ fn write_level_streaming(
     // verbatim's 15k rows/s is single-pipeline-bound").
     //
     // `in_flight` is split between the read-ahead channel and the window
-    // (`split_in_flight`), so the input batches resident here stay about what
-    // one channel of depth `in_flight` held; the output channel holds one
-    // window's worth, enough that the writer never starves while the next
-    // window computes.
+    // (`split_in_flight`), so about `in_flight` input batches are resident
+    // here. Before #494 this level held one: its single stage read a batch
+    // and processed it in place, and `in_flight` was the depth of the output
+    // channel. A window's finished outputs now also wait in hand while they
+    // are sent, so the output channel is kept shallow (at most
+    // `STREAMED_OUTPUT_DEPTH`) rather than a window deep: the writer only
+    // needs the next batch queued behind the one it is writing. That is
+    // still more resident than before at the auto depth, the streamed
+    // level's share of the window's unpriced memory cost (#716).
     //
     // `timers` (bound above as `&level_timers`) is shared by reference into
     // the producer threads: a `&Pass2Timers` is `Copy`, so the closures copy
@@ -5424,7 +5438,7 @@ fn write_level_streaming(
     // and the return value below.
     let (read_depth, window) = split_in_flight(in_flight);
     let outcome = scoped_pipe(
-        window,
+        window.min(STREAMED_OUTPUT_DEPTH),
         // Producer: read + process, in order, until EOF or the writer
         // hangs up. Returns the first stream/processing error, if any.
         // Everything the closure touches (`source`, `ctx`, `&timers`,
