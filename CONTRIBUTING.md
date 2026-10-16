@@ -166,8 +166,8 @@ A bump updates:
 Commitizen leaves `crates/python/uv.lock` unchanged. The pre-commit hook
 runs `uv lock` and stages the updated project version. Keep the hook
 enabled when committing the bump. If the hook has not run, use
-`cd crates/python && uv lock`. The hook and CI Version Consistency job
-fail if the versions disagree.
+`cd crates/python && uv lock`. The hook and the version
+check in the CI Lint job fail if the versions disagree.
 
 ### Recovery
 
@@ -191,6 +191,6 @@ git push origin :refs/tags/vX.Y.Z
 |---------|-------|-----|
 | `failed to select version for tylertoo-core` | The workspace dependency version did not move | Check that the `[workspace.dependencies]` entry in `Cargo.toml` moved with the bump |
 | `cz: command not found` | Commitizen is not installed | `uv tool install commitizen` |
-| Version Consistency job fails | Someone edited one version file by hand | Rerun `uv run cz bump` from the repo root |
+| Version consistency check fails | Someone edited one version file by hand | Rerun `uv run cz bump` from the repo root |
 | `uv.lock needs to be updated, but --locked was provided` | The bump did not refresh the lock file | `cd crates/python && uv lock`, then commit `uv.lock` |
 | `No pyproject.toml found` from `uv lock` | `uv lock` ran from the repo root | Run it in `crates/python` |

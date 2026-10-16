@@ -1,17 +1,23 @@
 # CI — the PR quality gates.
 #
-# Purpose: every job here is a *blocking* check for PRs into main. Humans only
-# review what machines can't check; everything below is machine-checked:
-#   version-check   version fields stay in sync across the workspace
+# Purpose: every job here is a *blocking* check for PRs into main, through
+# the one required check, `CI passed` (the `ci-passed` job at the bottom).
+# Humans only review what machines can't check; everything below is
+# machine-checked:
+#   Plan            decides what this run tests (see "WHAT RUNS WHEN")
+#   Lint            one runner for the small checks: version fields in sync,
+#                   cargo-audit + cargo-deny, zizmor on these workflows,
+#                   Vale + proselint on the handwritten docs, the public-API
+#                   baseline, and a build on the declared MSRV
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
-#                   Cargo.toml [workspace.lints]), cargo-machete, unit tests
-#   Test            the `quick` nextest tier (ubuntu/macos x stable/beta) —
-#                   see .config/nextest.toml (#457); installs the pinned
-#                   tippecanoe so the tippecanoe-decode golden test runs
-#                   rather than skips (#420)
+#                   Cargo.toml [workspace.lints]), cargo-shear, unit tests
+#   Test            the `quick` nextest tier (ubuntu/macos stable; beta on
+#                   main) — see .config/nextest.toml (#457); installs the
+#                   pinned tippecanoe so the tippecanoe-decode golden test
+#                   runs rather than skips (#420)
 #   Slow Tests      the slow tests `quick` excludes; Test + Slow Tests
-#                   together cover the `full` tier, on ubuntu/macos stable,
-#                   split into three CPU shards per OS (six checks)
+#                   together cover the `full` tier, split into three shards
+#                   (ubuntu on PRs; ubuntu + macos on main)
 #   Python Quality  ruff check/format (docstrings: pydocstyle, pydoclint,
 #                   W505), mypy + stubtest, ty, doctests, vulture, xenon,
 #                   pip-audit — all via uv against the committed lockfile
@@ -24,22 +30,33 @@
 #   Coverage        cargo-llvm-cov -> lcov; scripts/coverage_gate.py fails
 #                   below the line-coverage floor; codecov gets the report
 #                   (informational)
-#   Profiling       dhat-heap feature keeps compiling
-#   Security Audit  cargo-audit + cargo-deny (advisories/licenses/bans/sources)
-#   Docs Prose      Vale + proselint on the handwritten docs, via
-#                   scripts/lint-prose.sh (same command as the pre-commit hook)
-#   CI Lint         zizmor (GitHub Actions security linter) on this repo's
-#                   own workflows
+#   CI passed       fails if any job above failed or was cancelled; the only
+#                   CI context branch protection requires
+#
+# WHAT RUNS WHEN. The org's free plan runs 20 jobs at once, 5 of them on
+# macOS, across every PR and every push to main. A PR that started ~31 jobs
+# spent most of its hour queued, so PRs run a smaller set:
+#   pull_request    Test on ubuntu + macos stable; Slow Tests on ubuntu.
+#                   A PR that touches only docs (scripts/ci/docs_only.sh)
+#                   runs just Plan, Lint, Docs and the gate.
+#   push to main    everything: adds the beta Test lanes and the macOS Slow
+#                   Tests, so a macOS-only or beta break shows up on the
+#                   merge that caused it.
+#   workflow_dispatch  everything, on any branch. Run it on a PR that
+#                   changes pipeline internals, sharding, determinism or
+#                   platform-sensitive code, before merging.
+# A job skipped on purpose reports "skipped", which `CI passed` accepts.
 #
 # Benchmarks run in bench.yml (push to main / manual); mutation testing runs
 # in mutation-tests.yml (weekly); the tippecanoe parity gate (#420) runs in
-# tippecanoe-compare.yml (PRs, push to main, weekly). None appears here, so
-# no job in this workflow is ever skipped on a PR.
+# tippecanoe-compare.yml (PRs, push to main, weekly).
 #
 # TOOLCHAIN POLICY: floating `stable` for all gates, with a `beta` lane in the
 # Test matrix as the early-warning system for upcoming rustc/clippy breakage
 # (a new stable clippy once cost a morning — beta surfaces that a cycle
-# early). We deliberately do NOT pin the toolchain: a pin needs a scheduled
+# early). The beta lanes run on every push to main, not on PRs: a beta break
+# comes from the toolchain, not from the PR, and main sees several pushes a
+# day. We deliberately do NOT pin the toolchain: a pin needs a scheduled
 # bump job that itself rots, while beta failures are visible and actionable.
 # All third-party actions are pinned by commit SHA (enforced by zizmor);
 # Dependabot bumps the pins.
@@ -51,6 +68,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -65,67 +83,55 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Version consistency check - MUST pass before any release
-  version-check:
-    name: Version Consistency
+  # Plan: what this run tests. See "WHAT RUNS WHEN" in the header. Every
+  # other job reads these outputs, so they are the one place the PR/main
+  # split lives.
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.plan.outputs.code }}
+      test_matrix: ${{ steps.plan.outputs.test_matrix }}
+      slow_matrix: ${{ steps.plan.outputs.slow_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # HEAD^1 (the base tip) for the docs-only diff below.
+          fetch-depth: 2
 
-      - name: Check version consistency
+      - name: Decide what runs
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          echo "Checking version consistency across workspace..."
-
-          # Extract versions
-          WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
-          PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-          CZ_VERSION=$(grep '^version = ' .cz.toml | sed 's/version = "\(.*\)"/\1/')
-          # uv.lock pins the Python project's own version. `cz bump` does not
-          # touch it, and a stale pin fails the Python Quality job later with
-          # an opaque resolver error, so check it here where the fix is named.
-          UV_LOCK_VERSION=$(awk '/^name = "tylertoo"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' crates/python/uv.lock)
-
-          echo "Versions found:"
-          echo "  Cargo.toml workspace.package.version: $WORKSPACE_VERSION"
-          echo "  Cargo.toml tylertoo-core dependency: $CORE_DEP_VERSION"
-          echo "  pyproject.toml version:               $PYTHON_VERSION"
-          echo "  .cz.toml version:                     $CZ_VERSION"
-          echo "  crates/python/uv.lock version:        $UV_LOCK_VERSION"
-
-          # Check for mismatches
-          ERROR=0
-          if [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
-            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs core-dep=$CORE_DEP_VERSION"
-            ERROR=1
-          fi
-          if [ "$WORKSPACE_VERSION" != "$PYTHON_VERSION" ]; then
-            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs python=$PYTHON_VERSION"
-            ERROR=1
-          fi
-          if [ "$WORKSPACE_VERSION" != "$CZ_VERSION" ]; then
-            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs commitizen=$CZ_VERSION"
-            ERROR=1
-          fi
-          if [ "$WORKSPACE_VERSION" != "$UV_LOCK_VERSION" ]; then
-            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs uv.lock=$UV_LOCK_VERSION. Run 'cd crates/python && uv lock'."
-            ERROR=1
+          code=true
+          if [ "$EVENT" = pull_request ] \
+            && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
+            code=false
           fi
 
-          if [ "$ERROR" -eq 1 ]; then
-            echo ""
-            echo "Fix: Run 'uv run cz bump' from repo root to sync all versions,"
-            echo "     then 'cd crates/python && uv lock' to refresh the lockfile."
-            exit 1
+          if [ "$EVENT" = pull_request ]; then
+            test_matrix='{"os":["ubuntu-latest","macos-latest"],"rust":["stable"]}'
+            slow_os='["ubuntu-latest"]'
+          else
+            test_matrix='{"os":["ubuntu-latest","macos-latest"],"rust":["stable","beta"]}'
+            slow_os='["ubuntu-latest","macos-latest"]'
           fi
+          slow_matrix="{\"os\":$slow_os,\"shard\":[\"heavy\",\"determinism\",\"rest\"]}"
 
-          echo "All versions consistent: $WORKSPACE_VERSION"
+          {
+            echo "code=$code"
+            echo "test_matrix=$test_matrix"
+            echo "slow_matrix=$slow_matrix"
+          } | tee -a "$GITHUB_OUTPUT"
 
   # Fast feedback: formatting, lints, dead deps, unit tests
   check:
     name: Check
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -197,12 +203,15 @@ jobs:
       - name: Run clippy
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
+        # --all-features includes dhat-heap, so this is also the check that
+        # the profiling build compiles on glibc (it was a separate release
+        # build, "Profiling Features", until the job count had to come down).
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check musl target compiles (both allocator arrangements)
         # The CLI's musl-only #[global_allocator] (#480) must coexist with
-        # the dhat-heap allocator cfg; neither combination is compiled by
-        # any other job. musl-tools provides musl-gcc for the -sys crates'
+        # the dhat-heap allocator cfg; neither musl combination is compiled
+        # by any other step. musl-tools provides musl-gcc for the -sys crates'
         # C code (zstd, mimalloc).
         run: |
           sudo apt-get install -y musl-tools
@@ -237,13 +246,15 @@ jobs:
         run: cargo test --locked --lib --all-features
 
   # Full test suite
+  # The matrix comes from the plan job: ubuntu + macos stable on PRs, plus
+  # beta on main (see "WHAT RUNS WHEN" in the header).
   test:
     name: Test
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable, beta]
+      matrix: ${{ fromJSON(needs.plan.outputs.test_matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -361,26 +372,33 @@ jobs:
   # the `full` profile. They run beside the Test matrix, so no other job
   # waits on them (#524). Stable only, on both OSes: the set holds the
   # determinism and shard-parity tests, which guard platform-sensitive
-  # behavior.
+  # behavior. PRs run ubuntu only; every push to main adds macOS, so a
+  # macOS-only break surfaces on the merge that caused it (the plan job
+  # builds the matrix; see "WHAT RUNS WHEN" in the header).
   #
-  # Shards: `--partition count:N/3` deals the same slow set out across three
-  # runners, one test at a time in a stable order. The three shards are a CPU
-  # split of one test set, not three different kinds of test: the set is
-  # CPU-bound (about 2700 test-seconds against a 4-vCPU runner), and a single
-  # runner took 13-17 min. All six checks (3 shards x 2 OSes) must pass; a
-  # test that fails in any shard fails the set.
+  # Shards: the set is CPU-bound (about 2700 test-seconds against a 4-vCPU
+  # runner; a single runner took 13-17 min), so it is split three ways by
+  # test binary, balanced on measured test-seconds (ubuntu, Oct 2026):
+  #   heavy        sink_downgrade (one 568s test, the floor for any split),
+  #                hostile_geometry_eval, stream_profile_parity   ~825s
+  #   determinism  thread_count_determinism                        ~860s
+  #   rest         everything else in the slow set                ~1000s
+  # `rest` is defined as "not the other two", so a new slow binary lands
+  # there with no edit here. (`--partition count:N/3` dealt tests out one at
+  # a time and put 1850 of the 2700 test-seconds in shard 1.) Rebalance by
+  # moving a binary between the two named filters below.
   #
   # The golden-tile guard (`convert_guard_golden`, #558) lives in this set,
-  # and these six checks are the only place it gates merges. If they stop
-  # being required in branch protection, the guard stops gating.
+  # in `rest`, and gates merges through `CI passed`. If Slow Tests ever drops
+  # out of that job's `needs`, the guard stops gating.
   slow-tests:
-    name: Slow Tests (${{ matrix.os }}, shard ${{ matrix.shard }}/3)
+    name: Slow Tests (${{ matrix.os }}, ${{ matrix.shard }})
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        shard: [1, 2, 3]
+      matrix: ${{ fromJSON(needs.plan.outputs.slow_matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -442,18 +460,27 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run slow tests (shard ${{ matrix.shard }}/3)
+      - name: Run slow tests (${{ matrix.shard }})
         env:
           SHARD: ${{ matrix.shard }}
-        run: >-
-          cargo nextest run --locked --all-features
-          --ignore-default-filter -E 'not default()'
-          --partition "count:${SHARD}/3"
+        run: |
+          heavy='binary(sink_downgrade) | binary(hostile_geometry_eval) | binary(stream_profile_parity)'
+          determinism='binary(thread_count_determinism)'
+          case "$SHARD" in
+            heavy) shard="$heavy" ;;
+            determinism) shard="$determinism" ;;
+            rest) shard="not ($heavy | $determinism)" ;;
+            *) echo "::error::unknown shard $SHARD"; exit 1 ;;
+          esac
+          cargo nextest run --locked --all-features \
+            --ignore-default-filter -E "not default() & ($shard)"
 
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
   python-quality:
     name: Python Quality
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -559,6 +586,8 @@ jobs:
   # lint/type/audit steps, which do not depend on the OS, on Linux only.
   python-tests:
     name: Python Tests (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -725,6 +754,8 @@ jobs:
   # Coverage reporting
   coverage:
     name: Coverage
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -840,206 +871,20 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
-  # Profiling features compile check
-  profiling:
-    name: Profiling Features
+
+  # Lint: the small checks on one runner. Each used to be its own job, and
+  # on the free plan's 20-job pool a job that runs for seconds still waits
+  # its turn for a runner. Every check step runs `if: !cancelled()`, so one
+  # failure does not hide the next; the failing step's name says which
+  # check it was.
+  lint:
+    name: Lint
+    needs: plan
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-profiling-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build with dhat-heap feature
-        run: cargo build --locked --release --features dhat-heap
-
-  # Build on exactly the declared MSRV. The `rust-version` in Cargo.toml is a
-  # published compatibility promise, and nothing else in CI exercises it --
-  # stable and beta both satisfy any plausible value -- so it silently rotted
-  # to "1.75" while the real floor had moved to 1.95. The toolchain is read
-  # FROM Cargo.toml rather than pinned here, so the two cannot disagree: bump
-  # the manifest and this job follows.
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Read MSRV from Cargo.toml
-        id: msrv
-        run: |
-          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ -z "$version" ]; then
-            echo "::error::could not read rust-version from Cargo.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Declared MSRV: $version"
-
-      - name: Install Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
-
-      # --all-features so the optional `remote` stack (object_store, aws-*) is
-      # covered too; that is where the MSRV floor actually comes from.
-      - name: Check on the declared MSRV
-        run: cargo check --locked --workspace --all-targets --all-features
-
-  # Security audit: advisories on every PR, plus full supply-chain policy
-  # (licenses, bans, sources) via cargo-deny. The weekly security.yml run
-  # catches new advisories between PRs.
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          # Full history kept: the (currently disabled, see below) semver
-          # gate resolves its baseline from a git revision.
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
-        with:
-          tool: cargo-audit,cargo-deny
-
-      # Cargo.lock is committed, so there is nothing to generate here: the
-      # audits below run against the exact versions we build and ship. This
-      # step only fails the job if the lock is stale relative to the
-      # manifests, instead of letting the audit silently re-resolve.
-      # (The weekly security.yml run keeps auditing a *fresh* resolution as
-      # the early-warning lane — see the comment on that step.)
-      - name: Verify Cargo.lock is up to date
-        run: cargo metadata --locked --format-version 1 > /dev/null
-
-      - name: Run cargo audit
-        run: cargo audit
-
-      - name: Run cargo deny (advisories, licenses, bans, sources)
-        run: cargo deny check
-
-      # SEMVER GATE DISABLED until the v0.9 "freeze" milestone (#436/#437).
-      #
-      # The old gate ran with `--baseline-rev origin/main`, which compares
-      # each PR against main, not against the last release. Every PR that
-      # broke tylertoo-core's public API then needed its own minor bump,
-      # even when the previous bump was still unreleased, so the version
-      # climbed from 0.7.1 to 0.11.0 with no releases behind it and had to
-      # be reset to 0.8.0 by hand.
-      #
-      # Re-enable when the v0.9 API freeze lands: restore the
-      # cargo-semver-checks tool in the install step above and this step.
-      # Leave out `--baseline-rev`: without it the tool compares against
-      # the newest tylertoo-core on crates.io, so one bump covers every
-      # breaking change until the next release.
-      #
-      #   - name: Check for breaking API changes
-      #     run: |
-      #       cargo semver-checks check-release \
-      #         --package tylertoo-core
-      #
-      # The committed public-api baseline job below stays: API changes are
-      # still surfaced in review via api/tylertoo-core.txt diffs — they just
-      # no longer force a version bump.
-
-  # Public API surface: fail when tylertoo-core's exported API drifts from the
-  # committed baseline. This is a REVIEW gate, not a ban on growth — an
-  # intentional change is landed by regenerating the baseline in the same PR:
-  #
-  #   cd crates/core
-  #   rustup toolchain install $NIGHTLY   # the pin below
-  #   cargo +$NIGHTLY public-api --simplified > api/tylertoo-core.txt
-  #
-  # TOOLCHAIN EXCEPTION: this is the one job with a pinned toolchain. The
-  # workspace policy is floating `stable` (see the header), but the baseline
-  # is rustdoc JSON, and rustdoc renders paths differently from one nightly
-  # to the next. A floating `nightly` broke this gate with no source change
-  # when `std::io::Error` started printing as `core::io::error::Error`. The
-  # pin makes the diff mean "the API changed", not "rustc changed". Bump it
-  # deliberately, regenerating the baseline in the same commit.
-  public-api:
-    name: Public API
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
+      # Public API's pinned nightly: see the TOOLCHAIN EXCEPTION note there.
       NIGHTLY: nightly-2026-09-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust nightly
-        # cargo-public-api reads rustdoc JSON, which is nightly-only.
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ env.NIGHTLY }}
-
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Install cargo-public-api
-        run: cargo install cargo-public-api --locked
-
-      - name: Diff the public API against the baseline
-        run: |
-          cargo "+$NIGHTLY" public-api --simplified > api-current.txt
-          if ! diff -u api/tylertoo-core.txt api-current.txt; then
-            echo "::error::tylertoo-core public API changed."
-            echo "Regenerate the baseline in this PR if the change is intended:"
-            echo "  cd crates/core && cargo +$NIGHTLY public-api \\"
-            echo "    --simplified > api/tylertoo-core.txt"
-            exit 1
-          fi
-        working-directory: crates/core
-
-  # Prose lint for the handwritten docs. scripts/lint-prose.sh owns the file
-  # list and is the same command the pre-commit hook runs: Vale errors and
-  # any proselint finding fail the job. Vale's warnings and suggestions print
-  # afterwards as an advisory audit that never fails.
-  prose:
-    name: Docs Prose
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
       VALE_VERSION: "3.24.0"
       VALE_SHA256: 867534ddb678abca7f214bc4706ead0922bd5252ffe8035fc227013f66c8b214
     steps:
@@ -1047,10 +892,75 @@ jobs:
         with:
           persist-credentials: false
 
+      # Version fields stay in sync across the workspace. MUST pass before
+      # any release.
+      - name: Version consistency
+        if: ${{ !cancelled() }}
+        run: |
+          echo "Checking version consistency across workspace..."
+
+          # Extract versions
+          WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          CORE_DEP_VERSION=$(grep 'tylertoo-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+          PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          CZ_VERSION=$(grep '^version = ' .cz.toml | sed 's/version = "\(.*\)"/\1/')
+          # uv.lock pins the Python project's own version. `cz bump` does not
+          # touch it, and a stale pin fails the Python Quality job later with
+          # an opaque resolver error, so check it here where the fix is named.
+          UV_LOCK_VERSION=$(awk '/^name = "tylertoo"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' crates/python/uv.lock)
+
+          echo "Versions found:"
+          echo "  Cargo.toml workspace.package.version: $WORKSPACE_VERSION"
+          echo "  Cargo.toml tylertoo-core dependency: $CORE_DEP_VERSION"
+          echo "  pyproject.toml version:               $PYTHON_VERSION"
+          echo "  .cz.toml version:                     $CZ_VERSION"
+          echo "  crates/python/uv.lock version:        $UV_LOCK_VERSION"
+
+          # Check for mismatches
+          ERROR=0
+          if [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs core-dep=$CORE_DEP_VERSION"
+            ERROR=1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$PYTHON_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs python=$PYTHON_VERSION"
+            ERROR=1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$CZ_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs commitizen=$CZ_VERSION"
+            ERROR=1
+          fi
+          if [ "$WORKSPACE_VERSION" != "$UV_LOCK_VERSION" ]; then
+            echo "::error::Version mismatch: workspace=$WORKSPACE_VERSION vs uv.lock=$UV_LOCK_VERSION. Run 'cd crates/python && uv lock'."
+            ERROR=1
+          fi
+
+          if [ "$ERROR" -eq 1 ]; then
+            echo ""
+            echo "Fix: Run 'uv run cz bump' from repo root to sync all versions,"
+            echo "     then 'cd crates/python && uv lock' to refresh the lockfile."
+            exit 1
+          fi
+
+          echo "All versions consistent: $WORKSPACE_VERSION"
+
       - name: Install uv
+        if: ${{ !cancelled() }}
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
+      # CI Lint: zizmor (GitHub Actions security linter) on these workflows.
+      - name: zizmor
+        if: ${{ !cancelled() }}
+        run: uvx zizmor==1.26.1 --min-severity low .github/workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # Docs Prose: scripts/lint-prose.sh owns the file list and is the same
+      # command the pre-commit hook runs: Vale errors and any proselint
+      # finding fail the step. Vale's warnings and suggestions print
+      # afterwards as an advisory audit that never fails.
       - name: Install Vale
+        if: ${{ !cancelled() }}
         working-directory: ${{ runner.temp }}
         run: |
           gh release download "v${VALE_VERSION}" --repo vale-cli/vale \
@@ -1064,15 +974,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Fetch the pinned Vale packages
+        if: ${{ !cancelled() }}
         run: vale sync
 
       - name: Test the Tylertoo-* Vale rules
+        if: ${{ !cancelled() }}
         run: |
           vale test --coverage .vale/tests \
             .vale/styles/Tylertoo-Docs .vale/styles/Tylertoo-Mechanics \
             .vale/styles/Tylertoo-Terms .vale/styles/Tylertoo-Voice
 
       - name: Lint docs prose (Vale errors + proselint)
+        if: ${{ !cancelled() }}
         run: scripts/lint-prose.sh
 
       - name: Vale advisory audit (warnings and suggestions)
@@ -1081,19 +994,180 @@ jobs:
           scripts/lint-prose.sh --list \
             | xargs vale --no-exit --minAlertLevel=suggestion --output=line
 
-  # Lint the CI configuration itself.
-  ci-lint:
-    name: CI Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Three toolchains below: the declared MSRV, Public API's pinned
+      # nightly, and stable. dtolnay/rust-toolchain makes the last one it
+      # installs the default, so stable goes last and the other two are
+      # always named with `cargo +<toolchain>`.
+      #
+      # MSRV: the `rust-version` in Cargo.toml is a published compatibility
+      # promise, and nothing else in CI exercises it -- stable and beta both
+      # satisfy any plausible value -- so it silently rotted to "1.75" while
+      # the real floor had moved to 1.95. The toolchain is read FROM
+      # Cargo.toml rather than pinned here, so the two cannot disagree: bump
+      # the manifest and this check follows.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::could not read rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }} (MSRV)
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          persist-credentials: false
+          toolchain: ${{ steps.msrv.outputs.version }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install Rust nightly (Public API)
+        # cargo-public-api reads rustdoc JSON, which is nightly-only.
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY }}
 
-      - name: Run zizmor
-        run: uvx zizmor==1.26.1 --min-severity low .github/workflows
+      - name: Install Rust stable
+        if: ${{ !cancelled() }}
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Install protoc
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      # Security audit: advisories on every PR, plus full supply-chain policy
+      # (licenses, bans, sources) via cargo-deny. The weekly security.yml run
+      # catches new advisories between PRs.
+      - name: Install cargo-audit and cargo-deny
+        if: ${{ !cancelled() }}
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # Cargo.lock is committed, so there is nothing to generate here: the
+      # audits below run against the exact versions we build and ship. This
+      # step only fails if the lock is stale relative to the manifests,
+      # instead of letting the audit silently re-resolve. (The weekly
+      # security.yml run keeps auditing a *fresh* resolution as the
+      # early-warning lane — see the comment on that step.)
+      - name: Verify Cargo.lock is up to date
+        if: ${{ !cancelled() }}
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Run cargo audit
+        if: ${{ !cancelled() }}
+        run: cargo audit
+
+      - name: Run cargo deny (advisories, licenses, bans, sources)
+        if: ${{ !cancelled() }}
+        run: cargo deny check
+
+      # SEMVER GATE DISABLED until the v0.9 "freeze" milestone (#436/#437).
+      #
+      # The old gate ran with `--baseline-rev origin/main`, which compares
+      # each PR against main, not against the last release. Every PR that
+      # broke tylertoo-core's public API then needed its own minor bump,
+      # even when the previous bump was still unreleased, so the version
+      # climbed from 0.7.1 to 0.11.0 with no releases behind it and had to
+      # be reset to 0.8.0 by hand.
+      #
+      # Re-enable when the v0.9 API freeze lands: add cargo-semver-checks
+      # to the install step above and restore this step. Leave out
+      # `--baseline-rev`: without it the tool compares against the newest
+      # tylertoo-core on crates.io, so one bump covers every breaking change
+      # until the next release.
+      #
+      #   - name: Check for breaking API changes
+      #     run: |
+      #       cargo semver-checks check-release \
+      #         --package tylertoo-core
+      #
+      # The committed public-api baseline step below stays: API changes are
+      # still surfaced in review via api/tylertoo-core.txt diffs — they just
+      # no longer force a version bump.
+
+      # --all-features so the optional `remote` stack (object_store, aws-*) is
+      # covered too; that is where the MSRV floor actually comes from.
+      - name: Check on the declared MSRV
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+$MSRV" check --locked --workspace --all-targets --all-features
+
+      # Public API surface: fail when tylertoo-core's exported API drifts from
+      # the committed baseline. This is a REVIEW gate, not a ban on growth —
+      # an intentional change is landed by regenerating the baseline in the
+      # same PR:
+      #
+      #   cd crates/core
+      #   rustup toolchain install $NIGHTLY   # the pin above
+      #   cargo +$NIGHTLY public-api --simplified > api/tylertoo-core.txt
+      #
+      # TOOLCHAIN EXCEPTION: this is the one check with a pinned toolchain.
+      # The workspace policy is floating `stable` (see the header), but the
+      # baseline is rustdoc JSON, and rustdoc renders paths differently from
+      # one nightly to the next. A floating `nightly` broke this gate with no
+      # source change when `std::io::Error` started printing as
+      # `core::io::error::Error`. The pin makes the diff mean "the API
+      # changed", not "rustc changed". Bump it deliberately, regenerating
+      # the baseline in the same commit.
+      - name: Install cargo-public-api
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        run: cargo install cargo-public-api --locked
+
+      - name: Diff the public API against the baseline
+        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        working-directory: crates/core
+        run: |
+          cargo "+$NIGHTLY" public-api --simplified > api-current.txt
+          if ! diff -u api/tylertoo-core.txt api-current.txt; then
+            echo "::error::tylertoo-core public API changed."
+            echo "Regenerate the baseline in this PR if the change is intended:"
+            echo "  cd crates/core && cargo +$NIGHTLY public-api \\"
+            echo "    --simplified > api/tylertoo-core.txt"
+            exit 1
+          fi
+
+  # The one CI context branch protection requires. Every job above is
+  # blocking through it: it fails when any of them failed or was cancelled.
+  # "skipped" passes, because the plan job skips jobs on purpose (docs-only
+  # PRs; the main-only lanes). A new job must be added to `needs` here or
+  # it does not gate anything.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs:
+      - plan
+      - lint
+      - check
+      - test
+      - slow-tests
+      - python-quality
+      - python-tests
+      - docs
+      - coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed or was skipped on purpose
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null; then
+            echo "::error::a required CI job failed or was cancelled (listed above)"
+            exit 1
+          fi
