@@ -290,6 +290,9 @@ class TestOverviewIntegration:
             assert report["duration_secs"] > 0
             # Local inputs carry no remote fetch counters (#210).
             assert report["remote_fetch"] is None
+            # #451: this fixture declares its CRS, so the assume-WGS84
+            # fallback must not be flagged (the field is always present).
+            assert report["crs_assumed_wgs84"] is False
             # z0..z6 requested; coarse levels where every (tiny) building falls
             # below the visibility gate are omitted, so <= 7 levels survive and
             # the canonical (finest) one is always z6 with every input feature.

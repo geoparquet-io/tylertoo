@@ -21,6 +21,13 @@ pub struct CrsInfo {
     pub is_wgs84: bool,
     /// Human-readable CRS name if available
     pub name: Option<String>,
+    /// Whether the WGS84 answer is an *assumption* rather than a declaration
+    /// (#451): the file carried no usable CRS declaration (no key-value
+    /// metadata, no `geo` key, no `columns`, a missing primary column, or an
+    /// explicit `crs: null`) and the reader fell back to WGS84. A `crs` key
+    /// *omitted* from an otherwise well-formed column is NOT an assumption —
+    /// the GeoParquet spec defines that as OGC:CRS84.
+    pub assumed_wgs84: bool,
 }
 
 impl CrsInfo {
@@ -30,6 +37,16 @@ impl CrsInfo {
             identifier: Some("EPSG:4326".to_string()),
             is_wgs84: true,
             name: Some("WGS 84".to_string()),
+            assumed_wgs84: false,
+        }
+    }
+
+    /// Create `CrsInfo` indicating WGS84 *assumed* because the file declared
+    /// nothing usable (#451) — see [`CrsInfo::assumed_wgs84`].
+    fn wgs84_assumed() -> Self {
+        Self {
+            assumed_wgs84: true,
+            ..Self::wgs84()
         }
     }
 
@@ -40,6 +57,7 @@ impl CrsInfo {
             identifier: Some(id.to_string()),
             is_wgs84,
             name: None,
+            assumed_wgs84: false,
         }
     }
 
@@ -49,6 +67,7 @@ impl CrsInfo {
             identifier: None,
             is_wgs84: false,
             name: None,
+            assumed_wgs84: false,
         }
     }
 }
@@ -329,6 +348,80 @@ mod warn_once {
     pub(super) static NULL_CRS_DEGREES: Once = Once::new();
     pub(super) static NULL_CRS_UNKNOWN: Once = Once::new();
     pub(super) static UNEXPECTED_CRS_FORMAT: Once = Once::new();
+    pub(super) static GEO_VERSION_MISSING: Once = Once::new();
+    pub(super) static GEO_VERSION_UNKNOWN: Once = Once::new();
+}
+
+/// What a `geo` metadata `version` field says about how safely this reader
+/// can interpret the rest of the metadata (#451).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeoVersionDisposition {
+    /// A GeoParquet spec this reader knows: major 1 (1.0/1.1) or major 2
+    /// (parquet-native geometry types, which the Parquet `LogicalType`
+    /// readers handle — see #518).
+    Known,
+    /// The spec-required `version` field is absent.
+    Missing,
+    /// A major this reader does not know (a future 3.x, a pre-1.0 beta), or
+    /// a string that is not a version at all. The metadata is still read
+    /// best-effort, but fields may be misread.
+    Unknown,
+}
+
+/// Classify a `geo` metadata `version` string (#451).
+///
+/// The major is everything before the first `.` or `-`, so pre-release
+/// suffixes ("1.0.0-beta.1") classify by their major like releases do.
+pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDisposition {
+    let Some(version) = version else {
+        return GeoVersionDisposition::Missing;
+    };
+    let major = version.trim().split(['.', '-']).next().unwrap_or("");
+    match major.parse::<u32>() {
+        Ok(1 | 2) => GeoVersionDisposition::Known,
+        _ => GeoVersionDisposition::Unknown,
+    }
+}
+
+/// Warn (once per process) when a `geo` metadata `version` is missing or
+/// names a spec this reader does not know (#451). A warning, never an error:
+/// the fields read from the metadata (`primary_column`, `crs`, `bbox`,
+/// `covering`) are read best-effort and a future spec most likely still
+/// carries them, so rejecting the file outright would refuse inputs that
+/// parse fine — matching the issue's "hard-warn on unknown majors" ask.
+fn warn_geo_version(geo_json: &Value) {
+    let version = geo_json.get("version").and_then(Value::as_str);
+    match geo_version_disposition(version) {
+        GeoVersionDisposition::Known => {}
+        GeoVersionDisposition::Missing => {
+            warn_once::gate(&warn_once::GEO_VERSION_MISSING, || {
+                log::warn!(
+                    "GeoParquet 'geo' metadata has no 'version' field (the spec \
+                     requires one); reading it as GeoParquet 1.x"
+                )
+            });
+        }
+        GeoVersionDisposition::Unknown => {
+            // The version string is untrusted input headed for a log line;
+            // {:?} escapes it and the cap keeps a pathological value short.
+            let version = version.unwrap_or_default();
+            let shown: String = version.chars().take(64).collect();
+            warn_once::gate(&warn_once::GEO_VERSION_UNKNOWN, || {
+                log::warn!(
+                    "GeoParquet 'geo' metadata declares version {:?}{}, which this \
+                     version of tylertoo does not know (GeoParquet 1.x and 2.x are \
+                     supported); reading it best-effort as 1.x \u{2014} metadata \
+                     fields may be misread",
+                    shown,
+                    if shown.len() < version.len() {
+                        "…"
+                    } else {
+                        ""
+                    }
+                )
+            });
+        }
+    }
 }
 
 /// Extract CRS information from already-parsed parquet key-value metadata.
@@ -350,7 +443,7 @@ pub fn crs_info_from_kv_metadata(
         warn_once::gate(&warn_once::NO_KV_METADATA, || {
             log::warn!("GeoParquet file has no key-value metadata; assuming WGS84")
         });
-        return Ok(CrsInfo::wgs84());
+        return Ok(CrsInfo::wgs84_assumed());
     };
 
     let geo_value = kv_metadata
@@ -363,12 +456,16 @@ pub fn crs_info_from_kv_metadata(
         warn_once::gate(&warn_once::NO_GEO_METADATA, || {
             log::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84")
         });
-        return Ok(CrsInfo::wgs84());
+        return Ok(CrsInfo::wgs84_assumed());
     };
 
     // Parse the geo metadata JSON
     let geo_json: Value = serde_json::from_str(geo_json_str)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {}", e)))?;
+
+    // #451: flag a `geo.version` from a spec this reader does not know
+    // before interpreting any of its fields.
+    warn_geo_version(&geo_json);
 
     // Get the primary geometry column name (default is "geometry")
     let primary_column = geo_json
@@ -381,7 +478,7 @@ pub fn crs_info_from_kv_metadata(
         warn_once::gate(&warn_once::NO_COLUMNS, || {
             log::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84")
         });
-        return Ok(CrsInfo::wgs84());
+        return Ok(CrsInfo::wgs84_assumed());
     };
 
     // Get the primary column's metadata
@@ -392,7 +489,7 @@ pub fn crs_info_from_kv_metadata(
                 primary_column
             )
         });
-        return Ok(CrsInfo::wgs84());
+        return Ok(CrsInfo::wgs84_assumed());
     };
 
     // Extract CRS - can be a string identifier or PROJJSON object
@@ -412,10 +509,26 @@ pub fn crs_info_from_kv_metadata(
             let bbox_plausible_degrees = column_meta
                 .get("bbox")
                 .and_then(Value::as_array)
-                .filter(|b| b.len() >= 4)
-                .map(|b| {
+                .and_then(|b| {
                     let v: Vec<f64> = b.iter().filter_map(Value::as_f64).collect();
-                    v.len() >= 4 && v[0] >= -180.0 && v[2] <= 180.0 && v[1] >= -90.0 && v[3] <= 90.0
+                    // GeoParquet orders a 2D bbox [xmin, ymin, xmax, ymax]
+                    // and a 3D one [xmin, ymin, zmin, xmax, ymax, zmax], so
+                    // the x/y maxima move. Reading a 6-element bbox with the
+                    // 2D offsets compares a *z* minimum against +-180 and an
+                    // x maximum against +-90, which rejects any lon/lat file
+                    // east of 90E -- e.g. a Sedona-written Tokyo extract
+                    // with "crs": null and bbox
+                    // [139.6, 35.6, 0.0, 139.8, 35.8, 50.0].
+                    let idx: Option<[usize; 4]> = match v.len() {
+                        4 => Some([0, 1, 2, 3]),
+                        6 => Some([0, 1, 3, 4]),
+                        // Any other length is not a bbox we understand;
+                        // treat it as absent rather than guessing offsets.
+                        _ => None,
+                    };
+                    idx.map(|[xmin, ymin, xmax, ymax]| {
+                        v[xmin] >= -180.0 && v[xmax] <= 180.0 && v[ymin] >= -90.0 && v[ymax] <= 90.0
+                    })
                 })
                 // No (or malformed) bbox: nothing to check against — match
                 // the missing-geo-metadata precedent and assume.
@@ -427,7 +540,7 @@ pub fn crs_info_from_kv_metadata(
                          assuming OGC:CRS84 (lon/lat WGS84)"
                     )
                 });
-                Ok(CrsInfo::wgs84())
+                Ok(CrsInfo::wgs84_assumed())
             } else {
                 warn_once::gate(&warn_once::NULL_CRS_UNKNOWN, || {
                     log::warn!(
@@ -464,6 +577,7 @@ pub fn crs_info_from_kv_metadata(
                 identifier: id_str.or_else(|| name.map(|n| n.to_string())),
                 is_wgs84,
                 name: name.map(|s| s.to_string()),
+                assumed_wgs84: false,
             })
         }
         Some(other) => {
@@ -563,6 +677,65 @@ mod tests {
             !info.is_wgs84,
             "null CRS with out-of-degree-range bbox must stay unknown"
         );
+    }
+
+    #[test]
+    fn test_crs_null_with_3d_lonlat_bbox_assumes_crs84() {
+        // A 3D bbox is [xmin, ymin, zmin, xmax, ymax, zmax], so the x/y
+        // maxima sit at 3 and 4, not 2 and 3. Reading it with the 2D
+        // offsets compares zmin against +-180 and xmax against +-90, which
+        // rejects every lon/lat file east of 90E. Tokyo, with elevation:
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Polygon Z"],
+                "bbox": [139.6, 35.6, 0.0, 139.8, 35.8, 50.0],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(
+            info.is_wgs84,
+            "null CRS with a 3D degree-range bbox must still assume CRS84"
+        );
+    }
+
+    #[test]
+    fn test_crs_null_with_3d_projected_bbox_stays_unknown() {
+        // The 3D offsets must still catch genuinely projected coordinates.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [366882.0, 5237430.0, 0.0, 973200.0, 6100100.0, 120.0],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(
+            !info.is_wgs84,
+            "null CRS with an out-of-degree-range 3D bbox must stay unknown"
+        );
+    }
+
+    #[test]
+    fn test_crs_null_with_unparsable_bbox_length_assumes_crs84() {
+        // Neither 4 nor 6 elements: no bbox we can index, so match the
+        // no-bbox precedent and assume rather than guess offsets.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [139.6, 35.6, 139.8],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84);
     }
 
     #[test]
@@ -825,6 +998,139 @@ mod tests {
         assert_eq!(classify_crs_identifier("srid:3857"), CrsKind::WebMercator);
         assert_eq!(classify_crs_identifier("srid:4326"), CrsKind::Wgs84);
         assert_eq!(classify_crs_identifier("srid:27700"), CrsKind::Unknown);
+    }
+
+    /// #451: GeoParquet 1.x and 2.x are the specs this reader knows; both
+    /// are accepted without noise, pre-release suffixes included.
+    #[test]
+    fn geo_version_known_majors_are_accepted() {
+        for v in ["1.0.0", "1.1.0", "1.0.0-beta.1", "2.0.0", "2.1.0", "1"] {
+            assert_eq!(
+                geo_version_disposition(Some(v)),
+                GeoVersionDisposition::Known,
+                "{v:?} is a known GeoParquet version"
+            );
+        }
+    }
+
+    /// #451: a future/unknown major (or a version string that is not a
+    /// version at all) is flagged, never silently half-read; an absent
+    /// `version` field is its own case (the spec requires one).
+    #[test]
+    fn geo_version_unknown_major_or_garbage_is_flagged() {
+        for v in ["3.0.0", "0.4.0", "99.0.0", "banana", "", "  "] {
+            assert_eq!(
+                geo_version_disposition(Some(v)),
+                GeoVersionDisposition::Unknown,
+                "{v:?} is not a known GeoParquet version"
+            );
+        }
+        assert_eq!(
+            geo_version_disposition(None),
+            GeoVersionDisposition::Missing
+        );
+    }
+
+    /// #451: an unknown `geo.version` warns but never errors — the fields we
+    /// read (`primary_column`/`crs`/`bbox`) are read best-effort, and
+    /// rejecting the file outright would refuse inputs that still parse fine.
+    #[test]
+    fn unknown_geo_version_still_reads_crs_fields() {
+        let geo = serde_json::json!({
+            "version": "99.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:3857"}}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(!info.is_wgs84);
+        assert_eq!(info.identifier.as_deref(), Some("EPSG:3857"));
+        assert!(
+            !info.assumed_wgs84,
+            "a declared CRS is never flagged as assumed"
+        );
+    }
+
+    /// #451: every fallback branch that assumes WGS84 because the file
+    /// declared nothing usable must say so on the returned `CrsInfo`, so the
+    /// convert path can surface the assumption (warning + report field).
+    #[test]
+    fn missing_metadata_fallbacks_set_assumed_wgs84() {
+        // (1) No key-value metadata at all.
+        let info = crs_info_from_kv_metadata(None).unwrap();
+        assert!(info.is_wgs84 && info.assumed_wgs84, "no kv metadata");
+
+        // (2) Key-value metadata without a "geo" key.
+        let kv = vec![parquet::file::metadata::KeyValue::new(
+            "writer".to_string(),
+            "something".to_string(),
+        )];
+        let info = crs_info_from_kv_metadata(Some(&kv)).unwrap();
+        assert!(info.is_wgs84 && info.assumed_wgs84, "no geo key");
+
+        // (3) geo metadata without "columns".
+        let geo = serde_json::json!({"version": "1.1.0"});
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && info.assumed_wgs84, "no columns");
+
+        // (4) primary column missing from "columns".
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"other": {"encoding": "WKB"}}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && info.assumed_wgs84, "missing column");
+
+        // (5) Explicit `crs: null` with a degrees-plausible bbox (the
+        // Spark/Sedona shape) — CRS84 is assumed, and flagged as such.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [-179.99, -56.93, -61.52, 0.004],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && info.assumed_wgs84, "null crs, degree bbox");
+    }
+
+    /// #451: a *declared* WGS84 — explicitly, or by the spec's "omitted crs
+    /// means OGC:CRS84" rule — is not an assumption.
+    #[test]
+    fn declared_wgs84_is_not_flagged_assumed() {
+        // Explicit identifier.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && !info.assumed_wgs84, "explicit EPSG:4326");
+
+        // `crs` key omitted: the spec defines this as OGC:CRS84 — a
+        // declaration by omission, not the missing-metadata fallback.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB"}}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && !info.assumed_wgs84, "spec-default CRS84");
+
+        // PROJJSON declaration.
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "crs": {"type": "GeographicCRS", "name": "WGS 84",
+                        "id": {"authority": "EPSG", "code": 4326}}
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84 && !info.assumed_wgs84, "PROJJSON EPSG:4326");
     }
 
     #[test]
