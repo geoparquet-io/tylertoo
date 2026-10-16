@@ -87,6 +87,9 @@ class OverviewReport(TypedDict):
             past ±180° but within ±540° wraps and is not counted.
         unprojectable_features: Features beyond ±85.05° latitude, which
             Web Mercator cannot tile.
+        crs_assumed_wgs84: True when the input declared no CRS and
+            lon/lat WGS84 was assumed. If the coordinates are not
+            lon/lat degrees, the output is misplaced.
     """
 
     mode: Literal["duplicating", "partitioning"]
@@ -101,6 +104,7 @@ class OverviewReport(TypedDict):
     antimeridian_suspect_features: int
     out_of_range_features: int
     unprojectable_features: int
+    crs_assumed_wgs84: bool
     out_of_range_exemplars: list[OutOfRangeExemplar]
     duration_secs: float
     remote_fetch: RemoteFetch | None

@@ -509,11 +509,28 @@ pub fn crs_info_from_kv_metadata(
             let bbox_plausible_degrees = column_meta
                 .get("bbox")
                 .and_then(Value::as_array)
-                .filter(|b| b.len() >= 4)
                 .map(|b| {
                     let v: Vec<f64> = b.iter().filter_map(Value::as_f64).collect();
-                    v.len() >= 4 && v[0] >= -180.0 && v[2] <= 180.0 && v[1] >= -90.0 && v[3] <= 90.0
+                    // GeoParquet orders a 2D bbox [xmin, ymin, xmax, ymax]
+                    // and a 3D one [xmin, ymin, zmin, xmax, ymax, zmax], so
+                    // the x/y maxima move. Reading a 6-element bbox with the
+                    // 2D offsets compares a *z* minimum against +-180 and an
+                    // x maximum against +-90, which rejects any lon/lat file
+                    // east of 90E -- e.g. a Sedona-written Tokyo extract
+                    // with "crs": null and bbox
+                    // [139.6, 35.6, 0.0, 139.8, 35.8, 50.0].
+                    let idx: Option<[usize; 4]> = match v.len() {
+                        4 => Some([0, 1, 2, 3]),
+                        6 => Some([0, 1, 3, 4]),
+                        // Any other length is not a bbox we understand;
+                        // treat it as absent rather than guessing offsets.
+                        _ => None,
+                    };
+                    idx.map(|[xmin, ymin, xmax, ymax]| {
+                        v[xmin] >= -180.0 && v[xmax] <= 180.0 && v[ymin] >= -90.0 && v[ymax] <= 90.0
+                    })
                 })
+                .flatten()
                 // No (or malformed) bbox: nothing to check against — match
                 // the missing-geo-metadata precedent and assume.
                 .unwrap_or(true);
@@ -661,6 +678,65 @@ mod tests {
             !info.is_wgs84,
             "null CRS with out-of-degree-range bbox must stay unknown"
         );
+    }
+
+    #[test]
+    fn test_crs_null_with_3d_lonlat_bbox_assumes_crs84() {
+        // A 3D bbox is [xmin, ymin, zmin, xmax, ymax, zmax], so the x/y
+        // maxima sit at 3 and 4, not 2 and 3. Reading it with the 2D
+        // offsets compares zmin against +-180 and xmax against +-90, which
+        // rejects every lon/lat file east of 90E. Tokyo, with elevation:
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Polygon Z"],
+                "bbox": [139.6, 35.6, 0.0, 139.8, 35.8, 50.0],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(
+            info.is_wgs84,
+            "null CRS with a 3D degree-range bbox must still assume CRS84"
+        );
+    }
+
+    #[test]
+    fn test_crs_null_with_3d_projected_bbox_stays_unknown() {
+        // The 3D offsets must still catch genuinely projected coordinates.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [366882.0, 5237430.0, 0.0, 973200.0, 6100100.0, 120.0],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(
+            !info.is_wgs84,
+            "null CRS with an out-of-degree-range 3D bbox must stay unknown"
+        );
+    }
+
+    #[test]
+    fn test_crs_null_with_unparsable_bbox_length_assumes_crs84() {
+        // Neither 4 nor 6 elements: no bbox we can index, so match the
+        // no-bbox precedent and assume rather than guess offsets.
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "bbox": [139.6, 35.6, 139.8],
+                "crs": null
+            }}
+        });
+        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        assert!(info.is_wgs84);
     }
 
     #[test]
