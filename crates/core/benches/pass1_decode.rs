@@ -7,7 +7,8 @@
 //! [`tylertoo_core::batch_processor::extract_geometries_from_array`]. Until
 //! #650 that was the pair `overview::stream::scan_chunk` (the production
 //! pass-1 path) wrapped per chunk; pass 1 now scans geometry in place and
-//! converts only the rows it keeps, so this bench times the full conversion
+//! converts only the rows whose geometry it needs (coalesced lines, or every
+//! row for the #384 accumulator), so this bench times the full conversion
 //! that the in-memory path and pass 2 still pay. Batch decode is the thing
 //! this bench isolates; the file open/schema resolution happens once outside
 //! the timed closure.

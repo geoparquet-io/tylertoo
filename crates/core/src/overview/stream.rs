@@ -4342,7 +4342,9 @@ struct ScannedRow {
 ///
 /// Rows still convert when coalescing is on and the row is a line (it is
 /// weighed for the #449 guard and may be retained), or when the #384
-/// accumulator wants areas (every kept row is measured).
+/// accumulator wants areas (every kept row is measured). Both apply before
+/// the regional-extract gate, which [`scan_chunk`] runs later, so a row
+/// outside the region converts too, as every row did before #650.
 ///
 /// One entry per array slot. `None` is a null or unusable geometry, the two
 /// cases the old path skipped. A row `filter_mask` drops is not scanned and

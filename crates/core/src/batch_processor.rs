@@ -176,6 +176,10 @@ fn check_wkb_array(wkb: &dyn GeoArrowArray) -> Result<()> {
 /// reports it. The reader is not called on the values the walk rejects for a
 /// count, the nesting cap or a MultiPoint member overrun: those are the
 /// inputs that abort it.
+///
+/// On a value the reader decodes, it also checks pass 1's in-place scan
+/// ([`crate::overview::convert::scan_feature_traits`], #650) against
+/// decode-then-scan, to the bit, and panics if they differ.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {

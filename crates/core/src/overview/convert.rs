@@ -5398,8 +5398,10 @@ fn scan_geometry_into(g: &Geometry<f64>, scan: &mut FeatureScan) {
     }
 }
 
-/// Fused single-traversal replacement for `usable_geometry` + `geometry_bbox`
-/// + `feature_kind` used by the streaming pass-1 scan (#274).
+/// Fused single-traversal replacement for `usable_geometry`, `geometry_bbox`
+/// and `feature_kind` (#274). The streaming pass-1 scan now runs
+/// [`scan_feature_traits`] instead, which must return exactly what this does
+/// on the converted geometry (#650).
 ///
 /// Returns `None` for a geometry `usable_geometry` would reject (empty or any
 /// non-finite coord), otherwise `(feature_kind(g), geometry_bbox(g))`. It is
