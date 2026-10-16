@@ -2,10 +2,11 @@
 //!
 //! This module exposes the tylertoo-core functionality to Python via pyo3.
 
-use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use tylertoo_core::input_set::ConvertSource;
 use tylertoo_core::overview::assign::{
@@ -19,11 +20,14 @@ use tylertoo_core::overview::convert::{
     ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
 use tylertoo_core::overview::export::{
-    export_pmtiles as export_pmtiles_core, ExportOptions, FeatureOrder,
+    export_pmtiles as export_pmtiles_core, ExportOptions, ExportReport, FeatureOrder,
 };
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
+use tylertoo_core::overview::tiles::{
+    convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
+};
 
 /// Parse the `feature_order` kwarg into the core enum, surfacing a bad
 /// spelling as a Python `ValueError` rather than a panic (#361).
@@ -90,10 +94,16 @@ fn resolve_max_zoom_py(
 ///
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
+///
+/// Delegates the whole chain to core's tiles facade
+/// ([`tylertoo_core::overview::tiles::convert_to_pmtiles`], #439), so the
+/// policy — intermediate lifecycle and spill precedence, free-space
+/// preflight, knob guards, the #380 declaration, the combined report — can
+/// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input"),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input')"
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
@@ -106,85 +116,124 @@ fn convert(
     tile_size_limit: Option<usize>,
     simple_clip_fastpath: bool,
     feature_order: &str,
-) -> PyResult<()> {
+    spill_dir: Option<PathBuf>,
+) -> PyResult<Py<PyDict>> {
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
 
-    // Derive the layer name from the input if not provided: file stem for a
-    // single file, last path segment for a directory or s3://gs:// prefix,
-    // last literal segment for a glob (core owns the rules).
-    let layer_name =
-        layer_name.unwrap_or_else(|| tylertoo_core::input_set::derive_layer_name(input));
-
     // #444: built with `auto`'s placeholder, then resolved (a fixed zoom is
     // its own placeholder and comes back verbatim, with no I/O).
-    let mut options = ConvertOptions {
+    let mut convert_options = ConvertOptions {
         levels: LevelPlan::ZoomRange {
             min_zoom,
             max_zoom: max_zoom.plan_zoom(),
         },
+        // #439: the scratch knob the CLI spells `--spill-dir`. It also picks
+        // where the intermediate overview lands (precedence: this, then
+        // `$TMPDIR`, then the output's directory), which is why this facade
+        // exposes it: `$TMPDIR` is tmpfs in many containers, and the
+        // intermediate is at least input-sized.
+        spill_dir,
         ..ConvertOptions::default()
     };
-    resolve_max_zoom_py(py, max_zoom, &mut options, || {
+    // Resolves `auto` and writes the chosen zoom back into `levels`, which
+    // is where the facade reads the declared range from.
+    resolve_max_zoom_py(py, max_zoom, &mut convert_options, || {
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
-    let export_options = ExportOptions {
+    let options = TilesOptions {
+        convert: convert_options,
+        // `None` lets core derive the layer name from the input: file stem
+        // for a single file, last path segment for a directory or
+        // `s3://`/`gs://` prefix, last literal segment for a glob (core owns
+        // the rules).
         layer_name,
+        // #314: not exposed on this deprecated one-shot facade; use
+        // `overview()` + `export_pmtiles()` instead.
+        keep_overview: None,
+        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
+        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
+        // and `export-pmtiles --tile-range`.
+        shard: None,
+        tile_range: None,
         tile_buffer: 8,
-        extent: 4096,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
         feature_order: parse_feature_order(feature_order)?,
-        // #380: the archive's `vector_layers` declares the requested range
-        // even when the coarsest levels generalized to nothing (the header
-        // stays the actual tiles, #529/#522).
-        min_zoom: Some(min_zoom),
-        properties: Default::default(),
-        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
-        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
-        // and `export-pmtiles --tile-range`.
-        tile_range: None,
-        zoom_ceiling: None,
-        // #443: not exposed on this deprecated one-shot facade; use
-        // `overview()` + `export_pmtiles(..., feature_id=...)` instead.
+        // #443: not exposed here; `export_pmtiles(..., feature_id=...)`.
         feature_id: None,
-        // #427: likewise; `export_pmtiles(..., spill_dir=...)`.
-        spill_dir: None,
     };
 
-    // Intermediate overview file next to the output (same filesystem);
-    // TempPath removes it on drop — success or failure alike. Only the path
-    // is kept, not an open handle: convert publishes its output by renaming
-    // a sibling over this path, which Windows refuses while a handle to the
-    // destination is open ("Access is denied", #678).
-    let tmp_dir = output_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    let overview_tmp = tempfile::Builder::new()
-        .prefix(".tylertoo-overview-")
-        .suffix(".parquet")
-        .tempfile_in(&tmp_dir)
-        .map_err(|e| {
-            PyErr::new::<PyRuntimeError, _>(format!(
-                "failed to create temporary overview file: {}",
-                e
-            ))
-        })?
-        .into_temp_path();
-
     // Release the GIL while the Rust pipelines run.
-    py.detach(|| convert_to_overviews(&input_path, &overview_tmp, &options))
-        .map_err(convert_error_to_py)?;
-    py.detach(|| export_pmtiles_core(&overview_tmp, &output_path, &export_options))
-        .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
+    let outcome = py
+        .detach(|| convert_to_pmtiles(&TilesInput::Path(input_path), &output_path, &options))
+        .map_err(tiles_error_to_py)?;
+    let report = match outcome {
+        TilesOutcome::Converted(report) => report,
+        // Unreachable without a shard job, which this facade never sets.
+        other => {
+            return Err(PyErr::new::<PyRuntimeError, _>(format!(
+                "unexpected tiles outcome: {other:?}"
+            )))
+        }
+    };
 
-    Ok(())
+    // #314: the CLI shows this preflight as a `log::warn`, which these
+    // bindings have no bridge for — so a Python caller would hit ENOSPC
+    // mid-run with nothing said. Raise it as a warning instead, after the
+    // run (the warning is advisory; the convert either succeeded or already
+    // failed with its own error).
+    if let Some(msg) = &report.intermediate.space_warning {
+        PyErr::warn(
+            py,
+            &py.get_type::<PyUserWarning>(),
+            &CString::new(&**msg)?,
+            1,
+        )?;
+    }
+
+    // The combined report (#439): the two halves the two-step chain's own
+    // reports would carry, keyed like the CLI's `tiles --report` JSON.
+    let dict = PyDict::new(py);
+    dict.set_item("convert", convert_report_to_dict(py, &report.convert)?)?;
+    dict.set_item("export", export_report_to_dict(py, &report.export)?)?;
+    Ok(dict.into())
+}
+
+/// Map a [`TilesError`] to the Python exception type it deserves: the
+/// convert half keeps [`convert_error_to_py`]'s mapping; preflight refusals
+/// (a bad `keep_overview` directory, the #386/#443 knob guards) are
+/// `ValueError`; everything else is `RuntimeError`.
+fn tiles_error_to_py(e: TilesError) -> PyErr {
+    match e {
+        TilesError::Convert(inner) => convert_error_to_py(inner),
+        TilesError::KeepOverviewDirMissing { .. }
+        | TilesError::FeatureOrderColumnExcluded { .. }
+        | TilesError::FeatureIdColumnExcluded { .. }
+        | TilesError::FeatureIdAccumulated { .. } => {
+            PyErr::new::<PyValueError, _>(with_sources(&e))
+        }
+        other => PyErr::new::<PyRuntimeError, _>(with_sources(&other)),
+    }
+}
+
+/// `Display` plus the `#[source]` chain, `": "`-joined — what the CLI shows
+/// through anyhow's `Caused by:` and what a Python message would otherwise
+/// drop (an I/O error's "Permission denied (os error 13)" lives in
+/// `source()`, which `Display` alone omits).
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        use std::fmt::Write as _;
+        let _ = write!(out, ": {c}");
+        cause = c.source();
+    }
+    out
 }
 
 /// Map a [`ConvertError`] to the Python exception type it deserves:
@@ -487,6 +536,13 @@ fn overview(
             "sort_key and class_rank_column are mutually exclusive; supply at most one",
         ));
     }
+    // TODO(#445): the two rules below — the #428 finite check and the
+    // `unknown_rank = min(ranks) - 1.0` derivation — are also in core's
+    // `parse_class_rank`, which #439 made the one home for the *string*
+    // grammar. This dict-shaped input cannot reuse that parser, so the
+    // consolidation is a shared fallible constructor (e.g.
+    // `ClassRanking::with_ranks`) called by both. Behaviourally identical
+    // today; raised by the #439 review.
     let class_ranking = match (class_rank_column, class_ranks) {
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => {
@@ -712,6 +768,12 @@ fn export_pmtiles(
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
 
+    export_report_to_dict(py, &report)
+}
+
+/// Convert an [`ExportReport`] to a Python dict (shared by
+/// `export_pmtiles()` and the `convert()` facade's combined report, #439).
+fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("mode", &report.mode)?;
     dict.set_item("min_zoom", report.min_zoom)?;

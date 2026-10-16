@@ -19,7 +19,8 @@ def convert(
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     feature_order: str = "input",
-) -> None: ...
+    spill_dir: str | Path | None = None,
+) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
     output: str,

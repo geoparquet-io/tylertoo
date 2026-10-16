@@ -38,7 +38,6 @@ remote = [
     "dep:async-trait",
     "dep:futures-util",
     "dep:url",
-    "dep:fs4",
 ]
 
 [dependencies]
@@ -89,7 +88,10 @@ async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
 bytes = "1"
-fs4 = { version = "1.1", optional = true }
+# Non-optional since #439: the tiles facade's #314 free-space preflight
+# guards a LOCAL intermediate overview, so the probe cannot ride the
+# `remote` feature (which the #272 remote-spill preflight still uses too).
+fs4 = "1.1"
 # 0.3.4 floor: 0.3.3 dropped `impl From<GlobError> for io::Error`, which
 # 0.3.4 restored. See the `into` call in input_set::expand_glob.
 glob = "0.3.4"

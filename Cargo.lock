@@ -4397,7 +4397,6 @@ dependencies = [
  "clap-markdown",
  "dhat",
  "env_logger",
- "fs4",
  "indicatif",
  "log",
  "mimalloc",
@@ -4462,7 +4461,6 @@ name = "tylertoo-python"
 version = "0.8.0"
 dependencies = [
  "pyo3",
- "tempfile",
  "tylertoo-core",
 ]
 

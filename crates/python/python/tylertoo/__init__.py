@@ -15,6 +15,7 @@ from typing import Literal, TypedDict, cast
 from tylertoo import _tylertoo
 
 __all__ = [
+    "ConvertReport",
     "ExportReport",
     "LevelReport",
     "OutOfRangeExemplar",
@@ -155,6 +156,17 @@ class ExportReport(TypedDict):
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
+
+
+class ConvertReport(TypedDict):
+    """The combined report of a one-shot `convert()` run.
+
+    Both halves of the chain, keyed like the CLI's `tiles --report`
+    JSON: the overview conversion and the PMTiles export.
+    """
+
+    convert: OverviewReport
+    export: ExportReport
 
 
 class ValidationCheck(TypedDict):
@@ -401,10 +413,14 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     tile_size_limit: int | None = 512000,
     simple_clip_fastpath: bool = True,
     feature_order: Literal["input"] | str = "input",
-) -> None:
+    spill_dir: str | os.PathLike[str] | None = None,
+) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
     Use `overview()` followed by `export_pmtiles()` for all options.
+    Runs the same core facade as `tylertoo tiles`, so the chain — the
+    removed-after-export intermediate overview, its free-space
+    preflight, and the declared zoom range — matches the CLI.
 
     Args:
         input: See `overview()`.
@@ -415,6 +431,16 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         tile_size_limit: See `export_pmtiles()`.
         simple_clip_fastpath: See `export_pmtiles()`.
         feature_order: See `export_pmtiles()`.
+        spill_dir: Scratch directory for the intermediate overview and
+            the export's spill (the CLI's `--spill-dir`). The
+            intermediate is at least input-sized; without this it goes
+            to `$TMPDIR`, then the output's directory. Set it when
+            `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
+            when the chosen volume looks too small.
+
+    Returns:
+        Both halves' reports, keyed `"convert"` and `"export"` like the
+        CLI's `tiles --report` JSON.
 
     Raises:
         ValueError: Invalid zoom range or options.
@@ -422,7 +448,11 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         RuntimeError: Conversion or export failed.
 
     Example:
-        >>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+        >>> report = convert(
+        ...     "buildings.parquet", "out.pmtiles", max_zoom=10
+        ... )
+        >>> sorted(report)
+        ['convert', 'export']
     """
     # Every argument goes to the extension unchanged, by keyword.
-    _tylertoo.convert(**locals())
+    return cast("ConvertReport", _tylertoo.convert(**locals()))

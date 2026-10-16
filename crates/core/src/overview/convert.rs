@@ -2052,6 +2052,163 @@ pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, 
     Ok(bands)
 }
 
+/// Parse an `--entry-zoom` spec: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` (#364).
+///
+/// Mirrors [`parse_class_rank`]'s grammar so the two read alike; the payload
+/// is explicit rungs rather than ranks. Lives in core, next to
+/// [`parse_representation_spec`], so the CLI and every binding share the
+/// validation and the error messages (#439).
+///
+/// # Errors
+///
+/// Returns a description of the problem if the spec has no `:`, an empty
+/// column name, no `VALUE=ZOOM` pairs, or a value/zoom that does not parse.
+pub fn parse_entry_zoom(spec: &str) -> Result<crate::overview::ladder::EntryZoomSpec, String> {
+    use crate::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        format!(
+            "--entry-zoom {spec:?}: expected COLUMN:VALUE=ZOOM,VALUE=ZOOM,... \
+             (e.g. \"level:0.5=8,0.2=12\")"
+        )
+    })?;
+    if column.is_empty() {
+        return Err(format!("--entry-zoom {spec:?}: empty column name"));
+    }
+    let mut rungs = Vec::new();
+    for pair in rest.split(',').filter(|p| !p.trim().is_empty()) {
+        let (value, zoom) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}"))?;
+        let value: f64 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+        // #428, same rule as `parse_class_rank`: `f64::from_str` accepts
+        // `nan` and `inf`. A NaN rung is not ordered against any column
+        // value, and an `inf` rung snaps the match to the SMALLEST observed
+        // value — the exact inverse of the ladder this flag documents.
+        if !value.is_finite() {
+            return Err(format!(
+                "--entry-zoom {spec:?}: {value:?} is not a finite number (NaN and infinity \
+                 cannot be ordered against the column's values)"
+            ));
+        }
+        let zoom: u8 = zoom
+            .trim()
+            .parse()
+            .map_err(|_| format!("--entry-zoom {spec:?}: {zoom:?} is not a zoom level"))?;
+        rungs.push((value, zoom));
+    }
+    if rungs.is_empty() {
+        return Err(format!("--entry-zoom {spec:?}: no VALUE=ZOOM pairs"));
+    }
+    Ok(EntryZoomSpec {
+        column: column.to_string(),
+        kind: EntryZoomKind::Explicit(rungs),
+    })
+}
+
+/// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
+///
+/// `unknown_rank` (the priority for present-but-unlisted values) is derived as
+/// `min(listed ranks) - 1.0`, so unknown classes always lose to every listed
+/// value while still beating null/missing values (which lose to any rank).
+///
+/// Ranks must be finite (#428). `f64::from_str` happily accepts `nan` and
+/// `inf`, and either one breaks this flag's contract: a NaN is not ordered
+/// (the ranking comparator answers "does not beat" in both directions, so the
+/// cell incumbent silently keeps the cell), and `min(ranks)` computed with
+/// `f64::min` *ignores* NaN — one `nan` entry would leave `unknown_rank` at
+/// `+inf - 1.0 = +inf`, making unlisted values outrank every named class,
+/// the exact inverse of what this flag documents.
+///
+/// # Errors
+///
+/// Returns a description of the problem if the spec has no `:`, an empty
+/// column name, no `VALUE=RANK` entries, an empty value, or a rank that does
+/// not parse as a finite number.
+pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
+    let (column, rest) = spec.split_once(':').ok_or_else(|| {
+        format!("invalid --class-rank '{spec}': expected COLUMN:VALUE=RANK,... (missing ':')")
+    })?;
+    let column = column.trim();
+    if column.is_empty() {
+        return Err(format!("invalid --class-rank '{spec}': empty column name"));
+    }
+
+    let mut ranks: Vec<(String, f64)> = Vec::new();
+    for pair in rest.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (value, rank) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --class-rank entry '{pair}': expected VALUE=RANK"))?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("invalid --class-rank entry '{pair}': empty value"));
+        }
+        let rank: f64 = rank
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid rank in '{pair}': {e}"))?;
+        if !rank.is_finite() {
+            return Err(format!(
+                "invalid rank in '{pair}': ranks must be finite numbers \
+                 (NaN and infinity cannot be ordered against other classes)"
+            ));
+        }
+        ranks.push((value.to_string(), rank));
+    }
+    if ranks.is_empty() {
+        return Err(format!(
+            "invalid --class-rank '{spec}': no VALUE=RANK entries"
+        ));
+    }
+
+    // Unknown values must lose to every named class but beat nulls.
+    let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
+    Ok(ClassRanking {
+        column: column.to_string(),
+        ranks,
+        unknown_rank: min_rank - 1.0,
+    })
+}
+
+/// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
+/// `sum`, `max`, `min`, `mean` (case-insensitive).
+///
+/// # Errors
+///
+/// Returns a description of the problem if the spec has no `:`, an empty
+/// column name, or an unknown op.
+pub fn parse_accumulate(spec: &str) -> Result<crate::overview::cluster::AccumulateSpec, String> {
+    use crate::overview::cluster::{AccumulateOp, AccumulateSpec};
+
+    let (column, op) = spec.rsplit_once(':').ok_or_else(|| {
+        format!("invalid --accumulate-attribute '{spec}': expected COL:OP (missing ':')")
+    })?;
+    let column = column.trim();
+    if column.is_empty() {
+        return Err(format!(
+            "invalid --accumulate-attribute '{spec}': empty column name"
+        ));
+    }
+    let op = AccumulateOp::parse(op.trim()).ok_or_else(|| {
+        format!(
+            "invalid --accumulate-attribute '{spec}': unknown op {:?} \
+             (expected sum, max, min, or mean)",
+            op.trim()
+        )
+    })?;
+    Ok(AccumulateSpec {
+        column: column.to_string(),
+        op,
+    })
+}
+
 /// Per-level [`Representation`] (#317 / #279), parallel to `level_specs`
 /// (the resolved plan). Levels without a zoom (explicit-GSD plans) are never
 /// banded; [`validate_options`] rejects that combination up front.
@@ -4915,18 +5072,12 @@ pub(super) fn spill_space_check(
 
 /// Free bytes available to the current user on the volume holding `dir`
 /// (statvfs / `GetDiskFreeSpaceEx` via `fs4`), or `None` if the probe fails.
-/// Compiled to a stub without the `remote` feature — nothing spills there,
-/// and [`spill_space_check`] never probes for a local input.
-fn probe_available_space(dir: &Path) -> Option<u64> {
-    #[cfg(feature = "remote")]
-    {
-        fs4::available_space(dir).ok()
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = dir;
-        None
-    }
+/// Unconditional since #439: the tiles facade's #314 preflight guards a
+/// LOCAL intermediate, so the probe can no longer ride the `remote` feature
+/// (`fs4` is a plain dependency now). Shared with that preflight
+/// ([`crate::overview::tiles`]).
+pub(crate) fn probe_available_space(dir: &Path) -> Option<u64> {
+    fs4::available_space(dir).ok()
 }
 
 /// Emit the #272 spill free-space preflight warning, if warranted. Thin
@@ -10105,6 +10256,139 @@ mod tests {
         assert!(parse_representation_spec("0-7").is_err());
         assert!(parse_representation_spec("0-7:blob").is_err());
         assert!(parse_representation_spec("x-7:point").is_err());
+    }
+
+    /// #439: the `--entry-zoom` grammar lives in core so every binding
+    /// shares the validation and the error messages.
+    #[test]
+    fn parse_entry_zoom_grammar() {
+        use crate::overview::ladder::EntryZoomKind;
+
+        let ok = |spec: &str| parse_entry_zoom(spec).unwrap_or_else(|e| panic!("{spec:?}: {e}"));
+
+        let s = ok("density:5000=4,1000=6,200=8");
+        assert_eq!(s.column, "density");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => {
+                assert_eq!(pairs, &[(5000.0, 4), (1000.0, 6), (200.0, 8)]);
+            }
+            other => panic!("expected explicit rungs, got {other:?}"),
+        }
+
+        // Whitespace and a trailing comma are tolerated.
+        let s = ok("density: 5000 = 4 , 200 = 8 ,");
+        match &s.kind {
+            EntryZoomKind::Explicit(pairs) => assert_eq!(pairs, &[(5000.0, 4), (200.0, 8)]),
+            other => panic!("{other:?}"),
+        }
+
+        for bad in [
+            "density",          // no ':'
+            ":5000=4",          // empty column
+            "density:",         // no pairs
+            "density:5000",     // missing '='
+            "density:x=4",      // value not a number
+            "density:5000=z",   // zoom not a number
+            "density:5000=-1",  // negative zoom
+            "density:5000=999", // beyond u8
+        ] {
+            assert!(parse_entry_zoom(bad).is_err(), "{bad:?} must be rejected");
+        }
+
+        // #428's class-rank rule applies to rungs too: `f64::from_str`
+        // accepts `nan`/`inf`, a NaN rung is unordered against every value,
+        // and an `inf` rung snaps to the SMALLEST observed value — the
+        // inverse of the ladder this flag documents.
+        for bad in [
+            "density:nan=4",
+            "density:NaN=4",
+            "density:inf=4",
+            "density:-inf=4,100=8",
+            "density:infinity=4",
+        ] {
+            let err = parse_entry_zoom(bad).unwrap_err().to_ascii_lowercase();
+            assert!(
+                err.contains("finite"),
+                "{bad:?} must be rejected as non-finite, got: {err}"
+            );
+        }
+    }
+
+    /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one
+    /// breaks `--class-rank`'s contract. A NaN is not ordered, so the cell
+    /// incumbent would silently keep every cell it contests; worse, the
+    /// `unknown_rank` derivation uses `f64::min`, which IGNORES NaN — one
+    /// `nan` entry leaves the fold at `+inf`, so unlisted values would
+    /// outrank every named class, the inverse of the documented rule. The
+    /// parser rejects them with an explanation rather than producing that.
+    #[test]
+    fn parse_class_rank_rejects_non_finite_ranks() {
+        for spec in [
+            "cls:motorway=nan,trunk=2",
+            "cls:motorway=NaN",
+            "cls:motorway=inf,trunk=2",
+            "cls:motorway=-inf",
+            "cls:motorway=infinity",
+        ] {
+            let err = parse_class_rank(spec).unwrap_err().to_ascii_lowercase();
+            assert!(
+                err.contains("finite"),
+                "'{spec}' must be rejected as non-finite, got: {err}"
+            );
+        }
+
+        // Control: ordinary ranks still parse, and the unknown rank is
+        // min(ranks) - 1 — below every named class, above a null.
+        let cr = parse_class_rank("cls:motorway=3,trunk=2,primary=1").unwrap();
+        assert_eq!(cr.column, "cls");
+        assert_eq!(cr.unknown_rank, 0.0);
+        assert_eq!(cr.ranks.len(), 3);
+    }
+
+    /// The rest of the `--class-rank` grammar (#439): trimmed parts, and the
+    /// malformed shapes each named in the error.
+    #[test]
+    fn parse_class_rank_grammar() {
+        let cr = parse_class_rank(" cls : a = 2 , b = 1 ,").unwrap();
+        assert_eq!(cr.column, "cls");
+        assert_eq!(
+            cr.ranks,
+            vec![("a".to_string(), 2.0), ("b".to_string(), 1.0)]
+        );
+        assert_eq!(cr.unknown_rank, 0.0);
+
+        assert!(parse_class_rank("cls").is_err(), "missing ':'");
+        assert!(parse_class_rank(":a=1").is_err(), "empty column");
+        assert!(parse_class_rank("cls:").is_err(), "no entries");
+        assert!(parse_class_rank("cls:a").is_err(), "missing '='");
+        assert!(parse_class_rank("cls:=1").is_err(), "empty value");
+        assert!(parse_class_rank("cls:a=x").is_err(), "rank not a number");
+    }
+
+    /// The `--accumulate-attribute` grammar (#439): `COL:OP`, ops
+    /// case-insensitive and trimmed.
+    #[test]
+    fn parse_accumulate_grammar() {
+        use crate::overview::cluster::AccumulateOp;
+
+        let s = parse_accumulate("population:sum").unwrap();
+        assert_eq!(s.column, "population");
+        assert_eq!(s.op, AccumulateOp::Sum);
+
+        // Case-insensitive op, trimmed parts.
+        let s = parse_accumulate(" confidence : MEAN ").unwrap();
+        assert_eq!(s.column, "confidence");
+        assert_eq!(s.op, AccumulateOp::Mean);
+
+        let s = parse_accumulate("x:min").unwrap();
+        assert_eq!(s.op, AccumulateOp::Min);
+        let s = parse_accumulate("x:max").unwrap();
+        assert_eq!(s.op, AccumulateOp::Max);
+
+        assert!(parse_accumulate("population").is_err(), "missing op");
+        assert!(parse_accumulate(":sum").is_err(), "empty column");
+        assert!(parse_accumulate("pop:median").is_err(), "unknown op");
+        assert!(parse_accumulate("pop:").is_err(), "empty op");
     }
 
     #[test]

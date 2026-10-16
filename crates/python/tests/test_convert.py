@@ -291,3 +291,123 @@ class TestConvertIntegration:
 
             leftovers = [p for p in Path(tmpdir).iterdir() if "overview" in p.name]
             assert leftovers == [], f"temp overview leaked: {leftovers}"
+
+
+PROPERTIES_FIXTURE = FIXTURES_DIR / "properties" / "overture-names.parquet"
+
+
+@pytest.mark.skipif(
+    not PROPERTIES_FIXTURE.exists(),
+    reason="overture-names.parquet fixture not available",
+)
+class TestConvertCombinedReport:
+    """convert() returns the combined report the CLI's `tiles --report`
+    writes (#439): both halves of the chain, keyed "convert" and "export".
+
+    This is the drift the shared core facade ends: convert() used to
+    re-implement the chain with no report, no free-space preflight and no
+    knob guards.
+    """
+
+    def test_convert_returns_combined_report(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            report = tylertoo.convert(
+                input=str(PROPERTIES_FIXTURE),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+            )
+
+            assert output.exists()
+            assert isinstance(report, dict)
+            assert set(report) == {"convert", "export"}
+
+            convert_half = report["convert"]
+            assert convert_half["input_features"] > 0
+            assert convert_half["levels"], "per-level stats present"
+
+            export_half = report["export"]
+            # #380: the requested minimum zoom is declared even when the
+            # coarsest levels generalized away.
+            assert export_half["min_zoom"] == 0
+            assert export_half["max_zoom"] == 4
+            assert export_half["total_tiles"] >= 1
+            assert "duration_secs" in export_half
+
+    def test_convert_report_matches_two_step_reports(self):
+        """The combined report's halves carry the same keys the two-step
+        overview() and export_pmtiles() reports do."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            one_shot = tylertoo.convert(
+                input=str(PROPERTIES_FIXTURE),
+                output=str(Path(tmpdir) / "one.pmtiles"),
+                min_zoom=0,
+                max_zoom=4,
+            )
+
+            ov = Path(tmpdir) / "ov.parquet"
+            overview_report = tylertoo.overview(
+                input=str(PROPERTIES_FIXTURE), output=str(ov), min_zoom=0, max_zoom=4
+            )
+            export_report = tylertoo.export_pmtiles(
+                input=str(ov),
+                output=str(Path(tmpdir) / "two.pmtiles"),
+                layer_name="overture-names",
+                min_zoom=0,
+            )
+
+            assert set(one_shot["convert"]) == set(overview_report)
+            assert set(one_shot["export"]) == set(export_report)
+
+
+class TestConvertSpillDir:
+    """The `spill_dir` kwarg (#439 review).
+
+    The one-shot facade puts its intermediate overview in `spill_dir`,
+    then `$TMPDIR`, then the output's directory. Before this kwarg a
+    Python caller could not redirect an at-least-input-sized file away
+    from `$TMPDIR`, which is a small tmpfs in many containers.
+    """
+
+    def test_convert_honors_spill_dir(self):
+        """The intermediate goes to spill_dir, and is cleaned up."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            spill = Path(tmpdir) / "spill"
+            spill.mkdir()
+
+            report = tylertoo.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                spill_dir=str(spill),
+            )
+
+            assert output.exists()
+            assert set(report) == {"convert", "export"}
+            # The temp intermediate is removed after the export, so the
+            # directory it was created in is empty again.
+            assert list(spill.iterdir()) == [], "the intermediate must be cleaned up"
+
+    def test_convert_rejects_missing_spill_dir(self):
+        """A spill_dir that does not exist is an error, not a silent fallback."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+            missing = Path(tmpdir) / "nope" / "deeper"
+
+            with pytest.raises((ValueError, RuntimeError)) as exc_info:
+                tylertoo.convert(
+                    input=str(input_file),
+                    output=str(output),
+                    min_zoom=0,
+                    max_zoom=6,
+                    spill_dir=str(missing),
+                )
+            assert "nope" in str(exc_info.value), str(exc_info.value)

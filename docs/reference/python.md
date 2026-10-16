@@ -245,12 +245,13 @@ convert(
     tile_size_limit: int | None = 512_000,
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
-) -> None
+    spill_dir: str | os.PathLike[str] | None = None,
+) -> ConvertReport
 ```
 
 Convert GeoParquet to PMTiles in one call (deprecated).
 
-Use `overview()` followed by `export_pmtiles()` for all options.
+Use `overview()` followed by `export_pmtiles()` for all options. Runs the same core facade as `tylertoo tiles`, so the chain — the removed-after-export intermediate overview, its free-space preflight, and the declared zoom range — matches the CLI.
 
 ### Parameters
 
@@ -262,6 +263,11 @@ Use `overview()` followed by `export_pmtiles()` for all options.
 * `tile_size_limit`: See `export_pmtiles()`.
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
+* `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small.
+
+### Returns
+
+[`ConvertReport`](#convertreport): Both halves' reports, keyed `"convert"` and `"export"` like the CLI's `tiles --report` JSON.
 
 ### Raises
 
@@ -272,7 +278,11 @@ Use `overview()` followed by `export_pmtiles()` for all options.
 ### Example
 
 ```python
->>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+>>> report = convert(
+...     "buildings.parquet", "out.pmtiles", max_zoom=10
+... )
+>>> sorted(report)
+['convert', 'export']
 ```
 
 ## Report types
@@ -431,4 +441,14 @@ class ValidationCheck(TypedDict):
     name: str
     passed: bool
     message: str
+```
+
+### `ConvertReport`
+
+The combined report of a one-shot `convert()` run.
+
+```python
+class ConvertReport(TypedDict):
+    convert: OverviewReport
+    export: ExportReport
 ```
