@@ -576,9 +576,20 @@ fn find_f64_covering(schema: &Schema, geom_idx: usize) -> Option<(usize, [String
 /// covering struct `col` with child fields `names` (`xmin, ymin, xmax, ymax`
 /// order). `None` — the row is skipped, exactly as the geometry path skips a
 /// null/empty/non-finite geometry — for a null struct entry or child value
-/// (the spec ties bbox nulls to geometry nulls), a non-finite bound, or an
-/// inverted envelope (`xmin > xmax` / `ymin > ymax`: the spec's antimeridian
-/// wraparound form, which is not the planar bbox the signals measure).
+/// (the spec ties bbox nulls to geometry nulls) or a non-finite bound.
+///
+/// An inverted envelope is **swapped, not skipped**. `xmin > xmax` is the
+/// GeoParquet wraparound form a spec-aware producer writes for an
+/// antimeridian-crossing feature, and the geometry path has no inverted
+/// case at all: [`BboxAcc`] is a min/max over the coordinates, so the same
+/// feature yields a valid, ~358-degree-wide planar envelope there and is
+/// counted. Swapping reproduces exactly that envelope (179, -179 becomes
+/// -179, 179), which keeps the two paths measuring the same population —
+/// skipping would drop the row from one path only, and a Fiji- or
+/// Chukotka-only extract where every feature crosses would sample nothing
+/// and fail with `AutoZoomNoSignal` on a file the geometry path reads
+/// fine. An inverted `ymin > ymax` is not a legal wraparound, just
+/// malformed, and gets the same charitable planar reading.
 fn covering_bboxes(
     col: &ArrayRef,
     names: &[String; 4],
@@ -612,10 +623,21 @@ fn covering_bboxes(
             {
                 return None;
             }
-            let b = [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)];
-            (b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3]).then_some(b)
+            let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                return None;
+            }
+            // Swap rather than skip: see the note above.
+            Some([x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)])
         })
         .collect())
+}
+
+/// One sampling pass's signals: a mercator diagonal and a center per
+/// sampled feature, in sample order (the caller sorts the centers).
+struct SampledSignals {
+    diags_m: Vec<f64>,
+    centers: Vec<(f64, f64)>,
 }
 
 /// Estimate `--max-zoom auto` for a conversion of `source` under `options`.
@@ -696,67 +718,114 @@ pub(crate) fn estimate_with(
     // Sample bboxes from the f64 covering struct when the file declares one
     // (#693) — the geometry column is then never projected at all — else from
     // the geometry scalars.
-    let covering = find_f64_covering(&schema, geom_idx);
-    let sample_idx = covering.as_ref().map_or(geom_idx, |(idx, _)| *idx);
-    let mut cols = vec![sample_idx];
-    if let Some(f) = &bound_filter {
-        cols.extend_from_slice(f.columns());
-    }
-    cols.sort_unstable();
-    cols.dedup();
-    let sample_pos = cols
-        .binary_search(&sample_idx)
-        .expect("the sampled bbox column is projected");
-    let proj = |c: usize| cols.binary_search(&c).expect("filter column is projected");
+    let declared = find_f64_covering(&schema, geom_idx);
 
-    let stream = source.open_stream(&ReadPlan {
-        batch_size: AUTO_ZOOM_BATCH_ROWS,
-        projection: Some(&cols),
-        row_groups: selection.as_ref(),
-    })?;
-
-    let mut diags_m: Vec<f64> = Vec::new();
-    let mut centers: Vec<(f64, f64)> = Vec::new();
-    let mut row: u64 = 0;
-    for batch in stream {
-        let batch = batch?;
-        let n = batch.num_rows() as u64;
-        // Global rows `row + i` with `(row + i) % stride == 0`.
-        let first = (stride - row % stride) % stride;
-        row += n;
-        let mut picks: Vec<usize> = (first..n)
-            .step_by(stride as usize)
-            .map(|i| i as usize)
-            .collect();
-        if picks.is_empty() {
-            continue;
-        }
+    // One sampling pass over `source`, reading each row's bbox either from
+    // the declared covering struct or from the geometry scalars.
+    //
+    // Factored out so the covering path can fall back to the geometry path
+    // over the same source. A covering that the schema declares can still be
+    // unusable in the data — every value null (a struct column created from
+    // a schema template and never populated, a shape real pyarrow/ogr
+    // rewrites produce), or a child whose physical type is not Float64 — and
+    // committing to it from the schema alone turned a working
+    // `--max-zoom auto` into a hard `AutoZoomNoSignal` whose message blames
+    // "fewer than two distinct locations", naming neither the covering nor
+    // the real cause, on a file whose geometries are perfectly fine.
+    let sample = |covering: Option<&(usize, [String; 4])>| -> Result<SampledSignals, ConvertError> {
+        let sample_idx = covering.map_or(geom_idx, |(idx, _)| *idx);
+        let mut cols = vec![sample_idx];
         if let Some(f) = &bound_filter {
-            let mask = f.eval_mask(&batch, &proj);
-            picks.retain(|&i| mask[i] == Some(true));
+            cols.extend_from_slice(f.columns());
         }
-        let bboxes = match &covering {
-            Some((_, names)) => covering_bboxes(batch.column(sample_pos), names, &picks)?,
-            None => {
-                let garr = from_arrow_array(batch.column(sample_pos).as_ref(), &geom_field)
-                    .map_err(|e| {
-                        crate::Error::GeoParquetRead(format!("auto max-zoom geometry decode: {e}"))
-                    })?;
-                visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?
-            }
-        };
-        for bb in bboxes.into_iter().flatten() {
-            if bbox_units
-                .as_ref()
-                .is_some_and(|u| !bboxes_intersect(&bb, u))
-            {
+        cols.sort_unstable();
+        cols.dedup();
+        let sample_pos = cols
+            .binary_search(&sample_idx)
+            .expect("the sampled bbox column is projected");
+        let proj = |c: usize| cols.binary_search(&c).expect("filter column is projected");
+
+        let stream = source.open_stream(&ReadPlan {
+            batch_size: AUTO_ZOOM_BATCH_ROWS,
+            projection: Some(&cols),
+            row_groups: selection.as_ref(),
+        })?;
+
+        let mut diags_m: Vec<f64> = Vec::new();
+        let mut centers: Vec<(f64, f64)> = Vec::new();
+        let mut row: u64 = 0;
+        for batch in stream {
+            let batch = batch?;
+            let n = batch.num_rows() as u64;
+            // Global rows `row + i` with `(row + i) % stride == 0`.
+            let first = (stride - row % stride) % stride;
+            row += n;
+            let mut picks: Vec<usize> = (first..n)
+                .step_by(stride as usize)
+                .map(|i| i as usize)
+                .collect();
+            if picks.is_empty() {
                 continue;
             }
-            let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
-            diags_m.push(mercator_delta_m(bb[2] - bb[0], bb[3] - bb[1], cy, crs));
-            centers.push((cx, cy));
+            if let Some(f) = &bound_filter {
+                let mask = f.eval_mask(&batch, &proj);
+                picks.retain(|&i| mask[i] == Some(true));
+            }
+            let bboxes = match covering {
+                Some((_, names)) => covering_bboxes(batch.column(sample_pos), names, &picks)?,
+                None => {
+                    let garr = from_arrow_array(batch.column(sample_pos).as_ref(), &geom_field)
+                        .map_err(|e| {
+                            crate::Error::GeoParquetRead(format!(
+                                "auto max-zoom geometry decode: {e}"
+                            ))
+                        })?;
+                    visit_geoarrow_array(garr.as_ref(), SampledBboxes { rows: &picks })?
+                }
+            };
+            for bb in bboxes.into_iter().flatten() {
+                if bbox_units
+                    .as_ref()
+                    .is_some_and(|u| !bboxes_intersect(&bb, u))
+                {
+                    continue;
+                }
+                let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
+                diags_m.push(mercator_delta_m(bb[2] - bb[0], bb[3] - bb[1], cy, crs));
+                centers.push((cx, cy));
+            }
         }
-    }
+        Ok(SampledSignals { diags_m, centers })
+    };
+
+    let (
+        SampledSignals {
+            diags_m,
+            mut centers,
+        },
+        used_covering,
+    ) = match declared.as_ref() {
+        None => (sample(None)?, false),
+        Some(cv) => match sample(Some(cv)) {
+            Ok(got) if !got.centers.is_empty() => (got, true),
+            // The sample is capped at AUTO_ZOOM_SAMPLE_CAP rows either way,
+            // so the retry is bounded; and when the geometry path finds
+            // nothing either, the resulting AutoZoomNoSignal is the honest
+            // answer rather than an artifact of the sidecar.
+            Ok(_) => {
+                log::warn!(
+                    "the declared bbox covering column yielded no usable bounds for                      any sampled row; re-sampling --max-zoom auto from the geometry                      column"
+                );
+                (sample(None)?, false)
+            }
+            Err(e) => {
+                log::warn!(
+                    "could not read the declared bbox covering column ({e});                      re-sampling --max-zoom auto from the geometry column"
+                );
+                (sample(None)?, false)
+            }
+        },
+    };
 
     let sampled_count = centers.len();
     centers.sort_by_key(|&(cx, cy)| morton_key(cx, cy, crs));
@@ -777,7 +846,7 @@ pub(crate) fn estimate_with(
         min_zoom,
         ceiling,
     )?;
-    evidence.sampled_from_covering = covering.is_some();
+    evidence.sampled_from_covering = used_covering;
     Ok(evidence)
 }
 
@@ -1035,6 +1104,105 @@ mod tests {
         assert!(evidence.sampled_from_covering);
         assert_eq!(evidence.rows_read, 20);
         assert_eq!(evidence.sampled_count, 18);
+    }
+
+    /// `covering_bboxes` swaps an inverted envelope rather than skipping it,
+    /// so the covering path measures the same population the geometry path
+    /// does (`BboxAcc` is a min/max, which has no inverted case at all), and
+    /// skips only what a null or non-finite bound makes unmeasurable.
+    #[test]
+    fn covering_bboxes_swaps_inverted_and_skips_nonfinite() {
+        use arrow_array::{ArrayRef, Float64Array, StructArray};
+        use arrow_schema::{DataType, Field, Fields};
+        use std::sync::Arc;
+
+        // 0: ordinary. 1: antimeridian wraparound (xmin > xmax). 2: inverted
+        // y (not a legal wraparound, just malformed). 3: NaN. 4: +inf.
+        // 5: null child.
+        let xmin = Float64Array::from(vec![
+            Some(1.0),
+            Some(179.0),
+            Some(1.0),
+            Some(f64::NAN),
+            Some(1.0),
+            None,
+        ]);
+        let ymin = Float64Array::from(vec![
+            Some(2.0),
+            Some(-1.0),
+            Some(5.0),
+            Some(2.0),
+            Some(2.0),
+            Some(2.0),
+        ]);
+        let xmax = Float64Array::from(vec![
+            Some(3.0),
+            Some(-179.0),
+            Some(3.0),
+            Some(3.0),
+            Some(f64::INFINITY),
+            Some(3.0),
+        ]);
+        let ymax = Float64Array::from(vec![
+            Some(4.0),
+            Some(1.0),
+            Some(2.0),
+            Some(4.0),
+            Some(4.0),
+            Some(4.0),
+        ]);
+
+        let field_names = ["xmin", "ymin", "xmax", "ymax"];
+        let children: Fields = field_names
+            .iter()
+            .map(|n| Arc::new(Field::new(*n, DataType::Float64, true)))
+            .collect();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(xmin),
+            Arc::new(ymin),
+            Arc::new(xmax),
+            Arc::new(ymax),
+        ];
+        let col: ArrayRef = Arc::new(StructArray::new(children, arrays, None));
+        let names = field_names.map(str::to_string);
+
+        let got = covering_bboxes(&col, &names, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(got[0], Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(
+            got[1],
+            Some([-179.0, -1.0, 179.0, 1.0]),
+            "a wraparound bbox must become the planar envelope BboxAcc's \
+             min/max yields for the same feature, not a skipped row"
+        );
+        assert_eq!(got[2], Some([1.0, 2.0, 3.0, 5.0]), "inverted y swaps too");
+        assert_eq!(got[3], None, "NaN is unmeasurable");
+        assert_eq!(got[4], None, "+inf is unmeasurable");
+        assert_eq!(got[5], None, "a null child skips the row");
+    }
+
+    /// A covering the schema declares but the data never populates must not
+    /// turn a working `--max-zoom auto` into an error: the estimate warns,
+    /// re-samples the geometry column, and lands exactly where an uncovered
+    /// read of the same geometries does.
+    #[test]
+    fn an_all_null_covering_falls_back_to_the_geometry_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(20, 0.009);
+        let every_row: Vec<usize> = (0..geoms.len()).collect();
+        let source = write_manual_covering(&dir, "allnull.parquet", &geoms, true, &every_row);
+
+        let fell_back = estimate(&source, 0).unwrap();
+        let plain = estimate(&write(&dir, "plain.parquet", &geoms), 0).unwrap();
+
+        assert!(
+            !fell_back.sampled_from_covering,
+            "the evidence must report the path actually used"
+        );
+        assert_eq!(
+            fell_back.sampled_count, 20,
+            "every row measured after the retry, not zero"
+        );
+        assert_eq!(fell_back, plain);
     }
 
     /// `--bbox` and `--filter` scope the covering path exactly as they scope
