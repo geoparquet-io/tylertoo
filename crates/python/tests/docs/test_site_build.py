@@ -46,6 +46,7 @@ def site() -> Path:
         ("changelog/index.html", "Changelog"),
         ("reference/cli/index.html", "export-pmtiles"),
         ("reference/python/index.html", "export_pmtiles"),
+        ("spec/overviews/index.html", "canonical_level"),
     ],
 )
 def test_page_renders(site: Path, page: str, marker: str) -> None:

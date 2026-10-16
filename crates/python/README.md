@@ -37,6 +37,8 @@ tylertoo.overview("fieldmaps-madagascar-adm4.parquet", "madagascar-ov.parquet", 
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
 
+The intermediate `madagascar-ov.parquet` is a [`geo:overviews`](https://geoparquet-io.github.io/tylertoo/spec/overviews/) file (draft spec): a GeoParquet file that carries its own zoom pyramid and stays queryable as ordinary GeoParquet.
+
 See the [docs site](https://geoparquet-io.github.io/tylertoo/) for end-to-end tutorials and the API reference.
 
 ## Contributing

@@ -8,6 +8,8 @@ Related canonical documents:
 
 - **Format**: [`context/OVERVIEWS_SPEC.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/OVERVIEWS_SPEC.md) — the
   `geo:overviews` draft spec (single source of truth for the file format).
+  Published at <https://geoparquet-io.github.io/tylertoo/spec/overviews/>,
+  rendered from this same file (#442).
 - **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/tylertoo/blob/main/docs/OVERVIEW_TUNING.md) — every
   generalization knob, its default, and its direction.
 - **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)
