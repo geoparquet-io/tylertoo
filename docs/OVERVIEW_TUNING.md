@@ -1656,8 +1656,10 @@ runs all levels; `speed` always uses unbounded parallel grids.
 
 ### Batch concurrency
 
-`--in-flight-batches` sets each pass's channel depth. Raise it to overlap
-reads and computation when a few expensive geometries stall the pipeline.
+`--in-flight-batches` sets each pass's channel depth. In pass 2, half of it
+is the read-ahead channel and half is a window of batches processed at once.
+One batch's expensive geometries or serial decode then don't stall the
+batches behind it. Raise it to keep more cores busy.
 Each extra batch holds `read_batch_size` more rows; passes do not overlap.
 `--read-batch-size` sets the rows per batch, and `--in-flight-batches` sets
 how many batches coexist. Pass 2's readers add `--read-workers` × their queue
@@ -1889,7 +1891,9 @@ it by hand.
 
 - Conversion exhausts RAM or swaps: lower `--read-batch-size`, keep
   streaming enabled, and see [Scaling](guides/scaling.md).
-- Cores remain idle: raise `--in-flight-batches` for more read/compute overlap.
+- Cores remain idle: raise `--in-flight-batches` to process more batches at
+  once. If `pass2.windows.max_window` in `TYLERTOO_PROFILE_JSON` stays at 1,
+  reads are the bottleneck: raise `--read-workers` instead.
 - `--profile speed` exhausts RAM: use `bounded` to spill each level.
   The default `auto` spills when the estimate exceeds its budget.
 - `memory allocation of N bytes failed` on a musl binary at v0.7.1 or

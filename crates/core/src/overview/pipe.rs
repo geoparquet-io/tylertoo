@@ -35,6 +35,9 @@
 //! the unwind drops it before the join is reached.
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use rayon::prelude::*;
+
+use super::pipeline::ReadFlow;
 
 /// Run `produce` on a scoped thread feeding a bounded channel of depth
 /// `depth`, and `consume` on the calling thread, draining it.
@@ -83,6 +86,104 @@ where
         }
         consumed
     })
+}
+
+/// Split a resolved `--in-flight-batches` depth into `(channel depth, compute
+/// window)` for a consumer that drains with [`for_each_window`] (#494).
+///
+/// Before the window, `in_flight` was the channel depth alone and the
+/// consumer held one more batch in hand, so roughly `in_flight + 1` input
+/// batches were resident. The window takes up to `window` batches *out* of the
+/// channel at once, so giving the channel only the remainder keeps the
+/// resident input at about `in_flight` batches, and the memory model sized
+/// against it unchanged. Both halves are at least 1, so `in_flight` 1 (and 2)
+/// is exactly the old one-batch-at-a-time consumer.
+pub(super) fn split_in_flight(in_flight: usize) -> (usize, usize) {
+    let window = (in_flight / 2).max(1);
+    let depth = in_flight.saturating_sub(window).max(1);
+    (depth, window)
+}
+
+/// What [`for_each_window`] did, for the `TYLERTOO_PROFILE_JSON` dump: how
+/// many items it took, in how many windows, and the widest window it ran. A
+/// run whose `max_window` stays at 1 was reader-bound, not compute-bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct WindowStats {
+    pub(super) items: u64,
+    pub(super) windows: u64,
+    pub(super) max_window: u64,
+}
+
+/// Drain `rx` a window of up to `window` items at a time, run `process` over
+/// each window concurrently on the rayon pool, and hand every `(item, result)`
+/// to `emit` in **receive order** (#494).
+///
+/// This is how the pass-2 consumers get parallelism *across* batches as well
+/// as within them. Processing one batch at a time made every batch a barrier:
+/// its serial geometry decode, its slowest feature and its slowest level all
+/// had to finish before the next batch started, which on a wide machine left
+/// most of the pool idle. A window holds several batches' worth of work, so
+/// those serial stretches overlap each other and the barrier tail is amortized
+/// over `window` batches instead of one.
+///
+/// Output is unaffected: each item is processed independently of the others
+/// (as it was), and `emit` sees the results in exactly the order the items
+/// were received, so a downstream sink or writer receives the identical
+/// sequence whatever the window size or composition.
+///
+/// - The window **never waits to fill**. It blocks for its first item, then
+///   tops up with `try_recv` only from what is already queued, so a reader
+///   that is slower than the compute shrinks the windows toward 1 (today's
+///   behaviour) instead of idling the pool while it waits for a full one.
+/// - The barrier form (collect a window, `par_iter` it, emit) is deliberate.
+///   It is plain fork-join, so it cannot deadlock on a one-thread pool or when
+///   the caller is itself a pool worker, and nothing blocks inside rayon.
+/// - **Errors keep serial precedence**: the first `Err` in receive order is
+///   returned, even if a later item in the same window failed sooner in wall
+///   time. Items after it in its window were computed and are discarded;
+///   nothing at or after it reaches `emit`. A panic in `process` propagates
+///   out of `par_iter` to the caller, as one in the serial loop would.
+/// - `emit` returning [`ReadFlow::Stop`] (its downstream hung up) ends the
+///   drain cleanly after that item.
+pub(super) fn for_each_window<T, R, E>(
+    rx: &Receiver<T>,
+    window: usize,
+    process: impl Fn(&T) -> Result<R, E> + Sync,
+    mut emit: impl FnMut(T, R) -> Result<ReadFlow, E>,
+) -> Result<WindowStats, E>
+where
+    T: Send + Sync,
+    R: Send,
+    E: Send,
+{
+    let window = window.max(1);
+    let mut stats = WindowStats::default();
+    let mut items: Vec<T> = Vec::with_capacity(window);
+    while let Ok(first) = rx.recv() {
+        items.push(first);
+        while items.len() < window {
+            match rx.try_recv() {
+                Ok(item) => items.push(item),
+                Err(_) => break, // empty (don't wait) or disconnected
+            }
+        }
+        stats.items += items.len() as u64;
+        stats.windows += 1;
+        stats.max_window = stats.max_window.max(items.len() as u64);
+        // A one-item window skips the pool round-trip; the item's own
+        // processing still parallelizes inside itself.
+        let results: Vec<Result<R, E>> = if items.len() == 1 {
+            vec![process(&items[0])]
+        } else {
+            items.par_iter().map(&process).collect()
+        };
+        for (item, result) in items.drain(..).zip(results) {
+            if matches!(emit(item, result?)?, ReadFlow::Stop) {
+                return Ok(stats);
+            }
+        }
+    }
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -243,6 +344,233 @@ mod tests {
                 for _ in rx.iter() {}
                 Ok(())
             },
+        );
+    }
+
+    // --- for_each_window (#494) ---------------------------------------------
+
+    /// A disconnected channel already holding `0..n`, so every `try_recv`
+    /// top-up succeeds and the window composition is deterministic.
+    fn prefilled(n: usize) -> Receiver<usize> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for i in 0..n {
+            tx.send(i).unwrap();
+        }
+        rx
+    }
+
+    #[test]
+    fn split_in_flight_halves_between_channel_and_window() {
+        // (in_flight) -> (channel depth, compute window)
+        assert_eq!(split_in_flight(1), (1, 1));
+        assert_eq!(split_in_flight(2), (1, 1));
+        assert_eq!(split_in_flight(3), (2, 1));
+        assert_eq!(split_in_flight(4), (2, 2));
+        assert_eq!(split_in_flight(5), (3, 2));
+        assert_eq!(split_in_flight(16), (8, 8));
+        // 0 is not a valid resolved depth, but must not produce a zero window.
+        assert_eq!(split_in_flight(0), (1, 1));
+    }
+
+    /// Results reach `emit` in receive order, across window boundaries, with
+    /// a count that is not a multiple of the window.
+    #[test]
+    fn window_emits_in_receive_order() {
+        let rx = prefilled(20);
+        let mut got = Vec::new();
+        let stats = for_each_window::<usize, usize, ()>(
+            &rx,
+            3,
+            |&i| Ok(i * 10),
+            |i, r| {
+                got.push((i, r));
+                Ok(ReadFlow::Continue)
+            },
+        )
+        .unwrap();
+        assert_eq!(got, (0..20).map(|i| (i, i * 10)).collect::<Vec<_>>());
+        assert_eq!(stats.items, 20);
+        assert_eq!(stats.windows, 7, "20 items in windows of 3 is 6 full + 1");
+        assert_eq!(stats.max_window, 3);
+    }
+
+    /// The point of the window: items in one window are processed at the same
+    /// time, not one after another. The pre-#494-follow-up consumer took one
+    /// batch at a time, so its peak concurrency was 1 whatever the pool size.
+    #[test]
+    fn window_processes_items_concurrently() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let peak = within("window_processes_items_concurrently", move || {
+            let live = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let rx = prefilled(8);
+            pool.install(|| {
+                for_each_window::<usize, (), ()>(
+                    &rx,
+                    4,
+                    |_| {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Long enough for the pool's other workers to pick up
+                        // their items while this one is still in flight.
+                        std::thread::sleep(Duration::from_millis(50));
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    |_, ()| Ok(ReadFlow::Continue),
+                )
+                .unwrap();
+            });
+            peak.load(Ordering::SeqCst)
+        });
+        assert!(peak > 1, "window items never overlapped (peak {peak})");
+    }
+
+    /// Error precedence matches the serial loop: the first error in RECEIVE
+    /// order wins, even when a later item in the same window also failed (and
+    /// may well have failed first in wall-clock time), and nothing at or after
+    /// the failing item is emitted.
+    #[test]
+    fn window_reports_the_first_error_in_receive_order() {
+        let rx = prefilled(10);
+        let mut emitted = Vec::new();
+        let out = for_each_window::<usize, usize, String>(
+            &rx,
+            4,
+            |&i| match i {
+                5 => Err("five".to_string()),
+                6 => Err("six".to_string()),
+                _ => Ok(i),
+            },
+            |i, _| {
+                emitted.push(i);
+                Ok(ReadFlow::Continue)
+            },
+        );
+        assert_eq!(out.unwrap_err(), "five");
+        assert_eq!(emitted, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// An `emit` error ends the drain with that error.
+    #[test]
+    fn window_propagates_an_emit_error() {
+        let rx = prefilled(10);
+        let out = for_each_window::<usize, usize, &'static str>(
+            &rx,
+            4,
+            |&i| Ok(i),
+            |i, _| {
+                if i == 2 {
+                    Err("sink failed")
+                } else {
+                    Ok(ReadFlow::Continue)
+                }
+            },
+        );
+        assert_eq!(out.unwrap_err(), "sink failed");
+    }
+
+    /// `ReadFlow::Stop` from `emit` (its downstream hung up) ends the drain
+    /// cleanly: no further item is emitted or pulled.
+    #[test]
+    fn window_stops_when_emit_says_stop() {
+        let rx = prefilled(10);
+        let mut emitted = Vec::new();
+        let stats = for_each_window::<usize, usize, ()>(
+            &rx,
+            4,
+            |&i| Ok(i),
+            |i, _| {
+                emitted.push(i);
+                Ok(if i == 5 {
+                    ReadFlow::Stop
+                } else {
+                    ReadFlow::Continue
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(stats.windows, 2, "the window holding the stop is the last");
+        assert!(
+            !rx.is_empty(),
+            "items after the stopping window stay unpulled"
+        );
+    }
+
+    /// A window of 1 is the serial one-at-a-time loop.
+    #[test]
+    fn window_of_one_is_serial() {
+        let rx = prefilled(5);
+        let mut got = Vec::new();
+        let stats = for_each_window::<usize, usize, ()>(
+            &rx,
+            1,
+            |&i| Ok(i),
+            |i, _| {
+                got.push(i);
+                Ok(ReadFlow::Continue)
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        assert_eq!((stats.items, stats.windows, stats.max_window), (5, 5, 1));
+    }
+
+    /// The top-up never waits: with one item available and the producer
+    /// still connected, the window runs with what it has instead of blocking
+    /// for `window` items (that would idle the pool behind a slow reader).
+    #[test]
+    fn window_does_not_wait_to_fill() {
+        let got = within("window_does_not_wait_to_fill", || {
+            let (tx, rx) = crossbeam_channel::unbounded::<usize>();
+            tx.send(0).unwrap();
+            let mut got = Vec::new();
+            for_each_window::<usize, usize, ()>(
+                &rx,
+                8,
+                |&i| Ok(i),
+                |i, _| {
+                    got.push(i);
+                    // Stop after the first item; if the window had blocked to
+                    // fill, we would never get here (tx is still alive).
+                    Ok(ReadFlow::Stop)
+                },
+            )
+            .unwrap();
+            drop(tx);
+            got
+        });
+        assert_eq!(got, vec![0]);
+    }
+
+    /// An empty, disconnected channel is zero windows, not an error.
+    #[test]
+    fn window_over_an_empty_stream() {
+        let rx = prefilled(0);
+        let stats =
+            for_each_window::<usize, (), ()>(&rx, 4, |_| Ok(()), |_, ()| Ok(ReadFlow::Continue))
+                .unwrap();
+        assert_eq!((stats.items, stats.windows, stats.max_window), (0, 0, 0));
+    }
+
+    /// A panic inside `process` (hostile geometry in a clip path) propagates
+    /// to the caller instead of being swallowed by the pool.
+    #[test]
+    #[should_panic(expected = "process exploded")]
+    fn window_propagates_a_process_panic() {
+        let rx = prefilled(4);
+        let _ = for_each_window::<usize, (), ()>(
+            &rx,
+            4,
+            |&i| {
+                assert!(i != 2, "process exploded");
+                Ok(())
+            },
+            |_, ()| Ok(ReadFlow::Continue),
         );
     }
 }

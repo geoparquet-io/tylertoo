@@ -117,8 +117,18 @@ not "the run was not profiled".
                                     // under bounded/speed, which never
                                     // probe it
       "downgraded_to_spill": false  // auto flipped the RAM sinks to spill
-    }                               // mid-pass because the projection
-  },                                // passed the budget
+    },                              // mid-pass because the projection
+                                    // passed the budget
+    "windows": {                    // #494: input batches the pass-2
+      "batches": 156,               // consumers took, summed over both
+                                    // reads (buffered levels + finest)
+      "windows": 31,                // how many windows they ran in
+      "max_window": 8,              // the widest one: at most
+                                    // in_flight / 2; stuck at 1 means
+                                    // pass 2 was reader-bound
+      "mean_window": 5.03           // batches / windows
+    }
+  },
   "pass1_memory_preflight": {       // #543: the pre-scan verdict
     "verdict": "fits",              // fits | warned | exceeded_but_forced |
                                     // not_checked (a --plan replay)
@@ -335,6 +345,15 @@ asserts the partition.
 > the Brazil fixture), so it is negligible rather than merely uncounted.
 > `pass2.stage_secs.spill_write` likewise moved off the consumer thread onto
 > each level's spill writer and is folded in when that thread is joined.
+
+> **`pass2.stage_secs.{decode,simplify,build}` grew in the #494 window
+> change, and that is not a regression.** Each stage times one batch's
+> section of work, and since #494 the consumers run several batches
+> concurrently (`pass2.windows`). A batch's window now also contains the time
+> its parallel sections waited for pool threads busy with the other batches.
+> The sums therefore rise while `phase_walls.pass2` falls; on FTW Moldova
+> `simplify` went from 1 s to 4 s as pass 2 went from 3.9 s to 2.7 s.
+> Compare `phase_walls.pass2` across the change, not the stage sums.
 
 `pass1.stage_secs` and `pass2.stage_secs` are independent stage splits —
 they do not need to sum to their phase's `rows_per_sec` denominator or to

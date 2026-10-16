@@ -10,19 +10,23 @@
 //! This engine reads the input **once** and fans each batch to **all** buffered
 //! levels at once:
 //!
-//! - the read side streams the input in order over a bounded channel (depth =
-//!   `in_flight`, the read/compute-overlap and backpressure knob), tagging each
-//!   batch with its cumulative `row_offset`. It is one reader thread, or since
-//!   #494 several reader workers (auto-sized up to
+//! - the read side streams the input in order over a bounded channel, tagging
+//!   each batch with its cumulative `row_offset`. It is one reader thread, or
+//!   since #494 several reader workers (auto-sized up to
 //!   [`super::convert::READ_WORKERS_MAX`]) whose segments [`read_in_order`]
 //!   merges back into the identical batch sequence;
-//! - the consumer processes one batch at a time (batches stay in read order, so
-//!   no reorder buffer is needed) and parallelizes within it. On the default
+//! - the consumer takes a **window** of up to half of `in_flight` batches at a
+//!   time ([`super::pipe::for_each_window`], #494; the channel gets the other
+//!   half, see [`super::pipe::split_in_flight`]), processes them concurrently,
+//!   and pushes their outputs in read order, so no reorder buffer is needed.
+//!   Each batch also parallelizes within itself. On the default
 //!   cascading-duplicating path each rayon task is one **feature**, folded
 //!   fine→coarse through every level in series ([`process_batch_cascade`]).
 //!   With the cascade off, or in partitioning mode, every `(level × feature)`
 //!   simplification is its own rayon task, so the giant-geometry long pole at
-//!   one level overlaps the other levels' work;
+//!   one level overlaps the other levels' work. The window is what overlaps the
+//!   rest: one batch's serial decode, its per-level build and its slowest
+//!   feature no longer hold up the batches behind it;
 //! - each level's finished output batches accumulate in an ordered **sink**
 //!   (RAM under the `speed` profile, spilled to a temporary Arrow IPC file under
 //!   `bounded` — by a dedicated per-level writer thread, so the consumer hands
@@ -32,7 +36,8 @@
 //!
 //! Output is **byte-identical** to the serial path: within a batch the ascending
 //! `selected` order and `process_level_batch`'s order-preserving `par_iter` are
-//! unchanged, and batches reach every sink in ascending read order, so each
+//! unchanged, each batch is processed independently of the others in its
+//! window, and batches reach every sink in ascending read order, so each
 //! level's row sequence — and therefore its row-group boundaries — match exactly.
 //!
 //! The finest/canonical level is **not** handled here: it is verbatim, the
@@ -57,7 +62,7 @@ use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
-use super::pipe::scoped_pipe;
+use super::pipe::{for_each_window, scoped_pipe, split_in_flight};
 use super::stream::{process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers};
 use super::writer::{LevelWriteOutcome, OverviewWriter};
 
@@ -2107,8 +2112,12 @@ pub(super) fn run_pass2_buffered(
     let tuner_ref = &mut tuner;
     let timers_ref = &timers;
     let cascade = ctxs.first().is_some_and(|c| c.is_cascading_duplicating());
+    // #494: `in_flight` is shared between the read-ahead channel and the
+    // consumer's compute window, so the resident input stays about what one
+    // channel of depth `in_flight` held before the window existed.
+    let (read_depth, window) = split_in_flight(in_flight);
     scoped_pipe(
-        in_flight,
+        read_depth,
         // Producer: the input, in read order, over the per-part bbox-selected
         // row groups (#102 — the same selection both passes use, so global row
         // indices stay aligned). `read_in_order` is either one synchronous
@@ -2139,10 +2148,16 @@ pub(super) fn run_pass2_buffered(
                 },
             )
         },
-        // Consumer: process batches in read order; parallelize within each
-        // batch. Because batches arrive in order and are appended before the
-        // next is pulled, each sink stays in input order without a reorder
-        // buffer.
+        // Consumer: process a window of batches at a time (#494), each one
+        // parallelized within itself as well, and push every batch's output
+        // in read order. Because `for_each_window` emits in receive order and
+        // each batch is appended before the next one's output, each sink
+        // stays in input order without a reorder buffer.
+        //
+        // Before the window the consumer took one batch at a time, so every
+        // batch was a barrier: its serial geometry decode, its slowest feature
+        // and its slowest level all finished before the next batch started.
+        // A window overlaps those across batches.
         //
         // Cascading (#218, duplicating default): one call decodes the batch's
         // member geometries once and folds each feature fine→coarse, so level
@@ -2154,55 +2169,64 @@ pub(super) fn run_pass2_buffered(
             // minutes-to-hours; without this the phase is silent at info
             // level. Time-based so small inputs stay quiet.
             let mut last_progress = Instant::now();
-            for msg in rx.iter() {
-                Pass2Timers::add_dur(timers_ref.read_cell(), msg.read_dur);
-                let batch = &msg.batch;
-                let row_offset = msg.row_offset;
-                let per_level: Vec<Option<(RecordBatch, usize)>> = if cascade {
-                    process_batch_cascade(batch, row_offset, ctxs, timers_ref)?
-                } else {
-                    let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0
-                        ..num_levels)
-                        .into_par_iter()
-                        .map(|li| process_level_batch(batch, row_offset, &ctxs[li], timers_ref))
-                        .collect();
-                    let mut v = Vec::with_capacity(num_levels);
-                    for res in results {
-                        v.push(res?);
+            let stats = for_each_window(
+                &rx,
+                window,
+                |msg: &ReadMsg| -> Result<Vec<Option<(RecordBatch, usize)>>, ConvertError> {
+                    let (batch, row_offset) = (&msg.batch, msg.row_offset);
+                    if cascade {
+                        process_batch_cascade(batch, row_offset, ctxs, timers_ref)
+                    } else {
+                        let results: Vec<Result<Option<(RecordBatch, usize)>, ConvertError>> = (0
+                            ..num_levels)
+                            .into_par_iter()
+                            .map(|li| process_level_batch(batch, row_offset, &ctxs[li], timers_ref))
+                            .collect();
+                        results.into_iter().collect()
                     }
-                    v
-                };
-                for (li, out) in per_level.into_iter().enumerate() {
-                    if let Some((out, v)) = out {
-                        rows_ref[li] += out.num_rows();
-                        verts_ref[li] += v;
-                        tuner_ref.observe(&out);
-                        spill_bytes_ref[li] += sinks_ref[li].push(out)?;
+                },
+                |msg, per_level| {
+                    Pass2Timers::add_dur(timers_ref.read_cell(), msg.read_dur);
+                    for (li, out) in per_level.into_iter().enumerate() {
+                        if let Some((out, v)) = out {
+                            rows_ref[li] += out.num_rows();
+                            verts_ref[li] += v;
+                            tuner_ref.observe(&out);
+                            spill_bytes_ref[li] += sinks_ref[li].push(out)?;
+                        }
                     }
-                }
-                if tuner_ref.should_downgrade() {
-                    log::warn!(
-                        "[convert] pass2 auto: measured {} B per buffered row over {} buffered \
-                         row(s) projects {:.1} GiB for the buffered set — past the {:.1} GiB \
-                         budget; downgrading {num_levels} RAM sink(s) to spill (#626)",
-                        tuner_ref.bytes_per_row().unwrap_or(0),
-                        tuner_ref.rows,
-                        gib(tuner_ref.projected_bytes()),
-                        gib(tuner_ref.budget_bytes),
-                    );
-                    downgrade_sinks_to_spill(sinks_ref, spill_bytes_ref, out_schema, spill_dir)?;
-                    tuner_ref.mark_downgraded();
-                }
-                if last_progress.elapsed().as_secs() >= 10 {
-                    last_progress = Instant::now();
-                    log::info!(
-                        "[convert] pass 2: {} input row(s) processed ({} output \
-                         row(s) buffered across {num_levels} level(s))",
-                        row_offset + batch.num_rows(),
-                        rows_ref.iter().sum::<usize>(),
-                    );
-                }
-            }
+                    if tuner_ref.should_downgrade() {
+                        log::warn!(
+                            "[convert] pass2 auto: measured {} B per buffered row over {} \
+                             buffered row(s) projects {:.1} GiB for the buffered set — past the \
+                             {:.1} GiB budget; downgrading {num_levels} RAM sink(s) to spill \
+                             (#626)",
+                            tuner_ref.bytes_per_row().unwrap_or(0),
+                            tuner_ref.rows,
+                            gib(tuner_ref.projected_bytes()),
+                            gib(tuner_ref.budget_bytes),
+                        );
+                        downgrade_sinks_to_spill(
+                            sinks_ref,
+                            spill_bytes_ref,
+                            out_schema,
+                            spill_dir,
+                        )?;
+                        tuner_ref.mark_downgraded();
+                    }
+                    if last_progress.elapsed().as_secs() >= 10 {
+                        last_progress = Instant::now();
+                        log::info!(
+                            "[convert] pass 2: {} input row(s) processed ({} output \
+                             row(s) buffered across {num_levels} level(s))",
+                            msg.row_offset + msg.batch.num_rows(),
+                            rows_ref.iter().sum::<usize>(),
+                        );
+                    }
+                    Ok(ReadFlow::Continue)
+                },
+            )?;
+            timers_ref.record_windows(stats);
             Ok(())
         },
     )?;
