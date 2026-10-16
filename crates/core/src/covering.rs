@@ -1958,6 +1958,21 @@ mod tests {
         let selected =
             crate::overview::convert::select_input_row_groups(&metadata, &[-50.0, -5.0, 50.0, 5.0]);
         assert!(selected.is_empty(), "the gap must prune the row group");
+
+        // #643: a `--bbox` also carries its copies one world width away, and
+        // the wraparound lobes are unbounded, so a copy shifted ±360° always
+        // reaches one. The gap must still prune, and a box past +180° that
+        // lands on the west lobe must still select.
+        let query = |bbox: [f64; 4]| {
+            let q = crate::overview::convert::BboxQuery::new(&bbox, Crs::Epsg4326);
+            crate::overview::convert::select_input_row_groups_any(&metadata, q.boxes())
+        };
+        assert!(
+            query([-50.0, -5.0, 50.0, 5.0]).is_empty(),
+            "the gap must prune the row group under the wrapped copies too"
+        );
+        assert_eq!(query([185.0, -5.0, 186.0, 5.0]), vec![0], "the west lobe");
+        assert_eq!(query([-186.0, -5.0, -185.0, 5.0]), vec![0], "the east lobe");
     }
 
     /// Never guess: a native geometry column whose declared CRS doesn't

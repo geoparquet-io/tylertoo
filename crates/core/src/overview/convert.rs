@@ -4354,6 +4354,13 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// (`[xmin, ymin, xmax, ymax]` in the file's CRS units). A [`BboxQuery`]
 /// passes its bbox and the bbox shifted one world width each way (#643).
 ///
+/// `boxes[0]` is the box as given; the rest are its wrapped copies. A row
+/// group whose statistics wrap the antimeridian (`xmin > xmax`, #497) is
+/// tested against `boxes[0]` alone: its two lobes are unbounded in x, so a
+/// copy shifted one world width always reaches one of them and would keep
+/// every such group, while the box as given already reaches a lobe whenever
+/// a copy reaches the lobe's true extent.
+///
 /// Statistics-only: operates purely on the parsed parquet footer, tiered
 /// (#497) between GeoParquet 1.1 covering-column stats and GeoParquet 2.0
 /// native geo statistics
@@ -4391,7 +4398,14 @@ pub(crate) fn select_input_row_groups_any(
         .collect();
     (0..metadata.num_row_groups())
         .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
-            Some(b) => filters.iter().any(|f| b.intersects(f)),
+            Some(b) => {
+                let tested = if b.xmin > b.xmax {
+                    &filters[..filters.len().min(1)]
+                } else {
+                    &filters[..]
+                };
+                tested.iter().any(|f| b.intersects(f))
+            }
             None => true, // no stats — must read to stay correct
         })
         .collect()
