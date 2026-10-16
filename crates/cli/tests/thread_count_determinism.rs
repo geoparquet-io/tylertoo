@@ -387,6 +387,69 @@ fn pmtiles_output_is_byte_identical_across_read_worker_counts() {
     }
 }
 
+/// #494, compute side: byte-determinism across `--in-flight-batches`.
+///
+/// Pass 2's consumers process a window of up to `in_flight / 2` batches at
+/// once and emit them in read order. `--in-flight-batches 1` is a window of
+/// one, which is the old one-batch-at-a-time consumer, so it is the reference
+/// for 5 (an uneven 3 + 2 split between channel and window) and 16 (8 batches
+/// at once). A read batch of 13 rows turns the 1000-row fixture into ~77
+/// batches, so the wide windows really fill.
+///
+/// The `RAYON_NUM_THREADS=1` arm runs an 8-batch window on a one-thread pool.
+/// It pins the deadlock-freedom the window relies on: the window is plain
+/// fork-join, so a single worker must still finish every batch in it.
+#[test]
+fn pmtiles_output_is_byte_identical_across_in_flight_batches() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut baseline: Option<(String, Vec<u8>, Vec<u8>)> = None;
+    for (threads, in_flight) in [(4u32, 1u32), (4, 5), (4, 16), (1, 16)] {
+        let arm = format!("RAYON_NUM_THREADS={threads} --in-flight-batches {in_flight}");
+        let out = dir.path().join(format!("t{threads}-if{in_flight}.pmtiles"));
+        let overview_out = dir
+            .path()
+            .join(format!("t{threads}-if{in_flight}-overview.parquet"));
+        let (bytes, overview_bytes) = run_tiles(
+            &fixture,
+            &out,
+            &overview_out,
+            threads,
+            false,
+            12,
+            &[
+                "--in-flight-batches",
+                &in_flight.to_string(),
+                "--read-batch-size",
+                "13",
+            ],
+        );
+        match &baseline {
+            None => baseline = Some((arm, bytes, overview_bytes)),
+            Some((base_arm, base_bytes, base_overview_bytes)) => {
+                assert!(
+                    base_bytes == &bytes,
+                    "PMTiles output differs between `{base_arm}` ({} bytes) and `{arm}` \
+                     ({} bytes) — the pass-2 compute window (#494) changed the output: a \
+                     window must emit its batches in read order",
+                    base_bytes.len(),
+                    bytes.len()
+                );
+                assert!(
+                    base_overview_bytes == &overview_bytes,
+                    "kept overview Parquet differs between `{base_arm}` ({} bytes) and \
+                     `{arm}` ({} bytes) — #494 compute-window regression",
+                    base_overview_bytes.len(),
+                    overview_bytes.len()
+                );
+            }
+        }
+    }
+}
+
 /// The multi-part half of #494: a worker must never carry rows across a part
 /// boundary, because the sequential reader opens a fresh reader per part and
 /// so ends every part on a short batch. Three copies of the fixture in one

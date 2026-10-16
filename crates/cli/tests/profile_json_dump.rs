@@ -344,6 +344,42 @@ fn check_convert_line(
     check_rss_sampler(value, value, &CONVERT_PHASES);
     check_sink_measurement(value);
     check_pass1_memory_preflight(value);
+    check_pass2_windows(value);
+}
+
+/// #494: `pass2.windows` — how many input batches the pass-2 consumers
+/// processed at once. Every Pipelined run streams at least its finest level
+/// through a window, so the counters are never zero here; how wide the windows
+/// got depends on whether the reader kept ahead, so only the bounds are
+/// pinned: a window is at least one batch and at most half of `in_flight`
+/// (the other half is the read-ahead channel).
+fn check_pass2_windows(value: &serde_json::Value) {
+    let w = &value["pass2"]["windows"];
+    let field = |k: &str| {
+        w[k].as_u64()
+            .unwrap_or_else(|| panic!("pass2.windows.{k} must be an integer (#494): {value}"))
+    };
+    let (batches, windows, max_window) = (field("batches"), field("windows"), field("max_window"));
+    let mean = w["mean_window"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("pass2.windows.mean_window must be a number: {value}"));
+    let in_flight = value["in_flight"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("in_flight must be an integer: {value}"));
+    assert!(
+        windows > 0 && batches >= windows,
+        "pass2 must process its batches in at least one window: {value}"
+    );
+    let window_cap = (in_flight / 2).max(1);
+    assert!(
+        (1..=window_cap).contains(&max_window),
+        "pass2.windows.max_window ({max_window}) must lie in [1, in_flight/2 = {window_cap}]: \
+         {value}"
+    );
+    assert!(
+        (mean - batches as f64 / windows as f64).abs() < 1e-9 && mean <= max_window as f64,
+        "pass2.windows.mean_window ({mean}) must be batches/windows and <= max_window: {value}"
+    );
 }
 
 /// #626: `pass2.sink` — the MEASURED retained cost of a buffered output row,

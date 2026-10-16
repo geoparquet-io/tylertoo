@@ -109,7 +109,7 @@ use super::convert::{
     PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
-use super::pipe::scoped_pipe;
+use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
 use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
@@ -3152,6 +3152,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
         pass2_rows: ctx.pass2_rows,
         pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
         pass2_cascade_step_counts: ctx.pass2_engine_timers.cascade_step_counts(),
+        pass2_windows: ctx.pass2_engine_timers.window_stats(),
         writer_finish_secs: ctx.writer_finish_wall.as_secs_f64(),
         total_secs: ctx.start.elapsed().as_secs_f64(),
         levels: ctx
@@ -3198,6 +3199,9 @@ struct ProfileJsonInputs<'a> {
     /// means the fold never ran: a Serial-engine run, or a single-level
     /// ladder (where `run_pass2_buffered` is skipped entirely).
     pass2_cascade_step_counts: (u64, u64),
+    /// How the pass-2 consumers batched their input into concurrent windows
+    /// (#494, `pass2.windows` in the dump).
+    pass2_windows: WindowStats,
     writer_finish_secs: f64,
     total_secs: f64,
     /// Per WRITTEN level, in writer order (matches `ConvertReport.levels`):
@@ -3384,6 +3388,20 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
             // Ram→Spill downgrade. `bytes_per_row` is null when nothing was
             // buffered (the Serial path, or a single-level ladder).
             "sink": sink_json(inputs.sink_measurement),
+            // #494: how many input batches the consumers processed at once.
+            // `batches` sums both pass-2 reads (the buffered levels and the
+            // streamed finest level); `max_window` stuck at 1 means the
+            // reader, not the compute, set the pace. Zero on a Serial run.
+            "windows": {
+                "batches": inputs.pass2_windows.items,
+                "windows": inputs.pass2_windows.windows,
+                "max_window": inputs.pass2_windows.max_window,
+                "mean_window": if inputs.pass2_windows.windows > 0 {
+                    inputs.pass2_windows.items as f64 / inputs.pass2_windows.windows as f64
+                } else {
+                    0.0
+                },
+            },
         },
         // #543 + #626: the pre-scan pass-1 memory verdict. A run that was
         // warned here and then OOM-killed leaves the warning in the record.
@@ -5108,6 +5126,17 @@ pub(super) struct Pass2Timers {
     /// Total cascade-fold `Keep` steps evaluated ([`process_batch_cascade`]);
     /// the denominator for `cascade_steps_shared`.
     cascade_steps_total: AtomicU64,
+    /// Input batches the pass-2 consumers took through
+    /// [`for_each_window`](super::pipe::for_each_window) (#494), summed over
+    /// the buffered engine and the streamed finest level (each reads the
+    /// input once, so a two-read run counts every batch twice).
+    window_batches: AtomicU64,
+    /// Windows those batches were processed in; `window_batches / windows` is
+    /// the mean number of batches processed concurrently.
+    windows: AtomicU64,
+    /// The widest window either consumer ran. Stuck at 1 means pass 2 was
+    /// reader-bound: the window never had a second batch queued to take.
+    max_window: AtomicU64,
 }
 
 /// Pass-2 engine stage wall-time split, in seconds — [`Pass2Timers`]
@@ -5153,6 +5182,23 @@ impl Pass2Timers {
             .fetch_add(shared, Ordering::Relaxed);
         self.cascade_steps_total.fetch_add(total, Ordering::Relaxed);
     }
+    /// Record one consumer's [`WindowStats`] (#494).
+    pub(super) fn record_windows(&self, stats: WindowStats) {
+        self.window_batches
+            .fetch_add(stats.items, Ordering::Relaxed);
+        self.windows.fetch_add(stats.windows, Ordering::Relaxed);
+        self.max_window
+            .fetch_max(stats.max_window, Ordering::Relaxed);
+    }
+    /// Snapshot the window counters (`TYLERTOO_PROFILE_JSON`'s
+    /// `pass2.windows`).
+    pub(super) fn window_stats(&self) -> WindowStats {
+        WindowStats {
+            items: self.window_batches.load(Ordering::Relaxed),
+            windows: self.windows.load(Ordering::Relaxed),
+            max_window: self.max_window.load(Ordering::Relaxed),
+        }
+    }
     /// Snapshot `(shared, total)` cascade-fold step counts (#499,
     /// `TYLERTOO_PROFILE_JSON`'s `pass2.identical_steps`).
     pub(super) fn cascade_step_counts(&self) -> (u64, u64) {
@@ -5195,6 +5241,7 @@ impl Pass2Timers {
             self.cascade_steps_total.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        other.record_windows(self.window_stats());
     }
     pub(super) fn stage_secs(&self) -> Pass2StageSecs {
         Pass2StageSecs {
@@ -5348,60 +5395,102 @@ fn write_level_streaming(
         verts: usize,
     }
 
-    // Overlap decode→process with the parquet writer (#264,
-    // extending the #213 pipeline discipline to the streamed finest level): a
-    // producer thread reads input batches and runs `process_level_batch`
-    // (read + geometry decode + simplify + assemble), pushing finished output
-    // batches over a bounded channel; the writer drains it on this thread.
-    // Batches stay in read order (FIFO channel, single producer), so output —
-    // and therefore row-group boundaries — are byte-identical to a serial
-    // build. Channel depth bounds read/compute run-ahead the same way the
-    // buffered engine's reader channel does.
+    // Overlap read, process and write as three stages (#264 put the writer
+    // on its own stage, extending the #213 pipeline discipline to the
+    // streamed finest level; #494 split read from process). A reader thread
+    // reads input batches in order; the producer thread drains them in
+    // windows of up to `window` batches, runs `process_level_batch` (member
+    // selection + geometry decode + simplify + assemble) on every batch of a
+    // window concurrently, and pushes the finished output batches over a
+    // bounded channel in read order; the writer drains it on this thread.
+    // Batches stay in read order (FIFO channels, single producers, and
+    // `for_each_window` emits in receive order), so output — and therefore
+    // row-group boundaries — are byte-identical to a serial build.
+    //
+    // Before the window this stage took one batch at a time, so on the
+    // verbatim canonical level the per-batch decode and assemble — serial
+    // within a batch — ran on one thread for the whole level (#494: "even
+    // verbatim's 15k rows/s is single-pipeline-bound").
+    //
+    // `in_flight` is split between the read-ahead channel and the window
+    // (`split_in_flight`), so the input batches resident here stay about what
+    // one channel of depth `in_flight` held; the output channel holds one
+    // window's worth, enough that the writer never starves while the next
+    // window computes.
+    //
     // `timers` (bound above as `&level_timers`) is shared by reference into
-    // the producer thread: a `&Pass2Timers` is `Copy`, so the producer
-    // closure copies the borrow and leaves `level_timers` owned here for the
-    // post-scope read and the return value below.
+    // the producer threads: a `&Pass2Timers` is `Copy`, so the closures copy
+    // the borrow and leave `level_timers` owned here for the post-scope read
+    // and the return value below.
+    let (read_depth, window) = split_in_flight(in_flight);
     let outcome = scoped_pipe(
-        in_flight,
+        window,
         // Producer: read + process, in order, until EOF or the writer
         // hangs up. Returns the first stream/processing error, if any.
         // Everything the closure touches (`source`, `ctx`, `&timers`,
         // `row_groups`, the `usize`s) is `Copy`, so the outer bindings —
         // notably `timers`, read back afterwards — stay valid.
         |tx: &Sender<Processed>| -> Result<(), ConvertError> {
-            // Heartbeat (#242): the finest level re-streams the whole
-            // input; keep the operator informed on planet-scale files
-            // (quiet on small ones).
-            let mut last_progress = Instant::now();
-            // Regional extract (#102): read the same per-part bbox-selected
-            // row groups as pass 1, so the winner tables' global row indices
-            // line up. One reader, or several merged back into the identical
-            // batch sequence (#494) — `read_tuning` decides, and the decision
-            // never reaches the output.
-            read_in_order(
-                source,
-                row_groups,
-                read_tuning,
-                |batch, offset, read_dur| {
-                    if last_progress.elapsed().as_secs() >= 10 {
-                        last_progress = Instant::now();
-                        log::info!("[convert] level {level_idx}: {offset} input row(s) scanned");
-                    }
-                    Pass2Timers::add_dur(&timers.read, read_dur);
-                    match process_level_batch(&batch, offset, ctx, timers)? {
-                        // No members of this level in the batch.
-                        None => Ok(ReadFlow::Continue),
-                        Some((out, verts)) => Ok(
-                            // Writer gone (it errored and dropped the
-                            // receiver): stop; the writer's error is reported
-                            // by the caller.
-                            if tx.send(Processed { batch: out, verts }).is_err() {
+            scoped_pipe(
+                read_depth,
+                // Reader: the raw input batches, in order.
+                |read_tx: &Sender<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                    // Heartbeat (#242): the finest level re-streams the whole
+                    // input; keep the operator informed on planet-scale files
+                    // (quiet on small ones).
+                    let mut last_progress = Instant::now();
+                    // Regional extract (#102): read the same per-part
+                    // bbox-selected row groups as pass 1, so the winner
+                    // tables' global row indices line up. One reader, or
+                    // several merged back into the identical batch sequence
+                    // (#494) — `read_tuning` decides, and the decision never
+                    // reaches the output.
+                    read_in_order(
+                        source,
+                        row_groups,
+                        read_tuning,
+                        |batch, offset, read_dur| {
+                            if last_progress.elapsed().as_secs() >= 10 {
+                                last_progress = Instant::now();
+                                log::info!(
+                                    "[convert] level {level_idx}: {offset} input row(s) scanned"
+                                );
+                            }
+                            Pass2Timers::add_dur(&timers.read, read_dur);
+                            // Processor gone (it, or the writer behind it,
+                            // stopped): stop; its error is reported by the
+                            // caller.
+                            Ok(if read_tx.send((batch, offset)).is_err() {
                                 ReadFlow::Stop
                             } else {
                                 ReadFlow::Continue
-                            },
-                        ),
-                    }
+                            })
+                        },
+                    )
+                },
+                // Processor: a window of batches at a time, emitted in order.
+                |read_rx: Receiver<(RecordBatch, usize)>| -> Result<(), ConvertError> {
+                    let stats = for_each_window(
+                        &read_rx,
+                        window,
+                        |(batch, offset)| process_level_batch(batch, *offset, ctx, timers),
+                        |_, out| match out {
+                            // No members of this level in the batch.
+                            None => Ok(ReadFlow::Continue),
+                            // Writer gone (it errored and dropped the
+                            // receiver): stop; the writer's error is reported
+                            // by the caller.
+                            Some((batch, verts)) => {
+                                Ok(if tx.send(Processed { batch, verts }).is_err() {
+                                    ReadFlow::Stop
+                                } else {
+                                    ReadFlow::Continue
+                                })
+                            }
+                        },
+                    )?;
+                    timers.record_windows(stats);
+                    Ok(())
                 },
             )
         },

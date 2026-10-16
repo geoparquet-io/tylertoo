@@ -462,14 +462,18 @@ pub struct ConvertOptions {
     /// byte-identical across profiles. No effect when `streaming` is `false`.
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
-    /// pass-2 pipeline at once (bounded-channel depth / read-compute overlap
-    /// knob). Default [`IN_FLIGHT_BATCHES_AUTO`], which
+    /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
+    /// the read-ahead channel, the other the window of batches its consumers
+    /// process concurrently, so it sets compute overlap across batches as
+    /// well as read-ahead. Default [`IN_FLIGHT_BATCHES_AUTO`], which
     /// [`resolve_in_flight_batches`] expands to the machine's available
     /// parallelism (clamped to `[IN_FLIGHT_BATCHES_MIN, IN_FLIGHT_BATCHES_MAX]`)
     /// at pass-2 setup; any explicit positive value is honoured verbatim.
-    /// Higher improves core utilization on long-pole geometries at
-    /// proportionally more peak memory (`in_flight_batches × read_batch_size`
-    /// rows resident). No effect when `streaming` is `false`.
+    /// Higher improves core utilization at proportionally more peak memory
+    /// (`in_flight_batches × read_batch_size` input rows resident, plus the
+    /// window's output batches). 1 or 2 processes one batch at a time. Output
+    /// is byte-identical for every value. No effect when `streaming` is
+    /// `false`.
     pub in_flight_batches: usize,
     /// Number of concurrent reader threads pass 2 splits the input across
     /// (#494). Default [`READ_WORKERS_AUTO`], which
@@ -712,14 +716,16 @@ pub const IN_FLIGHT_BATCHES_MIN: usize = 4;
 
 /// Upper clamp for auto-sized in-flight batches.
 ///
-/// In-flight depth is read-ahead only: the consumer takes one batch at a time
-/// and parallelizes inside it, so a deeper channel adds no compute
-/// parallelism. Re-measured for #648 (`corpus/SWEEPS.md`, Decision 7): on
-/// 16 threads, depths 4 through 64 gave the same wall time and peak RSS on
-/// Overture Germany segments and fieldmaps adm4. The ceiling is therefore a
+/// Re-measured for #648 (`corpus/SWEEPS.md`, Decision 7): on 16 threads,
+/// depths 4 through 64 gave the same wall time and peak RSS on Overture
+/// Germany segments and fieldmaps adm4. At the time in-flight depth was
+/// read-ahead only, because the consumer took one batch at a time. Since
+/// #494 half of it is the consumer's compute window
+/// ([`super::pipe::split_in_flight`]), so 16 means 8 batches processed at
+/// once; the cap stands until Decision 7 is re-swept. The ceiling is also a
 /// memory bound for wide machines. Without it a 128-core box would hold 128
-/// resident batches (`in_flight × read_batch_size` rows) for no throughput
-/// gain. Power users can still pass a larger explicit value.
+/// resident batches (`in_flight × read_batch_size` rows). Power users can
+/// still pass a larger explicit value.
 pub const IN_FLIGHT_BATCHES_MAX: usize = 16;
 
 /// Resolve a requested in-flight-batches value to a concrete depth.
@@ -11498,7 +11504,11 @@ mod tests {
         };
 
         // The reference is the single sequential reader at the smallest
-        // chunking, which is the shape every other arm must reproduce.
+        // chunking, which is the shape every other arm must reproduce. Its
+        // `in_flight_batches` of 1 is also a compute window of 1 (#494): the
+        // one-batch-at-a-time consumer, which the wide-window arms below
+        // (16 → 8 batches at once, 5 → an uneven 3 + 2 split, 32 → 16) must
+        // match byte for byte.
         let reference = convert(7, 1, 1);
         // `ifb`/`workers` of 0 are the AUTO sentinels: they must produce the
         // same output as any explicit value (auto only changes overlap and
@@ -11509,6 +11519,9 @@ mod tests {
             (7usize, 1usize, 2usize),
             (7, 4, 4),
             (7, 2, 0),
+            (7, 16, 1),
+            (7, 5, 2),
+            (7, 32, 4),
             (64, 4, 3),
             (4096, 8, 2),
             (8192, 0, 0),
