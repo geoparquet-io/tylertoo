@@ -7359,12 +7359,15 @@ mod tests {
     /// with `try_to_geometry`, then `scan_feature`.
     mod scan_feature_traits_props {
         use super::super::{scan_feature, scan_feature_traits, FeatureKind};
+        use crate::batch_processor::{visit_geoarrow_array, GeoArrowVisitor};
         use geo::{Geometry, GeometryCollection, LineString, Polygon};
         use geo_traits::to_geo::ToGeoGeometry;
+        use geo_traits::{GeometryCollectionTrait, GeometryTrait};
         use geoarrow::array::WkbArray;
         use geoarrow::datatypes::WkbType;
-        use geoarrow_array::GeoArrowArrayAccessor;
+        use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
         use proptest::prelude::*;
+        use std::sync::Arc;
 
         type Scan = Option<(FeatureKind, [u64; 4])>;
 
@@ -7406,13 +7409,20 @@ mod tests {
             b
         }
 
-        /// The #274 generator, plus GeometryCollections of its output.
+        /// The #274 generator, plus empty points (`POINT(NaN NaN)`, as WKB
+        /// and native arrays spell them) and GeometryCollections, nested up
+        /// to two deep, of both. The #274 generator alone makes an empty
+        /// point only when both axes draw NaN, too rarely to reach one
+        /// inside a collection.
         fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
-            prop_oneof![
-                4 => super::scan_feature_props::any_geometry(),
-                1 => proptest::collection::vec(super::scan_feature_props::any_geometry(), 0..4)
-                    .prop_map(|gs| Geometry::GeometryCollection(GeometryCollection::new_from(gs))),
-            ]
+            let leaf = prop_oneof![
+                8 => super::scan_feature_props::any_geometry(),
+                1 => Just(Geometry::Point(geo::Point::new(f64::NAN, f64::NAN))),
+            ];
+            leaf.prop_recursive(2, 12, 4, |inner| {
+                proptest::collection::vec(inner, 0..4)
+                    .prop_map(|gs| Geometry::GeometryCollection(GeometryCollection::new_from(gs)))
+            })
         }
 
         proptest! {
@@ -7495,6 +7505,316 @@ mod tests {
                 let (old, new) = both(&wkb_of(&ls));
                 assert_eq!(new, old);
                 assert_eq!(new.unwrap().1, [a, a, a, a].map(f64::to_bits));
+            }
+        }
+
+        /// Both scans of every non-null row of an array, read through the
+        /// dispatch pass 1 uses ([`visit_geoarrow_array`]).
+        struct BothScans;
+
+        impl GeoArrowVisitor for BothScans {
+            type Output = Vec<(Scan, Scan)>;
+
+            fn visit<'a, A>(self, accessor: &'a A) -> crate::Result<Self::Output>
+            where
+                A: GeoArrowArrayAccessor<'a>,
+                A::Item: ToGeoGeometry<f64>,
+            {
+                let mut out = Vec::new();
+                for item in accessor.iter().flatten() {
+                    let g = item.map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+                    let old = g.try_to_geometry().and_then(|g| scan_feature(&g));
+                    out.push((bits(old), bits(scan_feature_traits(&g))));
+                }
+                Ok(out)
+            }
+        }
+
+        /// Assert the two scans agree, bit for bit, on every row of every
+        /// array; return each array's old scans.
+        fn assert_scans_agree(arrays: &[(String, Arc<dyn GeoArrowArray>)]) -> Vec<Vec<Scan>> {
+            arrays
+                .iter()
+                .map(|(name, array)| {
+                    let pairs = visit_geoarrow_array(array.as_ref(), BothScans)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                    for (i, (old, new)) in pairs.iter().enumerate() {
+                        assert_eq!(new, old, "{name}, non-null row {i}");
+                    }
+                    pairs.into_iter().map(|(old, _)| old).collect()
+                })
+                .collect()
+        }
+
+        /// `g` as WKT that the `wkt` crate reads back to the same bits: `{:?}`
+        /// keeps every finite value exactly, sign of zero included, and a
+        /// leading `+` makes the tokenizer read `NaN` and `inf` as numbers.
+        /// `open` drops the closing copy `Polygon::new` appended to each ring.
+        fn wkt_of(g: &Geometry<f64>, open: bool) -> String {
+            fn num(v: f64) -> String {
+                if v.is_nan() || v == f64::INFINITY {
+                    format!("+{v:?}")
+                } else {
+                    format!("{v:?}")
+                }
+            }
+            fn list(items: Vec<String>) -> String {
+                if items.is_empty() {
+                    "EMPTY".into()
+                } else {
+                    format!("({})", items.join(","))
+                }
+            }
+            fn coords(cs: &[geo::Coord<f64>]) -> String {
+                list(
+                    cs.iter()
+                        .map(|c| format!("{} {}", num(c.x), num(c.y)))
+                        .collect(),
+                )
+            }
+            let ring = |r: &LineString<f64>| {
+                let n = if open {
+                    r.0.len().saturating_sub(1)
+                } else {
+                    r.0.len()
+                };
+                coords(&r.0[..n])
+            };
+            let polygon = |p: &Polygon<f64>| {
+                let rings = std::iter::once(p.exterior()).chain(p.interiors());
+                format!("({})", rings.map(ring).collect::<Vec<_>>().join(","))
+            };
+            match g {
+                // WKT's own empty point; `POINT (NaN NaN)` would read as a
+                // point at NaN, which WKB and native arrays read as empty.
+                Geometry::Point(p) if p.x().is_nan() && p.y().is_nan() => "POINT EMPTY".into(),
+                Geometry::Point(p) => format!("POINT {}", coords(&[p.0])),
+                Geometry::LineString(ls) => format!("LINESTRING {}", coords(&ls.0)),
+                Geometry::Polygon(p) => format!("POLYGON {}", polygon(p)),
+                Geometry::MultiPoint(mp) => format!(
+                    "MULTIPOINT {}",
+                    list(mp.0.iter().map(|p| coords(&[p.0])).collect())
+                ),
+                Geometry::MultiLineString(ml) => format!(
+                    "MULTILINESTRING {}",
+                    list(ml.0.iter().map(|ls| coords(&ls.0)).collect())
+                ),
+                Geometry::MultiPolygon(mp) => {
+                    format!("MULTIPOLYGON {}", list(mp.0.iter().map(polygon).collect()))
+                }
+                Geometry::GeometryCollection(gc) => format!(
+                    "GEOMETRYCOLLECTION {}",
+                    list(gc.0.iter().map(|g| wkt_of(g, open)).collect())
+                ),
+                other => unreachable!("the generator makes no {other:?}"),
+            }
+        }
+
+        /// A collection holding a collection, which no native array holds.
+        fn nested_collection<G: GeometryTrait<T = f64>>(g: &G) -> bool {
+            use geo_traits::GeometryType as T;
+            match g.as_type() {
+                T::GeometryCollection(gc) => gc
+                    .geometries()
+                    .any(|m| matches!(m.as_type(), T::GeometryCollection(_))),
+                _ => false,
+            }
+        }
+
+        /// The single-type XY array a row belongs in, if any.
+        fn type_code<G: GeometryTrait<T = f64>>(g: &G) -> Option<u8> {
+            use geo_traits::GeometryType as T;
+            if g.dim() != geo_traits::Dimensions::Xy || nested_collection(g) {
+                return None;
+            }
+            match g.as_type() {
+                T::Point(_) => Some(1),
+                T::LineString(_) => Some(2),
+                T::Polygon(_) => Some(3),
+                T::MultiPoint(_) => Some(4),
+                T::MultiLineString(_) => Some(5),
+                T::MultiPolygon(_) => Some(6),
+                T::GeometryCollection(_) => Some(7),
+                T::Rect(_) | T::Triangle(_) | T::Line(_) => None,
+            }
+        }
+
+        /// `values` (WKT, `None` for null) as every GeoArrow array pass 1
+        /// reads: WKT in its three layouts, WKB, and the native arrays built
+        /// from the parsed WKT in both coordinate layouts: the mixed
+        /// `Geometry` array, the `GeometryCollection` array, and each
+        /// single-type array over its own rows, other rows null. Building from
+        /// the parsed WKT keeps rings as written, so an open ring stays open,
+        /// and a native array stores `POINT EMPTY` as NaN coordinates.
+        fn arrays_of(values: &[Option<String>]) -> Vec<(String, Arc<dyn GeoArrowArray>)> {
+            use arrow_array::{LargeStringArray, StringArray, StringViewArray};
+            use geoarrow::array::{
+                GeometryBuilder, GeometryCollectionBuilder, LargeWktArray, LineStringBuilder,
+                MultiLineStringBuilder, MultiPointBuilder, MultiPolygonBuilder, PointBuilder,
+                PolygonBuilder, WkbBuilder, WktArray, WktViewArray,
+            };
+            use geoarrow::datatypes::{
+                CoordType, Dimension, GeometryCollectionType, GeometryType, LineStringType,
+                MultiLineStringType, MultiPointType, MultiPolygonType, PointType, PolygonType,
+                WktType,
+            };
+
+            let strs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+            let wkt = WktArray::from((StringArray::from(strs.clone()), WktType::default()));
+            let parsed: Vec<Option<_>> = wkt
+                .iter()
+                .map(|v| v.transpose().expect("test WKT parses"))
+                .collect();
+            let large =
+                LargeWktArray::from((LargeStringArray::from(strs.clone()), WktType::default()));
+            let view = WktViewArray::from((StringViewArray::from(strs), WktType::default()));
+            let wkb = WkbBuilder::<i32>::from_nullable_geometries(&parsed, WkbType::default())
+                .expect("WKB")
+                .finish();
+            let mut out: Vec<(String, Arc<dyn GeoArrowArray>)> = vec![
+                ("wkt".into(), Arc::new(wkt)),
+                ("large wkt".into(), Arc::new(large)),
+                ("wkt view".into(), Arc::new(view)),
+                ("wkb".into(), Arc::new(wkb)),
+            ];
+            let rows = |code: u8| -> Vec<Option<_>> {
+                parsed
+                    .iter()
+                    .map(|g| g.clone().filter(|g| type_code(g) == Some(code)))
+                    .collect()
+            };
+            let mixed: Vec<Option<_>> = parsed
+                .iter()
+                .map(|g| g.clone().filter(|g| !nested_collection(g)))
+                .collect();
+            let md = Arc::<geoarrow::datatypes::Metadata>::default;
+            let xy = Dimension::XY;
+            for ct in [CoordType::Separated, CoordType::Interleaved] {
+                let point = PointBuilder::from_nullable_geometries(
+                    &rows(1),
+                    PointType::new(xy, md()).with_coord_type(ct),
+                );
+                let line = LineStringBuilder::from_nullable_geometries(
+                    &rows(2),
+                    LineStringType::new(xy, md()).with_coord_type(ct),
+                );
+                let polygon = PolygonBuilder::from_nullable_geometries(
+                    &rows(3),
+                    PolygonType::new(xy, md()).with_coord_type(ct),
+                );
+                let multi_point = MultiPointBuilder::from_nullable_geometries(
+                    &rows(4),
+                    MultiPointType::new(xy, md()).with_coord_type(ct),
+                );
+                let multi_line = MultiLineStringBuilder::from_nullable_geometries(
+                    &rows(5),
+                    MultiLineStringType::new(xy, md()).with_coord_type(ct),
+                );
+                let multi_polygon = MultiPolygonBuilder::from_nullable_geometries(
+                    &rows(6),
+                    MultiPolygonType::new(xy, md()).with_coord_type(ct),
+                );
+                let collection = GeometryCollectionBuilder::from_nullable_geometries(
+                    &rows(7),
+                    GeometryCollectionType::new(xy, md()).with_coord_type(ct),
+                );
+                let geometry = GeometryBuilder::from_nullable_geometries(
+                    &mixed,
+                    GeometryType::new(md()).with_coord_type(ct),
+                );
+                let arrays: [(&str, Arc<dyn GeoArrowArray>); 8] = [
+                    ("point", Arc::new(point.expect("point").finish())),
+                    ("linestring", Arc::new(line.expect("line").finish())),
+                    ("polygon", Arc::new(polygon.expect("polygon").finish())),
+                    (
+                        "multipoint",
+                        Arc::new(multi_point.expect("mpoint").finish()),
+                    ),
+                    (
+                        "multilinestring",
+                        Arc::new(multi_line.expect("mline").finish()),
+                    ),
+                    (
+                        "multipolygon",
+                        Arc::new(multi_polygon.expect("mpoly").finish()),
+                    ),
+                    ("collection", Arc::new(collection.expect("gc").finish())),
+                    ("geometry", Arc::new(geometry.expect("geometry").finish())),
+                ];
+                for (name, array) in arrays {
+                    out.push((format!("{name} {ct:?}"), array));
+                }
+            }
+            out
+        }
+
+        proptest! {
+            /// The WKB-only property above, over every array type pass 1
+            /// reads (#650): native GeoArrow in both coordinate layouts and
+            /// WKT as well as WKB, with nulls, and with rings left open.
+            #[test]
+            fn in_place_scan_matches_decode_then_scan_on_every_array_type(
+                gs in proptest::collection::vec(proptest::option::of(any_geometry()), 0..6),
+                open in any::<bool>(),
+            ) {
+                let values: Vec<Option<String>> =
+                    gs.iter().map(|g| g.as_ref().map(|g| wkt_of(g, open))).collect();
+                assert_scans_agree(&arrays_of(&values));
+            }
+        }
+
+        /// The cases the bit-for-bit claim rests on, in every array type that
+        /// can hold them: empty points alone, in a MultiPoint and in a
+        /// (nested) collection; NaN in one axis; signed zeros in every
+        /// position, including the first coordinate of an open ring, whose
+        /// copy `Polygon::new` appends; a polygon with an empty exterior but a
+        /// hole; Z and M coordinates.
+        #[test]
+        fn in_place_scan_matches_decode_then_scan_on_edge_cases() {
+            let cases = [
+                "POINT EMPTY",
+                "POINT (1 2)",
+                "POINT (+NaN 2)",
+                "POINT (+NaN +NaN)",
+                "POINT (-0 0)",
+                "MULTIPOINT ((1 2),(+NaN 3))",
+                "MULTIPOINT ((+NaN +NaN),(1 2))",
+                "MULTIPOINT ((0 -0),(-0 0))",
+                "LINESTRING EMPTY",
+                "LINESTRING (0 -0,-0 0,1 1)",
+                "LINESTRING (-0 0,0 -0)",
+                "LINESTRING (1 +inf,2 2)",
+                "POLYGON EMPTY",
+                "POLYGON ((0 0,2 0,2 2))",
+                "POLYGON ((-0 -0,1 0,1 1))",
+                "POLYGON ((1 1,-0 0,0 -0))",
+                "POLYGON ((0 0,1 0,1 1,-0 -0))",
+                "POLYGON (EMPTY,(0 0,1 0,1 1,0 0))",
+                "POLYGON ((0 0,1 0,1 1),(5 5,6 5,6 6))",
+                "POLYGON ((0 0,1 0,1 1),(5 5,-inf 5,6 6))",
+                "MULTIPOLYGON (((0 0,1 0,1 1)),((-0 5,3 5,3 9)))",
+                "MULTIPOLYGON EMPTY",
+                "MULTILINESTRING EMPTY",
+                "MULTILINESTRING (EMPTY,(0 -0,-0 0))",
+                "GEOMETRYCOLLECTION EMPTY",
+                "GEOMETRYCOLLECTION (POINT (1 2),POINT EMPTY)",
+                "GEOMETRYCOLLECTION (LINESTRING (0 0,1 1),POLYGON ((3 3,4 3,4 4)))",
+                "GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (POINT EMPTY),POINT (1 2))",
+                "GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (POINT (-0 0)),POINT (0 -0))",
+                "POINT Z (1 2 +NaN)",
+                "POINT Z (+NaN +NaN 3)",
+                "POINT ZM EMPTY",
+                "LINESTRING M (1 2 3,-0 0 4)",
+                "POLYGON ZM ((0 0 1 2,1 0 1 2,1 1 1 2))",
+            ];
+            let mut values: Vec<Option<String>> = vec![None];
+            values.extend(cases.iter().map(|c| Some(c.to_string())));
+            let arrays = arrays_of(&values);
+            let scans = assert_scans_agree(&arrays);
+            // Every array reaches both outcomes, not just `None`.
+            for ((name, _), s) in arrays.iter().zip(&scans) {
+                assert!(s.iter().any(Option::is_some), "{name}: nothing usable");
+                assert!(s.iter().any(Option::is_none), "{name}: nothing unusable");
             }
         }
     }
