@@ -55,7 +55,24 @@ group's statistics describe the stored coordinates, one world width
 from the tiles its wrapped copies land in. Convert counts a feature as out of
 range only past ±540° longitude, the reach of one wrap, so wrapped
 features are neither warned about as lost nor fatal to the all-lost
-gate.
+gate. They are reported instead (#644): `ConvertReport::wrapped_features`
+counts every feature past ±180° but within ±540°, one `log::info!` names
+the first few rows and coordinates, and the CLI and Python reports show
+the count. That keeps visible the one failure the old ±180° gate caught:
+a projected file labeled lon/lat whose coordinates stay within ±540°,
+such as a local grid in kilometres, which would otherwise tile silently
+at the wrong place.
+
+Convert's `--bbox` follows the same rule (#643). A feature matches when
+it, or its copy shifted ±360°, intersects the box: `BboxQuery` in
+`overview/convert.rs` holds the box and its two shifted copies, and both
+the row-group prune and the per-feature filter test all three, in both
+engines and in the `--max-zoom auto` estimate. EPSG:3857 shifts by one
+world width in metres. A data shard's row-group prune tests its read
+bounds the same way, so the shard covering lng -160 reads a 0..360 group
+stored at lng 200. The shard planner still weighs each row group by its
+stored coordinates, which only skews the balance of the cut, never which
+rows a shard reads.
 
 None of this reinterprets the inflated bbox of F1–F3. A polygon with
 vertices at -179.9 and +179.9 still describes a band through lng 0,
@@ -211,6 +228,24 @@ World-edge wrap (#342):
 - `overview::hostile::wrappable_longitude_overhang_is_in_range`
 - `overview_hostile::overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian`
 - `overview_hostile::zero_to_360_dataset_converts_and_tiles_at_wrapped_longitudes`
+
+Wrapped-feature report (#644):
+
+- `overview::hostile::bbox_wraps_flags_overhangs_past_the_world_edge`
+- `overview::hostile::wrapped_features_never_trip_the_all_lost_gate`
+- `overview::convert::tests::bbox_tally_counts_wrapped_features_apart_from_losses`
+- `overview::convert::tests::wrapped_note_names_rows_and_stays_quiet_at_zero`
+- `wrapped_log::wrapped_features_get_one_info_line_naming_the_row`
+
+`--bbox` across the wrap (#643):
+
+- `overview::convert::tests::bbox_query_tests_the_box_and_its_world_width_copies`
+- `overview::convert::tests::bbox_selects_0_360_features_from_the_western_hemisphere`
+- `overview::convert::tests::bbox_past_180_selects_features_stored_at_negative_longitudes`
+- `overview::convert::tests::bbox_wrap_applies_to_pseudo_mercator`
+- `overview::auto_zoom::tests::bbox_scopes_the_estimate_across_the_wrap`
+- `overview_hostile::bbox_on_the_far_side_of_the_antimeridian_selects_the_overhang`
+- `overview::stream::tests::shard_selection_reads_row_groups_one_wrap_away`
 
 Pre-existing (PR #186): `overview::hostile::antimeridian_and_pole_features_convert`
 (no-crash pin); `tile::tests::test_tiles_for_bbox_antimeridian_crossing`

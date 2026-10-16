@@ -111,6 +111,51 @@ fn wrappable_longitude_overhang_is_in_range() {
     ));
 }
 
+/// #644: a bbox past ±180° but within the wrap is reported as wrapped; one
+/// inside ±180° is not. `bbox_wraps` does not itself exclude out-of-range
+/// bboxes: `BboxTally::observe` asks it only of features still in range.
+#[test]
+fn bbox_wraps_flags_overhangs_past_the_world_edge() {
+    use super::convert::{bbox_out_of_crs_range, bbox_wraps};
+    use super::level::Crs;
+
+    for bbox in [
+        [178.563, 10.0, 180.4, 11.0],     // a5 dateline cell
+        [-180.751, -5.0, -175.853, -4.0], // its western twin
+        [0.0, -60.0, 360.0, 60.0],        // a 0..360 dataset's extent
+        [200.0, 10.0, 210.0, 12.0],       // wholly past +180°
+    ] {
+        assert!(bbox_wraps(&bbox, Crs::Epsg4326), "bbox {bbox:?} wraps");
+        assert!(!bbox_out_of_crs_range(&bbox, Crs::Epsg4326));
+    }
+    for bbox in [
+        [-180.0, -90.0, 180.0, 90.0], // the world's own edge
+        [10.0, 10.0, 20.0, 20.0],
+    ] {
+        assert!(
+            !bbox_wraps(&bbox, Crs::Epsg4326),
+            "bbox {bbox:?} is in range"
+        );
+    }
+    assert!(bbox_wraps(&[0.0, 0.0, 30_000_000.0, 0.0], Crs::Epsg3857));
+    assert!(!bbox_wraps(&[0.0, 0.0, 20_000_000.0, 0.0], Crs::Epsg3857));
+}
+
+/// #644: wrapped features are valid input. However many there are, they
+/// never join the #429 all-lost gate.
+#[test]
+fn wrapped_features_never_trip_the_all_lost_gate() {
+    use super::convert::{all_lost_error, BboxTallies};
+    use super::level::Crs;
+
+    let t = BboxTallies {
+        wrapped: 100,
+        ..Default::default()
+    };
+    assert_eq!(t.lost(), 0);
+    assert!(all_lost_error(&t, 100, Crs::Epsg4326).is_none());
+}
+
 /// Only a bbox ENTIRELY beyond the Mercator limit is untileable; one that
 /// straddles it still puts geometry in tiles and is merely clipped.
 #[test]

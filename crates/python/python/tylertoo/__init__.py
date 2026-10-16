@@ -88,6 +88,10 @@ class OverviewReport(TypedDict):
             past ±180° but within ±540° wraps and is not counted.
         unprojectable_features: Features beyond ±85.05° latitude, which
             Web Mercator cannot tile.
+        wrapped_features: Features past ±180° longitude but within
+            ±540°, drawn wrapped across the antimeridian. Expected for
+            0..360 data; otherwise the declared CRS may be wrong. Not a
+            loss.
         crs_assumed_wgs84: True when the input declared no CRS and
             lon/lat WGS84 was assumed. If the coordinates are not
             lon/lat degrees, the output is misplaced.
@@ -107,6 +111,7 @@ class OverviewReport(TypedDict):
     unprojectable_features: int
     crs_assumed_wgs84: bool
     out_of_range_exemplars: list[OutOfRangeExemplar]
+    wrapped_features: int
     duration_secs: float
     remote_fetch: RemoteFetch | None
 
@@ -298,7 +303,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
         read_batch_size: Rows per
             [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
-        bbox: Keep features that intersect this lon/lat box.
+        bbox: Keep features that intersect this lon/lat box, also one
+            ±360° wrap away, as for 0..360 data.
         filter: SQL-style predicate, such as `"confidence > 0.8"`.
         profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
             `"speed"` holds output in RAM, `"bounded"` uses disk, and

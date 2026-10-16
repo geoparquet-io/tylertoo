@@ -51,7 +51,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--min-zoom <MIN_ZOOM>` | Minimum (coarsest) Web Mercator zoom. Default: `0`. |
 | `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input. Ignored with `--gsd`. Default: `14`. |
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
-| `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box. Skips row groups outside the box. |
+| `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
 | `--max-tile-size <SIZE>` [alias: `tile-size-limit`] | Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap (default 500K, or no cap with `--verbatim`). A tile over the cap drops features until it fits. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
@@ -99,7 +99,7 @@ tylertoo overview [OPTIONS] [INPUT] [OUTPUT]
 | `--min-zoom <MIN_ZOOM>` | Minimum (coarsest) Web Mercator zoom. Default: `0`. |
 | `--max-zoom <MAX_ZOOM>` | Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a sample of the input. Ignored with `--gsd`. Default: `6`. |
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
-| `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box. Skips row groups outside the box. |
+| `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
 | `--cogp-compat` | Write the third-party `cogp` footer key for readers of that overview format. Partitioning mode only. |
 | `--report <PATH>` | Write the JSON conversion report to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |

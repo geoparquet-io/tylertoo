@@ -68,8 +68,8 @@ use crate::input_set::{ConvertSource, ReadPlan};
 use crate::world_coord::MAX_LATITUDE;
 
 use super::convert::{
-    bbox_to_crs_units, bboxes_intersect, detect_crs_from_kv, find_geometry_column,
-    validate_options, ConvertError, ConvertOptions, LevelPlan,
+    detect_crs_from_kv, find_geometry_column, validate_options, BboxQuery, ConvertError,
+    ConvertOptions, LevelPlan,
 };
 use super::filter::{parse_filter, BoundFilter};
 use super::level::{Crs, WEBMERC_CIRCUMFERENCE_M};
@@ -693,12 +693,12 @@ pub(crate) fn estimate_with(
     let bound_filter = filter
         .map(|src| Ok::<_, ConvertError>(BoundFilter::bind(&parse_filter(src)?, &schema, &[])?))
         .transpose()?;
-    let bbox_units = bbox.map(|b| bbox_to_crs_units(b, crs));
+    let bbox_query = bbox.map(|b| BboxQuery::new(b, crs));
 
     // The conversion's footer-statistics pruning (#102 bbox, #315 filter).
-    let bbox_sel = bbox_units
+    let bbox_sel = bbox_query
         .as_ref()
-        .map(|bb| source.select_row_groups(bb))
+        .map(|q| source.select_row_groups_any(q.boxes()))
         .transpose()?;
     let filter_sel = bound_filter
         .as_ref()
@@ -784,10 +784,7 @@ pub(crate) fn estimate_with(
                 }
             };
             for bb in bboxes.into_iter().flatten() {
-                if bbox_units
-                    .as_ref()
-                    .is_some_and(|u| !bboxes_intersect(&bb, u))
-                {
+                if bbox_query.as_ref().is_some_and(|q| !q.intersects(&bb)) {
                     continue;
                 }
                 let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
@@ -1458,6 +1455,32 @@ mod tests {
             sparse.chosen_zoom,
             whole.chosen_zoom
         );
+    }
+
+    /// #643: a western-hemisphere bbox scopes the estimate over a 0..360
+    /// dataset, as it scopes the convert, instead of finding no data.
+    #[test]
+    fn bbox_scopes_the_estimate_across_the_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms: Vec<Option<Geometry<f64>>> = point_grid(10, 0.1)
+            .into_iter()
+            .map(|g| {
+                g.map(|g| match g {
+                    Geometry::Point(p) => Geometry::Point(Point::new(p.x() + 200.0, p.y())),
+                    other => other,
+                })
+            })
+            .collect();
+        let source = write(&dir, "wrap.parquet", &geoms);
+        let wrapped = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            Some(&[-161.0, -1.0, -158.0, 2.0]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(wrapped.sampled_count, 100);
     }
 
     /// `--filter` scopes the estimate the same way (on the `id` column the

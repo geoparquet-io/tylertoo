@@ -108,9 +108,9 @@ use super::convert::{
     extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
     overture_road_ranking, record_coalesce_merged, record_level_outcome, resolve_read_workers,
     resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
-    validate_coalesce_schema, warn_plan_skipped_levels, BboxTallies, ClassRanking, CoalesceTable,
-    ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport,
-    PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
+    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
+    PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
@@ -819,27 +819,28 @@ fn build_writer_options_with_ceiling(
 /// re-derived over it.
 fn select_row_groups_streaming(
     source: &ConvertSource,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
     shard: Option<&crate::shard::TileRange>,
     crs: Crs,
 ) -> Result<Option<RowGroupSelection>, ConvertError> {
-    let bbox_selection: Option<RowGroupSelection> = match bbox_units {
-        Some(bb) => Some(source.select_row_groups(bb)?),
+    let bbox_selection: Option<RowGroupSelection> = match bbox_query {
+        Some(q) => Some(source.select_row_groups_any(q.boxes())?),
         None => None,
     };
     let filter_selection: Option<RowGroupSelection> = match filter {
         Some(f) => Some(source.select_row_groups_matching(f)?),
         None => None,
     };
+    // The shard's read bounds stop at ±180, but export draws a feature one
+    // world width away at its wrapped position (#342), so a 0..360 row group
+    // at lng 200 belongs to the shard covering -160: test the wrapped copies
+    // too, as `--bbox` does (#643).
     let shard_selection: Option<RowGroupSelection> = match shard {
         Some(range) => {
             let b = range.read_bounds();
-            let units = super::convert::bbox_to_crs_units(
-                &[b.lng_min, b.lat_min, b.lng_max, b.lat_max],
-                crs,
-            );
-            Some(source.select_row_groups(&units)?)
+            let query = BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs);
+            Some(source.select_row_groups_any(query.boxes())?)
         }
         None => None,
     };
@@ -2003,7 +2004,7 @@ struct Preflight {
     geom_field: Field,
     /// Schema indices of the accumulate columns (Q4).
     acc_cols: Vec<usize>,
-    bbox_units: Option<[f64; 4]>,
+    bbox_query: Option<BboxQuery>,
     bound_filter: Option<super::filter::BoundFilter>,
     selected_row_groups: Option<RowGroupSelection>,
     row_groups_total: usize,
@@ -2093,12 +2094,10 @@ fn convert_preflight_with_memory_limit(
     // tables stay aligned. Groups without stats are kept; the exact
     // per-feature filters in pass 1 guarantee identical output either way.
     let row_groups_total = source.num_row_groups_total()?;
-    let bbox_units = options
-        .bbox
-        .map(|b| super::convert::bbox_to_crs_units(&b, crs));
+    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
     let selected_row_groups = select_row_groups_streaming(
         source,
-        bbox_units.as_ref(),
+        bbox_query.as_ref(),
         bound_filter.as_ref(),
         options.shard.as_ref(),
         crs,
@@ -2146,7 +2145,7 @@ fn convert_preflight_with_memory_limit(
             selected_rows.max(0) as u64,
             memory_limit,
             skip_memory_preflight,
-            bbox_units.is_some() || bound_filter.is_some(),
+            bbox_query.is_some() || bound_filter.is_some(),
         )?
     } else {
         super::convert::Pass1MemoryReport::default()
@@ -2199,7 +2198,7 @@ fn convert_preflight_with_memory_limit(
         geom_idx,
         geom_field,
         acc_cols,
-        bbox_units,
+        bbox_query,
         bound_filter,
         selected_row_groups,
         row_groups_total,
@@ -2251,7 +2250,7 @@ struct Pass1Inputs<'a> {
     geom_idx: usize,
     acc_cols: &'a [usize],
     selected_row_groups: Option<&'a RowGroupSelection>,
-    bbox_units: Option<&'a [f64; 4]>,
+    bbox_query: Option<&'a BboxQuery>,
     bound_filter: Option<&'a super::filter::BoundFilter>,
     crs: Crs,
     /// Keep the coalesce chain tables the level counts are built from, for
@@ -2338,7 +2337,7 @@ fn run_front_half(
             geom_idx: preflight.geom_idx,
             acc_cols: &preflight.acc_cols,
             selected_row_groups: preflight.selected_row_groups.as_ref(),
-            bbox_units: preflight.bbox_units.as_ref(),
+            bbox_query: preflight.bbox_query.as_ref(),
             bound_filter: preflight.bound_filter.as_ref(),
             crs: preflight.crs,
             prebuild_chain_tables,
@@ -2499,7 +2498,7 @@ fn run_pass1_and_assign(
         options,
         inputs.acc_cols,
         inputs.selected_row_groups,
-        inputs.bbox_units,
+        inputs.bbox_query,
         inputs.bound_filter,
         inputs.crs,
     )?;
@@ -2582,6 +2581,7 @@ fn run_pass1_and_assign(
             antimeridian_suspect: tallies.antimeridian_suspect,
             out_of_range: tallies.out_of_range,
             unprojectable: tallies.unprojectable,
+            wrapped: tallies.wrapped,
         };
         let plan = ConvertPlan::from_winner_tables(
             &tables,
@@ -2772,6 +2772,9 @@ fn load_plan_state(
             // honestly but without the "e.g. lon ... (row ...)" detail the
             // original scan had.
             out_of_range_exemplars: Vec::new(),
+            wrapped: totals.wrapped,
+            // Same as the out-of-range exemplars: the count only (#644).
+            wrapped_exemplars: Vec::new(),
         },
         pass1_stage_secs: Pass1StageSecs::default(),
         // The load stands in for the scan; the assignment did not run at all.
@@ -2843,7 +2846,7 @@ pub(crate) fn convert_streaming_strategy(
         acc_cols,
         // Pass-1 inputs only: pass 2 reads the assignment's `min_levels`,
         // where a row the bbox or the filter dropped is already UNASSIGNED.
-        bbox_units: _,
+        bbox_query: _,
         bound_filter: _,
         selected_row_groups,
         row_groups_total,
@@ -3113,6 +3116,7 @@ fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
         out_of_range_features: inputs.tallies.out_of_range,
         unprojectable_features: inputs.tallies.unprojectable,
         out_of_range_exemplars: inputs.tallies.out_of_range_exemplars,
+        wrapped_features: inputs.tallies.wrapped,
         crs_assumed_wgs84: inputs.crs_assumed_wgs84,
         duration_secs: inputs.start.elapsed().as_secs_f64(),
         remote_fetch: super::convert::log_remote_fetch(inputs.source),
@@ -4449,7 +4453,7 @@ fn scan_chunk(
     gcol: &dyn Array,
     diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     crs: Crs,
     collect_lines: LineCollect,
     want_areas: bool,
@@ -4518,8 +4522,8 @@ fn scan_chunk(
         // produces no AssignFeature — its winner-table slot stays at the
         // UNASSIGNED sentinel, so pass 2 drops the row too. The row index
         // still advances (row-keyed tables stay aligned).
-        if let Some(bb) = bbox_units {
-            if !super::convert::bboxes_intersect(&fbbox, bb) {
+        if let Some(q) = bbox_query {
+            if !q.intersects(&fbbox) {
                 continue;
             }
         }
@@ -4580,7 +4584,7 @@ fn run_pass1(
     options: &ConvertOptions,
     acc_cols: &[usize],
     row_groups: Option<&RowGroupSelection>,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
     crs: Crs,
 ) -> Result<Pass1Output, ConvertError> {
@@ -4591,7 +4595,7 @@ fn run_pass1(
         options,
         acc_cols,
         row_groups,
-        bbox_units,
+        bbox_query,
         filter,
         crs,
         adaptive_pass1_chunk_rows(options.read_batch_size),
@@ -4907,7 +4911,7 @@ fn run_pass1_with_chunk_rows(
     options: &ConvertOptions,
     acc_cols: &[usize],
     row_groups: Option<&RowGroupSelection>,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
     crs: Crs,
     chunk_rows: usize,
@@ -4961,7 +4965,7 @@ fn run_pass1_with_chunk_rows(
     // (realloc = alloc + copy + free under mimalloc): 128 GiB at 1.58B rows.
     // `try_reserve_exact` so an absurd size falls back to growth instead of
     // aborting. Capacity only — output is unchanged.
-    if bbox_units.is_none() && filter.is_none() {
+    if bbox_query.is_none() && filter.is_none() {
         if let Ok(rows) = source.selected_row_count(row_groups) {
             let _ = features.try_reserve_exact(usize::try_from(rows.max(0)).unwrap_or(0));
         }
@@ -5066,7 +5070,7 @@ fn run_pass1_with_chunk_rows(
                             // index itself.
                             base + start,
                             mask_slice,
-                            bbox_units,
+                            bbox_query,
                             crs,
                             collect_lines,
                             want_areas,
@@ -6483,7 +6487,7 @@ mod tests {
             &pre.options,
             &pre.acc_cols,
             pre.selected_row_groups.as_ref(),
-            pre.bbox_units.as_ref(),
+            pre.bbox_query.as_ref(),
             pre.bound_filter.as_ref(),
             pre.crs,
             chunk_rows,
@@ -7557,7 +7561,7 @@ mod tests {
             &pre.options,
             &pre.acc_cols,
             pre.selected_row_groups.as_ref(),
-            pre.bbox_units.as_ref(),
+            pre.bbox_query.as_ref(),
             pre.bound_filter.as_ref(),
             pre.crs,
             CHUNK_ROWS,
@@ -8146,9 +8150,15 @@ mod tests {
 
         // bbox around (10,10): only row group 1 can intersect it.
         let bbox = [9.0, 9.0, 11.0, 11.0];
-        let sel = select_row_groups_streaming(&source, Some(&bbox), None, None, crs)
-            .unwrap()
-            .expect("a bbox always yields a selection");
+        let sel = select_row_groups_streaming(
+            &source,
+            Some(&BboxQuery::new(&bbox, crs)),
+            None,
+            None,
+            crs,
+        )
+        .unwrap()
+        .expect("a bbox always yields a selection");
         assert_eq!(
             sel.parts(),
             &[vec![1usize]],
@@ -8164,9 +8174,15 @@ mod tests {
         // bbox that misses every group: an empty selection reads nothing —
         // no batch is even delivered.
         let nowhere = [100.0, 100.0, 101.0, 101.0];
-        let sel = select_row_groups_streaming(&source, Some(&nowhere), None, None, crs)
-            .unwrap()
-            .unwrap();
+        let sel = select_row_groups_streaming(
+            &source,
+            Some(&BboxQuery::new(&nowhere, crs)),
+            None,
+            None,
+            crs,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sel.total_selected(), 0);
         let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
         assert!(
@@ -8210,9 +8226,15 @@ mod tests {
         // bbox ∩ filter: the bbox keeps group 2 only, the filter keeps 1 and
         // 2 — their intersection is group 2.
         let bbox = [19.0, 19.0, 21.0, 21.0];
-        let sel = select_row_groups_streaming(&source, Some(&bbox), Some(&filter), None, crs)
-            .unwrap()
-            .unwrap();
+        let sel = select_row_groups_streaming(
+            &source,
+            Some(&BboxQuery::new(&bbox, crs)),
+            Some(&filter),
+            None,
+            crs,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sel.parts(), &[vec![2usize]], "bbox ∩ filter");
         let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
         assert_eq!(ids, vec![2]);
@@ -8221,13 +8243,50 @@ mod tests {
         // Disjoint prunings: the bbox keeps group 0, which the filter
         // rejects — nothing survives and nothing is read.
         let bbox = [-1.0, -1.0, 1.0, 1.0];
-        let sel = select_row_groups_streaming(&source, Some(&bbox), Some(&filter), None, crs)
-            .unwrap()
-            .unwrap();
+        let sel = select_row_groups_streaming(
+            &source,
+            Some(&BboxQuery::new(&bbox, crs)),
+            Some(&filter),
+            None,
+            crs,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(sel.total_selected(), 0, "{:?}", sel.parts());
         let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
         assert!(ids.is_empty(), "{ids:?}");
         assert_eq!(batches, 0);
+    }
+
+    /// #643: export draws a 0..360 feature stored at lng 200 at lng -160
+    /// (#342), so the data shard whose tile range covers -160 must read its
+    /// row group. Comparing the shard's ±180 read bounds with the stored
+    /// coordinates dropped it from every shard.
+    #[test]
+    fn shard_selection_reads_row_groups_one_wrap_away() {
+        // Row groups: id 0 at lng 10, id 1 at lng 200 (drawn at -160), id 2
+        // at lng 350 (drawn at -10).
+        let coords = [(10.0, 10.0), (200.0, 10.0), (350.0, 10.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let crs = Crs::Epsg4326;
+
+        // z4 tile x=1 spans lng -157.5..-135; with its read margin the
+        // bounds stay west of -90, so only the wrapped group reaches it.
+        let id = crate::pmtiles_writer::tile_id(4, 1, 7);
+        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        let read = range.read_bounds();
+        assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
+
+        let sel = select_row_groups_streaming(&source, None, None, Some(&range), crs)
+            .unwrap()
+            .expect("a shard always yields a selection");
+        assert_eq!(
+            sel.parts(),
+            &[vec![1usize]],
+            "the shard reads the wrapped group"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -8540,7 +8599,7 @@ mod tests {
         field: &Field,
         gcol: &dyn Array,
         mask: Option<&[Option<bool>]>,
-        bbox_units: Option<&[f64; 4]>,
+        bbox_query: Option<&BboxQuery>,
         collect_lines: LineCollect,
         want_areas: bool,
     ) -> ChunkScan {
@@ -8575,8 +8634,8 @@ mod tests {
                 out.skipped_rows += 1;
                 continue;
             };
-            if let Some(bb) = bbox_units {
-                if !super::super::convert::bboxes_intersect(&fbbox, bb) {
+            if let Some(q) = bbox_query {
+                if !q.intersects(&fbbox) {
                     continue;
                 }
             }
@@ -8620,10 +8679,11 @@ mod tests {
         mask: &[Option<bool>],
         region: &[f64; 4],
     ) {
+        let region = BboxQuery::new(region, Crs::Epsg4326);
         for collect in [LineCollect::Off, LineCollect::Tally, LineCollect::Collect] {
             for want_areas in [false, true] {
                 for m in [None, Some(mask)] {
-                    for bb in [None, Some(region)] {
+                    for bb in [None, Some(&region)] {
                         let got = scan_chunk(
                             field,
                             gcol,

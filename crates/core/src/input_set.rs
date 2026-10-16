@@ -938,10 +938,19 @@ impl ConvertSource {
         &self,
         bbox_units: &[f64; 4],
     ) -> Result<RowGroupSelection, InputError> {
+        self.select_row_groups_any(std::slice::from_ref(bbox_units))
+    }
+
+    /// [`Self::select_row_groups`] keeping a row group that intersects any
+    /// of `boxes`: a `--bbox` and its copies one world width away (#643).
+    pub(crate) fn select_row_groups_any(
+        &self,
+        boxes: &[[f64; 4]],
+    ) -> Result<RowGroupSelection, InputError> {
         let per_part = self
             .metas()?
             .iter()
-            .map(|m| crate::overview::convert::select_input_row_groups(&m.parquet, bbox_units))
+            .map(|m| crate::overview::convert::select_input_row_groups_any(&m.parquet, boxes))
             .collect();
         Ok(RowGroupSelection(per_part))
     }

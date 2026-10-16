@@ -556,7 +556,10 @@ pub struct ConvertOptions {
     /// (closed-interval AABB test): input row groups whose GeoParquet 1.1
     /// bbox covering statistics don't intersect are skipped at the parquet
     /// footer level (their data pages are never read), and features of the
-    /// surviving row groups are filtered exactly by their own bbox. Inputs
+    /// surviving row groups are filtered exactly by their own bbox. A
+    /// feature also matches when its copy shifted ±360° intersects the
+    /// region, since export draws it there (#342, #643): `-170,0,-150,20`
+    /// selects a 0..360 feature stored at lng 200. Inputs
     /// without covering statistics degrade gracefully — every row group is
     /// read and only the exact per-feature filter applies, so the output is
     /// identical either way. Default `None` (full-extent conversion,
@@ -1204,6 +1207,15 @@ pub struct ConvertReport {
     /// of range, or when the run replayed a `--plan` artifact (whose saved
     /// totals do not carry exemplars).
     pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
+    /// Features whose bbox reaches past ±180° longitude (past the Web
+    /// Mercator world edge in x, for EPSG:3857) but stays within one wrap
+    /// (#644). The export draws them at their wrapped position (#342), so
+    /// they are not lost: a 0..360 dataset or a dateline cell counts here.
+    /// Reported because a file in a projected CRS but labeled lon/lat, with
+    /// `|x| ≤ 540`, would otherwise tile silently at the wrong place. One
+    /// aggregate `log::info!` names the first few rows. Informational only:
+    /// it never joins the #429 all-lost failure gate.
+    pub wrapped_features: usize,
     /// Whether the input declared no CRS at all (no `geo` metadata, or an
     /// explicit `crs: null`) and the reader *assumed* WGS84 lon/lat (#451).
     /// `false` whenever the CRS was declared — including by the GeoParquet
@@ -2441,14 +2453,14 @@ pub(crate) fn convert_to_overviews_strategy(
 /// Decode every geometry in `full` (row-aligned to the batch) and drop the rows
 /// that cannot participate in level assignment: a null/empty/non-finite
 /// geometry, or — under a regional extract (#102) — one whose bbox misses
-/// `bbox_units`. The batch and the geometry vec are filtered together so every
+/// `bbox_query`. The batch and the geometry vec are filtered together so every
 /// downstream index stays aligned. Returns the filtered batch and its surviving
 /// geometries.
 fn decode_and_filter_geometries(
     full: RecordBatch,
     geom_idx: usize,
     geom_field: &Field,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter_mask: Option<&[Option<bool>]>,
 ) -> Result<DecodedInput, ConvertError> {
     let geom_array: Arc<dyn GeoArrowArray> =
@@ -2471,7 +2483,7 @@ fn decode_and_filter_geometries(
             match g.as_ref().filter(|g| usable_geometry(g)) {
                 // Regional extract (#102): drop features whose bbox misses the
                 // requested region exactly, independent of row-group pruning.
-                Some(g) => bbox_units.is_none_or(|bb| bboxes_intersect(&geometry_bbox(g), bb)),
+                Some(g) => bbox_query.is_none_or(|q| q.intersects(&geometry_bbox(g))),
                 None => {
                     geom_skipped += 1;
                     false
@@ -3359,10 +3371,10 @@ fn load_input_table_with_limit(
     // compose by intersection. Groups without stats are kept; the exact
     // per-feature filters below guarantee identical output either way.
     let row_groups_total = builder.metadata().num_row_groups();
-    let bbox_units = options.bbox.map(|b| bbox_to_crs_units(&b, crs));
+    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
     let combined_sel = select_input_row_groups_combined(
         builder.metadata(),
-        bbox_units.as_ref(),
+        bbox_query.as_ref(),
         bound_filter.as_ref(),
     );
     let read_selection = combined_sel.clone();
@@ -3372,7 +3384,7 @@ fn load_input_table_with_limit(
     let (builder, row_groups_read) = match combined_sel {
         Some(sel) => {
             let n = sel.len();
-            let what = pruning_label(bbox_units.is_some(), bound_filter.is_some());
+            let what = pruning_label(bbox_query.is_some(), bound_filter.is_some());
             log::info!("{what} filter: reading {n}/{row_groups_total} input row groups");
             (builder.with_row_groups(sel), n)
         }
@@ -3405,7 +3417,7 @@ fn load_input_table_with_limit(
         full,
         geom_idx,
         &geom_field,
-        bbox_units.as_ref(),
+        bbox_query.as_ref(),
         filter_mask.as_deref(),
     )?;
     let row_locator = source.stream_row_locator(
@@ -3986,6 +3998,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         out_of_range_features: tallies.out_of_range,
         unprojectable_features: tallies.unprojectable,
         out_of_range_exemplars: tallies.out_of_range_exemplars,
+        wrapped_features: tallies.wrapped,
         crs_assumed_wgs84,
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
@@ -4271,6 +4284,47 @@ pub(super) fn bbox_to_crs_units(bbox: &[f64; 4], crs: Crs) -> [f64; 4] {
     }
 }
 
+/// A [`ConvertOptions::bbox`] query in the input's CRS units, with its copies
+/// shifted one world width west and east (#643).
+///
+/// Export draws a feature within ±540° at its wrapped position (#342), so a
+/// feature matches when it, or its copy shifted ±360° (±2 × `WEBMERC_HALF_M`
+/// for EPSG:3857), intersects the bbox. Shifting the query box instead of
+/// each feature is the same test. Export's wave read builds the same three
+/// boxes (`collect_wave`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BboxQuery {
+    /// The bbox as given, then shifted one world width west, then east.
+    boxes: [[f64; 4]; 3],
+}
+
+impl BboxQuery {
+    /// Build the query from a lon/lat-degree bbox for an input in `crs`.
+    pub(crate) fn new(bbox_deg: &[f64; 4], crs: Crs) -> Self {
+        let world = match crs {
+            Crs::Epsg4326 => 360.0,
+            // `lnglat_to_webmerc` is linear in x, so one world is exact.
+            Crs::Epsg3857 => 2.0 * WEBMERC_HALF_M,
+        };
+        let base = bbox_to_crs_units(bbox_deg, crs);
+        let shift = |dx: f64| [base[0] + dx, base[1], base[2] + dx, base[3]];
+        Self {
+            boxes: [base, shift(-world), shift(world)],
+        }
+    }
+
+    /// The three boxes to test, in CRS units.
+    pub(crate) fn boxes(&self) -> &[[f64; 4]; 3] {
+        &self.boxes
+    }
+
+    /// Whether a feature bbox, or its copy one world width away, intersects
+    /// the query ([`bboxes_intersect`] semantics).
+    pub(crate) fn intersects(&self, fbbox: &[f64; 4]) -> bool {
+        self.boxes.iter().any(|b| bboxes_intersect(fbbox, b))
+    }
+}
+
 /// Closed-interval AABB intersection of two `[xmin, ymin, xmax, ymax]` boxes
 /// (touching edges count as intersecting, matching
 /// [`crate::covering::RowGroupBounds::intersects`]).
@@ -4296,8 +4350,16 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
     }
 }
 
-/// Row groups of the input whose bbox statistics intersect `bbox_units`
-/// (`[xmin, ymin, xmax, ymax]` in the file's CRS units).
+/// Row groups of the input whose bbox statistics intersect any of `boxes`
+/// (`[xmin, ymin, xmax, ymax]` in the file's CRS units). A [`BboxQuery`]
+/// passes its bbox and the bbox shifted one world width each way (#643).
+///
+/// `boxes[0]` is the box as given; the rest are its wrapped copies. A row
+/// group whose statistics wrap the antimeridian (`xmin > xmax`, #497) is
+/// tested against `boxes[0]` alone: its two lobes are unbounded in x, so a
+/// copy shifted one world width always reaches one of them and would keep
+/// every such group, while the box as given already reaches a lobe whenever
+/// a copy reaches the lobe's true extent.
 ///
 /// Statistics-only: operates purely on the parsed parquet footer, tiered
 /// (#497) between GeoParquet 1.1 covering-column stats and GeoParquet 2.0
@@ -4309,7 +4371,7 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 ///
 /// The session CRS is re-derived from `metadata` itself
 /// (footer-metadata-only, no I/O — the same detection that already
-/// produced `bbox_units` via [`bbox_to_crs_units`]) so tier 2 can refuse to
+/// produced `boxes` via [`bbox_to_crs_units`]) so tier 2 can refuse to
 /// prune when the geometry column's declared CRS doesn't agree with it
 /// (never guess). An undetectable CRS here (shouldn't happen — the pipeline
 /// already errored out earlier if so) just skips tier 2, same as any other
@@ -4320,28 +4382,47 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// [`find_geometry_column`]) and threaded into tier 2, so a file with more
 /// than one geometry column can never be pruned on an envelope the reader
 /// will not read (#518).
-pub(crate) fn select_input_row_groups(
+pub(crate) fn select_input_row_groups_any(
     metadata: &parquet::file::metadata::ParquetMetaData,
-    bbox_units: &[f64; 4],
+    boxes: &[[f64; 4]],
 ) -> Vec<usize> {
     let bounds = input_row_group_bounds(metadata);
-    let filter = crate::tile::TileBounds {
-        lng_min: bbox_units[0],
-        lat_min: bbox_units[1],
-        lng_max: bbox_units[2],
-        lat_max: bbox_units[3],
-    };
+    let filters: Vec<crate::tile::TileBounds> = boxes
+        .iter()
+        .map(|b| crate::tile::TileBounds {
+            lng_min: b[0],
+            lat_min: b[1],
+            lng_max: b[2],
+            lat_max: b[3],
+        })
+        .collect();
     (0..metadata.num_row_groups())
         .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
-            Some(b) => b.intersects(&filter),
+            Some(b) => {
+                let tested = if b.xmin > b.xmax {
+                    &filters[..filters.len().min(1)]
+                } else {
+                    &filters[..]
+                };
+                tested.iter().any(|f| b.intersects(f))
+            }
             None => true, // no stats — must read to stay correct
         })
         .collect()
 }
 
+/// [`select_input_row_groups_any`] for a single box.
+#[cfg(test)]
+pub(crate) fn select_input_row_groups(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    bbox_units: &[f64; 4],
+) -> Vec<usize> {
+    select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
+}
+
 /// Per-row-group bboxes for one part, from footer metadata only.
 ///
-/// The extraction half of [`select_input_row_groups`], split out because the
+/// The extraction half of [`select_input_row_groups_any`], split out because the
 /// shard planner (#498) wants the same bboxes for a different purpose: it
 /// spreads each group's rows over the pivot tiles the bbox covers to balance
 /// the cut. Both callers therefore see exactly the same view of the input,
@@ -4395,10 +4476,11 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
 /// (#315). `None` when neither pruning is active (read everything).
 fn select_input_row_groups_combined(
     metadata: &parquet::file::metadata::ParquetMetaData,
-    bbox_units: Option<&[f64; 4]>,
+    bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
 ) -> Option<Vec<usize>> {
-    let bbox_sel: Option<Vec<usize>> = bbox_units.map(|bb| select_input_row_groups(metadata, bb));
+    let bbox_sel: Option<Vec<usize>> =
+        bbox_query.map(|q| select_input_row_groups_any(metadata, q.boxes()));
     let filter_sel: Option<Vec<usize>> = filter.map(|f| f.select_row_groups(metadata));
     match (bbox_sel, filter_sel) {
         (Some(a), Some(b)) => Some(a.into_iter().filter(|i| b.contains(i)).collect()),
@@ -4536,6 +4618,61 @@ pub(super) fn bbox_out_of_crs_range(bbox: &[f64; 4], crs: Crs) -> bool {
     let r = crs_coordinate_range(crs);
     let max_x = wrapped_max_x(&r);
     bbox[0] < -max_x || bbox[2] > max_x || bbox[1] < -r.max_y || bbox[3] > r.max_y
+}
+
+/// Whether a feature bbox reaches past ±180° longitude (the Web Mercator
+/// world edge in x, for EPSG:3857), so the export draws it, or part of it,
+/// at its wrapped position (#342, #644).
+///
+/// Wrapped data is valid input (a 0..360 dataset, a dateline cell at
+/// `x: 178 … 181`), but so is nothing else that looks like it: a file in a
+/// projected CRS labeled lon/lat, with `|x| ≤ 540`, lands here too. The
+/// convert reports it rather than gating on it. Only meaningful for a bbox
+/// [`bbox_out_of_crs_range`] passes; [`BboxTally::observe`] asks it of
+/// nothing else.
+pub(super) fn bbox_wraps(bbox: &[f64; 4], crs: Crs) -> bool {
+    let r = crs_coordinate_range(crs);
+    bbox[0] < -r.max_x || bbox[2] > r.max_x
+}
+
+/// The coordinate of a [`bbox_wraps`] bbox that lies past the world edge,
+/// by the larger overhang when it reaches past both (#644).
+fn wrapped_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
+    let r = crs_coordinate_range(crs);
+    let axis = match crs {
+        Crs::Epsg4326 => "lon",
+        Crs::Epsg3857 => "x",
+    };
+    let (west, east) = ((-r.max_x) - bbox[0], bbox[2] - r.max_x);
+    (axis, if east >= west { bbox[2] } else { bbox[0] })
+}
+
+/// #644 message (pure, so it is unit-testable without capturing logs): the
+/// one aggregate info line for `count` of `total` features drawn wrapped
+/// across the antimeridian, or `None` to stay quiet. `exemplars` names the
+/// first few rows, in the out-of-range warning's format.
+pub(super) fn wrapped_note(
+    count: usize,
+    total: usize,
+    crs: Crs,
+    exemplars: &[OutOfRangeExemplar],
+) -> Option<String> {
+    if count == 0 || total == 0 {
+        return None;
+    }
+    let edge = match crs {
+        Crs::Epsg4326 => "±180° longitude",
+        Crs::Epsg3857 => "the ±20037508.34 m world edge in x",
+    };
+    let pct = count as f64 / total as f64 * 100.0;
+    let exemplar = exemplar_note(exemplars, ExemplarEdge::Wrap);
+    let stop = if exemplar.is_empty() { "" } else { "." };
+    Some(format!(
+        "{count} of {total} feature(s) ({pct:.1}%) reach past {edge} and are drawn \
+         wrapped across the antimeridian.{exemplar}{stop} That is expected for 0..360 data \
+         and dateline cells; otherwise check that the coordinates really are the \
+         declared CRS."
+    ))
 }
 
 /// Whether a bbox is legal for its CRS yet lies wholly outside the Web
@@ -4679,13 +4816,45 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
 /// CLI's `tiles` summary line, so both name where the loss came from instead
 /// of only how much was lost.
 pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
+    exemplar_note(exemplars, ExemplarEdge::OutOfRange)
+}
+
+/// The range edge an exemplar's coordinate lies past, which sets where
+/// [`exemplar_value_text`] must not round it back to.
+#[derive(Debug, Clone, Copy)]
+enum ExemplarEdge {
+    /// [`bbox_out_of_crs_range`]'s edges: x and longitude carry the export's
+    /// one-world wrap (#342).
+    OutOfRange,
+    /// [`bbox_wraps`]'s edge: the world's own ±180° (#644).
+    Wrap,
+}
+
+impl ExemplarEdge {
+    /// The `|value|` an exemplar on `axis` lies beyond.
+    fn limit(self, axis: &str) -> f64 {
+        let wrap = match self {
+            Self::OutOfRange => 3.0,
+            Self::Wrap => 1.0,
+        };
+        match axis {
+            "lon" => wrap * 180.0,
+            "lat" => 90.0,
+            "x" => wrap * WEBMERC_HALF_M,
+            _ => WEBMERC_HALF_M,
+        }
+    }
+}
+
+/// [`out_of_range_exemplar_note`] for exemplars past `edge`.
+fn exemplar_note(exemplars: &[OutOfRangeExemplar], edge: ExemplarEdge) -> String {
     if exemplars.is_empty() {
         return String::new();
     }
     let parts: Vec<String> = exemplars
         .iter()
         .map(|e| {
-            let value = exemplar_value_text(e.axis, e.value);
+            let value = exemplar_value_text(e.value, edge.limit(e.axis));
             match e.part {
                 None => format!("{} {value} (row {})", e.axis, e.row),
                 Some(p) => format!("{} {value} (part {p}, row {})", e.axis, e.row),
@@ -4696,17 +4865,10 @@ pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
 }
 
 /// An exemplar's coordinate as text: three decimals, unless rounding to
-/// three decimals would land it back on the range edge (540.0000001 as
-/// "540.000"), in which case the shortest exact form, which always shows
-/// the excess. The edges are [`bbox_out_of_crs_range`]'s: x and longitude
-/// carry the export's one-world wrap (#342).
-fn exemplar_value_text(axis: &str, value: f64) -> String {
-    let limit = match axis {
-        "lon" => 3.0 * 180.0,
-        "lat" => 90.0,
-        "x" => 3.0 * WEBMERC_HALF_M,
-        _ => WEBMERC_HALF_M,
-    };
+/// three decimals would land it back on the range edge `limit` (540.0000001
+/// as "540.000"), in which case the shortest exact form, which always shows
+/// the excess.
+fn exemplar_value_text(value: f64, limit: f64) -> String {
     let short = format!("{value:.3}");
     match short.parse::<f64>() {
         Ok(rounded) if rounded.abs() > limit => short,
@@ -4781,6 +4943,13 @@ pub(super) struct BboxTallies {
     /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] out-of-range features' rows
     /// and offending coordinates (#553).
     pub out_of_range_exemplars: Vec<OutOfRangeExemplar>,
+    /// Features past ±180° longitude but within one wrap, which the export
+    /// draws wrapped (#644). Disjoint from the losses and outside
+    /// [`Self::lost`]: wrapped data is valid input.
+    pub wrapped: usize,
+    /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features' rows and
+    /// the coordinate past the edge.
+    pub wrapped_exemplars: Vec<OutOfRangeExemplar>,
 }
 
 impl BboxTallies {
@@ -4865,6 +5034,12 @@ pub(super) struct BboxTally {
     /// at the end of the scan — the row locator is not available (nor
     /// thread-safe to call) inside a scan task.
     exemplars: Vec<(usize, &'static str, f64)>,
+    /// Features past ±180° but within the wrap (#644).
+    wrapped: usize,
+    /// `(feature index, axis, value)` for the first
+    /// [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features, resolved like
+    /// `exemplars`.
+    wrapped_exemplars: Vec<(usize, &'static str, f64)>,
 }
 
 impl BboxTally {
@@ -4884,6 +5059,12 @@ impl BboxTally {
             }
         } else if bbox_unprojectable(bbox, crs) {
             self.unprojectable += 1;
+        } else if bbox_wraps(bbox, crs) {
+            self.wrapped += 1;
+            if self.wrapped_exemplars.len() < OUT_OF_RANGE_EXEMPLAR_CAP {
+                let (axis, value) = wrapped_coordinate(bbox, crs);
+                self.wrapped_exemplars.push((index, axis, value));
+            }
         }
     }
 
@@ -4897,11 +5078,18 @@ impl BboxTally {
         self.out_of_range += other.out_of_range;
         self.unprojectable += other.unprojectable;
         self.max_abs_out_of_range = self.max_abs_out_of_range.max(other.max_abs_out_of_range);
-        for &(index, axis, value) in &other.exemplars {
-            if self.exemplars.len() >= OUT_OF_RANGE_EXEMPLAR_CAP {
-                break;
-            }
-            self.exemplars.push((index + index_base, axis, value));
+        self.wrapped += other.wrapped;
+        for (mine, theirs) in [
+            (&mut self.exemplars, &other.exemplars),
+            (&mut self.wrapped_exemplars, &other.wrapped_exemplars),
+        ] {
+            let room = OUT_OF_RANGE_EXEMPLAR_CAP.saturating_sub(mine.len());
+            mine.extend(
+                theirs
+                    .iter()
+                    .take(room)
+                    .map(|&(index, axis, value)| (index + index_base, axis, value)),
+            );
         }
     }
 
@@ -4910,7 +5098,9 @@ impl BboxTally {
     ///
     /// `locate` turns a feature's index (its position in the pruned read
     /// stream) into the `(part, file row)` an exemplar names (#553); it is
-    /// called at most [`OUT_OF_RANGE_EXEMPLAR_CAP`] times.
+    /// called at most twice [`OUT_OF_RANGE_EXEMPLAR_CAP`] times (out-of-range
+    /// and wrapped exemplars). Wrapped features (#644) get one `log::info!`
+    /// and never count toward the all-lost failure.
     ///
     /// DIVERGENCE FROM THE TICKET'S WORDING: the all-lost check fires at the
     /// end of pass 1 rather than "at the end of convert". Pass 1 already knows
@@ -4922,13 +5112,8 @@ impl BboxTally {
         crs: Crs,
         locate: &dyn Fn(usize) -> (Option<usize>, usize),
     ) -> Result<BboxTallies, ConvertError> {
-        let t = BboxTallies {
-            antimeridian_suspect: self.antimeridian_suspect,
-            out_of_range: self.out_of_range,
-            unprojectable: self.unprojectable,
-            max_abs_out_of_range: self.max_abs_out_of_range,
-            out_of_range_exemplars: self
-                .exemplars
+        let resolve = |exemplars: Vec<(usize, &'static str, f64)>| -> Vec<OutOfRangeExemplar> {
+            exemplars
                 .into_iter()
                 .map(|(index, axis, value)| {
                     let (part, row) = locate(index);
@@ -4939,7 +5124,16 @@ impl BboxTally {
                         value,
                     }
                 })
-                .collect(),
+                .collect()
+        };
+        let t = BboxTallies {
+            antimeridian_suspect: self.antimeridian_suspect,
+            out_of_range: self.out_of_range,
+            unprojectable: self.unprojectable,
+            max_abs_out_of_range: self.max_abs_out_of_range,
+            out_of_range_exemplars: resolve(self.exemplars),
+            wrapped: self.wrapped,
+            wrapped_exemplars: resolve(self.wrapped_exemplars),
         };
         warn_antimeridian_suspects(t.antimeridian_suspect);
         if let Some(msg) = out_of_range_warning(
@@ -4953,6 +5147,9 @@ impl BboxTally {
         }
         if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
             log::warn!("{msg}");
+        }
+        if let Some(msg) = wrapped_note(t.wrapped, total, crs, &t.wrapped_exemplars) {
+            log::info!("{msg}");
         }
         match all_lost_error(&t, total, crs) {
             Some(e) => Err(e),
@@ -7468,6 +7665,84 @@ mod tests {
             out_of_range_exemplar_note(&[ex("x", 70_000_000.0)]),
             " e.g. x 70000000.000 (row 7)"
         );
+    }
+
+    /// #644: [`BboxTally`] counts the features past ±180° that the export
+    /// wraps, apart from the losses, and names the first few in file order
+    /// across merged chunks.
+    #[test]
+    fn bbox_tally_counts_wrapped_features_apart_from_losses() {
+        let mut features = vec![point_feature(0, 10.0, 10.0)]; // in range
+        for row in 1..=4usize {
+            features.push(point_feature(row, 180.0 + row as f64, 10.0));
+        }
+        features.push(point_feature(5, -181.5, 10.0)); // west overhang
+        features.push(point_feature(6, 600.0, 10.0)); // lost, not wrapped
+        let mut tally = BboxTally::default();
+        for f in &features {
+            tally.observe(&f.bbox, Crs::Epsg4326, f.index);
+        }
+        let t = tally
+            .clone()
+            .finish(features.len(), Crs::Epsg4326, &|i| (None, i))
+            .expect("not all lost");
+        assert_eq!((t.wrapped, t.out_of_range), (5, 1));
+        let named: Vec<(usize, &str, f64)> = t
+            .wrapped_exemplars
+            .iter()
+            .map(|e| (e.row, e.axis, e.value))
+            .collect();
+        assert_eq!(
+            named,
+            vec![(1, "lon", 181.0), (2, "lon", 182.0), (3, "lon", 183.0)]
+        );
+
+        // Merged chunks keep file order and the cap.
+        let mut first = BboxTally::default();
+        first.observe(&[-181.5, 0.0, -181.5, 0.0], Crs::Epsg4326, 0);
+        let mut merged = BboxTally::default();
+        merged.merge(&first, 0);
+        merged.merge(&tally, 10);
+        let t = merged
+            .finish(17, Crs::Epsg4326, &|i| (None, i))
+            .expect("not all lost");
+        assert_eq!(t.wrapped, 6);
+        let rows: Vec<usize> = t.wrapped_exemplars.iter().map(|e| e.row).collect();
+        assert_eq!(rows, vec![0, 11, 12]);
+        assert_eq!(t.wrapped_exemplars[0].value, -181.5, "the west edge");
+    }
+
+    /// #644: the wrapped note is quiet at zero, and otherwise names the count,
+    /// the edge, and the first rows, with the same exemplar format as the
+    /// out-of-range warning.
+    #[test]
+    fn wrapped_note_names_rows_and_stays_quiet_at_zero() {
+        let ex = |part, row, axis: &'static str, value| OutOfRangeExemplar {
+            part,
+            row,
+            axis,
+            value,
+        };
+        assert_eq!(wrapped_note(0, 10, Crs::Epsg4326, &[]), None);
+
+        let msg = wrapped_note(1, 10, Crs::Epsg4326, &[ex(None, 7, "lon", 190.25)])
+            .expect("a wrapped feature is noted");
+        assert!(msg.contains("1 of 10 feature(s)"), "{msg}");
+        assert!(msg.contains("±180° longitude"), "{msg}");
+        assert!(msg.contains("e.g. lon 190.250 (row 7). That"), "{msg}");
+        let bare = wrapped_note(1, 10, Crs::Epsg4326, &[]).unwrap();
+        assert!(bare.contains("antimeridian. That"), "{bare}");
+
+        let msg = wrapped_note(2, 4, Crs::Epsg4326, &[ex(Some(1), 3, "lon", -180.5)]).unwrap();
+        assert!(msg.contains("lon -180.500 (part 1, row 3)"), "{msg}");
+
+        // Just past the edge prints in full, never as "180.000".
+        let msg = wrapped_note(1, 1, Crs::Epsg4326, &[ex(None, 0, "lon", 180.000_000_1)]).unwrap();
+        assert!(msg.contains("lon 180.0000001 (row 0)"), "{msg}");
+
+        let msg = wrapped_note(1, 1, Crs::Epsg3857, &[ex(None, 0, "x", 30_000_000.0)]).unwrap();
+        assert!(msg.contains("±20037508.34 m"), "{msg}");
+        assert!(msg.contains("x 30000000.000 (row 0)"), "{msg}");
     }
 
     /// The filter path reads the same columns but must NOT lose ±inf: it is a
@@ -14173,6 +14448,144 @@ mod tests {
             let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
             assert_eq!(ids, vec![1], "streaming={streaming}");
         }
+    }
+
+    /// #643: export draws a feature stored at lng 200 at lng -160 (#342), so
+    /// a western-hemisphere `--bbox` must select it from a 0..360 dataset, in
+    /// the row-group prune and the per-feature filter of both engines.
+    #[test]
+    fn bbox_selects_0_360_features_from_the_western_hemisphere() {
+        let coords = vec![(190.0, 10.0), (200.0, 20.0), (350.0, 30.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let bbox = [-165.0, 15.0, -155.0, 25.0];
+
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                bbox: Some(bbox),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(
+                report.row_groups_read, 1,
+                "streaming={streaming}: the prune must keep exactly the wrapped group"
+            );
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            // Post-hoc: the feature shifted -360° lies in the bbox.
+            let posthoc: Vec<i64> = (0..coords.len() as i64)
+                .filter(|&id| {
+                    let (x, y) = coords[id as usize];
+                    (bbox[0]..=bbox[2]).contains(&(x - 360.0)) && (bbox[1]..=bbox[3]).contains(&y)
+                })
+                .collect();
+            assert_eq!(posthoc, vec![1]);
+            assert_eq!(ids, posthoc, "streaming={streaming}");
+        }
+    }
+
+    /// #643, the other direction: a bbox written past +180° selects a feature
+    /// stored just west of the antimeridian.
+    #[test]
+    fn bbox_past_180_selects_features_stored_at_negative_longitudes() {
+        let coords = vec![(-175.0, 0.0), (10.0, 0.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                bbox: Some([170.0, -1.0, 190.0, 1.0]),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![0], "streaming={streaming}");
+        }
+    }
+
+    /// #643 in EPSG:3857: the same wrap, one world width (2 × 20037508.34 m)
+    /// at a time. The bbox is in degrees and meets metre statistics.
+    #[test]
+    fn bbox_wrap_applies_to_pseudo_mercator() {
+        let metres: Vec<(f64, f64)> = [(200.0, 10.0), (300.0, 10.0)]
+            .iter()
+            .map(|&(lon, lat)| lnglat_to_webmerc(lon, lat))
+            .collect();
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(projjson),
+            None,
+        );
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                // Around lng -160 = 200 - 360.
+                bbox: Some([-161.0, 9.0, -159.0, 11.0]),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![0], "streaming={streaming}");
+        }
+    }
+
+    #[test]
+    fn bbox_query_tests_the_box_and_its_world_width_copies() {
+        let q = BboxQuery::new(&[-165.0, 15.0, -155.0, 25.0], Crs::Epsg4326);
+        assert_eq!(
+            q.boxes(),
+            &[
+                [-165.0, 15.0, -155.0, 25.0],
+                [-525.0, 15.0, -515.0, 25.0],
+                [195.0, 15.0, 205.0, 25.0],
+            ]
+        );
+        assert!(q.intersects(&[-160.0, 20.0, -160.0, 20.0]), "as stored");
+        assert!(q.intersects(&[200.0, 20.0, 200.0, 20.0]), "one wrap east");
+        assert!(q.intersects(&[-520.0, 20.0, -520.0, 20.0]), "one wrap west");
+        assert!(!q.intersects(&[-160.0, 30.0, -160.0, 30.0]), "latitude");
+        assert!(!q.intersects(&[0.0, 20.0, 0.0, 20.0]), "elsewhere");
+
+        let q = BboxQuery::new(&[-161.0, 9.0, -159.0, 11.0], Crs::Epsg3857);
+        let [base, west, east] = *q.boxes();
+        let world = 2.0 * WEBMERC_HALF_M;
+        assert_eq!(
+            base,
+            bbox_to_crs_units(&[-161.0, 9.0, -159.0, 11.0], Crs::Epsg3857)
+        );
+        assert_eq!(west, [base[0] - world, base[1], base[2] - world, base[3]]);
+        assert_eq!(east, [base[0] + world, base[1], base[2] + world, base[3]]);
+        let (x, y) = lnglat_to_webmerc(200.0, 10.0);
+        assert!(q.intersects(&[x, y, x, y]));
     }
 
     /// #553 review: an out-of-range exemplar's `row` is the row in the
