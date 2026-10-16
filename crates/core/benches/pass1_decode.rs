@@ -4,10 +4,13 @@
 //! columnar-I/O contract: read a GeoParquet file's record batches with a
 //! plain `ParquetRecordBatchReaderBuilder`, then for each batch's geometry
 //! column call [`geoarrow::array::from_arrow_array`] +
-//! [`tylertoo_core::batch_processor::extract_geometries_from_array`] — the
-//! exact pair `overview::stream::scan_chunk` (the production pass-1 path)
-//! wraps per chunk. Batch decode is the thing this bench isolates; the file
-//! open/schema resolution happens once outside the timed closure.
+//! [`tylertoo_core::batch_processor::extract_geometries_from_array`]. Until
+//! #650 that was the pair `overview::stream::scan_chunk` (the production
+//! pass-1 path) wrapped per chunk; pass 1 now scans geometry in place and
+//! converts only the rows it keeps, so this bench times the full conversion
+//! that the in-memory path and pass 2 still pay. Batch decode is the thing
+//! this bench isolates; the file open/schema resolution happens once outside
+//! the timed closure.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `pass1_decode`
 
@@ -56,8 +59,8 @@ fn load_batches(path: &Path) -> Option<(SchemaRef, Field, usize, Vec<RecordBatch
     Some((schema, gfield, gidx, batches))
 }
 
-/// Decode every batch's geometry column once, matching `scan_chunk`'s
-/// `from_arrow_array` + `extract_geometries_from_array` pair.
+/// Decode every batch's geometry column once: `from_arrow_array` +
+/// `extract_geometries_from_array`.
 fn decode_all(gfield: &Field, gidx: usize, batches: &[RecordBatch]) -> usize {
     let mut total = 0usize;
     for batch in batches {

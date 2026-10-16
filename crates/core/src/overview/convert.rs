@@ -41,6 +41,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
 use geo::{Area, BoundingRect, Geometry};
+use geo_traits::to_geo::ToGeoGeometry;
+use geo_traits::{
+    CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType as TraitGeometryType,
+    LineStringTrait, MultiLineStringTrait, MultiPointTrait, MultiPolygonTrait, PointTrait,
+    PolygonTrait,
+};
 use geoarrow::array::{from_arrow_array, GeometryBuilder};
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
@@ -5313,24 +5319,24 @@ impl FeatureScan {
     /// (i.e. a coord `bounding_rect` would include: points, line vertices,
     /// polygon *exterior* rings).
     #[inline]
-    fn note_bbox(&mut self, c: geo::Coord<f64>) {
+    fn note_bbox(&mut self, x: f64, y: f64) {
         self.any_coord = true;
-        if !c.x.is_finite() || !c.y.is_finite() {
+        if !x.is_finite() || !y.is_finite() {
             self.finite = false;
             return;
         }
         self.bbox_seen = true;
-        if c.x < self.min_x {
-            self.min_x = c.x;
+        if x < self.min_x {
+            self.min_x = x;
         }
-        if c.y < self.min_y {
-            self.min_y = c.y;
+        if y < self.min_y {
+            self.min_y = y;
         }
-        if c.x > self.max_x {
-            self.max_x = c.x;
+        if x > self.max_x {
+            self.max_x = x;
         }
-        if c.y > self.max_y {
-            self.max_y = c.y;
+        if y > self.max_y {
+            self.max_y = y;
         }
     }
 
@@ -5338,9 +5344,9 @@ impl FeatureScan {
     /// polygon *interior* rings, which `bounding_rect` ignores but
     /// `usable_geometry` (via `coords_iter`) includes.
     #[inline]
-    fn note_finite_only(&mut self, c: geo::Coord<f64>) {
+    fn note_finite_only(&mut self, x: f64, y: f64) {
         self.any_coord = true;
-        if !c.x.is_finite() || !c.y.is_finite() {
+        if !x.is_finite() || !y.is_finite() {
             self.finite = false;
         }
     }
@@ -5363,11 +5369,11 @@ fn scan_geometry_into(g: &Geometry<f64>, scan: &mut FeatureScan) {
     use geo::coords_iter::CoordsIter;
     let scan_polygon = |poly: &geo::Polygon<f64>, scan: &mut FeatureScan| {
         for c in poly.exterior().coords_iter() {
-            scan.note_bbox(c);
+            scan.note_bbox(c.x, c.y);
         }
         for ring in poly.interiors() {
             for c in ring.coords_iter() {
-                scan.note_finite_only(c);
+                scan.note_finite_only(c.x, c.y);
             }
         }
     };
@@ -5386,7 +5392,7 @@ fn scan_geometry_into(g: &Geometry<f64>, scan: &mut FeatureScan) {
         // Every other kind's `bounding_rect` set == its `coords_iter` set.
         other => {
             for c in other.coords_iter() {
-                scan.note_bbox(c);
+                scan.note_bbox(c.x, c.y);
             }
         }
     }
@@ -5402,13 +5408,114 @@ fn scan_geometry_into(g: &Geometry<f64>, scan: &mut FeatureScan) {
 /// decoded geometry once instead of twice (`usable_geometry` iterated every
 /// coord, then `bounding_rect` iterated the exterior again). The
 /// `scan_feature_matches_components` proptest pins the equivalence.
-pub(super) fn scan_feature(g: &Geometry<f64>) -> Option<(FeatureKind, [f64; 4])> {
+pub(crate) fn scan_feature(g: &Geometry<f64>) -> Option<(FeatureKind, [f64; 4])> {
     let mut scan = FeatureScan::new();
     scan_geometry_into(g, &mut scan);
     if !scan.finite || !scan.any_coord {
         return None;
     }
     Some((feature_kind(g), scan.bbox()))
+}
+
+/// [`scan_feature`] over any `geo_traits` geometry, read where it lies (#650):
+/// pass 1 runs it on the GeoArrow scalar, so a WKB row is scanned straight
+/// from its bytes instead of being copied into an owned `geo::Geometry` first.
+///
+/// It returns, bit for bit, what `g.try_to_geometry().and_then(|g|
+/// scan_feature(&g))` returns. Three things keep that true:
+///
+/// - `try_to_geometry` gives `None` when an empty point sits anywhere in the
+///   geometry: on its own, in a MultiPoint, or in a GeometryCollection. The
+///   walk returns `None` at the same points.
+/// - Coordinates are visited in the order the converted geometry would hold
+///   them, and [`FeatureScan`] compares strictly, so the `-0.0`/`+0.0` that
+///   min and max keep is the same.
+/// - `Polygon::new` closes each ring by appending a copy of its first
+///   coordinate. A copy cannot move a strict min or max or change
+///   finiteness, so the walk does not visit it.
+///
+/// `Rect`, `Triangle` and `Line` go through the conversion: `Rect::new`
+/// reorders its corners, and no GeoArrow array that pass 1 reads produces
+/// any of the three.
+pub(crate) fn scan_feature_traits<G: GeometryTrait<T = f64>>(
+    g: &G,
+) -> Option<(FeatureKind, [f64; 4])> {
+    // `feature_kind`'s mapping, on the top-level type.
+    let kind = match g.as_type() {
+        TraitGeometryType::Point(_) | TraitGeometryType::MultiPoint(_) => FeatureKind::Point,
+        TraitGeometryType::LineString(_) | TraitGeometryType::MultiLineString(_) => {
+            FeatureKind::Line
+        }
+        TraitGeometryType::Polygon(_)
+        | TraitGeometryType::MultiPolygon(_)
+        | TraitGeometryType::GeometryCollection(_) => FeatureKind::Polygon,
+        TraitGeometryType::Rect(_)
+        | TraitGeometryType::Triangle(_)
+        | TraitGeometryType::Line(_) => {
+            return g.try_to_geometry().and_then(|g| scan_feature(&g));
+        }
+    };
+    let mut scan = FeatureScan::new();
+    scan_traits_into(g, &mut scan)?;
+    if !scan.finite || !scan.any_coord {
+        return None;
+    }
+    Some((kind, scan.bbox()))
+}
+
+/// [`scan_geometry_into`] over `geo_traits`. `None` means an empty point was
+/// found, so `try_to_geometry` would have given no geometry at all.
+fn scan_traits_into<G: GeometryTrait<T = f64>>(g: &G, scan: &mut FeatureScan) -> Option<()> {
+    fn line<L: LineStringTrait<T = f64>>(ls: &L, scan: &mut FeatureScan) {
+        for c in ls.coords() {
+            scan.note_bbox(c.x(), c.y());
+        }
+    }
+    fn polygon<P: PolygonTrait<T = f64>>(p: &P, scan: &mut FeatureScan) {
+        if let Some(ext) = p.exterior() {
+            line(&ext, scan);
+        }
+        for ring in p.interiors() {
+            for c in ring.coords() {
+                scan.note_finite_only(c.x(), c.y());
+            }
+        }
+    }
+    match g.as_type() {
+        TraitGeometryType::Point(p) => {
+            let c = p.coord()?;
+            scan.note_bbox(c.x(), c.y());
+        }
+        TraitGeometryType::MultiPoint(mp) => {
+            for p in mp.points() {
+                let c = p.coord()?;
+                scan.note_bbox(c.x(), c.y());
+            }
+        }
+        TraitGeometryType::LineString(ls) => line(ls, scan),
+        TraitGeometryType::MultiLineString(ml) => {
+            for ls in ml.line_strings() {
+                line(&ls, scan);
+            }
+        }
+        TraitGeometryType::Polygon(p) => polygon(p, scan),
+        TraitGeometryType::MultiPolygon(mp) => {
+            for p in mp.polygons() {
+                polygon(&p, scan);
+            }
+        }
+        TraitGeometryType::GeometryCollection(gc) => {
+            for child in gc.geometries() {
+                scan_traits_into(&child, scan)?;
+            }
+        }
+        TraitGeometryType::Rect(_)
+        | TraitGeometryType::Triangle(_)
+        | TraitGeometryType::Line(_) => {
+            scan_geometry_into(&g.try_to_geometry()?, scan);
+        }
+    }
+    Some(())
 }
 
 /// Count coordinates (vertices) in a geometry.
@@ -7239,6 +7346,186 @@ mod tests {
                     None
                 };
                 prop_assert_eq!(scan_feature(&g), expected);
+            }
+        }
+    }
+
+    /// #650: pass 1 scans each geometry where it lies (`geo_traits` over the
+    /// GeoArrow scalar) instead of building a `geo::Geometry` first. The
+    /// in-place scan must give, bit for bit, what the old path gave: convert
+    /// with `try_to_geometry`, then `scan_feature`.
+    mod scan_feature_traits_props {
+        use super::super::{scan_feature, scan_feature_traits, FeatureKind};
+        use geo::{
+            Geometry, GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon,
+        };
+        use geo_traits::to_geo::ToGeoGeometry;
+        use geoarrow::array::WkbArray;
+        use geoarrow::datatypes::WkbType;
+        use geoarrow_array::GeoArrowArrayAccessor;
+        use proptest::prelude::*;
+
+        type Scan = Option<(FeatureKind, [u64; 4])>;
+
+        fn bits(s: Option<(FeatureKind, [f64; 4])>) -> Scan {
+            s.map(|(k, b)| (k, b.map(f64::to_bits)))
+        }
+
+        /// The old pass-1 result and the in-place one for one WKB value,
+        /// read the way a GeoParquet WKB column is read.
+        fn both(wkb: &[u8]) -> (Scan, Scan) {
+            let array = WkbArray::from((
+                arrow_array::BinaryArray::from_vec(vec![wkb]),
+                WkbType::default(),
+            ));
+            let item = array.value(0).expect("test WKB parses");
+            let old = item.try_to_geometry().and_then(|g| scan_feature(&g));
+            (bits(old), bits(scan_feature_traits(&item)))
+        }
+
+        fn wkb_of(g: &Geometry<f64>) -> Vec<u8> {
+            crate::wkb::geometry_to_wkb(g).expect("encode")
+        }
+
+        fn le(v: f64) -> [u8; 8] {
+            v.to_le_bytes()
+        }
+
+        /// Little-endian ISO WKB header: byte order + type code.
+        fn header(code: u32) -> Vec<u8> {
+            let mut b = vec![1u8];
+            b.extend_from_slice(&code.to_le_bytes());
+            b
+        }
+
+        fn point_wkb(x: f64, y: f64) -> Vec<u8> {
+            let mut b = header(1);
+            b.extend_from_slice(&le(x));
+            b.extend_from_slice(&le(y));
+            b
+        }
+
+        fn any_f64() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                8 => -1.0e6f64..1.0e6f64,
+                // Signed zeros: which of the two a min/max keeps depends on
+                // the order the coordinates are visited in.
+                2 => prop_oneof![Just(0.0), Just(-0.0)],
+                1 => Just(f64::NAN),
+                1 => prop_oneof![Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
+            ]
+        }
+        fn any_coord() -> impl Strategy<Value = geo::Coord<f64>> {
+            (any_f64(), any_f64()).prop_map(|(x, y)| geo::Coord { x, y })
+        }
+        fn any_ring() -> impl Strategy<Value = LineString<f64>> {
+            proptest::collection::vec(any_coord(), 0..6).prop_map(LineString::new)
+        }
+        fn any_polygon() -> impl Strategy<Value = Polygon<f64>> {
+            (any_ring(), proptest::collection::vec(any_ring(), 0..3))
+                .prop_map(|(ext, ints)| Polygon::new(ext, ints))
+        }
+        fn any_simple() -> impl Strategy<Value = Geometry<f64>> {
+            prop_oneof![
+                any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
+                proptest::collection::vec(any_coord(), 0..5)
+                    .prop_map(|cs| Geometry::MultiPoint(cs.into_iter().map(Point::from).collect())),
+                any_ring().prop_map(Geometry::LineString),
+                proptest::collection::vec(any_ring(), 0..3)
+                    .prop_map(|ls| Geometry::MultiLineString(MultiLineString::new(ls))),
+                any_polygon().prop_map(Geometry::Polygon),
+                proptest::collection::vec(any_polygon(), 0..3)
+                    .prop_map(|ps| Geometry::MultiPolygon(MultiPolygon::new(ps))),
+            ]
+        }
+        fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
+            prop_oneof![
+                4 => any_simple(),
+                1 => proptest::collection::vec(any_simple(), 0..4)
+                    .prop_map(|gs| Geometry::GeometryCollection(GeometryCollection::new_from(gs))),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn in_place_scan_matches_decode_then_scan(g in any_geometry()) {
+                let (old, new) = both(&wkb_of(&g));
+                prop_assert_eq!(new, old);
+            }
+        }
+
+        /// WKB spells an empty point `POINT(NaN NaN)`. `try_to_geometry`
+        /// gives `None` for it wherever it sits, so the whole row is
+        /// unusable, even when its other members are fine.
+        #[test]
+        fn empty_point_anywhere_makes_the_row_unusable() {
+            let empty = point_wkb(f64::NAN, f64::NAN);
+            let fine = point_wkb(1.0, 2.0);
+            let mut multi = header(4);
+            multi.extend_from_slice(&2u32.to_le_bytes());
+            multi.extend_from_slice(&fine);
+            multi.extend_from_slice(&empty);
+            let mut gc = header(7);
+            gc.extend_from_slice(&2u32.to_le_bytes());
+            gc.extend_from_slice(&fine);
+            gc.extend_from_slice(&empty);
+            for wkb in [empty, multi, gc] {
+                assert_eq!(both(&wkb), (None, None));
+            }
+        }
+
+        /// Z, M and ZM coordinates scan on x/y alone, as the decoder does.
+        #[test]
+        fn z_and_m_coordinates_scan_on_xy() {
+            for (code, extra) in [(1001u32, 1usize), (2001, 1), (3001, 2)] {
+                let mut wkb = header(code);
+                wkb.extend_from_slice(&le(3.0));
+                wkb.extend_from_slice(&le(-4.0));
+                for _ in 0..extra {
+                    wkb.extend_from_slice(&le(f64::NAN));
+                }
+                let (old, new) = both(&wkb);
+                assert_eq!(new, old, "type {code}");
+                assert_eq!(
+                    new,
+                    Some((FeatureKind::Point, [3.0, -4.0, 3.0, -4.0].map(f64::to_bits)))
+                );
+            }
+        }
+
+        /// A polygon's bbox is its exterior's alone, while finiteness covers
+        /// every ring, and an empty polygon is unusable.
+        #[test]
+        fn polygon_rings_split_bbox_from_finiteness() {
+            let ring = |cs: &[(f64, f64)]| LineString::from(cs.to_vec());
+            let ext = ring(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)]);
+            let outside = ring(&[(5.0, 5.0), (6.0, 5.0), (6.0, 6.0), (5.0, 5.0)]);
+            let nan_hole = ring(&[(0.2, 0.2), (f64::NAN, 0.3), (0.3, 0.3), (0.2, 0.2)]);
+            let cases = [
+                Polygon::new(ext.clone(), vec![outside]),
+                Polygon::new(ext, vec![nan_hole]),
+                Polygon::new(LineString::new(vec![]), vec![]),
+            ];
+            let (old, new) = both(&wkb_of(&Geometry::Polygon(cases[0].clone())));
+            assert_eq!(new, old);
+            assert_eq!(
+                new,
+                Some((FeatureKind::Polygon, [0.0, 0.0, 1.0, 1.0].map(f64::to_bits)))
+            );
+            for p in &cases[1..] {
+                assert_eq!(both(&wkb_of(&Geometry::Polygon(p.clone()))), (None, None));
+            }
+        }
+
+        /// The first of two equal-valued signed zeros wins min and max under
+        /// strict compares; the in-place scan keeps the visiting order.
+        #[test]
+        fn signed_zero_order_is_preserved() {
+            for (a, b) in [(0.0, -0.0), (-0.0, 0.0)] {
+                let ls = Geometry::LineString(LineString::from(vec![(a, a), (b, b)]));
+                let (old, new) = both(&wkb_of(&ls));
+                assert_eq!(new, old);
+                assert_eq!(new.unwrap().1, [a, a, a, a].map(f64::to_bits));
             }
         }
     }
