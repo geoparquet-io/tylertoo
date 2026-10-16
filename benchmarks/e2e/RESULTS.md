@@ -55,9 +55,13 @@ spread.
 
 At engine scale (the corpus tier, §1b: 300k–813k features per dataset,
 both tools in their production configuration), the measured end-to-end
-ratios are **8.6×–21.6×**, including **8.6× on the 632k-polygon Moldova
-parcels set that the pre-H3 pipeline lost 3.6× on** — with the caveats in
-§1b, starting with the one that the recording machine was not idle.
+ratios are **8.6×–21.3×** across the three datasets where both tools built
+the same zoom range, including **8.6× on the 632k-polygon Moldova parcels
+set that the pre-H3 pipeline lost 3.6× on**. The points row measured 21.6×,
+but tippecanoe built two zoom levels there that tylertoo did not, so it is
+quoted separately rather than as the top of the range (caveat 4) — with the
+rest of the caveats in §1b, starting with the one that the recording machine
+was not idle.
 
 ## 1. Headline (both tools at their own defaults)
 
@@ -93,10 +97,13 @@ verbatim. Reproduce with one command: `./benchmarks/e2e/run_corpus.sh`.
 - **Recorded** — 2026-10-15T22:32:09Z → `corpus_results.json`
 
 1. **The machine was not idle.** Another build job shared it during the
-   recording. The per-repeat spread stayed small — ≤6.3% on every
-   measurement except tylertoo's quality-matched points run (17%), computed
-   from `wall_all_s` in `corpus_results.json` — but treat every ratio as
-   provisional until re-recorded on an idle machine.
+   recording. The per-repeat spread stayed small on the tiling
+   measurements — ≤6.3% on every one except tylertoo's quality-matched
+   points run (17%). The GeoParquet→FlatGeobuf conversion stages, which are
+   included in tippecanoe's end-to-end sum, were noisier: up to 9.4% on
+   `polygons-portland-medium`. All computed from `wall_all_s` in
+   `corpus_results.json`. Treat every ratio as provisional until
+   re-recorded on an idle machine.
 2. **The Overture inputs are not byte-pinned.** The manifest's pinned release
    (`2026-06-17.0`) had expired from the Overture bucket, so this run fetched
    `GPQ_OVERTURE_RELEASE=2026-09-23.0`. Feature counts therefore exceed the
@@ -137,6 +144,14 @@ pipeline is 8.6× faster than tippecanoe end-to-end on the same file at
 | `polygons-portland-medium` | 2.69 s | 3.45 s | 56.05 s | **16.3×** | 1,208 → 1,208 | 1,213 | 84.5 MB | 1.20× |
 | `polygons-ftw-moldova-large` | 13.87 s | 20.03 s | 117.37 s | **5.9×** | 17,489 → 17,489 | 17,461 | 167.1 MB | 0.96× |
 
+Peak RSS on the matched runs, which the table above leaves out
+(`tylertoo_quality_matched.peak_rss_bytes` vs `tippecanoe_fgb` in
+`corpus_results.json`): 786 MB vs 652 MB on lines (1.20×), 927 MB vs
+967 MB on Portland buildings (0.96×), 1916 MB vs 926 MB on Moldova
+(2.07×), and 2110 MB vs 519 MB on points (4.07× — the highest memory
+ratio anywhere in this harness, on the same zoom-mismatched run as
+caveat 4). Turning the thinning ladder off costs memory as well as time.
+
 Two honest readings this table forces:
 
 - **The points quality-matched row is 2.4×, the weakest ratio measured
@@ -146,8 +161,13 @@ Two honest readings this table forces:
   not a parity measurement; for points the defaults row is the realistic one,
   since both tools' production configs drop points by design.
 - **`polygons-portland-medium` quality-matched is the one archive tylertoo
-  writes bigger** (1.20×; 1.11× even at defaults). Everywhere else tylertoo's
-  archives are 0.59–1.02×.
+  writes bigger at a matched zoom range** (1.20×; 1.11× even at defaults).
+  On lines and Moldova tylertoo's archives are 0.76–0.79×. The points row's
+  0.59× is **not** a like-for-like figure: it divides tylertoo's z0–14
+  archive by tippecanoe's z0–16 one. Compared at z0–14 only — 29.1 MB of
+  tippecanoe's 87.6 MB — tylertoo's points archive is **1.87× bigger**,
+  making it the largest relative archive in the set rather than the
+  smallest.
 
 Unlike the fixture set (contiguous admin coverage, where tippecanoe's
 defaults keep nearly everything and tylertoo's thin visibly), here
@@ -160,10 +180,13 @@ lines and polygons even at defaults.
 
 | dataset | tylertoo peak RSS | tippecanoe peak RSS | converter peak RSS | tylertoo CPU | tippecanoe CPU | tylertoo archive | tippecanoe archive | archive ratio |
 |---|---|---|---|---|---|---|---|---|
-| `points-nyc-medium` | 600 MB | 519 MB | 327 MB | 648% | 229% | 51.9 MB | 87.6 MB | 0.59× |
+| `points-nyc-medium` | 600 MB | 519 MB | 327 MB | 648% | 229% | 51.9 MB | 87.6 MB | 0.59× † |
 | `lines-portland-medium` | 1611 MB | 652 MB | 314 MB | 670% | 165% | 34.5 MB | 43.8 MB | 0.79× |
 | `polygons-portland-medium` | 999 MB | 967 MB | 374 MB | 626% | 204% | 78.2 MB | 70.2 MB | 1.11× |
 | `polygons-ftw-moldova-large` | 1848 MB | 926 MB | 700 MB | 714% | 260% | 132.2 MB | 174.8 MB | 0.76× |
+
+† Zoom-mismatched: tippecanoe's archive covers z0–16, tylertoo's z0–14
+(caveat 4). At z0–14 on both sides the ratio is 1.87×, not 0.59×.
 
 **tylertoo loses the memory column on three of four rows** — up to 2.5× on
 lines (1.6 GB vs 652 MB) and 2.0× on Moldova (1.8 GB vs 926 MB) — and wins
