@@ -68,8 +68,11 @@ it, or its copy shifted ±360°, intersects the box: `BboxQuery` in
 `overview/convert.rs` holds the box and its two shifted copies, and both
 the row-group prune and the per-feature filter test all three, in both
 engines and in the `--max-zoom auto` estimate. EPSG:3857 shifts by one
-world width in metres. The `--shard` tile ranges still compare against
-the stored coordinates.
+world width in metres. A data shard's row-group prune tests its read
+bounds the same way, so the shard covering lng -160 reads a 0..360 group
+stored at lng 200. The shard planner still weighs each row group by its
+stored coordinates, which only skews the balance of the cut, never which
+rows a shard reads.
 
 None of this reinterprets the inflated bbox of F1–F3. A polygon with
 vertices at -179.9 and +179.9 still describes a band through lng 0,
@@ -242,6 +245,7 @@ Wrapped-feature report (#644):
 - `overview::convert::tests::bbox_wrap_applies_to_pseudo_mercator`
 - `overview::auto_zoom::tests::bbox_scopes_the_estimate_across_the_wrap`
 - `overview_hostile::bbox_on_the_far_side_of_the_antimeridian_selects_the_overhang`
+- `overview::stream::tests::shard_selection_reads_row_groups_one_wrap_away`
 
 Pre-existing (PR #186): `overview::hostile::antimeridian_and_pole_features_convert`
 (no-crash pin); `tile::tests::test_tiles_for_bbox_antimeridian_crossing`

@@ -832,14 +832,15 @@ fn select_row_groups_streaming(
         Some(f) => Some(source.select_row_groups_matching(f)?),
         None => None,
     };
+    // The shard's read bounds stop at ±180, but export draws a feature one
+    // world width away at its wrapped position (#342), so a 0..360 row group
+    // at lng 200 belongs to the shard covering -160: test the wrapped copies
+    // too, as `--bbox` does (#643).
     let shard_selection: Option<RowGroupSelection> = match shard {
         Some(range) => {
             let b = range.read_bounds();
-            let units = super::convert::bbox_to_crs_units(
-                &[b.lng_min, b.lat_min, b.lng_max, b.lat_max],
-                crs,
-            );
-            Some(source.select_row_groups(&units)?)
+            let query = BboxQuery::new(&[b.lng_min, b.lat_min, b.lng_max, b.lat_max], crs);
+            Some(source.select_row_groups_any(query.boxes())?)
         }
         None => None,
     };
@@ -8255,6 +8256,37 @@ mod tests {
         let (ids, batches) = ids_read_in_order(&source, Some(&sel), 1);
         assert!(ids.is_empty(), "{ids:?}");
         assert_eq!(batches, 0);
+    }
+
+    /// #643: export draws a 0..360 feature stored at lng 200 at lng -160
+    /// (#342), so the data shard whose tile range covers -160 must read its
+    /// row group. Comparing the shard's ±180 read bounds with the stored
+    /// coordinates dropped it from every shard.
+    #[test]
+    fn shard_selection_reads_row_groups_one_wrap_away() {
+        // Row groups: id 0 at lng 10, id 1 at lng 200 (drawn at -160), id 2
+        // at lng 350 (drawn at -10).
+        let coords = [(10.0, 10.0), (200.0, 10.0), (350.0, 10.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let crs = Crs::Epsg4326;
+
+        // z4 tile x=1 spans lng -157.5..-135; with its read margin the
+        // bounds stay west of -90, so only the wrapped group reaches it.
+        let id = crate::pmtiles_writer::tile_id(4, 1, 7);
+        let range = crate::shard::TileRange::new(4, id, id).unwrap();
+        let read = range.read_bounds();
+        assert!(read.lng_min <= -160.0 && read.lng_max < -10.0, "{read:?}");
+
+        let sel = select_row_groups_streaming(&source, None, None, Some(&range), crs)
+            .unwrap()
+            .expect("a shard always yields a selection");
+        assert_eq!(
+            sel.parts(),
+            &[vec![1usize]],
+            "the shard reads the wrapped group"
+        );
     }
 
     // ------------------------------------------------------------------------
