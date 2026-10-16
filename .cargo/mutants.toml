@@ -59,6 +59,7 @@ additional_cargo_args = [
   "--test", "overview_property_tests",
   "--test", "pmtiles_clustered",
   "--test", "webmercator_roundtrip",
+  "--test", "wrapped_log",
 ]
 
 # nextest profile (a nextest arg, distinct from the Cargo profile above):
