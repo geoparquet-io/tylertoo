@@ -149,7 +149,7 @@ const PARTITIONING_GEOM_FACTOR: u64 = 4;
 /// [`DUPLICATING_BYTES_PER_ROW`]) was the *whole* per-row estimate — no
 /// geometry term, no property term — and it was the only guard: once the
 /// up-front choice said RAM, nothing looked again. Here 256 B sits on top of
-/// terms that are measured (pass 1's geometry weight up front; the Arrow
+/// terms that are measured (the footers' geometry weight up front; the Arrow
 /// bytes of every buffered batch at run time), and the run-time check runs
 /// for the whole pass with the bytes already buffered as a term of its
 /// projection. An up-front estimate that is too low therefore costs a late
@@ -193,8 +193,8 @@ const AUTO_FALLBACK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Estimated peak RAM (bytes) the pass-2 sink would hold if `buffered_rows`
-/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is pass 1's
-/// measured average encoded-geometry size per input row (#305); `None` (or a
+/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is the average
+/// encoded-geometry size per input row, from the footers (#305, #717); `None` (or a
 /// degenerate 0) falls back to the calibrated per-mode constants. Saturating,
 /// so absurd counts never overflow (they simply clamp to a "definitely spill"
 /// value).

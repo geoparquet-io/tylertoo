@@ -1113,9 +1113,9 @@ fn run_pass2_levels(
     // holds a sink, so there is nothing to have measured.
     let mut sink_measurement = pipeline::SinkMeasurement::default();
     // How pass 2 reads the input: the batch chunking (identical for every
-    // worker count), the resolved reader-thread count (#494), and pass 1's
-    // measured geometry weight, which is what sizes the read-ahead against
-    // the memory budget.
+    // worker count), the resolved reader-thread count (#494), and the footer
+    // geometry weight pass 1 reports (#717), which is what sizes the
+    // read-ahead against the memory budget.
     let read_tuning = ReadTuning {
         batch_size: options.read_batch_size.max(1),
         workers: resolve_read_workers(options.read_workers),
@@ -1158,9 +1158,9 @@ fn run_pass2_levels(
             let stream_last = ctxs[n - 1].verbatim;
             let buffered = if stream_last { n - 1 } else { n };
             let buffered_rows: usize = hints[..buffered].iter().sum();
-            // #305: pass 1's measured average encoded-geometry size per input
-            // row sizes the RAM-vs-spill estimate (falls back to calibrated
-            // constants on an empty scan). Same decision timing as before —
+            // #305: the average encoded-geometry size per input row, from the
+            // footers (#717), sizes the RAM-vs-spill estimate (falls back to
+            // calibrated constants on an empty scan). Same decision timing as before —
             // pass 1 has always completed by this point (the assign barrier).
             let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
             let backing = pipeline::resolve_backing(
@@ -4993,9 +4993,7 @@ fn run_pass1_with_chunk_rows(
     // `try_reserve_exact` so an absurd size falls back to growth instead of
     // aborting. Capacity only — output is unchanged.
     if bbox_query.is_none() && filter.is_none() {
-        if let Ok(rows) = source.selected_row_count(row_groups) {
-            let _ = features.try_reserve_exact(usize::try_from(rows.max(0)).unwrap_or(0));
-        }
+        let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
     }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     // #407: a zero simplify factor has no placeholder, so pass 1 collects no
