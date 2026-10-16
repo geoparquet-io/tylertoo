@@ -115,9 +115,20 @@ tile's features at once, so no wave setting makes one dense tile smaller.
 With thinning off (`--verbatim`), the z0 tile holds every feature. If one
 partition alone needs more than the available RAM, export stops right after
 its scan, before writing any tiles. The error names the densest tile. To get
-past it, keep fewer features at that zoom: drop `--verbatim`, or raise
-`tiles --min-zoom` above it. If the machine really has the memory, set
-`TYLERTOO_AUTO_MEM_LIMIT_BYTES` to the bytes export may use.
+past it, keep fewer features at that zoom:
+
+- Turn thinning back on for the dense geometry type alone. An explicit
+  thinning flag wins over `--verbatim`, so
+  `--verbatim --point-thinning 4` thins only the points and keeps everything
+  else verbatim. `--line-thinning 1` and `--polygon-thinning 1` do the same
+  for lines and polygons. On 2M points spread over the world, this cut the z0
+  tile from 2M features to 29k.
+- Drop `--verbatim`.
+- Raise `tiles --min-zoom` above that zoom, so the dense coarse zooms aren't
+  built.
+
+If the machine really has the memory, set `TYLERTOO_AUTO_MEM_LIMIT_BYTES` to
+the bytes export may use.
 
 ### Interrupted exports
 

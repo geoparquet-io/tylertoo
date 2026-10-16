@@ -142,6 +142,7 @@ fn export_refuses_a_partition_that_cannot_fit_in_ram() {
         "overview level 0 (z0) cannot fit in memory",
         "z0/0/0",
         "--verbatim",
+        "--point-thinning 4",
         "TYLERTOO_AUTO_MEM_LIMIT_BYTES",
     ] {
         assert!(

@@ -810,10 +810,11 @@ pub enum ExportError {
          {members} features, an estimated {:.1} GiB, and only {:.1} GiB is available. Its \
          densest tile, z{zoom}/{x}/{y}, holds {tile_members} features on its own, and export \
          never splits a tile, so no --partition-wave value fits it. Keep fewer features at \
-         this zoom: drop --verbatim (or the flags that turn thinning off), or raise \
-         `tiles --min-zoom` above z{zoom} so the dense coarse zooms are not built. If this \
-         machine does have the memory, set TYLERTOO_AUTO_MEM_LIMIT_BYTES to the bytes export \
-         may use (#665)",
+         this zoom: with --verbatim, turn thinning back on for the dense geometry type alone \
+         (--point-thinning 4, --line-thinning 1 or --polygon-thinning 1, the defaults) and \
+         the rest stays verbatim; or drop --verbatim; or raise `tiles --min-zoom` above \
+         z{zoom} so the dense coarse zooms are not built. If this machine does have the \
+         memory, set TYLERTOO_AUTO_MEM_LIMIT_BYTES to the bytes export may use (#665)",
         *.estimate_bytes as f64 / (1u64 << 30) as f64,
         *.available_bytes as f64 / (1u64 << 30) as f64
     )]
@@ -7463,6 +7464,7 @@ mod tests {
             "z0/0/0",
             "--partition-wave",
             "--verbatim",
+            "--point-thinning 4",
             "--min-zoom",
             "TYLERTOO_AUTO_MEM_LIMIT_BYTES",
         ] {
