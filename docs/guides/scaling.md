@@ -111,6 +111,31 @@ consecutive small zooms together. The group holds at most as many features as
 one full wave, so `--partition-wave` also bounds it. The archive is the same
 byte for byte.
 
+A partition always holds at least one whole tile, and export holds all of a
+tile's features at once, so no wave setting makes one dense tile smaller.
+With thinning off (`--verbatim`), the z0 tile holds every feature. If one
+tile alone needs more than the machine's memory (`MemAvailable`, or a cgroup
+`memory.max`), export stops right after its scan, before writing any tiles.
+The error names the tile. To get past it, rebuild the overview with `tiles`
+or `overview` so it keeps fewer features at that zoom:
+
+- Turn thinning back on for the dense geometry type alone. An explicit
+  thinning flag wins over `--verbatim`, so
+  `--verbatim --point-thinning 4` thins only the points and keeps everything
+  else verbatim. `--line-thinning 1` and `--polygon-thinning 1` do the same
+  for lines and polygons. On 2M points spread over the world, this cut the z0
+  tile from 2M features to 29k.
+- Drop `--verbatim`.
+- Raise `--min-zoom` above that zoom, so the dense coarse zooms aren't built.
+  The `export-pmtiles --min-zoom` flag is different: it only declares a
+  coarser minimum in the archive.
+
+If the machine does have the memory, for example as swap,
+`TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` turns the error into a warning and export
+tries anyway. When the figure is a `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
+export only warns, since that knob makes the automatic choices conservative
+and doesn't describe the machine.
+
 ### Interrupted exports
 
 After each finished zoom, at most once a minute, export logs a checkpoint

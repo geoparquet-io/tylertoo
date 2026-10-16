@@ -421,6 +421,25 @@ pub(super) struct MemoryLimit {
 /// On a tie the hard limit is reported. `None` when nothing could be probed
 /// (e.g. macOS without the override).
 pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
+    probe_uncached_memory_limit(true)
+}
+
+/// Uncached figure past which the process is killed rather than throttled,
+/// for export's dense-tile refusal (#665): the override, else the smaller of
+/// `MemAvailable` and the cgroup hard-limit headroom.
+///
+/// Uncached because in a `tiles` run [`available_memory_bytes`] was frozen
+/// during convert's pass 1, before convert freed that memory. cgroup
+/// `memory.high` is left out: going over it throttles and reclaims, it does
+/// not kill.
+pub(super) fn probe_oom_memory_limit() -> Option<MemoryLimit> {
+    probe_uncached_memory_limit(false)
+}
+
+/// The two uncached probes above: the override, else the binding term of
+/// `MemAvailable`, cgroup `memory.max` and, when `with_memory_high`, cgroup
+/// `memory.high`.
+fn probe_uncached_memory_limit(with_memory_high: bool) -> Option<MemoryLimit> {
     if let Some(bytes) = auto_mem_limit_override() {
         return Some(MemoryLimit {
             bytes,
@@ -436,7 +455,7 @@ pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
     } else {
         [None, None]
     };
-    binding_memory_limit([machine, cg_max, cg_high])
+    binding_memory_limit([machine, cg_max, cg_high.filter(|_| with_memory_high)])
 }
 
 /// The smallest of the probed figures (a hard limit wins a tie).
@@ -2515,6 +2534,17 @@ mod backing_tests {
     use crate::overview::level::{MemoryProfile, Mode};
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// #665: on Linux `/proc/meminfo` always answers, so export's dense-tile
+    /// refusal always has a figure, and never cgroup `memory.high`, which
+    /// throttles rather than kills.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_oom_memory_limit_reads_the_machine_without_memory_high() {
+        let limit = probe_oom_memory_limit().expect("Linux has /proc/meminfo");
+        assert!(limit.bytes > 0);
+        assert_ne!(limit.source, MemoryLimitSource::CgroupHigh);
+    }
 
     #[test]
     fn explicit_profiles_ignore_workload() {

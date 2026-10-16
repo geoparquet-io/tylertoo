@@ -1641,6 +1641,15 @@ pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::available_bytes: u64
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::estimate_bytes: u64
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::level: usize
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::limit_source: &'static str
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::members: usize
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::x: u32
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::y: u32
+pub tylertoo_core::overview::export::ExportError::TileExceedsMemory::zoom: u8
 pub tylertoo_core::overview::export::ExportError::UnknownProperty
 pub tylertoo_core::overview::export::ExportError::UnknownProperty::available: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::UnknownProperty::name: alloc::string::String
