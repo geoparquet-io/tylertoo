@@ -219,6 +219,14 @@ fn contour_to_linestring(contour: &IOverlayContour) -> Option<LineString<f64>> {
 /// let result = clip_polygon_ioverlay(&poly, &bounds);
 /// ```
 pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+    // Input guard (#692, mirroring the #435 line-path guard): i_float 5's
+    // adapter panics ("Invalid adapter bounds") on a non-finite extent or a
+    // coordinate magnitude past 2^500. A hostile vertex means there is
+    // nothing we can clip — return the same `None` as "doesn't intersect".
+    if !polygon_representable(poly) {
+        return None;
+    }
+
     // Convert polygon to i_overlay format
     let subj = polygon_to_ioverlay(poly);
 
@@ -259,6 +267,12 @@ pub fn clip_multipolygon_ioverlay(
     multi: &MultiPolygon<f64>,
     bounds: &TileBounds,
 ) -> Option<Geometry<f64>> {
+    // Input guard (#692): one hostile vertex anywhere poisons the whole
+    // input — empty result, no partial output, as the #435 line guard does.
+    if !multi.0.iter().all(polygon_representable) {
+        return None;
+    }
+
     // Convert all polygons to i_overlay format
     let subj_shapes: Vec<IOverlayShape> = multi.0.iter().map(polygon_to_ioverlay).collect();
 
@@ -287,7 +301,33 @@ pub fn clip_multipolygon_ioverlay(
 /// documents 2^500 (about 3.3e150) as the f64 limit of
 /// `FloatPointAdapter::new` and panics beyond it; the margin keeps the
 /// extent's centre/radius arithmetic finite too.
+///
+/// The margin must specifically leave a factor of two: `repair_polygon_ioverlay`
+/// and `union_polygons_ioverlay` pad the bounding rect by half its longest
+/// extent, so a shape spanning the full +/- this limit produces clip-box corners
+/// at +/- twice it -- and those corners are themselves adapter input points,
+/// validated against the same 2^500. Raising this constant past 2^499 would
+/// reintroduce the panic by way of the padding alone; the test
+/// `ioverlay_max_abs_coord_is_under_the_adapter_limit` pins that headroom.
 const IOVERLAY_MAX_ABS_COORD: f64 = 1e150;
+
+/// Can `v` be handed to `i_float` 5's adapter without tripping its
+/// "Invalid adapter bounds" panic (finite and below
+/// [`IOVERLAY_MAX_ABS_COORD`])? The #435 line-path guard, shared with the
+/// polygon entry points since #692.
+#[inline]
+fn representable(v: f64) -> bool {
+    v.is_finite() && v.abs() < IOVERLAY_MAX_ABS_COORD
+}
+
+/// Every coordinate of `poly` — exterior and holes — is
+/// [`representable`] (#692).
+fn polygon_representable(poly: &Polygon<f64>) -> bool {
+    std::iter::once(poly.exterior())
+        .chain(poly.interiors())
+        .flat_map(|ring| ring.0.iter())
+        .all(|c| representable(c.x) && representable(c.y))
+}
 
 /// Clip a MultiLineString to tile bounds using i_overlay's string clipping
 /// (#435).
@@ -318,7 +358,6 @@ pub fn clip_multilinestring_ioverlay(
     // (its documented f64 limit). The geo path returned nothing for such
     // input; keep that contract. `bounds` are lon/lat, so only the subject
     // can trip it.
-    let representable = |v: f64| v.is_finite() && v.abs() < IOVERLAY_MAX_ABS_COORD;
     if mls.0.is_empty()
         || !mls
             .0
@@ -368,6 +407,14 @@ pub fn clip_multilinestring_ioverlay(
 /// cut the overlap out as a hole. It relies on consistent winding, which is
 /// why the caller orients the parts first.
 pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> {
+    // Input guard (#692): a non-finite or over-limit vertex would panic the
+    // adapter (and an infinity poisons the padded-box arithmetic below).
+    // `None` is the "could not trace" result the caller (mvt.rs merge)
+    // already handles by emitting the parts as they are.
+    if !polys.iter().all(polygon_representable) {
+        return None;
+    }
+
     let mut rect: Option<geo::Rect<f64>> = None;
     for p in polys {
         let r = p.bounding_rect()?;
@@ -411,6 +458,16 @@ pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> 
 /// Returns `None` when nothing remains (degenerate rings or a fully
 /// self-canceling shape).
 pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
+    // Input guard (#692): a hostile vertex cannot be repaired, only panic
+    // the adapter (directly, or through the padded box turning non-finite).
+    // `None` is the non-panicking result both call sites already handle:
+    // mvt.rs `clean_into` emits the input unrepaired, and
+    // overview/simplify's `repair_candidate` falls back to collapse /
+    // full-resolution — the pass-through-unrepaired semantics of #435.
+    if !polygon_representable(poly) {
+        return None;
+    }
+
     let rect = poly.bounding_rect()?;
     // Pad so no vertex lies exactly on the clip-box edge; any positive
     // fraction of the extent works, the box just has to strictly contain
@@ -737,5 +794,134 @@ mod tests {
     fn ioverlay_max_abs_coord_is_under_the_adapter_limit() {
         assert!(IOVERLAY_MAX_ABS_COORD < 2f64.powi(500));
         assert!(IOVERLAY_MAX_ABS_COORD > 2f64.powi(498));
+        // `repair_polygon_ioverlay` / `union_polygons_ioverlay` pad the
+        // bounding rect by half its longest extent, so a shape spanning
+        // +/-IOVERLAY_MAX_ABS_COORD puts the clip box's corners at twice
+        // that -- and the adapter validates those corners too. Without this
+        // bound a larger-but-still-under-2^500 threshold would pass every
+        // other test here and panic again on a padded repair.
+        assert!(2.0 * IOVERLAY_MAX_ABS_COORD <= 2f64.powi(500));
+    }
+
+    // ========== Polygon-path input guard (#692) ==========
+    //
+    // Same hostile inputs as the line-path guard above (#435): a NaN/inf/huge
+    // vertex must yield the empty/None result the callers already handle, not
+    // an i_float adapter panic ("Invalid adapter bounds").
+
+    /// A square with one vertex replaced by `bad` in x.
+    fn poisoned_square(bad: f64) -> Polygon<f64> {
+        Polygon::new(
+            LineString::new(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: bad, y: 4.0 },
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        )
+    }
+
+    const HOSTILE_COORDS: [f64; 6] = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1e300,
+        -1e300,
+        f64::MAX,
+    ];
+
+    #[test]
+    fn test_clip_polygon_hostile_coordinate_yields_none() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in HOSTILE_COORDS {
+            let result = clip_polygon_ioverlay(&poisoned_square(bad), &bounds);
+            assert!(result.is_none(), "{bad}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_clip_polygon_hostile_hole_coordinate_yields_none() {
+        // The guard must look at interior rings too, not just the exterior.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in [f64::NAN, f64::INFINITY, 1e300] {
+            let poly = Polygon::new(
+                make_square(0.0, 0.0, 4.0, 4.0).exterior().clone(),
+                vec![LineString::new(vec![
+                    Coord { x: 1.0, y: 1.0 },
+                    Coord { x: 2.0, y: 1.0 },
+                    Coord { x: bad, y: 2.0 },
+                    Coord { x: 1.0, y: 1.0 },
+                ])],
+            );
+            let result = clip_polygon_ioverlay(&poly, &bounds);
+            assert!(result.is_none(), "{bad}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_clip_polygon_far_but_sane_coordinate_still_clips() {
+        // Well inside the guard: the engine must still run, not be
+        // short-circuited.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let result = clip_polygon_ioverlay(&make_square(-1e6, -1e6, 1e6, 1e6), &bounds);
+        match result {
+            Some(Geometry::Polygon(p)) => assert!(p.exterior().0.len() >= 4),
+            other => panic!("expected Polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_clip_multipolygon_hostile_coordinate_yields_none() {
+        // One bad part poisons the whole input, mirroring the line guard
+        // (#435): empty result, no partial output.
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in HOSTILE_COORDS {
+            let multi =
+                MultiPolygon::new(vec![make_square(1.0, 1.0, 2.0, 2.0), poisoned_square(bad)]);
+            let result = clip_multipolygon_ioverlay(&multi, &bounds);
+            assert!(result.is_none(), "{bad}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_clip_multipolygon_far_but_sane_coordinate_still_clips() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let multi = MultiPolygon::new(vec![
+            make_square(1.0, 1.0, 2.0, 2.0),
+            make_square(-1e6, -1e6, 1e6, 1e6),
+        ]);
+        let result = clip_multipolygon_ioverlay(&multi, &bounds);
+        assert!(result.is_some(), "{result:?}");
+    }
+
+    #[test]
+    fn test_union_polygons_hostile_coordinate_yields_none() {
+        for bad in HOSTILE_COORDS {
+            let polys = [make_square(0.0, 0.0, 2.0, 2.0), poisoned_square(bad)];
+            let result = union_polygons_ioverlay(&polys);
+            assert!(result.is_none(), "{bad}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_union_polygons_valid_input_still_unions() {
+        let polys = [
+            make_square(0.0, 0.0, 2.0, 2.0),
+            make_square(1.0, 1.0, 3.0, 3.0),
+        ];
+        match union_polygons_ioverlay(&polys) {
+            Some(Geometry::Polygon(p)) => assert!(p.exterior().0.len() >= 4),
+            other => panic!("expected Polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_repair_polygon_hostile_coordinate_yields_none() {
+        for bad in HOSTILE_COORDS {
+            let result = repair_polygon_ioverlay(&poisoned_square(bad));
+            assert!(result.is_none(), "{bad}: {result:?}");
+        }
     }
 }

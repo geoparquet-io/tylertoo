@@ -20,6 +20,10 @@ cargo build --release -p tylertoo
 python3 benchmarks/e2e/run_e2e.py --repeat 3 --geojson --quality-matched
 python3 benchmarks/e2e/format_results.py benchmarks/e2e/results-<stamp>.json
 
+./benchmarks/e2e/run_corpus.sh                # the corpus tier (#447), one command:
+                                              # fetch + optimize corpus data, build both
+                                              # binaries, measure, print the tables
+
 uv run benchmarks/e2e/compare_tippecanoe.py   # the parity gate (#420); exit 1 on a breach
 ```
 
@@ -214,6 +218,9 @@ Recorded per dataset, per stage, in `results.json`:
   is why wall is a median and memory is not. For the two-process tippecanoe
   pipeline the reported figure is the **larger of the two stages**, not their
   sum, because they never run concurrently.
+- **CPU utilisation** — percent of one core, median across the repeats, from
+  the same `/usr/bin/time` wrap (GNU prints it; Darwin's is computed as
+  (user + sys) / real). >100% means multi-core.
 - **output archive size** — bytes on disk.
 - **per-zoom tile counts and stored bytes** — from `tylertoo stats --json`,
   which reads PMTiles directory entries only. The *same code* reads both
@@ -241,7 +248,44 @@ size both tools are dominated by process start-up and pyramid scaffolding and
 the ratio says nothing about tiling throughput. They are kept as the
 geometry-class smoke test. RESULTS.md says so in the table itself.
 
-For a dataset that actually exercises the engines, pass your own:
+For datasets that actually exercise the engines, there is the **corpus tier**
+(`--corpus`, or the whole thing as one command with `run_corpus.sh`): every
+dataset `corpus/manifest.json` defines, read from the gpio-optimized copies at
+`corpus/data/gpio/<id>.parquet` (build them with `corpus/fetch.sh &&
+corpus/optimize.sh`, ~2–3 GB download; datasets not on disk are skipped with
+the recipe). The headline rows:
+
+| id | class | ~features |
+|---|---|---|
+| `points-nyc-medium` | point | 458k |
+| `lines-portland-medium` | line | ~280k |
+| `polygons-portland-medium` | polygon | ~650k |
+| `polygons-ftw-moldova-large` | polygon | 632k (the dataset the pre-H3 pipeline lost 3.6× on) |
+
+Two corpus-specific deviations from the fixture runs, both recorded in the
+results file per dataset:
+
+- **tippecanoe gets the manifest's recorded flags** (the same ones
+  `corpus/goldens.sh` uses — `--simplification=10 --drop-densest-as-needed`
+  etc.) on top of the parity set, and the zoom range comes from the manifest.
+  tylertoo runs its own defaults against them: both tools in their production
+  configuration for that data, rather than both at bare defaults — a
+  650k-building z14 tippecanoe run without density dropping is a configuration
+  nobody ships. The per-zoom tile counts of both archives are in the record,
+  so the output difference sits next to the timing. Exact tile parity is not
+  expected and not claimed; the tolerance-gated parity comparison is #420's
+  `compare_tippecanoe.py`.
+- **The Overture datasets are not byte-pinned.** `corpus/manifest.json` pins
+  an Overture release, but Overture expires old releases from the bucket, so a
+  refetch may need `GPQ_OVERTURE_RELEASE=<newer>` and feature counts drift a
+  few percent. The Moldova parcels file is a direct download and stable. The
+  run's actual input sizes are in the results file.
+
+The committed corpus record is `corpus_results.json` (the fixture record stays
+in `results.json`); `format_results.py corpus_results.json` regenerates its
+tables.
+
+For a dataset of your own, pass it directly:
 
 ```bash
 python3 run_e2e.py --dataset planet-buildings=/data/buildings.parquet \
@@ -257,11 +301,13 @@ dataset. That is the path for cluster-scale runs.
 |---|---|
 | `setup_tippecanoe.sh` | clones + verifies + builds the pinned tippecanoe; writes `tippecanoe.lock.json` |
 | `run_e2e.py` | the harness (stdlib only); writes `results-<UTC timestamp>.json` (or `--out`) and a markdown table |
+| `run_corpus.sh` | one command for the corpus tier: fetch + optimize the corpus, build both binaries, run `run_e2e.py --corpus --quality-matched`, print the tables |
 | `format_results.py` | prints RESULTS.md's tables from a results file (default `results.json`), so no number is retyped |
 | `render_parity.py` | side-by-side PNG renders of two archives at chosen zooms, with distinct-feature counts |
 | `compare_tippecanoe.py` | the parity gate (#420): tiles both tools, decodes both archives, per-zoom ratios vs `tippecanoe_tolerances.toml`; exit 1 on a breach |
 | `tippecanoe_tolerances.toml` | the gate's bands, one comment per band with the measured ratio and the divergence behind it |
-| `results.json` | the recorded run behind RESULTS.md (machine, argv, every repeat) |
+| `results.json` | the recorded fixture run behind RESULTS.md (machine, argv, every repeat) |
+| `corpus_results.json` | the recorded corpus run (#447) behind RESULTS.md's corpus section |
 | `RESULTS.md` | measured numbers, machine, caveats |
 | `tippecanoe.lock.json` | local resolution of the pin (gitignored; written by setup) |
 | `<repo>/.tools/` | built tippecanoe, next to go-pmtiles (gitignored) |
@@ -274,6 +320,7 @@ dataset. That is the path for cluster-scale runs.
 | `--geojson` | adds the ldGeoJSON + `-P` leg, evidence for "fgb is tippecanoe's best input" |
 | `--repeat N` | timed runs per measurement (median); default 3 |
 | `--dataset ID=PATH` | register your own GeoParquet; cluster-scale path |
+| `--corpus` | also register every `corpus/manifest.json` dataset (gpio copies; manifest zooms + recorded tippecanoe flags) |
 | `--tippecanoe-extra="…"` | probe a single tippecanoe flag's cost, recorded in the results file (use `=`, or argparse eats a leading `-`) |
 | `--work DIR --keep` | keep intermediates and archives, e.g. to feed `render_parity.py` |
 | `--tippecanoe PATH` | use a different tippecanoe (its `--version` must still be `tippecanoe v2.79.0`; recorded with `sha: null`) |

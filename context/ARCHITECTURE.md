@@ -8,6 +8,8 @@ Related canonical documents:
 
 - **Format**: [`context/OVERVIEWS_SPEC.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/OVERVIEWS_SPEC.md) — the
   `geo:overviews` draft spec (single source of truth for the file format).
+  Published at <https://geoparquet-io.github.io/tylertoo/spec/overviews/>,
+  rendered from this same file (#442).
 - **Tuning**: [`docs/OVERVIEW_TUNING.md`](https://github.com/geoparquet-io/tylertoo/blob/main/docs/OVERVIEW_TUNING.md) — every
   generalization knob, its default, and its direction.
 - **Benchmarks**: [`benchmarks/overview/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/overview/RESULTS.md)
@@ -96,7 +98,11 @@ verbatim (spec §2.4).
    (#287), and pass 2 re-fetching, cold, the property columns pass 1's
    geometry+ranking projection skipped (#286). Only selected row groups are
    staged, so pruned groups are still never touched and total network traffic
-   stays ≈1× the object (#219); local inputs skip pass 0 entirely.
+   stays ≈1× the object (#219); local inputs skip pass 0 entirely. The
+   concurrency ceiling and memory budget are env-overridable sweep knobs
+   (`TYLERTOO_STAGING_*`, #290 minimum; see docs/OVERVIEW_TUNING.md "Remote
+   staging (env)") — they change request scheduling only, never staged bytes
+   or batch order.
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).
@@ -881,9 +887,21 @@ documented f64 limit of 2^500, where the `geo` path returned an empty
 result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
 below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
 engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
-a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
-not changed by #435 and carry no such guard; whether they need one is a
-separate question.
+a panic. Since #692 the polygon entry points (`clip_polygon_ioverlay`,
+`clip_multipolygon_ioverlay`, `union_polygons_ioverlay`,
+`repair_polygon_ioverlay`) run the same per-coordinate check and return
+`None` — the "doesn't intersect" / "could not trace" result their callers
+already handle. Two of the four are reachable with hostile coordinates:
+`clip_polygon_ioverlay` from export's clip path, and
+`repair_polygon_ioverlay` from convert's `overview/simplify`, both over
+overview files this process did not write. The other two are guarded for
+one rule rather than a per-caller argument: `mvt.rs` reaches `repair` and
+`union_polygons_ioverlay` through `tile_rings_to_polygon`, whose
+`Vec<(i32, i32)>` rings are bounded by `TILE_COORD_CLAMP`, and
+`clip_multipolygon_ioverlay` has no production caller at all. Note the two
+outcomes differ: `clip` dropping a feature reads as "outside the tile",
+while `repair` returning `None` makes `mvt.rs` emit the ring
+**unrepaired**, so a hostile vertex survives to `snap_tile_coord`.
 
 **Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
 0.33.1 (the latest release at the time of writing) depends on it
