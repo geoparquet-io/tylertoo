@@ -12,14 +12,14 @@ theme:
   favicon: assets/logo.png
   palette:
     - scheme: default
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to dark mode
     - scheme: slate
-      primary: indigo
-      accent: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to light mode
@@ -31,6 +31,9 @@ theme:
     - search.highlight
     - content.code.copy
     - content.code.annotate
+
+extra_css:
+  - stylesheets/extra.css
 
 extra:
   social:
