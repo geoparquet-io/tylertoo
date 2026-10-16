@@ -800,6 +800,41 @@ pub enum ExportError {
     /// only surface deep into the export.
     #[error("spill-dir {} is not an existing directory", .0.display())]
     SpillDirNotDirectory(PathBuf),
+
+    /// A level's densest partition is estimated to need more than all of
+    /// available RAM, even exported on its own (#665). See
+    /// [`check_partition_fits`]. Raised after the scan, before any tile is
+    /// written.
+    #[error(
+        "overview level {level} (z{zoom}) cannot fit in memory: one of its partitions holds \
+         {members} features, an estimated {:.1} GiB, and only {:.1} GiB is available. Its \
+         densest tile, z{zoom}/{x}/{y}, holds {tile_members} features on its own, and export \
+         never splits a tile, so no --partition-wave value fits it. Keep fewer features at \
+         this zoom: drop --verbatim (or the flags that turn thinning off), or raise \
+         `tiles --min-zoom` above z{zoom} so the dense coarse zooms are not built. If this \
+         machine does have the memory, set TYLERTOO_AUTO_MEM_LIMIT_BYTES to the bytes export \
+         may use (#665)",
+        *.estimate_bytes as f64 / (1u64 << 30) as f64,
+        *.available_bytes as f64 / (1u64 << 30) as f64
+    )]
+    PartitionExceedsMemory {
+        /// 0-based overview level.
+        level: usize,
+        /// The level's zoom.
+        zoom: u8,
+        /// Column of the partition's densest tile.
+        x: u32,
+        /// Row of the partition's densest tile.
+        y: u32,
+        /// Members of that tile alone.
+        tile_members: usize,
+        /// Members of the whole partition.
+        members: usize,
+        /// Estimated resident bytes of the partition.
+        estimate_bytes: u64,
+        /// Available RAM the estimate was compared against.
+        available_bytes: u64,
+    },
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -980,6 +1015,36 @@ const PARTITION_SLOT_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
 /// costs wall clock while an OOM loses the whole run.
 const MEMBER_MEMORY_INFLATION: u64 = 2;
 
+/// Resident bytes of one clipped member beyond its inflated stored bytes,
+/// before any property (#665): the `Member` struct (96 B), allocator slack,
+/// and its share of the full-tile MVT build in [`build_mvt`].
+///
+/// The stored-bytes term alone under-counted points about 5×. Measured
+/// (2026-10, release build, one z0 tile of 2M Overture-shaped points with
+/// four properties, peak RSS slope between 200k and 2M members): 1,044 B per
+/// member against the 210 B that `2 × stored` (105 B/row) predicted. The same
+/// tile without properties measured about 320 B. Fitting both gives about
+/// 110 B here and [`MEMBER_PROPERTY_BYTES`] per property, rounded up.
+const MEMBER_BASE_BYTES: u64 = 128;
+
+/// Resident bytes each published property adds to one member (#665): the
+/// `(Arc<str>, PropertyValue)` slot, its owned `String`, and the MVT tag
+/// entries. Fitted from the measurement on [`MEMBER_BASE_BYTES`] (about
+/// 180 B each across four properties, one a 32-character id), rounded up.
+const MEMBER_PROPERTY_BYTES: u64 = 192;
+
+/// Estimated resident bytes of one clipped member (#311, #665): the finest
+/// level's mean stored bytes per row times [`MEMBER_MEMORY_INFLATION`], plus
+/// [`MEMBER_BASE_BYTES`] and [`MEMBER_PROPERTY_BYTES`] per published
+/// property. On the #665 calibration tile this predicts 1,106 B against
+/// 1,044 B measured, and 338 B against about 320 B without properties.
+fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
+    mean_stored_bytes
+        .saturating_mul(MEMBER_MEMORY_INFLATION)
+        .saturating_add(MEMBER_BASE_BYTES)
+        .saturating_add((properties as u64).saturating_mul(MEMBER_PROPERTY_BYTES))
+}
+
 /// The widest wave the memory budget allows: how many
 /// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots fit in
 /// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM, or
@@ -1015,8 +1080,8 @@ fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize 
 ///
 /// Where the upfront [`memory_safe_wave`] sizes from a flat per-slot constant,
 /// this uses the level's *actual* densest planned partition:
-/// `max(partition.members) × mean_member_bytes × [``MEMBER_MEMORY_INFLATION``]`
-/// directly estimates the largest partition's resident geometry volume. This
+/// `max(partition.members) × member_bytes` (see [`member_resident_bytes`])
+/// directly estimates the largest partition's resident volume. This
 /// captures the real driver — a single dense tile that overshoots
 /// [`DEFAULT_PARTITION_TARGET`] is one partition, wholly unbounded by the target
 /// — which the flat constant ignores entirely.
@@ -1033,10 +1098,10 @@ fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize 
 fn memory_safe_level_wave(
     ceiling: usize,
     partitions: &[Partition],
-    mean_member_bytes: Option<u64>,
+    member_bytes: Option<u64>,
     available_ram_bytes: Option<u64>,
 ) -> usize {
-    let (Some(mean), Some(ram)) = (mean_member_bytes.filter(|&b| b > 0), available_ram_bytes)
+    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
     else {
         return ceiling;
     };
@@ -1046,10 +1111,7 @@ fn memory_safe_level_wave(
     }
     // Saturating throughout: an absurd member count or byte size clamps the
     // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
-    let per_slot = (max_members as u64)
-        .saturating_mul(mean)
-        .saturating_mul(MEMBER_MEMORY_INFLATION)
-        .max(1);
+    let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
     let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
     let safe = (budget / per_slot).max(1) as usize;
     ceiling.min(safe)
@@ -1060,10 +1122,10 @@ fn memory_safe_level_wave(
 /// A serial export holds at most one wave of partitions. One full wave at
 /// the ceiling width, each partition at the planned target, is
 /// `ceiling × partition_target` members, so a group's collected members
-/// stay within what the serial loop already budgets for. When the mean
-/// member size and RAM are both known, the cap also narrows to the members
-/// that fit in the [`EXPORT_WAVE_RAM_FRACTION`] budget at
-/// [`MEMBER_MEMORY_INFLATION`], the same estimate [`memory_safe_level_wave`]
+/// stay within what the serial loop already budgets for. When the member
+/// size and RAM are both known, the cap also narrows to the members that fit
+/// in the [`EXPORT_WAVE_RAM_FRACTION`] budget at `member_bytes` each (see
+/// [`member_resident_bytes`]), the same estimate [`memory_safe_level_wave`]
 /// uses.
 ///
 /// The cap counts members only. A group can also hold the encoded tiles of
@@ -1075,17 +1137,76 @@ fn memory_safe_level_wave(
 fn level_group_member_cap(
     ceiling_wave: usize,
     partition_target: usize,
-    mean_member_bytes: Option<u64>,
+    member_bytes: Option<u64>,
     available_ram_bytes: Option<u64>,
 ) -> usize {
     let wave_cap = ceiling_wave.saturating_mul(partition_target);
-    let (Some(mean), Some(ram)) = (mean_member_bytes.filter(|&b| b > 0), available_ram_bytes)
+    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
     else {
         return wave_cap;
     };
     let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-    let per_member = mean.saturating_mul(MEMBER_MEMORY_INFLATION).max(1);
     wave_cap.min(usize::try_from(budget / per_member).unwrap_or(usize::MAX))
+}
+
+/// Refuse a level whose densest partition cannot fit in RAM even when it is
+/// the only one in flight (#665).
+///
+/// [`memory_safe_level_wave`] can narrow a wave down to one partition, but no
+/// further: [`plan_partitions`] never splits a tile, so a partition is at
+/// least its densest tile. With thinning off (`--verbatim`), the z0 tile
+/// holds every feature, and so does each coarse level's single partition.
+/// Exporting one means holding all its members and then their full MVT, so a
+/// partition estimated past the whole available RAM would only OOM, after
+/// minutes of work. Failing here, after the scan and before the first tile,
+/// turns that into an error that names the tile and what to change.
+///
+/// The threshold is all of available RAM, not the
+/// [`EXPORT_WAVE_RAM_FRACTION`] the wave budget uses: this refuses only what
+/// cannot fit serially. Unknown member size or RAM never refuses, matching
+/// the wave guard's fallbacks.
+fn check_partition_fits(
+    level: usize,
+    zoom: u8,
+    partitions: &[Partition],
+    tile_counts: &BTreeMap<u64, usize>,
+    member_bytes: Option<u64>,
+    available_ram_bytes: Option<u64>,
+) -> Result<(), ExportError> {
+    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
+    else {
+        return Ok(());
+    };
+    let Some(densest) = partitions.iter().max_by_key(|p| p.members) else {
+        return Ok(());
+    };
+    let estimate = (densest.members as u64).saturating_mul(per_member);
+    if estimate <= ram {
+        return Ok(());
+    }
+    // The partition's densest tile, the part no wave or partition target can
+    // shrink. First of equals, so the message is deterministic.
+    let (key, tile_members) = tile_counts.range(densest.key_lo..=densest.key_hi).fold(
+        (densest.key_lo, 0),
+        |best, (&k, &c)| {
+            if c > best.1 {
+                (k, c)
+            } else {
+                best
+            }
+        },
+    );
+    let (x, y) = key_to_xy(key, zoom);
+    Err(ExportError::PartitionExceedsMemory {
+        level,
+        zoom,
+        x,
+        y,
+        tile_members,
+        members: densest.members,
+        estimate_bytes: estimate,
+        available_bytes: ram,
+    })
 }
 
 /// Split the level plans into consecutive groups that export concurrently
@@ -1353,7 +1474,10 @@ pub fn write_empty_archive(
 ///
 /// `ceiling_wave` is the resolved `--partition-wave` upper bound. On `auto`
 /// each level narrows it further from its own densest partition (#311); an
-/// explicit wave is honoured verbatim.
+/// explicit wave is honoured verbatim. `member_bytes` is the estimated
+/// resident size of one member ([`member_resident_bytes`]). Under any wave, a
+/// level whose densest partition cannot fit in available RAM on its own is
+/// refused ([`check_partition_fits`], #665).
 #[allow(clippy::too_many_arguments)]
 fn plan_levels(
     scans: &[LevelScan],
@@ -1362,7 +1486,7 @@ fn plan_levels(
     partition_target: usize,
     ceiling_wave: usize,
     auto_wave: bool,
-    mean_member_bytes: Option<u64>,
+    member_bytes: Option<u64>,
     available_ram: Option<u64>,
 ) -> Result<Vec<LevelPlan>, ExportError> {
     scans
@@ -1375,17 +1499,23 @@ fn plan_levels(
             // tile-id ranges (#506) of roughly `partition_target` members
             // each.
             let partitions = plan_partitions(&scan.tile_counts, zoom, partition_target);
+            // #665: no wave fits a partition that alone exceeds RAM, so
+            // this runs whether or not the wave is `auto`.
+            check_partition_fits(
+                level_idx,
+                zoom,
+                &partitions,
+                &scan.tile_counts,
+                member_bytes,
+                available_ram,
+            )?;
 
             // Per-level memory guard (#311): on `auto`, narrow the wave from
             // THIS level's densest planned partition so a dense finest zoom
             // does not OOM the whole run. Explicit waves are honoured verbatim.
             let wave = if auto_wave {
-                let w = memory_safe_level_wave(
-                    ceiling_wave,
-                    &partitions,
-                    mean_member_bytes,
-                    available_ram,
-                );
+                let w =
+                    memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, available_ram);
                 if w < ceiling_wave {
                     let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
                     let budget_mib = available_ram
@@ -1393,10 +1523,10 @@ fn plan_levels(
                         .unwrap_or(0);
                     log::info!(
                         "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
-                         (densest partition {densest} members × ~{} B/member × {MEMBER_MEMORY_INFLATION}, \
+                         (densest partition {densest} members × ~{} B/member resident, \
                          {budget_mib} MiB budget) — #311 density guard",
                         level_idx + 1,
-                        mean_member_bytes.unwrap_or(0),
+                        member_bytes.unwrap_or(0),
                     );
                 }
                 w
@@ -1606,6 +1736,7 @@ fn export_pmtiles_run(
         feature_id,
         skipped: skipped_property_columns,
     } = resolve_export_columns(&reader, options, &level_zooms)?;
+    let member_bytes = export_member_bytes(&reader, &published, mean_member_bytes);
 
     // Writer: field metadata + layer name are derived from the first level's
     // schema (property columns, level/covering excluded).
@@ -1706,7 +1837,7 @@ fn export_pmtiles_run(
         partition_target,
         ceiling_wave,
         auto_wave,
-        mean_member_bytes,
+        member_bytes,
         available_ram,
     )?;
     progress.end_scan(t_scan);
@@ -1760,7 +1891,7 @@ fn export_pmtiles_run(
     let group_cap = level_group_member_cap(
         ceiling_wave,
         partition_target,
-        mean_member_bytes.filter(|_| auto_wave),
+        member_bytes.filter(|_| auto_wave),
         available_ram.filter(|_| auto_wave),
     );
     let group_cap = if knobs.concurrent_levels {
@@ -1881,6 +2012,21 @@ fn warn_encode_drops(zooms: &[ZoomReport]) -> usize {
         );
     }
     total
+}
+
+/// One member's estimated resident size (#665): [`member_resident_bytes`]
+/// over the finest level's mean stored row size and the properties every
+/// member carries. Steers the wave and the [`check_partition_fits`] refusal
+/// only, never output bytes. Pulled out of `export_pmtiles_run` to keep it
+/// under clippy's function-length ceiling.
+fn export_member_bytes(
+    reader: &OverviewReader,
+    published: &PublishedNames,
+    mean_stored_bytes: Option<u64>,
+) -> Option<u64> {
+    let properties = geometry_index(reader.schema())
+        .map_or(0, |g| property_columns(reader.schema(), g, published).len());
+    mean_stored_bytes.map(|mean| member_resident_bytes(mean, properties))
 }
 
 /// Every level's zoom, in level order, required to strictly ascend (#371 /
@@ -7196,19 +7342,21 @@ mod tests {
         // Sparse level: small partitions × modest members → the estimate is far
         // under budget, so the ceiling is preserved untouched.
         let sparse = partitions_with_members(&[32_768, 30_000, 31_000]);
+        let sparse_bytes = Some(member_resident_bytes(512, 0));
+        let dense_bytes = Some(member_resident_bytes(600, 0));
         assert_eq!(
-            memory_safe_level_wave(16, &sparse, Some(512), Some(54 * GIB)),
+            memory_safe_level_wave(16, &sparse, sparse_bytes, Some(54 * GIB)),
             16,
             "a sparse level must not narrow below the ceiling"
         );
 
         // Dense level: one tile overshoots the target into a 6.5M-member
-        // partition of ~600 B/member. per-slot ≈ 6.5M × 600 × 2 ≈ 7.3 GiB;
-        // budget = 0.5 × 54 GiB = 27 GiB → 3 slots. This is the Brazil case that
-        // OOM'd at wave 16, now capped to a safe 3.
+        // partition of ~600 B/member stored. per-slot ≈ 6.5M × (600 × 2 + 128)
+        // ≈ 8.0 GiB; budget = 0.5 × 54 GiB = 27 GiB → 3 slots. This is the
+        // Brazil case that OOM'd at wave 16, now capped to a safe 3.
         let dense = partitions_with_members(&[6_500_000, 100, 200]);
         assert_eq!(
-            memory_safe_level_wave(16, &dense, Some(600), Some(54 * GIB)),
+            memory_safe_level_wave(16, &dense, dense_bytes, Some(54 * GIB)),
             3,
         );
 
@@ -7218,14 +7366,14 @@ mod tests {
         // guard bypasses the throughput floor rather than OOM.
         let extreme = partitions_with_members(&[60_000_000, 100]);
         assert_eq!(
-            memory_safe_level_wave(16, &extreme, Some(600), Some(54 * GIB)),
+            memory_safe_level_wave(16, &extreme, dense_bytes, Some(54 * GIB)),
             1,
         );
 
         // The clamp is one-directional: a roomy budget never widens past the
         // ceiling the caller already chose.
         assert_eq!(
-            memory_safe_level_wave(4, &sparse, Some(512), Some(256 * GIB)),
+            memory_safe_level_wave(4, &sparse, sparse_bytes, Some(256 * GIB)),
             4,
         );
 
@@ -7243,14 +7391,154 @@ mod tests {
             "a degenerate zero member size falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &dense, Some(600), None),
+            memory_safe_level_wave(16, &dense, dense_bytes, None),
             16,
             "unprobeable RAM falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &[], Some(600), Some(54 * GIB)),
+            memory_safe_level_wave(16, &[], dense_bytes, Some(54 * GIB)),
             16,
             "an empty level falls back to the ceiling"
+        );
+    }
+
+    /// #665: the resident model reproduces the calibration it was fitted on,
+    /// biased high: one z0 tile of 2M Overture-shaped points (105 B stored
+    /// per row) measured 1,044 B per member with four properties, and about
+    /// 320 B with none. The bare `2 × stored` term predicted 210 B.
+    #[test]
+    fn member_resident_bytes_covers_the_665_calibration() {
+        let four = member_resident_bytes(105, 4);
+        assert!(
+            (1_044..=1_044 * 6 / 5).contains(&four),
+            "{four} B/member must cover the measured 1,044 B, within 20%"
+        );
+        let none = member_resident_bytes(105, 0);
+        assert!(
+            (320..=320 * 6 / 5).contains(&none),
+            "{none} B/member must cover the measured ~320 B, within 20%"
+        );
+        assert_eq!(member_resident_bytes(u64::MAX, usize::MAX), u64::MAX);
+    }
+
+    /// #665: a partition that cannot fit in available RAM even on its own is
+    /// refused, naming its densest tile; one that fits serially is not.
+    #[test]
+    fn check_partition_fits_refuses_only_what_no_wave_fits() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // The #665 run: `--verbatim` puts all 81M Overture places in the
+        // z0 tile, with four properties at ~105 B/row stored, on a box with
+        // ~57 GiB available. No wave width can help.
+        let places = 81_455_423;
+        let z0 = partitions_with_members(&[places]);
+        let z0_counts = BTreeMap::from([(tile_key(0, 0, 0), places)]);
+        let err = check_partition_fits(
+            0,
+            0,
+            &z0,
+            &z0_counts,
+            Some(member_resident_bytes(105, 4)),
+            Some(57 * GIB),
+        )
+        .expect_err("81M points in one z0 tile cannot fit in 57 GiB");
+        let ExportError::PartitionExceedsMemory {
+            level,
+            zoom,
+            x,
+            y,
+            tile_members,
+            members,
+            estimate_bytes,
+            available_bytes,
+        } = err
+        else {
+            panic!("wrong error: {err}");
+        };
+        assert_eq!((level, zoom, x, y), (0, 0, 0, 0));
+        assert_eq!((tile_members, members), (places, places));
+        assert!(estimate_bytes > available_bytes);
+        let msg = err.to_string();
+        for needle in [
+            "z0/0/0",
+            "--partition-wave",
+            "--verbatim",
+            "--min-zoom",
+            "TYLERTOO_AUTO_MEM_LIMIT_BYTES",
+        ] {
+            assert!(msg.contains(needle), "message must name {needle}: {msg}");
+        }
+
+        // The #311 Brazil level: dense, but a serial wave fits, so the wave
+        // guard handles it and nothing is refused.
+        let brazil = partitions_with_members(&[6_500_000, 100]);
+        let brazil_counts = BTreeMap::from([(0, 6_500_000), (1, 100)]);
+        assert!(check_partition_fits(
+            13,
+            14,
+            &brazil,
+            &brazil_counts,
+            Some(member_resident_bytes(600, 3)),
+            Some(54 * GIB),
+        )
+        .is_ok());
+
+        // The threshold is all of available RAM: exactly full fits, one more
+        // member does not.
+        let per_member = 1_000;
+        let at = partitions_with_members(&[1_000]);
+        let at_counts = BTreeMap::from([(0, 1_000)]);
+        assert!(
+            check_partition_fits(0, 0, &at, &at_counts, Some(per_member), Some(1_000_000)).is_ok()
+        );
+        let over = partitions_with_members(&[1_001]);
+        let over_counts = BTreeMap::from([(0, 1_001)]);
+        assert!(
+            check_partition_fits(0, 0, &over, &over_counts, Some(per_member), Some(1_000_000))
+                .is_err()
+        );
+
+        // Unknown member size or RAM, or nothing planned, never refuses.
+        assert!(check_partition_fits(0, 0, &z0, &z0_counts, None, Some(GIB)).is_ok());
+        assert!(check_partition_fits(0, 0, &z0, &z0_counts, Some(0), Some(GIB)).is_ok());
+        assert!(check_partition_fits(0, 0, &z0, &z0_counts, Some(per_member), None).is_ok());
+        assert!(
+            check_partition_fits(0, 0, &[], &BTreeMap::new(), Some(per_member), Some(1)).is_ok()
+        );
+    }
+
+    /// #665: the refusal names the densest tile of the densest partition,
+    /// not its first tile.
+    #[test]
+    fn check_partition_fits_names_the_densest_tile() {
+        let zoom = 2;
+        let counts: BTreeMap<u64, usize> = [((0, 0), 10), ((1, 0), 700), ((3, 3), 290)]
+            .into_iter()
+            .map(|((x, y), c)| (tile_key(x, y, zoom), c))
+            .collect();
+        let keys: Vec<u64> = counts.keys().copied().collect();
+        let partitions = vec![Partition {
+            key_lo: keys[0],
+            key_hi: keys[keys.len() - 1],
+            bbox: TileBounds::new(0.0, 0.0, 0.0, 0.0),
+            members: 1_000,
+        }];
+        let err = check_partition_fits(2, zoom, &partitions, &counts, Some(1_000), Some(1))
+            .expect_err("1,000 members cannot fit in 1 byte");
+        assert!(
+            matches!(
+                err,
+                ExportError::PartitionExceedsMemory {
+                    level: 2,
+                    zoom: 2,
+                    x: 1,
+                    y: 0,
+                    tile_members: 700,
+                    members: 1_000,
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 
@@ -7377,7 +7665,7 @@ mod tests {
             level_group_member_cap(6, 32_768, Some(600), None),
             6 * 32_768
         );
-        // A mean member size of 0 is unknown too, not a free member.
+        // A member size of 0 is unknown too, not a free member.
         assert_eq!(
             level_group_member_cap(6, 32_768, Some(0), Some(0)),
             6 * 32_768
@@ -7387,9 +7675,9 @@ mod tests {
             level_group_member_cap(6, 32_768, Some(100), Some(256 * GIB)),
             6 * 32_768
         );
-        // Tight RAM narrows it: 1 GiB × 0.5 / (1000 B × 2) = 268_435.
+        // Tight RAM narrows it: 1 GiB × 0.5 / 2000 B resident = 268_435.
         assert_eq!(
-            level_group_member_cap(16, 32_768, Some(1000), Some(GIB)),
+            level_group_member_cap(16, 32_768, Some(2000), Some(GIB)),
             (GIB / 2 / 2000) as usize
         );
     }

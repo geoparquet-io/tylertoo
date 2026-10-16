@@ -110,6 +110,15 @@ consecutive small zooms together. The group holds at most as many features as
 one full wave, so `--partition-wave` also bounds it. The archive is the same
 byte for byte.
 
+A partition always holds at least one whole tile, and export holds all of a
+tile's features at once, so no wave setting makes one dense tile smaller.
+With thinning off (`--verbatim`), the z0 tile holds every feature. If one
+partition alone needs more than the available RAM, export stops right after
+its scan, before writing any tiles. The error names the densest tile. To get
+past it, keep fewer features at that zoom: drop `--verbatim`, or raise
+`tiles --min-zoom` above it. If the machine really has the memory, set
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` to the bytes export may use.
+
 ### Interrupted exports
 
 After each finished zoom, at most once a minute, export logs a checkpoint
