@@ -301,6 +301,14 @@ pub fn clip_multipolygon_ioverlay(
 /// documents 2^500 (about 3.3e150) as the f64 limit of
 /// `FloatPointAdapter::new` and panics beyond it; the margin keeps the
 /// extent's centre/radius arithmetic finite too.
+///
+/// The margin must specifically leave a factor of two: `repair_polygon_ioverlay`
+/// and `union_polygons_ioverlay` pad the bounding rect by half its longest
+/// extent, so a shape spanning the full +/- this limit produces clip-box corners
+/// at +/- twice it -- and those corners are themselves adapter input points,
+/// validated against the same 2^500. Raising this constant past 2^499 would
+/// reintroduce the panic by way of the padding alone; the test
+/// `ioverlay_max_abs_coord_is_under_the_adapter_limit` pins that headroom.
 const IOVERLAY_MAX_ABS_COORD: f64 = 1e150;
 
 /// Can `v` be handed to `i_float` 5's adapter without tripping its
@@ -786,6 +794,13 @@ mod tests {
     fn ioverlay_max_abs_coord_is_under_the_adapter_limit() {
         assert!(IOVERLAY_MAX_ABS_COORD < 2f64.powi(500));
         assert!(IOVERLAY_MAX_ABS_COORD > 2f64.powi(498));
+        // `repair_polygon_ioverlay` / `union_polygons_ioverlay` pad the
+        // bounding rect by half its longest extent, so a shape spanning
+        // +/-IOVERLAY_MAX_ABS_COORD puts the clip box's corners at twice
+        // that -- and the adapter validates those corners too. Without this
+        // bound a larger-but-still-under-2^500 threshold would pass every
+        // other test here and panic again on a padded repair.
+        assert!(2.0 * IOVERLAY_MAX_ABS_COORD <= 2f64.powi(500));
     }
 
     // ========== Polygon-path input guard (#692) ==========

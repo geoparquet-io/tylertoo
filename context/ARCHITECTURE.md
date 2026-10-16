@@ -885,8 +885,17 @@ a panic. Since #692 the polygon entry points (`clip_polygon_ioverlay`,
 `clip_multipolygon_ioverlay`, `union_polygons_ioverlay`,
 `repair_polygon_ioverlay`) run the same per-coordinate check and return
 `None` — the "doesn't intersect" / "could not trace" result their callers
-already handle — because export reaches them over overview files this
-process did not write.
+already handle. Two of the four are reachable with hostile coordinates:
+`clip_polygon_ioverlay` from export's clip path, and
+`repair_polygon_ioverlay` from convert's `overview/simplify`, both over
+overview files this process did not write. The other two are guarded for
+one rule rather than a per-caller argument: `mvt.rs` reaches `repair` and
+`union_polygons_ioverlay` through `tile_rings_to_polygon`, whose
+`Vec<(i32, i32)>` rings are bounded by `TILE_COORD_CLAMP`, and
+`clip_multipolygon_ioverlay` has no production caller at all. Note the two
+outcomes differ: `clip` dropping a feature reads as "outside the tile",
+while `repair` returning `None` makes `mvt.rs` emit the ring
+**unrepaired**, so a hostile vertex survives to `snap_tile_coord`.
 
 **Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
 0.33.1 (the latest release at the time of writing) depends on it
