@@ -28,7 +28,7 @@
 //!
 //! Which column that is depends on the input (#693). When the file declares a
 //! GeoParquet 1.1 bbox covering whose four fields are all `f64`
-//! ([`find_f64_covering`]), the sample projects ONLY the covering struct and
+//! (`find_f64_covering`), the sample projects ONLY the covering struct and
 //! takes each sampled row's bbox from it — no geometry bytes are read at all,
 //! which on gpio-optimized input (the documented input contract) turns the
 //! pre-conversion read from the file's dominant column into its smallest.
