@@ -1021,6 +1021,7 @@ pub(crate) mod remote {
                 0 => 1,
                 s => ((tunables.mem_budget / s).max(1) as usize).min(tunables.max_concurrency),
             };
+            staging_tunables::log_live_concurrency(tunables, concurrency, max_span);
             log::debug!(
                 "[stage] fetching {} row-group span(s), {concurrency} in \
                  flight (largest span {max_span} B)",
@@ -1302,7 +1303,7 @@ pub(crate) mod remote {
         /// Hard ceiling on the concurrency override: each in-flight span is a
         /// task holding a whole row group's bytes, so an absurd value is a
         /// memory/socket bomb, not a sweep point.
-        const CONCURRENCY_MAX: usize = 128;
+        pub(super) const CONCURRENCY_MAX: usize = 128;
         /// Floor for the budget override: below ~1 MiB the budget-derived
         /// concurrency is pinned to 1 anyway, and a 0 budget is pathological.
         const MEM_BUDGET_MIN: u64 = 1024 * 1024;
@@ -1316,6 +1317,12 @@ pub(crate) mod remote {
             /// Transient-memory budget in bytes ([`MEM_BUDGET_VAR`]); live
             /// concurrency is `min(max_concurrency, mem_budget / largest span)`.
             pub(super) mem_budget: u64,
+            /// Was either variable set? Only [`effective`] knows (the
+            /// resolver's `lookup` seam cannot distinguish "unset" from
+            /// "set to the default"), so [`resolve`] always leaves this
+            /// false; it exists to decide the log level of the effective
+            /// and live-concurrency lines.
+            pub(super) overridden: bool,
         }
 
         impl Default for StagingTunables {
@@ -1323,6 +1330,7 @@ pub(crate) mod remote {
                 Self {
                     max_concurrency: STAGE_MAX_CONCURRENCY,
                     mem_budget: STAGE_MEM_BUDGET,
+                    overridden: false,
                 }
             }
         }
@@ -1360,6 +1368,7 @@ pub(crate) mod remote {
                 StagingTunables {
                     max_concurrency,
                     mem_budget,
+                    overridden: false,
                 },
                 warnings,
             )
@@ -1398,11 +1407,26 @@ pub(crate) mod remote {
                 }
                 Ok(v) => v,
                 Err(_) => {
-                    warnings.push(format!(
-                        "{var}={raw:?} is not a non-negative integer; \
-                         using the default {default}"
-                    ));
-                    default
+                    // A plain non-negative integer that merely overflows `T`
+                    // is out of range, not malformed, so clamp it like any
+                    // other out-of-range value. Falling back to the default
+                    // here would contradict the documented behaviour and
+                    // report "is not a non-negative integer" about a string
+                    // that plainly is one.
+                    let digits = raw.trim();
+                    let digits = digits.strip_prefix('+').unwrap_or(digits);
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        warnings.push(format!(
+                            "{var}={raw} is above the maximum {max}; clamping to {max}"
+                        ));
+                        max
+                    } else {
+                        warnings.push(format!(
+                            "{var}={raw:?} is not a non-negative integer; \
+                             using the default {default}"
+                        ));
+                        default
+                    }
                 }
             }
         }
@@ -1419,7 +1443,8 @@ pub(crate) mod remote {
                 let lookup = |name: &str| std::env::var(name).ok();
                 let overridden =
                     lookup(CONCURRENCY_VAR).is_some() || lookup(MEM_BUDGET_VAR).is_some();
-                let (tunables, warnings) = resolve(lookup);
+                let (mut tunables, warnings) = resolve(lookup);
+                tunables.overridden = overridden;
                 for w in &warnings {
                     log::warn!("[stage] {w}");
                 }
@@ -1435,6 +1460,39 @@ pub(crate) mod remote {
                 }
                 tunables
             })
+        }
+
+        /// Log the *live* in-flight concurrency once per process, at info
+        /// when an override is set.
+        ///
+        /// [`effective`]'s line reports the concurrency *ceiling*, but the
+        /// live value is `min(ceiling, budget / largest span)`. A budget that
+        /// caps a requested ceiling would otherwise leave a #290 sweep
+        /// recording a concurrency it never actually ran — the 8 and 16
+        /// points of a 1/2/4/8/16 sweep produce identical runs on an input
+        /// whose row groups are large enough, and only the ceiling appears in
+        /// the log. Logged once rather than per call, because
+        /// `stage_row_groups` runs per part and a multi-part input would
+        /// otherwise repeat it for every partition.
+        pub(super) fn log_live_concurrency(t: &StagingTunables, concurrency: usize, max_span: u64) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !t.overridden || LOGGED.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            if concurrency < t.max_concurrency {
+                log::info!(
+                    "[stage] live concurrency {concurrency}: the {} B budget \
+                     over the largest {max_span} B span caps the {} ceiling",
+                    t.mem_budget,
+                    t.max_concurrency
+                );
+            } else {
+                log::info!(
+                    "[stage] live concurrency {concurrency}, at the {} ceiling",
+                    t.max_concurrency
+                );
+            }
         }
     }
 
@@ -1830,7 +1888,9 @@ pub(crate) mod remote {
         //! inject the lookup closure — the process environment is never
         //! touched, so these are safe under parallel test execution.
 
-        use super::staging_tunables::{resolve, StagingTunables, CONCURRENCY_VAR, MEM_BUDGET_VAR};
+        use super::staging_tunables::{
+            resolve, StagingTunables, CONCURRENCY_MAX, CONCURRENCY_VAR, MEM_BUDGET_VAR,
+        };
         use super::{STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
 
         /// Lookup over a static `(name, value)` table.
@@ -1884,6 +1944,46 @@ pub(crate) mod remote {
                 assert!(
                     warnings[0].contains(CONCURRENCY_VAR),
                     "warning must name the variable: {}",
+                    warnings[0]
+                );
+            }
+        }
+
+        #[test]
+        fn values_that_overflow_the_target_type_clamp_to_the_maximum() {
+            // A string of digits too large for usize/u64 is out of range,
+            // not malformed: the documented behaviour is "clamps to the
+            // bound", and reporting "is not a non-negative integer" about
+            // "99999999999999999999" would be plainly wrong.
+            let (t, warnings) = resolve(env(&[(CONCURRENCY_VAR, "99999999999999999999")]));
+            assert_eq!(t.max_concurrency, CONCURRENCY_MAX);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains("above the maximum"),
+                "overflow must read as out-of-range, not unparsable: {}",
+                warnings[0]
+            );
+
+            let (t, warnings) = resolve(env(&[(MEM_BUDGET_VAR, "10000000000000000000000")]));
+            assert_eq!(t.mem_budget, u64::MAX);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("above the maximum"), "{}", warnings[0]);
+        }
+
+        #[test]
+        fn a_negative_or_malformed_value_still_falls_back_to_the_default() {
+            // The clamp above must not swallow genuinely malformed input:
+            // "-3" is not a non-negative integer, so it keeps the default
+            // rather than clamping to the minimum.
+            for bad in ["-3", "+", "1e3", "0x10"] {
+                let (t, warnings) = resolve(env(&[]).into_overlay(CONCURRENCY_VAR, bad));
+                assert_eq!(
+                    t.max_concurrency, STAGE_MAX_CONCURRENCY,
+                    "{bad:?} must fall back to the default"
+                );
+                assert!(
+                    warnings[0].contains("not a non-negative integer"),
+                    "{bad:?}: {}",
                     warnings[0]
                 );
             }
