@@ -1460,6 +1460,32 @@ mod tests {
         );
     }
 
+    /// #643: a western-hemisphere bbox scopes the estimate over a 0..360
+    /// dataset, as it scopes the convert, instead of finding no data.
+    #[test]
+    fn bbox_scopes_the_estimate_across_the_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms: Vec<Option<Geometry<f64>>> = point_grid(10, 0.1)
+            .into_iter()
+            .map(|g| {
+                g.map(|g| match g {
+                    Geometry::Point(p) => Geometry::Point(Point::new(p.x() + 200.0, p.y())),
+                    other => other,
+                })
+            })
+            .collect();
+        let source = write(&dir, "wrap.parquet", &geoms);
+        let wrapped = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            Some(&[-161.0, -1.0, -158.0, 2.0]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(wrapped.sampled_count, 100);
+    }
+
     /// `--filter` scopes the estimate the same way (on the `id` column the
     /// test writer adds: the first 400 rows are the dense grid).
     #[test]

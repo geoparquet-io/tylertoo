@@ -2342,6 +2342,33 @@ fn overhanging_cell_is_drawn_on_both_sides_of_the_antimeridian() {
     }
 }
 
+/// #643: export draws the overhang's 180°–181° part at the west edge, so a
+/// `--bbox` around lng -179.5 must select the cell, in both engines.
+#[test]
+fn bbox_on_the_far_side_of_the_antimeridian_selects_the_overhang() {
+    let geoms: Vec<Option<Geometry<f64>>> = vec![
+        Some(lnglat_rect(178.0, -1.0, 181.0, 1.0)), // id 0: overhangs
+        Some(lnglat_rect(10.0, -1.0, 12.0, 1.0)),   // id 1: control
+    ];
+    for streaming in [true, false] {
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        let tout = tempfile::NamedTempFile::new().unwrap();
+        write_input(tin.path(), &geoms, true, None);
+        let options = ConvertOptions {
+            bbox: Some([-180.0, -1.0, -179.0, 1.0]),
+            ..opts(streaming)
+        };
+        convert_to_overviews(tin.path(), tout.path(), &options)
+            .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+        let canonical = OverviewReader::open(tout.path()).unwrap().num_levels() - 1;
+        let ids: Vec<i64> = read_level_ids_geoms(tout.path(), canonical)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![0], "streaming={streaming}");
+    }
+}
+
 /// A dataset on the 0..360 longitude convention tiles at its wrapped
 /// position, as tippecanoe tiles it. Before #342 every feature counted as
 /// out of range and the convert failed with nothing left to tile.

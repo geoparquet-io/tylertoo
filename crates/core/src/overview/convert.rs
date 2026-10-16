@@ -14175,6 +14175,114 @@ mod tests {
         }
     }
 
+    /// #643: export draws a feature stored at lng 200 at lng -160 (#342), so
+    /// a western-hemisphere `--bbox` must select it from a 0..360 dataset, in
+    /// the row-group prune and the per-feature filter of both engines.
+    #[test]
+    fn bbox_selects_0_360_features_from_the_western_hemisphere() {
+        let coords = vec![(190.0, 10.0), (200.0, 20.0), (350.0, 30.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        let bbox = [-165.0, 15.0, -155.0, 25.0];
+
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                bbox: Some(bbox),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(
+                report.row_groups_read, 1,
+                "streaming={streaming}: the prune must keep exactly the wrapped group"
+            );
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            // Post-hoc: the feature shifted -360° lies in the bbox.
+            let posthoc: Vec<i64> = (0..coords.len() as i64)
+                .filter(|&id| {
+                    let (x, y) = coords[id as usize];
+                    (bbox[0]..=bbox[2]).contains(&(x - 360.0)) && (bbox[1]..=bbox[3]).contains(&y)
+                })
+                .collect();
+            assert_eq!(posthoc, vec![1]);
+            assert_eq!(ids, posthoc, "streaming={streaming}");
+        }
+    }
+
+    /// #643, the other direction: a bbox written past +180° selects a feature
+    /// stored just west of the antimeridian.
+    #[test]
+    fn bbox_past_180_selects_features_stored_at_negative_longitudes() {
+        let coords = vec![(-175.0, 0.0), (10.0, 0.0)];
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input(tin.path(), &coords, true);
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                bbox: Some([170.0, -1.0, 190.0, 1.0]),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![0], "streaming={streaming}");
+        }
+    }
+
+    /// #643 in EPSG:3857: the same wrap, one world width (2 × 20037508.34 m)
+    /// at a time. The bbox is in degrees and meets metre statistics.
+    #[test]
+    fn bbox_wrap_applies_to_pseudo_mercator() {
+        let metres: Vec<(f64, f64)> = [(200.0, 10.0), (300.0, 10.0)]
+            .iter()
+            .map(|&(lon, lat)| lnglat_to_webmerc(lon, lat))
+            .collect();
+        let projjson = serde_json::json!({
+            "type": "ProjectedCRS",
+            "name": "WGS 84 / Pseudo-Mercator",
+            "id": { "authority": "EPSG", "code": 3857 }
+        });
+        let md = geoarrow::datatypes::Metadata::new(
+            geoarrow::datatypes::Crs::from_projjson(projjson),
+            None,
+        );
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
+        for streaming in [true, false] {
+            let tout = tempfile::NamedTempFile::new().unwrap();
+            let opts = ConvertOptions {
+                mode: Mode::Duplicating,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                // Around lng -160 = 200 - 360.
+                bbox: Some([-161.0, 9.0, -159.0, 11.0]),
+                streaming,
+                ..Default::default()
+            };
+            let report = convert_to_overviews(tin.path(), tout.path(), &opts)
+                .unwrap_or_else(|e| panic!("streaming={streaming}: {e}"));
+            assert_eq!(report.row_groups_read, 1, "streaming={streaming}");
+            let ids = read_all_ids(&OverviewReader::open(tout.path()).unwrap());
+            assert_eq!(ids, vec![0], "streaming={streaming}");
+        }
+    }
+
     /// #553 review: an out-of-range exemplar's `row` is the row in the
     /// SOURCE FILE, not the feature's position in the pruned read stream.
     /// `--filter` statistics pushdown drops row group 0 here, so the
