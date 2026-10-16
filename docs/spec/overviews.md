@@ -26,9 +26,9 @@ drift apart.
     - **Standardization**: submission to the official GeoParquet
       process
       ([opengeospatial/geoparquet](https://github.com/opengeospatial/geoparquet))
-      is pending — nothing has been filed yet. The remaining steps are
-      tracked in
-      [#442](https://github.com/geoparquet-io/tylertoo/issues/442).
+      is pending — no submission has been filed yet. The remaining
+      steps are tracked in
+      [#701](https://github.com/geoparquet-io/tylertoo/issues/701).
 
 ---
 
