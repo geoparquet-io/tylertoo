@@ -288,3 +288,10 @@ costs real memory when rows carry large geometries. An explicit
 
 Raw artifacts: `corpus/data/bigbench/sweep_scratch/sweep.sh` and
 `sweep.tsv` (not committed).
+
+**Superseded premise (#494, 2026-10-16).** This sweep measured depth as
+read-ahead only. Since #494, pass 2 gives half of `in_flight` to a window of
+batches its consumers process at once (`pipe::split_in_flight`), so depth now
+sets compute concurrency too, and the flat curve above no longer predicts
+it. The clamp is unchanged until this decision is re-swept against the
+window.

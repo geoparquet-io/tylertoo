@@ -62,8 +62,9 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
 
 - **`--in-flight-batches N|auto`** sets how many read batches move through
   each pass at once. `auto` uses the core count, clamped to 4 through 16.
-  Each pass logs its choice. More batches keep more cores busy and consume
-  more memory. The passes do not overlap.
+  Each pass logs its choice. Pass 2 processes up to half of them at the same
+  time. More batches keep more cores busy and consume more memory. The passes
+  do not overlap.
 - **`--read-workers N|auto`** sets pass 2's reader threads. `auto` uses a
   quarter of the cores, at most 4. tylertoo honors an explicit value up to
   twice the core count. Remote inputs always use one reader, even when staged

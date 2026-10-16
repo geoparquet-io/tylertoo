@@ -227,7 +227,9 @@ verbatim (spec §2.4).
 2. **Pass 2** reads the input once more and fans each Arrow batch to *all*
    levels at once (the single-read pipelined engine, `overview/pipeline.rs`, #213): a
    reader streams batches over a bounded channel while a consumer simplifies
-   each batch across cores. On the default path (cascade on, duplicating
+   each batch across cores, and since #494 processes a window of up to
+   `in_flight / 2` batches at once (`pipe::for_each_window`), emitting their
+   outputs in read order. On the default path (cascade on, duplicating
    mode) the rayon tasks are per **feature**, and each task folds that
    feature through every level fine→coarse in series
    (`process_batch_cascade`). Only `--no-cascade` and partitioning mode fan
