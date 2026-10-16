@@ -883,9 +883,21 @@ documented f64 limit of 2^500, where the `geo` path returned an empty
 result. `clip_multilinestring_ioverlay` checks every coordinate (finite and
 below `IOVERLAY_MAX_ABS_COORD` = 1e150) and returns empty before calling the
 engine, so a NaN/inf/1e300 vertex still yields "nothing to clip" rather than
-a panic. The polygon entry points (`clip_polygon_ioverlay` and friends) are
-not changed by #435 and carry no such guard; whether they need one is a
-separate question.
+a panic. Since #692 the polygon entry points (`clip_polygon_ioverlay`,
+`clip_multipolygon_ioverlay`, `union_polygons_ioverlay`,
+`repair_polygon_ioverlay`) run the same per-coordinate check and return
+`None` — the "doesn't intersect" / "could not trace" result their callers
+already handle. Two of the four are reachable with hostile coordinates:
+`clip_polygon_ioverlay` from export's clip path, and
+`repair_polygon_ioverlay` from convert's `overview/simplify`, both over
+overview files this process did not write. The other two are guarded for
+one rule rather than a per-caller argument: `mvt.rs` reaches `repair` and
+`union_polygons_ioverlay` through `tile_rings_to_polygon`, whose
+`Vec<(i32, i32)>` rings are bounded by `TILE_COORD_CLAMP`, and
+`clip_multipolygon_ioverlay` has no production caller at all. Note the two
+outcomes differ: `clip` dropping a feature reads as "outside the tile",
+while `repair` returning `None` makes `mvt.rs` emit the ring
+**unrepaired**, so a hostile vertex survives to `snap_tile_coord`.
 
 **Residual duplicate:** `i_overlay` 4.5.2 stays in `Cargo.lock` because `geo`
 0.33.1 (the latest release at the time of writing) depends on it
