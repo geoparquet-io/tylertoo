@@ -509,7 +509,7 @@ pub fn crs_info_from_kv_metadata(
             let bbox_plausible_degrees = column_meta
                 .get("bbox")
                 .and_then(Value::as_array)
-                .map(|b| {
+                .and_then(|b| {
                     let v: Vec<f64> = b.iter().filter_map(Value::as_f64).collect();
                     // GeoParquet orders a 2D bbox [xmin, ymin, xmax, ymax]
                     // and a 3D one [xmin, ymin, zmin, xmax, ymax, zmax], so
@@ -530,7 +530,6 @@ pub fn crs_info_from_kv_metadata(
                         v[xmin] >= -180.0 && v[xmax] <= 180.0 && v[ymin] >= -90.0 && v[ymax] <= 90.0
                     })
                 })
-                .flatten()
                 // No (or malformed) bbox: nothing to check against — match
                 // the missing-geo-metadata precedent and assume.
                 .unwrap_or(true);
