@@ -827,13 +827,15 @@ cases) — a thin margin, recorded with the recipe in
 `tests/fixtures/guard/README.md`.
 
 What makes it a gate is where it runs. It is in the slow set in
-`.config/nextest.toml`, so it runs in the six `Slow Tests (<os>, shard N/3)`
-checks (`ci.yml`; ubuntu-latest and macos-latest, three `--partition` shards
-each, so its tests land in whichever shard the partition deals them to). All
-six must be **required** checks in `main`'s branch protection. The `Convert regression guard` job in
+`.config/nextest.toml`, so it runs in the `Slow Tests (<os>, rest)` check
+(`ci.yml`; the `rest` shard is every slow binary the two named shards do not
+take). Slow Tests gates merges through `CI passed`, the one CI check `main`'s
+branch protection **requires**; ubuntu runs on every PR, macOS on every push
+to `main`. The `Convert regression guard` job in
 `bench.yml` is *not* a required check, so it does not gate merges and the
 golden does not run there. If the golden ever leaves the nextest slow set, or
-Slow Tests stops being required, the guard silently stops gating.
+Slow Tests drops out of `CI passed`'s `needs`, or `CI passed` stops being
+required, the guard silently stops gating.
 
 Why the pre-existing guard did not do this, though it ran (green) on #539:
 `benchmarks/overview/ci_guard.py` runs `tylertoo overview` and compares

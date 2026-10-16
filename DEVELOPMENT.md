@@ -115,15 +115,25 @@ Plain `cargo test` ignores `nextest.toml`. It runs every test in the
 target you name, slow ones included, with no timeout. Use it for
 targeted runs, and use `cargo nextest run` for the tiers.
 
-CI mirrors the tiers. The Test job runs `quick` with stable and beta
-Rust, on both Ubuntu and macOS. The Slow Tests job runs the set that
-`quick` excludes, with stable Rust on both systems, in three CPU shards
-per OS. All six
-`Slow Tests (<os>, shard N/3)` checks must pass. To reproduce one shard:
+CI mirrors the tiers. The Test job runs `quick`, and the Slow Tests job
+runs the set that `quick` excludes, in three shards split by test binary:
+`heavy`, `determinism`, and `rest`. A pull request runs Test on Ubuntu
+and macOS with stable Rust, and Slow Tests on Ubuntu. Every push to
+`main` also runs the beta Test lanes and the macOS Slow Tests. To run that
+full set on a branch before merging, start the CI workflow by hand
+(`gh workflow run ci.yml --ref <branch>`). Do this for the same changes
+that call for `full` locally.
+
+A pull request that changes only docs skips the Rust and Python jobs;
+`scripts/ci/docs_only.sh` decides. Branch protection requires one CI
+check, `CI passed`, which fails when any other CI job fails.
+
+To reproduce one shard, take its filter from the Slow Tests job in
+`.github/workflows/ci.yml`:
 
 ```bash
 cargo nextest run --ignore-default-filter \
-  -E 'not default()' --partition count:2/3
+  -E 'not default() & binary(thread_count_determinism)'
 ```
 
 When a new test takes more than ~20 seconds, add it to the slow set in
@@ -398,7 +408,7 @@ similarity-rs --threshold 0.95 --min-lines 10 \
 
 # Public API surface against the baseline in
 # crates/core/api/tylertoo-core.txt. The Public API
-# job in ci.yml pins the nightly, because rustdoc
+# step in ci.yml pins the nightly, because rustdoc
 # output drifts between nightlies.
 cargo install cargo-public-api        # once
 rustup toolchain install \
@@ -445,7 +455,7 @@ python3 scripts/coverage_gate.py --check lcov.info --min 94
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
-`tylertoo-core` API freeze. The Public API job still surfaces each API
+`tylertoo-core` API freeze. The Public API check still surfaces each API
 change in review.
 
 Some thresholds are **ratchets**, set at the current code's level and
@@ -659,7 +669,7 @@ The docs tests check pages against the CLI. The Rust snapshot cases in
 
 ### Docs prose
 
-The `Docs Prose` job lints the handwritten docs with
+The Docs Prose steps of the CI Lint job lint the handwritten docs with
 [Vale](https://vale.sh/) and
 [proselint](https://github.com/amperser/proselint), and the pre-commit
 hook runs the same script on staged files. `scripts/lint-prose.sh` holds
@@ -885,7 +895,7 @@ RUST_BACKTRACE=1 cargo test \
 The repo commits `Cargo.lock`, so every build resolves to the same
 versions, from a laptop to the release artifacts. To update it, run
 `cargo update -p <crate>` or edit a manifest, and commit the new lock
-with the change. The Security Audit job fails when the lock falls out
+with the change. The security audit in the CI Lint job fails when the lock falls out
 of step with the manifests.
 
 Dependabot opens weekly updates for every dependency ecosystem in the
@@ -899,8 +909,8 @@ issue.
 **Geometry-engine bumps are the exception.** `geo`, `geo-types`,
 `i_overlay`, `i_float`, `i_shape`, and `earcut` can change rendered tile
 geometry at any semver level, so green CI alone does not approve one. The
-golden tile guard fails on any output change, and it runs in the required
-Slow Tests checks. Such a bump therefore reaches a human as a red check,
+golden tile guard fails on any output change, and it runs in Slow Tests,
+which gates every merge through the required `CI passed` check. Such a bump therefore reaches a human as a red check,
 not as a merge. See "Decision Record: Geometry-Engine Dependency Bumps"
 in `context/ARCHITECTURE.md`.
 

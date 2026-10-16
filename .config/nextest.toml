@@ -28,10 +28,11 @@
 # (nextest has no config-level string interpolation to share one expression.)
 #
 # CI (see ci.yml): the Test matrix and Coverage jobs run `quick`; the
-# "Slow Tests" job runs only the slow set on ubuntu/macos stable, in three
-# shards per OS, via `--ignore-default-filter -E 'not default()'
-# --partition count:N/3`. The shards are a CPU split of that one set, not
-# different tests. `default()` still means the same "quick" set.
+# "Slow Tests" job runs only the slow set, in three shards split by test
+# binary, via `--ignore-default-filter -E 'not default() & (<shard>)'`.
+# The shards are a CPU split of that one set, not different tests; the
+# catch-all `rest` shard picks up a new slow binary with no ci.yml edit.
+# `default()` still means the same "quick" set.
 #
 # `hostile_geometry_eval::full_scorecard` (#205) is the slow half of the
 # hostile-geometry clipping harness: it adds the 316k-vertex Antarctica ring
@@ -54,8 +55,8 @@
 
 [profile.default]
 # convert_guard_golden (#558 golden tile guard) MUST stay in this slow set:
-# the required Slow Tests checks are the only place it gates merges. Move
-# it out and the guard silently stops gating.
+# Slow Tests (through the required `CI passed` check) is the only place it
+# gates merges. Move it out and the guard silently stops gating.
 default-filter = """
 not (
     binary(thread_count_determinism)

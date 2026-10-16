@@ -60,8 +60,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Docs-only PRs skip this workflow's job: nothing it builds or reads can
+  # change (scripts/ci/docs_only.sh holds the rule; ci.yml's plan job uses
+  # the same one). A job skipped by `if:` reports "skipped" under its own
+  # name, which satisfies the required check.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # HEAD^1 (the base tip) for the docs-only diff below.
+          fetch-depth: 2
+
+      - name: Code or docs only?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ] \
+            && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
+            code=false
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   compare:
     name: tippecanoe parity
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
