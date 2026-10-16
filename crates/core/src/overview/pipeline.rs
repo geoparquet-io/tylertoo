@@ -434,6 +434,33 @@ pub(super) fn probe_preflight_memory_limit() -> Option<MemoryLimit> {
     binding_memory_limit([machine, cg_max, cg_high])
 }
 
+/// Uncached figure past which the process is killed rather than throttled,
+/// for export's dense-tile refusal (#665): the override, else the smaller of
+/// `MemAvailable` and the cgroup hard-limit headroom.
+///
+/// Uncached because in a `tiles` run [`available_memory_bytes`] was frozen
+/// during convert's pass 1, before convert freed that memory. cgroup
+/// `memory.high` is left out: going over it throttles and reclaims, it does
+/// not kill.
+pub(super) fn probe_oom_memory_limit() -> Option<MemoryLimit> {
+    if let Some(bytes) = auto_mem_limit_override() {
+        return Some(MemoryLimit {
+            bytes,
+            source: MemoryLimitSource::Override,
+        });
+    }
+    let machine = read_proc_mem_available().map(|bytes| MemoryLimit {
+        bytes,
+        source: MemoryLimitSource::MemAvailable,
+    });
+    let [cg_max, _] = if cfg!(target_os = "linux") {
+        read_cgroup_memory_limits_by_source(std::path::Path::new("/"))
+    } else {
+        [None, None]
+    };
+    binding_memory_limit([machine, cg_max, None])
+}
+
 /// The smallest of the probed figures (a hard limit wins a tie).
 fn binding_memory_limit(candidates: [Option<MemoryLimit>; 3]) -> Option<MemoryLimit> {
     candidates

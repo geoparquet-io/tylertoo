@@ -1,12 +1,14 @@
-//! #665: an export partition that cannot fit in available RAM on its own is
-//! refused after the scan, with an error that says what to change, instead
-//! of being collected until the kernel OOM-kills the run.
+//! #665: an export tile that cannot fit in memory on its own is caught after
+//! the scan, with a message that says what to change, instead of being
+//! collected until the kernel OOM-kills the run.
 //!
-//! `--verbatim` turns thinning off, so the z0 tile holds every point and the
-//! z0 level is one partition no wave width can shrink. Under a small
-//! `TYLERTOO_AUTO_MEM_LIMIT_BYTES` export must refuse it; with the probe
-//! left alone the same file exports. A subprocess test because the RAM
-//! probe is a process-wide cache.
+//! `--verbatim` turns thinning off, so the z0 tile holds every point and no
+//! wave width can shrink it. Against `MemAvailable` or a cgroup `memory.max`
+//! export refuses it; core's `dense_tile_refusal_writes_nothing` covers that
+//! with an injected figure. A `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override is a
+//! knob, not the machine's memory, so under one export warns with the same
+//! message and carries on. That is what this subprocess test pins, since the
+//! override is read from the environment.
 
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +19,7 @@ use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-const ROWS: usize = 20_000;
+const ROWS: usize = 5_000;
 
 fn tylertoo_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tylertoo")
@@ -108,7 +110,7 @@ fn export(overview: &Path, out: &Path, mem_limit: Option<&str>) -> (bool, String
 }
 
 #[test]
-fn export_refuses_a_partition_that_cannot_fit_in_ram() {
+fn export_warns_when_a_tile_exceeds_the_override() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("points.parquet");
     write_points(&input);
@@ -133,28 +135,33 @@ fn export_refuses_a_partition_that_cannot_fit_in_ram() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    // 20k members at several hundred resident bytes each is several MB,
-    // past a 1 MB probe even serially.
-    let refused = dir.path().join("refused.pmtiles");
-    let (ok, stderr) = export(&overview, &refused, Some("1000000"));
-    assert!(!ok, "a partition past available RAM must be refused");
+    // 5k members at several hundred resident bytes each is a few MB,
+    // past a 1 MB override even serially.
+    let warned = dir.path().join("warned.pmtiles");
+    let (ok, stderr) = export(&overview, &warned, Some("1000000"));
+    assert!(ok, "the override only warns:\n{stderr}");
     for needle in [
+        "continuing because the memory figure is the TYLERTOO_AUTO_MEM_LIMIT_BYTES override",
         "overview level 0 (z0) cannot fit in memory",
         "z0/0/0",
         "--verbatim",
         "--point-thinning 4",
-        "TYLERTOO_AUTO_MEM_LIMIT_BYTES",
+        "TYLERTOO_SKIP_MEMORY_PREFLIGHT",
     ] {
         assert!(
             stderr.contains(needle),
             "stderr must name {needle}:\n{stderr}"
         );
     }
-    assert!(!refused.exists(), "a refused export writes no archive");
+    assert!(warned.exists());
 
     // The same file exports when the probe is left to the machine.
     let exported = dir.path().join("exported.pmtiles");
     let (ok, stderr) = export(&overview, &exported, None);
     assert!(ok, "export must succeed with real RAM:\n{stderr}");
+    assert!(
+        !stderr.contains("cannot fit in memory"),
+        "5k points fit in real RAM:\n{stderr}"
+    );
     assert!(exported.exists());
 }

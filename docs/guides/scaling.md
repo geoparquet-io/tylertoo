@@ -113,9 +113,10 @@ byte for byte.
 A partition always holds at least one whole tile, and export holds all of a
 tile's features at once, so no wave setting makes one dense tile smaller.
 With thinning off (`--verbatim`), the z0 tile holds every feature. If one
-partition alone needs more than the available RAM, export stops right after
-its scan, before writing any tiles. The error names the densest tile. To get
-past it, keep fewer features at that zoom:
+tile alone needs more than the machine's memory (`MemAvailable`, or a cgroup
+`memory.max`), export stops right after its scan, before writing any tiles.
+The error names the tile. To get past it, rebuild the overview with `tiles`
+or `overview` so it keeps fewer features at that zoom:
 
 - Turn thinning back on for the dense geometry type alone. An explicit
   thinning flag wins over `--verbatim`, so
@@ -124,11 +125,15 @@ past it, keep fewer features at that zoom:
   for lines and polygons. On 2M points spread over the world, this cut the z0
   tile from 2M features to 29k.
 - Drop `--verbatim`.
-- Raise `tiles --min-zoom` above that zoom, so the dense coarse zooms aren't
-  built.
+- Raise `--min-zoom` above that zoom, so the dense coarse zooms aren't built.
+  The `export-pmtiles --min-zoom` flag is different: it only declares a
+  coarser minimum in the archive.
 
-If the machine really has the memory, set `TYLERTOO_AUTO_MEM_LIMIT_BYTES` to
-the bytes export may use.
+If the machine does have the memory, for example as swap,
+`TYLERTOO_SKIP_MEMORY_PREFLIGHT=1` turns the error into a warning and export
+tries anyway. When the figure is a `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
+export only warns, since that knob makes the automatic choices conservative
+and doesn't describe the machine.
 
 ### Interrupted exports
 
