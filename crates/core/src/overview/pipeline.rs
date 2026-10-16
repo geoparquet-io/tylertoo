@@ -96,10 +96,11 @@ const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 
 /// Measured-path per-row model (#305): `per_row =
 /// SINK_ROW_ALLOC_OVERHEAD_BYTES + factor(mode) × avg_geom_bytes`, where
-/// `avg_geom_bytes` is pass 1's measured
-/// average in-memory Arrow byte size of the encoded geometry column per input
-/// row. Pass 1 already decodes every geometry, so the measurement is free (one
-/// buffer-size sum per batch) and replaces the one-size-fits-all constants
+/// `avg_geom_bytes` is the average encoded size of the geometry column per
+/// input row, from the footers' uncompressed column sizes over the selected
+/// row groups (#717; until then, the Arrow memory of pass 1's batches, which
+/// depended on how the rows were read). It costs no I/O
+/// and replaces the one-size-fits-all constants
 /// above with the input's actual geometry weight — the dominant, wildly
 /// dataset-dependent term (corpus range: ~30 B/row for points to ~11.5 KiB/row
 /// for fieldmaps-adm4 boundary polygons).
@@ -974,9 +975,9 @@ pub(super) struct ReadTuning {
     pub(super) batch_size: usize,
     /// Reader threads asked for (already resolved; `1` = sequential).
     pub(super) workers: usize,
-    /// Pass 1's measured average encoded-geometry bytes per input row (#305),
-    /// used only to size the read-ahead against the memory budget. `None`
-    /// falls back to [`READ_ROW_BYTES_FALLBACK`].
+    /// Average encoded-geometry bytes per input row (#305), from the footers
+    /// (#717), used only to size the read-ahead against the memory budget.
+    /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
     pub(super) avg_geom_bytes: Option<u64>,
     /// The run's requested memory profile. `Bounded` means the caller asked
     /// for memory over speed, so a worker's read-ahead queue is capped lower
@@ -1027,8 +1028,8 @@ const READ_AHEAD_MIN_BATCHES: usize = 4;
 /// tolerance for longer consumer stalls, and the cost is resident Arrow data.
 const READ_AHEAD_MAX_BATCHES: usize = 32;
 
-/// Assumed decoded GEOMETRY bytes per input row when pass 1 measured nothing
-/// (an empty scan, or the `--plan` path). Deliberately generous:
+/// Assumed decoded GEOMETRY bytes per input row when there is no geometry
+/// weight to price with (no rows selected). Deliberately generous:
 /// over-estimating costs reader workers, under-estimating costs RAM. The
 /// non-geometry per-row term ([`READ_ROW_NON_GEOM_BYTES`]) is added on top,
 /// measured or not.
@@ -1077,7 +1078,7 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
     // term plus the measured encoded geometry, doubled.
     //
-    // `READ_ROW_NON_GEOM_BYTES` is not decoration. Pass 1 measures ONLY the
+    // `READ_ROW_NON_GEOM_BYTES` is not decoration. The weight covers ONLY the
     // geometry column, and a read batch carries every projected column — a
     // 58-column schema's properties, offsets, dictionaries and validity
     // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone

@@ -74,9 +74,9 @@ Resident batches include those in flight, each worker's read-ahead queue,
 and, under `bounded`, up to three per level in spill writers. Read-ahead gets
 10% of available RAM, so smaller machines get fewer workers. `bounded`
 halves each queue. The estimate allows about 4 KiB per row plus twice its
-measured geometry bytes. Pass 1 has measured nothing yet, so it assumes
-1 KiB of geometry per row. Unlike the pass-2 buffers, tylertoo sizes the read-ahead
-before pass 2 reads a row, so it cannot correct itself. Wide schemas with
+geometry bytes, which both passes take from the Parquet footer. Unlike the
+pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row, so
+it cannot correct itself. Wide schemas with
 large strings can exceed it.
 Measure memory use if headroom is tight, or use `--read-workers 1`.
 

@@ -2242,6 +2242,20 @@ fn byte_array_read_batch_cap(
     Ok(Some(rows))
 }
 
+/// How pass 1 reads its input (#717): pass 2's batch size, reader count and
+/// memory profile, with the read-ahead priced at `geom_bytes / rows`, the
+/// footers' geometry weight over the selected rows. Unlike pass 2's, this
+/// weight is not a pass-1 measurement, so it is known before the first batch.
+/// The fallback applies only when no rows are selected.
+fn pass1_read_tuning(options: &ConvertOptions, geom_bytes: u64, rows: u64) -> ReadTuning {
+    ReadTuning {
+        batch_size: options.read_batch_size.max(1),
+        workers: resolve_read_workers(options.read_workers),
+        avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
+        profile: options.profile,
+    }
+}
+
 /// The preflight-derived inputs pass 1 reads. Grouped so
 /// [`resolve_plan_state`] can take them as one argument.
 struct Pass1Inputs<'a> {
@@ -4053,11 +4067,11 @@ struct Pass1Output {
     num_rows: usize,
     /// Rows skipped for a null, empty, or non-finite geometry (H4).
     skipped_rows: usize,
-    /// Total in-memory Arrow byte size of the encoded geometry column across
-    /// every scanned batch (#305). `geom_bytes / num_rows` is the measured
-    /// average encoded-geometry size per input row that sizes the pass-2
-    /// RAM-vs-spill decision; near-free to collect (one buffer-size sum per
-    /// batch — no re-encode).
+    /// Encoded size of the geometry column over the selected row groups, from
+    /// the footers' uncompressed column sizes (#305; footer-derived since
+    /// #717, see [`ConvertSource::selected_column_bytes`]). `geom_bytes /
+    /// num_rows` is the average encoded-geometry size per input row that
+    /// sizes the pass-2 RAM-vs-spill decision and both passes' read-ahead.
     geom_bytes: u64,
     /// Pass-1 stage split in CORE-SECONDS ([profile] / `TYLERTOO_PROFILE_JSON`
     /// instrumentation, measurement base for the pass-1 parallelization
@@ -4950,14 +4964,16 @@ fn run_pass1_with_chunk_rows(
     // does at ~0.8 GB/s and so bounded pass 1's wall time. Pass 1 reads
     // through pass 2's ordered parallel reader, sized by the same
     // `read_workers`, so it delivers the same batches whatever the count.
-    // Pass 1 is what measures the geometry weight, so the read-ahead is
-    // priced with the fallback.
-    let read_tuning = ReadTuning {
-        batch_size: options.read_batch_size.max(1),
-        workers: resolve_read_workers(options.read_workers),
-        avg_geom_bytes: None,
-        profile: options.profile,
-    };
+    //
+    // #305: the geometry column's encoded size over the rows pass 1 reads,
+    // so the pass-2 RAM-vs-spill estimate can use this input's actual
+    // average geometry weight instead of a one-size-fits-all constant.
+    // #717: from the footers, not the Arrow batches, whose buffer capacity
+    // depends on how many readers produced them. Being a footer fact, it also
+    // prices pass 1's own read-ahead.
+    let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
+    let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
+    let read_tuning = pass1_read_tuning(options, geom_bytes, selected_rows);
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -4988,12 +5004,6 @@ fn run_pass1_with_chunk_rows(
         accumulator_requested(options) && placeholder_has_size(options.simplify.factor);
     let mut areas: Vec<f32> = Vec::new();
     let mut num_rows = 0usize;
-    // #305: the geometry column's encoded size over the rows pass 1 reads,
-    // so the pass-2 RAM-vs-spill estimate can use this input's actual
-    // average geometry weight instead of a one-size-fits-all constant.
-    // #717: from the footers, not the Arrow batches, whose buffer capacity
-    // depends on how many readers produced them.
-    let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
@@ -6689,6 +6699,28 @@ mod tests {
             let parallel = run_pass1_for_test(tin.path(), &options(workers), 5);
             assert_pass1_outputs_eq(&sequential, &parallel);
         }
+    }
+
+    /// #717 review: pass 1 runs several readers, each with its own read-ahead
+    /// queue, and the queue is sized from the per-row geometry weight. That
+    /// weight is a footer fact, known before the first batch, so pass 1 must
+    /// price its read-ahead with it. A 1 KiB guess under-counts heavy polygons
+    /// by the ratio of their real size to the guess.
+    #[test]
+    fn pass1_read_ahead_is_priced_with_the_footer_geometry_weight() {
+        let options = ConvertOptions {
+            read_batch_size: 64,
+            read_workers: 3,
+            profile: MemoryProfile::Bounded,
+            ..Default::default()
+        };
+        let tuning = pass1_read_tuning(&options, 40_000 * 9, 9);
+        assert_eq!(tuning.avg_geom_bytes, Some(40_000));
+        assert_eq!(tuning.batch_size, 64);
+        assert_eq!(tuning.workers, 3);
+        assert!(matches!(tuning.profile, MemoryProfile::Bounded));
+        // Nothing selected: no average to take, so the fallback applies.
+        assert_eq!(pass1_read_tuning(&options, 0, 0).avg_geom_bytes, None);
     }
 
     /// #449: pass 1 must stop collecting line geometries the moment the
