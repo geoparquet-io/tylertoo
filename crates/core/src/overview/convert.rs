@@ -7309,6 +7309,9 @@ mod tests {
         fn any_f64() -> impl Strategy<Value = f64> {
             prop_oneof![
                 8 => -1.0e6f64..1.0e6f64,
+                // Signed zeros: which of the two a min/max keeps depends on
+                // the order the coordinates are visited in (#650).
+                2 => prop_oneof![Just(0.0), Just(-0.0)],
                 1 => Just(f64::NAN),
                 1 => prop_oneof![Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
             ]
@@ -7323,7 +7326,7 @@ mod tests {
             (any_ring(), proptest::collection::vec(any_ring(), 0..3))
                 .prop_map(|(ext, ints)| Polygon::new(ext, ints))
         }
-        fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
+        pub(super) fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             prop_oneof![
                 any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
                 proptest::collection::vec(any_coord(), 0..5)
@@ -7356,9 +7359,7 @@ mod tests {
     /// with `try_to_geometry`, then `scan_feature`.
     mod scan_feature_traits_props {
         use super::super::{scan_feature, scan_feature_traits, FeatureKind};
-        use geo::{
-            Geometry, GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon,
-        };
+        use geo::{Geometry, GeometryCollection, LineString, Polygon};
         use geo_traits::to_geo::ToGeoGeometry;
         use geoarrow::array::WkbArray;
         use geoarrow::datatypes::WkbType;
@@ -7405,43 +7406,11 @@ mod tests {
             b
         }
 
-        fn any_f64() -> impl Strategy<Value = f64> {
-            prop_oneof![
-                8 => -1.0e6f64..1.0e6f64,
-                // Signed zeros: which of the two a min/max keeps depends on
-                // the order the coordinates are visited in.
-                2 => prop_oneof![Just(0.0), Just(-0.0)],
-                1 => Just(f64::NAN),
-                1 => prop_oneof![Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
-            ]
-        }
-        fn any_coord() -> impl Strategy<Value = geo::Coord<f64>> {
-            (any_f64(), any_f64()).prop_map(|(x, y)| geo::Coord { x, y })
-        }
-        fn any_ring() -> impl Strategy<Value = LineString<f64>> {
-            proptest::collection::vec(any_coord(), 0..6).prop_map(LineString::new)
-        }
-        fn any_polygon() -> impl Strategy<Value = Polygon<f64>> {
-            (any_ring(), proptest::collection::vec(any_ring(), 0..3))
-                .prop_map(|(ext, ints)| Polygon::new(ext, ints))
-        }
-        fn any_simple() -> impl Strategy<Value = Geometry<f64>> {
-            prop_oneof![
-                any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
-                proptest::collection::vec(any_coord(), 0..5)
-                    .prop_map(|cs| Geometry::MultiPoint(cs.into_iter().map(Point::from).collect())),
-                any_ring().prop_map(Geometry::LineString),
-                proptest::collection::vec(any_ring(), 0..3)
-                    .prop_map(|ls| Geometry::MultiLineString(MultiLineString::new(ls))),
-                any_polygon().prop_map(Geometry::Polygon),
-                proptest::collection::vec(any_polygon(), 0..3)
-                    .prop_map(|ps| Geometry::MultiPolygon(MultiPolygon::new(ps))),
-            ]
-        }
+        /// The #274 generator, plus GeometryCollections of its output.
         fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             prop_oneof![
-                4 => any_simple(),
-                1 => proptest::collection::vec(any_simple(), 0..4)
+                4 => super::scan_feature_props::any_geometry(),
+                1 => proptest::collection::vec(super::scan_feature_props::any_geometry(), 0..4)
                     .prop_map(|gs| Geometry::GeometryCollection(GeometryCollection::new_from(gs))),
             ]
         }
