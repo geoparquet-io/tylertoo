@@ -278,7 +278,11 @@ Use `overview()` followed by `export_pmtiles()` for all options. Runs the same c
 ### Example
 
 ```python
->>> convert("buildings.parquet", "out.pmtiles", max_zoom=10)
+>>> report = convert(
+...     "buildings.parquet", "out.pmtiles", max_zoom=10
+... )
+>>> sorted(report)
+['convert', 'export']
 ```
 
 ## Report types
