@@ -8388,156 +8388,99 @@ mod tests {
         }
     }
 
-    /// #650: `scan_chunk` reads each geometry in place and builds a
-    /// `geo::Geometry` only for the rows that keep one (coalesced lines, or
-    /// every row when the #384 accumulator wants areas). Every output must
-    /// match the pre-#650 body, which decoded the whole chunk and ran
-    /// `scan_feature` on each row, for every coalescing mode and gate.
-    #[test]
-    fn scan_chunk_in_place_matches_decode_then_scan() {
-        use arrow_array::BinaryArray;
-        use geo::{MultiPolygon, Polygon};
-
+    /// The pre-#650 `scan_chunk` loop, verbatim but for the decode, which
+    /// it does the old way: convert every row, then scan the copy.
+    fn pre_650_scan_chunk(
+        field: &Field,
+        gcol: &dyn Array,
+        mask: Option<&[Option<bool>]>,
+        bbox_units: Option<&[f64; 4]>,
+        collect_lines: LineCollect,
+        want_areas: bool,
+    ) -> ChunkScan {
         use super::super::convert::scan_feature;
         use crate::batch_processor::extract_geometries_opt_from_array;
 
-        /// The pre-#650 `scan_chunk` loop, verbatim but for the decode,
-        /// which it does the old way: convert every row, then scan it.
-        fn reference(
-            field: &Field,
-            gcol: &dyn Array,
-            mask: Option<&[Option<bool>]>,
-            bbox_units: Option<&[f64; 4]>,
-            collect_lines: LineCollect,
-            want_areas: bool,
-        ) -> ChunkScan {
-            let garr = from_arrow_array(gcol, field).unwrap();
-            let mut geoms = Vec::new();
-            extract_geometries_opt_from_array(garr.as_ref(), &mut geoms).unwrap();
-            let mut out = ChunkScan {
-                features: FeatureTable::new(),
-                tally: super::super::convert::BboxTally::default(),
-                areas: Vec::new(),
-                kept_row: vec![false; geoms.len()],
-                lines: Vec::new(),
-                line_count: 0,
-                line_bytes: 0,
-                point_count: 0,
-                skipped_rows: 0,
-            };
-            for (i, gopt) in geoms.iter().enumerate() {
-                if let Some(m) = mask {
-                    if m[i] != Some(true) {
-                        continue;
-                    }
-                }
-                let Some(g) = gopt.as_ref() else {
-                    out.skipped_rows += 1;
-                    continue;
-                };
-                let Some((kind, fbbox)) = scan_feature(g) else {
-                    out.skipped_rows += 1;
-                    continue;
-                };
-                if let Some(bb) = bbox_units {
-                    if !super::super::convert::bboxes_intersect(&fbbox, bb) {
-                        continue;
-                    }
-                }
-                if matches!(kind, FeatureKind::Point) {
-                    out.point_count += 1;
-                }
-                if collect_lines != LineCollect::Off && matches!(kind, FeatureKind::Line) {
-                    out.line_count += 1;
-                    out.line_bytes += collected_line_bytes(g);
-                    if collect_lines == LineCollect::Collect {
-                        out.lines.push(ChunkLine {
-                            local_row: i,
-                            local_feat_pos: out.features.len(),
-                            geom: g.clone(),
-                        });
-                    }
-                }
-                out.kept_row[i] = true;
-                if want_areas {
-                    out.areas.push(polygon_area_f32(g));
-                }
-                out.tally.observe(&fbbox, Crs::Epsg4326, i);
-                out.features.push(&AssignFeature {
-                    index: i,
-                    bbox: fbbox,
-                    kind,
-                    sort_key: None,
-                    entry_level: None,
-                });
-            }
-            out
-        }
-
-        fn point_wkb(x: f64, y: f64) -> Vec<u8> {
-            let mut v = vec![1u8];
-            v.extend_from_slice(&1u32.to_le_bytes());
-            v.extend_from_slice(&x.to_le_bytes());
-            v.extend_from_slice(&y.to_le_bytes());
-            v
-        }
-        let wkb = |g: Geometry<f64>| crate::wkb::geometry_to_wkb(&g).unwrap();
-        let square = |x: f64, y: f64, s: f64| {
-            Polygon::new(
-                LineString::from(vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)]),
-                vec![],
-            )
+        let garr = from_arrow_array(gcol, field).unwrap();
+        let mut geoms = Vec::new();
+        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms).unwrap();
+        let mut out = ChunkScan {
+            features: FeatureTable::new(),
+            tally: super::super::convert::BboxTally::default(),
+            areas: Vec::new(),
+            kept_row: vec![false; geoms.len()],
+            lines: Vec::new(),
+            line_count: 0,
+            line_bytes: 0,
+            point_count: 0,
+            skipped_rows: 0,
         };
-        let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
-        for i in 0..36 {
-            let f = i as f64;
-            rows.push(match i % 9 {
-                0 => None,
-                1 => Some(wkb(Geometry::Point(Point::new(f, -f)))),
-                2 => Some(wkb(Geometry::LineString(LineString::from(vec![
-                    (-0.0, f),
-                    (0.0, f + 1.0),
-                    (f, 2.0),
-                ])))),
-                3 => Some(wkb(Geometry::Polygon(square(f, f, 0.5)))),
-                4 => Some(wkb(Geometry::MultiPolygon(MultiPolygon::new(vec![
-                    square(-f, 0.0, 1.0),
-                    square(f, 1.0, 2.0),
-                ])))),
-                // Non-finite, then WKB's empty point: both unusable.
-                5 => Some(point_wkb(f64::NAN, f)),
-                6 => Some(point_wkb(f64::NAN, f64::NAN)),
-                7 => Some(wkb(Geometry::LineString(LineString::from(vec![
-                    (f, f),
-                    (f + 3.0, f + 0.5),
-                ])))),
-                _ => Some(wkb(Geometry::Point(Point::new(-f, 0.0)))),
+        for (i, gopt) in geoms.iter().enumerate() {
+            if let Some(m) = mask {
+                if m[i] != Some(true) {
+                    continue;
+                }
+            }
+            let Some(g) = gopt.as_ref() else {
+                out.skipped_rows += 1;
+                continue;
+            };
+            let Some((kind, fbbox)) = scan_feature(g) else {
+                out.skipped_rows += 1;
+                continue;
+            };
+            if let Some(bb) = bbox_units {
+                if !super::super::convert::bboxes_intersect(&fbbox, bb) {
+                    continue;
+                }
+            }
+            if matches!(kind, FeatureKind::Point) {
+                out.point_count += 1;
+            }
+            if collect_lines != LineCollect::Off && matches!(kind, FeatureKind::Line) {
+                out.line_count += 1;
+                out.line_bytes += collected_line_bytes(g);
+                if collect_lines == LineCollect::Collect {
+                    out.lines.push(ChunkLine {
+                        local_row: i,
+                        local_feat_pos: out.features.len(),
+                        geom: g.clone(),
+                    });
+                }
+            }
+            out.kept_row[i] = true;
+            if want_areas {
+                out.areas.push(polygon_area_f32(g));
+            }
+            out.tally.observe(&fbbox, Crs::Epsg4326, i);
+            out.features.push(&AssignFeature {
+                index: i,
+                bbox: fbbox,
+                kind,
+                sort_key: None,
+                entry_level: None,
             });
         }
-        let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| r.as_deref()).collect();
-        let gcol = BinaryArray::from(refs);
-        let mut md = std::collections::HashMap::new();
-        md.insert(
-            "ARROW:extension:name".to_string(),
-            "geoarrow.wkb".to_string(),
-        );
-        let field = Field::new("geometry", DataType::Binary, true).with_metadata(md);
-        let mask: Vec<Option<bool>> = (0..rows.len())
-            .map(|i| match i % 7 {
-                0 => Some(false),
-                3 => None,
-                _ => Some(true),
-            })
-            .collect();
-        let region = [-5.0, -40.0, 20.0, 40.0];
+        out
+    }
 
+    /// Assert `scan_chunk` over `gcol` matches [`pre_650_scan_chunk`] in
+    /// every output, for every coalescing mode, with and without areas,
+    /// the attribute filter (`mask`) and the regional extract (`region`).
+    fn assert_scan_chunk_matches_pre_650(
+        what: &str,
+        field: &Field,
+        gcol: &dyn Array,
+        mask: &[Option<bool>],
+        region: &[f64; 4],
+    ) {
         for collect in [LineCollect::Off, LineCollect::Tally, LineCollect::Collect] {
             for want_areas in [false, true] {
-                for m in [None, Some(mask.as_slice())] {
-                    for bb in [None, Some(&region)] {
+                for m in [None, Some(mask)] {
+                    for bb in [None, Some(region)] {
                         let got = scan_chunk(
-                            &field,
-                            &gcol,
+                            field,
+                            gcol,
                             0,
                             m,
                             bb,
@@ -8547,9 +8490,9 @@ mod tests {
                             &Pass1Timers::default(),
                         )
                         .unwrap();
-                        let want = reference(&field, &gcol, m, bb, collect, want_areas);
+                        let want = pre_650_scan_chunk(field, gcol, m, bb, collect, want_areas);
                         let case = format!(
-                            "collect {:?} areas {want_areas} mask {} bbox {}",
+                            "{what}: collect {:?} areas {want_areas} mask {} bbox {}",
                             collect as u8,
                             m.is_some(),
                             bb.is_some()
@@ -8577,6 +8520,201 @@ mod tests {
                         assert_eq!(got.skipped_rows, want.skipped_rows, "{case}");
                     }
                 }
+            }
+        }
+    }
+
+    /// Nine kinds of row, four times over: null, point, line with signed
+    /// zeros, polygon, multipolygon, NaN in one axis, NaN in both (WKB's and
+    /// native arrays' empty point), a second line, a second point.
+    fn pre_650_fixture_rows() -> Vec<Option<Geometry<f64>>> {
+        use geo::MultiPolygon;
+        let square = |x: f64, y: f64, s: f64| {
+            Polygon::new(
+                LineString::from(vec![(x, y), (x + s, y), (x + s, y + s), (x, y + s), (x, y)]),
+                vec![],
+            )
+        };
+        (0..36)
+            .map(|i| {
+                let f = f64::from(i);
+                match i % 9 {
+                    0 => None,
+                    1 => Some(Geometry::Point(Point::new(f, -f))),
+                    2 => Some(Geometry::LineString(LineString::from(vec![
+                        (-0.0, f),
+                        (0.0, f + 1.0),
+                        (f, 2.0),
+                    ]))),
+                    3 => Some(Geometry::Polygon(square(f, f, 0.5))),
+                    4 => Some(Geometry::MultiPolygon(MultiPolygon::new(vec![
+                        square(-f, 0.0, 1.0),
+                        square(f, 1.0, 2.0),
+                    ]))),
+                    5 => Some(Geometry::Point(Point::new(f64::NAN, f))),
+                    6 => Some(Geometry::Point(Point::new(f64::NAN, f64::NAN))),
+                    7 => Some(Geometry::LineString(LineString::from(vec![
+                        (f, f),
+                        (f + 3.0, f + 0.5),
+                    ]))),
+                    _ => Some(Geometry::Point(Point::new(-f, 0.0))),
+                }
+            })
+            .collect()
+    }
+
+    /// The fixture's attribute-filter mask: dropped, NULL and kept rows.
+    fn pre_650_fixture_mask(n: usize) -> Vec<Option<bool>> {
+        (0..n)
+            .map(|i| match i % 7 {
+                0 => Some(false),
+                3 => None,
+                _ => Some(true),
+            })
+            .collect()
+    }
+
+    /// The fixture's regional extract: misses some rows on each side.
+    const PRE_650_REGION: [f64; 4] = [-5.0, -40.0, 20.0, 40.0];
+
+    /// #650: `scan_chunk` reads each geometry in place and builds a
+    /// `geo::Geometry` only for the rows that keep one (coalesced lines, or
+    /// every row when the #384 accumulator wants areas). Every output must
+    /// match the pre-#650 body, which decoded the whole chunk and ran
+    /// `scan_feature` on each row, for every coalescing mode and gate.
+    #[test]
+    fn scan_chunk_in_place_matches_decode_then_scan() {
+        use arrow_array::BinaryArray;
+
+        // WKB spells the empty point `POINT(NaN NaN)`; `geometry_to_wkb`
+        // writes the NaN rows as such.
+        let rows: Vec<Option<Vec<u8>>> = pre_650_fixture_rows()
+            .iter()
+            .map(|g| g.as_ref().map(|g| crate::wkb::geometry_to_wkb(g).unwrap()))
+            .collect();
+        let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| r.as_deref()).collect();
+        let gcol = BinaryArray::from(refs);
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkb".to_string(),
+        );
+        let field = Field::new("geometry", DataType::Binary, true).with_metadata(md);
+        let mask = pre_650_fixture_mask(rows.len());
+        assert_scan_chunk_matches_pre_650("wkb", &field, &gcol, &mask, &PRE_650_REGION);
+    }
+
+    /// #650 over native GeoArrow columns: the mixed `Geometry` array in both
+    /// coordinate layouts, and the single-type line and polygon arrays a
+    /// GeoParquet file with native encoding most often holds.
+    #[test]
+    fn scan_chunk_in_place_matches_decode_then_scan_on_native_arrays() {
+        use geoarrow::array::{GeometryBuilder, LineStringBuilder, PolygonBuilder};
+        use geoarrow::datatypes::{
+            CoordType, Dimension, GeometryType, LineStringType, PolygonType,
+        };
+        use geoarrow_array::GeoArrowArray;
+
+        let geoms = pre_650_fixture_rows();
+        let only = |keep: fn(&Geometry<f64>) -> bool| -> Vec<Option<Geometry<f64>>> {
+            geoms.iter().map(|g| g.clone().filter(keep)).collect()
+        };
+        let lines = only(|g| matches!(g, Geometry::LineString(_)));
+        let polygons = only(|g| matches!(g, Geometry::Polygon(_)));
+        let mask = pre_650_fixture_mask(geoms.len());
+        let md = std::sync::Arc::<geoarrow::datatypes::Metadata>::default;
+        for ct in [CoordType::Separated, CoordType::Interleaved] {
+            let arrays: [(&str, std::sync::Arc<dyn GeoArrowArray>); 3] = [
+                (
+                    "geometry",
+                    std::sync::Arc::new(
+                        GeometryBuilder::from_nullable_geometries(
+                            &geoms,
+                            GeometryType::new(md()).with_coord_type(ct),
+                        )
+                        .unwrap()
+                        .finish(),
+                    ),
+                ),
+                (
+                    "linestring",
+                    std::sync::Arc::new(
+                        LineStringBuilder::from_nullable_geometries(
+                            &lines,
+                            LineStringType::new(Dimension::XY, md()).with_coord_type(ct),
+                        )
+                        .unwrap()
+                        .finish(),
+                    ),
+                ),
+                (
+                    "polygon",
+                    std::sync::Arc::new(
+                        PolygonBuilder::from_nullable_geometries(
+                            &polygons,
+                            PolygonType::new(Dimension::XY, md()).with_coord_type(ct),
+                        )
+                        .unwrap()
+                        .finish(),
+                    ),
+                ),
+            ];
+            for (name, array) in arrays {
+                let field = array.data_type().to_field("geometry", true);
+                let gcol = array.to_array_ref();
+                assert_scan_chunk_matches_pre_650(
+                    &format!("{name} {ct:?}"),
+                    &field,
+                    gcol.as_ref(),
+                    &mask,
+                    &PRE_650_REGION,
+                );
+            }
+        }
+    }
+
+    /// #650: `ScanRows` skips the scan of a row the attribute filter drops,
+    /// but still reads it, so a value the reader rejects fails the chunk
+    /// whether or not the filter keeps it, with the pre-#650 error: the
+    /// reader's message, under the chunk's global row range.
+    #[test]
+    fn scan_chunk_fails_on_an_unreadable_row_the_filter_drops() {
+        use crate::batch_processor::extract_geometries_opt_from_array;
+        use arrow_array::StringArray;
+
+        let gcol = StringArray::from(vec![Some("POINT (1 2)"), Some("POINT (1"), None]);
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "ARROW:extension:name".to_string(),
+            "geoarrow.wkt".to_string(),
+        );
+        let field = Field::new("geometry", DataType::Utf8, true).with_metadata(md);
+        let garr = from_arrow_array(&gcol, &field).unwrap();
+        let read_err = extract_geometries_opt_from_array(garr.as_ref(), &mut Vec::new())
+            .expect_err("row 1 is not WKT");
+        let want = ConvertError::from(decode_error_at_rows(40, 3, read_err)).to_string();
+        assert!(
+            want.contains("rows 40..43: Invalid geometry at index 1"),
+            "{want}"
+        );
+        let drop_row_1 = [Some(true), Some(false), Some(true)];
+        for mask in [None, Some(&drop_row_1[..])] {
+            for (collect, want_areas) in [(LineCollect::Off, false), (LineCollect::Collect, true)] {
+                let got = match scan_chunk(
+                    &field,
+                    &gcol,
+                    40,
+                    mask,
+                    None,
+                    Crs::Epsg4326,
+                    collect,
+                    want_areas,
+                    &Pass1Timers::default(),
+                ) {
+                    Ok(_) => panic!("mask {mask:?}: the unreadable row must fail the chunk"),
+                    Err(e) => e.to_string(),
+                };
+                assert_eq!(got, want, "mask {mask:?}");
             }
         }
     }
