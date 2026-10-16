@@ -2445,12 +2445,14 @@ fn encode_quantized_note(encode_quantized: usize) -> Option<String> {
 /// (#644), if any. Not part of the summary line's losses: wrapped data (0..360
 /// longitudes, dateline cells) is valid input and nothing was dropped. It is
 /// shown because a file in a projected CRS but labeled lon/lat, with
-/// `|x| ≤ 540`, would otherwise tile silently at the wrong place.
+/// `|x| ≤ 540`, would otherwise tile silently at the wrong place. Worded for
+/// either CRS: the report does not carry it, and for EPSG:3857 input the edge
+/// is the world edge in x, not a longitude.
 fn wrapped_note_line(wrapped: usize, input_features: usize) -> Option<String> {
     (wrapped > 0).then(|| {
         format!(
-            "note: {} of {} input features reach past \u{b1}180\u{b0} longitude and were \
-             drawn wrapped across the antimeridian \u{2014} expected for 0..360 data and \
+            "note: {} of {} input features reach past the world edge and were drawn \
+             wrapped across the antimeridian \u{2014} expected for 0..360 data and \
              dateline cells; otherwise check the real CRS with `gpio inspect <input>`",
             format_number(wrapped as u64),
             format_number(input_features as u64)
@@ -4707,7 +4709,7 @@ mod tests {
         assert_eq!(wrapped_note_line(0, 10), None);
         let note = wrapped_note_line(1234, 5000).unwrap();
         assert!(
-            note.contains("1,234 of 5,000 input features reach past \u{b1}180\u{b0}")
+            note.contains("1,234 of 5,000 input features reach past the world edge")
                 && note.contains("drawn wrapped across the antimeridian")
                 && !note.contains("dropped"),
             "{note}"
