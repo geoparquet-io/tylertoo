@@ -1616,7 +1616,7 @@ across all cores. The profile decides where output rows wait before writing.
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | Choose RAM buffering or disk spilling |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
-| `--read-workers N\|auto` | cores/4, at most 4 | More pass-2 readers = more throughput and resident batches |
+| `--read-workers N\|auto` | cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
 - **`speed`** buffers each level's rows in RAM. It runs in the least wall
   time, with no temp I/O, but peak RAM grows with total *output* size.
@@ -1627,9 +1627,10 @@ across all cores. The profile decides where output rows wait before writing.
 
 ### Automatic memory estimate
 
-`auto` estimates `buffered rows × per-row cost` from pass 1's average
-encoded-geometry size. Geometry dominates buffered rows and varies about
-400× across datasets. The estimate is conservative, favoring spilling.
+`auto` estimates `buffered rows × per-row cost` from the average
+encoded-geometry size of the rows pass 1 reads, taken from the uncompressed
+column sizes in the Parquet footer. Geometry dominates buffered rows and
+varies about 400× across datasets. The estimate is conservative, favoring spilling.
 If pass 1 scanned nothing, it uses about 8 KiB per duplicating row or
 16 KiB per partitioning row. Partitioning always spills above 2M buffered
 rows. The log reports the average, estimate, budget, and decision.
@@ -1667,22 +1668,26 @@ One batch's expensive geometries or serial decode then don't stall the
 batches behind it. Raise it to keep more cores busy.
 Each extra batch holds `read_batch_size` more rows; passes do not overlap.
 `--read-batch-size` sets the rows per batch, and `--in-flight-batches` sets
-how many batches coexist. Pass 2's readers add `--read-workers` × their queue
-depth on top. Under `bounded`, each level's spill writer adds up to three
+how many batches coexist. Each pass's readers add `--read-workers` × their
+queue depth on top. Under `bounded`, each level's spill writer adds up to three
 more batches: two queued and one in the encoder.
 
 ### Read workers
 
 `--read-workers` decodes disjoint runs of Parquet row groups concurrently
-in pass 2. An ordered merge restores the single-reader batch sequence,
-keeping output byte-identical.
+in both passes. An ordered merge restores the single-reader batch sequence,
+keeping output byte-identical. Most of a read is page decompression, which
+one thread does at under 1 GB/s, so on a machine with cores to spare a
+single reader bounds pass 1's wall time (#717).
 `crates/cli/tests/thread_count_determinism.rs` checks `1` against `2` and
 `4`. tylertoo honors an explicit value up to **2× the machine's cores**, at
 least 4. Above that the CLI rejects it, and the library clamps it with a
-warning, because each worker is a thread plus its own read-ahead queue. A
-worker buffers its run ahead of the merge. A row group larger than its queue
+warning, because each worker is a thread plus its own read-ahead queue. Each
+worker gets about four runs, as far as the row groups allow, so the merge is
+not left waiting on one worker's long run. A worker buffers its run ahead of
+the merge. A row group larger than its queue
 makes the worker wait mid-run, and the reads serialize again. A
-`[convert] pass 2 read:` debug line reports it. A single-row-group file
+`[convert] read:` debug line reports it. A single-row-group file
 always reads sequentially.
 
 For multi-GB partitioning inputs, `speed` can exhaust RAM: buffered output

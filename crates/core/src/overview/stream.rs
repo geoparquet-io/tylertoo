@@ -90,7 +90,7 @@ use rayon::prelude::*;
 use crate::batch_processor::{
     extract_geometries_from_array, visit_geoarrow_array, GeoArrowVisitor,
 };
-use crate::input_set::{ConvertSource, ReadPlan, RowGroupSelection};
+use crate::input_set::{ConvertSource, RowGroupSelection};
 
 use super::accumulate::{
     is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
@@ -1113,9 +1113,9 @@ fn run_pass2_levels(
     // holds a sink, so there is nothing to have measured.
     let mut sink_measurement = pipeline::SinkMeasurement::default();
     // How pass 2 reads the input: the batch chunking (identical for every
-    // worker count), the resolved reader-thread count (#494), and pass 1's
-    // measured geometry weight, which is what sizes the read-ahead against
-    // the memory budget.
+    // worker count), the resolved reader-thread count (#494), and the footer
+    // geometry weight pass 1 reports (#717), which is what sizes the
+    // read-ahead against the memory budget.
     let read_tuning = ReadTuning {
         batch_size: options.read_batch_size.max(1),
         workers: resolve_read_workers(options.read_workers),
@@ -1158,9 +1158,9 @@ fn run_pass2_levels(
             let stream_last = ctxs[n - 1].verbatim;
             let buffered = if stream_last { n - 1 } else { n };
             let buffered_rows: usize = hints[..buffered].iter().sum();
-            // #305: pass 1's measured average encoded-geometry size per input
-            // row sizes the RAM-vs-spill estimate (falls back to calibrated
-            // constants on an empty scan). Same decision timing as before —
+            // #305: the average encoded-geometry size per input row, from the
+            // footers (#717), sizes the RAM-vs-spill estimate (falls back to
+            // calibrated constants on an empty scan). Same decision timing as before —
             // pass 1 has always completed by this point (the assign barrier).
             let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
             let backing = pipeline::resolve_backing(
@@ -2240,6 +2240,20 @@ fn byte_array_read_batch_cap(
         widest.row_group,
     );
     Ok(Some(rows))
+}
+
+/// How pass 1 reads its input (#717): pass 2's batch size, reader count and
+/// memory profile, with the read-ahead priced at `geom_bytes / rows`, the
+/// footers' geometry weight over the selected rows. Unlike pass 2's, this
+/// weight is not a pass-1 measurement, so it is known before the first batch.
+/// The fallback applies only when no rows are selected.
+fn pass1_read_tuning(options: &ConvertOptions, geom_bytes: u64, rows: u64) -> ReadTuning {
+    ReadTuning {
+        batch_size: options.read_batch_size.max(1),
+        workers: resolve_read_workers(options.read_workers),
+        avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
+        profile: options.profile,
+    }
 }
 
 /// The preflight-derived inputs pass 1 reads. Grouped so
@@ -4053,11 +4067,11 @@ struct Pass1Output {
     num_rows: usize,
     /// Rows skipped for a null, empty, or non-finite geometry (H4).
     skipped_rows: usize,
-    /// Total in-memory Arrow byte size of the encoded geometry column across
-    /// every scanned batch (#305). `geom_bytes / num_rows` is the measured
-    /// average encoded-geometry size per input row that sizes the pass-2
-    /// RAM-vs-spill decision; near-free to collect (one buffer-size sum per
-    /// batch — no re-encode).
+    /// Encoded size of the geometry column over the selected row groups, from
+    /// the footers' uncompressed column sizes (#305; footer-derived since
+    /// #717, see [`ConvertSource::selected_column_bytes`]). `geom_bytes /
+    /// num_rows` is the average encoded-geometry size per input row that
+    /// sizes the pass-2 RAM-vs-spill decision and both passes' read-ahead.
     geom_bytes: u64,
     /// Pass-1 stage split in CORE-SECONDS ([profile] / `TYLERTOO_PROFILE_JSON`
     /// instrumentation, measurement base for the pass-1 parallelization
@@ -4103,7 +4117,9 @@ struct Pass1Timers {
 /// see [`Pass1Timers`]) — snapshotted for callers outside this module
 /// ([profile] logging and the `TYLERTOO_PROFILE_JSON` dump). As of #460 the
 /// stages overlap: `read` runs on the reader thread while `decode`/`scan`
-/// run on rayon chunks, so their sum can exceed the pass's wall time.
+/// run on rayon chunks, so their sum can exceed the pass's wall time. As of
+/// #717 `read` sums over every reader worker, so with `--read-workers > 1` it
+/// can exceed the pass's wall time on its own, as pass 2's does.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Pass1StageSecs {
     pub(super) read: f64,
@@ -4882,7 +4898,9 @@ fn merge_pass1_chunks(
 /// the pre-#460 shape — and assert byte-identical [`Pass1Output`]).
 ///
 /// Reader thread ([`super::pipe::scoped_pipe`], depth = pass 2's resolved
-/// in-flight-batches setting) → consumer: each batch is sliced into
+/// in-flight-batches setting; it reads through [`read_in_order`], so with
+/// `--read-workers > 1` it is the in-order merge of several readers, #717)
+/// → consumer: each batch is sliced into
 /// `chunk_rows`-row chunks (`RecordBatch::slice`, zero-copy), scanned in
 /// parallel by [`scan_chunk`] (geometry decode + gating), then merged back in
 /// ascending chunk order on the consumer thread. The order-dependent pieces —
@@ -4942,11 +4960,20 @@ fn run_pass1_with_chunk_rows(
 
     // Regional extract (#102): read only the bbox-selected row groups
     // (identical per-part selection in pass 2, keeping row indices aligned).
-    let mut reader = source.open_stream(&ReadPlan {
-        batch_size: options.read_batch_size.max(1),
-        projection: Some(&cols),
-        row_groups,
-    })?;
+    // #717: the read is mostly zstd decompression, which one reader thread
+    // does at ~0.8 GB/s and so bounded pass 1's wall time. Pass 1 reads
+    // through pass 2's ordered parallel reader, sized by the same
+    // `read_workers`, so it delivers the same batches whatever the count.
+    //
+    // #305: the geometry column's encoded size over the rows pass 1 reads,
+    // so the pass-2 RAM-vs-spill estimate can use this input's actual
+    // average geometry weight instead of a one-size-fits-all constant.
+    // #717: from the footers, not the Arrow batches, whose buffer capacity
+    // depends on how many readers produced them. Being a footer fact, it also
+    // prices pass 1's own read-ahead.
+    let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
+    let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
+    let read_tuning = pass1_read_tuning(options, geom_bytes, selected_rows);
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -4966,9 +4993,7 @@ fn run_pass1_with_chunk_rows(
     // `try_reserve_exact` so an absurd size falls back to growth instead of
     // aborting. Capacity only — output is unchanged.
     if bbox_query.is_none() && filter.is_none() {
-        if let Ok(rows) = source.selected_row_count(row_groups) {
-            let _ = features.try_reserve_exact(usize::try_from(rows.max(0)).unwrap_or(0));
-        }
+        let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
     }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
     // #407: a zero simplify factor has no placeholder, so pass 1 collects no
@@ -4977,7 +5002,6 @@ fn run_pass1_with_chunk_rows(
         accumulator_requested(options) && placeholder_has_size(options.simplify.factor);
     let mut areas: Vec<f32> = Vec::new();
     let mut num_rows = 0usize;
-    let mut geom_bytes = 0u64;
     let mut skipped_rows = 0usize;
     let mut point_count = 0usize;
     let mut explicit_keys: Vec<Option<f64>> = Vec::new();
@@ -4998,22 +5022,23 @@ fn run_pass1_with_chunk_rows(
     scoped_pipe(
         in_flight,
         // Producer: read batches in order until EOF or the consumer hangs
-        // up. A read error propagates via `?` (real failure, not a
-        // disconnect); a `SendError` means the consumer stopped — a clean
-        // `break`, per `scoped_pipe`'s contract.
+        // up. A read error propagates (real failure, not a disconnect); a
+        // `SendError` means the consumer stopped — a clean `Stop`, per
+        // `scoped_pipe`'s contract.
         |tx: &Sender<Pass1ReadMsg>| -> Result<(), ConvertError> {
-            loop {
-                let t_read = Instant::now();
-                let batch = match reader.next() {
-                    None => break,
-                    Some(res) => res?,
-                };
-                let read_dur = t_read.elapsed();
-                if tx.send(Pass1ReadMsg { batch, read_dur }).is_err() {
-                    break;
-                }
-            }
-            Ok(())
+            read_in_order(
+                source,
+                row_groups,
+                Some(&cols),
+                read_tuning,
+                |batch, _offset, read_dur| {
+                    Ok(if tx.send(Pass1ReadMsg { batch, read_dur }).is_err() {
+                        ReadFlow::Stop
+                    } else {
+                        ReadFlow::Continue
+                    })
+                },
+            )
         },
         // Consumer: process batches in read order. Within a batch, the
         // geometry decode + per-row scan/gate fans out over `chunk_rows`-row
@@ -5103,12 +5128,6 @@ fn run_pass1_with_chunk_rows(
                     );
                 }
                 num_rows += n;
-                // #305: measure the encoded geometry column's in-memory size
-                // so the pass-2 RAM-vs-spill estimate can use this input's
-                // actual average geometry weight instead of a
-                // one-size-fits-all constant. O(#buffers) per batch — no
-                // per-row work, no re-encode, unaffected by chunking.
-                geom_bytes += batch.column(gcol_idx).get_array_memory_size() as u64;
 
                 let t_keys = Instant::now();
                 extract_pass1_batch_keys(
@@ -5569,6 +5588,7 @@ fn write_level_streaming(
                     read_in_order(
                         source,
                         row_groups,
+                        None,
                         read_tuning,
                         |batch, offset, read_dur| {
                             if last_progress.elapsed().as_secs() >= 10 {
@@ -6121,7 +6141,9 @@ mod tests {
     /// module (only the items `run_pass1` itself needs are), so pull them in
     /// via the grandparent (`overview`) module directly.
     use super::super::convert::LevelPlan;
-    use super::super::testutil::{write_input, write_input_with_f64};
+    use super::super::testutil::{
+        write_input, write_input_with_f64, write_input_with_f64_row_groups,
+    };
 
     /// #494: `pass2.windows` sums batches and windows over both pass-2 reads
     /// and keeps the widest window, including when the streamed finest
@@ -6612,6 +6634,91 @@ mod tests {
              chunked={chunked_chunks} over {n} rows / {READ_BATCH_SIZE}-row \
              batches"
         );
+    }
+
+    /// #717: pass 1 reads through the same ordered parallel reader as pass 2,
+    /// so `read_workers` must not change a byte of [`Pass1Output`]. The read
+    /// batch size (7) divides neither the row-group size (25) nor the segment
+    /// size, so every worker seam falls mid-batch and the merge has to splice
+    /// the batches back together.
+    #[test]
+    fn pass1_parallel_read_matches_sequential_read() {
+        // 16 copies of 39 mixed rows: 624 rows over 25 row groups.
+        let geoms: Vec<Option<Geometry<f64>>> = (0..16)
+            .flat_map(|_| mixed_geometries(23, 9, 7))
+            .map(Some)
+            .collect();
+        let n = geoms.len();
+        let values: Vec<f64> = (0..n).map(|i| (n - i) as f64).collect();
+        let tin = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64_row_groups(tin.path(), &geoms, "rank", &values, Some(25));
+
+        const READ_BATCH_SIZE: usize = 7;
+        let options = |read_workers: usize| ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 9,
+            },
+            // A ranking column puts a second column in pass 1's projection.
+            sort_key: Some("rank".to_string()),
+            read_batch_size: READ_BATCH_SIZE,
+            read_workers,
+            simplify: SimplifyOptions {
+                collapse: CollapseMode::Square,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let segments = super::super::pipeline::parallel_read_segments(
+            &source,
+            None,
+            ReadTuning {
+                batch_size: READ_BATCH_SIZE,
+                workers: 4,
+                avg_geom_bytes: None,
+                profile: MemoryProfile::Auto,
+            },
+        );
+        assert!(
+            segments >= 2,
+            "the fixture must split across readers, or this compares the \
+             sequential reader with itself ({segments} segment(s))"
+        );
+
+        let sequential = run_pass1_for_test(tin.path(), &options(1), 5);
+        assert_eq!(
+            sequential.features.len(),
+            n,
+            "every row must survive pass 1, or a dropped row could hide a misread"
+        );
+        for workers in [2usize, 4] {
+            let parallel = run_pass1_for_test(tin.path(), &options(workers), 5);
+            assert_pass1_outputs_eq(&sequential, &parallel);
+        }
+    }
+
+    /// #717 review: pass 1 runs several readers, each with its own read-ahead
+    /// queue, and the queue is sized from the per-row geometry weight. That
+    /// weight is a footer fact, known before the first batch, so pass 1 must
+    /// price its read-ahead with it. A 1 KiB guess under-counts heavy polygons
+    /// by the ratio of their real size to the guess.
+    #[test]
+    fn pass1_read_ahead_is_priced_with_the_footer_geometry_weight() {
+        let options = ConvertOptions {
+            read_batch_size: 64,
+            read_workers: 3,
+            profile: MemoryProfile::Bounded,
+            ..Default::default()
+        };
+        let tuning = pass1_read_tuning(&options, 40_000 * 9, 9);
+        assert_eq!(tuning.avg_geom_bytes, Some(40_000));
+        assert_eq!(tuning.batch_size, 64);
+        assert_eq!(tuning.workers, 3);
+        assert!(matches!(tuning.profile, MemoryProfile::Bounded));
+        // Nothing selected: no average to take, so the fallback applies.
+        assert_eq!(pass1_read_tuning(&options, 0, 0).avg_geom_bytes, None);
     }
 
     /// #449: pass 1 must stop collecting line geometries the moment the
@@ -8097,6 +8204,7 @@ mod tests {
         read_in_order(
             source,
             selection,
+            None,
             ReadTuning {
                 batch_size: 1,
                 workers,

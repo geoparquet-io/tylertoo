@@ -87,7 +87,21 @@ pub(crate) fn write_input_with_f64(
     column: &str,
     values: &[f64],
 ) {
+    write_input_with_f64_row_groups(path, geoms, column, values, None);
+}
+
+/// [`write_input_with_f64`] with at most `rg_rows` rows per row group, so a
+/// parallel read has row groups to split across workers (#717). `None` keeps
+/// the writer's default.
+pub(crate) fn write_input_with_f64_row_groups(
+    path: &Path,
+    geoms: &[Option<Geometry<f64>>],
+    column: &str,
+    values: &[f64],
+    rg_rows: Option<usize>,
+) {
     use arrow_array::Float64Array;
+    use parquet::file::properties::WriterProperties;
 
     assert_eq!(geoms.len(), values.len(), "one value per geometry");
     let id = Int64Array::from((0..geoms.len() as i64).collect::<Vec<_>>());
@@ -114,8 +128,13 @@ pub(crate) fn write_input_with_f64(
     let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &gpq_options).unwrap();
     let target_schema = encoder.target_schema();
 
+    let props = rg_rows.map(|rows| {
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build()
+    });
     let file = std::fs::File::create(path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, target_schema, None).unwrap();
+    let mut writer = ArrowWriter::try_new(file, target_schema, props).unwrap();
     let encoded = encoder.encode_record_batch(&batch).unwrap();
     writer.write(&encoded).unwrap();
     writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());

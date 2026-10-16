@@ -481,8 +481,8 @@ pub struct ConvertOptions {
     /// is byte-identical for every value. No effect when `streaming` is
     /// `false`.
     pub in_flight_batches: usize,
-    /// Number of concurrent reader threads pass 2 splits the input across
-    /// (#494). Default [`READ_WORKERS_AUTO`], which
+    /// Number of concurrent reader threads pass 2 (#494) and pass 1 (#717)
+    /// each split the input across. Default [`READ_WORKERS_AUTO`], which
     /// [`resolve_read_workers`] expands to `min(cores / 4, READ_WORKERS_MAX)`;
     /// `1` reproduces the single sequential reader byte-for-byte, and so does
     /// every other value — workers own disjoint runs of row groups and an
@@ -776,7 +776,7 @@ pub(super) fn resolve_in_flight_batches_with_cores(requested: usize, cores: usiz
 /// (see [`resolve_read_workers`]). The library default.
 pub const READ_WORKERS_AUTO: usize = 0;
 
-/// Ceiling on auto-sized pass-2 reader threads (#494).
+/// Ceiling on auto-sized reader threads (#494; pass 1 too since #717).
 ///
 /// A reader worker is a decompress+decode thread, not an I/O-wait thread: it
 /// competes with the rayon compute pool for cores, and the merge that puts its
@@ -798,7 +798,7 @@ pub fn read_workers_ceiling() -> usize {
         .max(READ_WORKERS_MAX)
 }
 
-/// Resolve a requested pass-2 reader-thread count to a concrete one.
+/// Resolve a requested reader-thread count (both passes, #717) to a concrete one.
 ///
 /// [`READ_WORKERS_AUTO`] (0) takes a QUARTER of the machine's cores, clamped
 /// to `[1, READ_WORKERS_MAX]` — a quarter because pass 2's readers run

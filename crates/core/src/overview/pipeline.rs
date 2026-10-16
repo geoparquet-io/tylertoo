@@ -96,10 +96,11 @@ const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
 
 /// Measured-path per-row model (#305): `per_row =
 /// SINK_ROW_ALLOC_OVERHEAD_BYTES + factor(mode) × avg_geom_bytes`, where
-/// `avg_geom_bytes` is pass 1's measured
-/// average in-memory Arrow byte size of the encoded geometry column per input
-/// row. Pass 1 already decodes every geometry, so the measurement is free (one
-/// buffer-size sum per batch) and replaces the one-size-fits-all constants
+/// `avg_geom_bytes` is the average encoded size of the geometry column per
+/// input row, from the footers' uncompressed column sizes over the selected
+/// row groups (#717; until then, the Arrow memory of pass 1's batches, which
+/// depended on how the rows were read). It costs no I/O
+/// and replaces the one-size-fits-all constants
 /// above with the input's actual geometry weight — the dominant, wildly
 /// dataset-dependent term (corpus range: ~30 B/row for points to ~11.5 KiB/row
 /// for fieldmaps-adm4 boundary polygons).
@@ -148,7 +149,7 @@ const PARTITIONING_GEOM_FACTOR: u64 = 4;
 /// [`DUPLICATING_BYTES_PER_ROW`]) was the *whole* per-row estimate — no
 /// geometry term, no property term — and it was the only guard: once the
 /// up-front choice said RAM, nothing looked again. Here 256 B sits on top of
-/// terms that are measured (pass 1's geometry weight up front; the Arrow
+/// terms that are measured (the footers' geometry weight up front; the Arrow
 /// bytes of every buffered batch at run time), and the run-time check runs
 /// for the whole pass with the bytes already buffered as a term of its
 /// projection. An up-front estimate that is too low therefore costs a late
@@ -192,8 +193,8 @@ const AUTO_FALLBACK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Estimated peak RAM (bytes) the pass-2 sink would hold if `buffered_rows`
-/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is pass 1's
-/// measured average encoded-geometry size per input row (#305); `None` (or a
+/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is the average
+/// encoded-geometry size per input row, from the footers (#305, #717); `None` (or a
 /// degenerate 0) falls back to the calibrated per-mode constants. Saturating,
 /// so absurd counts never overflow (they simply clamp to a "definitely spill"
 /// value).
@@ -974,9 +975,9 @@ pub(super) struct ReadTuning {
     pub(super) batch_size: usize,
     /// Reader threads asked for (already resolved; `1` = sequential).
     pub(super) workers: usize,
-    /// Pass 1's measured average encoded-geometry bytes per input row (#305),
-    /// used only to size the read-ahead against the memory budget. `None`
-    /// falls back to [`READ_ROW_BYTES_FALLBACK`].
+    /// Average encoded-geometry bytes per input row (#305), from the footers
+    /// (#717), used only to size the read-ahead against the memory budget.
+    /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
     pub(super) avg_geom_bytes: Option<u64>,
     /// The run's requested memory profile. `Bounded` means the caller asked
     /// for memory over speed, so a worker's read-ahead queue is capped lower
@@ -1027,8 +1028,8 @@ const READ_AHEAD_MIN_BATCHES: usize = 4;
 /// tolerance for longer consumer stalls, and the cost is resident Arrow data.
 const READ_AHEAD_MAX_BATCHES: usize = 32;
 
-/// Assumed decoded GEOMETRY bytes per input row when pass 1 measured nothing
-/// (an empty scan, or the `--plan` path). Deliberately generous:
+/// Assumed decoded GEOMETRY bytes per input row when there is no geometry
+/// weight to price with (no rows selected). Deliberately generous:
 /// over-estimating costs reader workers, under-estimating costs RAM. The
 /// non-geometry per-row term ([`READ_ROW_NON_GEOM_BYTES`]) is added on top,
 /// measured or not.
@@ -1077,7 +1078,7 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
     // term plus the measured encoded geometry, doubled.
     //
-    // `READ_ROW_NON_GEOM_BYTES` is not decoration. Pass 1 measures ONLY the
+    // `READ_ROW_NON_GEOM_BYTES` is not decoration. The weight covers ONLY the
     // geometry column, and a read batch carries every projected column — a
     // 58-column schema's properties, offsets, dictionaries and validity
     // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
@@ -1160,9 +1161,15 @@ enum SegMsg {
 /// `InputSource` into a `Local` one, so `is_remote()` stays true and a remote
 /// convert's pass-2 read is ALWAYS sequential. Only inputs that were local to
 /// begin with take the parallel path.
+///
+/// `projection` is a [`ReadPlan::projection`]: root columns of the schema the
+/// source exposes, `None` for all of them. Every worker reads the same one.
+/// Pass 2 reads every column; pass 1 reads the geometry plus the columns its
+/// flags name (#717).
 pub(super) fn read_in_order<F>(
     source: &ConvertSource,
     row_groups: Option<&RowGroupSelection>,
+    projection: Option<&[usize]>,
     tuning: ReadTuning,
     mut on_batch: F,
 ) -> Result<(), ConvertError>
@@ -1174,23 +1181,23 @@ where
     let parallel = shape.workers > 1 && !source.is_remote();
     if tuning.workers > 1 && source.is_remote() {
         log::info!(
-            "[convert] pass 2: reading sequentially — parallel reads are local-only \
+            "[convert] reading sequentially — parallel reads are local-only \
              (a remote source's parts share one chunk cache)"
         );
     }
     if !parallel {
-        return read_sequentially(source, row_groups, batch_size, &mut on_batch);
+        return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
     }
-    let segments = source.read_segments(row_groups, shape.segment_target_rows)?;
+    let segments = plan_segments(source, row_groups, shape)?;
     if segments.len() < 2 {
-        return read_sequentially(source, row_groups, batch_size, &mut on_batch);
+        return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
     }
     let workers = shape.workers.min(segments.len());
     log::info!(
-        "[convert] pass 2 read: {workers} reader thread(s) over {} segment(s) \
+        "[convert] read: {workers} reader thread(s) over {} segment(s) \
          (~{} row(s) each, {} read-ahead batch(es) per reader)",
         segments.len(),
-        shape.segment_target_rows,
+        segments.iter().map(|s| s.rows).sum::<usize>() / segments.len(),
         shape.depth,
     );
     // A row group larger than a worker's whole queue cannot be buffered ahead,
@@ -1201,7 +1208,7 @@ where
     if let Some(biggest) = segments.iter().map(|s| s.rows).max() {
         if biggest > queue_rows {
             log::debug!(
-                "[convert] pass 2 read: largest segment is {biggest} row(s) but a \
+                "[convert] read: largest segment is {biggest} row(s) but a \
                  reader can buffer only {queue_rows} — reads will only partly \
                  overlap (the input's row groups are large relative to the \
                  read-ahead budget)"
@@ -1211,6 +1218,7 @@ where
     read_in_parallel(
         source,
         &segments,
+        projection,
         batch_size,
         workers,
         shape.depth,
@@ -1218,11 +1226,64 @@ where
     )
 }
 
+/// Segments each reader worker should get, at least, when the row groups
+/// allow it (#717).
+///
+/// [`ReadShape::segment_target_rows`] is a ceiling set by what a worker can
+/// buffer. On a machine with memory to spare it is large, and on its own it
+/// cut a 20-row-group input into 3 segments for 4 workers: the merge then
+/// drained worker 0's long first segment at one reader's speed while the
+/// others sat on full queues. Smaller segments keep every worker reading
+/// for the whole pass. Each one costs a reader open (the footer is reused)
+/// and, at its seam, one spliced batch. On the 20× Madagascar input, going
+/// from 1 to 4 segments per worker took pass 1 from 0.46 s to 0.26 s and pass
+/// 2 from 2.2 s to 1.55 s.
+const SEGMENTS_PER_WORKER: usize = 4;
+
+/// The segments [`read_in_order`] hands its workers: at most the shape's
+/// ceiling each, and small enough that every worker gets
+/// [`SEGMENTS_PER_WORKER`] of them when the row groups allow. Row groups are
+/// never split, so a run of large ones still gives fewer segments.
+fn plan_segments(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    shape: ReadShape,
+) -> Result<Vec<ReadSegment>, ConvertError> {
+    let rows = usize::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
+    let even = rows
+        .div_ceil(shape.workers.saturating_mul(SEGMENTS_PER_WORKER).max(1))
+        .max(1);
+    Ok(source.read_segments(row_groups, shape.segment_target_rows.min(even))?)
+}
+
+/// How many segments [`read_in_order`] would read concurrently for this
+/// source, selection and tuning; `0` when it would read sequentially.
+///
+/// Test seam: an equivalence test between worker counts compares the
+/// sequential reader with itself unless the fixture actually splits, and this
+/// is the same gating `read_in_order` applies.
+#[cfg(test)]
+pub(super) fn parallel_read_segments(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    tuning: ReadTuning,
+) -> usize {
+    let shape = resolve_read_shape(tuning);
+    if shape.workers < 2 || source.is_remote() {
+        return 0;
+    }
+    match plan_segments(source, row_groups, shape) {
+        Ok(segments) if segments.len() >= 2 => segments.len(),
+        _ => 0,
+    }
+}
+
 /// The pre-#494 path, unchanged and still the reference: one reader, one
 /// thread, batches straight through.
 fn read_sequentially<F>(
     source: &ConvertSource,
     row_groups: Option<&RowGroupSelection>,
+    projection: Option<&[usize]>,
     batch_size: usize,
     on_batch: &mut F,
 ) -> Result<(), ConvertError>
@@ -1231,7 +1292,7 @@ where
 {
     let mut reader = source.open_stream(&ReadPlan {
         batch_size,
-        projection: None,
+        projection,
         row_groups,
     })?;
     let mut row_offset = 0usize;
@@ -1282,6 +1343,7 @@ where
 fn read_in_parallel<F>(
     source: &ConvertSource,
     segments: &[ReadSegment],
+    projection: Option<&[usize]>,
     batch_size: usize,
     workers: usize,
     depth: usize,
@@ -1303,7 +1365,9 @@ where
             std::thread::Builder::new()
                 .name(format!("tylertoo-read-{w}"))
                 .spawn_scoped(scope, move || {
-                    read_segments_for_worker(source, segments, batch_size, workers, w, &tx)
+                    read_segments_for_worker(
+                        source, segments, projection, batch_size, workers, w, &tx,
+                    )
                 })?;
         }
 
@@ -1397,6 +1461,7 @@ where
 fn read_segments_for_worker(
     source: &ConvertSource,
     segments: &[ReadSegment],
+    projection: Option<&[usize]>,
     batch_size: usize,
     workers: usize,
     w: usize,
@@ -1404,7 +1469,7 @@ fn read_segments_for_worker(
 ) {
     let mut seq = w;
     while seq < segments.len() {
-        let mut stream = match source.open_segment(&segments[seq], batch_size) {
+        let mut stream = match source.open_segment(&segments[seq], projection, batch_size) {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx.send(SegMsg::Err(e.into()));
@@ -1568,6 +1633,7 @@ mod read_tests {
         read_in_order(
             source,
             None,
+            None,
             ReadTuning {
                 batch_size,
                 workers,
@@ -1620,9 +1686,7 @@ mod read_tests {
             avg_geom_bytes: Some(8),
             profile: MemoryProfile::Auto,
         });
-        let segments = source
-            .read_segments(None, shape.segment_target_rows)
-            .unwrap();
+        let segments = plan_segments(&source, None, shape).unwrap();
         assert!(
             segments.len() > 1 && shape.workers > 1,
             "fixture must actually split: {} segment(s), {} worker(s)",
@@ -1652,6 +1716,131 @@ mod read_tests {
                 got, reference,
                 "--read-workers {workers} must deliver the same batches, ids and \
                  row offsets as a single reader"
+            );
+        }
+    }
+
+    /// #717: the queue bound alone let a roomy machine cut 4 workers' worth
+    /// of input into 2–3 segments, and the merge then waited on worker 0's
+    /// long first segment while the rest sat idle. With room to spare, each
+    /// worker gets several segments, as far as the row groups allow.
+    #[test]
+    fn parallel_reads_give_each_worker_several_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        // 9 row groups of 700 rows: the queue bound alone allows 3968-row
+        // segments, i.e. two segments for four workers.
+        write_input(&path, 6300, 700);
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let tuning = ReadTuning {
+            batch_size: 128,
+            workers: 4,
+            avg_geom_bytes: Some(8),
+            profile: MemoryProfile::Auto,
+        };
+        let shape = resolve_read_shape(tuning);
+        assert_eq!(shape.workers, 4);
+        assert!(
+            source
+                .read_segments(None, shape.segment_target_rows)
+                .unwrap()
+                .len()
+                < 4,
+            "the queue bound alone must under-split this fixture, or the test is vacuous"
+        );
+        let segments = plan_segments(&source, None, shape).unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.row_groups.clone())
+                .collect::<Vec<_>>(),
+            (0..9).map(|g| vec![g]).collect::<Vec<_>>(),
+            "one row group per segment: 6300 rows / (4 workers × 4) is under a row group"
+        );
+        assert_eq!(parallel_read_segments(&source, None, tuning), 9);
+    }
+
+    /// Pass 1 reads a projection — the geometry plus the columns its flags
+    /// name — and #717 moved it onto this reader. Every worker must read the
+    /// projected columns only, and the merge must still reproduce the
+    /// sequential reader's batches exactly.
+    #[test]
+    fn parallel_reads_honour_a_projection() {
+        use arrow_array::Float64Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        let s = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("half", DataType::Float64, false),
+        ]));
+        let ids: Vec<i64> = (0..3000).collect();
+        let batch = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+                Arc::new(Float64Array::from(
+                    ids.iter().map(|&i| i as f64 / 2.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(250))
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), s, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let tuning = ReadTuning {
+            batch_size: 96,
+            workers: 4,
+            avg_geom_bytes: Some(8),
+            profile: MemoryProfile::Auto,
+        };
+        assert!(
+            parallel_read_segments(&source, None, tuning) > 1,
+            "fixture must split, or the parallel path is never taken"
+        );
+
+        let read = |workers: usize| {
+            let mut out: Vec<(usize, Vec<f64>)> = Vec::new();
+            read_in_order(
+                &source,
+                None,
+                Some(&[1]),
+                ReadTuning {
+                    batch_size: 96,
+                    workers,
+                    avg_geom_bytes: Some(8),
+                    profile: MemoryProfile::Auto,
+                },
+                |batch, offset, _dur| {
+                    assert_eq!(batch.num_columns(), 1, "only the projected column");
+                    assert_eq!(batch.schema().field(0).name(), "half");
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .unwrap();
+                    out.push((offset, col.values().to_vec()));
+                    Ok(ReadFlow::Continue)
+                },
+            )
+            .unwrap();
+            out
+        };
+        let reference = read(1);
+        let values: Vec<f64> = reference.iter().flat_map(|(_, v)| v.clone()).collect();
+        assert_eq!(
+            values,
+            ids.iter().map(|&i| i as f64 / 2.0).collect::<Vec<_>>()
+        );
+        for workers in [2usize, 4] {
+            assert_eq!(
+                read(workers),
+                reference,
+                "--read-workers {workers} must read the same projected batches"
             );
         }
     }
@@ -1739,6 +1928,7 @@ mod read_tests {
             let mut seen = 0usize;
             read_in_order(
                 &source,
+                None,
                 None,
                 ReadTuning {
                     batch_size: 64,
@@ -2148,6 +2338,7 @@ pub(super) fn run_pass2_buffered(
             read_in_order(
                 source,
                 selected_row_groups,
+                None,
                 read_tuning,
                 |batch, row_offset, read_dur| {
                     Ok(
