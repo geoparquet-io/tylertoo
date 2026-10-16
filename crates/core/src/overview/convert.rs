@@ -4652,9 +4652,10 @@ pub(super) fn wrapped_note(
     };
     let pct = count as f64 / total as f64 * 100.0;
     let exemplar = exemplar_note(exemplars, ExemplarEdge::Wrap);
+    let stop = if exemplar.is_empty() { "" } else { "." };
     Some(format!(
         "{count} of {total} feature(s) ({pct:.1}%) reach past {edge} and are drawn \
-         wrapped across the antimeridian.{exemplar} That is expected for 0..360 data \
+         wrapped across the antimeridian.{exemplar}{stop} That is expected for 0..360 data \
          and dateline cells; otherwise check that the coordinates really are the \
          declared CRS."
     ))
@@ -7714,7 +7715,9 @@ mod tests {
             .expect("a wrapped feature is noted");
         assert!(msg.contains("1 of 10 feature(s)"), "{msg}");
         assert!(msg.contains("±180° longitude"), "{msg}");
-        assert!(msg.contains("e.g. lon 190.250 (row 7)"), "{msg}");
+        assert!(msg.contains("e.g. lon 190.250 (row 7). That"), "{msg}");
+        let bare = wrapped_note(1, 10, Crs::Epsg4326, &[]).unwrap();
+        assert!(bare.contains("antimeridian. That"), "{bare}");
 
         let msg = wrapped_note(2, 4, Crs::Epsg4326, &[ex(Some(1), 3, "lon", -180.5)]).unwrap();
         assert!(msg.contains("lon -180.500 (part 1, row 3)"), "{msg}");
