@@ -13,6 +13,55 @@ For admin boundaries, parcels, or a choropleth, use `--verbatim` or raise
 `--gsd-base` and lower the thinning factors. See the
 [tuning reference](../OVERVIEW_TUNING.md).
 
+## How much faster — the skeptical reader's table
+
+Measured end-to-end (GeoParquet in, z0–z14 PMTiles out) against **tippecanoe
+v2.79.0 built from a verified pinned commit**, on the corpus datasets with
+tippecanoe running its recorded flags for each (`--drop-densest-as-needed`,
+`--simplification=10`, …) — both tools in a production configuration, not a
+rigged one. The "thinning off" column re-runs tylertoo with `--verbatim
+--simplify-factor 1.0` so it cannot win by emitting fewer features. Apple M3
+Pro, median of 2 warm runs; one recorded run on a non-idle machine, so treat
+ratios as approximate.
+
+| dataset (class) | features | tylertoo | tippecanoe e2e | speedup | speedup, thinning off | peak RSS (tylertoo / tippecanoe) |
+|---|---|---|---|---|---|---|
+| NYC places (point) † | 597,782 | 1.39 s | 30.03 s | **21.6×** | 2.4×* | 600 / 519 MB |
+| Portland roads (line) | 301,609 | 1.40 s | 28.30 s | **20.2×** | 16.3× | 1,611 / 652 MB |
+| Portland buildings (polygon) | 813,456 | 2.69 s | 57.22 s | **21.3×** | 16.3× | 999 / 967 MB |
+| Moldova parcels (polygon, dense) | 631,910 | 13.87 s | 119.28 s | **8.6×** | 5.9× | 1,848 / 926 MB |
+
+The honest footnotes, which are the point of this table:
+
+- † *The point row is not a parity measurement at all.* tippecanoe's recorded
+  flags had it building z15–z16 — 9,639 of its 10,486 tiles and 68% of its
+  output bytes — while tylertoo stopped at the requested z14. Both of that
+  row's ratios include that extra work.
+- *The point row's "thinning off" 2.4× is the weakest number this harness has
+  produced, and it carries a second mismatch on top of †:* `--verbatim` makes
+  tylertoo carry all 598k points at every zoom (1.39 s → 12.21 s) at 2110 MB
+  peak RSS, 4.07× tippecanoe's. Both tools drop points by design at
+  production settings, so neither point ratio describes how anyone would
+  actually run them. Read the line and polygon rows for parity numbers.
+- tylertoo's peak memory is **higher on three of four datasets** — up to 2.5×
+  on lines. The speed is parallelism (6–7 cores busy vs tippecanoe's ~2) plus
+  the native GeoParquet read, paid for in working set.
+- Archive sizes are smaller or equal except Portland buildings (1.11× at
+  defaults, 1.20× thinning off) — and except points, where the published
+  0.59× compares tylertoo's z0–14 archive against tippecanoe's z0–16. At
+  z0–14 on both sides tylertoo's points archive is 1.87× bigger.
+- Converting GeoParquet for tippecanoe is only 1–2% of its end-to-end wall at
+  this scale — the gap is tiler vs tiler, not a format-conversion tax.
+- On a small contiguous admin coverage (the 17k-polygon fixture set), the
+  parity-matched ratio is **≈7.5×**, not 16–20×.
+
+Every number above is from a committed record
+([`benchmarks/e2e/corpus_results.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/corpus_results.json),
+[`results.json`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/results.json))
+with full provenance, per-zoom tile counts, and the asymmetry list in
+[`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md).
+Reproduce with `./benchmarks/e2e/run_corpus.sh`.
+
 ## Flag mapping
 
 | tippecanoe | tylertoo | Note |

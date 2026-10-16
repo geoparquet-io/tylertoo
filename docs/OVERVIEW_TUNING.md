@@ -1682,6 +1682,43 @@ For multi-GB partitioning inputs, `speed` can exhaust RAM: buffered output
 may approach input size. `auto` selects `bounded` for large partitioning
 and over-budget runs. Watch peak RSS if you explicitly choose `speed`.
 
+### Remote staging (env)
+
+Pass 0 stages a remote input's selected row groups to the local disk spill
+up front, one coalesced range request per row group with several in flight
+([#286](https://github.com/geoparquet-io/tylertoo/issues/286)/[#287](https://github.com/geoparquet-io/tylertoo/issues/287)).
+Two of its heuristics accept **experimental environment overrides** so the
+[#290](https://github.com/geoparquet-io/tylertoo/issues/290) host sweep
+(source.coop vs real S3) can vary them per run without rebuilding. They are
+sweep knobs, not stable API — deliberately env-only, no CLI flags — and may
+change or disappear once #290 lands swept defaults. They alter request
+*scheduling* only; the staged bytes, batch order, and output are identical.
+
+| Variable | Default | Bounds | Effect |
+|----------|---------|--------|--------|
+| `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on row-group range requests in flight per part |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest row-group span)` |
+
+A negative or malformed value warns and keeps the default; a non-negative
+integer outside the bounds warns and clamps to the bound, including one too
+large for the underlying type. The values resolve once per process, at the
+first remote staging, so a long-lived library caller will not see a later change
+to the environment.
+
+Two lines are logged at staging start, at info when an override is set (so a
+sweep run records what it tested) and debug otherwise: the resolved ceiling
+and budget, and the **live** concurrency, which is what the run actually
+used. Watch the second one — the budget can cap the ceiling, so
+`TYLERTOO_STAGING_CONCURRENCY=16` and `=8` produce identical runs on an input
+whose row groups are large enough that `budget ÷ largest span` is the binding
+constraint.
+
+These warnings and lines go to the Rust log, which the CLI prints at its
+default `info` filter. The Python bindings install no log bridge, so from
+Python the overrides take effect **silently**: a typo in a variable name or
+value is indistinguishable from the default. Check the knobs from the CLI
+first if a sweep depends on them.
+
 ---
 
 ## Reusing a plan: `--save-plan`, `--plan`

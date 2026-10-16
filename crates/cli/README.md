@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/tylertoo?color=blue)](https://crates.io/crates/tylertoo)
 [![PyPI](https://img.shields.io/pypi/v/tylertoo?color=blue)](https://pypi.org/project/tylertoo/)
 
-GeoParquet to PMTiles with a Rust engine, CLI, and Python API. ~7.5× faster than tippecanoe (see [benchmarks](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md)). Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
+GeoParquet to PMTiles with a Rust engine, CLI, and Python API. 8.6–21.3× faster than tippecanoe end-to-end on 300k–813k-feature line and polygon datasets at each tool's production settings — 5.9–16.3× with tylertoo's feature thinning switched off, and at up to 2.1× peak memory (see [benchmarks](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md) for methods, caveats, and the point dataset, whose run compared unequal zoom ranges). Supports streaming, bounded-memory processing, remote reads, and sharded builds across multiple machines. Named after [“Tippecanoe and Tyler Too.”](https://en.wikipedia.org/wiki/Tippecanoe_and_Tyler_Too)
 
 ## Install
 
@@ -36,6 +36,8 @@ import tylertoo
 tylertoo.overview("fieldmaps-madagascar-adm4.parquet", "madagascar-ov.parquet", max_zoom=10)
 tylertoo.export_pmtiles("madagascar-ov.parquet", "madagascar.pmtiles")
 ```
+
+The intermediate `madagascar-ov.parquet` is a [`geo:overviews`](https://geoparquet-io.github.io/tylertoo/spec/overviews/) file (draft spec): a GeoParquet file that carries its own zoom pyramid and stays queryable as ordinary GeoParquet.
 
 See the [docs site](https://geoparquet-io.github.io/tylertoo/) for end-to-end tutorials and the API reference.
 
