@@ -6016,6 +6016,35 @@ mod tests {
     use super::super::convert::LevelPlan;
     use super::super::testutil::{write_input, write_input_with_f64};
 
+    /// #494: `pass2.windows` sums batches and windows over both pass-2 reads
+    /// and keeps the widest window, including when the streamed finest
+    /// level's timers are folded into the engine's.
+    #[test]
+    fn pass2_window_stats_sum_counts_and_keep_the_widest_window() {
+        let engine = Pass2Timers::default();
+        assert_eq!(engine.window_stats(), WindowStats::default());
+        engine.record_windows(WindowStats {
+            items: 10,
+            windows: 4,
+            max_window: 3,
+        });
+        let finest = Pass2Timers::default();
+        finest.record_windows(WindowStats {
+            items: 6,
+            windows: 3,
+            max_window: 2,
+        });
+        finest.fold_into(&engine);
+        assert_eq!(
+            engine.window_stats(),
+            WindowStats {
+                items: 16,
+                windows: 7,
+                max_window: 3,
+            }
+        );
+    }
+
     /// A mix of points, lines, and polygons, spread out so every row is its
     /// own coarse-level cell winner and no feature collapses during
     /// simplification (that would make an equivalence test brittle for the
