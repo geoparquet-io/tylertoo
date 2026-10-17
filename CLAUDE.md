@@ -6,6 +6,13 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
+## Agent-wide rules
+
+`AGENTS.md` holds the rules every coding agent follows, including how to
+file, group, and prioritize issues. Follow it.
+
+@AGENTS.md
+
 ## Critical Constraints
 
 ### 1. Test-Driven Development (TDD) is MANDATORY

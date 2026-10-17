@@ -8,6 +8,14 @@ Report security issues privately through
 For bugs and feature requests, use the
 [issue templates](https://github.com/geoparquet-io/tylertoo/issues/new/choose).
 
+## Issue priorities
+
+Every open issue carries a priority label, `P0` (most urgent) to `P3`, and
+a kind label: `bug`, `optimization`, or `enhancement`.
+[AGENTS.md](https://github.com/geoparquet-io/tylertoo/blob/main/AGENTS.md#the-priority-scale)
+defines the scale. When you report a bug, fill in the template's Impact
+and Workaround fields, and a maintainer assigns the labels.
+
 ## Development setup
 
 ```bash
