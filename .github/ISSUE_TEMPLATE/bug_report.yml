@@ -66,6 +66,29 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: What does this bug do to your work?
+      options:
+        - Wrong output, with no error or warning
+        - A crash or an error on my data
+        - Too slow, or uses too much memory
+        - Something else (explain under "Anything else?")
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: >
+        Did you find a way around it? Say how you found it, for example
+        from an error message, the docs, or trial and error.
+    validations:
+      required: false
+
   - type: textarea
     id: logs
     attributes:
