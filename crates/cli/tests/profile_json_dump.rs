@@ -649,7 +649,17 @@ fn check_export_line(report: &serde_json::Value, export_value: &serde_json::Valu
     // `tiles` exports a duplicating-mode overview, so every stage of the
     // per-wave path runs; the partitioning-only ones (`spill_*`) are present
     // but 0 here — see `profile_json_export_line_partitioning_mode`.
-    for name in ["band_read", "decode", "clip", "encode", "spool_write"] {
+    // The level scan's own stages (#730) run on every export.
+    for name in [
+        "band_read",
+        "decode",
+        "clip",
+        "encode",
+        "spool_write",
+        "scan_read",
+        "scan_decode",
+        "scan_size",
+    ] {
         assert!(
             export_stage_field(name) > 0.0,
             "export.stage_secs.{name} must be > 0 for a run that wrote tiles: {export_value}"
@@ -870,7 +880,16 @@ fn profile_json_export_line_partitioning_mode() {
             .as_f64()
             .unwrap_or_else(|| panic!("export.stage_secs.{name} must be a number: {export_value}"))
     };
-    for name in ["band_read", "decode", "clip", "encode", "spool_write"] {
+    for name in [
+        "band_read",
+        "decode",
+        "clip",
+        "encode",
+        "spool_write",
+        "scan_read",
+        "scan_decode",
+        "scan_size",
+    ] {
         assert!(
             stage(name) > 0.0,
             "export.stage_secs.{name} must be > 0 on the partitioning path: {export_value}"

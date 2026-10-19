@@ -3654,6 +3654,19 @@ pub(super) struct ExportTimers {
     /// #229/#459). Not the final `writer.finalize(...)` — see
     /// `phase_walls.finalize`.
     pub(super) checkpoint: AtomicU64,
+    /// The level scan's read (#730): opening each band's reader plus every
+    /// `next()` on [`super::export::scan_all_levels`]'s producer thread, the
+    /// scan's analogue of `band_read`. Single-threaded; overlaps
+    /// `scan_decode` / `scan_size` in wall time.
+    pub(super) scan_read: AtomicU64,
+    /// The level scan's per-batch bbox extraction (#730): reading the bbox
+    /// covering, or decoding the geometry when the file has none. A WALL
+    /// window on the scan's single consumer thread around each batch, so a
+    /// rayon-parallel decode inside it counts once, not per core.
+    pub(super) scan_decode: AtomicU64,
+    /// The level scan's per-batch tile sizing (`size_bboxes`, #730): a wall
+    /// window on the consumer thread, like `scan_decode`.
+    pub(super) scan_size: AtomicU64,
 }
 
 /// [`ExportTimers`] snapshotted in seconds for [`write_export_profile_json`].
@@ -3667,6 +3680,9 @@ pub(super) struct ExportStageSecs {
     pub(super) spill_read: f64,
     pub(super) spool_write: f64,
     pub(super) checkpoint: f64,
+    pub(super) scan_read: f64,
+    pub(super) scan_decode: f64,
+    pub(super) scan_size: f64,
 }
 
 impl ExportTimers {
@@ -3699,6 +3715,9 @@ impl ExportTimers {
             spill_read: nanos_secs(&self.spill_read),
             spool_write: nanos_secs(&self.spool_write),
             checkpoint: nanos_secs(&self.checkpoint),
+            scan_read: nanos_secs(&self.scan_read),
+            scan_decode: nanos_secs(&self.scan_decode),
+            scan_size: nanos_secs(&self.scan_size),
         }
     }
 }
@@ -3851,6 +3870,9 @@ pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
                 "spill_read": stage.spill_read,
                 "spool_write": stage.spool_write,
                 "checkpoint": stage.checkpoint,
+                "scan_read": stage.scan_read,
+                "scan_decode": stage.scan_decode,
+                "scan_size": stage.scan_size,
             },
             "per_zoom": per_zoom_json,
             "waves_total": inputs.waves_total,

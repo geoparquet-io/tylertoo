@@ -425,7 +425,10 @@ missing export line after a failed run is expected, not a profiling bug.
       "spill_write": 0.0,          // partitioning mode only; 0.0 otherwise
       "spill_read": 0.0,           // partitioning mode only; 0.0 otherwise
       "spool_write": 0.0028,
-      "checkpoint": 0.0
+      "checkpoint": 0.0,
+      "scan_read": 0.011,          // the level scan's split (#730); see
+      "scan_decode": 0.009,        // "Stages" below
+      "scan_size": 0.017
     },
     "per_zoom": [                  // one entry per exported zoom, coarse -> fine
       { "zoom": 1, "wall_secs": 0.012, "tiles": 1, "features": 40, "bytes": 4372 },
@@ -475,9 +478,7 @@ tile), never around a whole parallel section:
   the decode/clip consumer: the fill's producer in `fill_member_store`
   (partitioning), or each wave's producer in `process_wave` (duplicating,
   #535). The producer's blocking `tx.send` is excluded. The level scan's
-  own read (`scan_all_levels`, geometry column only) also runs on a
-  producer thread but is not timed by any stage; it lands in
-  `phase_walls.scan`.
+  own read is `scan_read`, not `band_read`.
 - `decode`: everything per batch around the clip that is not the clip. That
   means the GeoArrow → `geo::Geometry` decode, the EPSG:3857 → 4326
   reprojection (timed per geometry), property extraction, and per-row member
@@ -500,6 +501,15 @@ tile), never around a whole parallel section:
   is `phase_walls.finalize`. This stage is **legitimately 0.0** on any export
   that finishes before `CHECKPOINT_INTERVAL` elapses, and `checkpoints` (the
   call count) says the same thing as an integer.
+- `scan_read`, `scan_decode`, `scan_size` (#730): the level scan
+  (`scan_all_levels`) inside `phase_walls.scan`. `scan_read` is its
+  producer thread's reader opens and `next()` calls, like `band_read`.
+  `scan_decode` is getting each batch's per-feature bboxes, from the bbox
+  covering or, without one, by decoding the geometry. `scan_size` is
+  `size_bboxes`, which turns those bboxes into per-tile member counts.
+  **These two are wall windows on the scan's single consumer thread, not
+  core-seconds**: the rayon-parallel work inside one counts once. The read
+  overlaps the other two, as `band_read` overlaps `decode`.
 
 > **`export.stage_secs` is CORE-SECONDS, the same convention as
 > `pass2.stage_secs`.** Each stage is the sum of per-item windows across all

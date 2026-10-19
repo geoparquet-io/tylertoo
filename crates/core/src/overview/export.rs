@@ -1864,11 +1864,8 @@ fn export_pmtiles_run(
     // the thread.
     let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
-    let mut scans = scan_all_levels(&reader, crs, &meta, options)?;
-    log::info!(
-        "[export] scan complete: {num_levels} levels, single read, {:.2}s",
-        t_scan.elapsed().as_secs_f64()
-    );
+    let timers = Arc::<ExportTimers>::default();
+    let mut scans = scan_all_levels(&reader, crs, &meta, options, &timers)?;
 
     // #498: a sharded build's export owns a slice of the tile space, not all
     // of it. Restricting the SCAN — the per-zoom tile-count map every
@@ -1901,7 +1898,8 @@ fn export_pmtiles_run(
     // `TYLERTOO_PROFILE_JSON` line at the end ([`emit_export_profile_json`]).
     // #571: `ExportProgress` also owns the continuous RSS sampler started
     // before the scan (`None` when profiling is off).
-    let mut progress = ExportProgress::new(num_levels, rss_sampler, knobs.checkpoint_interval);
+    let mut progress =
+        ExportProgress::new(num_levels, timers, rss_sampler, knobs.checkpoint_interval);
 
     // Plan every level's partitions and wave width up front. The partitioning
     // single-read fill (#235) routes members by (level, partition, wave), so
@@ -2221,8 +2219,11 @@ struct ExportProgress {
 }
 
 impl ExportProgress {
+    /// `timers` are made before the level scan, which charges its `scan_*`
+    /// stages to them before this takes them over (#730).
     fn new(
         num_levels: usize,
+        timers: Arc<ExportTimers>,
         rss_sampler: Option<RssSampler>,
         checkpoint_interval: Duration,
     ) -> Self {
@@ -2231,7 +2232,7 @@ impl ExportProgress {
             checkpoint_interval,
             checkpoint_zooms: Vec::new(),
             profile: ExportProfile {
-                timers: Arc::default(),
+                timers,
                 walls: ExportPhaseWalls::default(),
                 per_zoom: Vec::with_capacity(num_levels),
                 waves_total: 0,
@@ -3874,12 +3875,90 @@ fn encode_buckets(
 /// same bounds rectangle and the same `tile_counts` map (and hence the same
 /// partition plan and the same archive). Peak memory is one batch's bboxes plus
 /// the `N` per-level `O(#tiles)` count maps.
+///
+/// PERF (#730): each feature's bbox comes from the file's f64 bbox covering
+/// when it has one ([`ScanBboxSource::for_reader`]), so the scan reads four
+/// doubles a row instead of decoding every geometry. A covering row the
+/// geometry path would treat differently (an empty geometry's ±inf sentinel,
+/// a non-finite bound) abandons that pass and rescans from the geometry, so
+/// such a file scans exactly as before; a file with no usable covering scans
+/// from the geometry from the start.
 fn scan_all_levels(
     reader: &OverviewReader,
     crs: Crs,
     meta: &OverviewsMeta,
     opts: &ExportOptions,
+    timers: &ExportTimers,
 ) -> Result<Vec<LevelScan>, ExportError> {
+    let t_scan = Instant::now();
+    let done = |scans: Vec<LevelScan>, from: &str| {
+        log::info!(
+            "[export] scan complete: {} levels, single read, bboxes from the {from}, {:.2}s",
+            scans.len(),
+            t_scan.elapsed().as_secs_f64()
+        );
+        scans
+    };
+    let source = ScanBboxSource::for_reader(reader);
+    if matches!(source, ScanBboxSource::Covering { .. }) {
+        if let Some(scans) = scan_all_levels_from(reader, crs, meta, opts, timers, &source)? {
+            return Ok(done(scans, "bbox covering"));
+        }
+        log::info!(
+            "[export] the bbox covering has an empty or non-finite row; \
+             rescanning from the geometry"
+        );
+    }
+    let scans = scan_all_levels_from(reader, crs, meta, opts, timers, &ScanBboxSource::Geometry)?
+        .expect("a geometry scan never abandons its pass");
+    Ok(done(scans, "geometry"))
+}
+
+/// Where [`scan_all_levels`] gets each feature's bbox (#730).
+#[derive(Debug, Clone, PartialEq)]
+enum ScanBboxSource {
+    /// The geometry column's f64 bbox covering
+    /// ([`crate::covering::find_f64_covering`]): the struct column's name and
+    /// its `xmin, ymin, xmax, ymax` child names.
+    ///
+    /// DIVERGENCE FROM THE GEOMETRY PATH: the covering's writer (the
+    /// `geoparquet` crate) takes the min/max over every ring's coordinates,
+    /// while `geo`'s `bounding_rect()` reads only a polygon's exterior. The
+    /// two differ only for an invalid polygon with a hole outside its shell,
+    /// where the covering is the larger box: the scan then counts the feature
+    /// in a few tiles it emits nothing to, and the archive's advertised bounds
+    /// can grow to include the hole. Planning stays safe because the scan's
+    /// counts still cover every key the clip emits. See `context/ARCHITECTURE.md`.
+    Covering { column: String, names: [String; 4] },
+    /// Decode the geometry column ([`decode_batch_bboxes`]).
+    Geometry,
+}
+
+impl ScanBboxSource {
+    /// The covering when the file declares a bit-exact f64 one for its
+    /// geometry column, else the geometry.
+    fn for_reader(reader: &OverviewReader) -> Self {
+        let schema = reader.schema();
+        geometry_index(schema)
+            .and_then(|g| crate::covering::find_f64_covering(schema, g))
+            .map_or(Self::Geometry, |(idx, names)| Self::Covering {
+                column: schema.field(idx).name().clone(),
+                names,
+            })
+    }
+}
+
+/// [`scan_all_levels`] from one bbox source. `Ok(None)` only from
+/// [`ScanBboxSource::Covering`], when a covering row has no exact bbox
+/// ([`covering_batch_bboxes`]) and the pass is abandoned.
+fn scan_all_levels_from(
+    reader: &OverviewReader,
+    crs: Crs,
+    meta: &OverviewsMeta,
+    opts: &ExportOptions,
+    timers: &ExportTimers,
+    source: &ScanBboxSource,
+) -> Result<Option<Vec<LevelScan>>, ExportError> {
     let num_levels = reader.num_levels();
     let partitioning = matches!(reader.mode(), Mode::Partitioning);
     let zooms: Vec<u8> = (0..num_levels)
@@ -3904,25 +3983,31 @@ fn scan_all_levels(
     // this function's docs.
     //
     // Memory (#559 review): the scan needs only each feature's bbox, so the
-    // read is projected to the geometry column — [`decode_batch_bboxes`] reads
-    // nothing else — and the pipe is the shallow [`WAVE_READ_IN_FLIGHT`]: this
-    // runs before any wave preflight, so its in-flight batches are unbudgeted.
-    // Projection keeps every row and the geometry column's field (name and
-    // metadata), so the decoded bboxes — and the scan — are unchanged. With no
-    // recognizable geometry column the read stays unprojected, so the error
-    // surfaces from the decode exactly as before.
-    let geom_root = geometry_index(reader.schema());
+    // read is projected to the one column the bbox comes from — the covering
+    // struct, else the geometry — and the pipe is the shallow
+    // [`WAVE_READ_IN_FLIGHT`]: this runs before any wave preflight, so its
+    // in-flight batches are unbudgeted. Projection keeps every row and the
+    // column's field (name and metadata), so the bboxes — and the scan — are
+    // unchanged. With no recognizable geometry column the read stays
+    // unprojected, so the error surfaces from the decode exactly as before.
+    let root = match source {
+        ScanBboxSource::Covering { column, .. } => reader.schema().index_of(column).ok(),
+        ScanBboxSource::Geometry => geometry_index(reader.schema()),
+    };
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
+    let mut abandoned = false;
+    let abandoned_ref = &mut abandoned;
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for j in 0..num_levels {
-                let band_reader = match geom_root {
-                    Some(g) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[g])?,
-                    None => reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE)?,
-                };
-                for batch in band_reader {
+                let mut band_reader = ExportTimers::time(&timers.scan_read, || match root {
+                    Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[r]),
+                    None => reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE),
+                })?;
+                while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
+                {
                     if tx.send((j, batch?)).is_err() {
                         return Ok(()); // consumer dropped the receiver
                     }
@@ -3936,15 +4021,28 @@ fn scan_all_levels(
                 // partitioning mode; duplicating bands are self-contained, so
                 // band `j` feeds level `j` alone.
                 let last = if partitioning { num_levels - 1 } else { j };
-                // Decode + (for 3857) reproject each feature's bbox once per
+                // Read + (for 3857) reproject each feature's bbox once per
                 // band; sizing the same bbox into every target level below is
                 // bit-identical to reprojecting it once per level, since
                 // reprojection is a pure fn.
-                let bboxes = decode_batch_bboxes(&batch, crs)?;
+                let bboxes = ExportTimers::time(&timers.scan_decode, || match source {
+                    ScanBboxSource::Covering { column, names } => {
+                        covering_batch_bboxes(&batch, column, names, crs)
+                    }
+                    ScanBboxSource::Geometry => decode_batch_bboxes(&batch, crs).map(Some),
+                })?;
+                let Some(bboxes) = bboxes else {
+                    // Dropping the receiver stops the producer cleanly.
+                    *abandoned_ref = true;
+                    return Ok(());
+                };
                 for k in j..=last {
                     let scan = &mut scans_ref[k];
                     scan.feature_count += bboxes.len();
-                    let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zooms_ref[k], opts);
+                    let (batch_bounds, batch_counts) =
+                        ExportTimers::time(&timers.scan_size, || {
+                            size_bboxes(&bboxes, zooms_ref[k], opts)
+                        });
                     if let Some(b) = batch_bounds {
                         match &mut scan.bounds {
                             Some(acc) => acc.expand(&b),
@@ -3959,7 +4057,83 @@ fn scan_all_levels(
             Ok(())
         },
     )?;
-    Ok(scans)
+    Ok((!abandoned).then_some(scans))
+}
+
+/// One record batch's per-feature bboxes read from its f64 bbox covering
+/// struct `column` (children `names`, in `xmin, ymin, xmax, ymax` order),
+/// reprojected exactly as [`decode_batch_bboxes`] reprojects a geometry's.
+///
+/// The result matches [`decode_batch_bboxes`] on the same rows: a null
+/// covering row is a null geometry, which the geometry path drops, so it is
+/// dropped here too; every other row is the min/max over the geometry's own
+/// coordinates (the covering is generated from the array the writer encodes,
+/// in the file's CRS, unrounded). `Ok(None)` when any non-null row is not a
+/// finite, ordered box — an empty geometry's `[+inf, +inf, -inf, -inf]`, a
+/// NaN, a null child — since the geometry path's answer for those (no bbox
+/// but counted, or not counted at all for an empty point) cannot be told
+/// from the covering alone.
+fn covering_batch_bboxes(
+    batch: &RecordBatch,
+    column: &str,
+    names: &[String; 4],
+    crs: Crs,
+) -> Result<Option<Vec<Option<TileBounds>>>, ExportError> {
+    let not_covering =
+        || crate::Error::GeoParquetRead(format!("bbox covering {column:?} is not an f64 struct"));
+    let strukt = batch
+        .column_by_name(column)
+        .and_then(|c| c.as_struct_opt())
+        .ok_or_else(not_covering)?;
+    let child = |name: &String| {
+        strukt
+            .column_by_name(name)
+            .and_then(|c| c.as_primitive_opt::<Float64Type>())
+            .ok_or_else(not_covering)
+    };
+    let [xmin, ymin, xmax, ymax] = [
+        child(&names[0])?,
+        child(&names[1])?,
+        child(&names[2])?,
+        child(&names[3])?,
+    ];
+    let mut bboxes = Vec::with_capacity(strukt.len() - strukt.null_count());
+    for i in 0..strukt.len() {
+        if strukt.is_null(i) {
+            continue;
+        }
+        if [xmin, ymin, xmax, ymax].iter().any(|c| c.is_null(i)) {
+            return Ok(None);
+        }
+        let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
+        // Finite and ordered: `<=` is false for NaN, and an ordered pair with
+        // one infinite end cannot pass the finiteness check.
+        if !(x0 <= x1
+            && y0 <= y1
+            && x0.is_finite()
+            && x1.is_finite()
+            && y0.is_finite()
+            && y1.is_finite())
+        {
+            return Ok(None);
+        }
+        bboxes.push(Some(lnglat_bbox(x0, y0, x1, y1, crs)));
+    }
+    Ok(Some(bboxes))
+}
+
+/// A bbox in the file's CRS as lon/lat [`TileBounds`]: the two corners go
+/// through [`webmerc_to_lnglat`] for an EPSG:3857 file. Reprojection is
+/// monotone per axis, so this is bit-identical to the bbox of the
+/// reprojected geometry. Both scan sources go through here.
+fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
+    if matches!(crs, Crs::Epsg3857) {
+        let (lng_min, lat_min) = webmerc_to_lnglat(x0, y0);
+        let (lng_max, lat_max) = webmerc_to_lnglat(x1, y1);
+        TileBounds::new(lng_min, lat_min, lng_max, lat_max)
+    } else {
+        TileBounds::new(x0, y0, x1, y1)
+    }
 }
 
 /// Decode one record batch's geometries into per-feature bounding boxes,
@@ -3983,14 +4157,7 @@ fn decode_batch_bboxes(
         .par_iter()
         .map(|geom| {
             geom.bounding_rect().map(|rect| {
-                let bbox = TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                if matches!(crs, Crs::Epsg3857) {
-                    let (lng_min, lat_min) = webmerc_to_lnglat(bbox.lng_min, bbox.lat_min);
-                    let (lng_max, lat_max) = webmerc_to_lnglat(bbox.lng_max, bbox.lat_max);
-                    TileBounds::new(lng_min, lat_min, lng_max, lat_max)
-                } else {
-                    bbox
-                }
+                lnglat_bbox(rect.min().x, rect.min().y, rect.max().x, rect.max().y, crs)
             })
         })
         .collect();
@@ -8311,19 +8478,45 @@ mod tests {
         }
     }
 
+    /// Rewrite overview file `src` to `dst` without its bbox covering (#730):
+    /// the `bbox` struct column is dropped and the `geo` metadata no longer
+    /// declares it — an overview file as a producer that writes no covering
+    /// would leave it.
+    fn rewrite_without_covering(src: &Path, dst: &Path) {
+        rewrite_overview(src, dst, None, true);
+    }
+
+    /// The `geo` metadata JSON `json` with the geometry column's `covering`
+    /// declaration removed.
+    fn geo_json_without_covering(json: &str) -> String {
+        let mut geo: serde_json::Value = serde_json::from_str(json).unwrap();
+        for column in geo["columns"].as_object_mut().unwrap().values_mut() {
+            column.as_object_mut().unwrap().remove("covering");
+        }
+        geo.to_string()
+    }
+
     /// Rewrite overview file `src` to `dst` row group for row group (same
-    /// boundaries, schema and footer keys), blanking the WKB geometry of
-    /// global row `bad_row` — an undecodable value the export's geometry
-    /// decode rejects with a typed error.
-    fn rewrite_with_blank_geometry(src: &Path, dst: &Path, bad_row: usize) {
+    /// boundaries, schema and footer keys). `bad_row` blanks the WKB geometry
+    /// of that global row — an undecodable value the export's geometry decode
+    /// rejects with a typed error; `strip_covering` drops the bbox covering
+    /// ([`rewrite_without_covering`]).
+    fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, strip_covering: bool) {
         use arrow_array::{Array, BinaryArray};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::arrow::ArrowWriter;
         use parquet::file::metadata::KeyValue;
 
         let probe = ParquetRecordBatchReaderBuilder::try_new(File::open(src).unwrap()).unwrap();
-        let schema = probe.schema().clone();
+        let in_schema = probe.schema().clone();
         let num_rgs = probe.metadata().num_row_groups();
+        let strip_geo = |kv: KeyValue| match (strip_covering, kv.key.as_str()) {
+            (true, "geo") => KeyValue::new(
+                kv.key.clone(),
+                geo_json_without_covering(kv.value.as_deref().unwrap()),
+            ),
+            _ => kv,
+        };
         let kvs: Vec<KeyValue> = probe
             .metadata()
             .file_metadata()
@@ -8332,7 +8525,23 @@ mod tests {
             .unwrap_or_default()
             .into_iter()
             .filter(|kv| kv.key != "ARROW:schema")
+            .map(strip_geo)
             .collect();
+        let keep: Vec<usize> = (0..in_schema.fields().len())
+            .filter(|&i| !(strip_covering && in_schema.field(i).name() == "bbox"))
+            .collect();
+        let mut schema_metadata = in_schema.metadata().clone();
+        if strip_covering {
+            if let Some(json) = schema_metadata.get_mut("geo") {
+                *json = geo_json_without_covering(json);
+            }
+        }
+        let schema = Arc::new(
+            in_schema
+                .project(&keep)
+                .unwrap()
+                .with_metadata(schema_metadata),
+        );
         let geom_idx = schema.index_of("geometry").unwrap();
 
         let mut writer =
@@ -8346,9 +8555,11 @@ mod tests {
                 .build()
                 .unwrap();
             for batch in reader {
-                let batch = batch.unwrap();
+                let batch = batch.unwrap().project(&keep).unwrap();
+                let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap();
                 let n = batch.num_rows();
-                let batch = if (row0..row0 + n).contains(&bad_row) {
+                let batch = if bad_row.is_some_and(|bad_row| (row0..row0 + n).contains(&bad_row)) {
+                    let bad_row = bad_row.unwrap();
                     let geoms = batch
                         .column(geom_idx)
                         .as_any()
@@ -8408,7 +8619,9 @@ mod tests {
         let good = tempfile::NamedTempFile::new().unwrap();
         write_mode_fixture(good.path(), &[(ids, geoms)], Mode::Duplicating, 10_000);
         let bad = tempfile::NamedTempFile::new().unwrap();
-        rewrite_with_blank_geometry(good.path(), bad.path(), bad_row);
+        // #730: the scan reads the bbox covering, not the geometry, so a blank
+        // geometry fails the scan's consumer only in a file without one.
+        rewrite_overview(good.path(), bad.path(), Some(bad_row), true);
         let bad_path = bad.path().to_path_buf();
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -8425,6 +8638,277 @@ mod tests {
         assert!(
             err.to_string().contains("Invalid geometry at index 17"),
             "expected the consumer's geometry-decode error, got: {err}"
+        );
+    }
+
+    // --- the scan's bbox covering source (#730) ------------------------------
+
+    /// A `write_mode_fixture` whose level geometries may be null.
+    fn write_mode_fixture_opt(
+        path: &Path,
+        level_geoms: &[Vec<Option<Geometry<f64>>>],
+        mode: Mode,
+    ) -> OverviewsMeta {
+        let schema = Arc::new(source_schema());
+        let specs: Vec<LevelSpec> = (0..level_geoms.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(mode, specs);
+        opts.max_row_group_size = 3;
+        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
+        let mut next_id = 0i64;
+        for (k, geoms) in level_geoms.iter().enumerate() {
+            let ids: Vec<i64> = (next_id..next_id + geoms.len() as i64).collect();
+            next_id += geoms.len() as i64;
+            let typ = GeometryType::new(Default::default());
+            let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
+            b.extend_from_iter(geoms.iter().map(Option::as_ref));
+            let name = StringArray::from(ids.iter().map(|i| format!("f{i}")).collect::<Vec<_>>());
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(name),
+                    Arc::new(b.finish().to_array_ref()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                writer
+                    .write_level(k, Some(ids.len()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap()
+    }
+
+    fn square(x: f64, y: f64, w: f64) -> geo::Polygon<f64> {
+        geo::Polygon::new(
+            LineString::from(vec![(x, y), (x + w, y), (x + w, y + w), (x, y + w), (x, y)]),
+            vec![],
+        )
+    }
+
+    /// Features of every shape the covering has to agree with the geometry
+    /// on, in degrees: points, lines, holed polygons, multipolygons, and
+    /// features on the antimeridian and the world edge (wrap copies).
+    fn covering_corpus(scale: f64) -> Vec<Vec<Option<Geometry<f64>>>> {
+        let p = |x: f64, y: f64| Some(Geometry::Point(Point::new(x * scale, y * scale)));
+        let holed = geo::Polygon::new(
+            LineString::from(vec![(10.0, 10.0), (30.0, 10.0), (30.0, 30.0), (10.0, 30.0)])
+                .map_coords(|c| c * scale),
+            vec![
+                LineString::from(vec![(15.0, 15.0), (20.0, 15.0), (20.0, 20.0)])
+                    .map_coords(|c| c * scale),
+            ],
+        );
+        let multi = geo::MultiPolygon::new(vec![
+            square(-60.0, -20.0, 5.0).map_coords(|c| c * scale),
+            square(-40.0, 5.0, 3.0).map_coords(|c| c * scale),
+        ]);
+        vec![
+            vec![
+                p(-120.0, 40.0),
+                p(179.999, -16.0),
+                Some(Geometry::Polygon(holed)),
+            ],
+            vec![
+                Some(Geometry::LineString(
+                    LineString::from(vec![(-70.0, -10.0), (-40.0, 5.0), (20.0, 8.0)])
+                        .map_coords(|c| c * scale),
+                )),
+                p(-180.0, 0.0),
+                Some(Geometry::MultiPolygon(multi)),
+                p(0.0, 0.0),
+            ],
+            vec![
+                p(-118.0, 34.0),
+                p(-117.5, 33.8),
+                Some(Geometry::Polygon(
+                    square(177.0, 60.0, 2.9).map_coords(|c| c * scale),
+                )),
+                p(2.0, 48.0),
+                p(179.9, 84.0),
+            ],
+        ]
+    }
+
+    /// Both sources' scans of one file, for every level: (covering, geometry).
+    fn scans_by_source(
+        path: &Path,
+        crs: Crs,
+        meta: &OverviewsMeta,
+    ) -> (Option<Vec<LevelScan>>, Vec<LevelScan>) {
+        let reader = OverviewReader::open(path).unwrap();
+        let source = ScanBboxSource::for_reader(&reader);
+        assert!(
+            matches!(source, ScanBboxSource::Covering { .. }),
+            "the overview writer's f64 covering must be the scan's source: {source:?}"
+        );
+        let timers = ExportTimers::default();
+        let opts = ExportOptions::default();
+        let covering = scan_all_levels_from(&reader, crs, meta, &opts, &timers, &source).unwrap();
+        let geometry = scan_all_levels_from(
+            &reader,
+            crs,
+            meta,
+            &opts,
+            &timers,
+            &ScanBboxSource::Geometry,
+        )
+        .unwrap()
+        .unwrap();
+        (covering, geometry)
+    }
+
+    /// #730: the overview writer's covering is the scan's source, and the
+    /// scan it gives is the geometry scan exactly — in both modes, in both
+    /// CRSs (a 3857 file's covering is in metres and reprojects like the
+    /// geometry's bbox), across wrap copies, holes and null geometries.
+    #[test]
+    fn covering_scan_matches_geometry_scan() {
+        const M_PER_DEG: f64 = 111_000.0;
+        for (crs, scale) in [(Crs::Epsg4326, 1.0), (Crs::Epsg3857, M_PER_DEG)] {
+            for mode in [Mode::Partitioning, Mode::Duplicating] {
+                let mut levels = covering_corpus(scale);
+                // A null geometry: no covering row, no feature on either path.
+                levels[1].push(None);
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let meta = write_mode_fixture_opt(tmp.path(), &levels, mode);
+                let (covering, geometry) = scans_by_source(tmp.path(), crs, &meta);
+                assert_eq!(
+                    covering.as_ref(),
+                    Some(&geometry),
+                    "{crs:?} {mode:?}: covering scan differs from the geometry scan"
+                );
+                assert!(
+                    geometry.iter().all(|s| !s.tile_counts.is_empty()),
+                    "vacuous: every level must size tiles"
+                );
+                let own = |k: usize| levels[k].iter().flatten().count();
+                let last = levels.len() - 1;
+                let expected = match mode {
+                    Mode::Partitioning => (0..=last).map(own).sum::<usize>(),
+                    Mode::Duplicating => own(last),
+                };
+                assert_eq!(
+                    geometry[last].feature_count, expected,
+                    "null rows are not features"
+                );
+            }
+        }
+    }
+
+    /// #730: an empty geometry has a `[+inf, +inf, -inf, -inf]` covering row
+    /// and no bbox on the geometry path (and an empty point is not even
+    /// counted there), so the covering pass is abandoned and the scan comes
+    /// from the geometry — the same scan as before the covering source.
+    #[test]
+    fn empty_geometry_covering_row_falls_back_to_the_geometry() {
+        let mut levels = covering_corpus(1.0);
+        levels[0].push(Some(Geometry::MultiPolygon(geo::MultiPolygon::new(vec![]))));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let meta = write_mode_fixture_opt(tmp.path(), &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(tmp.path(), Crs::Epsg4326, &meta);
+        assert_eq!(
+            covering, None,
+            "an empty geometry's covering row must abandon the pass"
+        );
+        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let scans = scan_all_levels(
+            &reader,
+            Crs::Epsg4326,
+            &meta,
+            &ExportOptions::default(),
+            &ExportTimers::default(),
+        )
+        .unwrap();
+        assert_eq!(scans, geometry);
+    }
+
+    /// #730's fallback: an overview file with no bbox covering still exports,
+    /// from the geometry, to the same archive bytes as with one.
+    #[test]
+    fn export_without_covering_matches_export_with_covering() {
+        for mode in [Mode::Partitioning, Mode::Duplicating] {
+            let dir = tempfile::tempdir().unwrap();
+            let with = dir.path().join("with.parquet");
+            let without = dir.path().join("without.parquet");
+            write_mode_fixture_opt(&with, &covering_corpus(1.0), mode);
+            rewrite_without_covering(&with, &without);
+            assert_eq!(
+                ScanBboxSource::for_reader(&OverviewReader::open(&without).unwrap()),
+                ScanBboxSource::Geometry,
+                "the rewrite must leave no covering to read"
+            );
+            let archive = |input: &Path, name: &str| {
+                let out = dir.path().join(name);
+                export_pmtiles(input, &out, &ExportOptions::default()).unwrap();
+                std::fs::read(&out).unwrap()
+            };
+            assert_eq!(
+                archive(&with, "with.pmtiles"),
+                archive(&without, "without.pmtiles"),
+                "{mode:?}: the archive depends on whether the file has a covering"
+            );
+        }
+    }
+
+    /// #730's documented divergence: an invalid polygon whose hole lies
+    /// outside its shell has a covering that includes the hole, while the
+    /// geometry path's `bounding_rect()` reads the shell alone. The covering
+    /// scan is then a superset — it counts tiles the clip never emits to, and
+    /// its bounds are wider — but every tile the archive holds is unchanged.
+    #[test]
+    fn escaping_hole_covering_scan_is_a_superset() {
+        use crate::archive_index::ArchiveIndex;
+        let shell = square(0.0, 0.0, 10.0);
+        let invalid = geo::Polygon::new(
+            shell.exterior().clone(),
+            vec![square(40.0, 40.0, 5.0).exterior().clone()],
+        );
+        let levels = vec![
+            vec![Some(Geometry::Point(Point::new(-50.0, -20.0)))],
+            vec![Some(Geometry::Polygon(invalid))],
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let with = dir.path().join("with.parquet");
+        let meta = write_mode_fixture_opt(&with, &levels, Mode::Partitioning);
+        let (covering, geometry) = scans_by_source(&with, Crs::Epsg4326, &meta);
+        let covering = covering.expect("an escaping hole is finite: no fallback");
+        let finest = levels.len() - 1;
+        let (c, g) = (&covering[finest], &geometry[finest]);
+        assert_eq!(c.feature_count, g.feature_count);
+        assert!(
+            g.tile_counts
+                .iter()
+                .all(|(k, n)| c.tile_counts.get(k) >= Some(n)),
+            "the covering scan must plan every tile the geometry scan does"
+        );
+        assert!(
+            c.tile_counts.len() > g.tile_counts.len(),
+            "vacuous: the hole must reach tiles the shell does not"
+        );
+        assert!(c.bounds.unwrap().lat_max > g.bounds.unwrap().lat_max);
+
+        let without = dir.path().join("without.parquet");
+        rewrite_without_covering(&with, &without);
+        let tiles = |input: &Path, name: &str| {
+            let out = dir.path().join(name);
+            export_pmtiles(input, &out, &ExportOptions::default()).unwrap();
+            let idx = ArchiveIndex::open(&out).unwrap();
+            idx.tiles()
+                .map(|t| {
+                    let t = t.unwrap();
+                    ((t.z, t.x, t.y), idx.read_range(t.range).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            tiles(&with, "with.pmtiles"),
+            tiles(&without, "without.pmtiles"),
+            "the covering's extra planned tiles must not change any tile"
         );
     }
 
@@ -9439,7 +9923,14 @@ mod tests {
         assert_eq!(num_levels, 3);
 
         let opts = ExportOptions::default();
-        let scans = scan_all_levels(&reader, Crs::Epsg4326, &meta, &opts).unwrap();
+        let scans = scan_all_levels(
+            &reader,
+            Crs::Epsg4326,
+            &meta,
+            &opts,
+            &ExportTimers::default(),
+        )
+        .unwrap();
         assert_eq!(scans.len(), num_levels);
 
         // Feature counts must equal the accumulating prefix sizes (3, 3+4, 3+4+5).
