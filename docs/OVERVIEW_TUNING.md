@@ -1728,9 +1728,10 @@ constraint.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
 default `info` filter. Python receives them through `logging` under the
-`tylertoo_core` logger. Python prints only warnings by default, so call
-`logging.basicConfig(level=logging.INFO)` to see the info lines; otherwise a
-typo in a variable name or value is indistinguishable from the default.
+`tylertoo_core` logger. Python prints only warnings by default, so a bad
+value shows up but the info lines do not: call
+`logging.basicConfig(level=logging.INFO)` to see them. Without them, a
+misspelled variable name is indistinguishable from the default.
 
 ---
 

@@ -235,8 +235,8 @@ pub enum DecodeError {
 /// # Errors
 ///
 /// Returns a [`DecodeError`] if the zoom range is inverted, the archive cannot
-/// be read or parsed, does not hold MVT tiles, holds a section or tile that does not decompress or decode,
-/// or if writing the output fails.
+/// be read or parsed, does not hold MVT tiles, holds a section or tile that
+/// does not decompress or decode, or if writing the output fails.
 pub fn decode_pmtiles(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -246,7 +246,14 @@ pub fn decode_pmtiles(
     let start = Instant::now();
     // #452: the output is created only after Pass A has decoded every tile.
     crate::atomic_output::check_writable(output_path.as_ref())?;
-    let bytes = std::fs::read(input_path.as_ref())?;
+    let input_path = input_path.as_ref();
+    // Name the input: the CLI checks it first, a library caller does not.
+    let bytes = std::fs::read(input_path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot read {}: {e}", input_path.display()),
+        )
+    })?;
     let header = Header::from_bytes(&bytes)?;
     if header.tile_type != TileType::Mvt {
         return Err(DecodeError::NotVectorTiles(header.tile_type));

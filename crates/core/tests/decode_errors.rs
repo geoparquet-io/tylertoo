@@ -708,3 +708,22 @@ fn equal_zoom_bounds_are_one_zoom_not_an_inverted_range() {
     assert_eq!(report.tiles_read, 0);
     assert_eq!(report.zoom_range, None);
 }
+
+/// A missing input names its path somewhere in the error chain. The CLI
+/// checks the input first, but a library or Python caller (#445) otherwise
+/// got a bare "No such file or directory".
+#[test]
+fn a_missing_input_names_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent.pmtiles");
+    let out = dir.path().join("out.parquet");
+    let err = decode_pmtiles(&missing, &out, &DecodeOptions::default()).unwrap_err();
+    assert!(matches!(err, DecodeError::Io(_)), "{err:?}");
+    let mut chain = err.to_string();
+    let mut cause = std::error::Error::source(&err);
+    while let Some(c) = cause {
+        chain.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    assert!(chain.contains("absent.pmtiles"), "{chain}");
+}
