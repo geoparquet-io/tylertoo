@@ -1277,12 +1277,11 @@ pub(crate) mod remote {
     const CLIENT_VAR_PREFIX: &str = "TYLERTOO_HTTP_";
 
     /// Parse `TYLERTOO_HTTP_*` variables out of `vars` into client options,
-    /// sorted by key so the log line is stable. An unknown key is skipped
-    /// with a warning naming the variable; the *value* is parsed by
-    /// `object_store` when the store is built, so a malformed one fails that
-    /// build with an error naming the key. Pure (no environment access), so
-    /// it is unit-testable; [`effective_client_overrides`] feeds it the
-    /// process environment.
+    /// sorted by key so the log line is stable. An unknown key, or a value
+    /// `object_store` cannot parse, is skipped with a warning naming the
+    /// variable (the same warn-and-ignore as the `TYLERTOO_STAGING_*` knobs).
+    /// No environment access, so it is unit-testable;
+    /// [`effective_client_overrides`] feeds it the process environment.
     fn client_overrides(
         vars: impl IntoIterator<Item = (String, String)>,
     ) -> (Vec<(ClientConfigKey, String)>, Vec<String>) {
@@ -1292,15 +1291,36 @@ pub(crate) mod remote {
             let Some(suffix) = name.strip_prefix(CLIENT_VAR_PREFIX) else {
                 continue;
             };
-            match suffix.to_ascii_lowercase().parse::<ClientConfigKey>() {
-                Ok(key) => out.push((key, value)),
-                Err(_) => warnings.push(format!(
+            let Ok(key) = suffix.to_ascii_lowercase().parse::<ClientConfigKey>() else {
+                warnings.push(format!(
                     "{name} names no object_store client option; ignoring it"
-                )),
+                ));
+                continue;
+            };
+            // `object_store` defers parsing a value to the store build, and
+            // its error there ("failed to parse \"x\" as Duration") names
+            // neither key nor variable. Probe-build a client with this one
+            // option so a bad value is caught here, by name. No I/O.
+            let probe = HttpBuilder::new()
+                .with_url("http://127.0.0.1")
+                .with_config(key, &value)
+                .build();
+            match probe {
+                Ok(_) => out.push((key, value)),
+                // The parse error can echo the value, so a redacted key
+                // gets neither.
+                Err(_) if redacted(key) => warnings.push(format!("{name} is invalid; ignoring it")),
+                Err(e) => warnings.push(format!("{name}={value} is invalid ({e}); ignoring it")),
             }
         }
         out.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
         (out, warnings)
+    }
+
+    /// Client options whose value is never logged: a proxy URL can carry
+    /// `user:password@` credentials.
+    fn redacted(key: ClientConfigKey) -> bool {
+        matches!(key, ClientConfigKey::ProxyUrl)
     }
 
     /// The process-wide client overrides: resolved from the environment once,
@@ -1318,7 +1338,10 @@ pub(crate) mod remote {
             if !overrides.is_empty() {
                 let list: Vec<String> = overrides
                     .iter()
-                    .map(|(k, v)| format!("{}={v}", k.as_ref()))
+                    .map(|(k, v)| {
+                        let v = if redacted(*k) { "<redacted>" } else { v };
+                        format!("{}={v}", k.as_ref())
+                    })
                     .collect();
                 log::info!(
                     "[remote] client options from {CLIENT_VAR_PREFIX}*: {}",
@@ -1487,7 +1510,7 @@ pub(crate) mod remote {
                 u64::MAX,
                 &mut warnings,
             );
-            let coalesce_window = resolve_one(
+            let mut coalesce_window = resolve_one(
                 &lookup,
                 COALESCE_VAR,
                 STAGE_COALESCE_WINDOW,
@@ -1495,6 +1518,16 @@ pub(crate) mod remote {
                 COALESCE_MAX,
                 &mut warnings,
             );
+            // A merged span is held whole while it downloads, so a window
+            // over the budget would overshoot it even at concurrency 1.
+            if coalesce_window > mem_budget {
+                warnings.push(format!(
+                    "{COALESCE_VAR}={coalesce_window} exceeds the staging memory \
+                     budget ({mem_budget} B, {MEM_BUDGET_VAR}); clamping the \
+                     window to the budget"
+                ));
+                coalesce_window = mem_budget;
+            }
             (
                 StagingTunables {
                     max_concurrency,
@@ -1655,16 +1688,28 @@ pub(crate) mod remote {
         window: u64,
     ) -> Vec<StagedSpan> {
         plan.sort_by_key(|s| s.span.start);
+        // Blocked spans by start, with a running max of their ends, so "does
+        // any blocked span overlap this gap" is one binary search rather than
+        // a scan per pair (a part can have tens of thousands of row groups).
+        let mut blocked = blocked.to_vec();
+        blocked.sort_by_key(|b| b.start);
+        let max_end: Vec<u64> = blocked
+            .iter()
+            .scan(0u64, |m, b| {
+                *m = (*m).max(b.end);
+                Some(*m)
+            })
+            .collect();
+        let gap_is_clear = |gap: &Range<u64>| {
+            let n = blocked.partition_point(|b| b.start < gap.end);
+            n == 0 || max_end[n - 1] <= gap.start
+        };
         let mut out: Vec<StagedSpan> = Vec::with_capacity(plan.len());
         for next in plan {
             if let Some(cur) = out.last_mut() {
                 let gap = cur.span.end..next.span.start;
                 let fits = next.span.end.saturating_sub(cur.span.start) <= window;
-                let clear = gap.start <= gap.end
-                    && !blocked
-                        .iter()
-                        .any(|b| b.start < gap.end && gap.start < b.end);
-                if fits && clear {
+                if fits && gap.start <= gap.end && gap_is_clear(&gap) {
                     cur.span.end = next.span.end;
                     cur.chunks.extend(next.chunks);
                     continue;
@@ -2248,7 +2293,11 @@ pub(crate) mod remote {
             assert_eq!(t.coalesce_window, 64 * 1024 * 1024);
             assert!(warnings.is_empty(), "{warnings:?}");
 
-            let (t, warnings) = resolve(env(&[(COALESCE_VAR, "99999999999")]));
+            // Budget raised past the ceiling so only the ceiling clamps.
+            let (t, warnings) = resolve(env(&[
+                (COALESCE_VAR, "99999999999"),
+                (MEM_BUDGET_VAR, "4294967296"),
+            ]));
             assert_eq!(t.coalesce_window, COALESCE_MAX);
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains(COALESCE_VAR), "{}", warnings[0]);
@@ -2257,6 +2306,24 @@ pub(crate) mod remote {
             assert_eq!(t.coalesce_window, 0);
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains(COALESCE_VAR), "{}", warnings[0]);
+        }
+
+        #[test]
+        fn coalesce_window_is_clamped_to_the_memory_budget() {
+            // 512 MiB window over the default 256 MiB budget: a merged span is
+            // held whole, so it must not outgrow the budget.
+            let (t, warnings) = resolve(env(&[(COALESCE_VAR, "536870912")]));
+            assert_eq!(t.coalesce_window, STAGE_MEM_BUDGET);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains(COALESCE_VAR), "{}", warnings[0]);
+            assert!(warnings[0].contains(MEM_BUDGET_VAR), "{}", warnings[0]);
+
+            let (t, warnings) = resolve(env(&[
+                (COALESCE_VAR, "8388608"),
+                (MEM_BUDGET_VAR, "4194304"),
+            ]));
+            assert_eq!(t.coalesce_window, 4 * 1024 * 1024);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
         }
     }
 
@@ -2326,6 +2393,18 @@ pub(crate) mod remote {
             let plan = vec![span(4..104), span(204..304), span(304..404)];
             let pruned = 104..204;
             let out = coalesce_spans(plan, std::slice::from_ref(&pruned), u64::MAX);
+            assert_eq!(spans(&out), vec![4..104, 204..404]);
+        }
+
+        #[test]
+        fn a_wide_early_blocked_span_still_blocks_a_later_gap() {
+            // Crafted interleaving: the blocked span with the nearest start
+            // (60..70) ends before the gap 104..204, but an earlier-starting
+            // one (50..150) reaches into it. The lookup must use the running
+            // max end, not just the nearest start.
+            let plan = vec![span(4..104), span(204..304), span(304..404)];
+            let blocked = [60..70, 50..150];
+            let out = coalesce_spans(plan, &blocked, u64::MAX);
             assert_eq!(spans(&out), vec![4..104, 204..404]);
         }
 
@@ -2518,6 +2597,40 @@ pub(crate) mod remote {
             assert!(o.is_empty(), "{o:?}");
             assert_eq!(w.len(), 1);
             assert!(w[0].contains("TYLERTOO_HTTP_WARP_SPEED"), "{}", w[0]);
+        }
+
+        #[test]
+        fn a_bad_proxy_url_warning_does_not_echo_credentials() {
+            let (o, w) = client_overrides(vars(&[(
+                "TYLERTOO_HTTP_PROXY_URL",
+                "http://user:hunter2@[::1:3128",
+            )]));
+            assert!(o.is_empty(), "{o:?}");
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(w[0].contains("TYLERTOO_HTTP_PROXY_URL"), "{}", w[0]);
+            assert!(!w[0].contains("hunter2"), "{}", w[0]);
+        }
+
+        #[test]
+        fn malformed_values_warn_naming_the_variable_and_are_skipped() {
+            let (o, w) = client_overrides(vars(&[
+                ("TYLERTOO_HTTP_TIMEOUT", "soon"),
+                ("TYLERTOO_HTTP_HTTP2_ONLY", "perhaps"),
+                ("TYLERTOO_HTTP_CONNECT_TIMEOUT", "10s"),
+            ]));
+            assert_eq!(
+                o,
+                vec![(ClientConfigKey::ConnectTimeout, "10s".to_string())]
+            );
+            assert_eq!(w.len(), 2, "{w:?}");
+            assert!(
+                w.iter().any(|m| m.contains("TYLERTOO_HTTP_TIMEOUT")),
+                "{w:?}"
+            );
+            assert!(
+                w.iter().any(|m| m.contains("TYLERTOO_HTTP_HTTP2_ONLY")),
+                "{w:?}"
+            );
         }
 
         #[test]

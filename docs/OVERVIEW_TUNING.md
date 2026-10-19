@@ -1712,12 +1712,14 @@ chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
 |----------|---------|--------|--------|
 | `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
 | `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest span)` |
-| `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
+| `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
 | `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |
 
 The window counts toward the memory budget: with
 `TYLERTOO_STAGING_COALESCE_BYTES=134217728` (128 MiB) and the default
-256 MiB budget, at most two merged spans are in flight.
+256 MiB budget, at most two merged spans are in flight. A window larger than
+the budget warns and is clamped to the budget, since a merged span is held
+whole in memory while it downloads.
 
 The window pays off only on a host where time to first byte dominates and
 throughput per connection is not capped; on a throttled host it costs
@@ -1731,8 +1733,8 @@ upper or lower case: for example `TYLERTOO_HTTP_HTTP2_ONLY=true`,
 `TYLERTOO_HTTP_POOL_MAX_IDLE_PER_HOST=16` or `TYLERTOO_HTTP_TIMEOUT=60s`. It
 applies to `https://`, `s3://` and `gs://` inputs alike, after the
 scheme's own `AWS_*` or `GOOGLE_*` settings, so it wins over them. An unknown
-key warns and is ignored. A malformed value fails the store build with an
-error naming the key. The client defaults to HTTP/1.1, one connection per
+key, or a value the client cannot parse, warns naming the variable and is
+ignored. The client defaults to HTTP/1.1, one connection per
 request in flight; S3 does not negotiate HTTP/2, so `HTTP2_ONLY` fails there.
 
 A negative or malformed value warns and keeps the default; a non-negative
@@ -1748,7 +1750,8 @@ used. Watch the second one — the budget can cap the ceiling, so
 `TYLERTOO_STAGING_CONCURRENCY=16` and `=8` produce identical runs on an input
 whose row groups are large enough that `budget ÷ largest span` is the binding
 constraint. A third info line, `[remote] client options from
-TYLERTOO_HTTP_*`, lists the client overrides in force.
+TYLERTOO_HTTP_*`, lists the client overrides in force, with a `PROXY_URL`
+value shown as `<redacted>`.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
 default `info` filter. The Python bindings install no log bridge, so from

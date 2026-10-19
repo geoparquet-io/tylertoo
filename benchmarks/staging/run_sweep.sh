@@ -43,7 +43,7 @@ SCRATCH="$(cd "$SCRATCH" && pwd)"
 cd "$SCRATCH" || exit 1
 EMU_LABEL="emu:${TTFB_MS:-0}ms:${CONN_BW_MBPS:-0}MBps"
 
-[ -x "$BIN" ] || { echo "build the release binary first (cargo build --release -p tylertoo --all-features)" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "build the release binary first (cargo build --release -p tylertoo; not --all-features, dhat skews timings)" >&2; exit 1; }
 CSV="$OUT/sweep.csv"
 [ -s "$CSV" ] || echo "host,grid,concurrency,window,http,rep,live_conc,stage_s,wall_s,requests,bytes,connections" >"$CSV"
 echo "# commit $(git -C "$ROOT" rev-parse --short HEAD) $(date -u +%FT%TZ) GRID=$GRID HOSTS=$HOSTS N=$N" >>"$OUT/runs.log"
@@ -81,7 +81,7 @@ run_cell() {
   [ "$http" = 2 ] && http_env=(TYLERTOO_HTTP_HTTP2_ONLY=true)
   rm -f "$dst"
   env TYLERTOO_STAGING_CONCURRENCY="$conc" TYLERTOO_STAGING_COALESCE_BYTES="$window" \
-    "${http_env[@]}" \
+    ${http_env[@]+"${http_env[@]}"} \
     /usr/bin/time -f "%e" -o "$tf" \
     "$BIN" overview "$(url_for "$host")" "$dst" --min-zoom 0 --max-zoom "$MAX_ZOOM" \
     --report "$rf" >"$log" 2>&1

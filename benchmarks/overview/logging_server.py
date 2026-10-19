@@ -12,7 +12,7 @@ Control endpoints (never counted):
                    connections}
 
 Optional host emulation for the #290 staging sweep (env, off by default):
-  TTFB_MS=<n>        sleep n ms before each data response's first byte
+  TTFB_MS=<n>        sleep n ms before each data response's status line
   CONN_BW_MBPS=<x>   cap each connection's body throughput at x MB/s
 
 This is the single source of truth for `bytes_fetched` / `request_count`
@@ -59,12 +59,14 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             _stats["connections"] += 1
 
-    def _send_body(self, body):
-        if TTFB_S == 0 and CONN_BW == 0:
-            self.wfile.write(body)
-            return
+    def _ttfb(self):
+        # Before the status line: headers are bytes too, and wfile is
+        # unbuffered, so sleeping after end_headers() would emulate time to
+        # first *body* byte instead.
         if TTFB_S:
             time.sleep(TTFB_S)
+
+    def _send_body(self, body):
         if CONN_BW == 0:
             self.wfile.write(body)
             return
@@ -115,6 +117,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(full, "rb") as f:
                 f.seek(start)
                 body = f.read(length)
+            self._ttfb()
             self.send_response(206)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
@@ -128,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             with open(full, "rb") as f:
                 body = f.read()
+            self._ttfb()
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Accept-Ranges", "bytes")
