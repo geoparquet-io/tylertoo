@@ -249,7 +249,7 @@ fn symlinked_outputs_and_stdout_reports_pass_the_preflight() {
 }
 
 /// `--report` is written after the output, so a report path naming the
-/// output (or the input) replaced the finished archive (or the source data)
+/// output (or the input, or `--keep-overview`) replaced the finished archive (or the source data)
 /// with the JSON report, and the run still exited 0. Refused up front, also
 /// when the two paths are spelled differently.
 #[test]
@@ -269,9 +269,19 @@ fn report_over_the_output_or_the_input_is_refused_up_front() {
     let (over_pmtiles, over_parquet) = (respelled("out.pmtiles"), respelled("out.parquet"));
     let over_input = respelled("missing-input.parquet");
     let over_archive = respelled("missing-input.pmtiles");
-    let cases: [&[&str]; 7] = [
+    let (kept, over_kept) = (path("kept.parquet"), respelled("kept.parquet"));
+    let cases: [&[&str]; 8] = [
         &["tiles", &input, &pmtiles, "--report", &over_pmtiles],
         &["tiles", &input, &pmtiles, "--report", &over_input],
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--keep-overview",
+            &kept,
+            "--report",
+            &over_kept,
+        ],
         &["overview", &input, &parquet, "--report", &over_parquet],
         &[
             "export-pmtiles",

@@ -2206,7 +2206,11 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     )?;
 
     check_output_path(&output, OutputKind::Pmtiles, args.force)?;
-    preflight_report(args.report.as_deref(), &[&output, spec.path()])?;
+    let named: Vec<&Path> = [output.as_path(), spec.path()]
+        .into_iter()
+        .chain(args.keep_overview.as_deref())
+        .collect();
+    preflight_report(args.report.as_deref(), &named)?;
 
     // #433: the export knobs that need no file are checked before the
     // convert, which on a large input runs for minutes before the export
@@ -3133,8 +3137,10 @@ fn preflight_writable(path: &Path) -> Result<()> {
 /// `--report` preflight (#452): the report is written when the run ends, so
 /// a bad path would otherwise throw the finished run away. It is rewritten
 /// in place, so an existing report must itself be writable. It must not be
-/// any of `others` (the run's output and inputs): written last, it would
-/// replace the finished output, or the source data, with JSON.
+/// any of `others` (the paths the command line names for the run to write
+/// or read): written last, it would replace the finished output, or the
+/// source data, with JSON. Only those paths are compared, not the files a
+/// directory, glob or `--files-from` input expands to.
 fn preflight_report(report: Option<&Path>, others: &[&Path]) -> Result<()> {
     let Some(path) = report else {
         return Ok(());
