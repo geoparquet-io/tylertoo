@@ -957,6 +957,14 @@ struct ConvertTuningArgs {
 }
 
 impl ConvertTuningArgs {
+    /// `--save-plan` and `--plan`, for [`preflight_report`].
+    fn plan_paths(&self) -> impl Iterator<Item = &Path> {
+        self.save_plan
+            .as_deref()
+            .into_iter()
+            .chain(self.plan.as_deref())
+    }
+
     /// Build [`ConvertOptions`] from the shared tuning flags, applying the same
     /// validation both `overview` and `tiles` rely on. The parent command owns
     /// `mode`, the `levels` plan, `bbox`, and `cogp_compat` and passes them in.
@@ -2209,6 +2217,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     let named: Vec<&Path> = [output.as_path(), spec.path()]
         .into_iter()
         .chain(args.keep_overview.as_deref())
+        .chain(args.shard_plan.as_deref())
+        .chain(args.tuning.plan_paths())
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
@@ -2608,7 +2618,11 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     // overview itself is written to a sibling and renamed over OUTPUT at the
     // end, so an interrupted run leaves a previous file intact either way.
     check_output_path(&output, OutputKind::GeoParquet, args.force)?;
-    preflight_report(args.report.as_deref(), &[&output, spec.path()])?;
+    let named: Vec<&Path> = [output.as_path(), spec.path()]
+        .into_iter()
+        .chain(args.tuning.plan_paths())
+        .collect();
+    preflight_report(args.report.as_deref(), &named)?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,

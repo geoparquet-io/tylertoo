@@ -249,7 +249,8 @@ fn symlinked_outputs_and_stdout_reports_pass_the_preflight() {
 }
 
 /// `--report` is written after the output, so a report path naming the
-/// output (or the input, or `--keep-overview`) replaced the finished archive (or the source data)
+/// output (or the input, or another file the command line names, such as
+/// `--keep-overview` or `--save-plan`) replaced the finished archive (or the source data)
 /// with the JSON report, and the run still exited 0. Refused up front, also
 /// when the two paths are spelled differently.
 #[test]
@@ -270,7 +271,32 @@ fn report_over_the_output_or_the_input_is_refused_up_front() {
     let over_input = respelled("missing-input.parquet");
     let over_archive = respelled("missing-input.pmtiles");
     let (kept, over_kept) = (path("kept.parquet"), respelled("kept.parquet"));
-    let cases: [&[&str]; 8] = [
+    let (plan, over_plan) = (path("convert.plan"), respelled("convert.plan"));
+    let (fleet, over_fleet) = (path("fleet.json"), respelled("fleet.json"));
+    let cases: [&[&str]; 11] = [
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--save-plan",
+            &plan,
+            "--report",
+            &over_plan,
+        ],
+        &[
+            "overview", &input, &parquet, "--plan", &plan, "--report", &over_plan,
+        ],
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--shard",
+            "coarse",
+            "--shard-plan",
+            &fleet,
+            "--report",
+            &over_fleet,
+        ],
         &["tiles", &input, &pmtiles, "--report", &over_pmtiles],
         &["tiles", &input, &pmtiles, "--report", &over_input],
         &[
