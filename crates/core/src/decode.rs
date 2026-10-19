@@ -110,6 +110,26 @@ pub struct DecodeOptions {
     pub layer: Option<String>,
 }
 
+impl DecodeOptions {
+    /// Reject an inverted zoom range (`min_zoom > max_zoom`), which would
+    /// otherwise select no tiles and quietly write an empty file.
+    /// [`decode_pmtiles`] calls this first; it is public so a caller can
+    /// check before doing its own preflight work.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::InvalidZoomRange`] when both bounds are set and
+    /// `min_zoom > max_zoom`.
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        match (self.min_zoom, self.max_zoom) {
+            (Some(min_zoom), Some(max_zoom)) if min_zoom > max_zoom => {
+                Err(DecodeError::InvalidZoomRange { min_zoom, max_zoom })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Summary of a completed decode.
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodeReport {
@@ -137,6 +157,9 @@ pub struct DecodeReport {
 /// `anyhow::Error`, or walk `source()`.
 #[derive(Debug, Error)]
 pub enum DecodeError {
+    #[error("minimum zoom {min_zoom} exceeds maximum zoom {max_zoom}")]
+    InvalidZoomRange { min_zoom: u8, max_zoom: u8 },
+
     #[error("I/O error")]
     Io(#[from] std::io::Error),
 
@@ -211,14 +234,15 @@ pub enum DecodeError {
 ///
 /// # Errors
 ///
-/// Returns a [`DecodeError`] if the archive cannot be read or parsed, does not
-/// hold MVT tiles, holds a section or tile that does not decompress or decode,
+/// Returns a [`DecodeError`] if the zoom range is inverted, the archive cannot
+/// be read or parsed, does not hold MVT tiles, holds a section or tile that does not decompress or decode,
 /// or if writing the output fails.
 pub fn decode_pmtiles(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     options: &DecodeOptions,
 ) -> Result<DecodeReport, DecodeError> {
+    options.validate()?;
     let start = Instant::now();
     // #452: the output is created only after Pass A has decoded every tile.
     crate::atomic_output::check_writable(output_path.as_ref())?;

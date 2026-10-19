@@ -652,3 +652,59 @@ fn a_layer_declaring_extent_zero_is_rejected() {
         "message must name the tile and the layer, got: {msg}"
     );
 }
+
+/// An inverted zoom range is a caller mistake, not an empty selection: it
+/// fails before the archive is read, and writes nothing (#445 — the check
+/// used to live only in the CLI, so library and Python callers silently got
+/// an empty file).
+#[test]
+fn inverted_zoom_range_is_rejected_before_any_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = small_archive(&dir);
+    let out = dir.path().join("out.parquet");
+    let options = DecodeOptions {
+        min_zoom: Some(8),
+        max_zoom: Some(5),
+        layer: None,
+    };
+    let err = decode_pmtiles(&path, &out, &options).expect_err("inverted range must fail");
+    assert!(
+        matches!(
+            err,
+            DecodeError::InvalidZoomRange {
+                min_zoom: 8,
+                max_zoom: 5
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "minimum zoom 8 exceeds maximum zoom 5");
+    assert!(!out.exists());
+
+    // Checked before the input is opened: a missing file still reports the
+    // range, not an I/O error.
+    let missing = dir.path().join("missing.pmtiles");
+    assert!(matches!(
+        decode_pmtiles(&missing, &out, &options),
+        Err(DecodeError::InvalidZoomRange { .. })
+    ));
+}
+
+/// `min_zoom == max_zoom` is one zoom, not an inverted range. (z6 holds no
+/// tiles in this archive, so the decode succeeds with nothing written; the
+/// archive's z5 payloads exist to exercise the error paths above.)
+#[test]
+fn equal_zoom_bounds_are_one_zoom_not_an_inverted_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = small_archive(&dir);
+    let out = dir.path().join("out.parquet");
+    let options = DecodeOptions {
+        min_zoom: Some(6),
+        max_zoom: Some(6),
+        layer: None,
+    };
+    assert!(options.validate().is_ok());
+    let report = decode_pmtiles(&path, &out, &options).unwrap();
+    assert_eq!(report.tiles_read, 0);
+    assert_eq!(report.zoom_range, None);
+}

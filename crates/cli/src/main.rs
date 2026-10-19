@@ -3360,16 +3360,13 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         Some(z) => (Some(z), Some(z)),
         None => (args.min_zoom, args.max_zoom),
     };
-    if let (Some(lo), Some(hi)) = (min_zoom, max_zoom) {
-        if lo > hi {
-            anyhow::bail!("--min-zoom {lo} exceeds --max-zoom {hi}");
-        }
-    }
     let options = DecodeOptions {
         min_zoom,
         max_zoom,
         layer: args.layer,
     };
+    // Before the "Decoding" line, so an inverted range prints nothing else.
+    options.validate()?;
 
     say!(
         "Decoding {} → {}",
