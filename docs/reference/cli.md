@@ -11,8 +11,15 @@ Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews.
 `tylertoo INPUT OUTPUT` with no subcommand runs `tiles`.
 
 ```text
-tylertoo <COMMAND>
+tylertoo [OPTIONS] <COMMAND>
 ```
+
+Exit status:
+
+- 0: success.
+- 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
+- 2: the command line was rejected while it was parsed.
+- 101: a panic, from an internal bug or an output pipe closed early.
 
 ### Subcommands
 
@@ -27,6 +34,14 @@ tylertoo <COMMAND>
 | [`pyramid`](#tylertoo-pyramid) | Build one archive from several inputs, each owning a zoom range |
 | [`merge`](#tylertoo-merge) | Combine PMTiles archives that hold disjoint tiles into one |
 | [`shard-plan`](#tylertoo-shard-plan) | Cut a dataset's tile space into N disjoint shards for a sharded build |
+
+### Global options
+
+| Option | Description |
+| --- | --- |
+| `-q`, `--quiet` | Print only warnings and errors. The output of `stats` and `validate` still prints. |
+
+These go before or after the subcommand.
 
 ## `tylertoo tiles`
 

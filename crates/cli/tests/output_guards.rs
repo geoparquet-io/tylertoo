@@ -130,3 +130,209 @@ fn export_pmtiles_rejects_missing_spill_dir_up_front() {
         "got:\n{stderr}"
     );
 }
+
+/// #452: an output in a directory that does not exist used to be found only
+/// when the output was created — after the whole convert (or every pyramid
+/// band, or the decode's first pass). Every writer now checks first: the
+/// input here does not exist either, and the output error must win.
+#[test]
+fn missing_output_directory_is_refused_before_the_input_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_dir = dir.path().join("no-such-dir");
+    let input = dir.path().join("missing-input.parquet");
+    let archive = dir.path().join("missing-input.pmtiles");
+    let band = format!("0-2:{}", input.display());
+    let pmtiles = missing_dir.join("out.pmtiles");
+    let parquet = missing_dir.join("out.parquet");
+    let plan = missing_dir.join("plan.json");
+    let (input, archive) = (input.to_str().unwrap(), archive.to_str().unwrap());
+    let (pmtiles, parquet) = (pmtiles.to_str().unwrap(), parquet.to_str().unwrap());
+    let cases: [&[&str]; 8] = [
+        &["tiles", input, pmtiles],
+        &[input, pmtiles], // the bare form is `tiles`
+        &["overview", input, parquet],
+        &["export-pmtiles", input, pmtiles],
+        &["decode", archive, parquet],
+        &["pyramid", pmtiles, "--band", &band],
+        &["merge", pmtiles, archive, archive],
+        &[
+            "shard-plan",
+            input,
+            "-o",
+            plan.to_str().unwrap(),
+            "--shards",
+            "2",
+        ],
+    ];
+    for args in cases {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: must fail");
+        assert!(
+            stderr.contains(&missing_dir.display().to_string())
+                && stderr.contains("does not exist"),
+            "{args:?}: must name the missing output directory, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("missing-input"),
+            "{args:?}: the input was looked at before the output, got:\n{stderr}"
+        );
+    }
+    assert!(!missing_dir.exists(), "nothing may create the directory");
+}
+
+/// #452: `--report` is written when the run ends, so a report path in a
+/// missing directory used to throw the finished run away. It is checked up
+/// front on every subcommand that takes it.
+#[test]
+fn report_into_a_missing_directory_is_refused_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("missing-input.parquet");
+    let archive = dir.path().join("missing-input.pmtiles");
+    let report = dir.path().join("no-such-dir").join("report.json");
+    let pmtiles = dir.path().join("out.pmtiles");
+    let parquet = dir.path().join("out.parquet");
+    let (input, archive) = (input.to_str().unwrap(), archive.to_str().unwrap());
+    let (pmtiles, parquet) = (pmtiles.to_str().unwrap(), parquet.to_str().unwrap());
+    let report = report.to_str().unwrap();
+    let cases: [&[&str]; 5] = [
+        &["tiles", input, pmtiles, "--report", report],
+        &["overview", input, parquet, "--report", report],
+        &["export-pmtiles", input, pmtiles, "--report", report],
+        &["decode", archive, parquet, "--report", report],
+        &["merge", pmtiles, archive, archive, "--report", report],
+    ];
+    for args in cases {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: must fail");
+        assert!(
+            stderr.contains("--report") && stderr.contains("does not exist"),
+            "{args:?}: must name --report and why, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("missing-input"),
+            "{args:?}: the input was looked at before --report, got:\n{stderr}"
+        );
+    }
+}
+
+/// #452 review: the preflight must not refuse what the writers handle. A
+/// dangling symlink is a fine PMTiles output (the writer replaces the
+/// link), and `--report /dev/stdout` writes through a `/proc/self/fd` link
+/// that cannot be canonicalized when stdout is a pipe, as it is here. Both
+/// get past the checks to the (missing) input.
+#[cfg(target_os = "linux")]
+#[test]
+fn symlinked_outputs_and_stdout_reports_pass_the_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("missing-input.parquet");
+    let link = dir.path().join("out.pmtiles");
+    std::os::unix::fs::symlink(dir.path().join("gone").join("x"), &link).unwrap();
+    let plain = dir.path().join("plain.pmtiles");
+    let (input, link) = (input.to_str().unwrap(), link.to_str().unwrap());
+    for args in [
+        &["tiles", input, link, "--force"][..],
+        &[
+            "tiles",
+            input,
+            plain.to_str().unwrap(),
+            "--report",
+            "/dev/stdout",
+        ][..],
+    ] {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: the missing input must still fail");
+        assert!(
+            stderr.contains("missing-input") && !stderr.contains("cannot write"),
+            "{args:?}: must get past the output checks, got:\n{stderr}"
+        );
+    }
+}
+
+/// `--report` is written after the output, so a report path naming the
+/// output (or the input, or another file the command line names, such as
+/// `--keep-overview` or `--save-plan`) replaced the finished archive (or the source data)
+/// with the JSON report, and the run still exited 0. Refused up front, also
+/// when the two paths are spelled differently.
+#[test]
+fn report_over_the_output_or_the_input_is_refused_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let respelled = |name: &str| {
+        dir.path()
+            .join(".")
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let (input, archive) = (path("missing-input.parquet"), path("missing-input.pmtiles"));
+    let (pmtiles, parquet) = (path("out.pmtiles"), path("out.parquet"));
+    let (over_pmtiles, over_parquet) = (respelled("out.pmtiles"), respelled("out.parquet"));
+    let over_input = respelled("missing-input.parquet");
+    let over_archive = respelled("missing-input.pmtiles");
+    let (kept, over_kept) = (path("kept.parquet"), respelled("kept.parquet"));
+    let (plan, over_plan) = (path("convert.plan"), respelled("convert.plan"));
+    let (fleet, over_fleet) = (path("fleet.json"), respelled("fleet.json"));
+    let cases: [&[&str]; 11] = [
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--save-plan",
+            &plan,
+            "--report",
+            &over_plan,
+        ],
+        &[
+            "overview", &input, &parquet, "--plan", &plan, "--report", &over_plan,
+        ],
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--shard",
+            "coarse",
+            "--shard-plan",
+            &fleet,
+            "--report",
+            &over_fleet,
+        ],
+        &["tiles", &input, &pmtiles, "--report", &over_pmtiles],
+        &["tiles", &input, &pmtiles, "--report", &over_input],
+        &[
+            "tiles",
+            &input,
+            &pmtiles,
+            "--keep-overview",
+            &kept,
+            "--report",
+            &over_kept,
+        ],
+        &["overview", &input, &parquet, "--report", &over_parquet],
+        &[
+            "export-pmtiles",
+            &input,
+            &pmtiles,
+            "--report",
+            &over_pmtiles,
+        ],
+        &["decode", &archive, &parquet, "--report", &over_parquet],
+        &["decode", &archive, &parquet, "--report", &over_archive],
+        &[
+            "merge",
+            &pmtiles,
+            &archive,
+            &archive,
+            "--report",
+            &over_pmtiles,
+        ],
+    ];
+    for args in cases {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: must fail");
+        assert!(
+            stderr.contains("--report") && stderr.contains("same file"),
+            "{args:?}: must refuse the report path, got:\n{stderr}"
+        );
+    }
+}

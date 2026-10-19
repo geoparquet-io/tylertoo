@@ -149,6 +149,8 @@ pub fn merge_shards(
             "merge needs at least one input archive".to_string(),
         ));
     }
+    // #452: the archive is created only at finalize, after every tile.
+    crate::atomic_output::check_writable(output)?;
 
     // Header + directories + metadata for every input. Even a hundred
     // multi-gigabyte shards cost megabytes here, which is the whole reason

@@ -166,23 +166,27 @@ impl MaxZoom {
     ///   estimating (the GSD ladder sets the levels, so the value is unused).
     /// - `Auto` with a zoom range fails fast on a `min_zoom` above the
     ///   ceiling, then runs the same up-front validation the conversion runs
-    ///   (so a bad option still fails in milliseconds, #371), then estimates
+    ///   (so a bad option still fails in milliseconds, #371), then checks
+    ///   that `output` (when given) can be written (#452), then estimates
     ///   over `source` honoring `options.bbox` / `options.filter`, logs the
     ///   pick and its evidence, and writes the chosen zoom into
     ///   `options.levels`.
     ///
     /// `source` is only read (its column projection is left alone), so it may
-    /// be the one the conversion then reads.
+    /// be the one the conversion then reads. `output` is the conversion's
+    /// output, which the conversion checks again; pass `None` when there is
+    /// none (a plan-only run) or the caller has already checked it.
     ///
     /// # Errors
     ///
     /// Returns a [`ConvertError`] if `min_zoom` is above the ceiling, if
-    /// `options` fail the conversion's up-front validation, or if
-    /// [`estimate_max_zoom`] fails.
+    /// `options` fail the conversion's up-front validation, if `output`
+    /// cannot be written, or if [`estimate_max_zoom`] fails.
     pub fn resolve(
         self,
         source: &ConvertSource,
         options: &mut ConvertOptions,
+        output: Option<&std::path::Path>,
     ) -> Result<u8, ConvertError> {
         let MaxZoom::Auto = self else {
             return Ok(self.plan_zoom());
@@ -193,6 +197,9 @@ impl MaxZoom {
         };
         check_auto_min_zoom(min_zoom, AUTO_MAX_ZOOM_CEILING)?;
         validate_options(options)?;
+        if let Some(output) = output {
+            crate::atomic_output::check_writable(output)?;
+        }
         let evidence = estimate_max_zoom(source, options)?;
         evidence.log();
         options.levels = LevelPlan::ZoomRange {
@@ -685,8 +692,13 @@ pub(crate) fn estimate_with(
 ) -> Result<AutoZoomEvidence, ConvertError> {
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
-    let crs = detect_crs_from_kv(source.key_value_metadata()?.as_ref())?;
-    let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let crs = detect_crs_from_kv(
+        source.key_value_metadata()?.as_ref(),
+        &source.display_name(),
+    )?;
+    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+        input: source.display_name(),
+    })?;
     let geom_field = schema.field(geom_idx).clone();
     // Bound against the file's own column names: a filter naming a column
     // the conversion renames (#288) addresses it by that same input name.
@@ -1528,7 +1540,9 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        let err = MaxZoom::Auto.resolve(&source, &mut options).unwrap_err();
+        let err = MaxZoom::Auto
+            .resolve(&source, &mut options, None)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1564,7 +1578,12 @@ mod tests {
             filter: Some("no_such_column = 1".to_string()),
             ..ConvertOptions::default()
         };
-        assert_eq!(MaxZoom::Fixed(9).resolve(&source, &mut options).unwrap(), 9);
+        assert_eq!(
+            MaxZoom::Fixed(9)
+                .resolve(&source, &mut options, None)
+                .unwrap(),
+            9
+        );
         assert!(matches!(
             options.levels,
             LevelPlan::ZoomRange { max_zoom: 9, .. }
@@ -1586,7 +1605,7 @@ mod tests {
             ..ConvertOptions::default()
         };
         assert!(matches!(
-            MaxZoom::Auto.resolve(&source, &mut bad).unwrap_err(),
+            MaxZoom::Auto.resolve(&source, &mut bad, None).unwrap_err(),
             ConvertError::Filter(_)
         ));
 
@@ -1597,7 +1616,7 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        let z = MaxZoom::Auto.resolve(&source, &mut options).unwrap();
+        let z = MaxZoom::Auto.resolve(&source, &mut options, None).unwrap();
         assert_eq!(z, 12);
         assert!(matches!(
             options.levels,
@@ -1605,6 +1624,38 @@ mod tests {
                 min_zoom: 0,
                 max_zoom: 12
             }
+        ));
+    }
+
+    /// #452: the estimate reads the input, so an output that cannot be
+    /// written is refused first — but after the option checks, so a bad
+    /// option is still reported as one.
+    #[test]
+    fn auto_checks_the_output_before_estimating() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write(&dir, "p.parquet", &point_grid(20, 0.001));
+        let missing = dir.path().join("no-such-dir").join("out.parquet");
+        let auto = || ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: MaxZoom::Auto.plan_zoom(),
+            },
+            ..ConvertOptions::default()
+        };
+        let err = MaxZoom::Auto
+            .resolve(&source, &mut auto(), Some(&missing))
+            .unwrap_err();
+        assert!(matches!(err, ConvertError::Output(_)), "{err:?}");
+
+        let mut bad = ConvertOptions {
+            filter: Some("id >>> 3".to_string()),
+            ..auto()
+        };
+        assert!(matches!(
+            MaxZoom::Auto
+                .resolve(&source, &mut bad, Some(&missing))
+                .unwrap_err(),
+            ConvertError::Filter(_)
         ));
     }
 
@@ -1619,7 +1670,7 @@ mod tests {
             ..ConvertOptions::default()
         };
         assert_eq!(
-            MaxZoom::Auto.resolve(&source, &mut options).unwrap(),
+            MaxZoom::Auto.resolve(&source, &mut options, None).unwrap(),
             AUTO_MAX_ZOOM_CEILING
         );
     }

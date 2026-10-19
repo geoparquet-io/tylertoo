@@ -39,11 +39,38 @@ pub enum ReaderError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
     Parquet(#[from] parquet::errors::ParquetError),
+    /// The overview file could not be opened (#452: the bare [`Self::Io`]
+    /// named no file). Not a `#[source]`, so `Caused by:` chains do not
+    /// repeat the reason.
+    #[error("cannot open {path}: {error}")]
+    Open {
+        /// The file as given.
+        path: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// The overview file's Parquet footer could not be read (#452).
+    #[error(
+        "cannot read the Parquet footer of {path}: {}",
+        crate::input::parquet_error_detail(.error)
+    )]
+    Footer {
+        /// The file as given.
+        path: String,
+        /// The underlying Parquet error.
+        error: parquet::errors::ParquetError,
+    },
     /// The `geo:overviews` footer key is absent — not an overview file.
-    #[error("'geo:overviews' footer key absent: not an overview file")]
-    MissingOverviewsKey,
+    #[error(
+        "{path} has no 'geo:overviews' footer key: not an overview file (make one with \
+         `tylertoo overview`)"
+    )]
+    MissingOverviewsKey {
+        /// The file as given.
+        path: String,
+    },
     /// The `geo:overviews` footer key is present but is not valid JSON per §3.
     #[error("invalid 'geo:overviews' JSON: {0}")]
     InvalidOverviewsJson(serde_json::Error),
@@ -93,8 +120,17 @@ impl OverviewReader {
     /// footer cannot be parsed, as well as the two cases above.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ReaderError> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let shown = || path.display().to_string();
+        let file = File::open(&path).map_err(|error| ReaderError::Open {
+            path: shown(),
+            error,
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+            ReaderError::Footer {
+                path: shown(),
+                error,
+            }
+        })?;
         let metadata = builder.metadata().clone();
         let schema = builder.schema().clone();
 
@@ -103,7 +139,7 @@ impl OverviewReader {
             .key_value_metadata()
             .and_then(|kvs| kvs.iter().find(|kv| kv.key == OVERVIEWS_KEY))
             .and_then(|kv| kv.value.clone())
-            .ok_or(ReaderError::MissingOverviewsKey)?;
+            .ok_or_else(|| ReaderError::MissingOverviewsKey { path: shown() })?;
 
         let meta = OverviewsMeta::from_json(&json).map_err(ReaderError::InvalidOverviewsJson)?;
 
@@ -125,6 +161,11 @@ impl OverviewReader {
             schema,
             meta,
         })
+    }
+
+    /// The file this reader opened, as given.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The parsed `geo:overviews` footer metadata.
@@ -781,7 +822,28 @@ mod tests {
             w.close().unwrap();
         }
         let err = OverviewReader::open(tmp.path()).unwrap_err();
-        assert!(matches!(err, ReaderError::MissingOverviewsKey));
+        assert!(matches!(err, ReaderError::MissingOverviewsKey { .. }));
+        // #452: a plain GeoParquet handed to `export-pmtiles` is the usual
+        // way to get here, so say which file it was.
+        let msg = err.to_string();
+        assert!(msg.contains(&tmp.path().display().to_string()), "{msg}");
+    }
+
+    /// #452: open-time I/O and footer errors name the file, and say
+    /// "Parquet error" once at most.
+    #[test]
+    fn open_errors_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.parquet");
+        let msg = OverviewReader::open(&missing).unwrap_err().to_string();
+        assert!(msg.contains(&missing.display().to_string()), "{msg}");
+        assert!(msg.contains("No such file"), "{msg}");
+
+        let corrupt = dir.path().join("corrupt.parquet");
+        std::fs::write(&corrupt, b"definitely not parquet").unwrap();
+        let msg = OverviewReader::open(&corrupt).unwrap_err().to_string();
+        assert!(msg.contains(&corrupt.display().to_string()), "{msg}");
+        assert!(!msg.to_lowercase().contains("parquet error"), "{msg}");
     }
 
     #[test]

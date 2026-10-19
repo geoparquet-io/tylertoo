@@ -2075,6 +2075,54 @@ fn empty_coarse_levels_omitted_with_clustering() {
 // Class 9: export-pmtiles hostile inputs
 // ============================================================================
 
+/// #452: an overview file whose geometry column is gone names the file.
+#[test]
+fn export_names_an_overview_file_without_geometry() {
+    let tovr = tempfile::NamedTempFile::new().unwrap();
+    make_valid_overview(tovr.path());
+    let open = || {
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(tovr.path()).unwrap()).unwrap()
+    };
+    let source = open();
+    let kvs = source
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .clone();
+    let row_groups = source.metadata().num_row_groups();
+    let keep: Vec<usize> = (0..source.schema().fields().len())
+        .filter(|&i| !source.schema().field(i).name().contains("geom"))
+        .collect();
+    let schema = Arc::new(source.schema().project(&keep).unwrap());
+
+    // Row group by row group, so the `geo:overviews` bands still line up.
+    let tbad = tempfile::NamedTempFile::new().unwrap();
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(tbad.path()).unwrap(), schema, None).unwrap();
+    for rg in 0..row_groups {
+        for batch in open().with_row_groups(vec![rg]).build().unwrap() {
+            writer
+                .write(&batch.unwrap().project(&keep).unwrap())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    for kv in kvs.into_iter().filter(|kv| kv.key == "geo:overviews") {
+        writer.append_key_value_metadata(kv);
+    }
+    writer.close().unwrap();
+
+    let tout = tempfile::NamedTempFile::new().unwrap();
+    let err = export_pmtiles(tbad.path(), tout.path(), &ExportOptions::default()).unwrap_err();
+    assert!(
+        matches!(err, ExportError::NoGeometryColumn { .. }),
+        "got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains(&tbad.path().display().to_string()), "{msg}");
+}
+
 #[test]
 fn export_non_overview_parquet_errors() {
     // A plain GeoParquet file (no `geo:overviews` key) is rejected with the
@@ -2084,7 +2132,10 @@ fn export_non_overview_parquet_errors() {
     write_input(tin.path(), &spread_points(3), true, None);
     let err = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default()).unwrap_err();
     assert!(
-        matches!(err, ExportError::Reader(ReaderError::MissingOverviewsKey)),
+        matches!(
+            err,
+            ExportError::Reader(ReaderError::MissingOverviewsKey { .. })
+        ),
         "got: {err}"
     );
 }
@@ -2137,7 +2188,7 @@ fn reader_rejects_negative_row_group_end() {
     });
     let err = OverviewReader::open(tbad.path()).unwrap_err();
     assert!(
-        !matches!(err, ReaderError::MissingOverviewsKey),
+        !matches!(err, ReaderError::MissingOverviewsKey { .. }),
         "wrong rejection: {err}"
     );
 }

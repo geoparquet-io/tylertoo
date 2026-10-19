@@ -1621,8 +1621,9 @@ impl PmtilesWriter {
     /// Returns [`Error::PMTilesWrite`] if the file cannot be created or
     /// written, or if a directory or the metadata cannot be compressed.
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
-        let file = File::create(path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to create file: {}", e)))?;
+        let file = File::create(path).map_err(|e| {
+            Error::PMTilesWrite(format!("Failed to create file {}: {e}", path.display()))
+        })?;
         let mut writer = BufWriter::new(file);
 
         // Build tile data buffer and directory entries with deduplication
@@ -3202,8 +3203,12 @@ impl StreamingPmtilesWriter {
             }
         };
 
-        let output_file = File::create(&partial_path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to create output file: {}", e)))?;
+        let output_file = File::create(&partial_path).map_err(|e| {
+            Error::PMTilesWrite(format!(
+                "Failed to create output file {}: {e}",
+                partial_path.display()
+            ))
+        })?;
         let mut writer = BufWriter::new(output_file);
 
         writer
@@ -3241,8 +3246,13 @@ impl StreamingPmtilesWriter {
         drop(writer);
 
         // Atomically publish the assembled archive.
-        std::fs::rename(&partial_path, output_path)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to publish archive: {}", e)))?;
+        std::fs::rename(&partial_path, output_path).map_err(|e| {
+            Error::PMTilesWrite(format!(
+                "Failed to publish archive {} over {}: {e}",
+                partial_path.display(),
+                output_path.display()
+            ))
+        })?;
 
         self.stats.checkpoint_bytes_written += tile_data_offset + self.current_offset;
 
@@ -6858,5 +6868,25 @@ mod tests {
         let stats = w.finalize(tmp.path()).unwrap();
         assert_eq!(stats.unique_tiles, 2 + u64::from(filler_tiles));
         assert_eq!(read_archive_tiles(&fs::read(tmp.path()).unwrap()), expected);
+    }
+
+    /// #452: "Failed to create output file: No such file or directory" named
+    /// no file. The entry points now check the output up front, but a library
+    /// caller driving the writer directly (or a directory removed mid-run)
+    /// still lands here.
+    #[test]
+    fn creating_the_output_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("gone").join("out.pmtiles");
+
+        let mut spooled = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        spooled.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+        let msg = spooled.finalize(&output).unwrap_err().to_string();
+        assert!(msg.contains(&output.display().to_string()), "{msg}");
+
+        let mut writer = PmtilesWriter::new();
+        writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+        let msg = writer.write_to_file(&output).unwrap_err().to_string();
+        assert!(msg.contains(&output.display().to_string()), "{msg}");
     }
 }

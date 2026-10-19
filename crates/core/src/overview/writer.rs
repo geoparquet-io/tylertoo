@@ -225,7 +225,7 @@ impl OverviewWriterOptions {
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
     /// Underlying parquet error.
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
     Parquet(#[from] parquet::errors::ParquetError),
     /// Arrow error (e.g. building a record batch).
     #[error("arrow error: {0}")]

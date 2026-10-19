@@ -1401,6 +1401,9 @@ pub fn build_pyramid(
     // tiling below where a late band's bad input would only surface after
     // every earlier band had already converted.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
+    // #452: the archive is created only after every band is tiled and
+    // merged; an unwritable output must not cost all of that first.
+    crate::atomic_output::check_writable(output)?;
 
     // Classified once, here, and reused below for the tiling loop: a band
     // that is about to be tiled loses the filename it was declared with —
@@ -1584,6 +1587,7 @@ pub fn merge_bands_with_options(
     // but cover disjoint geography, which the per-tile collision check below
     // would never catch.
     validate_bands(bands).map_err(Error::PMTilesWrite)?;
+    crate::atomic_output::check_writable(output)?;
     // The single call site for this warning: a direct library caller of this
     // `pub fn` gets it here. `build_pyramid` calls this too, but has already
     // warned (above, before conversion) about any pair involving a band it

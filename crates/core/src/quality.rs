@@ -310,15 +310,21 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
 
     // Resolve to first file if path is a directory
     let files = resolve_parquet_files(path)?;
-    let first_file = files
-        .first()
-        .ok_or_else(|| Error::GeoParquetRead("No parquet files found".to_string()))?;
+    let first_file = files.first().ok_or_else(|| {
+        Error::GeoParquetRead(format!("No parquet files found in {}", path.display()))
+    })?;
 
+    // #452: name the file; the bare messages named none.
     let file = std::fs::File::open(first_file)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
+        .map_err(|e| Error::GeoParquetRead(format!("cannot open {}: {e}", first_file.display())))?;
 
-    let reader = SerializedFileReader::new(file)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
+    let reader = SerializedFileReader::new(file).map_err(|e| {
+        Error::GeoParquetRead(format!(
+            "cannot read the Parquet footer of {}: {}",
+            first_file.display(),
+            crate::input::parquet_error_detail(&e)
+        ))
+    })?;
 
     let metadata = reader.metadata();
     let file_metadata = metadata.file_metadata();
@@ -633,6 +639,18 @@ pub fn validate_wgs84(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #452: a file that is not Parquet is named, and the reader's own
+    /// "Parquet error:" prefix is not repeated.
+    #[test]
+    fn extract_crs_names_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("corrupt.parquet");
+        std::fs::write(&corrupt, b"definitely not parquet").unwrap();
+        let msg = extract_crs(&corrupt).unwrap_err().to_string();
+        assert!(msg.contains(&corrupt.display().to_string()), "{msg}");
+        assert!(!msg.to_lowercase().contains("parquet error"), "{msg}");
+    }
 
     fn kv_with_geo(geo: &Value) -> Vec<parquet::file::metadata::KeyValue> {
         vec![parquet::file::metadata::KeyValue::new(

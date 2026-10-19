@@ -46,6 +46,15 @@ pub(super) fn format(markdown: String) -> String {
                 .unwrap();
             }
             output.push('\n');
+            // Global options (`-q`) appear only here: clap-markdown reads the
+            // unbuilt command, which has not copied them into subcommands.
+            for part in remainder.split("###### **").filter(|part| !part.is_empty()) {
+                let (heading, body) = part.split_once(":**\n").unwrap();
+                if heading == "Options" {
+                    write_table(&mut output, "Global options", &parse_entries(body));
+                    output.push_str("These go before or after the subcommand.\n\n");
+                }
+            }
             continue;
         }
 

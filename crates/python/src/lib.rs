@@ -72,12 +72,14 @@ fn extract_max_zoom(obj: &Bound<'_, PyAny>) -> PyResult<MaxZoom> {
 /// check has passed ([`MaxZoom::resolve`] validates the options before
 /// reading anything). A fixed zoom returns without opening the input; for
 /// `auto` a dedicated source is opened with `open_source`, so the
-/// conversion's own source is untouched. The GIL is released while the
-/// estimate reads.
+/// conversion's own source is untouched. Core checks `output` before the
+/// estimate reads the input (#452). The GIL is released while the estimate
+/// reads.
 fn resolve_max_zoom_py(
     py: Python<'_>,
     max_zoom: MaxZoom,
     options: &mut ConvertOptions,
+    output: &Path,
     open_source: impl FnOnce() -> Result<ConvertSource, ConvertError> + Send,
 ) -> PyResult<u8> {
     if !max_zoom.is_auto() {
@@ -85,7 +87,7 @@ fn resolve_max_zoom_py(
     }
     py.detach(|| {
         let source = open_source()?;
-        max_zoom.resolve(&source, options)
+        max_zoom.resolve(&source, options, Some(output))
     })
     .map_err(convert_error_to_py)
 }
@@ -138,7 +140,7 @@ fn convert(
     };
     // Resolves `auto` and writes the chosen zoom back into `levels`, which
     // is where the facade reads the declared range from.
-    resolve_max_zoom_py(py, max_zoom, &mut convert_options, || {
+    resolve_max_zoom_py(py, max_zoom, &mut convert_options, &output_path, || {
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
@@ -698,7 +700,7 @@ fn overview(
 
     // #444: every cheap check has passed; now estimate `auto` over a
     // dedicated source (skipped for an explicit `gsds` ladder).
-    resolve_max_zoom_py(py, max_zoom, &mut options, || match &parsed {
+    resolve_max_zoom_py(py, max_zoom, &mut options, &output_path, || match &parsed {
         OverviewInput::Path(p) => ConvertSource::resolve_path(p).map_err(ConvertError::from),
         OverviewInput::List(inputs) => {
             ConvertSource::from_input_list(inputs).map_err(ConvertError::from)

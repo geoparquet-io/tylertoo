@@ -55,6 +55,7 @@ additional_cargo_args = [
   "--test", "ioverlay_real_fixtures_test",
   "--test", "leaf_directory_integration",
   "--test", "line_clip_pinned",
+  "--test", "output_preflight",
   "--test", "overview_hostile",
   "--test", "overview_property_tests",
   "--test", "pmtiles_clustered",

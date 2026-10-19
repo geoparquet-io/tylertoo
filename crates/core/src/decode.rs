@@ -140,6 +140,11 @@ pub enum DecodeError {
     #[error("I/O error")]
     Io(#[from] std::io::Error),
 
+    /// The output cannot be written (#452: checked before the archive is
+    /// read).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
+
     #[error(transparent)]
     Archive(#[from] crate::Error),
 
@@ -215,6 +220,8 @@ pub fn decode_pmtiles(
     options: &DecodeOptions,
 ) -> Result<DecodeReport, DecodeError> {
     let start = Instant::now();
+    // #452: the output is created only after Pass A has decoded every tile.
+    crate::atomic_output::check_writable(output_path.as_ref())?;
     let bytes = std::fs::read(input_path.as_ref())?;
     let header = Header::from_bytes(&bytes)?;
     if header.tile_type != TileType::Mvt {

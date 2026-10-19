@@ -173,6 +173,20 @@ class TestConvertIntegration:
             # characterization test).
             assert data[101] == 14
 
+    def test_convert_max_zoom_auto_checks_the_output_before_reading(self):
+        """#452: "auto" reads the input to estimate, so an output in a
+        missing directory is refused first, naming the directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "no-such-dir"
+            with pytest.raises(RuntimeError, match="does not exist") as exc:
+                tylertoo.convert(
+                    input=str(Path(tmpdir) / "missing-input.parquet"),
+                    output=str(missing / "out.pmtiles"),
+                    max_zoom="auto",
+                )
+            assert str(missing) in str(exc.value)
+            assert "missing-input" not in str(exc.value)
+
     def test_convert_max_zoom_auto_is_case_insensitive(self):
         """ "AUTO" / "Auto" are accepted the same as "auto"."""
         input_file = REALDATA_DIR / "open-buildings.parquet"

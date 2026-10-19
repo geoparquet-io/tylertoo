@@ -17,10 +17,28 @@ For more information, try '--help'.
 
 ```
 
+Input errors name the file.
+
 ```console
 $ tylertoo missing.parquet out.pmtiles
 ? 1
-Error: overview conversion failed: input error: io error: No such file or directory (os error 2)
+Error: overview conversion failed: input error: cannot open missing.parquet: No such file or directory (os error 2)
+
+```
+
+```console
+$ tylertoo corrupt.parquet out.pmtiles
+? 1
+Error: overview conversion failed: input error: cannot read the Parquet footer of corrupt.parquet: Invalid Parquet file. Corrupt footer
+
+```
+
+An output in a missing directory is refused before the input is read.
+
+```console
+$ tylertoo overture-names.parquet no-such-dir/out.pmtiles
+? 1
+Error: cannot write no-such-dir/out.pmtiles: directory no-such-dir does not exist
 
 ```
 

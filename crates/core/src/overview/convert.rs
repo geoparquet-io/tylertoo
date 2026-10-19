@@ -1259,7 +1259,7 @@ pub enum ConvertError {
     #[error("property selection: {0}")]
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
     Parquet(#[from] parquet::errors::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
@@ -1271,10 +1271,12 @@ pub enum ConvertError {
     #[error("writer error: {0}")]
     Writer(#[from] WriterError),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
-    #[error("unsupported input CRS {crs:?}: overviews require EPSG:4326 or EPSG:3857")]
+    #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
+        /// Display name of the input (#452).
+        input: String,
     },
     /// All but a sliver (≥99%, `ALL_LOST_PERCENT`) of the input cannot be
     /// tiled (#429): the coordinates fall outside the declared CRS's range,
@@ -1297,9 +1299,16 @@ pub enum ConvertError {
         /// projected-CRS diagnosis in the message.
         max_abs: f64,
     },
-    /// The input has no geometry column.
-    #[error("input has no geometry column")]
-    NoGeometryColumn,
+    /// The output cannot be written (#452: checked before any input is read).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
+    /// The input has no geometry column: neither the GeoParquet `geo`
+    /// metadata's `primary_column` nor a recognized geometry column name.
+    #[error("{input} has no geometry column")]
+    NoGeometryColumn {
+        /// Display name of the input (path, URL, or partition set).
+        input: String,
+    },
     /// The `--sort-key` column is not present in the input schema.
     #[error("sort-key column {name:?} not found in input schema")]
     SortKeyColumnMissing {
@@ -2838,7 +2847,9 @@ pub(super) fn apply_property_selection(
         return Ok(());
     }
     let schema = source.file_schema()?;
-    let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+        input: source.display_name(),
+    })?;
     let mut warn = |msg: String| log::warn!("[convert] {msg}");
     let keep = options.properties.resolve(
         &schema,
@@ -3337,8 +3348,10 @@ fn load_input_table_with_limit(
     let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
-    let (crs, crs_assumed_wgs84) =
-        detect_crs_from_kv_assumed(builder.metadata().file_metadata().key_value_metadata())?;
+    let (crs, crs_assumed_wgs84) = detect_crs_from_kv_assumed(
+        builder.metadata().file_metadata().key_value_metadata(),
+        &source_single.display_name(),
+    )?;
     if crs_assumed_wgs84 {
         warn_assumed_wgs84(&source_single.display_name());
     }
@@ -3357,7 +3370,10 @@ fn load_input_table_with_limit(
     // input schema. Syntax was already validated in `validate_options`.
     let bound_filter = bind_attribute_filter(options, &input_schema, &renames)?;
 
-    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx =
+        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        })?;
     let geom_field = input_schema.field(geom_idx).clone();
 
     // Clustering schema checks + accumulate column resolution (Q4).
@@ -3750,6 +3766,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
         }
         None => options,
     };
+    // #452: the output is created after pass 1; a missing or read-only
+    // directory must not cost the whole scan first. After the option checks
+    // above (which read at most a footer, for a property selection), so a
+    // bad option is reported as such wherever the output points.
+    crate::atomic_output::check_writable(output_path)?;
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
@@ -4173,10 +4194,12 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 /// Detect the input CRS from parsed parquet key-value metadata and map it to
 /// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
+/// `input` names the file in the error (#452).
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    input: &str,
 ) -> Result<Crs, ConvertError> {
-    detect_crs_from_kv_assumed(kv).map(|(crs, _)| crs)
+    detect_crs_from_kv_assumed(kv, input).map(|(crs, _)| crs)
 }
 
 /// [`detect_crs_from_kv`], also reporting whether the WGS84 answer was the
@@ -4185,6 +4208,7 @@ pub(crate) fn detect_crs_from_kv(
 /// warn naming the input and record the assumption on the [`ConvertReport`].
 pub(crate) fn detect_crs_from_kv_assumed(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    input: &str,
 ) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
 
@@ -4206,6 +4230,7 @@ pub(crate) fn detect_crs_from_kv_assumed(
                 .identifier
                 .or(info.name)
                 .unwrap_or_else(|| "unknown".to_string()),
+            input: input.to_string(),
         }),
     }
 }
@@ -4249,7 +4274,7 @@ pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
         "geo".to_string(),
         geo_json.to_string(),
     )];
-    detect_crs_from_kv(Some(&kv))
+    detect_crs_from_kv(Some(&kv), "fuzz input")
 }
 
 /// Half the Web Mercator world extent in meters (`±` = the x/y range of
@@ -4435,7 +4460,8 @@ pub(crate) fn input_row_group_bounds(
     metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Vec<Option<crate::covering::RowGroupBounds>> {
     let geom_column = crate::covering::resolve_geometry_column_name(metadata);
-    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
+    // The error is discarded (it falls back below), so its name is moot.
+    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata(), "") {
         Ok(crs) => {
             crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
         }
@@ -9195,6 +9221,53 @@ mod tests {
         );
     }
 
+    /// #452: "input has no geometry column" named no file, which is no help
+    /// with a directory or glob of partitions. Every pipeline that looks
+    /// for the column names the input.
+    #[test]
+    fn no_geometry_column_names_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let exclude_all = PropertySelection {
+            exclude_all: true,
+            ..Default::default()
+        };
+        for (streaming, properties) in [
+            (true, PropertySelection::default()),
+            (false, PropertySelection::default()),
+            (true, exclude_all),
+        ] {
+            let err = convert_to_overviews(
+                &input,
+                dir.path().join("out.parquet"),
+                &ConvertOptions {
+                    streaming,
+                    properties: properties.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect_err("no geometry column");
+            assert!(
+                matches!(err, ConvertError::NoGeometryColumn { .. }),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&input.display().to_string()),
+                "streaming={streaming} {properties:?}: names the input: {msg}"
+            );
+        }
+    }
+
     /// #513: the preflight runs before a single input byte is read — the
     /// whole point is not paying for pass 1 first.
     #[test]
@@ -11419,12 +11492,26 @@ mod tests {
         );
         write_input(tin.path(), &geoms, false, Some(md));
 
-        let opts = ConvertOptions::default();
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::UnsupportedCrs { .. }),
-            "expected UnsupportedCrs, got {err:?}"
-        );
+        // #452: both pipelines, and auto-zoom's own read, name the file.
+        let streaming = ConvertOptions::default();
+        let in_memory = ConvertOptions {
+            streaming: false,
+            ..Default::default()
+        };
+        for opts in [streaming, in_memory] {
+            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+            assert!(
+                matches!(err, ConvertError::UnsupportedCrs { .. }),
+                "expected UnsupportedCrs, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
+        }
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let msg = super::super::auto_zoom::estimate_with(&source, 0, 16, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
     }
 
     /// Build the "geo" key-value metadata for a single WKB geometry column
@@ -11456,13 +11543,16 @@ mod tests {
             "id": { "authority": "EPSG", "code": 3857 }
         });
         let kv = kv_geo_with_crs(projjson);
-        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg3857);
+        assert_eq!(
+            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            Crs::Epsg3857
+        );
 
         // String forms resolve the same way.
         for id in ["EPSG:3857", "EPSG:900913"] {
             let kv = kv_geo_with_crs(serde_json::Value::String(id.to_string()));
             assert_eq!(
-                detect_crs_from_kv(Some(&kv)).unwrap(),
+                detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
                 Crs::Epsg3857,
                 "{id}"
             );
@@ -11473,7 +11563,10 @@ mod tests {
             "name": "WGS 84",
             "id": { "authority": "EPSG", "code": 4326 }
         }));
-        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg4326);
+        assert_eq!(
+            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            Crs::Epsg4326
+        );
 
         // A UTM zone — whose name also starts "WGS 84 /" — is rejected, not
         // silently read as degrees.
@@ -11483,7 +11576,7 @@ mod tests {
             "id": { "authority": "EPSG", "code": 32633 }
         }));
         assert!(matches!(
-            detect_crs_from_kv(Some(&kv)),
+            detect_crs_from_kv(Some(&kv), "t.parquet"),
             Err(ConvertError::UnsupportedCrs { .. })
         ));
     }
@@ -11522,7 +11615,10 @@ mod tests {
             .file_metadata()
             .key_value_metadata()
             .cloned();
-        assert_eq!(detect_crs_from_kv(kv.as_ref()).unwrap(), Crs::Epsg3857);
+        assert_eq!(
+            detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
+            Crs::Epsg3857
+        );
 
         let tout = tempfile::NamedTempFile::new().unwrap();
         let opts = ConvertOptions {

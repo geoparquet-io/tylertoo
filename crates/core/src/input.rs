@@ -64,8 +64,27 @@ pub enum InputError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Parquet error (footer parse, reader construction).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", parquet_error_detail(.0))]
     Parquet(#[from] ParquetError),
+    /// An input file could not be opened (#452: the bare [`Self::Io`] named
+    /// no file). Not a `#[source]`: the message already carries the reason,
+    /// and a source would repeat it in every `Caused by:` chain.
+    #[error("cannot open {input}: {error}")]
+    Open {
+        /// Display name of the input (path or URL).
+        input: String,
+        /// The underlying I/O error.
+        error: std::io::Error,
+    },
+    /// An input's Parquet footer could not be read or fetched (#452: the
+    /// bare [`Self::Parquet`] named no file).
+    #[error("cannot read the Parquet footer of {input}: {}", parquet_error_detail(.error))]
+    Footer {
+        /// Display name of the input (path or URL).
+        input: String,
+        /// The underlying Parquet error.
+        error: ParquetError,
+    },
     /// The input looks like a URL but uses a scheme we do not support.
     #[error(
         "unsupported input URL scheme `{scheme}://` in {url:?}: supported inputs are \
@@ -159,6 +178,16 @@ pub enum InputError {
         /// The glob crate's error message.
         message: String,
     },
+}
+
+/// A [`ParquetError`]'s message without the `Parquet error: ` prefix its
+/// `Display` adds to [`ParquetError::General`], so a message that already
+/// says what failed does not say "Parquet error" twice (#452).
+pub(crate) fn parquet_error_detail(error: &ParquetError) -> String {
+    match error {
+        ParquetError::General(message) => message.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Byte/request counters for a remote input. `Serialize` so conversion
@@ -275,10 +304,16 @@ impl InputSource {
     pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
-                let file = File::open(p)?;
-                Ok(ParquetRecordBatchReaderBuilder::try_new(
-                    InputReader::Local(file),
-                )?)
+                let file = File::open(p).map_err(|error| InputError::Open {
+                    input: self.display_name(),
+                    error,
+                })?;
+                ParquetRecordBatchReaderBuilder::try_new(InputReader::Local(file)).map_err(
+                    |error| InputError::Footer {
+                        input: self.display_name(),
+                        error,
+                    },
+                )
             }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
@@ -305,7 +340,10 @@ impl InputSource {
     ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
-                let file = File::open(p)?;
+                let file = File::open(p).map_err(|error| InputError::Open {
+                    input: self.display_name(),
+                    error,
+                })?;
                 Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
                     InputReader::Local(file),
                     meta.clone(),
@@ -889,7 +927,13 @@ pub(crate) mod remote {
                 return Ok(md.clone());
             }
             let reader = InputReader::Remote(self.reader());
-            let md = ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())?;
+            let md =
+                ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new()).map_err(|error| {
+                    InputError::Footer {
+                        input: self.url.clone(),
+                        error,
+                    }
+                })?;
             self.validate_chunk_ranges(md.metadata())?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
@@ -2375,6 +2419,52 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ftp"), "message names the scheme: {msg}");
         assert!(msg.contains("s3://"), "message lists alternatives: {msg}");
+    }
+
+    /// #452: a missing input used to surface as a bare "io error: No such
+    /// file or directory", with nothing saying which file.
+    #[test]
+    fn opening_a_missing_file_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.parquet");
+        let err = InputSource::from_path(&path).unwrap().open().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "names the path: {msg}"
+        );
+        assert!(msg.contains("No such file"), "keeps the OS reason: {msg}");
+    }
+
+    /// #452: a corrupt footer read "parquet error: Parquet error: Corrupt
+    /// footer", with no file name and the prefix said twice.
+    #[test]
+    fn a_corrupt_footer_names_the_file_without_stutter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.parquet");
+        std::fs::write(&path, b"not a parquet file at all, just text").unwrap();
+        let err = InputSource::from_path(&path).unwrap().open().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "names the path: {msg}"
+        );
+        assert!(
+            msg.contains("Corrupt footer"),
+            "keeps parquet's reason: {msg}"
+        );
+        assert_eq!(
+            msg.to_lowercase().matches("parquet error").count(),
+            0,
+            "no 'parquet error:' prefix, let alone two: {msg}"
+        );
+    }
+
+    /// #452: a mid-read Parquet error says "parquet error" once.
+    #[test]
+    fn a_parquet_error_says_so_once() {
+        let err = InputError::from(ParquetError::General("bad page".into()));
+        assert_eq!(err.to_string(), "parquet error: bad page");
     }
 
     #[test]

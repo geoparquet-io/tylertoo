@@ -521,6 +521,10 @@ pub struct SkippedPropertyColumn {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExportError {
+    /// The output cannot be written (#452: checked before the input is
+    /// opened).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
     /// Opening or reading the overview file failed.
     #[error("overview reader error: {0}")]
     Reader(#[from] ReaderError),
@@ -534,14 +538,24 @@ pub enum ExportError {
     #[error("{0}")]
     Core(#[from] crate::Error),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857.
-    #[error("unsupported input CRS {crs:?}: export requires EPSG:4326 or EPSG:3857")]
+    #[error("unsupported CRS {crs:?} in {path}: export requires EPSG:4326 or EPSG:3857")]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
+        /// The overview file (#452).
+        path: String,
     },
     /// The file has no geometry column.
-    #[error("overview file has no geometry column")]
-    NoGeometryColumn,
+    #[error(
+        "{} has no geometry column",
+        path.as_deref().unwrap_or("an overview batch")
+    )]
+    NoGeometryColumn {
+        /// The overview file (#452). `None` only from per-batch decoding,
+        /// which runs after the file's own check has passed, so it means a
+        /// bug rather than a bad file.
+        path: Option<String>,
+    },
 
     #[error(
         "declared min_zoom {declared} is finer than the coarsest level present (zoom \
@@ -1706,6 +1720,8 @@ fn export_pmtiles_run(
     // #433: the knobs that need no file (`extent`, `tile_buffer`) are checked
     // before any I/O, so a bad value fails here rather than after the open.
     options.validate()?;
+    // #452: and the output, before the input is opened.
+    crate::atomic_output::check_writable(output_path.as_ref())?;
     let start = Instant::now();
     let input_path = input_path.as_ref();
 
@@ -2334,7 +2350,10 @@ fn resolve_export_columns(
     options: &ExportOptions,
     level_zooms: &[u8],
 ) -> Result<ResolvedColumns, ExportError> {
-    let geom_idx = geometry_index(reader.schema()).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_idx =
+        geometry_index(reader.schema()).ok_or_else(|| ExportError::NoGeometryColumn {
+            path: Some(reader.path().display().to_string()),
+        })?;
     let mut published = PublishedNames::from_reader(reader).with_selection(
         reader.schema(),
         geom_idx,
@@ -3691,7 +3710,7 @@ fn fanout_batch_members(
         timers,
     } = *ctx;
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers)?;
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
@@ -3953,7 +3972,7 @@ fn decode_batch_bboxes(
     crs: Crs,
 ) -> Result<Vec<Option<TileBounds>>, ExportError> {
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
@@ -4373,7 +4392,7 @@ fn collect_wave_members(
     let timers = ctx.timers;
 
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers)?;
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
@@ -5706,7 +5725,7 @@ fn read_level_features(
 #[cfg(test)]
 fn decode_batch(batch: &RecordBatch, crs: Crs, out: &mut Vec<Feature>) -> Result<(), ExportError> {
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn)?;
+    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
     let geom_field = schema.field(geom_idx).clone();
 
     // Decode geometries.
@@ -6847,6 +6866,7 @@ fn detect_crs(path: &Path) -> Result<Crs, ExportError> {
                 .identifier
                 .or(info.name)
                 .unwrap_or_else(|| "unknown".to_string()),
+            path: path.display().to_string(),
         }),
     }
 }
@@ -12679,10 +12699,11 @@ mod tests {
                 None,
             )),
         );
-        assert!(matches!(
-            detect_crs(utm.path()),
-            Err(ExportError::UnsupportedCrs { .. })
-        ));
+        let err = detect_crs(utm.path()).unwrap_err();
+        assert!(matches!(err, ExportError::UnsupportedCrs { .. }));
+        // #452: and names the file.
+        let msg = err.to_string();
+        assert!(msg.contains(&utm.path().display().to_string()), "{msg}");
     }
 
     // ========================================================================

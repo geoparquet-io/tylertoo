@@ -1366,9 +1366,11 @@ impl MultiSource {
         // itself is enforced by the pipeline (against part 0), so a set
         // that consistently carries one unsupported CRS still errors with
         // the standard UnsupportedCrs message.
+        // Only Ok/Err is used here, so the error's input name is moot.
         let crs_of = |m: &PartMeta| {
             crate::overview::convert::detect_crs_from_kv(
                 m.parquet.file_metadata().key_value_metadata(),
+                "",
             )
             .ok()
         };
@@ -1691,8 +1693,13 @@ pub(crate) fn list_parquet_files(dir: &Path) -> Result<Vec<PathBuf>, InputError>
             .is_some_and(|n| n.starts_with('.') || n.starts_with('_'))
     }
     fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), InputError> {
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
+        // #452: name the directory; a bare `InputError::Io` did not.
+        let open = |error| InputError::Open {
+            input: dir.display().to_string(),
+            error,
+        };
+        for entry in std::fs::read_dir(dir).map_err(open)? {
+            let path = entry.map_err(open)?.path();
             if hidden(&path) {
                 continue;
             }
@@ -1722,7 +1729,11 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
         // glob 0.3.3 dropped `impl From<GlobError> for io::Error` and 0.3.4
         // restored it, deprecating `into_error`. The floor in Cargo.toml is
         // 0.3.4 so that `into` is the one form that compiles warning-free.
-        let path = entry.map_err(|e| InputError::Io(e.into()))?;
+        // #452: and name the path the glob could not read.
+        let path = entry.map_err(|e| InputError::Open {
+            input: e.path().display().to_string(),
+            error: e.into(),
+        })?;
         if path.is_file() && path.extension().is_some_and(|ext| ext == "parquet") {
             files.push(path);
         }
@@ -1900,6 +1911,30 @@ mod tests {
         assert!(files.windows(2).all(|w| w[0] <= w[1]), "sorted: {files:?}");
         assert!(files[0].ends_with("part-0.parquet"));
         assert!(files[1].ends_with("part-1.parquet"));
+    }
+
+    /// #452: an unreadable partition directory names itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root = std::fs::read_dir(&locked).is_ok();
+        let listed = list_parquet_files(dir.path());
+        let pattern = format!("{}/*/*.parquet", dir.path().display());
+        let globbed = expand_glob(&pattern);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // root reads any directory: nothing to assert there.
+        if root {
+            return;
+        }
+        for (what, result) in [("directory", listed.map(drop)), ("glob", globbed.map(drop))] {
+            let msg = result.expect_err(what).to_string();
+            assert!(msg.contains(&locked.display().to_string()), "{what}: {msg}");
+        }
     }
 
     #[test]
