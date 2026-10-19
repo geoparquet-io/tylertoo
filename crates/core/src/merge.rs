@@ -19,16 +19,17 @@
 //! check that the shards really were disjoint.
 //!
 //! **Disjointness is validated, not assumed — exactly, per tile id.** The
-//! k-way heap merge below emits ids in ascending order, so two inputs
-//! claiming one tile show up as two consecutive emissions of the same id.
-//! That is refused, naming both archives. A mis-specified shard set — the
-//! same shard listed twice, a shard from an earlier run, overlapping bounds
-//! in the pass-1 split — would otherwise produce an archive whose tiles
-//! silently shadow each other, and the failure would surface much later as
-//! missing geometry on a map. The check costs one `u64` comparison per tile
-//! and, unlike a range check, also catches a duplicate id *within* one
-//! archive (a spec-illegal double directory entry, which a per-archive range
-//! says nothing about) and applies to a single-input merge.
+//! k-way heap merge (`archive_index::MergedTiles`, which the pyramid merge
+//! shares) emits ids in ascending order, so two inputs claiming one tile show
+//! up as two consecutive emissions of the same id. That is refused, naming
+//! both archives. A mis-specified shard set — the same shard listed twice, a
+//! shard from an earlier run, overlapping bounds in the pass-1 split — would
+//! otherwise produce an archive whose tiles silently shadow each other, and
+//! the failure would surface much later as missing geometry on a map. The
+//! check costs one `u64` comparison per tile and, unlike a range check, also
+//! catches a duplicate id *within* one archive (a spec-illegal double
+//! directory entry, which a per-archive range says nothing about) and
+//! applies to a single-input merge.
 //!
 //! ## Memory
 //!
@@ -48,15 +49,14 @@
 //! per zoom as tiling the whole input in one pass", and these are the numbers
 //! that gets compared.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::archive_index::{ArchiveIndex, TileRef};
+use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::Compression;
 use crate::dedup::TileHasher;
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType};
@@ -136,7 +136,7 @@ pub struct MergeReport {
 ///
 /// # Panics
 ///
-/// Panics only on an internal invariant violation in the merge loop (a heap
+/// Panics only on an internal invariant violation in `MergedTiles` (a heap
 /// entry with no pending tile), which is a bug.
 pub fn merge_shards(
     inputs: &[PathBuf],
@@ -257,29 +257,19 @@ pub fn merge_shards(
     let mut per_zoom_tile_counts: BTreeMap<u8, u64> = BTreeMap::new();
     let mut tiles_total = 0u64;
 
-    // k-way merge by tile id: ids come out globally ascending, which is
-    // exactly what makes the output clustered, and inputs whose id ranges
-    // interleave (#498's pivot-subtree shards) are handled without special
-    // cases. It is also where disjointness is checked — see `last_written`.
-    let mut iters: Vec<_> = indexes.iter().map(ArchiveIndex::tiles).collect();
-    let mut heads: Vec<Option<TileRef>> = vec![None; indexes.len()];
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-    for (i, it) in iters.iter_mut().enumerate() {
-        if let Some(tile) = it.next() {
-            let t = tile.map_err(|e| at(&indexes[i], e))?;
-            heap.push(Reverse((t.id, i)));
-            heads[i] = Some(t);
-        }
-    }
+    // k-way merge by tile id ([`MergedTiles`], shared with the pyramid's
+    // shared-zoom merge): ids come out globally ascending, which is exactly
+    // what makes the output clustered, and inputs whose id ranges interleave
+    // (#498's pivot-subtree shards) are handled without special cases. It is
+    // also where disjointness is checked — see `last_written`.
+    let merged = MergedTiles::new(indexes.iter().map(ArchiveIndex::tiles).collect());
 
     // The last id written and which input wrote it. Ids arrive ascending, so
     // a repeat is adjacent: this is the whole disjointness check.
     let mut last_written: Option<(u64, usize)> = None;
 
-    while let Some(Reverse((_, i))) = heap.pop() {
-        let t = heads[i]
-            .take()
-            .expect("heap entry without a head is a bug in the merge loop");
+    for (i, tile) in merged {
+        let t = tile.map_err(|e| at(&indexes[i], e))?;
         if let Some((prev_id, prev_src)) = last_written {
             if t.id <= prev_id {
                 return Err(duplicate_tile_id(&indexes[prev_src], &indexes[i], t.id));
@@ -302,12 +292,6 @@ pub fn merge_shards(
             .map_err(|e| Error::PMTilesWrite(format!("failed to add tile: {e}")))?;
         *per_zoom_tile_counts.entry(t.z).or_insert(0) += 1;
         tiles_total += 1;
-
-        if let Some(tile) = iters[i].next() {
-            let next = tile.map_err(|e| at(&indexes[i], e))?;
-            heap.push(Reverse((next.id, i)));
-            heads[i] = Some(next);
-        }
     }
 
     let stats = writer
