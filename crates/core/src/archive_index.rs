@@ -470,7 +470,7 @@ impl Iterator for TileIter<'_> {
                 }
             }
             // Run lengths are archive-controlled u32s, and every expanded id
-            // becomes a map entry in a merge: one 0xFFFFFFFF run is tens of
+            // becomes a writer directory entry in a merge: one 0xFFFFFFFF run is tens of
             // gigabytes. Spend a budget of what this archive could
             // legitimately address, so many plausible runs cannot add up to
             // the same attack (#417). Spent before any of the run is emitted,

@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use tempfile::NamedTempFile;
 
-use crate::archive_index::ArchiveIndex;
+use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
@@ -1573,14 +1573,17 @@ pub fn merge_bands_with_options(
 
     if bands_share_zooms(bands) {
         // #385: bands in different layers share zooms, so one tile id can
-        // come from several bands. Index every band's tiles first, then emit
-        // each id once: a tile only one band wrote is copied still-compressed
-        // exactly as the single-pass path below does; a tile several bands
-        // wrote is decompressed, its layer messages concatenated in band
-        // order (an MVT tile is a protobuf message whose only field is a
-        // repeated `layers`, so byte concatenation IS layer concatenation),
-        // and recompressed. Every band's archive is held for the duration —
-        // the compressed archives, not the tile set.
+        // come from several bands. A k-way merge over the bands' directories
+        // (#403) emits each id once, in ascending order: a tile only one band
+        // wrote is copied still-compressed exactly as the single-pass path
+        // below does; a tile several bands wrote is decompressed, its layer
+        // messages concatenated in band order (an MVT tile is a protobuf
+        // message whose only field is a repeated `layers`, so byte
+        // concatenation IS layer concatenation), and recompressed. Each
+        // band's index is held for the duration — header, directories and
+        // metadata — plus one look-ahead tile per band. The merge used to
+        // build a map entry per tile id of every band before writing one,
+        // which is O(tiles) where this is O(bands).
         let archives: Vec<BandArchive> = bands
             .iter()
             .map(|b| BandArchive::open(&b.input, &b.layer))
@@ -1597,39 +1600,8 @@ pub fn merge_bands_with_options(
         // validate_bands only sees the labels, not what is actually inside
         // each archive's tiles; this is the check that catches the mismatch.
         check_shared_zoom_layer_labels(bands, &archives)?;
-        type Ref = (usize, std::ops::Range<usize>);
-        // One tile id's `(z, x, y)` and every band range that wrote it.
-        type Slot = ((u8, u32, u32), Vec<Ref>);
-        // Keyed by tile id, not (z, x, y): the writer appends tile data in
-        // add order and stamps the header `clustered`, which promises that
-        // offsets are monotonic in directory (tile id) order. Row-major order
-        // is not Hilbert order at any zoom ≥ 1, and go-pmtiles `verify`
-        // rejected the result as "out-of-order entry in clustered archive".
-        let mut index: BTreeMap<u64, Slot> = BTreeMap::new();
-        let mut counts = vec![0usize; bands.len()];
-        for (bi, (band, archive)) in bands.iter().zip(&archives).enumerate() {
+        for (band, archive) in bands.iter().zip(&archives) {
             track_band_bounds(band, archive, &mut union, &mut bands_without_bounds);
-            let mut skipped = 0usize;
-            archive.for_each_tile_range(|id, z, x, y, range| {
-                if z < band.min_zoom || z > band.max_zoom {
-                    skipped += 1;
-                    return Ok(());
-                }
-                let (_, refs) = index.entry(id).or_insert_with(|| ((z, x, y), Vec::new()));
-                if let Some((prev, _)) = refs.iter().find(|(p, _)| bands[*p].layer == band.layer) {
-                    return Err(Error::PMTilesWrite(format!(
-                        "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
-                        band.layer,
-                        bands[*prev].input.display(),
-                        band.input.display()
-                    )));
-                }
-                refs.push((bi, range));
-                counts[bi] += 1;
-                Ok(())
-            })?;
-            log_band_skip(band, skipped, fits[bi]);
-            skipped_total += skipped;
             layers.push(LayerMeta {
                 id: band.layer.clone(),
                 minzoom: band.min_zoom,
@@ -1637,51 +1609,114 @@ pub fn merge_bands_with_options(
                 fields: archive.fields.clone(),
             });
         }
+        // The writer appends tile data in add order and stamps the header
+        // `clustered`, which promises offsets monotonic in tile id. The
+        // k-way merge delivers ascending ids by construction — given
+        // ascending inputs, which `last_id` below enforces, since a band's
+        // directory is archive-supplied — so #506's check can be on.
+        writer.set_expect_clustered(true);
+
+        let mut counts = vec![0usize; bands.len()];
+        let mut skipped = vec![0usize; bands.len()];
+        let mut total = 0usize;
         let mut combined = 0usize;
+        // Every in-range band copy of the current id, in band order.
+        let mut group: Vec<(usize, std::ops::Range<usize>)> = Vec::with_capacity(bands.len());
+        let mut last_id: Option<u64> = None;
         let mut buf = Vec::new();
         // One cached (range, bytes) per band, for the same reason
         // `for_each_tile` caches: a run-length entry gives every id of the run
-        // the same byte range, and those ids are adjacent in `index`, so
+        // the same byte range, and those ids are adjacent in the merge, so
         // without this each one re-reads the identical body.
         let mut cache: Vec<Option<(std::ops::Range<usize>, Vec<u8>)>> = vec![None; archives.len()];
-        for ((z, x, y), refs) in index.values() {
-            let (z, x, y) = (*z, *x, *y);
-            if let [(bi, range)] = refs.as_slice() {
-                let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                let hash = TileHasher::hash(&data);
-                writer
-                    .add_tile_precompressed(z, x, y, hash, &data, data.len(), 0)
-                    .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
-                continue;
+        let mut merged =
+            MergedTiles::new(archives.iter().map(|a| a.index.tiles()).collect()).peekable();
+
+        while let Some((first_band, tile)) = merged.next() {
+            let t = tile?;
+            let (id, z, x, y) = (t.id, t.z, t.x, t.y);
+            if let Some(prev) = last_id.filter(|&prev| id <= prev) {
+                return Err(Error::PMTilesWrite(format!(
+                    "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
+                     must address tiles in ascending id order",
+                    bands[first_band].input.display()
+                )));
             }
-            buf.clear();
-            for (bi, range) in refs {
-                let raw = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                let plain = compression::decompress_capped(
-                    &raw,
-                    archives[*bi].header().tile_compression,
-                    MAX_TILE_BYTES,
-                )
-                .map_err(|e| {
-                    Error::PMTilesWrite(format!(
-                        "tile {z}/{x}/{y} of band {:?} failed to decompress: {e}",
-                        bands[*bi].layer
-                    ))
-                })?;
-                buf.extend_from_slice(&plain);
+            last_id = Some(id);
+
+            // Gather every band's copy of `id`. A peeked error is left for
+            // the next turn of the outer loop to return.
+            group.clear();
+            let mut next = Some((first_band, t.range));
+            while let Some((bi, range)) = next.take() {
+                let band = &bands[bi];
+                if z < band.min_zoom || z > band.max_zoom {
+                    skipped[bi] += 1;
+                } else {
+                    if let Some((prev, _)) =
+                        group.iter().find(|(p, _)| bands[*p].layer == band.layer)
+                    {
+                        return Err(Error::PMTilesWrite(format!(
+                            "tile {z}/{x}/{y} claimed twice for layer {:?} (bands {} and {})",
+                            band.layer,
+                            bands[*prev].input.display(),
+                            band.input.display()
+                        )));
+                    }
+                    group.push((bi, range));
+                    counts[bi] += 1;
+                }
+                if let Some((bi, Ok(n))) =
+                    merged.next_if(|(_, peeked)| matches!(peeked, Ok(n) if n.id == id))
+                {
+                    next = Some((bi, n.range));
+                }
             }
-            writer
-                .add_tile(z, x, y, &buf)
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
-            combined += 1;
+
+            match group.as_slice() {
+                // Every band's copy fell outside that band's range.
+                [] => continue,
+                [(bi, range)] => {
+                    let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
+                    let hash = TileHasher::hash(&data);
+                    writer
+                        .add_tile_precompressed(z, x, y, hash, &data, data.len(), 0)
+                        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+                }
+                refs => {
+                    buf.clear();
+                    for (bi, range) in refs {
+                        let raw = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
+                        let plain = compression::decompress_capped(
+                            &raw,
+                            archives[*bi].header().tile_compression,
+                            MAX_TILE_BYTES,
+                        )
+                        .map_err(|e| {
+                            Error::PMTilesWrite(format!(
+                                "tile {z}/{x}/{y} of band {:?} failed to decompress: {e}",
+                                bands[*bi].layer
+                            ))
+                        })?;
+                        buf.extend_from_slice(&plain);
+                    }
+                    writer
+                        .add_tile(z, x, y, &buf)
+                        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+                    combined += 1;
+                }
+            }
+            total += 1;
         }
         log::info!(
             "[pyramid] {} tile id(s) shared by several layers were merged; {} tile(s) copied as-is",
             combined,
-            index.len() - combined
+            total - combined
         );
-        for (band, n) in bands.iter().zip(counts) {
-            per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
+        for (bi, band) in bands.iter().enumerate() {
+            log_band_skip(band, skipped[bi], fits[bi]);
+            skipped_total += skipped[bi];
+            per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, counts[bi]));
         }
         return finish_merge(
             writer,
@@ -1691,7 +1726,7 @@ pub fn merge_bands_with_options(
             MergeTally {
                 skipped_total,
                 bands_without_bounds,
-                total_tiles: index.len(),
+                total_tiles: total,
             },
             output,
         );
@@ -3772,8 +3807,48 @@ mod tests {
         );
     }
 
+    /// #403: the shared-zoom merge streams the bands' directories through a
+    /// k-way merge and opts its writer into #506's ascending-id assertion, so
+    /// a band whose directory goes backwards (here, a run that overlaps the
+    /// next entry: 21, 22, 23, then 22 again) must be refused as an error —
+    /// not reach the writer, where it would trip that `debug_assert!`.
+    #[test]
+    fn shared_zoom_merge_refuses_a_band_directory_out_of_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let length = ArchiveIndex::open(&path).unwrap().entries()[0].length;
+        let z3_first = crate::pmtiles_writer::tile_id(3, 0, 0);
+        let entry = |tile_id, run_length| DirEntry {
+            tile_id,
+            offset: 0,
+            length,
+            run_length,
+        };
+        rewrite_directories(&path, &[entry(z3_first, 3), entry(z3_first + 1, 1)], &[]);
+        let other = dir.path().join("other.pmtiles");
+        write_band(
+            &other,
+            "other",
+            &[(3, 0, 0)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let bands = [
+            Band::parse(&format!("3-3:{}:agg", path.display())).unwrap(),
+            Band::parse(&format!("3-3:{}:other", other.display())).unwrap(),
+        ];
+        let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ascending id order") && err.contains("band.pmtiles"),
+            "expected an out-of-order directory error naming the band, got: {err}"
+        );
+    }
+
     /// An oversized run length through the pyramid reader: every expanded id
-    /// becomes a map entry in the merge, so one 0xFFFFFFFF run is tens of
+    /// becomes a writer directory entry in the merge, so one 0xFFFFFFFF run is tens of
     /// gigabytes.
     #[test]
     fn hostile_run_length_is_capped_in_the_pyramid_reader() {
