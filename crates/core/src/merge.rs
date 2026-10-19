@@ -21,14 +21,15 @@
 //! **Disjointness is validated, not assumed — exactly, per tile id.** The
 //! k-way heap merge (`archive_index::MergedTiles`, which the pyramid merge
 //! shares) emits ids in ascending order, so two inputs claiming one tile show
-//! up as two consecutive emissions of the same id. That is refused, naming both archives. A mis-specified shard set — the
-//! same shard listed twice, a shard from an earlier run, overlapping bounds
-//! in the pass-1 split — would otherwise produce an archive whose tiles
-//! silently shadow each other, and the failure would surface much later as
-//! missing geometry on a map. The check costs one `u64` comparison per tile
-//! and, unlike a range check, also catches a duplicate id *within* one
-//! archive (a spec-illegal double directory entry, which a per-archive range
-//! says nothing about) and applies to a single-input merge.
+//! up as two consecutive emissions of the same id. That is refused, naming
+//! both archives. A mis-specified shard set — the same shard listed twice, a
+//! shard from an earlier run, overlapping bounds in the pass-1 split — would
+//! otherwise produce an archive whose tiles silently shadow each other, and
+//! the failure would surface much later as missing geometry on a map. The
+//! check costs one `u64` comparison per tile and, unlike a range check, also
+//! catches a duplicate id *within* one archive (a spec-illegal double
+//! directory entry, which a per-archive range says nothing about) and
+//! applies to a single-input merge.
 //!
 //! ## Memory
 //!

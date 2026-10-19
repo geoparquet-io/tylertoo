@@ -867,14 +867,30 @@ fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> R
 /// entry, say — which is why neither path keeps a per-tile map.
 fn ensure_ascending(last: &mut Option<u64>, id: u64, band: &Band) -> Result<(), Error> {
     if let Some(prev) = last.filter(|&prev| id <= prev) {
-        return Err(Error::PMTilesWrite(format!(
-            "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
-             must address tiles in ascending id order",
-            band.input.display()
-        )));
+        return Err(out_of_order(band, id, prev));
     }
     *last = Some(id);
     Ok(())
+}
+
+/// The error for a band directory that lists `id` after `prev` (`id <= prev`).
+fn out_of_order(band: &Band, id: u64, prev: u64) -> Error {
+    Error::PMTilesWrite(format!(
+        "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
+         must address tiles in ascending id order",
+        band.input.display()
+    ))
+}
+
+/// Prefix an error from walking `path`'s directory with that path. The
+/// shared-zoom merge interleaves every band's directory, so an unattributed
+/// "tile data past end of archive" names none of the `--band` archives.
+fn in_band(path: &Path, e: Error) -> Error {
+    let msg = match e {
+        Error::PMTilesWrite(m) => m,
+        other => other.to_string(),
+    };
+    Error::PMTilesWrite(format!("{}: {msg}", path.display()))
 }
 
 /// A band's tile bytes, served from a one-slot cache keyed on the byte range.
@@ -1110,7 +1126,9 @@ impl BandArchive {
     /// The archive's actual zoom range -- see
     /// [`ArchiveIndex::actual_zoom_range`].
     fn actual_zoom_range(&self) -> Result<Option<(u8, u8)>, Error> {
-        self.index.actual_zoom_range()
+        self.index
+            .actual_zoom_range()
+            .map_err(|e| in_band(self.index.path(), e))
     }
 
     /// The archive's declared zoom range: header widened by its own
@@ -1157,7 +1175,7 @@ impl BandArchive {
         F: FnMut(u64, u8, u32, u32, std::ops::Range<usize>) -> Result<(), Error>,
     {
         for tile in self.index.tiles() {
-            let t = tile?;
+            let t = tile.map_err(|e| in_band(self.index.path(), e))?;
             f(t.id, t.z, t.x, t.y, t.range)?;
         }
         Ok(())
@@ -1660,16 +1678,22 @@ pub fn merge_bands_with_options(
             MergedTiles::new(archives.iter().map(|a| a.index.tiles()).collect()).peekable();
 
         while let Some((first_band, tile)) = merged.next() {
-            let t = tile?;
+            let t = tile.map_err(|e| in_band(&bands[first_band].input, e))?;
             let (id, z, x, y) = (t.id, t.z, t.x, t.y);
             ensure_ascending(&mut last_id, id, &bands[first_band])?;
 
             // Gather every band's copy of `id`. A peeked error is left for
             // the next turn of the outer loop to return.
             group.clear();
+            let mut prev_band = None;
             let mut next = Some((first_band, t.range));
             while let Some((bi, range)) = next.take() {
                 let band = &bands[bi];
+                // The merge emits (id, band) ascending, so a band repeating
+                // an id inside its own directory shows up right after itself.
+                if prev_band.replace(bi) == Some(bi) {
+                    return Err(out_of_order(band, id, id));
+                }
                 if z < band.min_zoom || z > band.max_zoom {
                     skipped[bi] += 1;
                 } else {
@@ -3928,6 +3952,88 @@ mod tests {
         );
     }
 
+    /// A repeat right after its twin (a run ending at 22, then an entry at
+    /// 22: ids 21, 22, 22) reaches the shared-zoom gather as two copies of
+    /// one id from one band. That is a malformed directory, not two bands
+    /// claiming a tile, and must be reported like the disjoint path reports
+    /// it — not as "claimed twice (bands band.pmtiles and band.pmtiles)".
+    #[test]
+    fn shared_zoom_merge_reports_an_adjacent_repeat_as_out_of_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let length = ArchiveIndex::open(&path).unwrap().entries()[0].length;
+        let z3_first = crate::pmtiles_writer::tile_id(3, 0, 0);
+        let entry = |tile_id, run_length| DirEntry {
+            tile_id,
+            offset: 0,
+            length,
+            run_length,
+        };
+        rewrite_directories(&path, &[entry(z3_first, 2), entry(z3_first + 1, 1)], &[]);
+        let other = dir.path().join("other.pmtiles");
+        write_band(
+            &other,
+            "other",
+            &[(3, 0, 0)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let bands = [
+            Band::parse(&format!("3-3:{}:agg", path.display())).unwrap(),
+            Band::parse(&format!("3-3:{}:other", other.display())).unwrap(),
+        ];
+        let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ascending id order") && err.contains("band.pmtiles"),
+            "expected an out-of-order directory error naming the band, got: {err}"
+        );
+        assert!(
+            !err.contains("claimed twice"),
+            "not a cross-band clash: {err}"
+        );
+    }
+
+    /// A band's directory fails mid-walk (here an entry past the tile-data
+    /// section, which only the merge's walk checks). The shared-zoom merge
+    /// interleaves every band's directory, so an error that does not name
+    /// its band leaves the user guessing which `--band` archive is corrupt.
+    #[test]
+    fn shared_zoom_merge_names_the_band_whose_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let header = Header::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        let root = [DirEntry {
+            tile_id: crate::pmtiles_writer::tile_id(3, 1, 1),
+            offset: header.tile_data_length, // one past the section's end
+            length: 4,
+            run_length: 1,
+        }];
+        rewrite_directories(&path, &root, &[]);
+        let other = dir.path().join("other.pmtiles");
+        write_band(
+            &other,
+            "other",
+            &[(3, 0, 0)],
+            TileBounds::new(-1.0, -1.0, 1.0, 1.0),
+            &[],
+        );
+
+        let bands = [
+            Band::parse(&format!("3-3:{}:other", other.display())).unwrap(),
+            Band::parse(&format!("3-3:{}:agg", path.display())).unwrap(),
+        ];
+        let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("past end of") && err.contains("band.pmtiles"),
+            "expected a past-end error naming the band, got: {err}"
+        );
+    }
+
     /// Replace `path`'s directories with a root pointing at `leaves`, in the
     /// order given. The root's own ids ascend (`root_ids`, one per leaf), as
     /// its delta encoding requires; what the leaves hold is up to the test.
@@ -4020,8 +4126,8 @@ mod tests {
     }
 
     /// An oversized run length through the pyramid reader: every expanded id
-    /// becomes a writer directory entry in the merge, so one 0xFFFFFFFF run is tens of
-    /// gigabytes.
+    /// becomes a writer directory entry in the merge, so one 0xFFFFFFFF run
+    /// is tens of gigabytes. The error names the band it came from.
     #[test]
     fn hostile_run_length_is_capped_in_the_pyramid_reader() {
         let dir = tempfile::tempdir().unwrap();
@@ -4044,8 +4150,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("run-length expansion"),
-            "expected a run-length expansion error, got: {err}"
+            err.contains("run-length expansion") && err.contains("band.pmtiles"),
+            "expected a run-length expansion error naming the band, got: {err}"
         );
     }
 
@@ -4072,7 +4178,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("past end of"), "{err}");
+        assert!(
+            err.contains("past end of") && err.contains("band.pmtiles"),
+            "{err}"
+        );
     }
 
     /// #404: the single-pass path copied each band's tiles in *argument*
