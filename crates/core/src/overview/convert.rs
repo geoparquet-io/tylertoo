@@ -933,16 +933,23 @@ impl ConvertOptions {
     /// depends on [`Self::cluster`], and the logged summary on
     /// [`Self::is_verbatim`], which reads [`Self::entry_zoom`]. It touches
     /// only the knobs [`Self::verbatim`] does; `sort_direction`, the density
-    /// rates and everything else are left alone. The verbatim/partitioning
-    /// conflict is not checked here — conversion rejects it
-    /// ([`ConvertError::VerbatimPartitioningUnsupported`]) however the knobs
-    /// were reached.
-    #[must_use]
+    /// rates and everything else are left alone.
+    ///
+    /// # Errors
+    ///
+    /// [`ConvertError::VerbatimPartitioningUnsupported`] when `verbatim` is
+    /// set and [`Self::mode`] is partitioning, whatever the overrides:
+    /// conversion itself rejects only the all-off case, so a partially
+    /// overridden verbatim run would otherwise put every point and line in
+    /// the coarsest level.
     pub fn with_generalization(
         mut self,
         overrides: &GeneralizationOverrides,
         verbatim: bool,
-    ) -> Self {
+    ) -> Result<Self, ConvertError> {
+        if verbatim && matches!(self.mode, Mode::Partitioning) {
+            return Err(ConvertError::VerbatimPartitioningUnsupported);
+        }
         let defaults = AssignConfig::default();
         let tuned = |explicit: Option<f64>, default: f64| {
             explicit.unwrap_or(if verbatim { 0.0 } else { default })
@@ -985,7 +992,7 @@ impl ConvertOptions {
                 );
             }
         }
-        self
+        Ok(self)
     }
 
     /// Whether this configuration generalizes nothing — the predicate form of
@@ -1069,14 +1076,16 @@ mod generalization_override_tests {
     #[test]
     fn no_overrides_and_no_verbatim_keeps_the_defaults() {
         let o = ConvertOptions::default()
-            .with_generalization(&GeneralizationOverrides::default(), false);
+            .with_generalization(&GeneralizationOverrides::default(), false)
+            .unwrap();
         assert_eq!(knobs(&o), knobs(&ConvertOptions::default()));
     }
 
     #[test]
     fn verbatim_alone_matches_the_verbatim_preset() {
         let o = ConvertOptions::default()
-            .with_generalization(&GeneralizationOverrides::default(), true);
+            .with_generalization(&GeneralizationOverrides::default(), true)
+            .unwrap();
         assert_eq!(knobs(&o), knobs(&ConvertOptions::default().verbatim()));
         assert!(o.is_verbatim());
     }
@@ -1090,7 +1099,9 @@ mod generalization_override_tests {
             coalesce_lines: Some(true),
             ..GeneralizationOverrides::default()
         };
-        let o = ConvertOptions::default().with_generalization(&overrides, true);
+        let o = ConvertOptions::default()
+            .with_generalization(&overrides, true)
+            .unwrap();
         assert_eq!(o.assign.polygon_thinning, 8.0);
         assert_eq!(o.simplify.factor, 0.5);
         assert!(o.density.enabled);
@@ -1106,7 +1117,9 @@ mod generalization_override_tests {
             density_drop: Some(false),
             ..GeneralizationOverrides::default()
         };
-        let o = ConvertOptions::default().with_generalization(&overrides, false);
+        let o = ConvertOptions::default()
+            .with_generalization(&overrides, false)
+            .unwrap();
         assert_eq!(o.assign.line_visibility, 0.0);
         assert!(!o.density.enabled);
         assert_eq!(
@@ -1123,9 +1136,12 @@ mod generalization_override_tests {
         };
         let o = clustered
             .clone()
-            .with_generalization(&GeneralizationOverrides::default(), false);
+            .with_generalization(&GeneralizationOverrides::default(), false)
+            .unwrap();
         assert_eq!(o.assign.point_thinning, CLUSTER_POINT_THINNING_DEFAULT);
-        let o = clustered.with_generalization(&GeneralizationOverrides::default(), true);
+        let o = clustered
+            .with_generalization(&GeneralizationOverrides::default(), true)
+            .unwrap();
         assert_eq!(o.assign.point_thinning, 0.0);
     }
 
@@ -1139,12 +1155,46 @@ mod generalization_override_tests {
             gsd_base: 512.0,
             ..ConvertOptions::default()
         };
-        let o = base.with_generalization(&GeneralizationOverrides::default(), true);
+        let o = base
+            .with_generalization(&GeneralizationOverrides::default(), true)
+            .unwrap();
         assert_eq!(
             o.assign.sort_direction,
             super::super::assign::SortDirection::Asc
         );
         assert_eq!(o.gsd_base, 512.0);
+    }
+
+    /// Verbatim degenerates under partitioning (every feature lands in the
+    /// coarsest level), so the flag is refused there even when an override
+    /// leaves some generalization on — the CLI's `--verbatim` rule, now one
+    /// rule for every caller.
+    #[test]
+    fn verbatim_is_refused_in_partitioning_mode_even_with_overrides() {
+        let partitioning = ConvertOptions {
+            mode: Mode::Partitioning,
+            ..ConvertOptions::default()
+        };
+        for overrides in [
+            GeneralizationOverrides::default(),
+            GeneralizationOverrides {
+                polygon_thinning: Some(8.0),
+                ..GeneralizationOverrides::default()
+            },
+        ] {
+            let err = partitioning
+                .clone()
+                .with_generalization(&overrides, true)
+                .expect_err("verbatim + partitioning must be refused");
+            assert!(
+                matches!(err, ConvertError::VerbatimPartitioningUnsupported),
+                "{err:?}"
+            );
+        }
+        // Partitioning without verbatim is fine.
+        assert!(partitioning
+            .with_generalization(&GeneralizationOverrides::default(), false)
+            .is_ok());
     }
 }
 
@@ -1625,7 +1675,7 @@ pub enum ConvertError {
     /// what makes verbatim meaningful, because it writes each feature at every
     /// level it is visible at.
     #[error(
-        "--verbatim requires duplicating mode: partitioning places each feature at \
+        "verbatim requires duplicating mode: partitioning places each feature at \
          exactly one level, so with thinning off every feature lands in the coarsest \
          level and every finer level is empty"
     )]
@@ -11512,8 +11562,6 @@ mod tests {
         assert_eq!(cr.ranks.len(), 3);
     }
 
-    /// The rest of the `--class-rank` grammar (#439): trimmed parts, and the
-    /// malformed shapes each named in the error.
     #[test]
     fn class_ranking_new_derives_the_unknown_rank_below_every_class() {
         let cr =
@@ -11537,6 +11585,8 @@ mod tests {
         }
     }
 
+    /// The rest of the `--class-rank` grammar (#439): trimmed parts, and the
+    /// malformed shapes each named in the error.
     #[test]
     fn parse_class_rank_grammar() {
         let cr = parse_class_rank(" cls : a = 2 , b = 1 ,").unwrap();

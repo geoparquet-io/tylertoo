@@ -62,6 +62,19 @@ class TestVerbatim:
         with pytest.raises(ValueError, match="duplicating"):
             _overview(max_zoom=8, verbatim=True, mode="partitioning")
 
+    def test_verbatim_with_partitioning_raises_even_with_an_override(
+        self,
+    ) -> None:
+        # Refused for the flag, as the CLI does, not only when every knob
+        # ends up off: lines and points would still all land in level 0.
+        with pytest.raises(ValueError, match="duplicating"):
+            _overview(
+                max_zoom=8,
+                verbatim=True,
+                mode="partitioning",
+                polygon_thinning=8.0,
+            )
+
     def test_tuning_knobs_default_to_none(self) -> None:
         params = inspect.signature(tylertoo.overview).parameters
         for name in (

@@ -1425,7 +1425,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
-pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> Self
+pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::clone(&self) -> tylertoo_core::overview::convert::ConvertOptions
 impl core::default::Default for tylertoo_core::overview::convert::ConvertOptions

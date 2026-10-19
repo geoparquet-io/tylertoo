@@ -1168,7 +1168,7 @@ impl ConvertTuningArgs {
 
         // Last, because the defaults read `cluster` and the logged summary
         // reads `entry_zoom`.
-        Ok(options.with_generalization(&overrides, self.verbatim))
+        Ok(options.with_generalization(&overrides, self.verbatim)?)
     }
 }
 

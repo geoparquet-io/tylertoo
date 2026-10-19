@@ -746,7 +746,8 @@ fn overview(
         ..ConvertOptions::default()
     }
     // Last: the defaults read `cluster`, the logged summary `entry_zoom`.
-    .with_generalization(&overrides, verbatim);
+    .with_generalization(&overrides, verbatim)
+    .map_err(convert_error_to_py)?;
 
     // `str` stays the single-input path (files, directories, globs, remote
     // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered
