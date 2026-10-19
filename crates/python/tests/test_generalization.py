@@ -75,3 +75,38 @@ class TestVerbatim:
         ):
             assert params[name].default is None, name
         assert params["verbatim"].default is False
+
+
+OVERTURE_NAMES = FIXTURES_DIR / "properties" / "overture-names.parquet"
+PROMOTE_TEN = "id:" + ",".join(f"{i}=0" for i in range(1, 11))
+
+
+def _names_overview(**kwargs: Any) -> tylertoo.OverviewReport:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "overview.parquet"
+        return tylertoo.overview(str(OVERTURE_NAMES), str(out), max_zoom=6, **kwargs)
+
+
+class TestEntryZoom:
+    """`entry_zoom` spells the ladder out, value by value (#364)."""
+
+    def test_listed_values_enter_at_their_zoom(self) -> None:
+        plain = _names_overview()
+        laddered = _names_overview(entry_zoom=PROMOTE_TEN)
+        # Twenty clustered points: one wins level 0 on its own; the ten
+        # listed ids are admitted there as well.
+        assert plain["levels"][0]["feature_count"] == 1
+        assert laddered["levels"][0]["zoom"] == 0
+        assert laddered["levels"][0]["feature_count"] >= 10
+
+    def test_magnitude_ladder_and_entry_zoom_are_exclusive(self) -> None:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _names_overview(magnitude_ladder="id", entry_zoom=PROMOTE_TEN)
+
+    def test_a_malformed_spec_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="expected COLUMN:VALUE=ZOOM"):
+            _names_overview(entry_zoom="id")
+
+    def test_a_spec_matching_no_value_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="no entry-zoom rung matches"):
+            _names_overview(entry_zoom="id:999=0")

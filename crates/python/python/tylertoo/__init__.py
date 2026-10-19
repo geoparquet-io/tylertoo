@@ -210,6 +210,7 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     sort_key: str | None = None,
     magnitude_ladder: str | None = None,
     ladder_step: int = 1,
+    entry_zoom: str | None = None,
     sort_direction: Literal["desc", "asc"] = "desc",
     class_rank_column: str | None = None,
     class_ranks: dict[str, float] | None = None,
@@ -270,6 +271,10 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         magnitude_ladder: Column whose values set each feature's first
             zoom, largest first.
         ladder_step: Zooms between `magnitude_ladder` values.
+        entry_zoom: First zoom for listed values of a column, as
+            `"COLUMN:VALUE=ZOOM,VALUE=ZOOM"`, such as
+            `"density:5000=4,1000=6"`. Unlisted values use the normal
+            visibility gate. Not with `magnitude_ladder`.
         sort_direction: Whether larger or smaller `sort_key` values win.
         class_rank_column: String column ranked by `class_ranks`.
         class_ranks: Finite priority per class; higher values win.

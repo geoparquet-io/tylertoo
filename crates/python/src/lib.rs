@@ -15,8 +15,9 @@ use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 use tylertoo_core::overview::convert::{
-    convert_to_overviews, convert_to_overviews_sources, parse_representation_spec, ClassRanking,
-    ConvertError, ConvertOptions, ConvertReport, GeneralizationOverrides, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, parse_entry_zoom,
+    parse_representation_spec, ClassRanking, ConvertError, ConvertOptions, ConvertReport,
+    GeneralizationOverrides, LevelPlan,
 };
 use tylertoo_core::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions, ExportReport, FeatureOrder,
@@ -297,6 +298,7 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
         ConvertError::AllFeaturesOutOfRange { .. }
         | ConvertError::UnsupportedCrs { .. }
         | ConvertError::InvalidLevels(_)
+        | ConvertError::InvalidConfig(_)
         | ConvertError::RankingConflict
         | ConvertError::ClusterPartitioningUnsupported
         | ConvertError::VerbatimPartitioningUnsupported
@@ -458,6 +460,31 @@ fn class_ranking_from_kwargs(
     }
 }
 
+/// The entry-zoom ladder (#364, #445): derived from a column's values
+/// (`magnitude_ladder`, every `ladder_step` zooms), or spelled out as
+/// `COLUMN:VALUE=ZOOM,...` (`entry_zoom`, core's grammar, shared with the
+/// CLI's `--entry-zoom`). The two are mutually exclusive, which clap
+/// enforces for the CLI.
+fn entry_zoom_spec(
+    magnitude_ladder: Option<&str>,
+    ladder_step: u8,
+    entry_zoom: Option<&str>,
+) -> PyResult<Option<EntryZoomSpec>> {
+    match (magnitude_ladder, entry_zoom) {
+        (Some(_), Some(_)) => Err(PyErr::new::<PyValueError, _>(
+            "magnitude_ladder and entry_zoom are mutually exclusive; supply at most one",
+        )),
+        (Some(column), None) => Ok(Some(EntryZoomSpec {
+            column: column.to_string(),
+            kind: EntryZoomKind::DenseRank { step: ladder_step },
+        })),
+        (None, Some(spec)) => parse_entry_zoom(spec)
+            .map(Some)
+            .map_err(PyErr::new::<PyValueError, _>),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Native body of `tylertoo.overview()`.
 ///
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
@@ -476,6 +503,7 @@ fn class_ranking_from_kwargs(
     sort_key=None,
     magnitude_ladder=None,
     ladder_step=1,
+    entry_zoom=None,
     sort_direction="desc",
     class_rank_column=None,
     class_ranks=None,
@@ -516,7 +544,7 @@ fn class_ranking_from_kwargs(
     read_workers=0,
     spill_dir=None,
 ),
-    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
+    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, entry_zoom=None, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -531,6 +559,7 @@ fn overview(
     sort_key: Option<String>,
     magnitude_ladder: Option<&str>,
     ladder_step: u8,
+    entry_zoom: Option<&str>,
     sort_direction: &str,
     class_rank_column: Option<String>,
     class_ranks: Option<BTreeMap<String, f64>>,
@@ -667,10 +696,7 @@ fn overview(
             ..AssignConfig::default()
         },
         sort_key,
-        entry_zoom: magnitude_ladder.map(|column| EntryZoomSpec {
-            column: column.to_string(),
-            kind: EntryZoomKind::DenseRank { step: ladder_step },
-        }),
+        entry_zoom: entry_zoom_spec(magnitude_ladder, ladder_step, entry_zoom)?,
         class_ranking,
         no_auto_rank,
         simplify: SimplifyOptions {

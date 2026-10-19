@@ -37,6 +37,7 @@ def overview(
     sort_key: str | None = None,
     magnitude_ladder: str | None = None,
     ladder_step: int = 1,
+    entry_zoom: str | None = None,
     sort_direction: str = "desc",
     class_rank_column: str | None = None,
     class_ranks: dict[str, float] | None = None,
