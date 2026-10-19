@@ -985,7 +985,9 @@ impl ConvertTuningArgs {
         cogp_compat: bool,
     ) -> Result<tylertoo_core::overview::convert::ConvertOptions> {
         use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-        use tylertoo_core::overview::convert::{parse_representation_spec, ConvertOptions};
+        use tylertoo_core::overview::convert::{
+            parse_representation_spec, ConvertOptions, GeneralizationOverrides,
+        };
         use tylertoo_core::overview::level::{MemoryProfile, Mode};
         use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
         use tylertoo_core::overview::writer::RowGroupSizePolicy;
@@ -1005,35 +1007,25 @@ impl ConvertTuningArgs {
             }
         };
 
-        // `--verbatim` supplies DEFAULTS, it does not override. Each knob
-        // falls back to 0 (off) under the flag and to its ladder default
-        // otherwise, so an explicitly-passed value always wins and
-        // `--verbatim --simplify-factor 0.5` means what the docs say it means.
-        // Applying it wholesale after the fact would silently discard the
-        // override — the same mistake `--max-tile-size` already avoids.
-        let ladder = AssignConfig::default();
-        let tuned = |explicit: Option<f64>, default: f64| {
-            explicit.unwrap_or(if self.verbatim { 0.0 } else { default })
+        // `--verbatim` supplies DEFAULTS, it does not override: an explicitly
+        // passed knob always wins, so `--verbatim --simplify-factor 0.5`
+        // means what the docs say it means. Core owns the rule (#445) and
+        // applies it once the options are complete, below.
+        let overrides = GeneralizationOverrides {
+            point_thinning: self.point_thinning,
+            line_thinning: self.line_thinning,
+            polygon_thinning: self.polygon_thinning,
+            line_visibility: self.line_visibility,
+            polygon_visibility: self.polygon_visibility,
+            simplify_factor: self.simplify_factor,
+            // No positive spelling exists for either, so `--verbatim`
+            // cannot be overriding an explicit request here.
+            density_drop: self.no_density_drop.then_some(false),
+            coalesce_lines: self.no_coalesce_lines.then_some(false),
         };
-
-        // Cluster-conditional default: with --cluster, absorbed points are
-        // summarized (point_count), so the sparser 16.0 grid is the better look.
-        let point_thinning = tuned(
-            self.point_thinning,
-            if self.cluster {
-                tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
-            } else {
-                ladder.point_thinning
-            },
-        );
-
         let assign = AssignConfig {
-            point_thinning,
-            line_thinning: tuned(self.line_thinning, ladder.line_thinning),
-            polygon_thinning: tuned(self.polygon_thinning, ladder.polygon_thinning),
-            line_visibility: tuned(self.line_visibility, ladder.line_visibility),
-            polygon_visibility: tuned(self.polygon_visibility, ladder.polygon_visibility),
             sort_direction: SortDirection::Desc,
+            ..AssignConfig::default()
         };
 
         // --class-rank and --sort-key are mutually exclusive (also enforced in core).
@@ -1093,8 +1085,6 @@ impl ConvertTuningArgs {
                  chain cannot satisfy"
             );
         }
-        let coalesce_lines = !self.no_coalesce_lines && !self.verbatim;
-
         // Zoom-band representation selector (#317 / #279); structural
         // validity against the plan is enforced by core convert validation.
         let representation = match &self.representation {
@@ -1112,10 +1102,8 @@ impl ConvertTuningArgs {
             class_ranking,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
-                factor: tuned(
-                    self.simplify_factor,
-                    tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
-                ),
+                // Set with the other generalization knobs, below.
+                factor: tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
                 // --collapse and --collapse-square are mutually exclusive
                 // (clap conflicts_with); both default off = drop (#279).
                 //
@@ -1140,9 +1128,8 @@ impl ConvertTuningArgs {
             },
             representation,
             density: DensityBudgetConfig {
-                // No positive spelling exists for either, so `--verbatim`
-                // cannot be overriding an explicit request here.
-                enabled: !self.no_density_drop && !self.verbatim,
+                // Set with the other generalization knobs, below.
+                enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
             },
@@ -1158,7 +1145,7 @@ impl ConvertTuningArgs {
             read_workers: self.read_workers,
             cluster: self.cluster,
             accumulate,
-            coalesce_lines,
+            coalesce_lines: true,
             coalesce_snap: self.coalesce_snap,
             coalesce_max_level_rows: self.coalesce_max_level_rows,
             coalesce_junction_angle: self.coalesce_junction_angle,
@@ -1179,25 +1166,9 @@ impl ConvertTuningArgs {
             zoom_ceiling: None,
         };
 
-        // Logged because "no features were dropped" is a surprising thing to
-        // infer from a quiet run — and the message has to tell the truth about
-        // a composed run, where an override means the output is NOT verbatim.
-        if self.verbatim {
-            if options.is_verbatim() {
-                log::info!(
-                    "[convert] --verbatim: generalization off (no thinning, no \
-                     visibility gates, no simplification, no density budget, no \
-                     line coalescing); every level reproduces the input"
-                );
-            } else {
-                log::info!(
-                    "[convert] --verbatim with overrides: generalization is off \
-                     except where you set it explicitly, so some features or \
-                     vertices may still be dropped"
-                );
-            }
-        }
-        Ok(options)
+        // Last, because the defaults read `cluster` and the logged summary
+        // reads `entry_zoom`.
+        Ok(options.with_generalization(&overrides, self.verbatim))
     }
 }
 

@@ -877,6 +877,75 @@ impl ConvertOptions {
         self
     }
 
+    /// Set every generalization knob from the caller's explicit values,
+    /// with `verbatim` choosing what an unset knob falls back to: off (`0`,
+    /// `false`) under verbatim, the normal default otherwise (#445).
+    ///
+    /// This is the rule `--verbatim` documents — it supplies *defaults*, so
+    /// `--verbatim --simplify-factor 0.5` keeps the 0.5 — shared by the CLI
+    /// and the Python bindings so the two cannot drift. Applying
+    /// [`Self::verbatim`] after the knobs instead would silently discard the
+    /// override.
+    ///
+    /// Call it on otherwise-complete options: the point-thinning default
+    /// depends on [`Self::cluster`], and the logged summary on
+    /// [`Self::is_verbatim`], which reads [`Self::entry_zoom`]. It touches
+    /// only the knobs [`Self::verbatim`] does; `sort_direction`, the density
+    /// rates and everything else are left alone. The verbatim/partitioning
+    /// conflict is not checked here — conversion rejects it
+    /// ([`ConvertError::VerbatimPartitioningUnsupported`]) however the knobs
+    /// were reached.
+    #[must_use]
+    pub fn with_generalization(
+        mut self,
+        overrides: &GeneralizationOverrides,
+        verbatim: bool,
+    ) -> Self {
+        let defaults = AssignConfig::default();
+        let tuned = |explicit: Option<f64>, default: f64| {
+            explicit.unwrap_or(if verbatim { 0.0 } else { default })
+        };
+        // With clustering, absorbed points are summarized (point_count), so
+        // the sparser grid is the better look.
+        let point_default = if self.cluster {
+            super::assign::CLUSTER_POINT_THINNING_DEFAULT
+        } else {
+            defaults.point_thinning
+        };
+        self.assign.point_thinning = tuned(overrides.point_thinning, point_default);
+        self.assign.line_thinning = tuned(overrides.line_thinning, defaults.line_thinning);
+        self.assign.polygon_thinning = tuned(overrides.polygon_thinning, defaults.polygon_thinning);
+        self.assign.line_visibility = tuned(overrides.line_visibility, defaults.line_visibility);
+        self.assign.polygon_visibility =
+            tuned(overrides.polygon_visibility, defaults.polygon_visibility);
+        self.simplify.factor = tuned(
+            overrides.simplify_factor,
+            super::simplify::DEFAULT_SIMPLIFY_FACTOR,
+        );
+        self.density.enabled = overrides.density_drop.unwrap_or(!verbatim);
+        self.coalesce_lines = overrides.coalesce_lines.unwrap_or(!verbatim);
+
+        // Logged because "no features were dropped" is a surprising thing to
+        // infer from a quiet run — and the message has to tell the truth about
+        // a composed run, where an override means the output is NOT verbatim.
+        if verbatim {
+            if self.is_verbatim() {
+                log::info!(
+                    "[convert] verbatim: generalization off (no thinning, no \
+                     visibility gates, no simplification, no density budget, no \
+                     line coalescing); every level reproduces the input"
+                );
+            } else {
+                log::info!(
+                    "[convert] verbatim with overrides: generalization is off \
+                     except where you set it explicitly, so some features or \
+                     vertices may still be dropped"
+                );
+            }
+        }
+        self
+    }
+
     /// Whether this configuration generalizes nothing — the predicate form of
     /// [`Self::verbatim`], true for a config that reproduces its input at
     /// every level however it was reached (the flag, or the equivalent knobs
@@ -906,6 +975,134 @@ impl ConvertOptions {
             && self.simplify.factor == 0.0
             && !self.density.enabled
             && !self.coalesce_lines
+    }
+}
+
+/// Explicitly set generalization knobs for
+/// [`ConvertOptions::with_generalization`]; `None` means "not set", which
+/// falls back to the normal default, or to off under verbatim (#445).
+///
+/// One field per CLI flag (`--point-thinning`, …, `--no-density-drop`,
+/// `--no-coalesce-lines`) and per Python keyword argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GeneralizationOverrides {
+    /// Point grid cell size in GSDs.
+    pub point_thinning: Option<f64>,
+    /// Line grid cell size in GSDs.
+    pub line_thinning: Option<f64>,
+    /// Polygon grid cell size in GSDs.
+    pub polygon_thinning: Option<f64>,
+    /// Smallest line bounding-box diagonal kept, in GSDs.
+    pub line_visibility: Option<f64>,
+    /// Smallest polygon bounding-box diagonal kept, in GSDs.
+    pub polygon_visibility: Option<f64>,
+    /// Simplification tolerance, in GSDs.
+    pub simplify_factor: Option<f64>,
+    /// Whether the per-level density budget applies.
+    pub density_drop: Option<bool>,
+    /// Whether touching same-class lines are joined at coarse levels.
+    pub coalesce_lines: Option<bool>,
+}
+
+#[cfg(test)]
+mod generalization_override_tests {
+    use super::*;
+    use crate::overview::assign::CLUSTER_POINT_THINNING_DEFAULT;
+
+    fn knobs(o: &ConvertOptions) -> ([f64; 6], bool, bool) {
+        (
+            [
+                o.assign.point_thinning,
+                o.assign.line_thinning,
+                o.assign.polygon_thinning,
+                o.assign.line_visibility,
+                o.assign.polygon_visibility,
+                o.simplify.factor,
+            ],
+            o.density.enabled,
+            o.coalesce_lines,
+        )
+    }
+
+    #[test]
+    fn no_overrides_and_no_verbatim_keeps_the_defaults() {
+        let o = ConvertOptions::default()
+            .with_generalization(&GeneralizationOverrides::default(), false);
+        assert_eq!(knobs(&o), knobs(&ConvertOptions::default()));
+    }
+
+    #[test]
+    fn verbatim_alone_matches_the_verbatim_preset() {
+        let o = ConvertOptions::default()
+            .with_generalization(&GeneralizationOverrides::default(), true);
+        assert_eq!(knobs(&o), knobs(&ConvertOptions::default().verbatim()));
+        assert!(o.is_verbatim());
+    }
+
+    #[test]
+    fn an_explicit_knob_wins_over_verbatim() {
+        let overrides = GeneralizationOverrides {
+            polygon_thinning: Some(8.0),
+            simplify_factor: Some(0.5),
+            density_drop: Some(true),
+            coalesce_lines: Some(true),
+            ..GeneralizationOverrides::default()
+        };
+        let o = ConvertOptions::default().with_generalization(&overrides, true);
+        assert_eq!(o.assign.polygon_thinning, 8.0);
+        assert_eq!(o.simplify.factor, 0.5);
+        assert!(o.density.enabled);
+        assert!(o.coalesce_lines);
+        assert_eq!(o.assign.line_thinning, 0.0);
+        assert!(!o.is_verbatim());
+    }
+
+    #[test]
+    fn an_explicit_knob_wins_without_verbatim() {
+        let overrides = GeneralizationOverrides {
+            line_visibility: Some(0.0),
+            density_drop: Some(false),
+            ..GeneralizationOverrides::default()
+        };
+        let o = ConvertOptions::default().with_generalization(&overrides, false);
+        assert_eq!(o.assign.line_visibility, 0.0);
+        assert!(!o.density.enabled);
+        assert_eq!(
+            o.assign.polygon_visibility,
+            AssignConfig::default().polygon_visibility
+        );
+    }
+
+    #[test]
+    fn point_thinning_defaults_to_the_cluster_grid_with_cluster() {
+        let clustered = ConvertOptions {
+            cluster: true,
+            ..ConvertOptions::default()
+        };
+        let o = clustered
+            .clone()
+            .with_generalization(&GeneralizationOverrides::default(), false);
+        assert_eq!(o.assign.point_thinning, CLUSTER_POINT_THINNING_DEFAULT);
+        let o = clustered.with_generalization(&GeneralizationOverrides::default(), true);
+        assert_eq!(o.assign.point_thinning, 0.0);
+    }
+
+    #[test]
+    fn sort_direction_and_other_fields_are_untouched() {
+        let base = ConvertOptions {
+            assign: AssignConfig {
+                sort_direction: super::super::assign::SortDirection::Asc,
+                ..AssignConfig::default()
+            },
+            gsd_base: 512.0,
+            ..ConvertOptions::default()
+        };
+        let o = base.with_generalization(&GeneralizationOverrides::default(), true);
+        assert_eq!(
+            o.assign.sort_direction,
+            super::super::assign::SortDirection::Asc
+        );
+        assert_eq!(o.gsd_base, 512.0);
     }
 }
 
