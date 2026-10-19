@@ -10,15 +10,13 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::assign::{
-    AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
-};
+use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
 use tylertoo_core::overview::convert::{
     convert_to_overviews, convert_to_overviews_sources, parse_representation_spec, ClassRanking,
-    ConvertError, ConvertOptions, ConvertReport, LevelPlan,
+    ConvertError, ConvertOptions, ConvertReport, GeneralizationOverrides, LevelPlan,
 };
 use tylertoo_core::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions, ExportReport, FeatureOrder,
@@ -301,6 +299,7 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
         | ConvertError::InvalidLevels(_)
         | ConvertError::RankingConflict
         | ConvertError::ClusterPartitioningUnsupported
+        | ConvertError::VerbatimPartitioningUnsupported
         | ConvertError::AccumulateWithoutCluster
         | ConvertError::SortKeyColumnMissing { .. }
         | ConvertError::ClassRankColumnMissing { .. }
@@ -482,22 +481,23 @@ fn class_ranking_from_kwargs(
     class_ranks=None,
     class_rank_unknown=None,
     no_auto_rank=false,
-    simplify_factor=1.0,
+    verbatim=false,
+    simplify_factor=None,
     collapse=false,
     collapse_square=false,
     representation=None,
     cascade=true,
     point_thinning=None,
-    line_thinning=1.0,
-    polygon_thinning=1.0,
-    line_visibility=2.0,
-    polygon_visibility=2.0,
+    line_thinning=None,
+    polygon_thinning=None,
+    line_visibility=None,
+    polygon_visibility=None,
     drop_rate=1.65,
     drop_gamma=1.5,
-    density_drop=true,
+    density_drop=None,
     cluster=false,
     accumulate_attributes=None,
-    coalesce_lines=true,
+    coalesce_lines=None,
     coalesce_snap=1.0,
     coalesce_junction_angle=0.0,
     coalesce_max_level_rows=2_000_000,
@@ -516,7 +516,7 @@ fn class_ranking_from_kwargs(
     read_workers=0,
     spill_dir=None,
 ),
-    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, simplify_factor=1.0, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=1.0, polygon_thinning=1.0, line_visibility=2.0, polygon_visibility=2.0, drop_rate=1.65, drop_gamma=1.5, density_drop=True, cluster=False, accumulate_attributes=None, coalesce_lines=True, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
+    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -536,22 +536,23 @@ fn overview(
     class_ranks: Option<BTreeMap<String, f64>>,
     class_rank_unknown: Option<f64>,
     no_auto_rank: bool,
-    simplify_factor: f64,
+    verbatim: bool,
+    simplify_factor: Option<f64>,
     collapse: bool,
     collapse_square: bool,
     representation: Option<String>,
     cascade: bool,
     point_thinning: Option<f64>,
-    line_thinning: f64,
-    polygon_thinning: f64,
-    line_visibility: f64,
-    polygon_visibility: f64,
+    line_thinning: Option<f64>,
+    polygon_thinning: Option<f64>,
+    line_visibility: Option<f64>,
+    polygon_visibility: Option<f64>,
     drop_rate: f64,
     drop_gamma: f64,
-    density_drop: bool,
+    density_drop: Option<bool>,
     cluster: bool,
     accumulate_attributes: Option<BTreeMap<String, String>>,
-    coalesce_lines: bool,
+    coalesce_lines: Option<bool>,
     coalesce_snap: f64,
     coalesce_junction_angle: f64,
     coalesce_max_level_rows: usize,
@@ -645,24 +646,25 @@ fn overview(
 
     let accumulate = accumulate_specs(accumulate_attributes, cluster, mode)?;
 
-    // Cluster-conditional default: with cluster=True, absorbed points are
-    // summarized (point_count), so the sparser 16.0 grid is the better look.
-    let point_thinning = point_thinning.unwrap_or(if cluster {
-        CLUSTER_POINT_THINNING_DEFAULT
-    } else {
-        AssignConfig::default().point_thinning
-    });
+    // `None` is "not set": core resolves it to the normal default, or to
+    // off under `verbatim`, so an explicit value always wins (#445).
+    let overrides = GeneralizationOverrides {
+        point_thinning,
+        line_thinning,
+        polygon_thinning,
+        line_visibility,
+        polygon_visibility,
+        simplify_factor,
+        density_drop,
+        coalesce_lines,
+    };
 
     let mut options = ConvertOptions {
         mode,
         levels,
         assign: AssignConfig {
-            point_thinning,
-            line_thinning,
-            polygon_thinning,
-            line_visibility,
-            polygon_visibility,
             sort_direction,
+            ..AssignConfig::default()
         },
         sort_key,
         entry_zoom: magnitude_ladder.map(|column| EntryZoomSpec {
@@ -672,15 +674,15 @@ fn overview(
         class_ranking,
         no_auto_rank,
         simplify: SimplifyOptions {
-            factor: simplify_factor,
             collapse: collapse_mode,
             cascade,
+            ..SimplifyOptions::default()
         },
         representation: representation_bands,
         density: DensityBudgetConfig {
-            enabled: density_drop,
             drop_rate,
             gamma: drop_gamma,
+            ..DensityBudgetConfig::default()
         },
         gsd_base,
         cogp_compat_key: cogp_compat,
@@ -694,7 +696,6 @@ fn overview(
         read_workers,
         cluster,
         accumulate,
-        coalesce_lines,
         coalesce_snap,
         coalesce_max_level_rows,
         coalesce_junction_angle,
@@ -714,7 +715,10 @@ fn overview(
         shard: None,
         shard_plan_digest: None,
         zoom_ceiling: None,
-    };
+        ..ConvertOptions::default()
+    }
+    // Last: the defaults read `cluster`, the logged summary `entry_zoom`.
+    .with_generalization(&overrides, verbatim);
 
     // `str` stays the single-input path (files, directories, globs, remote
     // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered

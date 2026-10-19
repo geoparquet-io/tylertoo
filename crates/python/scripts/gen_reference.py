@@ -32,7 +32,7 @@ FUNCTION_ORDER = ["overview", "export_pmtiles", "validate", "convert"]
 OVERVIEW_GROUPS = {
     "input": "Input and levels",
     "sort_key": "Feature priority",
-    "simplify_factor": "Geometry and thinning",
+    "verbatim": "Geometry and thinning",
     "cluster": "Clustering",
     "coalesce_lines": "Line coalescing",
     "include_properties": "Properties",

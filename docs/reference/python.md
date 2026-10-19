@@ -32,22 +32,23 @@ overview(
     class_ranks: dict[str, float] | None = None,
     class_rank_unknown: float | None = None,
     no_auto_rank: bool = False,
-    simplify_factor: float = 1.0,
+    verbatim: bool = False,
+    simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
-    line_thinning: float = 1.0,
-    polygon_thinning: float = 1.0,
-    line_visibility: float = 2.0,
-    polygon_visibility: float = 2.0,
+    line_thinning: float | None = None,
+    polygon_thinning: float | None = None,
+    line_visibility: float | None = None,
+    polygon_visibility: float | None = None,
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
-    density_drop: bool = True,
+    density_drop: bool | None = None,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
-    coalesce_lines: bool = True,
+    coalesce_lines: bool | None = None,
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
@@ -95,19 +96,20 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Geometry and thinning
 
-* `simplify_factor`: Simplification tolerance, in GSDs.
+* `verbatim`: Turn off thinning, visibility gates, simplification, the density budget, and line coalescing, for pre-aggregated or pre-levelled input. Sets the defaults of the options below to off; an option you pass still applies.
+* `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1 (0 with `verbatim`).
 * `collapse`: Represent small polygons as points.
 * `collapse_square`: Represent small polygons as small squares.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
-* `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`).
-* `line_thinning`: Line grid cell size in GSDs.
-* `polygon_thinning`: Polygon grid cell size in GSDs.
-* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs.
-* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs.
+* `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
+* `line_thinning`: Line grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
+* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
 * `drop_gamma`: How strongly the budget spares sparse areas.
-* `density_drop`: Apply the per-level feature budget.
+* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`).
 
 #### Clustering
 
@@ -116,7 +118,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Line coalescing
 
-* `coalesce_lines`: Join touching same-class lines at coarse levels.
+* `coalesce_lines`: Join touching same-class lines at coarse levels, or `None` for on (off with `verbatim`).
 * `coalesce_snap`: Largest gap between joined line ends, in GSDs.
 * `coalesce_junction_angle`: Largest turn through a junction, in degrees. Set `0` to stop at every junction.
 * `coalesce_max_level_rows`: Skip joining above this line count per level to bound memory.
