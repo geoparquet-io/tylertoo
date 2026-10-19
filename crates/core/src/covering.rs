@@ -41,6 +41,7 @@
 use crate::overview::level::Crs;
 use crate::tile::{lng_lat_to_tile, TileBounds, TileCoord};
 use crate::Error;
+use arrow_schema::{DataType, Schema};
 use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -284,6 +285,68 @@ pub fn parse_covering_metadata(
         bbox.xmax.clone(),
         bbox.ymax.clone(),
     )))
+}
+
+/// A bit-exact f64 bbox covering for the geometry column at `geom_idx`
+/// (#693; also the export scan's bbox source since #730): the root (schema)
+/// index of the covering struct column and its four child-field names, in
+/// `xmin, ymin, xmax, ymax` order as spelled in the file's own schema.
+///
+/// `None` — and the caller then reads the geometry itself — unless ALL of:
+///
+/// - the schema carries "geo" metadata whose covering belongs to the geometry
+///   column the conversion reads ([`parse_covering_metadata`] enforces the
+///   per-column ownership, #519);
+/// - every covering path is `[struct, field]` on one shared top-level struct
+///   (the only shape the GeoParquet 1.1 spec describes);
+/// - all four fields are `Float64`. The spec allows `FLOAT` too (Overture
+///   writes f32), but an f32 bound is rounded to the nearest float32, NOT
+///   bit-identical to the f64 bbox the geometry scalars yield — centers and
+///   diagonals would shift and could move a marginal zoom. gpio (the
+///   documented input contract) writes f64, so the fast path covers it; an
+///   f32 covering simply keeps the exact geometry path.
+///
+/// Name matching is case-insensitive, like
+/// [`crate::covering::find_bbox_column_indices`] on the pruning side.
+pub(crate) fn find_f64_covering(schema: &Schema, geom_idx: usize) -> Option<(usize, [String; 4])> {
+    let geo_json = schema
+        .metadata()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
+        .map(|(_, v)| v.as_str())?;
+    let spec = parse_covering_metadata(geo_json, Some(schema.field(geom_idx).name())).ok()??;
+    let paths = [
+        &spec.xmin_path,
+        &spec.ymin_path,
+        &spec.xmax_path,
+        &spec.ymax_path,
+    ];
+    if paths.iter().any(|p| p.len() != 2) {
+        return None;
+    }
+    let root = &paths[0][0];
+    if paths.iter().any(|p| &p[0] != root) {
+        return None;
+    }
+    let (idx, field) = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.name().eq_ignore_ascii_case(root))?;
+    let DataType::Struct(children) = field.data_type() else {
+        return None;
+    };
+    let mut names: [String; 4] = Default::default();
+    for (slot, p) in names.iter_mut().zip(paths) {
+        let child = children
+            .iter()
+            .find(|c| c.name().eq_ignore_ascii_case(&p[1]))?;
+        if *child.data_type() != DataType::Float64 {
+            return None;
+        }
+        *slot = child.name().clone();
+    }
+    Some((idx, names))
 }
 
 // ============================================================================
