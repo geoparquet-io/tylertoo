@@ -551,3 +551,91 @@ fn tiles_refuses_a_directory_output_even_with_force() {
     );
     assert!(output.is_dir(), "the directory must be left alone");
 }
+
+/// #452: `-q/--quiet` leaves warnings and errors only. The default run logs
+/// the auto-zoom choice at INFO and prints a summary on stdout (see
+/// `tiles_facade_accepts_max_zoom_auto`); with `-q` both are gone, from
+/// either side of the subcommand and on the bare form. The archive is still
+/// written.
+#[test]
+fn quiet_silences_info_logs_and_the_summary() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = fixture.to_str().unwrap();
+    for (i, args) in [
+        vec!["-q", "tiles"],
+        vec!["tiles", "--quiet"],
+        vec!["-q"], // bare form
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = dir.path().join(format!("quiet-{i}.pmtiles"));
+        let result = Command::new(tylertoo_bin())
+            .args(&args)
+            .args([fixture, output.to_str().unwrap(), "--max-zoom", "auto"])
+            .env_remove("RUST_LOG")
+            .env("TYLERTOO_DHAT", "off")
+            .output()
+            .expect("run tylertoo -q");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "{args:?}: {stderr}");
+        assert!(
+            output.exists(),
+            "{args:?}: the archive must still be written"
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "{args:?}: no summary under --quiet, got: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            !stderr.contains("INFO"),
+            "{args:?}: no INFO lines under --quiet, got: {stderr}"
+        );
+    }
+}
+
+/// #452: `-q` caps the level even when `RUST_LOG` asks for more.
+#[test]
+fn quiet_wins_over_rust_log() {
+    let Some(fixture) = fixture::realdata("open-buildings.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("quiet.pmtiles");
+    let result = Command::new(tylertoo_bin())
+        .args(["-q", fixture.to_str().unwrap(), output.to_str().unwrap()])
+        .args(["--max-zoom", "auto"])
+        .env("RUST_LOG", "debug")
+        .env("TYLERTOO_DHAT", "off")
+        .output()
+        .expect("run tylertoo -q");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("INFO") && !stderr.contains("DEBUG"),
+        "got: {stderr}"
+    );
+}
+
+/// #452: `-q` and `tiles -v` contradict each other: a usage error (exit 2).
+#[test]
+fn quiet_and_verbose_are_a_usage_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.parquet");
+    let output = dir.path().join("out.pmtiles");
+    let result = Command::new(tylertoo_bin())
+        .args(["-q", "tiles", "-v"])
+        .args([input.to_str().unwrap(), output.to_str().unwrap()])
+        .output()
+        .expect("run tylertoo -q -v");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--quiet") && stderr.contains("--verbose"),
+        "{stderr}"
+    );
+}

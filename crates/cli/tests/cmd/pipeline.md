@@ -121,3 +121,32 @@ Merging 1 archive(s) → merged.pmtiles
 ✓ 8 tiles (8 unique) from 1 archive(s), z0..z6 in [..]s
 
 ```
+
+`-q` silences the status lines of a command that writes a file, notes
+included. What `stats` prints is its result, so it still prints.
+
+```console
+$ tylertoo -q merge quiet.pmtiles out.pmtiles
+
+$ tylertoo stats -q quiet.pmtiles
+z  tiles  total  mean  p50  p99  max
+0      1    161   161  161  161  161
+1      1    200   200  200  200  200
+2      1    227   227  227  227  227
+3      2    457   228  228  229  229
+4      1    282   282  282  282  282
+5      1    333   333  333  333  333
+6      1    621   621  621  621  621
+
+Largest 8 tile(s):
+z   x   y  bytes
+6  10  24    621
+5   5  12    333
+4   2   6    282
+3   1   2    229
+3   1   3    228
+2   0   1    227
+1   0   0    200
+0   0   0    161
+
+```

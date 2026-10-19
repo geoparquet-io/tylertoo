@@ -25,12 +25,27 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::export::FeatureOrder;
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+
+/// `-q/--quiet` (#452), set once in `main` before dispatch.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// `println!` for the status and summary lines of a subcommand that writes
+/// a file, which `--quiet` silences. What `stats` and `validate` print is
+/// their result, so they keep `println!`.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        if !QUIET.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
 
 /// Why a suffixed size did not parse: only the overflow branch should
 /// mention the ceiling, so the caller's message is built per branch.
@@ -207,6 +222,18 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
     Ok(bbox)
 }
 
+/// Exit-status contract (#452), shown under `tylertoo --help` and in the
+/// generated CLI reference. Exit 1 is `main` returning `Err` (anyhow
+/// prints it); exit 2 is clap's for a parse error, and `--quiet` with
+/// `tiles --verbose` reuses it.
+const EXIT_STATUS_HELP: &str = "\
+Exit status:
+
+- 0: success.
+- 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
+- 2: the command line was rejected while it was parsed.
+- 101: a panic, from an internal bug or an output pipe closed early.";
+
 /// Convert GeoParquet to PMTiles vector tiles and multi-resolution
 /// overviews.
 ///
@@ -215,11 +242,17 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
 #[command(
     name = "tylertoo",
     about = "Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews",
-    version
+    version,
+    after_help = EXIT_STATUS_HELP
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Print only warnings and errors. The output of `stats` and `validate`
+    /// still prints.
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1341,6 +1374,14 @@ fn main() -> Result<()> {
     // positional token is not a known subcommand (and not --help/--version).
     let cli = Cli::parse_from(rewrite_bare_args(std::env::args_os()));
 
+    // One logger for every subcommand: INFO by default, RUST_LOG overrides,
+    // and `--quiet` caps whatever that gave at WARN.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if cli.quiet {
+        QUIET.store(true, Ordering::Relaxed);
+        log::set_max_level(log::max_level().min(log::LevelFilter::Warn));
+    }
+
     match cli.command {
         Command::Overview(args) => run_overview(*args),
         Command::Validate(args) => run_validate(args),
@@ -2025,14 +2066,14 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     }
     .context("writing the convert plan failed")?;
 
-    println!("✓ Wrote the convert plan (no tiles: --plan-only)");
-    println!("  input:  {}", spec.display());
-    println!(
+    say!("✓ Wrote the convert plan (no tiles: --plan-only)");
+    say!("  input:  {}", spec.display());
+    say!(
         "  plan:   {} ({})",
         save_plan.display(),
         HumanBytes(report.plan_bytes)
     );
-    println!(
+    say!(
         "  rows:   {} input row(s) → {} feature(s) ({} point, {} line, {} polygon)",
         format_number(report.input_rows as u64),
         format_number(report.input_features as u64),
@@ -2040,7 +2081,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         format_number(report.lines as u64),
         format_number(report.polygons as u64),
     );
-    println!(
+    say!(
         "  levels: {} planned level(s) populated{}",
         report.levels.len(),
         if report.skipped_empty_levels.is_empty() {
@@ -2060,7 +2101,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     );
     // The provenance an operator most often wants to check before spending
     // shard hours: which column decided every cell winner, and the ladder.
-    println!(
+    say!(
         "  ranking: {}{}",
         report.ranking.mode,
         report
@@ -2070,11 +2111,11 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
             .map_or_else(String::new, |c| format!(" on {c:?}"))
     );
     if let Some(spec) = &report.entry_zoom {
-        println!("  entry-zoom ladder: {spec}");
+        say!("  entry-zoom ladder: {spec}");
     }
     if args.verbose {
         for l in &report.levels {
-            println!(
+            say!(
                 "  level {:<2} (z{:<2}) gsd {:>10.2} m: {:>9} feature(s)",
                 l.planned_level,
                 l.zoom.map_or_else(|| "-".to_string(), |z| z.to_string()),
@@ -2083,14 +2124,14 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
             );
         }
     }
-    println!(
+    say!(
         "  time:   {:.2}s total (pass 1 {:.2}s, assignment {:.2}s)",
         start.elapsed().as_secs_f64(),
         report.pass1_secs,
         report.assign_secs,
     );
     if shard.is_some() {
-        println!(
+        say!(
             "  next:   give this plan to every data shard with --plan {}",
             save_plan.display()
         );
@@ -2098,7 +2139,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         // No cut digest in the fingerprint, so a data shard (which presents
         // its shard plan's) refuses this plan — say so here rather than at
         // the first shard of the fleet.
-        println!(
+        say!(
             "  next:   replay this plan in an unsharded run (`tiles --plan {0}` or \
              `overview --plan {0}`). It records no shard plan, so a fleet's data shards \
              refuse it: for a fleet, re-run with --shard coarse --shard-plan <the fleet's \
@@ -2123,7 +2164,17 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         self, IntermediateOverview, TilesObserver, TilesOptions, TilesOutcome,
     };
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Checked here, not with clap's `conflicts_with`: `quiet` is a global
+    // arg that only `tiles` has a `verbose` to conflict with, and clap's
+    // debug asserts reject a conflict target missing from any subcommand.
+    if args.verbose && QUIET.load(Ordering::Relaxed) {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--quiet and --verbose cannot be used together",
+            )
+            .exit();
+    }
 
     // #560: the plan-writing half of the coarse job, on its own. Branches
     // before the OUTPUT is resolved, because there is none.
@@ -2178,7 +2229,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
     impl TilesObserver for Printer {
         fn overview_written(&mut self, intermediate: &IntermediateOverview, c: &ConvertReport) {
-            println!(
+            say!(
                 "  intermediate overview: {} ({}{})",
                 intermediate.path.display(),
                 HumanBytes(intermediate.bytes),
@@ -2189,7 +2240,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 }
             );
             if self.verbose {
-                println!(
+                say!(
                     "Overview: {} input features → {} rows across {} levels in {:.2}s",
                     format_number(c.input_features as u64),
                     format_number(c.total_rows as u64),
@@ -2209,26 +2260,27 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             // legal outcomes — core wrote the valid tile-less archive; this
             // only reports it.
             TilesOutcome::EmptyShard(info) => {
-                println!(
+                say!(
                     "✓ shard {} owns no input rows; wrote an empty archive at {}",
                     info.role,
                     output.display()
                 );
-                println!(
+                say!(
                     "  z{}..z{} declared, 0 tiles. This is normal for a cut whose data is \
                      concentrated elsewhere — `tylertoo merge` skips a tile-less input.",
-                    info.min_zoom, info.max_zoom,
+                    info.min_zoom,
+                    info.max_zoom,
                 );
                 return Ok(());
             }
             TilesOutcome::EmptyCoarse(info) => {
-                println!(
+                say!(
                     "✓ coarse job has no features at z{}..z{}; wrote an empty archive at {}",
                     info.min_zoom,
                     info.max_zoom,
                     output.display()
                 );
-                println!(
+                say!(
                     "  Every feature first appears at or past the pivot z{}, so the data shards \
                      hold all of it. Any --save-plan was written as usual; `tylertoo merge` \
                      skips a tile-less input.",
@@ -2242,19 +2294,22 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 
     if args.verbose {
         for z in &export_report.zooms {
-            println!(
+            say!(
                 "  z{:<2} (level {}): {:>7} tiles, {:>9} features",
-                z.zoom, z.level, z.tile_count, z.tile_feature_count
+                z.zoom,
+                z.level,
+                z.tile_count,
+                z.tile_feature_count
             );
         }
     }
 
-    println!(
+    say!(
         "✓ Converted {} → {}",
         spec.label(),
         output.file_name().unwrap_or_default().to_string_lossy()
     );
-    println!(
+    say!(
         "  {}",
         tiles_summary_line(
             export_report.total_tiles,
@@ -2271,13 +2326,13 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     );
     print_skipped_property_columns(&export_report.skipped_property_columns);
     if let Some(note) = encode_quantized_note(export_report.encode_quantized_features) {
-        println!("  {note}");
+        say!("  {note}");
     }
     if let Some(note) = wrapped_note_line(
         convert_report.wrapped_features,
         convert_report.input_features,
     ) {
-        println!("  {note}");
+        say!("  {note}");
     }
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
@@ -2294,12 +2349,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         // on, the level was empty because there was less than one placeholder
         // of area in it, and the hint would name the flag already given.
         if args.tuning.collapse || args.tuning.collapse_square {
-            println!(
+            say!(
                 "  {} declared but empty: less than one placeholder of area there",
                 empty_zooms.join(", ")
             );
         } else {
-            println!(
+            say!(
                 "  {} declared but empty: every feature generalized away there \
                  (see --collapse / --collapse-square), or an entry-zoom ladder \
                  holds every feature out of them",
@@ -2309,7 +2364,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     }
 
     if let Some(note) = row_group_autoscale_note(convert_report) {
-        println!("{note}");
+        say!("{note}");
     }
 
     // The combined report so the one-step run captures both halves the
@@ -2320,7 +2375,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             serde_json::to_string_pretty(&*report).context("failed to serialize tiles report")?;
         std::fs::write(report_path, json)
             .with_context(|| format!("failed to write report to {}", report_path.display()))?;
-        println!("  report written to {}", report_path.display());
+        say!("  report written to {}", report_path.display());
     }
 
     Ok(())
@@ -2526,8 +2581,6 @@ fn bands_split_one_archive(bands: &[tylertoo_core::pyramid::Band]) -> bool {
 fn run_overview(args: OverviewArgs) -> Result<()> {
     use tylertoo_core::overview::level::Mode;
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
 
     // #427: refuse an existing output (without --force) before any work. The
@@ -2560,26 +2613,30 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     let report = run_convert(&spec, &output, &options)?;
 
     // Human-readable summary.
-    println!();
-    println!(
+    say!();
+    say!(
         "✓ Overview {} → {}  ({:?} mode)",
         spec.label(),
         output.file_name().unwrap_or_default().to_string_lossy(),
         report.mode
     );
-    println!(
+    say!(
         "  {} input features → {} rows across {} levels in {:.2}s",
         format_number(report.input_features as u64),
         format_number(report.total_rows as u64),
         report.levels.len(),
         report.duration_secs
     );
-    println!(
+    say!(
         "  {:>3}  {:>12}  {:>10}  {:>10}  {:>12}",
-        "lvl", "gsd(m)", "features", "vertices", "bytes"
+        "lvl",
+        "gsd(m)",
+        "features",
+        "vertices",
+        "bytes"
     );
     for lvl in &report.levels {
-        println!(
+        say!(
             "  {:>3}  {:>12.2}  {:>10}  {:>10}  {:>12}",
             lvl.level,
             lvl.gsd,
@@ -2592,7 +2649,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     // declared CRS, its range and the fix; the note here only makes sure the
     // summary itself never reads as an unqualified success.
     if report.out_of_range_features > 0 {
-        println!(
+        say!(
             "  note: {} of {} input features reach beyond the coordinate range the \
              file's declared CRS allows and were dropped or clipped \u{2014} see the \
              warning above, and check the real CRS with `gpio inspect <input>`",
@@ -2601,7 +2658,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         );
     }
     if report.unprojectable_features > 0 {
-        println!(
+        say!(
             "  note: {} of {} input features have valid lon/lat but lie outside the \
              Web Mercator tiling domain (|lat| > 85.05\u{b0}); these features cannot \
              be tiled",
@@ -2610,7 +2667,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         );
     }
     if let Some(note) = wrapped_note_line(report.wrapped_features, report.input_features) {
-        println!("  {note}");
+        say!("  {note}");
     }
     if !report.skipped_empty_levels.is_empty() {
         let planned: Vec<String> = report
@@ -2621,7 +2678,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
                 None => format!("level {}", s.planned_level),
             })
             .collect();
-        println!(
+        say!(
             "  note: {} empty level(s) omitted ({}) — no features visible at those \
              scales; the pyramid starts at the coarsest non-empty level",
             report.skipped_empty_levels.len(),
@@ -2630,7 +2687,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     }
 
     if let Some(note) = row_group_autoscale_note(&report) {
-        println!("{note}");
+        say!("{note}");
     }
 
     if let Some(report_path) = &args.report {
@@ -2638,7 +2695,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             serde_json::to_string_pretty(&report).context("failed to serialize overview report")?;
         std::fs::write(report_path, json)
             .with_context(|| format!("failed to write report to {}", report_path.display()))?;
-        println!("  report written to {}", report_path.display());
+        say!("  report written to {}", report_path.display());
     }
 
     Ok(())
@@ -2754,8 +2811,6 @@ fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<(
 fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     // #427: refuse an existing output (without --force) and a bad --spill-dir
     // before the input is even looked at.
     check_output_path(&args.output, OutputKind::Pmtiles, args.force)?;
@@ -2789,7 +2844,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         spill_dir: args.spill_dir.clone(),
     };
 
-    println!(
+    say!(
         "Exporting {} → {}",
         args.input.display(),
         args.output.display()
@@ -2797,12 +2852,14 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     let report = export_pmtiles(&args.input, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
-    println!(
+    say!(
         "  mode={} zooms z{}..z{}",
-        report.mode, report.min_zoom, report.max_zoom
+        report.mode,
+        report.min_zoom,
+        report.max_zoom
     );
     for z in &report.zooms {
-        println!(
+        say!(
             "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
             z.zoom,
             z.level,
@@ -2825,7 +2882,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             }
         );
     }
-    println!(
+    say!(
         "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s{}",
         report.total_tiles,
         report.total_tile_features,
@@ -2844,7 +2901,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     );
     print_skipped_property_columns(&report.skipped_property_columns);
     if let Some(note) = encode_quantized_note(report.encode_quantized_features) {
-        println!("  {note}");
+        say!("  {note}");
     }
 
     if let Some(path) = &args.report {
@@ -2852,7 +2909,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
         std::fs::write(path, json)
             .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        println!("  report → {}", path.display());
+        say!("  report → {}", path.display());
     }
     Ok(())
 }
@@ -2866,7 +2923,7 @@ fn print_skipped_property_columns(
     if skipped.is_empty() {
         return;
     }
-    println!(
+    say!(
         "  {} property column{} not exported (no MVT encoding for the type): {}",
         skipped.len(),
         if skipped.len() == 1 { "" } else { "s" },
@@ -2906,8 +2963,6 @@ fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
     use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band};
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if args.output.exists() && !args.force {
         anyhow::bail!(
@@ -2971,7 +3026,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
-        println!(
+        say!(
             "  z{lo}-{hi} -> layer {layer:?}: {} tiles",
             format_number(*n as u64)
         );
@@ -2981,9 +3036,9 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // line to print.
     let split = report.skipped > 0 && bands_split_one_archive(&bands);
     if let Some(line) = pyramid_skip_message(report.skipped, split) {
-        println!("{line}");
+        say!("{line}");
     }
-    println!(
+    say!(
         "✓ Built {} band(s) → {} ({} tiles)",
         bands.len(),
         args.output.display(),
@@ -3075,8 +3130,6 @@ fn preflight_report(report: Option<&Path>) -> Result<()> {
 fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     use tylertoo_core::shard::ShardPlan;
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     // No `exists()` precheck: a shard plan is cut for whatever a fleet will
     // read, which may be a directory, a glob, an s3:// prefix or a manifest.
     // `ConvertSource::resolve` names a bad input far better than a bare
@@ -3096,14 +3149,14 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     plan.save(&args.output)?;
 
     let input_label = spec.display();
-    println!(
+    say!(
         "Cut {} shard(s) at pivot z{} for {input_label}",
         plan.shards(),
         plan.pivot_zoom,
     );
     let total = plan.estimated_rows_total.max(1);
     for (i, r) in plan.ranges.iter().enumerate() {
-        println!(
+        say!(
             "  shard {i:<3} tiles {}..={}  ({:>5} pivot tile(s), ~{} row(s), {:.1}%)",
             r.lo,
             r.hi,
@@ -3113,7 +3166,7 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
         );
     }
     if plan.unplaced_rows > 0 {
-        println!(
+        say!(
             "\n  ! ~{} row(s) could not be placed: their row groups carry no usable bbox \
              statistics (or cover so much of the pivot zoom that they name no cut point), so \
              they were spread evenly instead of balanced. Run the input through `gpio \
@@ -3129,7 +3182,7 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     // empty archive), so the only place to notice is here, at cut time.
     let empty = plan.ranges.iter().filter(|r| r.estimated_rows == 0).count();
     if empty > 0 {
-        println!(
+        say!(
             "\n  ! {empty} of {} shard(s) are empty of data: their ranges own pivot tiles the \
              estimator places no rows in. Those jobs will run, find nothing and write a valid \
              empty archive (the merge skips it), so nothing breaks — but a smaller --shards, \
@@ -3137,8 +3190,8 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
             plan.shards(),
         );
     }
-    println!("\n✓ wrote {}", args.output.display());
-    println!(
+    say!("\n✓ wrote {}", args.output.display());
+    say!(
         "\nNext:\n  \
          tylertoo tiles {input_label} coarse.pmtiles --shard coarse --shard-plan {} --save-plan convert.plan\n  \
          tylertoo tiles {input_label} shard-$i.pmtiles --shard $i/{} --shard-plan {} --plan convert.plan\n  \
@@ -3152,8 +3205,6 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
 
 fn run_merge(args: MergeArgs) -> Result<()> {
     use tylertoo_core::merge::{merge_shards, MergeOptions};
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if args.output.exists() && !args.force {
         anyhow::bail!(
@@ -3197,10 +3248,12 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         // Not an error: merging one archive is a well-defined (if pointless)
         // copy, and a script that shards dynamically can legitimately end up
         // with one shard. Worth saying out loud, though.
-        eprintln!("note: merging a single archive just rewrites it");
+        if !QUIET.load(Ordering::Relaxed) {
+            eprintln!("note: merging a single archive just rewrites it");
+        }
     }
 
-    println!(
+    say!(
         "Merging {} archive(s) → {}",
         args.inputs.len(),
         args.output.display()
@@ -3212,21 +3265,21 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
 
     for (zoom, count) in &report.per_zoom_tile_counts {
-        println!("  z{:<2} {:>10} tiles", zoom, format_number(*count));
+        say!("  z{:<2} {:>10} tiles", zoom, format_number(*count));
     }
     if !report.inputs_without_bounds.is_empty() {
         // Almost always a shard exported without bounds, which quietly
         // shrinks the merged archive's extent, so it belongs on stdout next
         // to the counts and not only in the log.
-        println!(
+        say!(
             "  ! {} input(s) carried no usable bounds and were excluded from the merged bounds:",
             report.inputs_without_bounds.len()
         );
         for name in &report.inputs_without_bounds {
-            println!("      {name}");
+            say!("      {name}");
         }
     }
-    println!(
+    say!(
         "\n✓ {} tiles ({} unique) from {} archive(s), z{}..z{} in {:.2}s",
         format_number(report.tiles_total),
         format_number(report.unique_tiles),
@@ -3241,7 +3294,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
         std::fs::write(path, json)
             .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        println!("  report → {}", path.display());
+        say!("  report → {}", path.display());
     }
     Ok(())
 }
@@ -3250,8 +3303,6 @@ fn run_merge(args: MergeArgs) -> Result<()> {
 /// `tylertoo_core::decode::decode_pmtiles`).
 fn run_decode(args: DecodeArgs) -> Result<()> {
     use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // #427: refuse an existing output (without --force) before any work.
     check_output_path(&args.output, OutputKind::GeoParquet, args.force)?;
@@ -3276,7 +3327,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         layer: args.layer,
     };
 
-    println!(
+    say!(
         "Decoding {} → {}",
         args.input.display(),
         args.output.display()
@@ -3285,17 +3336,17 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         .with_context(|| format!("decode failed for {}", args.input.display()))?;
 
     match report.zoom_range {
-        Some((lo, hi)) => println!("  zooms z{lo}..z{hi}, layers: {}", report.layers.join(", ")),
-        None => println!("  no features matched the filters"),
+        Some((lo, hi)) => say!("  zooms z{lo}..z{hi}, layers: {}", report.layers.join(", ")),
+        None => say!("  no features matched the filters"),
     }
-    println!(
+    say!(
         "\n✓ {} features from {} tiles ({} skipped as degenerate) in {:.2}s",
         format_number(report.features_written),
         format_number(report.tiles_read),
         report.features_skipped,
         report.elapsed_secs
     );
-    println!(
+    say!(
         "  note: output is the tiled representation (simplified, clipped, \
          duplicated across zooms); see `tylertoo decode --help`"
     );
@@ -3305,7 +3356,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
         std::fs::write(path, json)
             .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        println!("  report → {}", path.display());
+        say!("  report → {}", path.display());
     }
     Ok(())
 }
@@ -3436,6 +3487,40 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// clap's own consistency checks over the whole command tree (conflict
+    /// targets that exist, unique short flags, ...), which otherwise run
+    /// only when a debug build happens to parse the offending subcommand.
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// #452: `-q/--quiet` is global: accepted before or after any
+    /// subcommand.
+    #[test]
+    fn quiet_is_accepted_on_either_side_of_any_subcommand() {
+        for args in [
+            &["tylertoo", "-q", "stats", "a.pmtiles"][..],
+            &["tylertoo", "stats", "a.pmtiles", "--quiet"],
+            &[
+                "tylertoo",
+                "merge",
+                "-q",
+                "out.pmtiles",
+                "a.pmtiles",
+                "b.pmtiles",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(cli.quiet, "{args:?}");
+        }
+        assert!(
+            !Cli::try_parse_from(["tylertoo", "stats", "a.pmtiles"])
+                .unwrap()
+                .quiet
+        );
+    }
 
     // --- single-file-only rejections (v0.7 PR-C) -----------------------------
 

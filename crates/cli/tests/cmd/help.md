@@ -7,7 +7,7 @@ Convert GeoParquet to PMTiles vector tiles and multi-resolution overviews.
 
 `tylertoo INPUT OUTPUT` with no subcommand runs `tiles`.
 
-Usage: tylertoo <COMMAND>
+Usage: tylertoo [OPTIONS] <COMMAND>
 
 Commands:
   tiles           Generate PMTiles vector tiles from GeoParquet (the default command)
@@ -22,10 +22,20 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
+  -q, --quiet
+          Print only warnings and errors. The output of `stats` and `validate` still prints
+
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+Exit status:
+
+- 0: success.
+- 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
+- 2: the command line was rejected while it was parsed.
+- 101: a panic, from an internal bug or an output pipe closed early.
 
 ```
