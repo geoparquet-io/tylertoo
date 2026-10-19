@@ -247,3 +247,56 @@ fn symlinked_outputs_and_stdout_reports_pass_the_preflight() {
         );
     }
 }
+
+/// `--report` is written after the output, so a report path naming the
+/// output (or the input) replaced the finished archive (or the source data)
+/// with the JSON report, and the run still exited 0. Refused up front, also
+/// when the two paths are spelled differently.
+#[test]
+fn report_over_the_output_or_the_input_is_refused_up_front() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let respelled = |name: &str| {
+        dir.path()
+            .join(".")
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let (input, archive) = (path("missing-input.parquet"), path("missing-input.pmtiles"));
+    let (pmtiles, parquet) = (path("out.pmtiles"), path("out.parquet"));
+    let (over_pmtiles, over_parquet) = (respelled("out.pmtiles"), respelled("out.parquet"));
+    let over_input = respelled("missing-input.parquet");
+    let over_archive = respelled("missing-input.pmtiles");
+    let cases: [&[&str]; 7] = [
+        &["tiles", &input, &pmtiles, "--report", &over_pmtiles],
+        &["tiles", &input, &pmtiles, "--report", &over_input],
+        &["overview", &input, &parquet, "--report", &over_parquet],
+        &[
+            "export-pmtiles",
+            &input,
+            &pmtiles,
+            "--report",
+            &over_pmtiles,
+        ],
+        &["decode", &archive, &parquet, "--report", &over_parquet],
+        &["decode", &archive, &parquet, "--report", &over_archive],
+        &[
+            "merge",
+            &pmtiles,
+            &archive,
+            &archive,
+            "--report",
+            &over_pmtiles,
+        ],
+    ];
+    for args in cases {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: must fail");
+        assert!(
+            stderr.contains("--report") && stderr.contains("same file"),
+            "{args:?}: must refuse the report path, got:\n{stderr}"
+        );
+    }
+}

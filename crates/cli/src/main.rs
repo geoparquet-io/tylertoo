@@ -1499,12 +1499,20 @@ impl InputSpec {
         }
     }
 
+    /// The input path, or the manifest's.
+    fn path(&self) -> &Path {
+        match self {
+            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
+        }
+    }
+
     /// Label for summary lines (input file name or manifest file name).
     fn label(&self) -> String {
-        let p = match self {
-            InputSpec::Path(p) | InputSpec::Manifest(p) => p,
-        };
-        p.file_name().unwrap_or_default().to_string_lossy().into()
+        self.path()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into()
     }
 }
 
@@ -2173,7 +2181,11 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // arg that only `tiles` has a `verbose` to conflict with, and clap's
     // debug asserts reject a conflict target missing from any subcommand.
     if args.verbose && QUIET.load(Ordering::Relaxed) {
-        Cli::command()
+        // Built, so the usage line reads `tylertoo tiles ...`, not the root's.
+        let mut cli = Cli::command();
+        cli.build();
+        cli.find_subcommand_mut("tiles")
+            .expect("tiles is a subcommand")
             .error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--quiet and --verbose cannot be used together",
@@ -2194,7 +2206,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     )?;
 
     check_output_path(&output, OutputKind::Pmtiles, args.force)?;
-    preflight_report(args.report.as_deref())?;
+    preflight_report(args.report.as_deref(), &[&output, spec.path()])?;
 
     // #433: the export knobs that need no file are checked before the
     // convert, which on a large input runs for minutes before the export
@@ -2592,7 +2604,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     // overview itself is written to a sibling and renamed over OUTPUT at the
     // end, so an interrupted run leaves a previous file intact either way.
     check_output_path(&output, OutputKind::GeoParquet, args.force)?;
-    preflight_report(args.report.as_deref())?;
+    preflight_report(args.report.as_deref(), &[&output, spec.path()])?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,
@@ -2819,7 +2831,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     // #427: refuse an existing output (without --force) and a bad --spill-dir
     // before the input is even looked at.
     check_output_path(&args.output, OutputKind::Pmtiles, args.force)?;
-    preflight_report(args.report.as_deref())?;
+    preflight_report(args.report.as_deref(), &[&args.output, &args.input])?;
     check_spill_dir(args.spill_dir.as_deref())?;
     reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
     require_single_local_file(&args.input, "export-pmtiles")?;
@@ -3120,13 +3132,23 @@ fn preflight_writable(path: &Path) -> Result<()> {
 
 /// `--report` preflight (#452): the report is written when the run ends, so
 /// a bad path would otherwise throw the finished run away. It is rewritten
-/// in place, so an existing report must itself be writable.
-fn preflight_report(report: Option<&Path>) -> Result<()> {
-    match report {
-        Some(path) => tylertoo_core::atomic_output::check_writable_in_place(path)
-            .map_err(|e| anyhow::anyhow!("--report: {e}")),
-        None => Ok(()),
+/// in place, so an existing report must itself be writable. It must not be
+/// any of `others` (the run's output and inputs): written last, it would
+/// replace the finished output, or the source data, with JSON.
+fn preflight_report(report: Option<&Path>, others: &[&Path]) -> Result<()> {
+    let Some(path) = report else {
+        return Ok(());
+    };
+    let key = canonical_key(path);
+    if let Some(other) = others.iter().find(|o| canonical_key(o) == key) {
+        anyhow::bail!(
+            "--report {} is the same file as {}; the report would overwrite it",
+            path.display(),
+            other.display()
+        );
     }
+    tylertoo_core::atomic_output::check_writable_in_place(path)
+        .map_err(|e| anyhow::anyhow!("--report: {e}"))
 }
 
 /// Run `tylertoo merge`: several disjoint PMTiles archives → one (thin facade
@@ -3225,7 +3247,10 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     // mirrors `--work-dir`, which fails fast because the writer creates its
     // spool file up front.
     preflight_writable(&args.output)?;
-    preflight_report(args.report.as_deref())?;
+    let written_or_read: Vec<&Path> = std::iter::once(args.output.as_path())
+        .chain(args.inputs.iter().map(PathBuf::as_path))
+        .collect();
+    preflight_report(args.report.as_deref(), &written_or_read)?;
 
     // Name a missing input here rather than letting the reader fail later
     // with a bare "No such file or directory" and no path. Every input is a
@@ -3313,7 +3338,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 
     // #427: refuse an existing output (without --force) before any work.
     check_output_path(&args.output, OutputKind::GeoParquet, args.force)?;
-    preflight_report(args.report.as_deref())?;
+    preflight_report(args.report.as_deref(), &[&args.output, &args.input])?;
     reject_files_from(args.files_from.as_ref(), "decode")?;
     require_single_local_file(&args.input, "decode")?;
 

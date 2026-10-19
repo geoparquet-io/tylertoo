@@ -638,4 +638,8 @@ fn quiet_and_verbose_are_a_usage_error() {
         stderr.contains("--quiet") && stderr.contains("--verbose"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("Usage: tylertoo tiles"),
+        "the usage line is the subcommand's: {stderr}"
+    );
 }

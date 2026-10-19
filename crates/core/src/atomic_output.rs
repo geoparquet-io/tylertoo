@@ -172,6 +172,15 @@ pub fn check_writable(target: &Path) -> Result<(), OutputNotWritable> {
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(());
     }
+    // `Path::parent` ignores a trailing separator, so `out.pmtiles/` would
+    // otherwise probe `.`, pass, and fail at the final create or rename.
+    if ends_with_separator(target) {
+        return not_writable(
+            target,
+            "it ends in a path separator, so it names a directory; give the output a file path"
+                .into(),
+        );
+    }
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -220,6 +229,15 @@ pub fn check_writable_in_place(target: &Path) -> Result<(), OutputNotWritable> {
         Ok(_) => Ok(()),
         Err(e) => not_writable(target, format!("the existing file is not writable: {e}")),
     }
+}
+
+/// Separators are ASCII, so the last encoded byte is one only when the last
+/// character is.
+fn ends_with_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|&b| std::path::is_separator(char::from(b)))
 }
 
 fn not_writable(target: &Path, reason: String) -> Result<(), OutputNotWritable> {
@@ -568,6 +586,22 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("nope").join("x"), &dangling).unwrap();
         check_writable(&dangling).unwrap();
         assert_eq!(listing(dir.path()), ["out.pmtiles"]);
+    }
+
+    /// `out.pmtiles/` names a directory, which no writer can create as a
+    /// file; `Path::parent` drops the trailing slash, so without its own
+    /// check the probe of `.` passed and the run failed only at the end.
+    #[test]
+    fn check_writable_refuses_a_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = dir.path().join("out.pmtiles").into_os_string();
+        target.push(std::path::MAIN_SEPARATOR_STR);
+        let target = PathBuf::from(target);
+        let msg = check_writable(&target).unwrap_err().to_string();
+        assert!(msg.contains("names a directory"), "{msg}");
+        let msg = check_writable_in_place(&target).unwrap_err().to_string();
+        assert!(msg.contains("names a directory"), "{msg}");
+        assert!(listing(dir.path()).is_empty());
     }
 
     /// A bare file name lives in the current directory: `Path::parent`
