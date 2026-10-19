@@ -354,6 +354,9 @@ pub enum TilesError {
     /// The export half (or its #433 preflight) failed.
     #[error("export failed: {0}")]
     Export(ExportError),
+    /// The output cannot be written (#452: checked before any work).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
     /// [`TilesOptions::keep_overview`] names a directory that does not
     /// exist (#433 — checked before any work).
     #[error("--keep-overview directory {} does not exist", dir.display())]
@@ -539,6 +542,10 @@ pub fn convert_to_pmtiles_observed(
         &options.feature_order,
         options.feature_id.as_deref(),
     )?;
+    // #452: before the intermediate is created — which would otherwise be
+    // the first thing to trip over a missing output directory, with a
+    // message about the intermediate — and long before the export.
+    crate::atomic_output::check_writable(output)?;
 
     // #498/#541: the convert-side consequences of a sharded job are the
     // facade's, not the caller's. Applied to our own copy, so a Rust caller

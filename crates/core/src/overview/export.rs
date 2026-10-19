@@ -521,6 +521,10 @@ pub struct SkippedPropertyColumn {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExportError {
+    /// The output cannot be written (#452: checked before the input is
+    /// opened).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
     /// Opening or reading the overview file failed.
     #[error("overview reader error: {0}")]
     Reader(#[from] ReaderError),
@@ -1706,6 +1710,8 @@ fn export_pmtiles_run(
     // #433: the knobs that need no file (`extent`, `tile_buffer`) are checked
     // before any I/O, so a bad value fails here rather than after the open.
     options.validate()?;
+    // #452: and the output, before the input is opened.
+    crate::atomic_output::check_writable(output_path.as_ref())?;
     let start = Instant::now();
     let input_path = input_path.as_ref();
 

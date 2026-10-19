@@ -81,13 +81,19 @@ impl ValidationReport {
 }
 
 /// Errors that prevent a validation run from starting at all (I/O, footer).
+///
+/// The messages carry no path and no "io error:" prefix: every caller
+/// already says "could not open '<path>': " in front (#452).
 #[derive(Debug, thiserror::Error)]
 pub enum CheckError {
     /// I/O error opening the file.
-    #[error("io error: {0}")]
+    #[error("{0}")]
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer could not be parsed).
-    #[error("parquet error: {0}")]
+    #[error(
+        "cannot read the Parquet footer: {}",
+        crate::input::parquet_error_detail(.0)
+    )]
     Parquet(#[from] parquet::errors::ParquetError),
 }
 
@@ -1038,6 +1044,24 @@ mod tests {
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
     use std::sync::Arc;
+
+    /// #452: callers prefix the path ("could not open 'x': ..."), so the
+    /// error itself must not add "io error:" / "parquet error: Parquet
+    /// error:" layers on top.
+    #[test]
+    fn open_errors_carry_no_stuttering_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = validate_file(dir.path().join("missing.parquet"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.starts_with("No such file"), "{msg}");
+
+        let corrupt = dir.path().join("corrupt.parquet");
+        std::fs::write(&corrupt, b"definitely not parquet").unwrap();
+        let msg = validate_file(&corrupt).unwrap_err().to_string();
+        assert!(msg.contains("Corrupt footer"), "{msg}");
+        assert!(!msg.to_lowercase().contains("parquet error"), "{msg}");
+    }
 
     // --- fixture builders ---------------------------------------------------
 

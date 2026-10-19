@@ -39,7 +39,7 @@ pub mod vector_tile {
 }
 
 pub mod archive_index;
-pub(crate) mod atomic_output;
+pub mod atomic_output;
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;
@@ -97,6 +97,10 @@ pub enum Error {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The output cannot be written (#452: checked before any work).
+    #[error(transparent)]
+    Output(#[from] atomic_output::OutputNotWritable),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

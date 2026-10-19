@@ -1722,7 +1722,9 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
 /// #427 for `overview`, `export-pmtiles` and `decode`): an existing file is
 /// refused unless `force`. A directory can never be replaced by the final
 /// rename, `--force` or not, so it is refused up front instead of after a
-/// whole convert + export.
+/// whole convert + export. So is a missing or read-only directory (#452);
+/// core checks that again, but only after auto-zoom and shard resolution
+/// have read the input.
 fn check_output_path(output: &Path, kind: OutputKind, force: bool) -> Result<()> {
     if output.is_dir() {
         anyhow::bail!(
@@ -1733,7 +1735,7 @@ fn check_output_path(output: &Path, kind: OutputKind, force: bool) -> Result<()>
     if output.exists() && !force {
         anyhow::bail!("{} exists (use --force to overwrite)", output.display());
     }
-    Ok(())
+    preflight_writable(output)
 }
 
 /// What a subcommand's output is, for [`check_output_path`]'s message.
@@ -2136,6 +2138,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     )?;
 
     check_output_path(&output, OutputKind::Pmtiles, args.force)?;
+    preflight_report(args.report.as_deref())?;
 
     // #433: the export knobs that need no file are checked before the
     // convert, which on a large input runs for minutes before the export
@@ -2531,6 +2534,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     // overview itself is written to a sibling and renamed over OUTPUT at the
     // end, so an interrupted run leaves a previous file intact either way.
     check_output_path(&output, OutputKind::GeoParquet, args.force)?;
+    preflight_report(args.report.as_deref())?;
 
     let mode = match args.mode.as_str() {
         "duplicating" => Mode::Duplicating,
@@ -2755,6 +2759,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     // #427: refuse an existing output (without --force) and a bad --spill-dir
     // before the input is even looked at.
     check_output_path(&args.output, OutputKind::Pmtiles, args.force)?;
+    preflight_report(args.report.as_deref())?;
     check_spill_dir(args.spill_dir.as_deref())?;
     reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
     require_single_local_file(&args.input, "export-pmtiles")?;
@@ -2910,6 +2915,8 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
             args.output.display()
         );
     }
+    // #452: the archive is created only after every band is tiled.
+    preflight_writable(&args.output)?;
 
     let bands = args
         .bands
@@ -3043,29 +3050,22 @@ fn canonical_key(path: &Path) -> PathBuf {
 
 /// Fail now if `path` cannot be created, instead of after the work is done.
 ///
-/// Probes by creating (and removing) the file when it does not exist, so a
-/// missing directory or a read-only one is reported with the path that caused
-/// it. An existing file is left strictly alone — `--force` decides whether it
-/// may be overwritten, and this must not truncate it.
+/// Core's [`check_writable`](tylertoo_core::atomic_output::check_writable)
+/// probes the directory, so a missing or read-only one is reported with the
+/// path that caused it. An existing file is left strictly alone — `--force`
+/// decides whether it may be overwritten.
 fn preflight_writable(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
-            anyhow::bail!(
-                "{}: directory {} does not exist",
-                path.display(),
-                parent.display()
-            );
-        }
-    }
-    match std::fs::File::create(path) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(path);
-            Ok(())
-        }
-        Err(e) => anyhow::bail!("{}: cannot be written ({e})", path.display()),
+    Ok(tylertoo_core::atomic_output::check_writable(path)?)
+}
+
+/// `--report` preflight (#452): the report is written when the run ends, so
+/// a bad path would otherwise throw the finished run away. It is rewritten
+/// in place, so an existing report must itself be writable.
+fn preflight_report(report: Option<&Path>) -> Result<()> {
+    match report {
+        Some(path) => tylertoo_core::atomic_output::check_writable_in_place(path)
+            .map_err(|e| anyhow::anyhow!("--report: {e}")),
+        None => Ok(()),
     }
 }
 
@@ -3088,7 +3088,8 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
          the SAME shard plan, so replacing one mid-build silently re-cuts the tile space.",
         args.output.display()
     );
-    preflight_writable(&args.output)?;
+    // `ShardPlan::save` rewrites the file in place.
+    tylertoo_core::atomic_output::check_writable_in_place(&args.output)?;
 
     let source = resolve_convert_source(&spec)?;
     let plan = ShardPlan::compute(&source, args.pivot, args.shards)?;
@@ -3160,6 +3161,13 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             args.output.display()
         );
     }
+    // Preflight the paths the run will write, before it reads gigabytes: a
+    // `--report` in a directory that does not exist, or an output whose parent
+    // is missing or read-only, would otherwise surface only at the end. This
+    // mirrors `--work-dir`, which fails fast because the writer creates its
+    // spool file up front.
+    preflight_writable(&args.output)?;
+    preflight_report(args.report.as_deref())?;
 
     // Name a missing input here rather than letting the reader fail later
     // with a bare "No such file or directory" and no path. Every input is a
@@ -3185,15 +3193,6 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         }
     }
 
-    // Preflight the paths the run will write, before it reads gigabytes: a
-    // `--report` in a directory that does not exist, or an output whose parent
-    // is missing or read-only, would otherwise surface only at the end. This
-    // mirrors `--work-dir`, which fails fast because the writer creates its
-    // spool file up front.
-    preflight_writable(&args.output).map_err(|e| anyhow::anyhow!("output {e}"))?;
-    if let Some(report) = &args.report {
-        preflight_writable(report).map_err(|e| anyhow::anyhow!("--report {e}"))?;
-    }
     if args.inputs.len() < 2 {
         // Not an error: merging one archive is a well-defined (if pointless)
         // copy, and a script that shards dynamically can legitimately end up
@@ -3256,6 +3255,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
 
     // #427: refuse an existing output (without --force) before any work.
     check_output_path(&args.output, OutputKind::GeoParquet, args.force)?;
+    preflight_report(args.report.as_deref())?;
     reject_files_from(args.files_from.as_ref(), "decode")?;
     require_single_local_file(&args.input, "decode")?;
 

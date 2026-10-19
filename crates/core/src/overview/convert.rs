@@ -1297,9 +1297,16 @@ pub enum ConvertError {
         /// projected-CRS diagnosis in the message.
         max_abs: f64,
     },
-    /// The input has no geometry column.
-    #[error("input has no geometry column")]
-    NoGeometryColumn,
+    /// The output cannot be written (#452: checked before any input is read).
+    #[error(transparent)]
+    Output(#[from] crate::atomic_output::OutputNotWritable),
+    /// The input has no geometry column: neither the GeoParquet `geo`
+    /// metadata's `primary_column` nor a recognized geometry column name.
+    #[error("{input} has no geometry column")]
+    NoGeometryColumn {
+        /// Display name of the input (path, URL, or partition set).
+        input: String,
+    },
     /// The `--sort-key` column is not present in the input schema.
     #[error("sort-key column {name:?} not found in input schema")]
     SortKeyColumnMissing {
@@ -2838,7 +2845,9 @@ pub(super) fn apply_property_selection(
         return Ok(());
     }
     let schema = source.file_schema()?;
-    let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+        input: source.display_name(),
+    })?;
     let mut warn = |msg: String| log::warn!("[convert] {msg}");
     let keep = options.properties.resolve(
         &schema,
@@ -3357,7 +3366,10 @@ fn load_input_table_with_limit(
     // input schema. Syntax was already validated in `validate_options`.
     let bound_filter = bind_attribute_filter(options, &input_schema, &renames)?;
 
-    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx =
+        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        })?;
     let geom_field = input_schema.field(geom_idx).clone();
 
     // Clustering schema checks + accumulate column resolution (Q4).
@@ -3750,6 +3762,11 @@ pub(crate) fn convert_to_overviews_source_strategy(
         }
         None => options,
     };
+    // #452: the output is created after pass 1; a missing or read-only
+    // directory must not cost the whole scan first. After the option checks
+    // above (which read at most a footer, for a property selection), so a
+    // bad option is reported as such wherever the output points.
+    crate::atomic_output::check_writable(output_path)?;
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
@@ -9193,6 +9210,53 @@ mod tests {
             b"an older plan",
             "the preflight must not truncate the file it probes"
         );
+    }
+
+    /// #452: "input has no geometry column" named no file, which is no help
+    /// with a directory or glob of partitions. Every pipeline that looks
+    /// for the column names the input.
+    #[test]
+    fn no_geometry_column_names_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let exclude_all = PropertySelection {
+            exclude_all: true,
+            ..Default::default()
+        };
+        for (streaming, properties) in [
+            (true, PropertySelection::default()),
+            (false, PropertySelection::default()),
+            (true, exclude_all),
+        ] {
+            let err = convert_to_overviews(
+                &input,
+                dir.path().join("out.parquet"),
+                &ConvertOptions {
+                    streaming,
+                    properties: properties.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect_err("no geometry column");
+            assert!(
+                matches!(err, ConvertError::NoGeometryColumn { .. }),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&input.display().to_string()),
+                "streaming={streaming} {properties:?}: names the input: {msg}"
+            );
+        }
     }
 
     /// #513: the preflight runs before a single input byte is read — the

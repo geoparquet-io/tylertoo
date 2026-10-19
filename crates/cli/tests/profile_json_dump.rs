@@ -1065,16 +1065,22 @@ fn failed_run_leaves_no_zero_byte_profile_json() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let profile_json = dir.path().join("profile.jsonl");
-    // A writable profile path, but an overview output under a directory that
-    // does not exist: option validation passes (so the preflight runs), the
-    // conversion then fails long before the dump would be appended.
-    let out = dir.path().join("no-such-dir").join("out.parquet");
+    // A writable profile path, but an overview output that fails on its first
+    // write: every preflight passes (so the profile one runs), the conversion
+    // then fails long before the dump would be appended. A missing output
+    // directory no longer works for this — it is refused up front (#452),
+    // before the profile preflight.
+    let out = std::path::Path::new("/dev/full");
+    if !out.exists() {
+        return;
+    }
 
     let output = Command::new(tylertoo_bin())
         .args([
             "overview",
             fixture.to_str().unwrap(),
             out.to_str().unwrap(),
+            "--force",
             "--min-zoom",
             "0",
             "--max-zoom",

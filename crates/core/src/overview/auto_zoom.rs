@@ -686,7 +686,9 @@ pub(crate) fn estimate_with(
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
     let crs = detect_crs_from_kv(source.key_value_metadata()?.as_ref())?;
-    let geom_idx = find_geometry_column(&schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+        input: source.display_name(),
+    })?;
     let geom_field = schema.field(geom_idx).clone();
     // Bound against the file's own column names: a filter naming a column
     // the conversion renames (#288) addresses it by that same input name.

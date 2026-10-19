@@ -2077,7 +2077,10 @@ fn convert_preflight_with_memory_limit(
     // can name the column before any row-group selection or staging reads
     // it. The geometry column is never one of the #288 reserved names, so
     // it is never touched by the rename above.
-    let geom_idx = find_geometry_column(&input_schema).ok_or(ConvertError::NoGeometryColumn)?;
+    let geom_idx =
+        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        })?;
     let geom_field = input_schema.field(geom_idx).clone();
 
     // Attribute filter (#315): parse + bind against the input schema.

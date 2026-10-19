@@ -123,6 +123,104 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     ))
 }
 
+/// An output path that [`check_writable`] found could not be written.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot write {}: {reason}", .path.display())]
+pub struct OutputNotWritable {
+    /// The output path as given.
+    pub path: PathBuf,
+    /// Why not, naming the directory where that is the cause.
+    pub reason: String,
+}
+
+/// Preflight for a file output (#452): fail in milliseconds, naming the
+/// path, instead of after a whole conversion.
+///
+/// Checks what [`create`], the PMTiles writer and a final rename will need:
+/// that `target` is not a directory and that its directory exists and
+/// accepts new files. The directory is probed with a uniquely named,
+/// immediately removed sibling. `target` itself is never opened: an
+/// existing output is replaced by a rename, so its own permissions do not
+/// matter, and a PMTiles `<output>.partial` salvage file beside it is left
+/// alone. An existing non-regular `target` (`/dev/null`, a FIFO) is written
+/// directly and passes without a probe.
+///
+/// # Errors
+///
+/// [`OutputNotWritable`] naming `target` and, where it is the cause, its
+/// directory.
+pub fn check_writable(target: &Path) -> Result<(), OutputNotWritable> {
+    let fail = |reason: String| {
+        Err(OutputNotWritable {
+            path: target.to_path_buf(),
+            reason,
+        })
+    };
+    // Resolve a symlink the way `create` does, so the probe lands in the
+    // directory the output will be published into.
+    let resolved;
+    let real = match std::fs::symlink_metadata(target) {
+        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(target) {
+            Ok(p) => {
+                resolved = p;
+                resolved.as_path()
+            }
+            Err(e) => return fail(format!("cannot resolve the symlink: {e}")),
+        },
+        _ => target,
+    };
+    if let Ok(m) = std::fs::metadata(real) {
+        if m.is_dir() {
+            return fail("it is a directory; give the output a file path".to_string());
+        }
+        if !m.is_file() {
+            return Ok(());
+        }
+    }
+    let dir = match real.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return fail(format!("{} is not a directory", dir.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return fail(format!("directory {} does not exist", dir.display()))
+        }
+        Err(e) => return fail(format!("cannot access directory {}: {e}", dir.display())),
+    }
+    match tempfile::Builder::new()
+        .prefix(".tylertoo-write-probe.")
+        .tempfile_in(dir)
+    {
+        Ok(_probe) => Ok(()), // removed on drop
+        Err(e) => fail(format!("directory {} is not writable: {e}", dir.display())),
+    }
+}
+
+/// [`check_writable`] for a file rewritten in place, not renamed over.
+///
+/// A file written with `std::fs::write` or `File::create` needs an existing
+/// regular file to be writable too. It is opened for writing without
+/// truncation, so the check cannot destroy it.
+///
+/// # Errors
+///
+/// As [`check_writable`], plus an existing file that cannot be opened for
+/// writing.
+pub fn check_writable_in_place(target: &Path) -> Result<(), OutputNotWritable> {
+    check_writable(target)?;
+    if std::fs::metadata(target).is_ok_and(|m| m.is_file()) {
+        if let Err(e) = std::fs::OpenOptions::new().write(true).open(target) {
+            return Err(OutputNotWritable {
+                path: target.to_path_buf(),
+                reason: format!("the existing file is not writable: {e}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl PendingOutput {
     /// Where the output is being written before publish.
     #[cfg(test)]
@@ -346,5 +444,126 @@ mod tests {
             err.to_string().contains("out.parquet"),
             "error names the destination: {err}"
         );
+    }
+
+    // --- check_writable (#452) ----------------------------------------------
+
+    #[test]
+    fn check_writable_accepts_a_new_file_in_a_writable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        check_writable(&dir.path().join("out.pmtiles")).unwrap();
+        assert!(listing(dir.path()).is_empty(), "the probe is removed");
+    }
+
+    #[test]
+    fn check_writable_names_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("nope");
+        let target = parent.join("out.pmtiles");
+        let msg = check_writable(&target).unwrap_err().to_string();
+        assert!(msg.contains(&target.display().to_string()), "{msg}");
+        assert!(msg.contains(&parent.display().to_string()), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
+
+    #[test]
+    fn check_writable_refuses_a_directory_and_a_file_as_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = check_writable(dir.path()).unwrap_err().to_string();
+        assert!(msg.contains("is a directory"), "{msg}");
+
+        let file = dir.path().join("plain");
+        std::fs::write(&file, b"x").unwrap();
+        let msg = check_writable(&file.join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not a directory"), "{msg}");
+    }
+
+    /// An existing output is replaced by a rename, so its own mode does not
+    /// matter, and the check must leave it byte-for-byte alone. In
+    /// particular a PMTiles run's `<output>.partial` salvage file is never
+    /// touched: the Tail layout rotates it to `.partial.prev`.
+    #[test]
+    fn check_writable_leaves_existing_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.pmtiles");
+        let partial = dir.path().join("out.pmtiles.partial");
+        std::fs::write(&target, b"previous output").unwrap();
+        std::fs::write(&partial, b"salvage").unwrap();
+        check_writable(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous output");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"salvage");
+        assert_eq!(listing(dir.path()), ["out.pmtiles", "out.pmtiles.partial"]);
+    }
+
+    /// Devices are written directly by [`create`], so there is no directory
+    /// to probe (and `/dev` is not writable for ordinary users).
+    #[test]
+    fn check_writable_passes_devices_through() {
+        for dev in ["/dev/null", "/dev/full"] {
+            let dev = Path::new(dev);
+            if dev.exists() {
+                check_writable(dev).unwrap();
+            }
+        }
+    }
+
+    /// A bare file name lives in the current directory: `Path::parent`
+    /// gives `""` for it, which is not a missing directory.
+    #[test]
+    fn check_writable_resolves_a_bare_file_name_to_the_current_directory() {
+        check_writable(Path::new("tylertoo-check-writable-probe.pmtiles")).unwrap();
+    }
+
+    /// A file rewritten in place (a JSON report, a shard plan) needs the
+    /// existing file itself to be writable, which a rename-published output
+    /// does not; and the check must not truncate it.
+    #[cfg(unix)]
+    #[test]
+    fn check_writable_in_place_probes_an_existing_file_without_truncating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        check_writable_in_place(&report).unwrap();
+        assert!(!report.exists(), "a new file is not created");
+
+        std::fs::write(&report, b"{}").unwrap();
+        check_writable_in_place(&report).unwrap();
+        assert_eq!(std::fs::read(&report).unwrap(), b"{}");
+
+        std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // root ignores file modes: nothing to assert there.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&report)
+            .is_ok()
+        {
+            return;
+        }
+        check_writable(&report).expect("a rename replaces a read-only file fine");
+        let msg = check_writable_in_place(&report).unwrap_err().to_string();
+        assert!(msg.contains(&report.display().to_string()), "{msg}");
+        assert!(msg.contains("not writable"), "{msg}");
+        assert_eq!(std::fs::read(&report).unwrap(), b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_writable_names_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // root ignores directory modes: nothing to assert there.
+        if File::create(ro.join("as-root")).is_ok() {
+            return;
+        }
+        let msg = check_writable(&ro.join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&ro.display().to_string()), "{msg}");
+        assert!(msg.contains("not writable"), "{msg}");
     }
 }

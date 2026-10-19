@@ -2084,7 +2084,10 @@ fn export_non_overview_parquet_errors() {
     write_input(tin.path(), &spread_points(3), true, None);
     let err = export_pmtiles(tin.path(), tout.path(), &ExportOptions::default()).unwrap_err();
     assert!(
-        matches!(err, ExportError::Reader(ReaderError::MissingOverviewsKey)),
+        matches!(
+            err,
+            ExportError::Reader(ReaderError::MissingOverviewsKey { .. })
+        ),
         "got: {err}"
     );
 }
@@ -2137,7 +2140,7 @@ fn reader_rejects_negative_row_group_end() {
     });
     let err = OverviewReader::open(tbad.path()).unwrap_err();
     assert!(
-        !matches!(err, ReaderError::MissingOverviewsKey),
+        !matches!(err, ReaderError::MissingOverviewsKey { .. }),
         "wrong rejection: {err}"
     );
 }
