@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
 use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
@@ -934,6 +935,60 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     Ok(dict.into())
 }
 
+/// Native body of `tylertoo.decode()`.
+///
+/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
+/// passes every argument here by keyword.
+#[pyfunction]
+#[pyo3(signature = (input, output, *, min_zoom=None, max_zoom=None, layer=None))]
+fn decode(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    min_zoom: Option<u8>,
+    max_zoom: Option<u8>,
+    layer: Option<String>,
+) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
+    let options = DecodeOptions {
+        min_zoom,
+        max_zoom,
+        layer,
+    };
+    let input_path = Path::new(input).to_path_buf();
+    let output_path = Path::new(output).to_path_buf();
+    let report = py
+        .detach(|| decode_pmtiles(&input_path, &output_path, &options))
+        .map_err(decode_error_to_py)?;
+
+    // Keyed like the CLI's `decode --report` JSON (`DecodeReport`'s serde
+    // names).
+    let dict = PyDict::new(py);
+    dict.set_item("tiles_read", report.tiles_read)?;
+    dict.set_item("features_written", report.features_written)?;
+    dict.set_item("features_skipped", report.features_skipped)?;
+    dict.set_item("layers", PyList::new(py, &report.layers)?)?;
+    dict.set_item("zoom_range", report.zoom_range)?;
+    dict.set_item("elapsed_secs", report.elapsed_secs)?;
+    Ok(dict.into())
+}
+
+/// Map a [`DecodeError`] to a Python exception: an inverted zoom range, a
+/// raster archive, or a property that collides with a provenance column is
+/// the caller's input problem (`ValueError`); a damaged or unreadable
+/// archive, or a failed write, is `RuntimeError`. The cause chain is kept,
+/// since `DecodeError` leaves it out of its own `Display` (#396).
+fn decode_error_to_py(e: DecodeError) -> PyErr {
+    match e {
+        DecodeError::InvalidZoomRange { .. }
+        | DecodeError::NotVectorTiles(_)
+        | DecodeError::ReservedColumn(_) => PyErr::new::<PyValueError, _>(with_sources(&e)),
+        other => {
+            PyErr::new::<PyRuntimeError, _>(format!("decode failed: {}", with_sources(&other)))
+        }
+    }
+}
+
 /// The compiled extension, imported as `tylertoo._tylertoo`.
 ///
 /// `python/tylertoo/__init__.py` wraps it with the public, typed API.
@@ -957,5 +1012,6 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(overview, m)?)?;
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
+    m.add_function(wrap_pyfunction!(decode, m)?)?;
     Ok(())
 }

@@ -225,6 +225,50 @@ Export an overview file to a PMTiles archive, one zoom per level.
 10
 ```
 
+## `decode`
+
+```python
+decode(
+    input: str,
+    output: str,
+    *,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    layer: str | None = None,
+) -> DecodeReport
+```
+
+Decode a PMTiles archive of vector tiles back to GeoParquet.
+
+Writes one row per feature per tile: the tiled representation, so features are simplified, clipped at tile edges, and repeated at every zoom and in every tile they cross. The columns are `zoom`, `layer`, `mvt_id`, the properties in name order, then `geometry` as lon/lat (`EPSG:4326`) WKB. The output is overwritten if it exists.
+
+### Parameters
+
+* `input`: PMTiles archive of vector tiles.
+* `output`: GeoParquet file to write.
+* `min_zoom`: Coarsest zoom to decode, or `None` for the archive's coarsest.
+* `max_zoom`: Finest zoom to decode, or `None` for the archive's finest. Set both to one zoom to decode only that zoom.
+* `layer`: Decode only this MVT layer, or `None` for every layer.
+
+### Returns
+
+[`DecodeReport`](#decodereport): Counts of tiles read and features written, with the layers and zooms found.
+
+### Raises
+
+* `ValueError`: `min_zoom` above `max_zoom`, an archive of raster tiles, or a property named like a provenance column.
+* `RuntimeError`: Not a PMTiles archive, a damaged tile, or reading or writing failed.
+
+### Example
+
+```python
+>>> report = decode(
+...     "buildings.pmtiles", "decoded.parquet", min_zoom=10
+... )
+>>> report["layers"], report["zoom_range"]
+(['overview'], (10, 10))
+```
+
 ## `validate`
 
 ```python
@@ -449,6 +493,27 @@ class SkippedPropertyColumn(TypedDict):
     name: str
     data_type: str
 ```
+
+### `DecodeReport`
+
+What `decode()` read and wrote.
+
+```python
+class DecodeReport(TypedDict):
+    tiles_read: int
+    features_written: int
+    features_skipped: int
+    layers: list[str]
+    zoom_range: tuple[int, int] | None
+    elapsed_secs: float
+```
+
+* `tiles_read`: Tiles read, after the zoom filter.
+* `features_written`: Feature rows written.
+* `features_skipped`: Features whose geometry decoded to nothing, such as a polygon collapsed at the tile extent.
+* `layers`: MVT layers read, after the layer filter, sorted.
+* `zoom_range`: Coarsest and finest zoom written, or `None` when no feature matched the filters.
+* `elapsed_secs`: Wall-clock seconds.
 
 ### `ValidationReport`
 

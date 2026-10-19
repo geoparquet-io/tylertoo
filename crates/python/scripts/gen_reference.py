@@ -24,9 +24,9 @@ from docstring_parser import parse
 import tylertoo
 
 # Workflow order, so the diff guard sees deterministic output: the
-# overview -> export path, then validation, then the deprecated
-# one-shot.
-FUNCTION_ORDER = ["overview", "export_pmtiles", "validate", "convert"]
+# overview -> export path, then decoding, validation, and the
+# deprecated one-shot.
+FUNCTION_ORDER = ["overview", "export_pmtiles", "decode", "validate", "convert"]
 
 # Start groups at named arguments, retaining docstring order.
 OVERVIEW_GROUPS = {
@@ -49,6 +49,7 @@ TYPE_ORDER = [
     "ExportReport",
     "ZoomReport",
     "SkippedPropertyColumn",
+    "DecodeReport",
     "ValidationReport",
     "ValidationCheck",
     "ConvertReport",

@@ -1,8 +1,9 @@
 """Fixtures for the docstring examples (`--doctest-modules`).
 
-The examples name `buildings.parquet` and `overview.parquet`. Each one
-runs in a fresh directory that holds both: a small committed polygon
-fixture, and an overview file built from it once per session.
+The examples name `buildings.parquet`, `overview.parquet` and
+`buildings.pmtiles`. Each one runs in a fresh directory that holds all
+three: a small committed polygon fixture, and an overview file and an
+archive built from it once per session.
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ def _example_files(tmp_path_factory: pytest.TempPathFactory) -> Path:
         str(source / "overview.parquet"),
         max_zoom=10,
     )
+    tylertoo.export_pmtiles(
+        str(source / "overview.parquet"),
+        str(source / "buildings.pmtiles"),
+    )
     return source
 
 
@@ -41,6 +46,6 @@ def _example_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for name in ("buildings.parquet", "overview.parquet"):
+    for name in ("buildings.parquet", "overview.parquet", "buildings.pmtiles"):
         shutil.copy(_example_files / name, tmp_path / name)
     monkeypatch.chdir(tmp_path)

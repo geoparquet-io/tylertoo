@@ -8,7 +8,7 @@
 from pathlib import Path
 from typing import Any, Literal
 
-__all__ = ["convert", "export_pmtiles", "overview", "validate"]
+__all__ = ["convert", "decode", "export_pmtiles", "overview", "validate"]
 
 def convert(
     input: str,
@@ -97,3 +97,11 @@ def export_pmtiles(
     spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
+def decode(
+    input: str,
+    output: str,
+    *,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    layer: str | None = None,
+) -> dict[str, Any]: ...
