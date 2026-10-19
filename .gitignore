@@ -86,3 +86,6 @@ site/
 # Vale packages fetched by `vale sync` (pinned in .vale.ini)
 .vale/styles/Google/
 .vale/styles/Microsoft/
+
+# dhat heap profiles left by `--all-features` test runs
+dhat-heap.json

@@ -409,15 +409,18 @@ GeoParquet 1.1 covering for its geometry column (`find_f64_covering`; the
 overview writer always does), the scan reads those four doubles a row and
 never decodes the WKB. On FTW Brazil (Mato Grosso, 4.58M features, z0–13)
 the scan fell from 8.98 s to 0.77 s and the export from 51.4 s to 42.6 s
-(medians of 3); the geometry read and decode had each cost about 7.5 s. The covering is the `geoparquet` crate's min/max over the encoded
-array's own coordinates, in the file's CRS, unrounded, so for valid data it
+(medians of 3); the geometry read and decode had each cost about 7.5 s.
+The covering is the `geoparquet` crate's min/max over the encoded array's
+own coordinates, in the file's CRS, unrounded, so for valid data it
 is bit-identical to `bounding_rect()` and the archive is unchanged. Two
 cases fall back to decoding the geometry. A file without a usable covering
 (none declared, or f32 children) scans from the geometry from the start. A
 covering row that is not a finite, ordered box (an empty geometry's
 `[+inf, +inf, -inf, -inf]`, a NaN) abandons the covering pass and rescans
 the whole file from the geometry, because the geometry path's answer for
-those rows cannot be read off the covering.
+those rows cannot be read off the covering. Convert skips empty and
+non-finite geometries (`usable_geometry`), so only an overview file from
+another producer takes this path.
 
 **DIVERGENCE FROM THE GEOMETRY PATH: an escaping hole widens the scan.**
 `geo`'s `bounding_rect()` reads only a polygon's exterior ring. The
