@@ -2631,12 +2631,18 @@ impl StreamingPmtilesWriter {
     /// the caller compresses tile bytes off-thread (e.g. inside a Rayon
     /// `par_iter`) and hands the finished bytes here so the serial ordering loop
     /// never runs gzip. To keep deduplication byte-for-byte identical to the
-    /// serial path, `hash` MUST be the [`TileHasher::hash`] of the tile's
-    /// **uncompressed** MVT bytes (never the compressed bytes), and `raw_len` the
-    /// uncompressed length (used only for the dedup byte-savings stat). Because
-    /// compression is deterministic, identical uncompressed bytes give
-    /// identical compressed bytes, so the archive is bit-identical to
-    /// compressing serially.
+    /// serial path, `hash` must be the [`TileHasher::hash`] of the tile's
+    /// **uncompressed** MVT bytes, and `raw_len` the uncompressed length (used
+    /// only for the dedup byte-savings stat). Because compression is
+    /// deterministic, identical uncompressed bytes give identical compressed
+    /// bytes, so the archive is bit-identical to compressing serially.
+    ///
+    /// The one other sound keyspace is the hash of the **compressed** bytes,
+    /// for a caller that copies tiles without ever decompressing them
+    /// ([`crate::merge`], [`crate::pyramid`]). Whichever is used, every tile
+    /// added to one writer must be keyed the same way: two keyspaces in one
+    /// dedup cache never match each other, so identical bodies keyed
+    /// differently are stored twice (#403).
     ///
     /// A `hash` hit is a candidate, not a verdict: the tile aliases a stored
     /// body only when `compressed` equals that body's bytes (#531). A caller

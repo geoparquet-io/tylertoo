@@ -2586,6 +2586,23 @@ fn pyramid_skip_message(skipped: usize, archive_split: bool) -> Option<String> {
     }
 }
 
+/// The line explaining why the per-band tile counts sum past the total, or
+/// `None` when they add up (#403).
+///
+/// A tile id several bands wrote at a shared zoom is one tile in the archive
+/// (its layers concatenated) but appears in each of those bands' counts, so
+/// `report.per_band_tiles` can sum to more than `report.total_tiles`.
+fn pyramid_shared_note(per_band_sum: usize, total: usize) -> Option<String> {
+    (per_band_sum > total).then(|| {
+        format!(
+            "  band counts sum to {} but the archive holds {} tiles: a tile shared by \
+             several layers counts once per band but once in the total",
+            format_number(per_band_sum as u64),
+            format_number(total as u64)
+        )
+    })
+}
+
 /// Whether this build genuinely splits one pre-tiled archive across several
 /// bands — two or more `--band` entries that are PMTiles archives and
 /// resolve to the same file (#527 review, finding 2).
@@ -3071,6 +3088,10 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // line to print.
     let split = report.skipped > 0 && bands_split_one_archive(&bands);
     if let Some(line) = pyramid_skip_message(report.skipped, split) {
+        say!("{line}");
+    }
+    let per_band_sum = report.per_band_tiles.iter().map(|(.., n)| n).sum();
+    if let Some(line) = pyramid_shared_note(per_band_sum, report.total_tiles) {
         say!("{line}");
     }
     say!(
@@ -4938,6 +4959,27 @@ mod tests {
             msg.contains('!'),
             "kept == dropped is not evidence of a split: {msg}"
         );
+    }
+
+    // --- #403: per-band counts can sum past the total -------------------
+
+    /// Disjoint bands (or shared zooms with no tile in common): the per-band
+    /// lines add up to the total and need no explanation.
+    #[test]
+    fn pyramid_shared_note_is_silent_when_the_counts_add_up() {
+        assert_eq!(pyramid_shared_note(0, 0), None);
+        assert_eq!(pyramid_shared_note(12, 12), None);
+    }
+
+    /// A tile id several bands wrote at a shared zoom counts once per band
+    /// but once in the total, so the per-band lines sum past it. Say why,
+    /// next to the numbers, or the summary reads as tiles going missing.
+    #[test]
+    fn pyramid_shared_note_explains_a_sum_above_the_total() {
+        let msg = pyramid_shared_note(1500, 1000).unwrap();
+        assert!(msg.contains("1,500") && msg.contains("1,000"), "{msg}");
+        assert!(msg.contains("once per band"), "{msg}");
+        assert!(!msg.contains('!'), "nothing is wrong: {msg}");
     }
 
     /// The split signal is two `--band` entries naming the same archive,

@@ -138,6 +138,15 @@ missing_panics_doc = "warn"
 # real identifiers.
 doc_markdown = "warn"
 
+# Line tables only, not full debug info, in dev and test builds. Every
+# integration test is its own binary statically linking arrow, parquet, geo
+# and the AWS SDK, and full DWARF made each one ~600 MB; parallel worktrees
+# each carrying a target/ of these filled the disk. Backtraces keep function
+# names and file:line, which is all test failures need. Lost: inspecting
+# locals in gdb/lldb; for that, build with CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 codegen-units = 1
