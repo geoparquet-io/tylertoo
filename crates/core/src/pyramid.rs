@@ -19,7 +19,6 @@
 //!
 //! See issues #345 and #385.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -859,6 +858,25 @@ fn check_shared_zoom_layer_labels(bands: &[Band], archives: &[BandArchive]) -> R
     Ok(())
 }
 
+/// Refuse a tile id that does not ascend past the last one written (#403).
+///
+/// A band's directory is archive-supplied and nothing upstream checks its
+/// order, yet both merge paths feed the writer in directory order and opt it
+/// into #506's clustered check, whose `debug_assert!` a descending add trips.
+/// Strictly ascending also rules out a repeat — a run overlapping the next
+/// entry, say — which is why neither path keeps a per-tile map.
+fn ensure_ascending(last: &mut Option<u64>, id: u64, band: &Band) -> Result<(), Error> {
+    if let Some(prev) = last.filter(|&prev| id <= prev) {
+        return Err(Error::PMTilesWrite(format!(
+            "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
+             must address tiles in ascending id order",
+            band.input.display()
+        )));
+    }
+    *last = Some(id);
+    Ok(())
+}
+
 /// A band's tile bytes, served from a one-slot cache keyed on the byte range.
 ///
 /// A run-length directory entry hands every id of the run the same range, and
@@ -1566,6 +1584,13 @@ pub fn merge_bands_with_options(
     // 300-byte band archive into 164 KiB.
     let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
         .map_err(|e| Error::PMTilesWrite(format!("Failed to create streaming writer: {e}")))?;
+    // The writer appends tile data in add order and stamps the header
+    // `clustered`, which promises offsets monotonic in tile id. Both paths
+    // below add in ascending id order — the shared-zoom path by k-way merge,
+    // the disjoint path by sorting bands coarsest first (#404) — and
+    // [`ensure_ascending`] refuses a band directory that breaks it, so #506's
+    // check can be on.
+    writer.set_expect_clustered(true);
     // No `set_declared_min_zoom`/`set_declared_max_zoom` here: #380's
     // declared band range (a band's coarse zooms may generalize to nothing;
     // `--allow-missing-zooms` lets a band declare deeper zooms than its
@@ -1618,13 +1643,6 @@ pub fn merge_bands_with_options(
                 fields: archive.fields.clone(),
             });
         }
-        // The writer appends tile data in add order and stamps the header
-        // `clustered`, which promises offsets monotonic in tile id. The
-        // k-way merge delivers ascending ids by construction — given
-        // ascending inputs, which `last_id` below enforces, since a band's
-        // directory is archive-supplied — so #506's check can be on.
-        writer.set_expect_clustered(true);
-
         let mut counts = vec![0usize; bands.len()];
         let mut skipped = vec![0usize; bands.len()];
         let mut total = 0usize;
@@ -1644,14 +1662,7 @@ pub fn merge_bands_with_options(
         while let Some((first_band, tile)) = merged.next() {
             let t = tile?;
             let (id, z, x, y) = (t.id, t.z, t.x, t.y);
-            if let Some(prev) = last_id.filter(|&prev| id <= prev) {
-                return Err(Error::PMTilesWrite(format!(
-                    "{}: directory lists tile id {id} after {prev}; a PMTiles directory \
-                     must address tiles in ascending id order",
-                    bands[first_band].input.display()
-                )));
-            }
-            last_id = Some(id);
+            ensure_ascending(&mut last_id, id, &bands[first_band])?;
 
             // Gather every band's copy of `id`. A peeked error is left for
             // the next turn of the outer loop to return.
@@ -1749,9 +1760,12 @@ pub fn merge_bands_with_options(
         );
     }
 
-    // Guards against a later band overwriting an earlier one's tile. Disjoint
-    // zoom ranges make that impossible; this asserts it.
-    let mut seen: BTreeMap<(u8, u32, u32), &str> = BTreeMap::new();
+    // Disjoint zoom ranges mean no band can overwrite another's tile, and a
+    // repeat inside one band's directory fails [`ensure_ascending`]: strictly
+    // ascending ids are the whole collision check, with no per-tile map (the
+    // `(z, x, y)` map this replaced was O(tiles), #403).
+    let mut last_id: Option<u64> = None;
+    let mut total_tiles = 0usize;
 
     // #404: coarsest band first, whatever order the caller listed them in.
     // The writer appends tile data in add order and stamps the header
@@ -1785,12 +1799,7 @@ pub fn merge_bands_with_options(
                 skipped += 1;
                 return Ok(());
             }
-            if let Some(prev) = seen.insert((z, x, y), band.layer.as_str()) {
-                return Err(Error::PMTilesWrite(format!(
-                    "tile {z}/{x}/{y} claimed by both {prev:?} and {:?}",
-                    band.layer
-                )));
-            }
+            ensure_ascending(&mut last_id, crate::pmtiles_writer::tile_id(z, x, y), band)?;
             // Hash the COMPRESSED bytes. Nothing is decompressed here, so the
             // uncompressed hash the writer's own path keys on is unavailable.
             // This is conservative: identical compressed bytes are certainly
@@ -1805,6 +1814,7 @@ pub fn merge_bands_with_options(
         })?;
         log_band_skip(band, skipped, fit);
         skipped_total += skipped;
+        total_tiles += n;
         per_band.push((band.layer.clone(), band.min_zoom, band.max_zoom, n));
         layers.push(LayerMeta {
             id: band.layer.clone(),
@@ -1814,7 +1824,6 @@ pub fn merge_bands_with_options(
         });
     }
 
-    let total_tiles = seen.len();
     finish_merge(
         writer,
         union,
@@ -3910,6 +3919,97 @@ mod tests {
             Band::parse(&format!("3-3:{}:agg", path.display())).unwrap(),
             Band::parse(&format!("3-3:{}:other", other.display())).unwrap(),
         ];
+        let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ascending id order") && err.contains("band.pmtiles"),
+            "expected an out-of-order directory error naming the band, got: {err}"
+        );
+    }
+
+    /// Replace `path`'s directories with a root pointing at `leaves`, in the
+    /// order given. The root's own ids ascend (`root_ids`, one per leaf), as
+    /// its delta encoding requires; what the leaves hold is up to the test.
+    fn rewrite_with_leaves(path: &Path, root_ids: &[u64], leaves: &[Vec<DirEntry>]) {
+        use crate::pmtiles_writer::encode_directory;
+
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut header = Header::from_bytes(&bytes).unwrap();
+        let mut leaf_section = Vec::new();
+        let mut root = Vec::new();
+        for (id, leaf) in root_ids.iter().zip(leaves) {
+            let enc = compression::compress(&encode_directory(leaf), header.internal_compression)
+                .unwrap();
+            root.push(DirEntry {
+                tile_id: *id,
+                offset: leaf_section.len() as u64,
+                length: enc.len() as u32,
+                run_length: 0,
+            });
+            leaf_section.extend_from_slice(&enc);
+        }
+        header.leaf_dirs_offset = bytes.len() as u64;
+        header.leaf_dirs_length = leaf_section.len() as u64;
+        bytes.extend_from_slice(&leaf_section);
+        let root_enc =
+            compression::compress(&encode_directory(&root), header.internal_compression).unwrap();
+        header.root_dir_offset = bytes.len() as u64;
+        header.root_dir_length = root_enc.len() as u64;
+        bytes.extend_from_slice(&root_enc);
+        bytes[..127].copy_from_slice(&header.to_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// The disjoint-zoom path keeps no per-tile map: tile ids must ascend,
+    /// which rules out a repeat as well. A run overlapping the next entry
+    /// (21, 22, 23, then 22 again) is refused, naming the band.
+    #[test]
+    fn disjoint_merge_refuses_a_band_directory_repeating_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let length = ArchiveIndex::open(&path).unwrap().entries()[0].length;
+        let z3_first = crate::pmtiles_writer::tile_id(3, 0, 0);
+        let entry = |tile_id, run_length| DirEntry {
+            tile_id,
+            offset: 0,
+            length,
+            run_length,
+        };
+        rewrite_directories(&path, &[entry(z3_first, 3), entry(z3_first + 1, 1)], &[]);
+
+        let bands = [Band::parse(&format!("3-3:{}:agg", path.display())).unwrap()];
+        let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ascending id order") && err.contains("band.pmtiles"),
+            "expected an out-of-order directory error naming the band, got: {err}"
+        );
+    }
+
+    /// No repeat at all, but the leaves resolve out of order (26, then 21):
+    /// the writer would get descending adds, and #506's clustered check is
+    /// on for this path too, so the merge must refuse the band instead.
+    #[test]
+    fn disjoint_merge_refuses_a_band_whose_leaves_go_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = hostile_band(&dir);
+        let length = ArchiveIndex::open(&path).unwrap().entries()[0].length;
+        let z3_first = crate::pmtiles_writer::tile_id(3, 0, 0);
+        let entry = |tile_id| DirEntry {
+            tile_id,
+            offset: 0,
+            length,
+            run_length: 1,
+        };
+        rewrite_with_leaves(
+            &path,
+            &[z3_first, z3_first + 1],
+            &[vec![entry(z3_first + 5)], vec![entry(z3_first)]],
+        );
+
+        let bands = [Band::parse(&format!("3-3:{}:agg", path.display())).unwrap()];
         let err = merge_bands(&bands, &dir.path().join("out.pmtiles"))
             .unwrap_err()
             .to_string();
