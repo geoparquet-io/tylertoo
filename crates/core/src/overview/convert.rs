@@ -1271,10 +1271,12 @@ pub enum ConvertError {
     #[error("writer error: {0}")]
     Writer(#[from] WriterError),
     /// The input CRS is neither EPSG:4326 nor EPSG:3857 (spec Q3).
-    #[error("unsupported input CRS {crs:?}: overviews require EPSG:4326 or EPSG:3857")]
+    #[error("unsupported CRS {crs:?} in {input}: overviews require EPSG:4326 or EPSG:3857")]
     UnsupportedCrs {
         /// The rejected CRS identifier.
         crs: String,
+        /// Display name of the input (#452).
+        input: String,
     },
     /// All but a sliver (≥99%, `ALL_LOST_PERCENT`) of the input cannot be
     /// tiled (#429): the coordinates fall outside the declared CRS's range,
@@ -3346,8 +3348,10 @@ fn load_input_table_with_limit(
     let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
-    let (crs, crs_assumed_wgs84) =
-        detect_crs_from_kv_assumed(builder.metadata().file_metadata().key_value_metadata())?;
+    let (crs, crs_assumed_wgs84) = detect_crs_from_kv_assumed(
+        builder.metadata().file_metadata().key_value_metadata(),
+        &source_single.display_name(),
+    )?;
     if crs_assumed_wgs84 {
         warn_assumed_wgs84(&source_single.display_name());
     }
@@ -4190,10 +4194,12 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 /// Detect the input CRS from parsed parquet key-value metadata and map it to
 /// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
+/// `input` names the file in the error (#452).
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    input: &str,
 ) -> Result<Crs, ConvertError> {
-    detect_crs_from_kv_assumed(kv).map(|(crs, _)| crs)
+    detect_crs_from_kv_assumed(kv, input).map(|(crs, _)| crs)
 }
 
 /// [`detect_crs_from_kv`], also reporting whether the WGS84 answer was the
@@ -4202,6 +4208,7 @@ pub(crate) fn detect_crs_from_kv(
 /// warn naming the input and record the assumption on the [`ConvertReport`].
 pub(crate) fn detect_crs_from_kv_assumed(
     kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    input: &str,
 ) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
 
@@ -4223,6 +4230,7 @@ pub(crate) fn detect_crs_from_kv_assumed(
                 .identifier
                 .or(info.name)
                 .unwrap_or_else(|| "unknown".to_string()),
+            input: input.to_string(),
         }),
     }
 }
@@ -4266,7 +4274,7 @@ pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
         "geo".to_string(),
         geo_json.to_string(),
     )];
-    detect_crs_from_kv(Some(&kv))
+    detect_crs_from_kv(Some(&kv), "fuzz input")
 }
 
 /// Half the Web Mercator world extent in meters (`±` = the x/y range of
@@ -4452,7 +4460,8 @@ pub(crate) fn input_row_group_bounds(
     metadata: &parquet::file::metadata::ParquetMetaData,
 ) -> Vec<Option<crate::covering::RowGroupBounds>> {
     let geom_column = crate::covering::resolve_geometry_column_name(metadata);
-    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata()) {
+    // The error is discarded (it falls back below), so its name is moot.
+    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata(), "") {
         Ok(crs) => {
             crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
         }
@@ -11483,12 +11492,26 @@ mod tests {
         );
         write_input(tin.path(), &geoms, false, Some(md));
 
-        let opts = ConvertOptions::default();
-        let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
-        assert!(
-            matches!(err, ConvertError::UnsupportedCrs { .. }),
-            "expected UnsupportedCrs, got {err:?}"
-        );
+        // #452: both pipelines, and auto-zoom's own read, name the file.
+        let streaming = ConvertOptions::default();
+        let in_memory = ConvertOptions {
+            streaming: false,
+            ..Default::default()
+        };
+        for opts in [streaming, in_memory] {
+            let err = convert_to_overviews(tin.path(), tout.path(), &opts).unwrap_err();
+            assert!(
+                matches!(err, ConvertError::UnsupportedCrs { .. }),
+                "expected UnsupportedCrs, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
+        }
+        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        let msg = super::super::auto_zoom::estimate_with(&source, 0, 16, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
     }
 
     /// Build the "geo" key-value metadata for a single WKB geometry column
@@ -11520,13 +11543,16 @@ mod tests {
             "id": { "authority": "EPSG", "code": 3857 }
         });
         let kv = kv_geo_with_crs(projjson);
-        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg3857);
+        assert_eq!(
+            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            Crs::Epsg3857
+        );
 
         // String forms resolve the same way.
         for id in ["EPSG:3857", "EPSG:900913"] {
             let kv = kv_geo_with_crs(serde_json::Value::String(id.to_string()));
             assert_eq!(
-                detect_crs_from_kv(Some(&kv)).unwrap(),
+                detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
                 Crs::Epsg3857,
                 "{id}"
             );
@@ -11537,7 +11563,10 @@ mod tests {
             "name": "WGS 84",
             "id": { "authority": "EPSG", "code": 4326 }
         }));
-        assert_eq!(detect_crs_from_kv(Some(&kv)).unwrap(), Crs::Epsg4326);
+        assert_eq!(
+            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            Crs::Epsg4326
+        );
 
         // A UTM zone — whose name also starts "WGS 84 /" — is rejected, not
         // silently read as degrees.
@@ -11547,7 +11576,7 @@ mod tests {
             "id": { "authority": "EPSG", "code": 32633 }
         }));
         assert!(matches!(
-            detect_crs_from_kv(Some(&kv)),
+            detect_crs_from_kv(Some(&kv), "t.parquet"),
             Err(ConvertError::UnsupportedCrs { .. })
         ));
     }
@@ -11586,7 +11615,10 @@ mod tests {
             .file_metadata()
             .key_value_metadata()
             .cloned();
-        assert_eq!(detect_crs_from_kv(kv.as_ref()).unwrap(), Crs::Epsg3857);
+        assert_eq!(
+            detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
+            Crs::Epsg3857
+        );
 
         let tout = tempfile::NamedTempFile::new().unwrap();
         let opts = ConvertOptions {

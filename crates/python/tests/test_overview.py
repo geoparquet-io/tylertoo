@@ -345,6 +345,20 @@ class TestOverviewIntegration:
             # same value the core characterization test asserts.
             assert report["levels"][-1]["zoom"] == 14
 
+    def test_overview_max_zoom_auto_checks_the_output_before_reading(self):
+        """#452: "auto" reads the input to estimate, so an output in a
+        missing directory is refused first, naming the directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "no-such-dir"
+            with pytest.raises(RuntimeError, match="does not exist") as exc:
+                tylertoo.overview(
+                    str(Path(tmpdir) / "missing-input.parquet"),
+                    str(missing / "out.parquet"),
+                    max_zoom="auto",
+                )
+            assert str(missing) in str(exc.value)
+            assert "missing-input" not in str(exc.value)
+
     def test_overview_max_zoom_auto_min_zoom_above_ceiling_raises(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,

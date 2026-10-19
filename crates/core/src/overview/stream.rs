@@ -2059,7 +2059,8 @@ fn convert_preflight_with_memory_limit(
 
     // CRS detection + rejection (spec Q3) — footer metadata only.
     let kv = source.key_value_metadata()?;
-    let (crs, crs_assumed_wgs84) = super::convert::detect_crs_from_kv_assumed(kv.as_ref())?;
+    let (crs, crs_assumed_wgs84) =
+        super::convert::detect_crs_from_kv_assumed(kv.as_ref(), &source.display_name())?;
     if crs_assumed_wgs84 {
         super::convert::warn_assumed_wgs84(&source.display_name());
     }

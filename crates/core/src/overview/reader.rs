@@ -163,6 +163,11 @@ impl OverviewReader {
         })
     }
 
+    /// The file this reader opened, as given.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The parsed `geo:overviews` footer metadata.
     pub fn meta(&self) -> &OverviewsMeta {
         &self.meta

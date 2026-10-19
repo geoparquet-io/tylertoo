@@ -1366,9 +1366,11 @@ impl MultiSource {
         // itself is enforced by the pipeline (against part 0), so a set
         // that consistently carries one unsupported CRS still errors with
         // the standard UnsupportedCrs message.
+        // Only Ok/Err is used here, so the error's input name is moot.
         let crs_of = |m: &PartMeta| {
             crate::overview::convert::detect_crs_from_kv(
                 m.parquet.file_metadata().key_value_metadata(),
+                "",
             )
             .ok()
         };

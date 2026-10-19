@@ -1617,7 +1617,8 @@ fn resolve_max_zoom(
         return Ok(max_zoom.plan_zoom());
     }
     let source = resolve_convert_source(spec)?;
-    Ok(max_zoom.resolve(&source, options)?)
+    // `None`: `check_output_path` has already checked the output.
+    Ok(max_zoom.resolve(&source, options, None)?)
 }
 
 /// Resolve the level plan shared by `overview` and `tiles`: an explicit
