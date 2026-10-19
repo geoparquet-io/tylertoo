@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use tylertoo_core::archive_index::ArchiveIndex;
-use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES};
+use tylertoo_core::compression::{compress, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::pmtiles_writer::{
     encode_directory, tile_id, DirEntry, Header, MAX_LEAF_DIRECTORIES,
@@ -726,4 +726,198 @@ fn a_missing_input_names_its_path() {
         cause = c.source();
     }
     assert!(chain.contains("absent.pmtiles"), "{chain}");
+}
+
+/// #462: decode used to `std::fs::read` the whole archive before parsing the
+/// header, so its input buffer was O(archive) however small the tiles it
+/// decoded — a planet-scale PMTiles could not be decoded on an ordinary box.
+/// It now reads the header and directories eagerly and each tile body by
+/// offset, like `ArchiveIndex` (#498).
+///
+/// A 1 TiB sparse tail behind a valid archive is bytes no PMTiles section
+/// points at. Decode must not touch them: the old whole-file read could not
+/// even allocate the buffer. Unix only, because NTFS `set_len` reserves real
+/// clusters rather than leaving a hole.
+#[cfg(unix)]
+#[test]
+fn decode_reads_tiles_by_offset_not_the_whole_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // `small_archive`'s tiles vary the command byte, not a coordinate, so
+    // most of them are not decodable MVT; this test needs ones that are.
+    let plain = dir.path().join("plain.pmtiles");
+    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+    writer.set_layer_name("t");
+    for i in 0..8u32 {
+        let mut tile = POINT_TILE.to_vec();
+        tile[12] = 0x02 + 2 * (i as u8); // MoveTo x = 1 + i
+        writer.add_tile(5, i, 7, &tile).unwrap();
+    }
+    writer.finalize(&plain).unwrap();
+    let bytes = std::fs::read(&plain).unwrap();
+    let want = decode_pmtiles(
+        &plain,
+        dir.path().join("plain.parquet"),
+        &DecodeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(want.features_written, 8);
+
+    let tailed = with_sparse_tail(&dir, "tailed.pmtiles", &bytes, 1 << 40);
+    let got = decode_pmtiles(
+        &tailed,
+        dir.path().join("tailed.parquet"),
+        &DecodeOptions::default(),
+    )
+    .expect("a tail no section addresses must not be read");
+    assert_eq!(got.tiles_read, want.tiles_read);
+    assert_eq!(got.features_written, want.features_written);
+    assert_eq!(got.layers, want.layers);
+}
+
+/// `small_archive` with its root directory replaced by one entry pointing
+/// at a `body_len`-byte tile body, which a sparse tail supplies. Decodes it
+/// and returns the error.
+fn decode_with_tile_body_of(dir: &tempfile::TempDir, name: &str, body_len: u64) -> DecodeError {
+    let (_, bytes) = small_archive(dir);
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+
+    // Root directory first, then the (sparse) tile data runs to end of file.
+    let mut out = bytes.clone();
+    let root = [DirEntry {
+        tile_id: 0,
+        offset: 0,
+        length: u32::try_from(body_len).unwrap(),
+        run_length: 1,
+    }];
+    let enc = compress(&encode_directory(&root), header.internal_compression).unwrap();
+    header.root_dir_offset = out.len() as u64;
+    header.root_dir_length = enc.len() as u64;
+    out.extend_from_slice(&enc);
+    header.tile_data_offset = out.len() as u64;
+    header.tile_data_length = body_len;
+    out[..127].copy_from_slice(&header.to_bytes());
+    let path = with_sparse_tail(dir, &format!("{name}.pmtiles"), &out, body_len);
+
+    decode_pmtiles(
+        &path,
+        dir.path().join(format!("{name}.parquet")),
+        &DecodeOptions::default(),
+    )
+    .expect_err("a tile body of zeros is not a tile")
+}
+
+/// #462, with #510's rule for file-backed reads: a tile body's declared
+/// length is archive-supplied, so it is checked against the tile ceiling
+/// *before* the read allocates it. A compressed body larger than
+/// `MAX_TILE_BYTES` cannot decompress to a tile under that ceiling.
+#[test]
+fn oversized_tile_body_is_refused_before_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = decode_with_tile_body_of(&dir, "huge-tile", MAX_TILE_BYTES + 1);
+    let msg = chain(&err);
+    assert!(
+        matches!(&err, DecodeError::TileDecompress { .. })
+            && msg.contains("compressed body")
+            && msg.contains(&MAX_TILE_BYTES.to_string()),
+        "expected a capped tile read naming the ceiling, got: {msg}"
+    );
+}
+
+/// The ceiling is inclusive: a body of exactly `MAX_TILE_BYTES` is read and
+/// handed to the codec, which is what rejects these zeros.
+#[test]
+fn tile_body_at_the_ceiling_is_read_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = decode_with_tile_body_of(&dir, "ceiling-tile", MAX_TILE_BYTES);
+    let msg = chain(&err);
+    assert!(
+        matches!(&err, DecodeError::TileDecompress { .. }) && !msg.contains("compressed body"),
+        "expected the codec, not the length cap, to reject the body, got: {msg}"
+    );
+}
+
+/// `small_archive` with its root directory repointed at `root_len` bytes of
+/// sparse tail. Decodes it and returns the error.
+fn decode_with_root_of(dir: &tempfile::TempDir, name: &str, root_len: u64) -> DecodeError {
+    let (_, bytes) = small_archive(dir);
+    let mut header = Header::from_bytes(&bytes[..127]).unwrap();
+    header.root_dir_offset = bytes.len() as u64;
+    header.root_dir_length = root_len;
+    let mut out = bytes.clone();
+    out[..127].copy_from_slice(&header.to_bytes());
+    let path = with_sparse_tail(dir, &format!("{name}.pmtiles"), &out, root_len);
+
+    decode_pmtiles(
+        &path,
+        dir.path().join(format!("{name}.parquet")),
+        &DecodeOptions::default(),
+    )
+    .expect_err("a root directory of zeros is not a directory")
+}
+
+/// #462: the decode twin of `archive_index_directory_read_is_capped`. Once the
+/// root directory is read by offset rather than sliced from a resident file,
+/// its declared length is checked before the allocation.
+#[test]
+fn oversized_directory_is_refused_before_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = decode_with_root_of(&dir, "huge-root-decode", 256 * 1024 * 1024);
+    assert!(
+        matches!(&err, DecodeError::InvalidArchive(m)
+            if m.contains("root directory") && m.contains("claims")
+                && m.contains(&MAX_INTERNAL_BYTES.to_string())),
+        "expected a capped-read error naming the section and ceiling, got: {err}"
+    );
+}
+
+/// The ceiling is inclusive: a root directory of exactly
+/// `MAX_INTERNAL_BYTES` is read and handed to the codec, which is what
+/// rejects these zeros.
+#[test]
+fn directory_at_the_ceiling_is_read_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = decode_with_root_of(&dir, "ceiling-root", MAX_INTERNAL_BYTES);
+    assert!(
+        matches!(
+            &err,
+            DecodeError::Decompress {
+                what: "root directory",
+                ..
+            }
+        ),
+        "expected the codec, not the length cap, to reject the directory, got: {err}"
+    );
+}
+
+/// `collect_entries` checks a run's *last* tile id rather than expanding it
+/// (#462). A run ending on the last id of the zoom-31 address space is real
+/// and must pass; one tile further is not.
+#[test]
+fn run_ending_on_the_last_tile_id_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bytes) = small_archive(&dir);
+    let last = (0..=31u32).map(|z| 1u64 << (2 * z)).sum::<u64>() - 1;
+    let run = |tile_id: u64| {
+        [DirEntry {
+            tile_id,
+            offset: 0,
+            length: 0,
+            run_length: 2,
+        }]
+    };
+    // z31 lies outside the zoom filter, so the run is validated, not decoded.
+    let options = DecodeOptions {
+        max_zoom: Some(5),
+        ..DecodeOptions::default()
+    };
+    let decode = |name: &str, tile_id: u64| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, with_directories(&bytes, &run(tile_id), None)).unwrap();
+        decode_pmtiles(&path, dir.path().join(format!("{name}.parquet")), &options)
+    };
+
+    let report = decode("last-id.pmtiles", last - 1).expect("a run ending on the last id is valid");
+    assert_eq!(report.tiles_read, 0);
+    let err = decode("past-last-id.pmtiles", last).expect_err("one past the last id is not");
+    assert!(err.to_string().contains("zoom 31"), "{err}");
 }

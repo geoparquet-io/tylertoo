@@ -100,3 +100,11 @@ minimum_test_timeout = 120.0
 # "missed" report for them is noise.
 skip_calls_defaults = true
 skip_calls = ["debug!", "trace!", "info!", "warn!", "error!"]
+
+# The `fuzz_*` hooks exist only under the `fuzzing` feature, and mutation
+# runs build default features (see `scripts/mutants-test-binaries.sh`), so
+# a mutant inside one is never compiled and can only show as missed. Their
+# guard is `crates/core/tests/fuzz_seeds.rs`, which CI runs with
+# `--all-features`: every seed replays through its hook, and the decode
+# hooks' counts are held to `decode_pmtiles`' on the same input.
+exclude_re = ["\\bfuzz_\\w+"]

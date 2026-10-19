@@ -13,6 +13,14 @@
 //!   and properties are whatever survived tiling. There is no round-trip
 //!   guarantee. Extract the maximum zoom for the best available detail.
 //!
+//! # Memory
+//!
+//! The archive is never loaded whole (#462). The header and directories are
+//! read up front; tile bodies are read by offset, through a small read-ahead
+//! window, once per pass (the schema pass, then the row pass). Run-length
+//! entries are expanded lazily. Peak memory is O(directory entries + one tile
+//! + one output batch), however large the archive is.
+//!
 //! # Coordinate transform
 //!
 //! Tile-local integer coordinates are lifted to WGS84 through tippecanoe's
@@ -79,11 +87,13 @@ use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::archive_index::FileBytes;
 use crate::compression::{decompress_capped, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
 use crate::overview::writer::geo_metadata_json_deterministic;
 use crate::pmtiles_writer::{
-    decode_directory, max_expanded_entries, tile_id_to_zxy, Header, TileType, MAX_LEAF_DIRECTORIES,
+    decode_directory, max_expanded_entries, tile_id_to_zxy, ArchiveBytes, DirEntry, Header,
+    TileType, HEADER_BYTES, MAX_LEAF_DIRECTORIES,
 };
 use crate::vector_tile::tile::GeomType;
 use crate::vector_tile::Tile;
@@ -247,27 +257,36 @@ pub fn decode_pmtiles(
     // #452: the output is created only after Pass A has decoded every tile.
     crate::atomic_output::check_writable(output_path.as_ref())?;
     let input_path = input_path.as_ref();
+    // #462: the header and directories are read up front, and each tile
+    // body is read by offset when a pass reaches it (the reader
+    // `archive_index` built for the pyramid merge, #498). The input then
+    // costs O(directory + one tile), not O(archive).
     // Name the input: the CLI checks it first, a library caller does not.
-    let bytes = std::fs::read(input_path).map_err(|e| {
+    let src = FileBytes::open(input_path).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("cannot read {}: {e}", input_path.display()),
         )
     })?;
-    let header = Header::from_bytes(&bytes)?;
+    let head_len = usize::try_from(src.total_len()).map_or(HEADER_BYTES, |l| l.min(HEADER_BYTES));
+    let header = Header::from_bytes(&src.read_range(0, head_len)?)?;
     if header.tile_type != TileType::Mvt {
         return Err(DecodeError::NotVectorTiles(header.tile_type));
     }
 
-    let tiles = collect_tile_refs(&bytes, &header, options)?;
+    let entries = collect_entries(&src, &header)?;
 
     // ---- Pass A: property schema union + layer inventory. -----------------
     // Tiles are decoded twice (schema first, rows second) so peak memory
     // stays O(one tile + one batch) instead of O(all features).
     let mut col_types: BTreeMap<String, ColType> = BTreeMap::new();
     let mut layers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for tile in &tiles {
-        for (layer_name, feature) in decode_tile_features(&bytes, &header, tile, options)? {
+    let mut tiles_read = 0u64;
+    let mut reader = TileReader::new(&src);
+    for tile in tile_refs(&entries, &header, options) {
+        let tile = tile?;
+        tiles_read += 1;
+        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
             layers.insert(layer_name);
             for (key, value) in &feature.props {
                 if RESERVED_COLUMNS.contains(&key.as_str()) {
@@ -312,7 +331,7 @@ pub fn decode_pmtiles(
 
     // ---- Pass B: decode again, batch rows, stream to the writer. ----------
     let mut report = DecodeReport {
-        tiles_read: tiles.len() as u64,
+        tiles_read,
         features_written: 0,
         features_skipped: 0,
         layers: layers.into_iter().collect(),
@@ -320,8 +339,10 @@ pub fn decode_pmtiles(
         elapsed_secs: 0.0,
     };
     let mut batch = RowBatch::new(&col_types);
-    for tile in &tiles {
-        for (layer_name, feature) in decode_tile_features(&bytes, &header, tile, options)? {
+    let mut reader = TileReader::new(&src);
+    for tile in tile_refs(&entries, &header, options) {
+        let tile = tile?;
+        for (layer_name, feature) in decode_tile_features(&mut reader, &header, &tile, options)? {
             match feature.geometry {
                 Some(geometry) => {
                     batch.push(
@@ -391,33 +412,58 @@ struct TileRef {
     len: usize,
 }
 
-/// Walk the root (and any leaf) directories, expand run-length entries, and
-/// apply the zoom filter. Entries arrive in ascending tile-id order (the
-/// writer emits clustered archives), which the output preserves.
-fn collect_tile_refs(
-    bytes: &[u8],
+/// `length` bytes at `offset` as an in-file `(start, len)`, or an error
+/// naming `what`. Both numbers come from the archive.
+fn file_range(
+    offset: u64,
+    length: u64,
+    file_len: u64,
+    what: &str,
+) -> Result<(usize, usize), DecodeError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| DecodeError::InvalidArchive(format!("{what} offset overflow")))?;
+    let len = usize::try_from(length)
+        .map_err(|_| DecodeError::InvalidArchive(format!("{what} length overflow")))?;
+    start
+        .checked_add(len)
+        .filter(|&end| u64::try_from(end).is_ok_and(|end| end <= file_len))
+        .ok_or_else(|| DecodeError::InvalidArchive(format!("{what} extends past end of file")))?;
+    Ok((start, len))
+}
+
+/// Walk the root (and any leaf) directories into one list of entries in
+/// ascending tile-id order (the writer emits clustered archives), run
+/// lengths left unexpanded, and validate every entry so [`tile_refs`] can
+/// expand them blind: its range lies inside the tile-data section and the
+/// file, its run fits the archive's expansion budget, and its last tile id
+/// is a real one.
+///
+/// O(directory entries), not O(tiles) (#462): a run of identical ocean
+/// tiles is one entry here however many tiles it covers.
+fn collect_entries<S: ArchiveBytes + ?Sized>(
+    src: &S,
     header: &Header,
-    options: &DecodeOptions,
-) -> Result<Vec<TileRef>, DecodeError> {
-    let section = |offset: u64, length: u64, what: &str| -> Result<&[u8], DecodeError> {
-        let start = usize::try_from(offset)
-            .map_err(|_| DecodeError::InvalidArchive(format!("{what} offset overflow")))?;
-        let end = start
-            .checked_add(
-                usize::try_from(length)
-                    .map_err(|_| DecodeError::InvalidArchive(format!("{what} length overflow")))?,
-            )
-            .filter(|&e| e <= bytes.len())
-            .ok_or_else(|| {
-                DecodeError::InvalidArchive(format!("{what} extends past end of file"))
-            })?;
-        Ok(&bytes[start..end])
-    };
+) -> Result<Vec<DirEntry>, DecodeError> {
+    // A directory's length is archive-supplied, and a positioned read
+    // allocates whatever it claims, so it is capped before the read with
+    // `read_all_entries_from`'s wording (#510). A compressed body larger
+    // than the ceiling it decompresses under cannot be a directory.
+    let section =
+        |offset: u64, length: u64, what: &str| -> Result<std::borrow::Cow<'_, [u8]>, DecodeError> {
+            if length > MAX_INTERNAL_BYTES {
+                return Err(DecodeError::InvalidArchive(format!(
+                    "{what} claims {length} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+                 ceiling on an archive's internal sections"
+                )));
+            }
+            let (start, len) = file_range(offset, length, src.total_len(), what)?;
+            Ok(src.read_range(start, len)?)
+        };
 
     let decode_dir =
         |offset: u64, length: u64, what: &'static str| -> Result<Vec<_>, DecodeError> {
             let raw = section(offset, length, what)?;
-            let plain = decompress_capped(raw, header.internal_compression, MAX_INTERNAL_BYTES)
+            let plain = decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
                 .map_err(|source| DecodeError::Decompress {
                     what,
                     offset,
@@ -524,9 +570,10 @@ fn collect_tile_refs(
     // Run lengths are archive-controlled u32s: one entry claiming 0xFFFFFFFF
     // is 137 GB of TileRefs. The budget is what the archive could legitimately
     // address (see `max_expanded_entries`), spent across every entry so a
-    // thousand plausible-looking runs cannot add up to the same attack.
+    // thousand plausible-looking runs cannot add up to the same attack. The
+    // runs are expanded lazily by `tile_refs`, but the budget still bounds
+    // how long a pass walks.
     let mut budget = entry_limit;
-    let mut tiles = Vec::new();
     for entry in &entries {
         within(
             entry.offset,
@@ -542,32 +589,121 @@ fn collect_tile_refs(
                 entry.tile_id,
             ))
         })?;
-        for i in 0..run {
-            let tile_id = entry.tile_id.checked_add(i).ok_or_else(|| {
-                DecodeError::InvalidArchive(format!(
-                    "run of {run} tiles from tile id {} overflows the tile-id space",
-                    entry.tile_id
-                ))
-            })?;
-            let (z, x, y) = tile_id_to_zxy(tile_id)?;
-            if options.min_zoom.is_some_and(|mz| z < mz)
-                || options.max_zoom.is_some_and(|mz| z > mz)
-            {
-                continue;
-            }
-            let start = absolute(header.tile_data_offset, entry.offset, "tile data")?;
-            // Validate the range now so pass B can slice without checks.
-            section(start, u64::from(entry.length), "tile data")?;
-            tiles.push(TileRef {
-                z,
-                x,
-                y,
-                start: start as usize,
-                len: entry.length as usize,
-            });
+        // Ids are monotone, so a valid last id vouches for the whole run.
+        let last = entry.tile_id.checked_add(run - 1).ok_or_else(|| {
+            DecodeError::InvalidArchive(format!(
+                "run of {run} tiles from tile id {} overflows the tile-id space",
+                entry.tile_id
+            ))
+        })?;
+        tile_id_to_zxy(last)?;
+        let start = absolute(header.tile_data_offset, entry.offset, "tile data")?;
+        file_range(start, u64::from(entry.length), src.total_len(), "tile data")?;
+    }
+    Ok(entries)
+}
+
+/// Every tile `entries` address, run lengths expanded and the zoom filter
+/// applied, in ascending tile-id order. Lazy, so a pass holds one
+/// [`TileRef`] at a time rather than all of them (#462).
+///
+/// `entries` come from [`collect_entries`], which validated every range and
+/// id; the conversions here stay checked so a broken invariant is an error,
+/// not a panic or a wrapped offset.
+fn tile_refs<'a>(
+    entries: &'a [DirEntry],
+    header: &'a Header,
+    options: &'a DecodeOptions,
+) -> impl Iterator<Item = Result<TileRef, DecodeError>> + 'a {
+    entries.iter().flat_map(move |entry| {
+        (0..u64::from(entry.run_length.max(1)))
+            .filter_map(move |i| tile_ref(entry, i, header, options).transpose())
+    })
+}
+
+/// The `i`th tile of `entry`'s run, or `None` when the zoom filter drops it.
+fn tile_ref(
+    entry: &DirEntry,
+    i: u64,
+    header: &Header,
+    options: &DecodeOptions,
+) -> Result<Option<TileRef>, DecodeError> {
+    let tile_id = entry
+        .tile_id
+        .checked_add(i)
+        .ok_or_else(|| DecodeError::InvalidArchive("tile id overflow".to_string()))?;
+    let (z, x, y) = tile_id_to_zxy(tile_id)?;
+    if options.min_zoom.is_some_and(|mz| z < mz) || options.max_zoom.is_some_and(|mz| z > mz) {
+        return Ok(None);
+    }
+    let start = header
+        .tile_data_offset
+        .checked_add(entry.offset)
+        .and_then(|s| usize::try_from(s).ok())
+        .ok_or_else(|| DecodeError::InvalidArchive("tile data offset overflow".to_string()))?;
+    Ok(Some(TileRef {
+        z,
+        x,
+        y,
+        start,
+        len: entry.length as usize,
+    }))
+}
+
+/// How much tile data [`TileReader`] reads at a time.
+const TILE_READ_WINDOW: usize = 1 << 20;
+
+/// Read-ahead for tile bodies (#462).
+///
+/// A clustered archive stores tile bodies in the order a pass visits them,
+/// so reading a window at a time costs one positioned read per
+/// [`TILE_READ_WINDOW`] instead of one per tile, and a run of tiles sharing
+/// one body is served from the window too. With one read per tile, a full
+/// decode of a 100 MB, 147k-tile archive ran ~3% slower than reading the
+/// whole file. A body behind the window (a deduplicated tile's
+/// back-reference) or larger than it is read on its own. Memory stays
+/// O(window + one tile).
+struct TileReader<'a, S: ?Sized> {
+    src: &'a S,
+    window: Vec<u8>,
+    /// File offset of `window[0]`.
+    at: usize,
+}
+
+impl<'a, S: ArchiveBytes + ?Sized> TileReader<'a, S> {
+    fn new(src: &'a S) -> Self {
+        TileReader {
+            src,
+            window: Vec::new(),
+            at: 0,
         }
     }
-    Ok(tiles)
+
+    /// `len` bytes at `start`. The caller has checked that the range lies
+    /// inside the file ([`collect_entries`]).
+    fn read(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>, DecodeError> {
+        let end = start + len;
+        if start < self.at || end > self.at + self.window.len() {
+            // Behind the window is a deduplicated tile pointing back at an
+            // earlier body; refilling for it would drag the window backwards
+            // and cost a full window per back-reference.
+            if start < self.at || len > TILE_READ_WINDOW {
+                return Ok(self.src.read_range(start, len)?);
+            }
+            let file_len = usize::try_from(self.src.total_len()).unwrap_or(usize::MAX);
+            // `end <= file_len`, so the window always covers the tile.
+            let window = TILE_READ_WINDOW.min(file_len - start);
+            self.window = self.src.read_range(start, window)?.into_owned();
+            self.at = start;
+        }
+        Ok(std::borrow::Cow::Borrowed(
+            &self.window[start - self.at..end - self.at],
+        ))
+    }
 }
 
 // ============================================================================
@@ -584,24 +720,35 @@ struct DecodedFeature {
 
 /// Decompress and decode one tile into `(layer_name, feature)` pairs,
 /// applying the layer filter and the coordinate transform.
-fn decode_tile_features(
-    bytes: &[u8],
+fn decode_tile_features<S: ArchiveBytes + ?Sized>(
+    reader: &mut TileReader<'_, S>,
     header: &Header,
     tile: &TileRef,
     options: &DecodeOptions,
 ) -> Result<Vec<(String, DecodedFeature)>, DecodeError> {
-    let raw = &bytes[tile.start..tile.start + tile.len];
-    let plain =
-        decompress_capped(raw, header.tile_compression, MAX_TILE_BYTES).map_err(|source| {
-            DecodeError::TileDecompress {
-                z: tile.z,
-                x: tile.x,
-                y: tile.y,
-                offset: tile.start as u64,
-                length: tile.len as u64,
-                source,
-            }
-        })?;
+    let fail = |source| DecodeError::TileDecompress {
+        z: tile.z,
+        x: tile.x,
+        y: tile.y,
+        offset: tile.start as u64,
+        length: tile.len as u64,
+        source,
+    };
+    // The body is read by offset (#462), which allocates whatever length the
+    // directory claims, so the length is capped before the read (#510). A
+    // compressed body larger than the ceiling it decompresses under cannot
+    // be a legitimate tile.
+    if tile.len as u64 > MAX_TILE_BYTES {
+        return Err(fail(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "compressed body of {} bytes exceeds the {MAX_TILE_BYTES}-byte tile ceiling",
+                tile.len
+            ),
+        )));
+    }
+    let raw = reader.read(tile.start, tile.len)?;
+    let plain = decompress_capped(&raw, header.tile_compression, MAX_TILE_BYTES).map_err(fail)?;
     let decoded = Tile::decode(plain.as_slice()).map_err(|source| DecodeError::Mvt {
         z: tile.z,
         x: tile.x,
@@ -717,7 +864,12 @@ pub fn fuzz_decode_tile(
         start: 0,
         len: plain.len(),
     };
-    let decoded = decode_tile_features(plain, &header, &tile, &DecodeOptions::default())?;
+    let decoded = decode_tile_features(
+        &mut TileReader::new(&plain),
+        &header,
+        &tile,
+        &DecodeOptions::default(),
+    )?;
     let with_geometry = decoded.iter().filter(|(_, f)| f.geometry.is_some()).count();
     Ok((decoded.len(), with_geometry))
 }
@@ -727,7 +879,7 @@ pub fn fuzz_decode_tile(
 ///
 /// Runs everything `decode` does to an archive it reads: the header, the
 /// tile-type check, the directory walk with its leaf/entry/run-length budgets
-/// ([`collect_tile_refs`]), and for every addressed tile the capped
+/// ([`collect_entries`]), and for every addressed tile the capped
 /// decompression and MVT decode, the reserved-column check and the property
 /// type union. [`fuzz_decode_tile`] reaches only the last step. Returns
 /// `(tiles, features)`. Only the `fuzz/` crate calls this; the `fuzzing`
@@ -740,11 +892,15 @@ pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> 
     if header.tile_type != TileType::Mvt {
         return Err(DecodeError::NotVectorTiles(header.tile_type));
     }
-    let tiles = collect_tile_refs(bytes, &header, &options)?;
+    let entries = collect_entries(&bytes, &header)?;
     let mut col_types: BTreeMap<String, ColType> = BTreeMap::new();
     let mut features = 0;
-    for tile in &tiles {
-        for (_layer, feature) in decode_tile_features(bytes, &header, tile, &options)? {
+    let mut tiles = 0;
+    let mut reader = TileReader::new(&bytes);
+    for tile in tile_refs(&entries, &header, &options) {
+        let tile = tile?;
+        tiles += 1;
+        for (_layer, feature) in decode_tile_features(&mut reader, &header, &tile, &options)? {
             features += 1;
             for (key, value) in &feature.props {
                 if RESERVED_COLUMNS.contains(&key.as_str()) {
@@ -758,7 +914,7 @@ pub fn fuzz_decode_archive(bytes: &[u8]) -> Result<(usize, usize), DecodeError> 
             }
         }
     }
-    Ok((tiles.len(), features))
+    Ok((tiles, features))
 }
 
 // ============================================================================
@@ -1628,6 +1784,97 @@ mod tests {
 
         // No field set: invalid, skipped.
         assert_eq!(PropValue::from_mvt(&mvt_value()), None);
+    }
+
+    /// #462: whatever order and size the reads come in (forward, backward,
+    /// straddling a window edge, larger than the window, ending exactly at
+    /// end of file), `TileReader` hands back the same bytes as slicing the
+    /// whole archive did.
+    #[test]
+    fn tile_reader_matches_direct_slices() {
+        let file: Vec<u8> = (0..3 * TILE_READ_WINDOW + 17)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let src: &[u8] = &file;
+        let mut reader = TileReader::new(&src);
+        let w = TILE_READ_WINDOW;
+        let reads = [
+            (0, 10),
+            (10, 100),
+            (10, 100),      // a run sharing one body
+            (w - 5, 10),    // straddles the first window's edge
+            (3, 7),         // backwards, out of the current window
+            (w + 1, 2 * w), // larger than a window
+            (file.len() - 1, 1),
+            (file.len() - w, w), // a full window ending at end of file
+            (5, 0),
+        ];
+        for (start, len) in reads {
+            let got = reader.read(start, len).unwrap();
+            assert_eq!(&got[..], &file[start..start + len], "read({start}, {len})");
+        }
+    }
+
+    /// An in-memory source that counts the positioned reads made of it.
+    struct CountingBytes<'a> {
+        bytes: &'a [u8],
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl ArchiveBytes for CountingBytes<'_> {
+        fn total_len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_range(
+            &self,
+            offset: usize,
+            len: usize,
+        ) -> crate::Result<std::borrow::Cow<'_, [u8]>> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(std::borrow::Cow::Borrowed(
+                &self.bytes[offset..offset + len],
+            ))
+        }
+    }
+
+    /// The window is what makes ranged decode as fast as the whole-file read
+    /// (#462), so which reads it serves is pinned, not just their bytes:
+    /// every read inside the window, edges included, costs no source read; a
+    /// back-reference or an over-window body is read on its own and leaves
+    /// the window where it was.
+    #[test]
+    fn tile_reader_serves_the_window_without_rereading() {
+        let w = TILE_READ_WINDOW;
+        let file: Vec<u8> = (0..3 * w + 17).map(|i| (i * 31 % 251) as u8).collect();
+        let src = CountingBytes {
+            bytes: &file,
+            reads: std::cell::Cell::new(0),
+        };
+        let mut reader = TileReader::new(&src);
+        // (start, len, source reads so far)
+        let reads = [
+            (0, 10, 1),      // first read fills [0, w)
+            (5, 5, 1),       // inside it
+            (0, 10, 1),      // starting on its first byte
+            (w - 10, 10, 1), // ending on its last byte
+            (w, 10, 2),      // past it: refill at w
+            (3, 7, 3),       // behind it: read directly
+            (w + 5, 5, 3),   // the window stayed at w
+            (0, w + 1, 4),   // larger than a window: read directly
+            (w + 9, 1, 4),   // the window stayed at w
+            (2 * w, w, 5),   // exactly a window: refill at 2w
+            (2 * w, w, 5),   // the same body again, a run sharing it
+        ];
+        for (start, len, want) in reads {
+            let got = reader.read(start, len).unwrap();
+            assert_eq!(&got[..], &file[start..start + len], "read({start}, {len})");
+            assert_eq!(
+                src.reads.get(),
+                want,
+                "source reads after read({start}, {len})"
+            );
+        }
     }
 
     #[test]

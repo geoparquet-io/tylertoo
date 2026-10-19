@@ -68,10 +68,26 @@ pub fn usable_bounds(header: &Header) -> Option<TileBounds> {
 /// measuring RSS (flaky everywhere, hopeless in CI): after `open`, an
 /// archive's `bytes_read` is its header plus its directories plus its
 /// metadata, and nothing about the file's total size moves it.
-struct FileBytes {
+///
+/// `decode` reads its input through this too (#462), so neither PMTiles
+/// reader holds more of an archive than its directories and one tile.
+pub(crate) struct FileBytes {
     file: File,
     len: u64,
     bytes_read: AtomicU64,
+}
+
+impl FileBytes {
+    /// Open `path` for positioned reads; nothing is read yet.
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(FileBytes {
+            file,
+            len,
+            bytes_read: AtomicU64::new(0),
+        })
+    }
 }
 
 /// One positioned read, without disturbing any file cursor another reader
@@ -174,17 +190,9 @@ impl ArchiveIndex {
     /// more metadata than the internal-section ceiling allows.
     pub fn open(path: &Path) -> Result<Self> {
         let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
-        let file = File::open(path)
+        let src = FileBytes::open(path)
             .map_err(|e| Error::PMTilesRead(format!("failed to open {}: {e}", path.display())))?;
-        let len = file
-            .metadata()
-            .map_err(|e| Error::PMTilesRead(format!("failed to stat {}: {e}", path.display())))?
-            .len();
-        let src = FileBytes {
-            file,
-            len,
-            bytes_read: AtomicU64::new(0),
-        };
+        let len = src.len;
 
         // The header is a fixed 127 bytes at offset 0; `Header::from_bytes`
         // validates magic, version and the fields #417 made load-bearing.
