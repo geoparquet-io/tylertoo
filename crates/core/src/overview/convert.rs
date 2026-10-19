@@ -1259,7 +1259,7 @@ pub enum ConvertError {
     #[error("property selection: {0}")]
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
     Parquet(#[from] parquet::errors::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]

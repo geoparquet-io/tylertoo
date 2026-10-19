@@ -214,3 +214,36 @@ fn report_into_a_missing_directory_is_refused_up_front() {
         );
     }
 }
+
+/// #452 review: the preflight must not refuse what the writers handle. A
+/// dangling symlink is a fine PMTiles output (the writer replaces the
+/// link), and `--report /dev/stdout` writes through a `/proc/self/fd` link
+/// that cannot be canonicalized when stdout is a pipe, as it is here. Both
+/// get past the checks to the (missing) input.
+#[cfg(target_os = "linux")]
+#[test]
+fn symlinked_outputs_and_stdout_reports_pass_the_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("missing-input.parquet");
+    let link = dir.path().join("out.pmtiles");
+    std::os::unix::fs::symlink(dir.path().join("gone").join("x"), &link).unwrap();
+    let plain = dir.path().join("plain.pmtiles");
+    let (input, link) = (input.to_str().unwrap(), link.to_str().unwrap());
+    for args in [
+        &["tiles", input, link, "--force"][..],
+        &[
+            "tiles",
+            input,
+            plain.to_str().unwrap(),
+            "--report",
+            "/dev/stdout",
+        ][..],
+    ] {
+        let (ok, stderr) = run(args);
+        assert!(!ok, "{args:?}: the missing input must still fail");
+        assert!(
+            stderr.contains("missing-input") && !stderr.contains("cannot write"),
+            "{args:?}: must get past the output checks, got:\n{stderr}"
+        );
+    }
+}

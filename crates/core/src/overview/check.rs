@@ -83,7 +83,7 @@ impl ValidationReport {
 /// Errors that prevent a validation run from starting at all (I/O, footer).
 ///
 /// The messages carry no path and no "io error:" prefix: every caller
-/// already says "could not open '<path>': " in front (#452).
+/// already says `could not open '<path>': ` in front (#452).
 #[derive(Debug, thiserror::Error)]
 pub enum CheckError {
     /// I/O error opening the file.

@@ -1727,7 +1727,11 @@ pub(crate) fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, InputError> {
         // glob 0.3.3 dropped `impl From<GlobError> for io::Error` and 0.3.4
         // restored it, deprecating `into_error`. The floor in Cargo.toml is
         // 0.3.4 so that `into` is the one form that compiles warning-free.
-        let path = entry.map_err(|e| InputError::Io(e.into()))?;
+        // #452: and name the path the glob could not read.
+        let path = entry.map_err(|e| InputError::Open {
+            input: e.path().display().to_string(),
+            error: e.into(),
+        })?;
         if path.is_file() && path.extension().is_some_and(|ext| ext == "parquet") {
             files.push(path);
         }
@@ -1916,12 +1920,18 @@ mod tests {
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = list_parquet_files(dir.path());
+        let root = std::fs::read_dir(&locked).is_ok();
+        let listed = list_parquet_files(dir.path());
+        let pattern = format!("{}/*/*.parquet", dir.path().display());
+        let globbed = expand_glob(&pattern);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         // root reads any directory: nothing to assert there.
-        if let Err(err) = result {
-            let msg = err.to_string();
-            assert!(msg.contains(&locked.display().to_string()), "{msg}");
+        if root {
+            return;
+        }
+        for (what, result) in [("directory", listed.map(drop)), ("glob", globbed.map(drop))] {
+            let msg = result.expect_err(what).to_string();
+            assert!(msg.contains(&locked.display().to_string()), "{what}: {msg}");
         }
     }
 

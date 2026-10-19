@@ -39,7 +39,7 @@ pub enum ReaderError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
     Parquet(#[from] parquet::errors::ParquetError),
     /// The overview file could not be opened (#452: the bare [`Self::Io`]
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not

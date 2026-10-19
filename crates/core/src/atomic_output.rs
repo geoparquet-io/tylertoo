@@ -136,89 +136,121 @@ pub struct OutputNotWritable {
 /// Preflight for a file output (#452): fail in milliseconds, naming the
 /// path, instead of after a whole conversion.
 ///
-/// Checks what [`create`], the PMTiles writer and a final rename will need:
-/// that `target` is not a directory and that its directory exists and
-/// accepts new files. The directory is probed with a uniquely named,
-/// immediately removed sibling. `target` itself is never opened: an
-/// existing output is replaced by a rename, so its own permissions do not
-/// matter, and a PMTiles `<output>.partial` salvage file beside it is left
-/// alone. An existing non-regular `target` (`/dev/null`, a FIFO) is written
-/// directly and passes without a probe.
+/// Checks that `target` is not a directory and that its directory exists
+/// and accepts new files, which is what every writer needs before its final
+/// rename. The directory is probed with a uniquely named, immediately
+/// removed sibling. `target` itself is never opened, and a PMTiles
+/// `<output>.partial` salvage file beside it is left alone. On Unix an
+/// existing output's own permissions do not matter, since the rename
+/// replaces it.
+///
+/// Two kinds of `target` pass without a probe, leaving any error to the
+/// writer, which names the path too:
+/// - an existing non-regular file (`/dev/null`, a pipe, `/dev/stdout`);
+/// - a symlink. The writers disagree on one: the GeoParquet writer writes
+///   through it, while the PMTiles writers replace the link itself. A check
+///   that guessed either way would refuse outputs the other writer handles.
 ///
 /// # Errors
 ///
 /// [`OutputNotWritable`] naming `target` and, where it is the cause, its
 /// directory.
 pub fn check_writable(target: &Path) -> Result<(), OutputNotWritable> {
-    let fail = |reason: String| {
-        Err(OutputNotWritable {
-            path: target.to_path_buf(),
-            reason,
-        })
-    };
-    // Resolve a symlink the way `create` does, so the probe lands in the
-    // directory the output will be published into.
-    let resolved;
-    let real = match std::fs::symlink_metadata(target) {
-        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(target) {
-            Ok(p) => {
-                resolved = p;
-                resolved.as_path()
-            }
-            Err(e) => return fail(format!("cannot resolve the symlink: {e}")),
-        },
-        _ => target,
-    };
-    if let Ok(m) = std::fs::metadata(real) {
+    // `metadata` follows links, including `/proc/self/fd/N` ones that point
+    // at a pipe and that `canonicalize` cannot resolve.
+    if let Ok(m) = std::fs::metadata(target) {
         if m.is_dir() {
-            return fail("it is a directory; give the output a file path".to_string());
+            return not_writable(
+                target,
+                "it is a directory; give the output a file path".into(),
+            );
         }
         if !m.is_file() {
             return Ok(());
         }
     }
-    let dir = match real.parent() {
+    if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(());
+    }
+    let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
     match std::fs::metadata(dir) {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => return fail(format!("{} is not a directory", dir.display())),
+        Ok(_) => return not_writable(target, format!("{} is not a directory", dir.display())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return fail(format!("directory {} does not exist", dir.display()))
+            return not_writable(
+                target,
+                format!("directory {} does not exist", dir.display()),
+            )
         }
-        Err(e) => return fail(format!("cannot access directory {}: {e}", dir.display())),
+        Err(e) => {
+            return not_writable(
+                target,
+                format!("cannot access directory {}: {e}", dir.display()),
+            )
+        }
     }
-    match tempfile::Builder::new()
-        .prefix(".tylertoo-write-probe.")
-        .tempfile_in(dir)
-    {
-        Ok(_probe) => Ok(()), // removed on drop
-        Err(e) => fail(format!("directory {} is not writable: {e}", dir.display())),
-    }
+    probe_directory(dir).or_else(|e| {
+        not_writable(
+            target,
+            format!("directory {} is not writable: {e}", dir.display()),
+        )
+    })
 }
 
 /// [`check_writable`] for a file rewritten in place, not renamed over.
 ///
-/// A file written with `std::fs::write` or `File::create` needs an existing
-/// regular file to be writable too. It is opened for writing without
-/// truncation, so the check cannot destroy it.
+/// `std::fs::write` and `File::create` truncate an existing file rather
+/// than replace it, so that file must be writable, and its directory need
+/// not be. It is opened for writing without truncation, so the check
+/// cannot destroy it. A path that does not exist yet gets
+/// [`check_writable`].
 ///
 /// # Errors
 ///
-/// As [`check_writable`], plus an existing file that cannot be opened for
+/// As [`check_writable`], or an existing file that cannot be opened for
 /// writing.
 pub fn check_writable_in_place(target: &Path) -> Result<(), OutputNotWritable> {
-    check_writable(target)?;
-    if std::fs::metadata(target).is_ok_and(|m| m.is_file()) {
-        if let Err(e) = std::fs::OpenOptions::new().write(true).open(target) {
-            return Err(OutputNotWritable {
-                path: target.to_path_buf(),
-                reason: format!("the existing file is not writable: {e}"),
-            });
+    if !std::fs::metadata(target).is_ok_and(|m| m.is_file()) {
+        return check_writable(target);
+    }
+    match std::fs::OpenOptions::new().write(true).open(target) {
+        Ok(_) => Ok(()),
+        Err(e) => not_writable(target, format!("the existing file is not writable: {e}")),
+    }
+}
+
+fn not_writable(target: &Path, reason: String) -> Result<(), OutputNotWritable> {
+    Err(OutputNotWritable {
+        path: target.to_path_buf(),
+        reason,
+    })
+}
+
+/// Create and remove a uniquely named file in `dir`. Not `tempfile`: its
+/// errors append the random probe name, which means nothing to a user.
+fn probe_directory(dir: &Path) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let probe = dir.join(format!(".tylertoo-write-probe.{}.{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return Ok(());
+            }
+            // Left behind by an earlier process with the same pid.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    Ok(())
 }
 
 impl PendingOutput {
@@ -509,6 +541,35 @@ mod tests {
         }
     }
 
+    /// `--report /dev/stdout` and `--report >(jq .)` name a `/proc/self/fd`
+    /// link that `canonicalize` cannot resolve for a pipe; `std::fs::write`
+    /// writes through it fine, so the check must not refuse it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_writable_passes_stdout_and_fd_links_through() {
+        check_writable(Path::new("/dev/stdout")).unwrap();
+        check_writable_in_place(Path::new("/dev/stdout")).unwrap();
+        let (read, write) = std::io::pipe().unwrap();
+        use std::os::fd::AsRawFd;
+        let link = PathBuf::from(format!("/dev/fd/{}", write.as_raw_fd()));
+        check_writable(&link).unwrap();
+        check_writable_in_place(&link).unwrap();
+        drop((read, write));
+    }
+
+    /// A symlinked output passes unprobed: the GeoParquet writer writes
+    /// through the link, the PMTiles writers replace it, so a dangling link
+    /// is a fine PMTiles output.
+    #[cfg(unix)]
+    #[test]
+    fn check_writable_passes_symlinks_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let dangling = dir.path().join("out.pmtiles");
+        std::os::unix::fs::symlink(dir.path().join("nope").join("x"), &dangling).unwrap();
+        check_writable(&dangling).unwrap();
+        assert_eq!(listing(dir.path()), ["out.pmtiles"]);
+    }
+
     /// A bare file name lives in the current directory: `Path::parent`
     /// gives `""` for it, which is not a missing directory.
     #[test]
@@ -548,6 +609,25 @@ mod tests {
         assert_eq!(std::fs::read(&report).unwrap(), b"{}");
     }
 
+    /// The other way round: a writable file in a read-only directory can be
+    /// rewritten in place, so only the rename-published check refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn check_writable_in_place_ignores_a_read_only_directory_for_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let report = ro.join("report.json");
+        std::fs::write(&report, b"{}").unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        check_writable_in_place(&report).unwrap();
+        // root ignores directory modes: the rest only holds for others.
+        if File::create(ro.join("as-root")).is_err() {
+            assert!(check_writable(&report).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn check_writable_names_a_read_only_directory() {
@@ -565,5 +645,9 @@ mod tests {
             .to_string();
         assert!(msg.contains(&ro.display().to_string()), "{msg}");
         assert!(msg.contains("not writable"), "{msg}");
+        assert!(
+            !msg.contains("probe"),
+            "the probe name means nothing: {msg}"
+        );
     }
 }

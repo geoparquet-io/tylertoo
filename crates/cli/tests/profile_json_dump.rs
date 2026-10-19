@@ -1072,6 +1072,7 @@ fn failed_run_leaves_no_zero_byte_profile_json() {
     // before the profile preflight.
     let out = std::path::Path::new("/dev/full");
     if !out.exists() {
+        eprintln!("Skipping failed_run_leaves_no_zero_byte_profile_json: no /dev/full");
         return;
     }
 

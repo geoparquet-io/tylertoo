@@ -64,7 +64,7 @@ pub enum InputError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// Parquet error (footer parse, reader construction).
-    #[error("parquet error: {0}")]
+    #[error("parquet error: {}", parquet_error_detail(.0))]
     Parquet(#[from] ParquetError),
     /// An input file could not be opened (#452: the bare [`Self::Io`] named
     /// no file). Not a `#[source]`: the message already carries the reason,
@@ -2458,6 +2458,13 @@ mod tests {
             0,
             "no 'parquet error:' prefix, let alone two: {msg}"
         );
+    }
+
+    /// #452: a mid-read Parquet error says "parquet error" once.
+    #[test]
+    fn a_parquet_error_says_so_once() {
+        let err = InputError::from(ParquetError::General("bad page".into()));
+        assert_eq!(err.to_string(), "parquet error: bad page");
     }
 
     #[test]

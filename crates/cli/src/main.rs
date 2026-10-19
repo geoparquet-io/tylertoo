@@ -249,6 +249,10 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
+    // DIVERGENCE FROM TIPPECANOE: its `-q` also silences warnings ("Work
+    // quietly instead of reporting progress or warning messages"). Ours
+    // keeps them: several report data loss that a quiet run should still
+    // show. See context/ARCHITECTURE.md.
     /// Print only warnings and errors. The output of `stats` and `validate`
     /// still prints.
     #[arg(short, long, global = true)]
@@ -3165,8 +3169,10 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
             100.0 * r.estimated_rows as f64 / total as f64,
         );
     }
+    // This and the empty-shard note are `println!`, not `say!`: they are
+    // warnings, which `--quiet` keeps, and core logs no copy of them.
     if plan.unplaced_rows > 0 {
-        say!(
+        println!(
             "\n  ! ~{} row(s) could not be placed: their row groups carry no usable bbox \
              statistics (or cover so much of the pivot zoom that they name no cut point), so \
              they were spread evenly instead of balanced. Run the input through `gpio \
@@ -3182,7 +3188,7 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     // empty archive), so the only place to notice is here, at cut time.
     let empty = plan.ranges.iter().filter(|r| r.estimated_rows == 0).count();
     if empty > 0 {
-        say!(
+        println!(
             "\n  ! {empty} of {} shard(s) are empty of data: their ranges own pivot tiles the \
              estimator places no rows in. Those jobs will run, find nothing and write a valid \
              empty archive (the merge skips it), so nothing breaks — but a smaller --shards, \
