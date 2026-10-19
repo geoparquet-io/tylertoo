@@ -8855,6 +8855,48 @@ mod tests {
         }
     }
 
+    /// #730: `covering_batch_bboxes` takes a covering row only when it is a
+    /// finite, ordered box. Each rejected row breaks exactly one of the six
+    /// conditions, so no single one can be dropped from the check.
+    #[test]
+    fn covering_row_must_be_finite_and_ordered() {
+        use arrow_array::{Float64Array, StructArray};
+        use arrow_schema::DataType;
+        let names = ["xmin", "ymin", "xmax", "ymax"].map(String::from);
+        let batch_of = |row: [f64; 4]| {
+            let children: Vec<(Arc<Field>, ArrayRef)> = names
+                .iter()
+                .zip(row)
+                .map(|(n, v)| {
+                    let field = Arc::new(Field::new(n, DataType::Float64, true));
+                    (field, Arc::new(Float64Array::from(vec![v])) as ArrayRef)
+                })
+                .collect();
+            let strukt: ArrayRef = Arc::new(StructArray::from(children));
+            let schema = Schema::new(vec![Field::new("bbox", strukt.data_type().clone(), true)]);
+            RecordBatch::try_new(Arc::new(schema), vec![strukt]).unwrap()
+        };
+        let read = |row: [f64; 4]| {
+            covering_batch_bboxes(&batch_of(row), "bbox", &names, Crs::Epsg4326).unwrap()
+        };
+        assert_eq!(
+            read([1.0, 2.0, 3.0, 4.0]),
+            Some(vec![Some(TileBounds::new(1.0, 2.0, 3.0, 4.0))])
+        );
+        let inf = f64::INFINITY;
+        for row in [
+            [3.0, 2.0, 1.0, 4.0], // x unordered
+            [1.0, 4.0, 3.0, 2.0], // y unordered
+            [-inf, 2.0, 3.0, 4.0],
+            [1.0, 2.0, inf, 4.0],
+            [1.0, -inf, 3.0, 4.0],
+            [1.0, 2.0, 3.0, inf],
+            [f64::NAN, 2.0, 3.0, 4.0],
+        ] {
+            assert_eq!(read(row), None, "{row:?} must abandon the covering pass");
+        }
+    }
+
     /// #730's documented divergence: an invalid polygon whose hole lies
     /// outside its shell has a covering that includes the hole, while the
     /// geometry path's `bounding_rect()` reads the shell alone. The covering
