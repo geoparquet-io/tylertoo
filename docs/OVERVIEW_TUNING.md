@@ -69,8 +69,9 @@ smaller of two measures, in Web Mercator meters:
 - the tenth-percentile spacing between nearby features
 
 The result is clamped to `[--min-zoom, 16]` and logged with its measurements
-at `info`. Treat it as a starting point. Python's `logging` does not receive
-the Rust log; read the finest `zoom` in the report's `levels` instead.
+at `info`. Treat it as a starting point. From Python, the line reaches
+`logging` at `INFO` under the `tylertoo_core` logger, and the finest `zoom`
+in the report's `levels` gives the chosen zoom.
 
 An input with nothing to measure, such as one location or only empty
 geometries, is an error, as with `-zg`. So is a `--min-zoom` above 16. With
@@ -1726,10 +1727,10 @@ whose row groups are large enough that `budget ÷ largest span` is the binding
 constraint.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
-default `info` filter. The Python bindings install no log bridge, so from
-Python the overrides take effect **silently**: a typo in a variable name or
-value is indistinguishable from the default. Check the knobs from the CLI
-first if a sweep depends on them.
+default `info` filter. Python receives them through `logging` under the
+`tylertoo_core` logger. Python prints only warnings by default, so call
+`logging.basicConfig(level=logging.INFO)` to see the info lines; otherwise a
+typo in a variable name or value is indistinguishable from the default.
 
 ---
 

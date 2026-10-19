@@ -8,6 +8,7 @@ use pyo3::types::{PyDict, PyList};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tylertoo_core::input_set::ConvertSource;
 use tylertoo_core::overview::assign::{
     AssignConfig, DensityBudgetConfig, SortDirection, CLUSTER_POINT_THINNING_DEFAULT,
@@ -28,6 +29,22 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::overview::tiles::{
     convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
 };
+
+/// The installed log bridge's cache handle (#445), set once at import.
+static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
+
+/// Drop pyo3-log's cached Python loggers and levels, so a `logging`
+/// configuration change made since the last call (`basicConfig`,
+/// `setLevel`, pytest's `caplog`) applies to this one.
+///
+/// The cache is what lets a filtered-out record on a worker thread skip the
+/// GIL entirely; resetting it once per call keeps that, at the cost of one
+/// atomic store. Every entry point calls this first.
+fn refresh_log_levels() {
+    if let Some(handle) = LOG_RESET.get() {
+        handle.reset();
+    }
+}
 
 /// Parse the `feature_order` kwarg into the core enum, surfacing a bad
 /// spelling as a Python `ValueError` rather than a panic (#361).
@@ -120,6 +137,7 @@ fn convert(
     feature_order: &str,
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
 
@@ -184,11 +202,11 @@ fn convert(
         }
     };
 
-    // #314: the CLI shows this preflight as a `log::warn`, which these
-    // bindings have no bridge for — so a Python caller would hit ENOSPC
-    // mid-run with nothing said. Raise it as a warning instead, after the
-    // run (the warning is advisory; the convert either succeeded or already
-    // failed with its own error).
+    // #314: core logs this preflight as a `log::warn`, which reaches Python
+    // `logging` (#445) — but only for a caller who looks there, and a full
+    // disk mid-run is worth saying louder. Raise it as a `UserWarning` too,
+    // after the run (the warning is advisory; the convert either succeeded
+    // or already failed with its own error).
     if let Some(msg) = &report.intermediate.space_warning {
         PyErr::warn(
             py,
@@ -488,6 +506,7 @@ fn overview(
     read_workers: usize,
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
     let mode = match mode {
         "duplicating" => Mode::Duplicating,
         "partitioning" => Mode::Partitioning,
@@ -745,6 +764,7 @@ fn export_pmtiles(
     feature_id: Option<String>,
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
         tile_buffer,
@@ -823,6 +843,7 @@ fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<P
 #[pyfunction]
 #[pyo3(signature = (file))]
 fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
     let path = Path::new(file).to_path_buf();
     let report = py.detach(|| validate_file(&path)).map_err(|e| {
         PyErr::new::<PyRuntimeError, _>(format!("could not open '{}': {}", file, e))
@@ -845,8 +866,22 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
 /// The compiled extension, imported as `tylertoo._tylertoo`.
 ///
 /// `python/tylertoo/__init__.py` wraps it with the public, typed API.
+///
+/// Importing it installs pyo3-log as the `log` backend (#445), so core's
+/// diagnostics reach Python's `logging` under `tylertoo_core.*` (the Rust
+/// module path, `::` → `.`) — the warnings and progress lines the CLI
+/// prints. Records below DEBUG are never forwarded. Forwarding takes the GIL,
+/// so every core call here runs inside `py.detach`: a worker thread logging
+/// while this thread waited on it with the GIL held would deadlock.
 #[pymodule]
 fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Another extension in this process may already own the global logger;
+    // keep it rather than fail the import.
+    if let Ok(handle) =
+        pyo3_log::Logger::new(m.py(), pyo3_log::Caching::LoggersAndLevels)?.install()
+    {
+        let _ = LOG_RESET.set(handle);
+    }
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;

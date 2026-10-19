@@ -24,6 +24,7 @@ tylertoo-core = { workspace = true, features = ["remote"] }
 # pyo3 safe API, no version-specific C API -- so the stable ABI costs
 # nothing here.
 pyo3 = { workspace = true, features = ["abi3-py39"] }
+pyo3-log = { workspace = true }
 
 [lints]
 workspace = true

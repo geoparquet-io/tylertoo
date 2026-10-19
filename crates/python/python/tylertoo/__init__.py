@@ -4,6 +4,11 @@ Options and defaults match the CLI. Ground sample distance (GSD) is
 the meters covered by one pixel at a level. See the
 [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
 for generalization options.
+
+Diagnostics go to Python's `logging` under the `tylertoo_core` logger:
+the warnings and progress lines the CLI prints. Python shows warnings
+by default; call `logging.basicConfig(level=logging.INFO)` to see
+progress. Each call reads the logging configuration when it starts.
 """
 
 from __future__ import annotations
