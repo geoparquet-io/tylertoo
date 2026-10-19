@@ -34,13 +34,14 @@ cargo nextest --version > /dev/null 2>&1 \
   || { echo "error: cargo-nextest is required (cargo install cargo-nextest --locked)" >&2; exit 2; }
 
 # One line per integration-test binary with a runnable test, sorted.
-# Default features on purpose: that is what cargo-mutants builds, and a
-# feature-gated test binary must be listed only if the mutation run would
-# have it. Compiler output goes to a file and is shown if the list fails.
+# The same features as `features` in .cargo/mutants.toml: that is what
+# cargo-mutants builds, and a feature-gated test binary must be listed only
+# if the mutation run would have it. Compiler output goes to a file and is
+# shown if the list fails.
 errlog=$(mktemp)
 trap 'rm -f "$errlog"' EXIT
 binaries=$(
-  cargo nextest list --package tylertoo-core --profile mutants \
+  cargo nextest list --package tylertoo-core --profile mutants --features remote \
       --locked --message-format json 2> "$errlog" \
     | jq -r '
         .["rust-suites"][]
