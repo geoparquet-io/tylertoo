@@ -19,10 +19,9 @@
 //! check that the shards really were disjoint.
 //!
 //! **Disjointness is validated, not assumed — exactly, per tile id.** The
-//! k-way heap merge ([`MergedTiles`], which the pyramid merge shares) emits
-//! ids in ascending order, so two inputs claiming one tile show up as two
-//! consecutive emissions of the same id.
-//! That is refused, naming both archives. A mis-specified shard set — the
+//! k-way heap merge (`archive_index::MergedTiles`, which the pyramid merge
+//! shares) emits ids in ascending order, so two inputs claiming one tile show
+//! up as two consecutive emissions of the same id. That is refused, naming both archives. A mis-specified shard set — the
 //! same shard listed twice, a shard from an earlier run, overlapping bounds
 //! in the pass-1 split — would otherwise produce an archive whose tiles
 //! silently shadow each other, and the failure would surface much later as
@@ -136,7 +135,7 @@ pub struct MergeReport {
 ///
 /// # Panics
 ///
-/// Panics only on an internal invariant violation in [`MergedTiles`] (a heap
+/// Panics only on an internal invariant violation in `MergedTiles` (a heap
 /// entry with no pending tile), which is a bug.
 pub fn merge_shards(
     inputs: &[PathBuf],

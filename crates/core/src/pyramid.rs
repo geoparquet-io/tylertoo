@@ -1700,8 +1700,16 @@ pub fn merge_bands_with_options(
                         })?;
                         buf.extend_from_slice(&plain);
                     }
+                    // Compressed here and keyed on the COMPRESSED bytes, like
+                    // a tile copied through above, not handed to `add_tile`
+                    // (which keys on the uncompressed bytes): one writer, one
+                    // dedup keyspace (#403). Compression is deterministic, so
+                    // equal combined tiles still collapse to one body.
+                    let gz = compression::compress(&buf, Compression::Gzip).map_err(|e| {
+                        Error::PMTilesWrite(format!("tile {z}/{x}/{y} failed to compress: {e}"))
+                    })?;
                     writer
-                        .add_tile(z, x, y, &buf)
+                        .add_tile_precompressed(z, x, y, TileHasher::hash(&gz), &gz, buf.len(), 0)
                         .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
                     combined += 1;
                 }
@@ -2502,6 +2510,61 @@ mod tests {
             w.add_tile(*z, *x, *y, payload).unwrap();
         }
         w.finalize(path).unwrap();
+    }
+
+    /// A tile's `(z, x, y)` and its uncompressed payload.
+    type BandTile = ((u8, u32, u32), Vec<u8>);
+
+    /// Like [`write_band_with_payload`], but each tile carries its own
+    /// payload.
+    fn write_band_tiles(path: &Path, layer: &str, tiles: &[BandTile]) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(layer);
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        for ((z, x, y), payload) in tiles {
+            w.add_tile(*z, *x, *y, payload).unwrap();
+        }
+        w.finalize(path).unwrap();
+    }
+
+    /// #403: the shared-zoom merge hands the writer one dedup keyspace. A
+    /// tile copied through was keyed on its compressed bytes but a combined
+    /// tile on its uncompressed bytes, so two ids whose stored bodies are
+    /// byte-identical — a combined `a‖b` and a band's own `a‖b` tile — never
+    /// met in the dedup cache, and the merged archive stored the body twice.
+    #[test]
+    fn combined_and_copied_tiles_share_one_dedup_keyspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, out) = (
+            dir.path().join("a.pmtiles"),
+            dir.path().join("b.pmtiles"),
+            dir.path().join("out.pmtiles"),
+        );
+        let both = [layer_tile("a"), layer_tile("b")].concat();
+        write_band_tiles(&a, "a", &[((0, 0, 0), layer_tile("a"))]);
+        write_band_tiles(
+            &b,
+            "b",
+            &[((0, 0, 0), layer_tile("b")), ((1, 0, 0), both.clone())],
+        );
+        let bands = [
+            Band::parse(&format!("0-1:{}:a", a.display())).unwrap(),
+            Band::parse(&format!("0-1:{}:b", b.display())).unwrap(),
+        ];
+        let report = merge_bands_with_options(&bands, &out, true).unwrap();
+        assert_eq!(report.total_tiles, 2);
+        assert_eq!(merged_layer_names(&out, 0, 0, 0), ["a", "b"], "combined");
+        assert_eq!(merged_layer_names(&out, 1, 0, 0), ["a", "b"], "copied");
+
+        let ranges: Vec<_> = ArchiveIndex::open(&out)
+            .unwrap()
+            .tiles()
+            .map(|t| t.unwrap().range)
+            .collect();
+        assert_eq!(
+            ranges[0], ranges[1],
+            "the combined 0/0/0 and the copied 1/0/0 are the same bytes and must be stored once"
+        );
     }
 
     /// Decode a merged tile's layer names in order.
