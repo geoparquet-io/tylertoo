@@ -1006,28 +1006,21 @@ pub(crate) mod remote {
                 let mut chunks = Vec::with_capacity(rg.columns().len());
                 for col in rg.columns() {
                     let (s, len) = col.byte_range();
-                    // Checked (#430): `load_footer` validated these, but a
-                    // wrapped span here would fetch the wrong bytes.
-                    let checked = s
+                    // Checked (#430): `load_footer` validated these for every
+                    // row group, pruned or not, but a wrapped span here would
+                    // fetch the wrong bytes.
+                    let chunk_end = s
                         .checked_add(len)
                         .filter(|e| *e <= self.size)
-                        .zip(usize::try_from(len).ok());
-                    if checked.is_none() && !keep {
-                        // A pruned group is never fetched, so its bad range
-                        // is not this call's error; block through the end of
-                        // the object so no merge can reach into it.
-                        start = start.min(s);
-                        end = self.size;
-                        continue;
-                    }
-                    let chunk_end = checked.ok_or_else(|| {
-                        ParquetError::EOF(format!(
-                            "column chunk range {s}..{} beyond object size {} for {}",
-                            s as u128 + len as u128,
-                            self.size,
-                            self.location
-                        ))
-                    })?;
+                        .zip(usize::try_from(len).ok())
+                        .ok_or_else(|| {
+                            ParquetError::EOF(format!(
+                                "column chunk range {s}..{} beyond object size {} for {}",
+                                s as u128 + len as u128,
+                                self.size,
+                                self.location
+                            ))
+                        })?;
                     start = start.min(s);
                     end = end.max(chunk_end.0);
                     chunks.push((s, chunk_end.1));
@@ -1335,21 +1328,31 @@ pub(crate) mod remote {
             for w in &warnings {
                 log::warn!("[remote] {w}");
             }
-            if !overrides.is_empty() {
-                let list: Vec<String> = overrides
-                    .iter()
-                    .map(|(k, v)| {
-                        let v = if redacted(*k) { "<redacted>" } else { v };
-                        format!("{}={v}", k.as_ref())
-                    })
-                    .collect();
-                log::info!(
-                    "[remote] client options from {CLIENT_VAR_PREFIX}*: {}",
-                    list.join(", ")
-                );
+            if let Some(line) = overrides_log_line(&overrides) {
+                log::info!("[remote] {line}");
             }
             overrides
         })
+    }
+
+    /// The info line naming the client overrides in force, or `None` when
+    /// there are none. A [`redacted`] key's value is never shown. Split out so
+    /// the wording is unit-testable without capturing a logger.
+    fn overrides_log_line(overrides: &[(ClientConfigKey, String)]) -> Option<String> {
+        if overrides.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = overrides
+            .iter()
+            .map(|(k, v)| {
+                let v = if redacted(*k) { "<redacted>" } else { v };
+                format!("{}={v}", k.as_ref())
+            })
+            .collect();
+        Some(format!(
+            "client options from {CLIENT_VAR_PREFIX}*: {}",
+            list.join(", ")
+        ))
     }
 
     /// Bridges the AWS SDK credential chain (profiles, SSO, IMDS, ...) into
@@ -2325,6 +2328,16 @@ pub(crate) mod remote {
             assert_eq!(t.coalesce_window, 4 * 1024 * 1024);
             assert_eq!(warnings.len(), 1, "{warnings:?}");
         }
+
+        #[test]
+        fn a_window_equal_to_the_memory_budget_is_not_clamped() {
+            let (t, warnings) = resolve(env(&[
+                (COALESCE_VAR, "4194304"),
+                (MEM_BUDGET_VAR, "4194304"),
+            ]));
+            assert_eq!(t.coalesce_window, 4 * 1024 * 1024);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
     }
 
     #[cfg(test)]
@@ -2406,6 +2419,17 @@ pub(crate) mod remote {
             let blocked = [60..70, 50..150];
             let out = coalesce_spans(plan, &blocked, u64::MAX);
             assert_eq!(spans(&out), vec![4..104, 204..404]);
+        }
+
+        #[test]
+        fn a_blocked_span_starting_where_the_gap_ends_does_not_block_it() {
+            // Crafted footer: pruned 204..250 shares bytes with selected
+            // 204..304. The gap 104..204 is half-open, so the pruned span
+            // does not reach into it, and its bytes are fetched for the
+            // selected group anyway.
+            let plan = vec![span(4..104), span(204..304)];
+            let out = coalesce_spans(plan, std::slice::from_ref(&(204..250)), u64::MAX);
+            assert_eq!(spans(&out), vec![4..304]);
         }
 
         #[test]
@@ -2557,7 +2581,7 @@ pub(crate) mod remote {
     mod client_override_tests {
         //! #290 dimension 4: `TYLERTOO_HTTP_<KEY>` → `object_store` client option.
 
-        use super::client_overrides;
+        use super::{client_overrides, overrides_log_line};
         use object_store::ClientConfigKey;
 
         fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -2634,6 +2658,15 @@ pub(crate) mod remote {
         }
 
         #[test]
+        fn a_bad_value_warning_echoes_the_value_unless_redacted() {
+            // Only PROXY_URL is withheld; any other bad value is shown so the
+            // user can see what they typed.
+            let (_, w) = client_overrides(vars(&[("TYLERTOO_HTTP_TIMEOUT", "soon")]));
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(w[0].contains("TYLERTOO_HTTP_TIMEOUT=soon"), "{}", w[0]);
+        }
+
+        #[test]
         fn output_is_sorted_so_the_log_line_is_stable() {
             let (o, _) = client_overrides(vars(&[
                 ("TYLERTOO_HTTP_TIMEOUT", "60s"),
@@ -2641,6 +2674,107 @@ pub(crate) mod remote {
             ]));
             let keys: Vec<String> = o.iter().map(|(k, _)| k.as_ref().to_string()).collect();
             assert_eq!(keys, vec!["connect_timeout", "timeout"]);
+        }
+
+        #[test]
+        fn no_overrides_means_no_log_line() {
+            assert_eq!(overrides_log_line(&[]), None);
+        }
+
+        #[test]
+        fn log_line_names_each_override_and_redacts_the_proxy_url() {
+            let line = overrides_log_line(&[
+                (
+                    ClientConfigKey::ProxyUrl,
+                    "http://user:hunter2@proxy:3128".to_string(),
+                ),
+                (ClientConfigKey::Timeout, "60s".to_string()),
+            ])
+            .expect("overrides are in force");
+            assert!(line.contains("TYLERTOO_HTTP_*"), "{line}");
+            assert!(line.contains("proxy_url=<redacted>"), "{line}");
+            assert!(line.contains("timeout=60s"), "{line}");
+            assert!(!line.contains("hunter2"), "{line}");
+        }
+    }
+
+    #[cfg(test)]
+    mod process_env_tests {
+        //! The two `OnceLock`s that read the real process environment
+        //! ([`staging_tunables::effective`], [`effective_client_overrides`])
+        //! and the store each scheme resolves to. An environment test re-runs
+        //! itself in a child process with its variables set, so no test
+        //! mutates this process's environment and the cache is filled from
+        //! exactly those variables.
+
+        use super::staging_tunables::{self, COALESCE_VAR, CONCURRENCY_VAR};
+        use super::{effective_client_overrides, store_and_location};
+        use object_store::ClientConfigKey;
+
+        /// Runs the named test of this module alone in a child process with
+        /// `vars` set. Returns `true` inside that child, where the caller runs
+        /// its body, and `false` in the parent once the child has passed.
+        /// Same shape as `run_alone` in `overview::stream`.
+        fn run_in_child(test: &str, vars: &[(&str, &str)]) -> bool {
+            const CHILD: &str = "TYLERTOO_ENV_TEST_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                return true;
+            }
+            let (_, module) = module_path!().split_once("::").expect("crate::module path");
+            let name = format!("{module}::{test}");
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .envs(vars.iter().copied())
+                    .output()
+                    .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{name} failed in its own process:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            false
+        }
+
+        #[test]
+        fn effective_staging_tunables_read_the_environment() {
+            if !run_in_child(
+                "effective_staging_tunables_read_the_environment",
+                &[(CONCURRENCY_VAR, "3"), (COALESCE_VAR, "4096")],
+            ) {
+                return;
+            }
+            let t = staging_tunables::effective();
+            assert_eq!(t.max_concurrency, 3);
+            assert_eq!(t.coalesce_window, 4096);
+            assert!(t.overridden);
+        }
+
+        #[test]
+        fn effective_client_overrides_read_the_environment() {
+            if !run_in_child(
+                "effective_client_overrides_read_the_environment",
+                &[("TYLERTOO_HTTP_TIMEOUT", "7s")],
+            ) {
+                return;
+            }
+            assert!(
+                effective_client_overrides()
+                    .contains(&(ClientConfigKey::Timeout, "7s".to_string())),
+                "{:?}",
+                effective_client_overrides()
+            );
+        }
+
+        #[test]
+        fn gs_urls_resolve_to_a_store() {
+            // Building the store does no I/O: credentials resolve on the
+            // first request.
+            let (_, location) = store_and_location("gs://some-bucket/dir/part.parquet")
+                .expect("gs:// builds a GCS store");
+            assert_eq!(location.as_ref(), "dir/part.parquet");
         }
     }
 
