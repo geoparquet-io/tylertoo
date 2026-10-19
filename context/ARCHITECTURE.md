@@ -98,11 +98,16 @@ verbatim (spec §2.4).
    (#287), and pass 2 re-fetching, cold, the property columns pass 1's
    geometry+ranking projection skipped (#286). Only selected row groups are
    staged, so pruned groups are still never touched and total network traffic
-   stays ≈1× the object (#219); local inputs skip pass 0 entirely. The
-   concurrency ceiling and memory budget are env-overridable sweep knobs
-   (`TYLERTOO_STAGING_*`, #290 minimum; see docs/OVERVIEW_TUNING.md "Remote
-   staging (env)") — they change request scheduling only, never staged bytes
-   or batch order.
+   stays ≈1× the object (#219); local inputs skip pass 0 entirely. An
+   optional coalescing window (`TYLERTOO_STAGING_COALESCE_BYTES`, off by
+   default) merges *adjacent selected* row groups into one request up to the
+   window; an unselected row group between two selected ones always splits
+   the merge, so the ≈1× bound holds. The concurrency ceiling, memory budget,
+   window and HTTP client options are env-overridable sweep knobs
+   (`TYLERTOO_STAGING_*`, `TYLERTOO_HTTP_*`, #290; see
+   docs/OVERVIEW_TUNING.md "Remote staging (env)" and
+   benchmarks/staging/RESULTS.md). They change request scheduling only, never
+   staged bytes or batch order.
 1. **Pass 1** streams the input once, keeping only a small per-feature record
    (bbox, kind, ranking key). Level assignment + density budget run over
    those records to produce per-level **winner tables** (~1 byte/feature).

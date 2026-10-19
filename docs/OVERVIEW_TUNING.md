@@ -1700,17 +1700,43 @@ and over-budget runs. Watch peak RSS if you explicitly choose `speed`.
 Pass 0 stages a remote input's selected row groups to the local disk spill
 up front, one coalesced range request per row group with several in flight
 ([#286](https://github.com/geoparquet-io/tylertoo/issues/286)/[#287](https://github.com/geoparquet-io/tylertoo/issues/287)).
-Two of its heuristics accept **experimental environment overrides** so the
+Its heuristics, and the HTTP client under it, accept **experimental
+environment overrides** so the
 [#290](https://github.com/geoparquet-io/tylertoo/issues/290) host sweep
 (source.coop vs real S3) can vary them per run without rebuilding. They are
-sweep knobs, not stable API — deliberately env-only, no CLI flags — and may
-change or disappear once #290 lands swept defaults. They alter request
-*scheduling* only; the staged bytes, batch order, and output are identical.
+sweep knobs, not stable API: deliberately env-only, with no CLI flags, and
+they may change or disappear. They alter request *scheduling* only, so the
+output is identical whatever their values. The sweep that measured them, and
+chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
 
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|
-| `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on row-group range requests in flight per part |
-| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest row-group span)` |
+| `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest span)` |
+| `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
+| `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |
+
+The window counts toward the memory budget: with
+`TYLERTOO_STAGING_COALESCE_BYTES=134217728` (128 MiB) and the default
+256 MiB budget, at most two merged spans are in flight. A window larger than
+the budget warns and is clamped to the budget, since a merged span is held
+whole in memory while it downloads.
+
+The window pays off only on a host where time to first byte dominates and
+throughput per connection is not capped; on a throttled host it costs
+connections and runs slower. Each merged span is one request, and a request
+that takes longer than the client timeout (30 s by default) fails. Staging
+then gives up on the part and the passes read over the network chunk by
+chunk. With a large window on a slow host, raise `TYLERTOO_HTTP_TIMEOUT`.
+
+`TYLERTOO_HTTP_<KEY>` forwards any `object_store` client option, named in
+upper or lower case: for example `TYLERTOO_HTTP_HTTP2_ONLY=true`,
+`TYLERTOO_HTTP_POOL_MAX_IDLE_PER_HOST=16` or `TYLERTOO_HTTP_TIMEOUT=60s`. It
+applies to `https://`, `s3://` and `gs://` inputs alike, after the
+scheme's own `AWS_*` or `GOOGLE_*` settings, so it wins over them. An unknown
+key, or a value the client cannot parse, warns naming the variable and is
+ignored. The client defaults to HTTP/1.1, one connection per
+request in flight; S3 does not negotiate HTTP/2, so `HTTP2_ONLY` fails there.
 
 A negative or malformed value warns and keeps the default; a non-negative
 integer outside the bounds warns and clamps to the bound, including one too
@@ -1719,12 +1745,14 @@ first remote staging, so a long-lived library caller will not see a later change
 to the environment.
 
 Two lines are logged at staging start, at info when an override is set (so a
-sweep run records what it tested) and debug otherwise: the resolved ceiling
-and budget, and the **live** concurrency, which is what the run actually
+sweep run records what it tested) and debug otherwise: the resolved ceiling,
+budget and window, and the **live** concurrency, which is what the run actually
 used. Watch the second one — the budget can cap the ceiling, so
 `TYLERTOO_STAGING_CONCURRENCY=16` and `=8` produce identical runs on an input
 whose row groups are large enough that `budget ÷ largest span` is the binding
-constraint.
+constraint. A third info line, `[remote] client options from
+TYLERTOO_HTTP_*`, lists the client overrides in force, with a `PROXY_URL`
+value shown as `<redacted>`.
 
 These warnings and lines go to the Rust log, which the CLI prints at its
 default `info` filter. Python receives them through `logging` under the

@@ -27,6 +27,15 @@ test_tool = "nextest"
 # this to nextest as `--cargo-profile=mutants`.
 profile = "mutants"
 
+# Build tylertoo-core with the `remote` feature. The whole `input::remote`
+# module (object-store reads, staging, the TYLERTOO_HTTP_* knobs) and its
+# unit tests sit behind it, so with default features every mutant there
+# compiled out of the code under test and was reported missed: PR #729's
+# diff run scored 0/52, all in `remote`. CI's test tiers already build
+# with --all-features; `remote` is the only one the mutation run needs
+# (`dhat-heap` swaps the allocator, `fuzzing` only exposes internals).
+features = ["remote"]
+
 # Passed to both the build and the test invocation, so they restrict what
 # cargo *builds* per mutant, not just what nextest runs: the lib test
 # binary plus the integration binaries that have at least one test the
