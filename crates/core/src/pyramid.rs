@@ -1259,7 +1259,16 @@ fn parse_layers(
 /// What a pyramid build produced.
 #[derive(Debug, Clone)]
 pub struct PyramidReport {
+    /// Distinct tile ids written to the merged archive.
     pub total_tiles: usize,
+    /// `(layer, min_zoom, max_zoom, tiles)` for every band, in merge order:
+    /// argument order when bands share a zoom, coarsest band first otherwise
+    /// (#404).
+    ///
+    /// The counts can sum to more than [`Self::total_tiles`] (#403). A tile id
+    /// several bands wrote at a shared zoom is one tile in the archive, its
+    /// layers concatenated, so it counts once in `total_tiles` but once for
+    /// each of those bands here.
     pub per_band_tiles: Vec<(String, u8, u8, usize)>,
     /// Tiles found in a band archive at a zoom outside that band's declared
     /// range, and therefore dropped. Non-zero means the band declares a

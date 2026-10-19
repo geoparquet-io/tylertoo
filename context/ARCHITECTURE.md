@@ -1280,7 +1280,9 @@ crates/core/src/
 ├── mvt.rs              # MVT encoding
 ├── decode.rs           # PMTiles → GeoParquet decoding (#112)
 ├── pyramid.rs          # Multi-band pyramids: merge per-band PMTiles archives
-│                       # with disjoint zoom ranges into one archive (#345)
+│                       # into one archive (#345); bands in different layers
+│                       # may share zooms, their tiles' layers concatenated
+│                       # as a k-way merge streams the bands (#385, #403)
 ├── shard.rs            # Cut a dataset's tile space into N disjoint shards
 │                       # (#498): density-balanced pivot-zoom ranges from
 │                       # footer statistics alone, the TileRange a shard's
@@ -1294,7 +1296,9 @@ crates/core/src/
 │                       # overlapping inputs are pyramid.rs's job
 ├── archive_index.rs    # Read a PMTiles archive's header + directories and
 │                       # fetch tile bodies by offset; what lets pyramid.rs
-│                       # and merge.rs work on archives bigger than RAM
+│                       # and merge.rs work on archives bigger than RAM.
+│                       # MergedTiles: the k-way, ascending-id merge of
+│                       # several archives both share (one look-ahead each)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
 ├── dedup.rs            # Tile deduplication (XXH3)
