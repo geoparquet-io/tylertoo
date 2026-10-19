@@ -235,6 +235,9 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     cogp_compat: bool = False,
     row_group_size: int = 10_000,
     full_column_stats: bool = False,
@@ -300,6 +303,13 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             degrees. Set `0` to stop at every junction.
         coalesce_max_level_rows: Skip joining above this line count per
             level to bound memory.
+        include_properties: Keep only these property columns and skip
+            reading the rest. Columns other options read, such as
+            `sort_key`, must stay in the list. `[]` keeps none.
+        exclude_properties: Drop these property columns.
+            `include_properties` overrides it.
+        exclude_all_properties: Drop every property column, writing
+            geometry only. `include_properties` overrides it.
         cogp_compat: Write the third-party `cogp` footer key for readers
             of that overview format.
         row_group_size: Maximum rows per output row group.
@@ -326,8 +336,9 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
 
     Raises:
         ValueError: Invalid or conflicting options, a missing or
-            mistyped column, an unsupported projection, or almost
-            nothing to tile.
+            mistyped column, a property selection the input cannot
+            satisfy, an unsupported projection, or almost nothing to
+            tile.
         MemoryError: Too little memory for this input.
         RuntimeError: Reading or writing failed.
 
@@ -354,6 +365,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     partition_wave: int = 0,
     feature_order: Literal["input"] | str = "input",
     min_zoom: int | None = None,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
 ) -> ExportReport:
@@ -375,6 +389,13 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             property name with an optional `:asc` or `:desc`.
         min_zoom: Coarsest zoom to declare when the coarsest levels are
             empty.
+        include_properties: Keep only these properties in the tiles.
+            The overview file keeps every column, and the
+            `feature_order` column must stay. `[]` keeps none.
+        exclude_properties: Drop these properties from the tiles.
+            `include_properties` overrides it.
+        exclude_all_properties: Drop every property, writing
+            geometry-only tiles. `include_properties` overrides it.
         feature_id: Integer column to use as the MVT feature ID.
         spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
             used when memory runs short.
@@ -383,7 +404,8 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         Tile counts for each zoom written, with encoding diagnostics.
 
     Raises:
-        ValueError: Invalid `feature_order` syntax.
+        ValueError: Invalid `feature_order` syntax, or a property
+            selection the overview file cannot satisfy.
         RuntimeError: Not an overview file, an option is out of range,
             or reading or writing failed.
 
@@ -425,6 +447,10 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     simple_clip_fastpath: bool = True,
     feature_order: Literal["input"] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
+    *,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
@@ -448,13 +474,16 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
             to `$TMPDIR`, then the output's directory. Set it when
             `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
             when the chosen volume looks too small.
+        include_properties: See `overview()`.
+        exclude_properties: See `overview()`.
+        exclude_all_properties: See `overview()`.
 
     Returns:
         Both halves' reports, keyed `"convert"` and `"export"` like the
         CLI's `tiles --report` JSON.
 
     Raises:
-        ValueError: Invalid zoom range or options.
+        ValueError: Invalid zoom range, options, or property selection.
         MemoryError: Too little memory for this input.
         RuntimeError: Conversion or export failed.
 

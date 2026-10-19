@@ -20,6 +20,10 @@ def convert(
     simple_clip_fastpath: bool = True,
     feature_order: str = "input",
     spill_dir: str | Path | None = None,
+    *,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
 ) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
@@ -57,6 +61,9 @@ def overview(
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
     cogp_compat: bool = False,
     row_group_size: int = 10_000,
     full_column_stats: bool = False,
@@ -81,6 +88,9 @@ def export_pmtiles(
     partition_wave: int = 0,
     feature_order: str = "input",
     min_zoom: int | None = None,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...

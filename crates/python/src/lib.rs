@@ -21,10 +21,11 @@ use tylertoo_core::overview::convert::{
     ConvertError, ConvertOptions, ConvertReport, LevelPlan,
 };
 use tylertoo_core::overview::export::{
-    export_pmtiles as export_pmtiles_core, ExportOptions, ExportReport, FeatureOrder,
+    export_pmtiles as export_pmtiles_core, ExportError, ExportOptions, ExportReport, FeatureOrder,
 };
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
+use tylertoo_core::overview::properties::PropertySelection;
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::overview::tiles::{
     convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
@@ -51,6 +52,22 @@ fn refresh_log_levels() {
 fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
     s.parse::<FeatureOrder>()
         .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// The `include_properties` / `exclude_properties` / `exclude_all_properties`
+/// kwargs as core's [`PropertySelection`] (#445, #402). Core owns the
+/// precedence (an include list wins) and the validation; an empty include
+/// list keeps no properties, as core documents.
+fn property_selection(
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    exclude_all: bool,
+) -> PropertySelection {
+    PropertySelection {
+        include,
+        exclude: exclude.unwrap_or_default(),
+        exclude_all,
+    }
 }
 
 /// Extract the `max_zoom` kwarg (#444): an `int` zoom, or the string
@@ -121,8 +138,8 @@ fn resolve_max_zoom_py(
 /// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None)"
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False)"
 )]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
@@ -136,6 +153,9 @@ fn convert(
     simple_clip_fastpath: bool,
     feature_order: &str,
     spill_dir: Option<PathBuf>,
+    include_properties: Option<Vec<String>>,
+    exclude_properties: Option<Vec<String>>,
+    exclude_all_properties: bool,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let input_path = Path::new(input).to_path_buf();
@@ -154,6 +174,13 @@ fn convert(
         // exposes it: `$TMPDIR` is tmpfs in many containers, and the
         // intermediate is at least input-sized.
         spill_dir,
+        // Applied at convert time, so unselected columns are never read; the
+        // facade's own export keeps every column the overview holds.
+        properties: property_selection(
+            include_properties,
+            exclude_properties,
+            exclude_all_properties,
+        ),
         ..ConvertOptions::default()
     };
     // Resolves `auto` and writes the chosen zoom back into `levels`, which
@@ -281,7 +308,8 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
         | ConvertError::AccumulateColumnMissing { .. }
         | ConvertError::AccumulateColumnNotNumeric { .. }
         | ConvertError::AutoZoomMinAboveCeiling { .. }
-        | ConvertError::AutoZoomNoSignal { .. } => PyErr::new::<PyValueError, _>(format!("{}", e)),
+        | ConvertError::AutoZoomNoSignal { .. }
+        | ConvertError::Properties(_) => PyErr::new::<PyValueError, _>(format!("{}", e)),
         other => PyErr::new::<PyRuntimeError, _>(format!("overview conversion failed: {}", other)),
     }
 }
@@ -473,6 +501,9 @@ fn class_ranking_from_kwargs(
     coalesce_snap=1.0,
     coalesce_junction_angle=0.0,
     coalesce_max_level_rows=2_000_000,
+    include_properties=None,
+    exclude_properties=None,
+    exclude_all_properties=false,
     cogp_compat=false,
     row_group_size=10_000,
     full_column_stats=false,
@@ -485,7 +516,7 @@ fn class_ranking_from_kwargs(
     read_workers=0,
     spill_dir=None,
 ),
-    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, simplify_factor=1.0, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=1.0, polygon_thinning=1.0, line_visibility=2.0, polygon_visibility=2.0, drop_rate=1.65, drop_gamma=1.5, density_drop=True, cluster=False, accumulate_attributes=None, coalesce_lines=True, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
+    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, simplify_factor=1.0, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=1.0, polygon_thinning=1.0, line_visibility=2.0, polygon_visibility=2.0, drop_rate=1.65, drop_gamma=1.5, density_drop=True, cluster=False, accumulate_attributes=None, coalesce_lines=True, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -524,6 +555,9 @@ fn overview(
     coalesce_snap: f64,
     coalesce_junction_angle: f64,
     coalesce_max_level_rows: usize,
+    include_properties: Option<Vec<String>>,
+    exclude_properties: Option<Vec<String>>,
+    exclude_all_properties: bool,
     cogp_compat: bool,
     row_group_size: usize,
     full_column_stats: bool,
@@ -666,8 +700,11 @@ fn overview(
         coalesce_junction_angle,
         bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
         filter,
-        // #386: property selection is not on the Python surface yet.
-        properties: Default::default(),
+        properties: property_selection(
+            include_properties,
+            exclude_properties,
+            exclude_all_properties,
+        ),
         spill_dir,
         // The convert plan artifact (--save-plan / --plan) is not on the
         // Python surface yet; follow-up.
@@ -729,7 +766,7 @@ fn overview(
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, feature_id=None, spill_dir=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -743,6 +780,9 @@ fn export_pmtiles(
     partition_wave: usize,
     feature_order: &str,
     min_zoom: Option<u8>,
+    include_properties: Option<Vec<String>>,
+    exclude_properties: Option<Vec<String>>,
+    exclude_all_properties: bool,
     feature_id: Option<String>,
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
@@ -758,7 +798,11 @@ fn export_pmtiles(
         feature_order: parse_feature_order(feature_order)?,
         // #380: the declared minimum; None keeps the coarsest level's zoom.
         min_zoom,
-        properties: Default::default(),
+        properties: property_selection(
+            include_properties,
+            exclude_properties,
+            exclude_all_properties,
+        ),
         // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
         // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
         // and `export-pmtiles --tile-range`.
@@ -772,9 +816,24 @@ fn export_pmtiles(
 
     let report = py
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
-        .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("export failed: {}", e)))?;
+        .map_err(export_error_to_py)?;
 
     export_report_to_dict(py, &report)
+}
+
+/// Map an [`ExportError`] to a Python exception: a property selection the
+/// overview file cannot satisfy is the caller's input problem, so
+/// `ValueError`; everything else keeps the `RuntimeError` it always was.
+fn export_error_to_py(e: ExportError) -> PyErr {
+    match e {
+        ExportError::UnknownProperty { .. }
+        | ExportError::UnsupportedProperty { .. }
+        | ExportError::CoveringProperty { .. }
+        | ExportError::PropertyRequiredByKnob { .. } => {
+            PyErr::new::<PyValueError, _>(format!("{e}"))
+        }
+        other => PyErr::new::<PyRuntimeError, _>(format!("export failed: {other}")),
+    }
 }
 
 /// Convert an [`ExportReport`] to a Python dict (shared by

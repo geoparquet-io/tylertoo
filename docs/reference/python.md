@@ -51,6 +51,9 @@ overview(
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     cogp_compat: bool = False,
     row_group_size: int = 10_000,
     full_column_stats: bool = False,
@@ -118,6 +121,12 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `coalesce_junction_angle`: Largest turn through a junction, in degrees. Set `0` to stop at every junction.
 * `coalesce_max_level_rows`: Skip joining above this line count per level to bound memory.
 
+#### Properties
+
+* `include_properties`: Keep only these property columns and skip reading the rest. Columns other options read, such as `sort_key`, must stay in the list. `[]` keeps none.
+* `exclude_properties`: Drop these property columns. `include_properties` overrides it.
+* `exclude_all_properties`: Drop every property column, writing geometry only. `include_properties` overrides it.
+
 #### Output, filtering, and memory
 
 * `cogp_compat`: Write the third-party `cogp` footer key for readers of that overview format.
@@ -138,7 +147,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 ### Raises
 
-* `ValueError`: Invalid or conflicting options, a missing or mistyped column, an unsupported projection, or almost nothing to tile.
+* `ValueError`: Invalid or conflicting options, a missing or mistyped column, a property selection the input cannot satisfy, an unsupported projection, or almost nothing to tile.
 * `MemoryError`: Too little memory for this input.
 * `RuntimeError`: Reading or writing failed.
 
@@ -167,6 +176,9 @@ export_pmtiles(
     partition_wave: int = 0,
     feature_order: Literal['input'] | str = "input",
     min_zoom: int | None = None,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
 ) -> ExportReport
@@ -186,6 +198,9 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `partition_wave`: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves) at once, or `0` to size from CPUs and RAM.
 * `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
 * `min_zoom`: Coarsest zoom to declare when the coarsest levels are empty.
+* `include_properties`: Keep only these properties in the tiles. The overview file keeps every column, and the `feature_order` column must stay. `[]` keeps none.
+* `exclude_properties`: Drop these properties from the tiles. `include_properties` overrides it.
+* `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
 
@@ -195,7 +210,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 
 ### Raises
 
-* `ValueError`: Invalid `feature_order` syntax.
+* `ValueError`: Invalid `feature_order` syntax, or a property selection the overview file cannot satisfy.
 * `RuntimeError`: Not an overview file, an option is out of range, or reading or writing failed.
 
 ### Example
@@ -248,6 +263,10 @@ convert(
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
+    *,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
 ) -> ConvertReport
 ```
 
@@ -266,6 +285,9 @@ Use `overview()` followed by `export_pmtiles()` for all options. Runs the same c
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small.
+* `include_properties`: See `overview()`.
+* `exclude_properties`: See `overview()`.
+* `exclude_all_properties`: See `overview()`.
 
 ### Returns
 
@@ -273,7 +295,7 @@ Use `overview()` followed by `export_pmtiles()` for all options. Runs the same c
 
 ### Raises
 
-* `ValueError`: Invalid zoom range or options.
+* `ValueError`: Invalid zoom range, options, or property selection.
 * `MemoryError`: Too little memory for this input.
 * `RuntimeError`: Conversion or export failed.
 

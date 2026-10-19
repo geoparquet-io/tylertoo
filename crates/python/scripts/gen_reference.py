@@ -35,6 +35,7 @@ OVERVIEW_GROUPS = {
     "simplify_factor": "Geometry and thinning",
     "cluster": "Clustering",
     "coalesce_lines": "Line coalescing",
+    "include_properties": "Properties",
     "cogp_compat": "Output, filtering, and memory",
 }
 
