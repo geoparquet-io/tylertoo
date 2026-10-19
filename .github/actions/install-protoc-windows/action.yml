@@ -1,0 +1,39 @@
+name: Install protoc (Windows)
+description: >-
+  Put a pinned protoc release on PATH for prost-build.
+
+  Replaces `choco install protoc`. When Chocolatey's community feed is down
+  (a 503 on 2026-10-19), `choco install` reports "installed 0/0 packages"
+  and still exits 0, so the job fails minutes later in the build script
+  on a missing protoc. A GitHub release download with a pinned checksum
+  fails here, or not at all.
+
+  To bump: change both values below; the digest is on the release page, or
+  `gh api repos/protocolbuffers/protobuf/releases/tags/v<VERSION>
+  --jq '.assets[] | select(.name|test("win64")) | .digest'`.
+
+runs:
+  using: composite
+  steps:
+    - name: Download and verify protoc
+      shell: pwsh
+      env:
+        PROTOC_VERSION: "36.2"
+        PROTOC_SHA256: f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3
+      # The GITHUB_PATH write appends a constant under RUNNER_TEMP, nothing
+      # an attacker supplies.
+      run: | # zizmor: ignore[github-env]
+        $ErrorActionPreference = 'Stop'
+        $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+        $dest = Join-Path $env:RUNNER_TEMP 'protoc'
+        $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+        $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+        if ($hash -ne $env:PROTOC_SHA256) {
+          throw "protoc $env:PROTOC_VERSION checksum mismatch: got $hash"
+        }
+        Expand-Archive $zip -DestinationPath $dest -Force
+        $protoc = Join-Path $dest 'bin\protoc.exe'
+        & $protoc --version
+        if ($LASTEXITCODE -ne 0) { throw "protoc --version exited $LASTEXITCODE" }
+        Join-Path $dest 'bin' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH

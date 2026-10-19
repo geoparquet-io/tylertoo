@@ -615,7 +615,7 @@ jobs:
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc
+        uses: ./.github/actions/install-protoc-windows
 
       - name: Cache cargo (pyo3 build)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -951,7 +951,7 @@ jobs:
       # CI Lint: zizmor (GitHub Actions security linter) on these workflows.
       - name: zizmor
         if: ${{ !cancelled() }}
-        run: uvx zizmor==1.26.1 --min-severity low .github/workflows
+        run: uvx zizmor==1.26.1 --min-severity low .github/workflows .github/actions
         env:
           GH_TOKEN: ${{ github.token }}
 
