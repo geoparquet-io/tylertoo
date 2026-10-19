@@ -8759,6 +8759,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let s = timers.stage_secs();
+        assert!(
+            s.scan_read > 0.0 && s.scan_decode > 0.0 && s.scan_size > 0.0,
+            "the scan must charge its scan_* stages: {} {} {}",
+            s.scan_read,
+            s.scan_decode,
+            s.scan_size
+        );
         (covering, geometry)
     }
 
