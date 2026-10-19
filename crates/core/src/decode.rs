@@ -1815,6 +1815,68 @@ mod tests {
         }
     }
 
+    /// An in-memory source that counts the positioned reads made of it.
+    struct CountingBytes<'a> {
+        bytes: &'a [u8],
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl ArchiveBytes for CountingBytes<'_> {
+        fn total_len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_range(
+            &self,
+            offset: usize,
+            len: usize,
+        ) -> crate::Result<std::borrow::Cow<'_, [u8]>> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(std::borrow::Cow::Borrowed(
+                &self.bytes[offset..offset + len],
+            ))
+        }
+    }
+
+    /// The window is what makes ranged decode as fast as the whole-file read
+    /// (#462), so which reads it serves is pinned, not just their bytes:
+    /// every read inside the window, edges included, costs no source read; a
+    /// back-reference or an over-window body is read on its own and leaves
+    /// the window where it was.
+    #[test]
+    fn tile_reader_serves_the_window_without_rereading() {
+        let w = TILE_READ_WINDOW;
+        let file: Vec<u8> = (0..3 * w + 17).map(|i| (i * 31 % 251) as u8).collect();
+        let src = CountingBytes {
+            bytes: &file,
+            reads: std::cell::Cell::new(0),
+        };
+        let mut reader = TileReader::new(&src);
+        // (start, len, source reads so far)
+        let reads = [
+            (0, 10, 1),      // first read fills [0, w)
+            (5, 5, 1),       // inside it
+            (0, 10, 1),      // starting on its first byte
+            (w - 10, 10, 1), // ending on its last byte
+            (w, 10, 2),      // past it: refill at w
+            (3, 7, 3),       // behind it: read directly
+            (w + 5, 5, 3),   // the window stayed at w
+            (0, w + 1, 4),   // larger than a window: read directly
+            (w + 9, 1, 4),   // the window stayed at w
+            (2 * w, w, 5),   // exactly a window: refill at 2w
+            (2 * w, w, 5),   // the same body again, a run sharing it
+        ];
+        for (start, len, want) in reads {
+            let got = reader.read(start, len).unwrap();
+            assert_eq!(&got[..], &file[start..start + len], "read({start}, {len})");
+            assert_eq!(
+                src.reads.get(),
+                want,
+                "source reads after read({start}, {len})"
+            );
+        }
+    }
+
     #[test]
     fn coltype_unify_lattice() {
         use ColType::*;

@@ -69,6 +69,19 @@ fn plan_file_seeds() {
     replay("plan_file", &[], tylertoo_core::overview::fuzz_convert_plan);
 }
 
+/// `decode_pmtiles` on `archive`, written to a temp file.
+fn decode_report(archive: &[u8]) -> tylertoo_core::decode::DecodeReport {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("seed.pmtiles");
+    std::fs::write(&input, archive).unwrap();
+    tylertoo_core::decode::decode_pmtiles(
+        &input,
+        dir.path().join("seed.parquet"),
+        &tylertoo_core::decode::DecodeOptions::default(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn decode_archive_seeds() {
     replay(
@@ -76,6 +89,19 @@ fn decode_archive_seeds() {
         &[],
         tylertoo_core::decode::fuzz_decode_archive,
     );
+    // The hook must walk the archive `decode` walks: a hook that returned
+    // early would still come back `Ok` and fuzz nothing.
+    for (name, bytes) in seeds("decode_archive") {
+        let (tiles, features) = tylertoo_core::decode::fuzz_decode_archive(&bytes).unwrap();
+        let report = decode_report(&bytes);
+        assert!(tiles > 0, "{name}");
+        assert_eq!(tiles as u64, report.tiles_read, "{name}");
+        assert_eq!(
+            features as u64,
+            report.features_written + report.features_skipped,
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -149,14 +175,41 @@ fn band_archive_seeds() {
     );
 }
 
+/// The tile coordinates `mvt_decode` gives a seed: its first byte picks
+/// the zoom, and the tile is that zoom's south-east corner.
+fn mvt_seed(b: &[u8]) -> (u8, u32, &[u8]) {
+    let (&first, tile) = b.split_first().expect("a zoom byte");
+    let z = first & 31;
+    let max = if z == 0 { 0 } else { (1u32 << z) - 1 };
+    (z, max, tile)
+}
+
 #[test]
 fn mvt_decode_seeds() {
     replay("mvt_decode", &[], |b| {
-        let (&first, tile) = b.split_first().expect("a zoom byte");
-        let z = first & 31;
-        let max = if z == 0 { 0 } else { (1u32 << z) - 1 };
+        let (z, max, tile) = mvt_seed(b);
         tylertoo_core::decode::fuzz_decode_tile(z, max, max, tile)
     });
+    // The hook's counts are `decode`'s for the same tile in an archive.
+    for (name, bytes) in seeds("mvt_decode") {
+        let (z, max, tile) = mvt_seed(&bytes);
+        let (features, with_geometry) =
+            tylertoo_core::decode::fuzz_decode_tile(z, max, max, tile).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("tile.pmtiles");
+        let mut writer =
+            tylertoo_core::StreamingPmtilesWriter::new(tylertoo_core::Compression::None).unwrap();
+        writer.add_tile(z, max, max, tile).unwrap();
+        writer.finalize(&archive).unwrap();
+        let report = decode_report(&std::fs::read(&archive).unwrap());
+        assert!(features > 0, "{name}");
+        assert_eq!(with_geometry as u64, report.features_written, "{name}");
+        assert_eq!(
+            (features - with_geometry) as u64,
+            report.features_skipped,
+            "{name}"
+        );
+    }
 }
 
 #[test]
