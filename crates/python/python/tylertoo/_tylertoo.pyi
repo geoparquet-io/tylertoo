@@ -8,7 +8,7 @@
 from pathlib import Path
 from typing import Any, Literal
 
-__all__ = ["convert", "export_pmtiles", "overview", "validate"]
+__all__ = ["convert", "decode", "export_pmtiles", "overview", "pyramid", "validate"]
 
 def convert(
     input: str,
@@ -20,6 +20,10 @@ def convert(
     simple_clip_fastpath: bool = True,
     feature_order: str = "input",
     spill_dir: str | Path | None = None,
+    *,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
 ) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
@@ -33,30 +37,35 @@ def overview(
     sort_key: str | None = None,
     magnitude_ladder: str | None = None,
     ladder_step: int = 1,
+    entry_zoom: str | None = None,
     sort_direction: str = "desc",
     class_rank_column: str | None = None,
     class_ranks: dict[str, float] | None = None,
     class_rank_unknown: float | None = None,
     no_auto_rank: bool = False,
-    simplify_factor: float = 1.0,
+    verbatim: bool = False,
+    simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
-    line_thinning: float = 1.0,
-    polygon_thinning: float = 1.0,
-    line_visibility: float = 2.0,
-    polygon_visibility: float = 2.0,
+    line_thinning: float | None = None,
+    polygon_thinning: float | None = None,
+    line_visibility: float | None = None,
+    polygon_visibility: float | None = None,
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
-    density_drop: bool = True,
+    density_drop: bool | None = None,
     cluster: bool = False,
     accumulate_attributes: dict[str, str] | None = None,
-    coalesce_lines: bool = True,
+    coalesce_lines: bool | None = None,
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
     cogp_compat: bool = False,
     row_group_size: int = 10_000,
     full_column_stats: bool = False,
@@ -81,7 +90,28 @@ def export_pmtiles(
     partition_wave: int = 0,
     feature_order: str = "input",
     min_zoom: int | None = None,
+    include_properties: list[str] | None = None,
+    exclude_properties: list[str] | None = None,
+    exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | Path | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
+def decode(
+    input: str,
+    output: str,
+    *,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    layer: str | None = None,
+) -> dict[str, Any]: ...
+def pyramid(
+    bands: list[str],
+    output: str,
+    *,
+    generalize: bool = False,
+    tile_size_limit: int | None = None,
+    feature_order: str = "input",
+    work_dir: str | Path | None = None,
+    allow_missing_zooms: bool = False,
+) -> dict[str, Any]: ...

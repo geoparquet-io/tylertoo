@@ -10,6 +10,8 @@ Build GeoParquet overview files and export them to PMTiles archives.
 
 Options and defaults match the CLI. Ground sample distance (GSD) is the meters covered by one pixel at a level. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for generalization options.
 
+Diagnostics go to Python's `logging` under the `tylertoo_core` logger: the warnings and progress lines the CLI prints. Python shows warnings by default; call `logging.basicConfig(level=logging.INFO)` to see progress. Each call reads the logging configuration when it starts.
+
 ## `overview`
 
 ```python
@@ -25,30 +27,35 @@ overview(
     sort_key: str | None = None,
     magnitude_ladder: str | None = None,
     ladder_step: int = 1,
+    entry_zoom: str | None = None,
     sort_direction: Literal['desc', 'asc'] = "desc",
     class_rank_column: str | None = None,
     class_ranks: dict[str, float] | None = None,
     class_rank_unknown: float | None = None,
     no_auto_rank: bool = False,
-    simplify_factor: float = 1.0,
+    verbatim: bool = False,
+    simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
-    line_thinning: float = 1.0,
-    polygon_thinning: float = 1.0,
-    line_visibility: float = 2.0,
-    polygon_visibility: float = 2.0,
+    line_thinning: float | None = None,
+    polygon_thinning: float | None = None,
+    line_visibility: float | None = None,
+    polygon_visibility: float | None = None,
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
-    density_drop: bool = True,
+    density_drop: bool | None = None,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
-    coalesce_lines: bool = True,
+    coalesce_lines: bool | None = None,
     coalesce_snap: float = 1.0,
     coalesce_junction_angle: float = 0.0,
     coalesce_max_level_rows: int = 2_000_000,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     cogp_compat: bool = False,
     row_group_size: int = 10_000,
     full_column_stats: bool = False,
@@ -82,6 +89,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `sort_key`: Numeric column used to choose each cell's winner.
 * `magnitude_ladder`: Column whose values set each feature's first zoom, largest first.
 * `ladder_step`: Zooms between `magnitude_ladder` values.
+* `entry_zoom`: First zoom for listed values of a column, as `"COLUMN:VALUE=ZOOM,VALUE=ZOOM"`, such as `"density:5000=4,1000=6"`. Unlisted values use the normal visibility gate. Not with `magnitude_ladder`.
 * `sort_direction`: Whether larger or smaller `sort_key` values win.
 * `class_rank_column`: String column ranked by `class_ranks`.
 * `class_ranks`: Finite priority per class; higher values win.
@@ -90,19 +98,20 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Geometry and thinning
 
-* `simplify_factor`: Simplification tolerance, in GSDs.
+* `verbatim`: Turn off thinning, visibility gates, simplification, the density budget, and line coalescing, for pre-aggregated or pre-levelled input. Sets the defaults of the options below to off; an option you pass still applies.
+* `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1 (0 with `verbatim`).
 * `collapse`: Represent small polygons as points.
 * `collapse_square`: Represent small polygons as small squares.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
-* `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`).
-* `line_thinning`: Line grid cell size in GSDs.
-* `polygon_thinning`: Polygon grid cell size in GSDs.
-* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs.
-* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs.
+* `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
+* `line_thinning`: Line grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
+* `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
 * `drop_gamma`: How strongly the budget spares sparse areas.
-* `density_drop`: Apply the per-level feature budget.
+* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`).
 
 #### Clustering
 
@@ -111,10 +120,16 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 #### Line coalescing
 
-* `coalesce_lines`: Join touching same-class lines at coarse levels.
+* `coalesce_lines`: Join touching same-class lines at coarse levels, or `None` for on (off with `verbatim`).
 * `coalesce_snap`: Largest gap between joined line ends, in GSDs.
 * `coalesce_junction_angle`: Largest turn through a junction, in degrees. Set `0` to stop at every junction.
 * `coalesce_max_level_rows`: Skip joining above this line count per level to bound memory.
+
+#### Properties
+
+* `include_properties`: Keep only these property columns and skip reading the rest. Columns other options read, such as `sort_key`, must stay in the list. `[]` keeps none.
+* `exclude_properties`: Drop these property columns. `include_properties` overrides it.
+* `exclude_all_properties`: Drop every property column, writing geometry only. `include_properties` overrides it.
 
 #### Output, filtering, and memory
 
@@ -136,7 +151,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 ### Raises
 
-* `ValueError`: Invalid or conflicting options, a missing or mistyped column, an unsupported projection, or almost nothing to tile.
+* `ValueError`: Invalid or conflicting options, a missing or mistyped column, a property selection the input cannot satisfy, an unsupported projection, or almost nothing to tile.
 * `MemoryError`: Too little memory for this input.
 * `RuntimeError`: Reading or writing failed.
 
@@ -165,6 +180,9 @@ export_pmtiles(
     partition_wave: int = 0,
     feature_order: Literal['input'] | str = "input",
     min_zoom: int | None = None,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
 ) -> ExportReport
@@ -184,6 +202,9 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `partition_wave`: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves) at once, or `0` to size from CPUs and RAM.
 * `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
 * `min_zoom`: Coarsest zoom to declare when the coarsest levels are empty.
+* `include_properties`: Keep only these properties in the tiles. The overview file keeps every column, and the `feature_order` column must stay. `[]` keeps none.
+* `exclude_properties`: Drop these properties from the tiles. `include_properties` overrides it.
+* `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
 
@@ -193,7 +214,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 
 ### Raises
 
-* `ValueError`: Invalid `feature_order` syntax.
+* `ValueError`: Invalid `feature_order` syntax, or a property selection the overview file cannot satisfy.
 * `RuntimeError`: Not an overview file, an option is out of range, or reading or writing failed.
 
 ### Example
@@ -202,6 +223,102 @@ Export an overview file to a PMTiles archive, one zoom per level.
 >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
 >>> report["max_zoom"]
 10
+```
+
+## `pyramid`
+
+```python
+pyramid(
+    bands: Sequence[str],
+    output: str,
+    *,
+    generalize: bool = False,
+    tile_size_limit: int | None = None,
+    feature_order: Literal['input'] | str = "input",
+    work_dir: str | os.PathLike[str] | None = None,
+    allow_missing_zooms: bool = False,
+) -> PyramidReport
+```
+
+Build one PMTiles archive from per-zoom-band inputs.
+
+Each band names a zoom range, an input, and an MVT layer. Bands of different layers may share zooms, giving several layers per tile; bands of one layer must not overlap. The output is overwritten if it exists.
+
+### Parameters
+
+* `bands`: Band specs as `"LO-HI:INPUT"` or `"LO-HI:INPUT:LAYER"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=INPUT=LAYER` form.
+* `output`: PMTiles archive to write.
+* `generalize`: Generalize each GeoParquet band, as `overview()` does. By default each band is tiled verbatim, keeping every feature, for input already made for its zooms.
+* `tile_size_limit`: Maximum tile size in bytes for bands tiled here, or `0` or `None` for no limit.
+* `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
+* `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
+* `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
+
+### Returns
+
+[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics.
+
+### Raises
+
+* `ValueError`: A malformed band spec, overlapping bands of one layer, a missing band input, or invalid `feature_order` syntax.
+* `RuntimeError`: A band failed to convert, export, or merge.
+
+### Example
+
+```python
+>>> report = pyramid(
+...     [
+...         "8-9:buildings.parquet:coarse",
+...         "10-12:buildings.parquet:fine",
+...     ],
+...     "pyramid.pmtiles",
+... )
+>>> [band["layer"] for band in report["bands"]]
+['coarse', 'fine']
+```
+
+## `decode`
+
+```python
+decode(
+    input: str,
+    output: str,
+    *,
+    min_zoom: int | None = None,
+    max_zoom: int | None = None,
+    layer: str | None = None,
+) -> DecodeReport
+```
+
+Decode a PMTiles archive of vector tiles back to GeoParquet.
+
+Writes one row per feature per tile: the tiled representation, so features are simplified, clipped at tile edges, and repeated at every zoom and in every tile they cross. The columns are `zoom`, `layer`, `mvt_id`, the properties in name order, then `geometry` as lon/lat (`EPSG:4326`) WKB. The output is overwritten if it exists.
+
+### Parameters
+
+* `input`: PMTiles archive of vector tiles.
+* `output`: GeoParquet file to write.
+* `min_zoom`: Coarsest zoom to decode, or `None` for the archive's coarsest.
+* `max_zoom`: Finest zoom to decode, or `None` for the archive's finest. Set both to one zoom to decode only that zoom.
+* `layer`: Decode only this MVT layer, or `None` for every layer.
+
+### Returns
+
+[`DecodeReport`](#decodereport): Counts of tiles read and features written, with the layers and zooms found.
+
+### Raises
+
+* `ValueError`: `min_zoom` above `max_zoom`, an archive of raster tiles, or a property named like a provenance column.
+* `RuntimeError`: Not a PMTiles archive, a damaged tile, or reading or writing failed.
+
+### Example
+
+```python
+>>> report = decode(
+...     "buildings.pmtiles", "decoded.parquet", min_zoom=10
+... )
+>>> report["layers"], report["zoom_range"]
+(['overview'], (10, 10))
 ```
 
 ## `validate`
@@ -246,6 +363,10 @@ convert(
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
+    *,
+    include_properties: Sequence[str] | None = None,
+    exclude_properties: Sequence[str] | None = None,
+    exclude_all_properties: bool = False,
 ) -> ConvertReport
 ```
 
@@ -264,6 +385,9 @@ Use `overview()` followed by `export_pmtiles()` for all options. Runs the same c
 * `simple_clip_fastpath`: See `export_pmtiles()`.
 * `feature_order`: See `export_pmtiles()`.
 * `spill_dir`: Scratch directory for the intermediate overview and the export's spill (the CLI's `--spill-dir`). The intermediate is at least input-sized; without this it goes to `$TMPDIR`, then the output's directory. Set it when `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised when the chosen volume looks too small.
+* `include_properties`: See `overview()`.
+* `exclude_properties`: See `overview()`.
+* `exclude_all_properties`: See `overview()`.
 
 ### Returns
 
@@ -271,7 +395,7 @@ Use `overview()` followed by `export_pmtiles()` for all options. Runs the same c
 
 ### Raises
 
-* `ValueError`: Invalid zoom range or options.
+* `ValueError`: Invalid zoom range, options, or property selection.
 * `MemoryError`: Too little memory for this input.
 * `RuntimeError`: Conversion or export failed.
 
@@ -421,6 +545,55 @@ class SkippedPropertyColumn(TypedDict):
     name: str
     data_type: str
 ```
+
+### `PyramidReport`
+
+What `pyramid()` merged.
+
+```python
+class PyramidReport(TypedDict):
+    total_tiles: int
+    bands: list[PyramidBandReport]
+    skipped_tiles: int
+    bands_without_bounds: list[str]
+```
+
+* `bands`: One entry per band, by zoom range, coarsest first.
+* `skipped_tiles`: Tiles in a pre-tiled band at zooms outside its declared range, and so left out. Expected when one archive is split across several bands.
+* `bands_without_bounds`: Bands whose archive declared no bounds, and so did not widen the merged archive's bounds.
+
+### `PyramidBandReport`
+
+Tiles one band contributed to a pyramid.
+
+```python
+class PyramidBandReport(TypedDict):
+    layer: str
+    min_zoom: int
+    max_zoom: int
+    tiles: int
+```
+
+### `DecodeReport`
+
+What `decode()` read and wrote.
+
+```python
+class DecodeReport(TypedDict):
+    tiles_read: int
+    features_written: int
+    features_skipped: int
+    layers: list[str]
+    zoom_range: tuple[int, int] | None
+    elapsed_secs: float
+```
+
+* `tiles_read`: Tiles read, after the zoom filter.
+* `features_written`: Feature rows written.
+* `features_skipped`: Features whose geometry decoded to nothing, such as a polygon collapsed at the tile extent.
+* `layers`: MVT layers read, after the layer filter, sorted.
+* `zoom_range`: Coarsest and finest zoom written, or `None` when no feature matched the filters.
+* `elapsed_secs`: Wall-clock seconds.
 
 ### `ValidationReport`
 

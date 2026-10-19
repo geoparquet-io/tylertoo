@@ -223,6 +223,9 @@ pub tylertoo_core::decode::DecodeError::Geometry::x: u32
 pub tylertoo_core::decode::DecodeError::Geometry::y: u32
 pub tylertoo_core::decode::DecodeError::Geometry::z: u8
 pub tylertoo_core::decode::DecodeError::InvalidArchive(alloc::string::String)
+pub tylertoo_core::decode::DecodeError::InvalidZoomRange
+pub tylertoo_core::decode::DecodeError::InvalidZoomRange::max_zoom: u8
+pub tylertoo_core::decode::DecodeError::InvalidZoomRange::min_zoom: u8
 pub tylertoo_core::decode::DecodeError::Io(core::io::error::Error)
 pub tylertoo_core::decode::DecodeError::Mvt
 pub tylertoo_core::decode::DecodeError::Mvt::source: prost::error::DecodeError
@@ -268,6 +271,8 @@ pub struct tylertoo_core::decode::DecodeOptions
 pub tylertoo_core::decode::DecodeOptions::layer: core::option::Option<alloc::string::String>
 pub tylertoo_core::decode::DecodeOptions::max_zoom: core::option::Option<u8>
 pub tylertoo_core::decode::DecodeOptions::min_zoom: core::option::Option<u8>
+impl tylertoo_core::decode::DecodeOptions
+pub fn tylertoo_core::decode::DecodeOptions::validate(&self) -> core::result::Result<(), tylertoo_core::decode::DecodeError>
 impl core::clone::Clone for tylertoo_core::decode::DecodeOptions
 pub fn tylertoo_core::decode::DecodeOptions::clone(&self) -> tylertoo_core::decode::DecodeOptions
 impl core::default::Default for tylertoo_core::decode::DecodeOptions
@@ -1365,6 +1370,8 @@ pub struct tylertoo_core::overview::convert::ClassRanking
 pub tylertoo_core::overview::convert::ClassRanking::column: alloc::string::String
 pub tylertoo_core::overview::convert::ClassRanking::ranks: alloc::vec::Vec<(alloc::string::String, f64)>
 pub tylertoo_core::overview::convert::ClassRanking::unknown_rank: f64
+impl tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::ClassRanking::new(impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<(alloc::string::String, f64)>, core::option::Option<f64>) -> core::result::Result<Self, alloc::string::String>
 impl core::clone::Clone for tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::ClassRanking::clone(&self) -> tylertoo_core::overview::convert::ClassRanking
 impl core::cmp::PartialEq for tylertoo_core::overview::convert::ClassRanking
@@ -1418,6 +1425,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
+pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::clone(&self) -> tylertoo_core::overview::convert::ConvertOptions
 impl core::default::Default for tylertoo_core::overview::convert::ConvertOptions
@@ -1466,6 +1474,32 @@ impl core::marker::Unpin for tylertoo_core::overview::convert::ConvertReport
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::ConvertReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::ConvertReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::ConvertReport
+pub struct tylertoo_core::overview::convert::GeneralizationOverrides
+pub tylertoo_core::overview::convert::GeneralizationOverrides::coalesce_lines: core::option::Option<bool>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::density_drop: core::option::Option<bool>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::line_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::line_visibility: core::option::Option<f64>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::point_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::polygon_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::polygon_visibility: core::option::Option<f64>
+pub tylertoo_core::overview::convert::GeneralizationOverrides::simplify_factor: core::option::Option<f64>
+impl core::clone::Clone for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::clone(&self) -> tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::cmp::PartialEq for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::eq(&self, &tylertoo_core::overview::convert::GeneralizationOverrides) -> bool
+impl core::default::Default for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::default() -> tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::fmt::Debug for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::Freeze for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::Send for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::Sync for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::Unpin for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::convert::GeneralizationOverrides
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::GeneralizationOverrides
 pub struct tylertoo_core::overview::convert::LevelReport
 pub tylertoo_core::overview::convert::LevelReport::compressed_bytes: i64
 pub tylertoo_core::overview::convert::LevelReport::feature_count: usize
@@ -3374,6 +3408,7 @@ pub fn tylertoo_core::pyramid::build_pyramid(&[tylertoo_core::pyramid::Band], &s
 pub fn tylertoo_core::pyramid::classify_band_input(&std::path::Path) -> tylertoo_core::pyramid::BandSource
 pub fn tylertoo_core::pyramid::merge_bands(&[tylertoo_core::pyramid::Band], &std::path::Path) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::merge_bands_with_options(&[tylertoo_core::pyramid::Band], &std::path::Path, bool) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
+pub fn tylertoo_core::pyramid::parse_bands<S: core::convert::AsRef<str>>(&[S]) -> core::result::Result<alloc::vec::Vec<tylertoo_core::pyramid::Band>, alloc::string::String>
 pub fn tylertoo_core::pyramid::validate_bands(&[tylertoo_core::pyramid::Band]) -> core::result::Result<(), alloc::string::String>
 pub mod tylertoo_core::quality
 pub struct tylertoo_core::quality::CrsInfo

@@ -985,7 +985,9 @@ impl ConvertTuningArgs {
         cogp_compat: bool,
     ) -> Result<tylertoo_core::overview::convert::ConvertOptions> {
         use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-        use tylertoo_core::overview::convert::{parse_representation_spec, ConvertOptions};
+        use tylertoo_core::overview::convert::{
+            parse_representation_spec, ConvertOptions, GeneralizationOverrides,
+        };
         use tylertoo_core::overview::level::{MemoryProfile, Mode};
         use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
         use tylertoo_core::overview::writer::RowGroupSizePolicy;
@@ -1005,35 +1007,25 @@ impl ConvertTuningArgs {
             }
         };
 
-        // `--verbatim` supplies DEFAULTS, it does not override. Each knob
-        // falls back to 0 (off) under the flag and to its ladder default
-        // otherwise, so an explicitly-passed value always wins and
-        // `--verbatim --simplify-factor 0.5` means what the docs say it means.
-        // Applying it wholesale after the fact would silently discard the
-        // override — the same mistake `--max-tile-size` already avoids.
-        let ladder = AssignConfig::default();
-        let tuned = |explicit: Option<f64>, default: f64| {
-            explicit.unwrap_or(if self.verbatim { 0.0 } else { default })
+        // `--verbatim` supplies DEFAULTS, it does not override: an explicitly
+        // passed knob always wins, so `--verbatim --simplify-factor 0.5`
+        // means what the docs say it means. Core owns the rule (#445) and
+        // applies it once the options are complete, below.
+        let overrides = GeneralizationOverrides {
+            point_thinning: self.point_thinning,
+            line_thinning: self.line_thinning,
+            polygon_thinning: self.polygon_thinning,
+            line_visibility: self.line_visibility,
+            polygon_visibility: self.polygon_visibility,
+            simplify_factor: self.simplify_factor,
+            // No positive spelling exists for either, so `--verbatim`
+            // cannot be overriding an explicit request here.
+            density_drop: self.no_density_drop.then_some(false),
+            coalesce_lines: self.no_coalesce_lines.then_some(false),
         };
-
-        // Cluster-conditional default: with --cluster, absorbed points are
-        // summarized (point_count), so the sparser 16.0 grid is the better look.
-        let point_thinning = tuned(
-            self.point_thinning,
-            if self.cluster {
-                tylertoo_core::overview::assign::CLUSTER_POINT_THINNING_DEFAULT
-            } else {
-                ladder.point_thinning
-            },
-        );
-
         let assign = AssignConfig {
-            point_thinning,
-            line_thinning: tuned(self.line_thinning, ladder.line_thinning),
-            polygon_thinning: tuned(self.polygon_thinning, ladder.polygon_thinning),
-            line_visibility: tuned(self.line_visibility, ladder.line_visibility),
-            polygon_visibility: tuned(self.polygon_visibility, ladder.polygon_visibility),
             sort_direction: SortDirection::Desc,
+            ..AssignConfig::default()
         };
 
         // --class-rank and --sort-key are mutually exclusive (also enforced in core).
@@ -1093,8 +1085,6 @@ impl ConvertTuningArgs {
                  chain cannot satisfy"
             );
         }
-        let coalesce_lines = !self.no_coalesce_lines && !self.verbatim;
-
         // Zoom-band representation selector (#317 / #279); structural
         // validity against the plan is enforced by core convert validation.
         let representation = match &self.representation {
@@ -1112,10 +1102,8 @@ impl ConvertTuningArgs {
             class_ranking,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
-                factor: tuned(
-                    self.simplify_factor,
-                    tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
-                ),
+                // Set with the other generalization knobs, below.
+                factor: tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
                 // --collapse and --collapse-square are mutually exclusive
                 // (clap conflicts_with); both default off = drop (#279).
                 //
@@ -1140,9 +1128,8 @@ impl ConvertTuningArgs {
             },
             representation,
             density: DensityBudgetConfig {
-                // No positive spelling exists for either, so `--verbatim`
-                // cannot be overriding an explicit request here.
-                enabled: !self.no_density_drop && !self.verbatim,
+                // Set with the other generalization knobs, below.
+                enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
             },
@@ -1158,7 +1145,7 @@ impl ConvertTuningArgs {
             read_workers: self.read_workers,
             cluster: self.cluster,
             accumulate,
-            coalesce_lines,
+            coalesce_lines: true,
             coalesce_snap: self.coalesce_snap,
             coalesce_max_level_rows: self.coalesce_max_level_rows,
             coalesce_junction_angle: self.coalesce_junction_angle,
@@ -1179,25 +1166,9 @@ impl ConvertTuningArgs {
             zoom_ceiling: None,
         };
 
-        // Logged because "no features were dropped" is a surprising thing to
-        // infer from a quiet run — and the message has to tell the truth about
-        // a composed run, where an override means the output is NOT verbatim.
-        if self.verbatim {
-            if options.is_verbatim() {
-                log::info!(
-                    "[convert] --verbatim: generalization off (no thinning, no \
-                     visibility gates, no simplification, no density budget, no \
-                     line coalescing); every level reproduces the input"
-                );
-            } else {
-                log::info!(
-                    "[convert] --verbatim with overrides: generalization is off \
-                     except where you set it explicitly, so some features or \
-                     vertices may still be dropped"
-                );
-            }
-        }
-        Ok(options)
+        // Last, because the defaults read `cluster` and the logged summary
+        // reads `entry_zoom`.
+        Ok(options.with_generalization(&overrides, self.verbatim)?)
     }
 }
 
@@ -2987,34 +2958,10 @@ fn print_skipped_property_columns(
     );
 }
 
-/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
-/// the segment `Band::parse` peeled off its end, the `=LAYER` suffix that was
-/// stripped — for callers that want to hint "was this actually part of the
-/// path?" when the stripped-down input then fails an existence check.
-///
-/// Mirrors `Band::parse`'s own separator choice (`=` wins whichever of `:`
-/// and `=` appears first) without reaching into its private helpers: this is
-/// a best-effort hint, not a re-parse, so a false negative here just means no
-/// hint is offered, not a wrong answer.
-fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
-    let colon = spec.find(':');
-    let equals = spec.find('=');
-    let is_equals_form = match (colon, equals) {
-        (Some(c), Some(e)) => e < c,
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    if !is_equals_form {
-        return None;
-    }
-    let suffix = format!("={layer}");
-    spec.ends_with(&suffix).then_some(suffix)
-}
-
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band};
+    use tylertoo_core::pyramid::{build_pyramid, parse_bands};
 
     if args.output.exists() && !args.force {
         anyhow::bail!(
@@ -3025,52 +2972,9 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // #452: the archive is created only after every band is tiled.
     preflight_writable(&args.output)?;
 
-    let bands = args
-        .bands
-        .iter()
-        .map(|s| Band::parse(s).map_err(|e| anyhow::anyhow!(e)))
-        .collect::<Result<Vec<_>>>()?;
-    validate_bands(&bands).map_err(|e| anyhow::anyhow!(e))?;
-
-    // Report a missing band input here, naming it, rather than letting the
-    // reader fail later with a bare "No such file or directory" and no path.
-    //
-    // This cannot be a `classify_band_input` check: that returns `Archive` only
-    // when the file opens, so a missing path always classifies as `Source` and
-    // the kind tells us nothing about whether it exists. What it can be is a
-    // plain existence test, skipped for the three spellings where `exists()`
-    // has no useful answer — a remote URL, a glob, and anything else the
-    // reader resolves itself.
-    for (spec, b) in args.bands.iter().zip(&bands) {
-        let spelled = b.input.to_string_lossy();
-        let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
-        if !deferred && !b.input.exists() {
-            let mut msg = format!("band input not found: {}", b.input.display());
-            // A bare Hive partition dir spec like
-            // `0-13=admin:country_code=BR` (no trailing filename) silently
-            // parses as INPUT=admin:country_code, LAYER=BR: the trailing
-            // `=BR` looked like an explicit layer, so it was stripped from
-            // the path. If that is what happened here, say so — a bare
-            // "not found" gives no hint that a layer was ever peeled off.
-            if let Some(suffix) = stripped_equals_layer_suffix(spec, &b.layer) {
-                let candidate = format!("{}{suffix}", b.input.display());
-                if std::path::Path::new(&candidate).exists() {
-                    msg.push_str(&format!(
-                        "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
-                         parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
-                         the path, append an explicit =LAYER instead"
-                    ));
-                } else {
-                    msg.push_str(&format!(
-                        "\n  hint: the trailing {suffix:?} was parsed as a layer name \
-                         (LO-HI=INPUT=LAYER); if it is part of the path, append an \
-                         explicit =LAYER instead"
-                    ));
-                }
-            }
-            anyhow::bail!(msg);
-        }
-    }
+    // Spec parsing, band-set validation and the band-input existence check
+    // (with its stripped-`=LAYER` hint) all live in core (#445).
+    let bands = parse_bands(&args.bands).map_err(|e| anyhow::anyhow!(e))?;
 
     let opts = pyramid_options(&args);
 
@@ -3389,16 +3293,13 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
         Some(z) => (Some(z), Some(z)),
         None => (args.min_zoom, args.max_zoom),
     };
-    if let (Some(lo), Some(hi)) = (min_zoom, max_zoom) {
-        if lo > hi {
-            anyhow::bail!("--min-zoom {lo} exceeds --max-zoom {hi}");
-        }
-    }
     let options = DecodeOptions {
         min_zoom,
         max_zoom,
         layer: args.layer,
     };
+    // Before the "Decoding" line, so an inverted range prints nothing else.
+    options.validate()?;
 
     say!(
         "Decoding {} → {}",

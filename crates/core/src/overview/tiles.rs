@@ -257,8 +257,8 @@ pub struct IntermediateOverview {
     pub retained: bool,
     /// The #314 free-space preflight's warning, when the volume holding the
     /// intermediate looked too small for it. Already logged (`log::warn`);
-    /// carried here so a binding without a log bridge can surface it (the
-    /// Python `convert()` raises it as a `UserWarning`). `None` when the
+    /// carried here so a caller can surface it more loudly than a log line
+    /// (the Python `convert()` also raises it as a `UserWarning`). `None` when the
     /// volume fits or either side of the comparison is unknowable.
     pub space_warning: Option<String>,
 }
