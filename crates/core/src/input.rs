@@ -504,14 +504,15 @@ pub(crate) mod remote {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use bytes::Bytes;
-    use object_store::aws::{AmazonS3Builder, AwsCredential};
-    use object_store::gcp::GoogleCloudStorageBuilder;
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
+    use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
     use object_store::http::HttpBuilder;
     use object_store::path::Path as ObjectPath;
     // ObjectStoreExt: object_store 0.14 moved `get_range` and `head` off the
     // base trait onto an extension trait.
     use object_store::{
-        ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt, ObjectStoreScheme,
+        ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
+        ObjectStoreScheme,
     };
     use parquet::arrow::arrow_reader::{
         ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
@@ -630,20 +631,30 @@ pub(crate) mod remote {
         if let Some(store) = stores.lock().expect("store cache lock").get(&key) {
             return Ok((Arc::clone(store), location));
         }
+        let overrides = effective_client_overrides();
         let store: Arc<dyn ObjectStore> = match scheme {
             ObjectStoreScheme::AmazonS3 => build_s3(&url)?,
             ObjectStoreScheme::GoogleCloudStorage => Arc::new(
-                GoogleCloudStorageBuilder::from_env()
-                    .with_url(url_str)
+                overrides
+                    .iter()
+                    .fold(
+                        GoogleCloudStorageBuilder::from_env().with_url(url_str),
+                        |b, (k, v)| b.with_config(GoogleConfigKey::Client(*k), v),
+                    )
                     .build()
                     .map_err(|e| store_error(url_str, e))?,
             ),
             ObjectStoreScheme::Http => {
                 let origin = &url[..url::Position::BeforePath];
                 Arc::new(
-                    HttpBuilder::new()
-                        .with_url(origin)
-                        .with_client_options(ClientOptions::new().with_allow_http(true))
+                    overrides
+                        .iter()
+                        .fold(
+                            HttpBuilder::new()
+                                .with_url(origin)
+                                .with_client_options(ClientOptions::new().with_allow_http(true)),
+                            |b, (k, v)| b.with_config(*k, v),
+                        )
                         .build()
                         .map_err(|e| store_error(url_str, e))?,
                 )
@@ -965,15 +976,31 @@ pub(crate) mod remote {
             &self,
             selected: Option<&[usize]>,
         ) -> Result<(), InputError> {
+            self.stage_row_groups_with(selected, staging_tunables::effective())
+        }
+
+        /// [`Self::stage_row_groups`] with explicit tunables: the test seam,
+        /// so a test can pin the window or concurrency without touching the
+        /// process environment that [`staging_tunables::effective`] reads.
+        fn stage_row_groups_with(
+            &self,
+            selected: Option<&[usize]>,
+            tunables: &staging_tunables::StagingTunables,
+        ) -> Result<(), InputError> {
             let metadata = self.load_footer()?;
             let row_groups = metadata.metadata().row_groups();
 
-            let indices: Vec<usize> = match selected {
-                Some(sel) => sel.to_vec(),
-                None => (0..row_groups.len()).collect(),
-            };
-            let mut plan: Vec<StagedRowGroup> = Vec::with_capacity(indices.len());
-            for rg in indices.into_iter().filter_map(|i| row_groups.get(i)) {
+            let mut is_selected = vec![selected.is_none(); row_groups.len()];
+            for &i in selected.unwrap_or_default() {
+                if let Some(s) = is_selected.get_mut(i) {
+                    *s = true;
+                }
+            }
+            let mut plan: Vec<StagedSpan> = Vec::new();
+            // Spans of the unselected row groups: a coalesced request must
+            // never reach into one (#219/#210 — pruned bytes stay unfetched).
+            let mut blocked: Vec<Range<u64>> = Vec::new();
+            for (rg, &keep) in row_groups.iter().zip(&is_selected) {
                 let mut start = u64::MAX;
                 let mut end = 0u64;
                 let mut chunks = Vec::with_capacity(rg.columns().len());
@@ -981,32 +1008,46 @@ pub(crate) mod remote {
                     let (s, len) = col.byte_range();
                     // Checked (#430): `load_footer` validated these, but a
                     // wrapped span here would fetch the wrong bytes.
-                    let chunk_end = s
+                    let checked = s
                         .checked_add(len)
                         .filter(|e| *e <= self.size)
-                        .zip(usize::try_from(len).ok())
-                        .ok_or_else(|| {
-                            ParquetError::EOF(format!(
-                                "column chunk range {s}..{} beyond object size {} for {}",
-                                s as u128 + len as u128,
-                                self.size,
-                                self.location
-                            ))
-                        })?;
+                        .zip(usize::try_from(len).ok());
+                    if checked.is_none() && !keep {
+                        // A pruned group is never fetched, so its bad range
+                        // is not this call's error; block through the end of
+                        // the object so no merge can reach into it.
+                        start = start.min(s);
+                        end = self.size;
+                        continue;
+                    }
+                    let chunk_end = checked.ok_or_else(|| {
+                        ParquetError::EOF(format!(
+                            "column chunk range {s}..{} beyond object size {} for {}",
+                            s as u128 + len as u128,
+                            self.size,
+                            self.location
+                        ))
+                    })?;
                     start = start.min(s);
                     end = end.max(chunk_end.0);
                     chunks.push((s, chunk_end.1));
                 }
-                if end > start {
-                    plan.push(StagedRowGroup {
+                if end <= start {
+                    continue;
+                }
+                if keep {
+                    plan.push(StagedSpan {
                         span: start..end,
                         chunks,
                     });
+                } else {
+                    blocked.push(start..end);
                 }
             }
             if plan.is_empty() {
                 return Ok(());
             }
+            let plan = coalesce_spans(plan, &blocked, tunables.coalesce_window);
 
             // Bound in-flight (resident) spans by the memory budget: holding
             // one row group transiently matches the L1 cache ceiling, so never
@@ -1016,15 +1057,14 @@ pub(crate) mod remote {
                 .map(|r| r.span.end - r.span.start)
                 .max()
                 .unwrap_or(0);
-            let tunables = staging_tunables::effective();
             let concurrency = match max_span {
                 0 => 1,
                 s => ((tunables.mem_budget / s).max(1) as usize).min(tunables.max_concurrency),
             };
             staging_tunables::log_live_concurrency(tunables, concurrency, max_span);
             log::debug!(
-                "[stage] fetching {} row-group span(s), {concurrency} in \
-                 flight (largest span {max_span} B)",
+                "[stage] fetching {} span(s), {concurrency} in flight \
+                 (largest span {max_span} B)",
                 plan.len()
             );
 
@@ -1043,7 +1083,7 @@ pub(crate) mod remote {
                             .get_range(&location, rg.span.clone())
                             .await
                             .map_err(|e| ParquetError::External(Box::new(e)))?;
-                        Ok::<(StagedRowGroup, Bytes), ParquetError>((rg, bytes))
+                        Ok::<(StagedSpan, Bytes), ParquetError>((rg, bytes))
                     }
                 }))
                 .buffer_unordered(concurrency);
@@ -1219,10 +1259,74 @@ pub(crate) mod remote {
         if anonymous {
             builder = builder.with_skip_signature(true);
         }
+        for (k, v) in effective_client_overrides() {
+            builder = builder.with_config(AmazonS3ConfigKey::Client(*k), v);
+        }
 
         Ok(Arc::new(builder.build().map_err(|e| {
             InputError::RemoteConfig(format!("cannot configure S3 store for {url}: {e}"))
         })?))
+    }
+
+    /// Prefix of the `object_store` client-option overrides (#290 dimension 4):
+    /// `TYLERTOO_HTTP_<KEY>=<value>` sets client option `<key>` (lowercased,
+    /// e.g. `TYLERTOO_HTTP_HTTP2_ONLY=true`, `TYLERTOO_HTTP_TIMEOUT=60s`) on
+    /// every remote store, whatever the scheme, so one sweep knob works on
+    /// both https and s3 hosts. Experimental, like the `TYLERTOO_STAGING_*`
+    /// knobs: see `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
+    const CLIENT_VAR_PREFIX: &str = "TYLERTOO_HTTP_";
+
+    /// Parse `TYLERTOO_HTTP_*` variables out of `vars` into client options,
+    /// sorted by key so the log line is stable. An unknown key is skipped
+    /// with a warning naming the variable; the *value* is parsed by
+    /// `object_store` when the store is built, so a malformed one fails that
+    /// build with an error naming the key. Pure (no environment access), so
+    /// it is unit-testable; [`effective_client_overrides`] feeds it the
+    /// process environment.
+    fn client_overrides(
+        vars: impl IntoIterator<Item = (String, String)>,
+    ) -> (Vec<(ClientConfigKey, String)>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        for (name, value) in vars {
+            let Some(suffix) = name.strip_prefix(CLIENT_VAR_PREFIX) else {
+                continue;
+            };
+            match suffix.to_ascii_lowercase().parse::<ClientConfigKey>() {
+                Ok(key) => out.push((key, value)),
+                Err(_) => warnings.push(format!(
+                    "{name} names no object_store client option; ignoring it"
+                )),
+            }
+        }
+        out.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        (out, warnings)
+    }
+
+    /// The process-wide client overrides: resolved from the environment once,
+    /// on the first store build, logging warnings plus one info line naming
+    /// the overrides in force (so a #290 sweep run records what it tested).
+    fn effective_client_overrides() -> &'static [(ClientConfigKey, String)] {
+        static CELL: OnceLock<Vec<(ClientConfigKey, String)>> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let vars = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+            let (overrides, warnings) = client_overrides(vars);
+            for w in &warnings {
+                log::warn!("[remote] {w}");
+            }
+            if !overrides.is_empty() {
+                let list: Vec<String> = overrides
+                    .iter()
+                    .map(|(k, v)| format!("{}={v}", k.as_ref()))
+                    .collect();
+                log::info!(
+                    "[remote] client options from {CLIENT_VAR_PREFIX}*: {}",
+                    list.join(", ")
+                );
+            }
+            overrides
+        })
     }
 
     /// Bridges the AWS SDK credential chain (profiles, SSO, IMDS, ...) into
@@ -1279,19 +1383,28 @@ pub(crate) mod remote {
     /// ([`staging_tunables`], #290).
     const STAGE_MEM_BUDGET: u64 = CHUNK_CACHE_MAX_BYTES;
 
-    /// Pass-0 staging tunables (#290): the two staging constants above, each
+    /// Staging coalescing window (#290 dimension 2): adjacent selected row
+    /// groups merge into one range request while the merged span stays at or
+    /// under this many bytes; a pruned row group always splits a merge. `0`
+    /// (the default) keeps one request per row group, as #289 shipped.
+    /// Overridable via `TYLERTOO_STAGING_COALESCE_BYTES`
+    /// ([`staging_tunables`]).
+    const STAGE_COALESCE_WINDOW: u64 = 0;
+
+    /// Pass-0 staging tunables (#290): the staging constants above, each
     /// overridable through a `TYLERTOO_STAGING_*` environment variable so the
     /// #290 parameter sweep can vary them per run without rebuilding.
     /// Experimental sweep knobs, not stable API — see
     /// `docs/OVERVIEW_TUNING.md` ("Remote staging (env)").
     ///
-    /// The knobs change I/O *scheduling* only (how many coalesced range
-    /// requests are in flight at once): the same bytes are staged into the
+    /// The knobs change I/O *scheduling* only (how many range requests are in
+    /// flight at once, and where one request ends and the next begins): the
+    /// same bytes are staged into the
     /// same spill slots keyed by chunk offset, and both passes consume them
     /// through the reader's unchanged path, so output stays byte-identical
     /// whatever the values.
     mod staging_tunables {
-        use super::{STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
+        use super::{STAGE_COALESCE_WINDOW, STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
 
         /// Override for [`STAGE_MAX_CONCURRENCY`]: ceiling on in-flight
         /// row-group spans.
@@ -1299,6 +1412,8 @@ pub(crate) mod remote {
         /// Override for [`STAGE_MEM_BUDGET`]: transient-memory budget, in
         /// bytes (same unit as `TYLERTOO_AUTO_MEM_LIMIT_BYTES`).
         pub(super) const MEM_BUDGET_VAR: &str = "TYLERTOO_STAGING_MEM_BUDGET_BYTES";
+        /// Override for [`STAGE_COALESCE_WINDOW`], in bytes.
+        pub(super) const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
 
         /// Hard ceiling on the concurrency override: each in-flight span is a
         /// task holding a whole row group's bytes, so an absurd value is a
@@ -1307,6 +1422,10 @@ pub(crate) mod remote {
         /// Floor for the budget override: below ~1 MiB the budget-derived
         /// concurrency is pinned to 1 anyway, and a 0 budget is pathological.
         const MEM_BUDGET_MIN: u64 = 1024 * 1024;
+        /// Ceiling on the window override: a merged span is held whole in
+        /// memory while it downloads, so past 1 GiB the window is a memory
+        /// bomb rather than a sweep point.
+        pub(super) const COALESCE_MAX: u64 = 1024 * 1024 * 1024;
 
         /// The resolved staging knobs. Defaults are the constants that were
         /// hardcoded before #290's minimum landed.
@@ -1317,7 +1436,10 @@ pub(crate) mod remote {
             /// Transient-memory budget in bytes ([`MEM_BUDGET_VAR`]); live
             /// concurrency is `min(max_concurrency, mem_budget / largest span)`.
             pub(super) mem_budget: u64,
-            /// Was either variable set? Only [`effective`] knows (the
+            /// Largest merged span, in bytes ([`COALESCE_VAR`]); `0` = one
+            /// request per row group.
+            pub(super) coalesce_window: u64,
+            /// Was any variable set? Only [`effective`] knows (the
             /// resolver's `lookup` seam cannot distinguish "unset" from
             /// "set to the default"), so [`resolve`] always leaves this
             /// false; it exists to decide the log level of the effective
@@ -1330,6 +1452,7 @@ pub(crate) mod remote {
                 Self {
                     max_concurrency: STAGE_MAX_CONCURRENCY,
                     mem_budget: STAGE_MEM_BUDGET,
+                    coalesce_window: STAGE_COALESCE_WINDOW,
                     overridden: false,
                 }
             }
@@ -1364,10 +1487,19 @@ pub(crate) mod remote {
                 u64::MAX,
                 &mut warnings,
             );
+            let coalesce_window = resolve_one(
+                &lookup,
+                COALESCE_VAR,
+                STAGE_COALESCE_WINDOW,
+                0,
+                COALESCE_MAX,
+                &mut warnings,
+            );
             (
                 StagingTunables {
                     max_concurrency,
                     mem_budget,
+                    coalesce_window,
                     overridden: false,
                 },
                 warnings,
@@ -1441,8 +1573,9 @@ pub(crate) mod remote {
             static CELL: OnceLock<StagingTunables> = OnceLock::new();
             CELL.get_or_init(|| {
                 let lookup = |name: &str| std::env::var(name).ok();
-                let overridden =
-                    lookup(CONCURRENCY_VAR).is_some() || lookup(MEM_BUDGET_VAR).is_some();
+                let overridden = [CONCURRENCY_VAR, MEM_BUDGET_VAR, COALESCE_VAR]
+                    .iter()
+                    .any(|v| lookup(v).is_some());
                 let (mut tunables, warnings) = resolve(lookup);
                 tunables.overridden = overridden;
                 for w in &warnings {
@@ -1450,8 +1583,9 @@ pub(crate) mod remote {
                 }
                 let line = format!(
                     "[stage] staging tunables: concurrency ceiling={} \
-                     ({CONCURRENCY_VAR}), mem budget={} B ({MEM_BUDGET_VAR})",
-                    tunables.max_concurrency, tunables.mem_budget
+                     ({CONCURRENCY_VAR}), mem budget={} B ({MEM_BUDGET_VAR}), \
+                     coalesce window={} B ({COALESCE_VAR})",
+                    tunables.max_concurrency, tunables.mem_budget, tunables.coalesce_window
                 );
                 if overridden {
                     log::info!("{line}");
@@ -1496,13 +1630,49 @@ pub(crate) mod remote {
         }
     }
 
-    /// One selected row group's staging plan: its contiguous byte span and
-    /// the `(chunk_start, len)` of every column chunk inside it — keyed
+    /// One staging request: a contiguous byte span covering one selected row
+    /// group, or several adjacent ones once [`coalesce_spans`] merges them,
+    /// plus the `(chunk_start, len)` of every column chunk inside it — keyed
     /// exactly how the L2 spill and [`RemoteReader::chunk_data`] look chunks
     /// up (`chunk.start`), so a staged slice is a drop-in L2 hit.
-    struct StagedRowGroup {
+    struct StagedSpan {
         span: Range<u64>,
         chunks: Vec<(u64, usize)>,
+    }
+
+    /// Merge adjacent row-group spans into fewer, larger requests (#290
+    /// dimension 2). Neighbours in file order merge while the merged span
+    /// stays within `window` bytes and no `blocked` (unselected) row group
+    /// lies between them; unowned bytes between two selected spans count
+    /// toward the window. `window == 0` returns one span per row group, and a
+    /// row group larger than the window stays a request of its own.
+    ///
+    /// Only request boundaries move: every chunk keeps its own spill slot, so
+    /// the staged bytes, and the output, do not change.
+    fn coalesce_spans(
+        mut plan: Vec<StagedSpan>,
+        blocked: &[Range<u64>],
+        window: u64,
+    ) -> Vec<StagedSpan> {
+        plan.sort_by_key(|s| s.span.start);
+        let mut out: Vec<StagedSpan> = Vec::with_capacity(plan.len());
+        for next in plan {
+            if let Some(cur) = out.last_mut() {
+                let gap = cur.span.end..next.span.start;
+                let fits = next.span.end.saturating_sub(cur.span.start) <= window;
+                let clear = gap.start <= gap.end
+                    && !blocked
+                        .iter()
+                        .any(|b| b.start < gap.end && gap.start < b.end);
+                if fits && clear {
+                    cur.span.end = next.span.end;
+                    cur.chunks.extend(next.chunks);
+                    continue;
+                }
+            }
+            out.push(next);
+        }
+        out
     }
 
     /// On-disk overflow for fetched column chunks (issue #219).
@@ -1889,7 +2059,8 @@ pub(crate) mod remote {
         //! touched, so these are safe under parallel test execution.
 
         use super::staging_tunables::{
-            resolve, StagingTunables, CONCURRENCY_MAX, CONCURRENCY_VAR, MEM_BUDGET_VAR,
+            resolve, StagingTunables, COALESCE_MAX, COALESCE_VAR, CONCURRENCY_MAX, CONCURRENCY_VAR,
+            MEM_BUDGET_VAR,
         };
         use super::{STAGE_MAX_CONCURRENCY, STAGE_MEM_BUDGET};
 
@@ -2062,6 +2233,301 @@ pub(crate) mod remote {
             );
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains(CONCURRENCY_VAR), "{}", warnings[0]);
+        }
+
+        #[test]
+        fn coalesce_window_defaults_to_off() {
+            let (t, warnings) = resolve(env(&[]));
+            assert_eq!(t.coalesce_window, 0, "default is one request per row group");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+
+        #[test]
+        fn coalesce_window_override_is_honored_and_clamped() {
+            let (t, warnings) = resolve(env(&[(COALESCE_VAR, "67108864")]));
+            assert_eq!(t.coalesce_window, 64 * 1024 * 1024);
+            assert!(warnings.is_empty(), "{warnings:?}");
+
+            let (t, warnings) = resolve(env(&[(COALESCE_VAR, "99999999999")]));
+            assert_eq!(t.coalesce_window, COALESCE_MAX);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(COALESCE_VAR), "{}", warnings[0]);
+
+            let (t, warnings) = resolve(env(&[(COALESCE_VAR, "big")]));
+            assert_eq!(t.coalesce_window, 0);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(COALESCE_VAR), "{}", warnings[0]);
+        }
+    }
+
+    #[cfg(test)]
+    mod coalesce_tests {
+        //! #290 dimension 2: merge adjacent selected row-group spans into one
+        //! request up to a window, never across a pruned row group.
+
+        use super::staging_tunables::StagingTunables;
+        use super::{coalesce_spans, StagedSpan};
+        use crate::input::InputSource;
+        use std::ops::Range;
+
+        /// A span over `range` whose chunks are two halves of it.
+        fn span(range: Range<u64>) -> StagedSpan {
+            let mid = range.start + (range.end - range.start) / 2;
+            StagedSpan {
+                chunks: vec![
+                    (range.start, (mid - range.start) as usize),
+                    (mid, (range.end - mid) as usize),
+                ],
+                span: range,
+            }
+        }
+
+        fn spans(out: &[StagedSpan]) -> Vec<Range<u64>> {
+            out.iter().map(|s| s.span.clone()).collect()
+        }
+
+        #[test]
+        fn window_zero_keeps_one_request_per_row_group() {
+            let plan = vec![span(4..104), span(104..204), span(204..304)];
+            let out = coalesce_spans(plan, &[], 0);
+            assert_eq!(spans(&out), vec![4..104, 104..204, 204..304]);
+        }
+
+        #[test]
+        fn adjacent_spans_merge_up_to_the_window() {
+            let plan = vec![
+                span(4..104),
+                span(104..204),
+                span(204..304),
+                span(304..404),
+                span(404..504),
+            ];
+            // 200 B window: pairs merge, the fifth stays alone.
+            let out = coalesce_spans(plan, &[], 200);
+            assert_eq!(spans(&out), vec![4..204, 204..404, 404..504]);
+            // Every chunk survives the merge, in file order.
+            assert_eq!(out[0].chunks.len(), 4);
+            assert_eq!(out[0].chunks[0], (4, 50));
+            assert_eq!(out[0].chunks[3], (154, 50));
+        }
+
+        #[test]
+        fn a_large_window_merges_everything_contiguous() {
+            let plan = vec![span(4..104), span(104..204), span(204..304)];
+            let out = coalesce_spans(plan, &[], u64::MAX);
+            assert_eq!(spans(&out), vec![4..304]);
+            assert_eq!(out[0].chunks.len(), 6);
+        }
+
+        #[test]
+        fn never_bridges_a_pruned_row_group() {
+            // Row group 104..204 was pruned: its bytes must never be fetched
+            // (#219/#210), however large the window.
+            let plan = vec![span(4..104), span(204..304), span(304..404)];
+            let pruned = 104..204;
+            let out = coalesce_spans(plan, std::slice::from_ref(&pruned), u64::MAX);
+            assert_eq!(spans(&out), vec![4..104, 204..404]);
+        }
+
+        #[test]
+        fn out_of_order_input_is_merged_in_file_order() {
+            let plan = vec![span(204..304), span(4..104), span(104..204)];
+            let out = coalesce_spans(plan, &[], u64::MAX);
+            assert_eq!(spans(&out), vec![4..304]);
+            let starts: Vec<u64> = out[0].chunks.iter().map(|c| c.0).collect();
+            assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
+        }
+
+        #[test]
+        fn an_oversized_span_stays_a_single_request() {
+            let plan = vec![span(4..504), span(504..554), span(554..604)];
+            let out = coalesce_spans(plan, &[], 100);
+            assert_eq!(spans(&out), vec![4..504, 504..604]);
+        }
+
+        #[test]
+        fn a_gap_between_selected_spans_is_bridged_only_within_the_window() {
+            // Unowned bytes (no row group) between two selected spans, e.g.
+            // padding: bridging them is safe, but they count toward the window.
+            let plan = vec![span(4..104), span(120..220)];
+            assert_eq!(spans(&coalesce_spans(plan, &[], 216)), vec![4..220]);
+            let plan = vec![span(4..104), span(120..220)];
+            assert_eq!(
+                spans(&coalesce_spans(plan, &[], 215)),
+                vec![4..104, 120..220]
+            );
+        }
+
+        /// `groups` row groups of `rows` rows each.
+        fn multi_rg_parquet(rows: usize, groups: usize) -> Vec<u8> {
+            use arrow_array::{Int64Array, RecordBatch};
+            use parquet::file::properties::WriterProperties;
+            use std::sync::Arc;
+
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(rows))
+                .build();
+            let values: Vec<i64> = (0..(rows * groups) as i64).collect();
+            let batch =
+                RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(values)) as _)])
+                    .unwrap();
+            let mut buf = Vec::new();
+            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
+                .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            buf
+        }
+
+        fn tunables(window: u64) -> StagingTunables {
+            StagingTunables {
+                coalesce_window: window,
+                ..StagingTunables::default()
+            }
+        }
+
+        /// Stage through the seam; return (requests, ranges) the staging added.
+        fn stage(
+            source: &InputSource,
+            selected: Option<&[usize]>,
+            window: u64,
+        ) -> (u64, Vec<Range<u64>>) {
+            let InputSource::Remote(r) = source else {
+                unreachable!()
+            };
+            let _ = source.open().unwrap(); // footer first, so it is not counted
+            let before = source.fetch_stats().unwrap().requests;
+            let ranges_before = source.fetched_ranges().unwrap().len();
+            r.stage_row_groups_with(selected, &tunables(window))
+                .unwrap();
+            let after = source.fetch_stats().unwrap().requests;
+            let ranges = source.fetched_ranges().unwrap()[ranges_before..].to_vec();
+            (after - before, ranges)
+        }
+
+        #[test]
+        fn a_large_window_stages_every_row_group_in_one_request() {
+            let bytes = multi_rg_parquet(1000, 5);
+            let source = crate::input::test_memory_source(bytes, "w.parquet");
+            let (requests, _) = stage(&source, None, u64::MAX);
+            assert_eq!(requests, 1, "5 contiguous row groups, one window");
+
+            // The passes then read entirely from the spill: no more requests,
+            // and every value comes back.
+            let before = source.fetch_stats().unwrap().requests;
+            let reader = source.open().unwrap().build().unwrap();
+            let mut sum = 0i64;
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                sum += col.iter().flatten().sum::<i64>();
+            }
+            assert_eq!(sum, (0..5000i64).sum::<i64>());
+            assert_eq!(
+                source.fetch_stats().unwrap().requests,
+                before,
+                "staged chunks must serve the read without the network"
+            );
+        }
+
+        #[test]
+        fn window_zero_keeps_one_request_per_row_group_end_to_end() {
+            let bytes = multi_rg_parquet(1000, 5);
+            let source = crate::input::test_memory_source(bytes, "w0.parquet");
+            let (requests, _) = stage(&source, None, 0);
+            assert_eq!(requests, 5);
+        }
+
+        #[test]
+        fn a_large_window_never_fetches_a_pruned_row_group() {
+            let bytes = multi_rg_parquet(1000, 5);
+            let md = parquet::file::metadata::ParquetMetaDataReader::new()
+                .parse_and_finish(&bytes::Bytes::from(bytes.clone()))
+                .unwrap();
+            let pruned = md.row_group(2);
+            let lo = pruned
+                .columns()
+                .iter()
+                .map(|c| c.byte_range().0)
+                .min()
+                .unwrap();
+            let hi = pruned
+                .columns()
+                .iter()
+                .map(|c| c.byte_range().0 + c.byte_range().1)
+                .max()
+                .unwrap();
+
+            let source = crate::input::test_memory_source(bytes, "wp.parquet");
+            let (requests, ranges) = stage(&source, Some(&[0, 1, 3, 4]), u64::MAX);
+            assert_eq!(requests, 2, "0+1 and 3+4, split at the pruned group");
+            for r in ranges {
+                assert!(
+                    r.end <= lo || r.start >= hi,
+                    "range {r:?} overlaps pruned row group {lo}..{hi}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod client_override_tests {
+        //! #290 dimension 4: `TYLERTOO_HTTP_<KEY>` → `object_store` client option.
+
+        use super::client_overrides;
+        use object_store::ClientConfigKey;
+
+        fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn no_vars_means_no_overrides() {
+            let (o, w) = client_overrides(vars(&[("PATH", "/bin"), ("AWS_REGION", "x")]));
+            assert!(o.is_empty() && w.is_empty(), "{o:?} {w:?}");
+        }
+
+        #[test]
+        fn known_keys_map_to_client_config_keys() {
+            let (o, w) = client_overrides(vars(&[
+                ("TYLERTOO_HTTP_HTTP2_ONLY", "true"),
+                ("TYLERTOO_HTTP_POOL_MAX_IDLE_PER_HOST", "4"),
+            ]));
+            assert!(w.is_empty(), "{w:?}");
+            assert!(o.contains(&(ClientConfigKey::Http2Only, "true".to_string())));
+            assert!(o.contains(&(ClientConfigKey::PoolMaxIdlePerHost, "4".to_string())));
+        }
+
+        #[test]
+        fn key_suffix_is_case_insensitive() {
+            let (o, w) = client_overrides(vars(&[("TYLERTOO_HTTP_http1_only", "true")]));
+            assert!(w.is_empty(), "{w:?}");
+            assert_eq!(o, vec![(ClientConfigKey::Http1Only, "true".to_string())]);
+        }
+
+        #[test]
+        fn unknown_keys_warn_naming_the_variable_and_are_skipped() {
+            let (o, w) = client_overrides(vars(&[("TYLERTOO_HTTP_WARP_SPEED", "9")]));
+            assert!(o.is_empty(), "{o:?}");
+            assert_eq!(w.len(), 1);
+            assert!(w[0].contains("TYLERTOO_HTTP_WARP_SPEED"), "{}", w[0]);
+        }
+
+        #[test]
+        fn output_is_sorted_so_the_log_line_is_stable() {
+            let (o, _) = client_overrides(vars(&[
+                ("TYLERTOO_HTTP_TIMEOUT", "60s"),
+                ("TYLERTOO_HTTP_CONNECT_TIMEOUT", "10s"),
+            ]));
+            let keys: Vec<String> = o.iter().map(|(k, _)| k.as_ref().to_string()).collect();
+            assert_eq!(keys, vec!["connect_timeout", "timeout"]);
         }
     }
 
