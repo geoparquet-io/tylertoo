@@ -8,7 +8,7 @@
 from pathlib import Path
 from typing import Any, Literal
 
-__all__ = ["convert", "decode", "export_pmtiles", "overview", "validate"]
+__all__ = ["convert", "decode", "export_pmtiles", "overview", "pyramid", "validate"]
 
 def convert(
     input: str,
@@ -104,4 +104,14 @@ def decode(
     min_zoom: int | None = None,
     max_zoom: int | None = None,
     layer: str | None = None,
+) -> dict[str, Any]: ...
+def pyramid(
+    bands: list[str],
+    output: str,
+    *,
+    generalize: bool = False,
+    tile_size_limit: int | None = None,
+    feature_order: str = "input",
+    work_dir: str | Path | None = None,
+    allow_missing_zooms: bool = False,
 ) -> dict[str, Any]: ...

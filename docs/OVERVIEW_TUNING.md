@@ -1159,8 +1159,8 @@ map.setFeatureState({ source, sourceLayer, id }, { hover: true });
   give features that share an id, and feature state then applies to all
   of them at once.
 
-`pyramid` does not take `--feature-id`, and neither does the Python
-`convert()` one-shot. Use `overview()` and then
+`pyramid` does not take `--feature-id`, and neither do the Python
+`pyramid()` and `convert()` one-shot. Use `overview()` and then
 `export_pmtiles(..., feature_id=...)` instead.
 
 ---

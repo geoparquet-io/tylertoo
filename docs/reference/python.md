@@ -225,6 +225,58 @@ Export an overview file to a PMTiles archive, one zoom per level.
 10
 ```
 
+## `pyramid`
+
+```python
+pyramid(
+    bands: Sequence[str],
+    output: str,
+    *,
+    generalize: bool = False,
+    tile_size_limit: int | None = None,
+    feature_order: Literal['input'] | str = "input",
+    work_dir: str | os.PathLike[str] | None = None,
+    allow_missing_zooms: bool = False,
+) -> PyramidReport
+```
+
+Build one PMTiles archive from per-zoom-band inputs.
+
+Each band names a zoom range, an input, and an MVT layer. Bands of different layers may share zooms, giving several layers per tile; bands of one layer must not overlap. The output is overwritten if it exists.
+
+### Parameters
+
+* `bands`: Band specs as `"LO-HI:INPUT"` or `"LO-HI:INPUT:LAYER"`, such as `"0-7:countries.parquet:admin"`. `INPUT` is a GeoParquet source or a PMTiles archive for zooms `LO` to `HI`; `LAYER` defaults to the input's file stem. See the [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/) for the `LO-HI=INPUT=LAYER` form.
+* `output`: PMTiles archive to write.
+* `generalize`: Generalize each GeoParquet band, as `overview()` does. By default each band is tiled verbatim, keeping every feature, for input already made for its zooms.
+* `tile_size_limit`: Maximum tile size in bytes for bands tiled here, or `0` or `None` for no limit.
+* `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
+* `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
+* `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
+
+### Returns
+
+[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics.
+
+### Raises
+
+* `ValueError`: A malformed band spec, overlapping bands of one layer, a missing band input, or invalid `feature_order` syntax.
+* `RuntimeError`: A band failed to convert, export, or merge.
+
+### Example
+
+```python
+>>> report = pyramid(
+...     [
+...         "8-9:buildings.parquet:coarse",
+...         "10-12:buildings.parquet:fine",
+...     ],
+...     "pyramid.pmtiles",
+... )
+>>> [band["layer"] for band in report["bands"]]
+['coarse', 'fine']
+```
+
 ## `decode`
 
 ```python
@@ -492,6 +544,34 @@ A property column omitted because MVT cannot encode its type.
 class SkippedPropertyColumn(TypedDict):
     name: str
     data_type: str
+```
+
+### `PyramidReport`
+
+What `pyramid()` merged.
+
+```python
+class PyramidReport(TypedDict):
+    total_tiles: int
+    bands: list[PyramidBandReport]
+    skipped_tiles: int
+    bands_without_bounds: list[str]
+```
+
+* `bands`: One entry per band, by zoom range, coarsest first.
+* `skipped_tiles`: Tiles in a pre-tiled band at zooms outside its declared range, and so left out. Expected when one archive is split across several bands.
+* `bands_without_bounds`: Bands whose archive declared no bounds, and so did not widen the merged archive's bounds.
+
+### `PyramidBandReport`
+
+Tiles one band contributed to a pyramid.
+
+```python
+class PyramidBandReport(TypedDict):
+    layer: str
+    min_zoom: int
+    max_zoom: int
+    tiles: int
 ```
 
 ### `DecodeReport`

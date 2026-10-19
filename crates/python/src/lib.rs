@@ -30,6 +30,7 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::overview::tiles::{
     convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
 };
+use tylertoo_core::pyramid::{build_pyramid, parse_bands, PyramidOptions};
 
 /// The installed log bridge's cache handle (#445), set once at import.
 static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
@@ -989,6 +990,69 @@ fn decode_error_to_py(e: DecodeError) -> PyErr {
     }
 }
 
+/// Native body of `tylertoo.pyramid()`.
+///
+/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
+/// passes every argument here by keyword.
+#[pyfunction]
+#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false))]
+#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
+fn pyramid(
+    py: Python<'_>,
+    bands: Vec<String>,
+    output: &str,
+    generalize: bool,
+    tile_size_limit: Option<usize>,
+    feature_order: &str,
+    work_dir: Option<PathBuf>,
+    allow_missing_zooms: bool,
+) -> PyResult<Py<PyDict>> {
+    refresh_log_levels();
+    // Spec grammar, band-set rules and the input-exists check are core's,
+    // shared with the CLI's `--band` (#445).
+    let bands = parse_bands(&bands).map_err(PyErr::new::<PyValueError, _>)?;
+    let mut options = PyramidOptions {
+        work_dir,
+        allow_missing_zooms,
+        ..PyramidOptions::default()
+    };
+    // The default tiles each GeoParquet band verbatim (an aggregate band
+    // must keep every feature); `generalize` runs the normal ladder, as the
+    // CLI's `--generalize` does.
+    if generalize {
+        options.convert = ConvertOptions::default();
+    }
+    // 0 (or None) disables the cap; any positive value is the byte limit.
+    options.export.tile_size_limit = tile_size_limit.filter(|&n| n > 0);
+    options.export.feature_order = parse_feature_order(feature_order)?;
+    let output_path = Path::new(output).to_path_buf();
+
+    let report = py
+        .detach(|| build_pyramid(&bands, &output_path, &options))
+        .map_err(|e| {
+            PyErr::new::<PyRuntimeError, _>(format!("pyramid build failed: {}", with_sources(&e)))
+        })?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("total_tiles", report.total_tiles)?;
+    let per_band = PyList::empty(py);
+    for (layer, min_zoom, max_zoom, tiles) in &report.per_band_tiles {
+        let d = PyDict::new(py);
+        d.set_item("layer", layer)?;
+        d.set_item("min_zoom", min_zoom)?;
+        d.set_item("max_zoom", max_zoom)?;
+        d.set_item("tiles", tiles)?;
+        per_band.append(d)?;
+    }
+    dict.set_item("bands", per_band)?;
+    dict.set_item("skipped_tiles", report.skipped)?;
+    dict.set_item(
+        "bands_without_bounds",
+        PyList::new(py, &report.bands_without_bounds)?,
+    )?;
+    Ok(dict.into())
+}
+
 /// The compiled extension, imported as `tylertoo._tylertoo`.
 ///
 /// `python/tylertoo/__init__.py` wraps it with the public, typed API.
@@ -1013,5 +1077,6 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
+    m.add_function(wrap_pyfunction!(pyramid, m)?)?;
     Ok(())
 }
