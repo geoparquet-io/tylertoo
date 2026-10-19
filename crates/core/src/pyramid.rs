@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
@@ -378,7 +378,7 @@ pub fn classify_band_input(path: &Path) -> BandSource {
 /// one layer share a zoom, or if a band names a remote `.pmtiles` archive.
 pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     if bands.is_empty() {
-        return Err("a pyramid needs at least one --band".to_string());
+        return Err("a pyramid needs at least one band".to_string());
     }
     for band in bands {
         if let Some(msg) = remote_archive_rejection(&band.input) {
@@ -1543,8 +1543,10 @@ pub fn build_pyramid(
     }
 
     // Keeps every intermediate alive for the merge and unlinks them on drop —
-    // including the early-return paths below.
-    let mut scratch: Vec<NamedTempFile> = Vec::new();
+    // including the early-return paths below. TempPaths, not open
+    // NamedTempFiles: convert and export publish by renaming a sibling over
+    // the path, which Windows refuses while a handle to it is open (#678).
+    let mut scratch: Vec<TempPath> = Vec::new();
     let mut tiled: Vec<Band> = Vec::with_capacity(bands.len());
 
     for (band, kind) in bands.iter().zip(&kinds) {
@@ -1573,13 +1575,14 @@ pub fn build_pyramid(
             },
         );
 
-        let named = |suffix: &str| -> Result<NamedTempFile, Error> {
+        let named = |suffix: &str| -> Result<TempPath, Error> {
             let mut b = tempfile::Builder::new();
             b.prefix("tylertoo-pyramid-").suffix(suffix);
             match &opts.work_dir {
                 Some(dir) => b.tempfile_in(dir),
                 None => b.tempfile(),
             }
+            .map(NamedTempFile::into_temp_path)
             .map_err(|e| Error::PMTilesWrite(format!("band {:?}: {e}", band.layer)))
         };
 
@@ -1593,7 +1596,7 @@ pub fn build_pyramid(
             },
             ..opts.convert.clone()
         };
-        convert_to_overviews(&band.input, overview.path(), &convert).map_err(|e| {
+        convert_to_overviews(&band.input, &overview, &convert).map_err(|e| {
             Error::PMTilesWrite(format!("band {:?}: convert failed: {e}", band.layer))
         })?;
 
@@ -1612,12 +1615,12 @@ pub fn build_pyramid(
                 .or_else(|| opts.work_dir.clone()),
             ..opts.export.clone()
         };
-        export_pmtiles(overview.path(), archive.path(), &export).map_err(|e| {
+        export_pmtiles(&overview, &archive, &export).map_err(|e| {
             Error::PMTilesWrite(format!("band {:?}: export failed: {e}", band.layer))
         })?;
 
         tiled.push(Band {
-            input: archive.path().to_path_buf(),
+            input: archive.to_path_buf(),
             layer: band.layer.clone(),
             min_zoom: band.min_zoom,
             max_zoom: band.max_zoom,
