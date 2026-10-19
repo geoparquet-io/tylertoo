@@ -2958,34 +2958,10 @@ fn print_skipped_property_columns(
     );
 }
 
-/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
-/// the segment `Band::parse` peeled off its end, the `=LAYER` suffix that was
-/// stripped — for callers that want to hint "was this actually part of the
-/// path?" when the stripped-down input then fails an existence check.
-///
-/// Mirrors `Band::parse`'s own separator choice (`=` wins whichever of `:`
-/// and `=` appears first) without reaching into its private helpers: this is
-/// a best-effort hint, not a re-parse, so a false negative here just means no
-/// hint is offered, not a wrong answer.
-fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
-    let colon = spec.find(':');
-    let equals = spec.find('=');
-    let is_equals_form = match (colon, equals) {
-        (Some(c), Some(e)) => e < c,
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    if !is_equals_form {
-        return None;
-    }
-    let suffix = format!("={layer}");
-    spec.ends_with(&suffix).then_some(suffix)
-}
-
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
 /// facade over `tylertoo_core::pyramid::merge_bands`).
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
-    use tylertoo_core::pyramid::{build_pyramid, validate_bands, Band};
+    use tylertoo_core::pyramid::{build_pyramid, parse_bands};
 
     if args.output.exists() && !args.force {
         anyhow::bail!(
@@ -2996,52 +2972,9 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     // #452: the archive is created only after every band is tiled.
     preflight_writable(&args.output)?;
 
-    let bands = args
-        .bands
-        .iter()
-        .map(|s| Band::parse(s).map_err(|e| anyhow::anyhow!(e)))
-        .collect::<Result<Vec<_>>>()?;
-    validate_bands(&bands).map_err(|e| anyhow::anyhow!(e))?;
-
-    // Report a missing band input here, naming it, rather than letting the
-    // reader fail later with a bare "No such file or directory" and no path.
-    //
-    // This cannot be a `classify_band_input` check: that returns `Archive` only
-    // when the file opens, so a missing path always classifies as `Source` and
-    // the kind tells us nothing about whether it exists. What it can be is a
-    // plain existence test, skipped for the three spellings where `exists()`
-    // has no useful answer — a remote URL, a glob, and anything else the
-    // reader resolves itself.
-    for (spec, b) in args.bands.iter().zip(&bands) {
-        let spelled = b.input.to_string_lossy();
-        let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
-        if !deferred && !b.input.exists() {
-            let mut msg = format!("band input not found: {}", b.input.display());
-            // A bare Hive partition dir spec like
-            // `0-13=admin:country_code=BR` (no trailing filename) silently
-            // parses as INPUT=admin:country_code, LAYER=BR: the trailing
-            // `=BR` looked like an explicit layer, so it was stripped from
-            // the path. If that is what happened here, say so — a bare
-            // "not found" gives no hint that a layer was ever peeled off.
-            if let Some(suffix) = stripped_equals_layer_suffix(spec, &b.layer) {
-                let candidate = format!("{}{suffix}", b.input.display());
-                if std::path::Path::new(&candidate).exists() {
-                    msg.push_str(&format!(
-                        "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
-                         parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
-                         the path, append an explicit =LAYER instead"
-                    ));
-                } else {
-                    msg.push_str(&format!(
-                        "\n  hint: the trailing {suffix:?} was parsed as a layer name \
-                         (LO-HI=INPUT=LAYER); if it is part of the path, append an \
-                         explicit =LAYER instead"
-                    ));
-                }
-            }
-            anyhow::bail!(msg);
-        }
-    }
+    // Spec parsing, band-set validation and the band-input existence check
+    // (with its stripped-`=LAYER` hint) all live in core (#445).
+    let bands = parse_bands(&args.bands).map_err(|e| anyhow::anyhow!(e))?;
 
     let opts = pyramid_options(&args);
 

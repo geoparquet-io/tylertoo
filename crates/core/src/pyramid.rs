@@ -428,6 +428,90 @@ pub fn validate_bands(bands: &[Band]) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse and check a list of `LO-HI:INPUT[:LAYER]` band specs.
+///
+/// Each spec goes through [`Band::parse`], the set through
+/// [`validate_bands`], then each local input is checked for existence
+/// (#445: shared by the CLI's `--band` and the Python `pyramid(bands=...)`).
+///
+/// The existence check names the missing input up front rather than letting
+/// the reader fail later with a bare "No such file or directory" and no
+/// path. It is a plain existence test, skipped where `exists()` has no
+/// useful answer: a remote URL and a glob, which the reader resolves itself.
+/// (It cannot be a [`classify_band_input`] check: that returns `Archive` only
+/// when the file opens, so a missing path always classifies as `Source`.)
+///
+/// # Errors
+///
+/// The first problem found, as a message: a malformed spec, an invalid band
+/// set, or a local input that does not exist.
+pub fn parse_bands<S: AsRef<str>>(specs: &[S]) -> Result<Vec<Band>, String> {
+    let bands = specs
+        .iter()
+        .map(|s| Band::parse(s.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_bands(&bands)?;
+    for (spec, band) in specs.iter().zip(&bands) {
+        check_band_input_exists(spec.as_ref(), band)?;
+    }
+    Ok(bands)
+}
+
+/// [`parse_bands`]' existence check for one band.
+fn check_band_input_exists(spec: &str, band: &Band) -> Result<(), String> {
+    let spelled = band.input.to_string_lossy();
+    let deferred = spelled.contains("://") || spelled.contains(['*', '?', '[']);
+    if deferred || band.input.exists() {
+        return Ok(());
+    }
+    let mut msg = format!("band input not found: {}", band.input.display());
+    // A bare Hive partition dir spec like `0-13=admin:country_code=BR` (no
+    // trailing filename) silently parses as INPUT=admin:country_code,
+    // LAYER=BR: the trailing `=BR` looked like an explicit layer, so it was
+    // stripped from the path. If that is what happened here, say so — a bare
+    // "not found" gives no hint that a layer was ever peeled off.
+    if let Some(suffix) = stripped_equals_layer_suffix(spec, &band.layer) {
+        let candidate = format!("{}{suffix}", band.input.display());
+        if Path::new(&candidate).exists() {
+            msg.push_str(&format!(
+                "\n  hint: {candidate:?} exists — the trailing {suffix:?} was \
+                 parsed as a layer name (LO-HI=INPUT=LAYER); if it is part of \
+                 the path, append an explicit =LAYER instead"
+            ));
+        } else {
+            msg.push_str(&format!(
+                "\n  hint: the trailing {suffix:?} was parsed as a layer name \
+                 (LO-HI=INPUT=LAYER); if it is part of the path, append an \
+                 explicit =LAYER instead"
+            ));
+        }
+    }
+    Err(msg)
+}
+
+/// If `spec` is the `LO-HI=INPUT=LAYER` escape form and `layer` is exactly
+/// the segment [`Band::parse`] peeled off its end, the `=LAYER` suffix that
+/// was stripped — for the "was this actually part of the path?" hint when
+/// the stripped-down input then fails the existence check.
+///
+/// Mirrors [`Band::parse`]'s separator choice (`=` wins whichever of `:` and
+/// `=` appears first): this is a best-effort hint, not a re-parse, so a false
+/// negative here just means no hint is offered, not a wrong answer.
+fn stripped_equals_layer_suffix(spec: &str, layer: &str) -> Option<String> {
+    let colon = spec.find(':');
+    let equals = spec.find('=');
+    let is_equals_form = match (colon, equals) {
+        (Some(c), Some(e)) => e < c,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if !is_equals_form {
+        return None;
+    }
+    let suffix = format!("={layer}");
+    spec.ends_with(&suffix).then_some(suffix)
+}
+
 /// Whether any two bands share a zoom (necessarily in different layers once
 /// [`validate_bands`] has passed).
 fn bands_share_zooms(bands: &[Band]) -> bool {
@@ -2080,6 +2164,62 @@ mod tests {
         decode_directory, offsets_are_clustered, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES,
     };
     use std::collections::HashMap;
+
+    /// #445: `parse_bands` names a missing local input instead of letting
+    /// the reader fail later without a path.
+    #[test]
+    fn parse_bands_names_a_missing_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.parquet");
+        let err = parse_bands(&[format!("0-5:{}", missing.display())]).unwrap_err();
+        assert!(err.starts_with("band input not found: "), "{err}");
+        assert!(err.contains("nope.parquet"), "{err}");
+        assert!(!err.contains("hint"), "{err}");
+    }
+
+    /// The `=LAYER` escape form strips a trailing `=X`; when the unstripped
+    /// path exists, the error says so.
+    #[test]
+    fn parse_bands_hints_at_a_stripped_equals_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = dir.path().join("admin:country_code=BR");
+        std::fs::create_dir(&hive).unwrap();
+        let spec = format!("0-13={}", hive.display());
+        let err = parse_bands(&[spec]).unwrap_err();
+        assert!(err.starts_with("band input not found: "), "{err}");
+        assert!(err.contains("hint: "), "{err}");
+        assert!(err.contains("exists"), "{err}");
+
+        // Same spelling, nothing on disk: still the hint, without "exists".
+        let gone = dir.path().join("other:country_code=FR");
+        let err = parse_bands(&[format!("0-13={}", gone.display())]).unwrap_err();
+        assert!(err.contains("hint: the trailing \"=FR\""), "{err}");
+    }
+
+    /// Remote URLs and globs are resolved by the reader, so they skip the
+    /// existence check.
+    #[test]
+    fn parse_bands_defers_urls_and_globs() {
+        let bands = parse_bands(&[
+            "0-5:s3://bucket/a.parquet:a",
+            "6-9:/nonexistent/dir/*.parquet:b",
+        ])
+        .unwrap();
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0].layer, "a");
+        assert_eq!((bands[1].min_zoom, bands[1].max_zoom), (6, 9));
+    }
+
+    /// Spec and set errors come through unchanged, before any existence
+    /// check.
+    #[test]
+    fn parse_bands_propagates_parse_and_validation_errors() {
+        let none: [&str; 0] = [];
+        assert!(parse_bands(&none).unwrap_err().contains("at least one"));
+        assert!(parse_bands(&["nonsense"]).is_err());
+        let err = parse_bands(&["0-5:/x/a.parquet:l", "5-9:/x/b.parquet:l"]).unwrap_err();
+        assert!(err.contains("overlap"), "{err}");
+    }
 
     /// A band input is classified by content, not by name: `.pmtiles` is a
     /// convention and a source can be a glob, a directory or a URL that no
