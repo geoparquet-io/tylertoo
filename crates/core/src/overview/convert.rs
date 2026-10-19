@@ -288,6 +288,48 @@ pub struct ClassRanking {
     pub unknown_rank: f64,
 }
 
+impl ClassRanking {
+    /// Build a ranking from `(value, priority)` pairs, enforcing the rules
+    /// every spelling of a class ranking shares (#445: the `--class-rank`
+    /// string via [`parse_class_rank`], and the Python `class_ranks` dict):
+    ///
+    /// - at least one pair;
+    /// - every priority, and an explicit `unknown_rank`, finite (#428). A NaN
+    ///   is not ordered, so the incumbent of a contested cell would silently
+    ///   keep it; and the `min` fold below ignores NaN, so one would leave the
+    ///   derived unknown rank at +inf — unlisted values outranking every
+    ///   listed class, the inverse of the documented rule;
+    /// - `unknown_rank` defaulting to `min(priorities) - 1`, so unlisted values
+    ///   lose to every listed class but still beat nulls.
+    ///
+    /// # Errors
+    ///
+    /// A description of the first rule broken.
+    pub fn new(
+        column: impl Into<String>,
+        ranks: Vec<(String, f64)>,
+        unknown_rank: Option<f64>,
+    ) -> Result<Self, String> {
+        const NOT_FINITE: &str =
+            "must be a finite number (NaN and infinity cannot be ordered against other classes)";
+        if ranks.is_empty() {
+            return Err("at least one class rank is required".to_string());
+        }
+        if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
+            return Err(format!("rank {rank} for class {value:?} {NOT_FINITE}"));
+        }
+        if let Some(unknown) = unknown_rank.filter(|u| !u.is_finite()) {
+            return Err(format!("unknown-class rank {unknown} {NOT_FINITE}"));
+        }
+        let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
+        Ok(Self {
+            column: column.into(),
+            ranks,
+            unknown_rank: unknown_rank.unwrap_or(min_rank - 1.0),
+        })
+    }
+}
+
 /// Upper bound on how many `(value, priority)` pairs are echoed into the
 /// footer provenance block (§3.5). Larger maps record only the mode + column.
 const MAX_PROVENANCE_RANKS: usize = 64;
@@ -2398,13 +2440,9 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
         ));
     }
 
-    // Unknown values must lose to every named class but beat nulls.
-    let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
-    Ok(ClassRanking {
-        column: column.to_string(),
-        ranks,
-        unknown_rank: min_rank - 1.0,
-    })
+    // The shared rules (unknown values lose to every named class but beat
+    // nulls); the per-entry messages above already named any offender.
+    ClassRanking::new(column, ranks, None)
 }
 
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
@@ -11476,6 +11514,29 @@ mod tests {
 
     /// The rest of the `--class-rank` grammar (#439): trimmed parts, and the
     /// malformed shapes each named in the error.
+    #[test]
+    fn class_ranking_new_derives_the_unknown_rank_below_every_class() {
+        let cr =
+            ClassRanking::new("cls", vec![("a".into(), 3.0), ("b".into(), -2.0)], None).unwrap();
+        assert_eq!(cr.column, "cls");
+        assert_eq!(cr.unknown_rank, -3.0);
+        let cr = ClassRanking::new("cls", vec![("a".into(), 3.0)], Some(10.0)).unwrap();
+        assert_eq!(cr.unknown_rank, 10.0);
+    }
+
+    #[test]
+    fn class_ranking_new_rejects_empty_and_non_finite() {
+        assert!(ClassRanking::new("c", vec![], None)
+            .unwrap_err()
+            .contains("at least one"));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = ClassRanking::new("c", vec![("a".into(), bad)], None).unwrap_err();
+            assert!(err.contains("finite") && err.contains("\"a\""), "{err}");
+            let err = ClassRanking::new("c", vec![("a".into(), 1.0)], Some(bad)).unwrap_err();
+            assert!(err.contains("finite") && err.contains("unknown"), "{err}");
+        }
+    }
+
     #[test]
     fn parse_class_rank_grammar() {
         let cr = parse_class_rank(" cls : a = 2 , b = 1 ,").unwrap();

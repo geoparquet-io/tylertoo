@@ -401,6 +401,36 @@ fn accumulate_specs(
         .collect()
 }
 
+/// The `class_rank_column` / `class_ranks` / `class_rank_unknown` kwargs as
+/// core's [`ClassRanking`]. The pairing rules are Python-shaped (the CLI
+/// spells all three as one `--class-rank` string); the ranking rules — at
+/// least one class, finite ranks (#428), unknown defaulting below every
+/// class — are core's, shared with `--class-rank` through
+/// [`ClassRanking::new`].
+fn class_ranking_from_kwargs(
+    has_sort_key: bool,
+    class_rank_column: Option<String>,
+    class_ranks: Option<BTreeMap<String, f64>>,
+    class_rank_unknown: Option<f64>,
+) -> PyResult<Option<ClassRanking>> {
+    if has_sort_key && class_rank_column.is_some() {
+        return Err(PyErr::new::<PyValueError, _>(
+            "sort_key and class_rank_column are mutually exclusive; supply at most one",
+        ));
+    }
+    match (class_rank_column, class_ranks) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(PyErr::new::<PyValueError, _>(
+            "class_rank_column and class_ranks must be supplied together",
+        )),
+        (Some(column), Some(ranks)) => {
+            ClassRanking::new(column, ranks.into_iter().collect(), class_rank_unknown)
+                .map(Some)
+                .map_err(|e| PyErr::new::<PyValueError, _>(format!("class_ranks: {e}")))
+        }
+    }
+}
+
 /// Native body of `tylertoo.overview()`.
 ///
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
@@ -551,60 +581,12 @@ fn overview(
         },
     };
 
-    // Class ranking: column and ranks must be supplied together; the unknown
-    // rank defaults to min(ranks) - 1 so unlisted values lose to every listed
-    // class but still beat nulls (mirrors the CLI's --class-rank parsing).
-    if sort_key.is_some() && class_rank_column.is_some() {
-        return Err(PyErr::new::<PyValueError, _>(
-            "sort_key and class_rank_column are mutually exclusive; supply at most one",
-        ));
-    }
-    // TODO(#445): the two rules below — the #428 finite check and the
-    // `unknown_rank = min(ranks) - 1.0` derivation — are also in core's
-    // `parse_class_rank`, which #439 made the one home for the *string*
-    // grammar. This dict-shaped input cannot reuse that parser, so the
-    // consolidation is a shared fallible constructor (e.g.
-    // `ClassRanking::with_ranks`) called by both. Behaviourally identical
-    // today; raised by the #439 review.
-    let class_ranking = match (class_rank_column, class_ranks) {
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(PyErr::new::<PyValueError, _>(
-                "class_rank_column and class_ranks must be supplied together",
-            ))
-        }
-        (Some(column), Some(ranks)) => {
-            if ranks.is_empty() {
-                return Err(PyErr::new::<PyValueError, _>(
-                    "class_ranks must contain at least one value: rank entry",
-                ));
-            }
-            // Ranks must be finite (#428), mirroring the CLI's --class-rank
-            // parsing. A NaN is not ordered, so the incumbent of a contested
-            // cell would silently keep it; and the min() fold below IGNORES
-            // NaN, so one would leave unknown_rank at +inf — unlisted values
-            // outranking every listed class, the inverse of the rule this
-            // argument documents.
-            if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-                return Err(PyErr::new::<PyValueError, _>(format!(
-                    "class_ranks[{value:?}] = {rank}: ranks must be finite numbers \
-                     (NaN and infinity cannot be ordered against other classes)"
-                )));
-            }
-            if let Some(unknown) = class_rank_unknown.filter(|u| !u.is_finite()) {
-                return Err(PyErr::new::<PyValueError, _>(format!(
-                    "class_rank_unknown = {unknown}: must be a finite number \
-                     (NaN and infinity cannot be ordered against other classes)"
-                )));
-            }
-            let min_rank = ranks.values().copied().fold(f64::INFINITY, f64::min);
-            Some(ClassRanking {
-                column,
-                ranks: ranks.into_iter().collect(),
-                unknown_rank: class_rank_unknown.unwrap_or(min_rank - 1.0),
-            })
-        }
-    };
+    let class_ranking = class_ranking_from_kwargs(
+        sort_key.is_some(),
+        class_rank_column,
+        class_ranks,
+        class_rank_unknown,
+    )?;
 
     // Below-tolerance collapse disposition (#279) + zoom-band representation
     // selector (#317); mirrors the CLI flags. Structural validity of the
