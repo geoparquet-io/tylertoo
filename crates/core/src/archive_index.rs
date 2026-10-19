@@ -22,6 +22,8 @@
 //! \#417 lives here now, so both readers — and any future one — inherit them
 //! rather than re-deriving them.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -521,6 +523,92 @@ impl Iterator for TileIter<'_> {
     }
 }
 
+/// A k-way merge of several ascending tile streams — typically one
+/// [`ArchiveIndex::tiles`] per input archive.
+///
+/// Yields `(source, tile)` in ascending `(id, source)` order: globally
+/// ascending ids, which is what makes a writer fed from it clustered by
+/// construction, and an id several sources hold once per source, in source
+/// order. A repeat inside one source is passed through, adjacent to its twin,
+/// for the caller's duplicate check to refuse.
+///
+/// Holds one look-ahead tile per source and nothing else (#403): the pyramid's
+/// shared-zoom merge used to index every tile id of every band before writing
+/// one, which is O(tiles) where this is O(sources). Sources are first pulled
+/// on the first [`Iterator::next`].
+///
+/// An `Err` from a source is handed out with that source's index, after every
+/// tile already popped, and ends the merge.
+pub(crate) struct MergedTiles<I> {
+    iters: Vec<I>,
+    heads: Vec<Option<TileRef>>,
+    heap: BinaryHeap<Reverse<(u64, usize)>>,
+    /// An error a source returned while being advanced, handed out on the
+    /// call after the tile popped alongside it.
+    pending: Option<(usize, Error)>,
+    primed: bool,
+    done: bool,
+}
+
+impl<I: Iterator<Item = Result<TileRef>>> MergedTiles<I> {
+    pub(crate) fn new(iters: Vec<I>) -> Self {
+        let n = iters.len();
+        MergedTiles {
+            iters,
+            heads: (0..n).map(|_| None).collect(),
+            heap: BinaryHeap::with_capacity(n),
+            pending: None,
+            primed: false,
+            done: false,
+        }
+    }
+
+    /// Pull source `i`'s next tile into the heap. `Err` is that source's own
+    /// error, which the caller hands out.
+    fn advance(&mut self, i: usize) -> std::result::Result<(), Error> {
+        match self.iters[i].next() {
+            Some(Ok(t)) => {
+                self.heap.push(Reverse((t.id, i)));
+                self.heads[i] = Some(t);
+                Ok(())
+            }
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<I: Iterator<Item = Result<TileRef>>> Iterator for MergedTiles<I> {
+    type Item = (usize, Result<TileRef>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if let Some((i, e)) = self.pending.take() {
+            self.done = true;
+            return Some((i, Err(e)));
+        }
+        if !self.primed {
+            self.primed = true;
+            for i in 0..self.iters.len() {
+                if let Err(e) = self.advance(i) {
+                    self.done = true;
+                    return Some((i, Err(e)));
+                }
+            }
+        }
+        let Reverse((_, i)) = self.heap.pop()?;
+        let t = self.heads[i]
+            .take()
+            .expect("a heap entry always has its source's head");
+        if let Err(e) = self.advance(i) {
+            self.pending = Some((i, e));
+        }
+        Some((i, Ok(t)))
+    }
+}
+
 /// Test-only: assert the `go-pmtiles verify` zoom invariants on an archive
 /// (#529, #522). The header's `min_zoom`/`max_zoom` must equal the zooms the
 /// directory actually addresses ([`ArchiveIndex::actual_zoom_range`]; z0..z0
@@ -705,5 +793,135 @@ mod tests {
 
         let idx = ArchiveIndex::open(&path).unwrap();
         assert_eq!(idx.actual_zoom_range().unwrap(), None);
+    }
+
+    /// A synthetic tile at `id` whose range names its source, so a test can
+    /// tell which stream an emission came from.
+    fn tref(id: u64, src: usize) -> TileRef {
+        let (z, x, y) = tile_id_to_zxy(id).unwrap();
+        TileRef {
+            id,
+            z,
+            x,
+            y,
+            range: src..src + 1,
+        }
+    }
+
+    fn stream(ids: &[u64], src: usize) -> std::vec::IntoIter<Result<TileRef>> {
+        ids.iter()
+            .map(|&id| Ok(tref(id, src)))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn drain<I: Iterator<Item = Result<TileRef>>>(m: MergedTiles<I>) -> Vec<(usize, u64)> {
+        m.map(|(src, t)| (src, t.unwrap().id)).collect()
+    }
+
+    /// #403: interleaved ascending streams come out globally ascending —
+    /// the order a `clustered` header promises.
+    #[test]
+    fn merged_tiles_emit_ascending_ids_across_interleaved_sources() {
+        let m = MergedTiles::new(vec![stream(&[0, 3, 9], 0), stream(&[1, 2, 10], 1)]);
+        assert_eq!(
+            drain(m),
+            vec![(0, 0), (1, 1), (1, 2), (0, 3), (0, 9), (1, 10)]
+        );
+    }
+
+    /// An id several sources hold comes out once per source, in source
+    /// order: the pyramid concatenates a shared tile's layers in band order.
+    #[test]
+    fn merged_tiles_emit_a_shared_id_once_per_source_in_source_order() {
+        let m = MergedTiles::new(vec![
+            stream(&[5], 0),
+            stream(&[1, 5], 1),
+            stream(&[5, 6], 2),
+        ]);
+        assert_eq!(drain(m), vec![(1, 1), (0, 5), (1, 5), (2, 5), (2, 6)]);
+    }
+
+    /// A spec-illegal repeat inside one source is not swallowed: both copies
+    /// come out, adjacent, so the caller's duplicate check sees them.
+    #[test]
+    fn merged_tiles_keep_a_duplicate_id_within_one_source() {
+        let m = MergedTiles::new(vec![stream(&[4, 4], 0), stream(&[2], 1)]);
+        assert_eq!(drain(m), vec![(1, 2), (0, 4), (0, 4)]);
+    }
+
+    /// An error is handed out with the source it came from, after every tile
+    /// that source yielded before it, and ends the merge.
+    #[test]
+    fn merged_tiles_report_an_error_with_its_source() {
+        let bad = vec![
+            Ok(tref(3, 1)),
+            Err(Error::PMTilesWrite("corrupt".to_string())),
+            Ok(tref(8, 1)),
+        ];
+        let m = MergedTiles::new(vec![stream(&[1, 7], 0), bad.into_iter()]);
+        let out: Vec<(usize, std::result::Result<u64, String>)> = m
+            .map(|(src, t)| (src, t.map(|t| t.id).map_err(|e| e.to_string())))
+            .collect();
+        assert_eq!(out.len(), 3, "the error is the last item: {out:?}");
+        assert_eq!(out[0], (0, Ok(1)));
+        assert_eq!(out[1], (1, Ok(3)));
+        assert_eq!(out[2].0, 1);
+        assert!(out[2].1.as_ref().unwrap_err().contains("corrupt"));
+    }
+
+    /// #403's memory claim, as a checked fact rather than a comment: the
+    /// merge holds one look-ahead per source, never a source's whole stream.
+    /// The pyramid's shared-zoom merge used to index every tile id of every
+    /// band before writing one.
+    #[test]
+    fn merged_tiles_pull_at_most_one_tile_ahead_per_source() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Counted {
+            inner: std::vec::IntoIter<Result<TileRef>>,
+            pulls: Rc<Cell<usize>>,
+        }
+        impl Iterator for Counted {
+            type Item = Result<TileRef>;
+            fn next(&mut self) -> Option<Self::Item> {
+                self.pulls.set(self.pulls.get() + 1);
+                self.inner.next()
+            }
+        }
+
+        let ids: [Vec<u64>; 3] = [
+            (0..100).map(|i| i * 3).collect(),
+            (0..100).map(|i| i * 3 + 1).collect(),
+            (0..100).map(|i| i * 3 + 2).collect(),
+        ];
+        let pulls: Vec<Rc<Cell<usize>>> = (0..3).map(|_| Rc::new(Cell::new(0))).collect();
+        let sources = ids
+            .iter()
+            .enumerate()
+            .map(|(s, v)| Counted {
+                inner: stream(v, s),
+                pulls: Rc::clone(&pulls[s]),
+            })
+            .collect();
+        let mut m = MergedTiles::new(sources);
+
+        let total = |p: &[Rc<Cell<usize>>]| p.iter().map(|c| c.get()).sum::<usize>();
+        assert_eq!(
+            total(&pulls),
+            0,
+            "nothing is pulled before the first next()"
+        );
+        for yielded in 1..=300 {
+            m.next().expect("300 tiles").1.unwrap();
+            // Each source has been pulled for what it already yielded plus
+            // one look-ahead; nothing more is ever buffered.
+            assert!(
+                total(&pulls) <= yielded + pulls.len(),
+                "after {yielded} tile(s), {} pulls",
+                total(&pulls)
+            );
+        }
     }
 }
