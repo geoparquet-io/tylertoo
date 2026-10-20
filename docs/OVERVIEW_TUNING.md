@@ -17,6 +17,49 @@ for a specific problem. The
 
 ---
 
+## Complete tiles or small tiles
+
+By default, tylertoo keeps polygon layers whole at every zoom, as tippecanoe
+does. Admin areas, parcels, land cover, and fields draw without holes at
+coarse and middle zooms. Three defaults work together:
+
+- The [density budget](#density-budget-drop-rate-drop-gamma-no-density-drop)
+  thins points only. Lines and polygons keep every feature that passes
+  thinning and the visibility gates.
+- A polygon too small to draw at a level becomes a small
+  [placeholder square](#collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
+  and the polygons that thinning removes are represented by squares too, so
+  dense areas stay filled.
+- When a tile goes over the [size cap](#tile-size-cap), its densest lines and
+  polygons are merged into a neighbour instead of being dropped, and the tile
+  is measured again until it fits.
+
+These defaults cost time. On 632k FTW field polygons (z0–z12), a build took
+about 1.3× as long as with the defaults before #745, and used about 6% more
+peak memory. Choose a different trade-off with these settings:
+
+| Goal | Settings | Cost and effect |
+|---|---|---|
+| Fewer dropped polygons | `--polygon-visibility 0 --polygon-thinning 0` | Every polygon reaches every level, simplified for it. About 1.7–2.2× the build time of the old defaults on the field benchmark; tiles go over the cap more often, so more polygons are merged. |
+| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
+| Every kept feature exactly as in the source | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
+
+### What merging does to attributes
+
+Merging follows tippecanoe's `--coalesce-densest-as-needed`. The merged
+feature keeps the attributes and id of the feature it was merged into. The
+absorbed features' geometry is drawn as part of it, and their attributes are
+not carried. In a choropleth, an absorbed polygon therefore takes its
+neighbour's colour, and the merged areas can end at tile edges, where the
+next tile merged differently. Use `--size-valve drop` when every drawn
+polygon must carry its own attributes.
+
+Merging works in the input's row order: each feature is merged into the
+feature kept just before it. Sort the input spatially first, with
+`gpio sort hilbert`, so that the feature before is a neighbour. On shuffled
+input the merged features are arbitrary collections, and colour changes at
+tile edges become far more frequent.
+
 ## The GSD ladder: `--gsd-base` and `--gsd`
 
 A zoom-range plan (`--min-zoom` and `--max-zoom`, the default) derives each
@@ -528,9 +571,13 @@ and parcels visible at coarse zooms with existing fill styles.
 `geometry_types` stays `["Polygon"]`, so no spec-Q4 geometry-type opt-in
 applies.
 
-`--collapse-square` is opt-in, and the default disposition is still to drop. The
-footer provenance records it as `generalization.collapse: "square"`, and
-`--collapse` records `"point"`.
+Placeholder squares are the default since #745. `--no-collapse` restores the
+earlier default, which drops below-tolerance polygons. Under an
+[entry-zoom ladder](#attribute-driven-entry-zoom-magnitude-ladder-entry-zoom),
+the default switches to points, because the square's area dithering would
+delete the small features the ladder promotes; pass `--collapse-square` to
+keep squares anyway. The footer provenance records squares as
+`generalization.collapse: "square"`, and `--collapse` records `"point"`.
 
 Two mechanisms share the threshold `T = side²`, where `side` is `tol` floored
 at one tile unit of the level's zoom (see the divergences below).
@@ -738,6 +785,14 @@ limits counts.
 | `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
 | `--drop-gamma F` | `1.5` | exponent (≥1) | **bigger = more sparse-area protection** |
 | `--no-density-drop` | off | flag | disables the budget |
+| `--drop-lines` | off | flag | lets the budget thin lines too |
+| `--drop-polygons` | off | flag | lets the budget thin polygons too |
+
+The budget thins points only by default, as tippecanoe's `-r` does: removing
+a point leaves no hole, while removing a polygon from a coverage does. `N`
+then counts only the features the budget thins. `--drop-lines` and
+`--drop-polygons` opt lines and polygons back in, as tippecanoe's flags of
+the same names do; together they restore the budget before #745.
 
 ### Drop rate
 
@@ -1200,10 +1255,23 @@ precision. Other positive values are accepted with a warning.
 
 `export-pmtiles --tile-size-limit`, also spelled
 `--max-tile-size` as on `tiles`, caps each tile's encoded MVT size. The
-default of 500K matches tippecanoe, and `0` disables the cap. A tile over the
-cap sheds features for that tile only, in one non-iterative pass. It keeps
-the largest first for polygons and lines, and keeps a uniform spatial stride
-for point tiles.
+default of 500K matches tippecanoe, and `0` disables the cap.
+`--max-compressed-tile-size` caps the gzip-compressed size instead, like
+tippecanoe's `-M`; it is off by default, and when both caps are set a tile
+must fit both.
+
+A tile over a cap is reduced for that tile only, and measured again until it
+fits. `--size-valve` chooses how:
+
+- `merge` (the default) merges the densest lines and polygons into the
+  feature kept just before them, raising the merge threshold until the tile
+  fits. See [what merging does to attributes](#what-merging-does-to-attributes).
+  If merging everything it can still leaves the tile over the cap, unmerged
+  features are dropped, largest kept; a merged feature is never dropped. A
+  tile that is still over after that is written as it is, with a warning.
+- `drop` drops features, keeping the largest for polygons and lines.
+
+Point tiles always keep a uniform spatial stride of their points.
 
 ### Polygon clipping
 

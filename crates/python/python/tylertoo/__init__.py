@@ -138,6 +138,9 @@ class ZoomReport(TypedDict):
     oversized_tiles: int
     encode_dropped_features: int
     encode_quantized_features: int
+    merged_features: int
+    valve_dropped_features: int
+    max_valve_passes: int
 
 
 class SkippedPropertyColumn(TypedDict):
@@ -151,8 +154,12 @@ class ExportReport(TypedDict):
     """Exported tile counts and encoding diagnostics.
 
     Attributes:
-        oversized_tiles: Tiles that dropped features to fit
-            `tile_size_limit`.
+        oversized_tiles: Tiles that went over a size limit and were
+            reduced to fit.
+        merged_features: Tile features merged into a neighbour to fit a
+            size limit (`size_valve="merge"`).
+        valve_dropped_features: Tile features dropped to fit a size
+            limit.
         encode_dropped_features: Features removed by clipping. A
             nonzero count logs a warning for lost content.
         encode_quantized_features: Features that collapsed at the tile
@@ -168,6 +175,8 @@ class ExportReport(TypedDict):
     total_tiles: int
     total_tile_features: int
     oversized_tiles: int
+    merged_features: int
+    valve_dropped_features: int
     encode_dropped_features: int
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
@@ -298,6 +307,7 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
+    no_collapse: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -308,6 +318,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool | None = None,
+    drop_lines: bool = False,
+    drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
     | None = None,
@@ -366,8 +378,14 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             below to off; an option you pass still applies.
         simplify_factor: Simplification tolerance, in GSDs, or `None`
             for 1 (0 with `verbatim`).
-        collapse: Represent small polygons as points.
-        collapse_square: Represent small polygons as small squares.
+        collapse: Represent small polygons as points instead of the
+            default placeholder squares.
+        collapse_square: Represent small polygons as small squares, also
+            under an entry-zoom ladder, which otherwise switches to
+            points. Squares are the default.
+        no_collapse: Drop small polygons instead of representing them,
+            the default before #745. Smaller output, but a polygon
+            coverage shows holes at coarse zooms.
         representation: Geometry kind per zoom band, such as
             `"0-7:point,8-14:geom"`.
         cascade: Speed up simplification by deriving each level from
@@ -385,7 +403,11 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         drop_rate: Ratio between feature budgets of adjacent levels.
         drop_gamma: How strongly the budget spares sparse areas.
         density_drop: Apply the per-level feature budget, or `None` for
-            on (off with `verbatim`).
+            on (off with `verbatim`). It thins points only unless
+            `drop_lines` or `drop_polygons` is set.
+        drop_lines: Let the feature budget thin lines too.
+        drop_polygons: Let the feature budget thin polygons too, which
+            leaves holes in a polygon coverage.
         cluster: Merge each cell's points and add `point_count`.
         accumulate_attributes: Aggregation method for each column in
             a cluster.
@@ -466,6 +488,8 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
+    size_valve: Literal["merge", "drop"] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
 
@@ -500,6 +524,12 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         attribution: Attribution text or HTML stored in the archive
             metadata; MapLibre shows it in its attribution control.
             Each value is stored as given, and `""` is kept as `""`.
+        size_valve: How a tile over its limit is reduced: `"merge"`
+            folds the densest lines and polygons into a neighbour, which
+            keeps its own attributes; `"drop"` removes features, leaving
+            holes. Points are always dropped.
+        max_compressed_tile_size: Maximum gzip-compressed tile size in
+            bytes, like tippecanoe's `-M`, or `0` for no limit.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.
@@ -680,6 +710,8 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
+    size_valve: Literal["merge", "drop"] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
@@ -707,6 +739,8 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         include_properties: See `overview()`.
         exclude_properties: See `overview()`.
         exclude_all_properties: See `overview()`.
+        size_valve: See `export_pmtiles()`.
+        max_compressed_tile_size: See `export_pmtiles()`.
 
     Returns:
         Both halves' reports, keyed `"convert"` and `"export"` like the

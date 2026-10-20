@@ -7,11 +7,13 @@ differences.
 [`benchmarks/e2e/RESULTS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/benchmarks/e2e/RESULTS.md)
 compares speed, size, and memory use, with methods and caveats.
 
-The defaults produce different maps: tylertoo thins features heavily at coarse
-and middle zooms; tippecanoe retains more of a contiguous polygon coverage.
-For admin boundaries, parcels, or a choropleth, use `--verbatim` or raise
-`--gsd-base` and lower the thinning factors. See the
-[tuning reference](../OVERVIEW_TUNING.md).
+Like tippecanoe, tylertoo thins points by default and keeps lines and
+polygons, so admin boundaries, parcels and other polygon coverages draw
+without holes at coarse and middle zooms. Polygons too small for a zoom
+become placeholder squares, and an oversized tile merges its densest
+polygons into their neighbours, as `--coalesce-densest-as-needed` does. See
+[complete tiles or small tiles](../OVERVIEW_TUNING.md#complete-tiles-or-small-tiles)
+for the settings that trade completeness for speed and size.
 
 ## How much faster — the skeptical reader's table
 
@@ -73,12 +75,14 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 | `-n` name / `-N` description / `-A` attribution | `--name` / `--description` / `--attribution` | An unset field is left out of the archive. tippecanoe names the tileset after the output file and copies the name into `description`. `merge` and `pyramid` keep every inherited credit; see [attribution](attribution.md) |
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
-| `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder. tylertoo anchors on the full canonical count, so the default differs |
+| `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder. tylertoo anchors on the full canonical count, so the default differs. Thins points only by default, as in tippecanoe |
+| `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Let the drop rate thin lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default |
-| `-M` maximum tile bytes (default 500K) | `--max-tile-size` / `--tile-size-limit` (default 500K) | Same default; 0 disables the cap |
-| `--drop-fraction-as-needed` tile-size loop | `--tile-size-limit` | One drop pass; stored levels already have feature budgets |
-| tiny-polygon reduction | `--collapse-square` | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses |
+| `-M` maximum tile bytes (default 500K) | `--max-compressed-tile-size` (default off), or `--max-tile-size` / `--tile-size-limit` (default 500K) | `-M` caps the gzip-compressed tile; `--max-tile-size` caps the uncompressed MVT. 0 disables either |
+| `--coalesce-densest-as-needed` | `--size-valve merge` (the default) | Merges the densest lines and polygons into the feature kept before them, re-measuring until the tile fits. The merged feature keeps its own attributes. Each tile picks its own threshold; tippecanoe raises one threshold for the whole zoom |
+| `--drop-densest-as-needed`, `--drop-fraction-as-needed` | `--size-valve drop` | Drops features until the tile fits, keeping the largest polygons and lines and a uniform stride of points |
+| tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
 | `--use-attribute-for-id` | `--feature-id` | Accepts integer or `DECIMAL(p,0)` columns. Rejects string, float, null, and negative ids. Without this flag, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |

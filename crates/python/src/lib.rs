@@ -937,12 +937,17 @@ fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<P
         d.set_item("oversized_tiles", z.oversized_tiles)?;
         d.set_item("encode_dropped_features", z.encode_dropped_features)?;
         d.set_item("encode_quantized_features", z.encode_quantized_features)?;
+        d.set_item("merged_features", z.merged_features)?;
+        d.set_item("valve_dropped_features", z.valve_dropped_features)?;
+        d.set_item("max_valve_passes", z.max_valve_passes)?;
         zooms.append(d)?;
     }
     dict.set_item("zooms", zooms)?;
     dict.set_item("total_tiles", report.total_tiles)?;
     dict.set_item("total_tile_features", report.total_tile_features)?;
     dict.set_item("oversized_tiles", report.oversized_tiles)?;
+    dict.set_item("merged_features", report.merged_features)?;
+    dict.set_item("valve_dropped_features", report.valve_dropped_features)?;
     let skipped = PyList::empty(py);
     for col in &report.skipped_property_columns {
         let d = PyDict::new(py);
