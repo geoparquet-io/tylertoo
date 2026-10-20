@@ -59,6 +59,7 @@ additional_cargo_args = [
   "--test", "accumulate_log",
   "--test", "decode_errors",
   "--test", "decode_roundtrip",
+  "--test", "export_geometry_column_name",
   "--test", "hostile_geometry_eval",
   "--test", "invalid_geometry_clipping",
   "--test", "ioverlay_real_fixtures_test",

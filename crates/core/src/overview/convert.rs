@@ -4245,6 +4245,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         &renames,
         options,
     )?;
+    writer_opts.primary_column = Some(geom_name.clone());
     record_emitted_merged(&mut writer_opts, &emitted);
     if let Some(g) = writer_opts.generalization.as_mut() {
         g.entry_zoom = entry.and_then(|e| e.provenance);
