@@ -30,11 +30,13 @@ use super::convert::{
     ConvertReport, LevelPlan,
 };
 use super::export::{
-    export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
+    export_pmtiles, write_empty_archive_with_metadata, ExportError, ExportOptions, ExportReport,
+    FeatureOrder,
 };
 use super::writer::WriterError;
 use crate::input_set::ConvertSource;
 use crate::shard::{ShardRole, TileRange};
+use crate::TilesetMetadata;
 
 /// What the facade reads: a path (file/dir/glob/URL/prefix, resolved by
 /// core's input resolution) or a manifest of explicit files/URLs (the CLI's
@@ -200,6 +202,10 @@ pub struct TilesOptions {
     pub feature_order: FeatureOrder,
     /// Promote this property to the MVT feature id (#443).
     pub feature_id: Option<String>,
+    /// Publication `name`, `description` and `attribution`
+    /// ([`ExportOptions::metadata`]), written to the archive, including the
+    /// empty archive of a shard or coarse job that owns no rows.
+    pub metadata: TilesetMetadata,
 }
 
 impl Default for TilesOptions {
@@ -217,6 +223,7 @@ impl Default for TilesOptions {
             partition_wave: export.partition_wave,
             feature_order: FeatureOrder::default(),
             feature_id: None,
+            metadata: TilesetMetadata::default(),
         }
     }
 }
@@ -529,6 +536,7 @@ pub fn convert_to_pmtiles_observed(
     // the convert; this is the same check on the values already known.
     ExportOptions {
         tile_buffer: options.tile_buffer,
+        metadata: options.metadata.clone(),
         ..ExportOptions::default()
     }
     .validate()
@@ -642,8 +650,14 @@ pub fn convert_to_pmtiles_observed(
                     // The shard owns [pivot, finest]; a GSD ladder has no
                     // finest zoom to declare, so the pivot stands alone.
                     let max_zoom = zoom_plan.map_or_else(|| range.pivot_zoom(), |(_, max)| max);
-                    write_empty_archive(output, &layer_name, range.pivot_zoom(), max_zoom)
-                        .map_err(TilesError::EmptyShardArchive)?;
+                    write_empty_archive_with_metadata(
+                        output,
+                        &layer_name,
+                        range.pivot_zoom(),
+                        max_zoom,
+                        &options.metadata,
+                    )
+                    .map_err(TilesError::EmptyShardArchive)?;
                     log::info!(
                         "[tiles] shard {} owns no input rows ({e}); wrote an empty archive",
                         job.role
@@ -669,8 +683,14 @@ pub fn convert_to_pmtiles_observed(
                     // ladder), so the fallback is unreachable in practice.
                     let min_zoom = zoom_plan.map_or(0, |(min, _)| min);
                     let max_zoom = job.pivot_zoom.saturating_sub(1);
-                    write_empty_archive(output, &layer_name, min_zoom, max_zoom)
-                        .map_err(TilesError::EmptyCoarseArchive)?;
+                    write_empty_archive_with_metadata(
+                        output,
+                        &layer_name,
+                        min_zoom,
+                        max_zoom,
+                        &options.metadata,
+                    )
+                    .map_err(TilesError::EmptyCoarseArchive)?;
                     log::info!(
                         "[tiles] shard job {} has nothing to write ({e}); wrote an empty archive",
                         job.role
@@ -741,6 +761,7 @@ pub fn convert_to_pmtiles_observed(
         // #427: one scratch knob — the export's member spill goes where the
         // convert's spill (and the intermediate overview) go.
         spill_dir: options.convert.spill_dir.clone(),
+        metadata: options.metadata.clone(),
     };
     let export_report =
         export_pmtiles(&overview_path, output, &export_opts).map_err(TilesError::Export)?;
@@ -899,6 +920,25 @@ mod tests {
         write_input(path, &geoms, false, None);
     }
 
+    /// Publication metadata for the empty-archive tests: an empty job
+    /// writes the same `name`/`attribution` a job with data would, so a
+    /// fleet whose shards are all empty still carries its credit.
+    fn grid_metadata() -> TilesetMetadata {
+        TilesetMetadata::new()
+            .with_name("Grid")
+            .with_attribution("<b>Survey</b>")
+    }
+
+    fn assert_grid_metadata(path: &Path) {
+        let json = crate::archive_index::ArchiveIndex::open(path)
+            .unwrap()
+            .metadata_json()
+            .unwrap();
+        assert_eq!(json["name"], "Grid");
+        assert_eq!(json["attribution"], "<b>Survey</b>");
+        assert!(json.get("description").is_none(), "unset stays absent");
+    }
+
     fn zoomed_options(min_zoom: u8, max_zoom: u8) -> TilesOptions {
         TilesOptions {
             convert: ConvertOptions {
@@ -972,6 +1012,7 @@ mod tests {
                 pivot_zoom: 4,
                 cut_digest: digest,
             }),
+            metadata: grid_metadata(),
             ..TilesOptions::default()
         };
 
@@ -998,6 +1039,7 @@ mod tests {
 
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
+        assert_grid_metadata(&output);
     }
 
     /// #541: a coarse job whose ceiling sits below every level the data
@@ -1039,6 +1081,7 @@ mod tests {
                 pivot_zoom: 3,
                 cut_digest: "0123456789abcdef".to_string(),
             }),
+            metadata: grid_metadata(),
             ..zoomed_options(0, 14)
         };
 
@@ -1055,6 +1098,7 @@ mod tests {
 
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
+        assert_grid_metadata(&output);
     }
 
     /// #439/#498: the facade applies the shard's convert-side consequences

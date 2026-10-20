@@ -31,9 +31,12 @@ use crate::dedup::TileHasher;
 use crate::input::url_scheme;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
-use crate::pmtiles_writer::{Header, StreamingPmtilesWriter, TileType, MAX_TILE_ID_ZOOM};
+use crate::pmtiles_metadata::MetadataCollector;
+use crate::pmtiles_writer::{
+    Header, StreamingPmtilesWriter, TileType, HEADER_BYTES, MAX_TILE_ID_ZOOM,
+};
 use crate::tile::TileBounds;
-use crate::Error;
+use crate::{Error, TilesetMetadata};
 
 /// One band: an input tiled verbatim across `min_zoom..=max_zoom` into `layer`.
 #[derive(Debug, Clone)]
@@ -1320,7 +1323,8 @@ fn parse_layers(
         Ok(v) => v,
         Err(e) => {
             log::warn!(
-                "{}: metadata is not valid JSON ({e}); merged layer will declare no fields",
+                "{}: metadata is not valid JSON ({e}); merged layer will declare no fields, \
+                 and no name, description or attribution is inherited from it",
                 path.display()
             );
             return Ok(ParsedLayers {
@@ -1433,6 +1437,12 @@ pub struct PyramidOptions {
     /// band and archive share no zoom at all), which is always an error —
     /// see [`crate::pyramid::merge_bands_with_options`].
     pub allow_missing_zooms: bool,
+    /// The final archive's `name`, `description` and `attribution`, each
+    /// overriding what the bands carry for that field (`Some("")` included).
+    /// An unset field is inherited from the band archives, including the
+    /// ones generated with [`ExportOptions::metadata`] from `export`; see
+    /// [`merge_bands_with_metadata`] for how.
+    pub metadata: TilesetMetadata,
 }
 
 impl Default for PyramidOptions {
@@ -1448,6 +1458,7 @@ impl Default for PyramidOptions {
             },
             work_dir: None,
             allow_missing_zooms: false,
+            metadata: TilesetMetadata::default(),
         }
     }
 }
@@ -1542,6 +1553,29 @@ pub fn build_pyramid(
         }
     }
 
+    // The publication metadata too: a name conflict between two archive
+    // bands, or with the metadata a GeoParquet band will be exported with,
+    // fails here rather than after every source band has been tiled. The
+    // merge resolves it again from the archives it actually reads.
+    let mut collector = MetadataCollector::new(&opts.metadata);
+    for (band, kind) in bands.iter().zip(&kinds) {
+        match kind {
+            BandSource::Archive => collect_band_metadata(&mut collector, band)?,
+            BandSource::Source => {
+                // Every generated band archive must be valid on its own,
+                // whatever the final override replaces it with.
+                opts.export
+                    .metadata
+                    .check_size()
+                    .map_err(Error::InvalidConfig)?;
+                collector
+                    .add_metadata(&format!("band {:?}", band.layer), &opts.export.metadata)
+                    .map_err(Error::InvalidConfig)?;
+            }
+        }
+    }
+    collector.resolve().map_err(Error::InvalidConfig)?;
+
     // Keeps every intermediate alive for the merge and unlinks them on drop —
     // including the early-return paths below. TempPaths, not open
     // NamedTempFiles: convert and export publish by renaming a sibling over
@@ -1631,7 +1665,58 @@ pub fn build_pyramid(
         scratch.push(archive);
     }
 
-    merge_bands_with_options(&tiled, output, opts.allow_missing_zooms)
+    merge_bands_with_metadata(&tiled, output, opts.allow_missing_zooms, &opts.metadata)
+}
+
+/// Add one band archive's publication metadata to `collector`.
+///
+/// Reads only the header and the metadata section, under the same ceiling
+/// [`BandArchive::open`] applies, never the directories: the disjoint-zoom
+/// merge opens one band at a time on purpose, and this check has to see
+/// every band before the first one is copied. Metadata that is not valid
+/// JSON contributes nothing; [`parse_layers`] warns about it when the band
+/// is opened for its tiles.
+fn collect_band_metadata(collector: &mut MetadataCollector, band: &Band) -> Result<(), Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = &band.input;
+    let at = |e: std::io::Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(at)?;
+    let mut head = [0u8; HEADER_BYTES];
+    file.read_exact(&mut head).map_err(at)?;
+    let header = Header::from_bytes(&head)?;
+    if header.json_metadata_length > MAX_INTERNAL_BYTES {
+        return Err(Error::PMTilesWrite(format!(
+            "{}: metadata claims {} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+             ceiling on an archive's internal sections",
+            path.display(),
+            header.json_metadata_length
+        )));
+    }
+    // The same check, and message, as `ArchiveIndex::open`.
+    let len = file.metadata().map_err(at)?.len();
+    if header
+        .json_metadata_offset
+        .checked_add(header.json_metadata_length)
+        .is_none_or(|end| end > len)
+    {
+        return Err(Error::PMTilesWrite(format!(
+            "metadata past end of {}",
+            path.display()
+        )));
+    }
+    let mut raw = vec![0u8; header.json_metadata_length as usize];
+    file.seek(SeekFrom::Start(header.json_metadata_offset))
+        .map_err(at)?;
+    file.read_exact(&mut raw).map_err(at)?;
+    let plain =
+        compression::decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
+            .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))?;
+    if let Ok(root) = serde_json::from_slice::<Value>(&plain) {
+        collector
+            .add_json(&path.display().to_string(), &root)
+            .map_err(Error::InvalidConfig)?;
+    }
+    Ok(())
 }
 
 /// Merge per-band archives into one, in band order.
@@ -1670,6 +1755,39 @@ pub fn merge_bands_with_options(
     output: &Path,
     allow_missing_zooms: bool,
 ) -> Result<PyramidReport, Error> {
+    merge_bands_with_metadata(
+        bands,
+        output,
+        allow_missing_zooms,
+        &TilesetMetadata::default(),
+    )
+}
+
+/// Like [`merge_bands_with_options`], with the merged archive's publication
+/// metadata.
+///
+/// Each field of `metadata` that is set (`Some("")` included) is written as
+/// given. An unset field is inherited from the band archives: one value they
+/// agree on is kept, differing names or descriptions are an error, and every
+/// distinct attribution credit is kept, sorted and joined with `" | "`. A band
+/// that uses only some of its archive's zooms still passes on the archive's
+/// whole credit.
+///
+/// The metadata is resolved from every band before any tile is read, so a
+/// conflict fails before the merge does any real work.
+///
+/// # Errors
+///
+/// As [`merge_bands_with_options`], and if the inherited names or
+/// descriptions differ where `metadata` sets none, if a band's inherited
+/// field is not a string, or if the result is too large for an archive's
+/// metadata.
+pub fn merge_bands_with_metadata(
+    bands: &[Band],
+    output: &Path,
+    allow_missing_zooms: bool,
+    metadata: &TilesetMetadata,
+) -> Result<PyramidReport, Error> {
     // A library caller can hand over same-layer bands that overlap in zoom
     // but cover disjoint geography, which the per-tile collision check below
     // would never catch.
@@ -1686,6 +1804,12 @@ pub fn merge_bands_with_options(
     // yet at this point.
     warn_implicit_layer_overlaps(bands);
 
+    let mut collector = MetadataCollector::new(metadata);
+    for band in bands {
+        collect_band_metadata(&mut collector, band)?;
+    }
+    let publication = collector.resolve().map_err(Error::InvalidConfig)?;
+
     // StreamingPmtilesWriter, not PmtilesWriter: it spools tile bytes to a temp
     // file instead of holding every tile in RAM, and it deduplicates. The merge
     // is exactly the workload that needs both — an aggregate band is mostly
@@ -1700,6 +1824,7 @@ pub fn merge_bands_with_options(
     // [`ensure_ascending`] refuses a band directory that breaks it, so #506's
     // check can be on.
     writer.set_expect_clustered(true);
+    writer.set_metadata(publication);
     // No `set_declared_min_zoom`/`set_declared_max_zoom` here: #380's
     // declared band range (a band's coarse zooms may generalize to nothing;
     // `--allow-missing-zooms` lets a band declare deeper zooms than its
@@ -4748,5 +4873,381 @@ mod tests {
             remote_archive_rejection(Path::new("/local/tiles.pmtiles")).is_none(),
             "a local archive is the ordinary two-step form"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Publication metadata (name / description / attribution)
+    // -------------------------------------------------------------------------
+
+    fn write_published_band(
+        path: &Path,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+        meta: crate::TilesetMetadata,
+    ) {
+        write_published_payload(path, layer, tiles, &[0x1a, 0x02, 0x08, 0x01], meta);
+    }
+
+    fn write_published_payload(
+        path: &Path,
+        layer: &str,
+        tiles: &[(u8, u32, u32)],
+        payload: &[u8],
+        meta: crate::TilesetMetadata,
+    ) {
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(layer);
+        w.set_bounds(&TileBounds::new(-1.0, -1.0, 1.0, 1.0));
+        w.set_metadata(meta);
+        for (z, x, y) in tiles {
+            w.add_tile(*z, *x, *y, payload).unwrap();
+        }
+        w.finalize(path).unwrap();
+    }
+
+    fn publication(path: &Path) -> crate::TilesetMetadata {
+        let meta: Value = serde_json::from_str(&read_metadata(path)).unwrap();
+        let get = |k: &str| meta.get(k).map(|v| v.as_str().unwrap().to_string());
+        crate::TilesetMetadata {
+            name: get("name"),
+            description: get("description"),
+            attribution: get("attribution"),
+        }
+    }
+
+    fn band(input: &Path, layer: &str, min_zoom: u8, max_zoom: u8) -> Band {
+        Band {
+            input: input.to_path_buf(),
+            layer: layer.to_string(),
+            min_zoom,
+            max_zoom,
+        }
+    }
+
+    fn meta() -> crate::TilesetMetadata {
+        crate::TilesetMetadata::new()
+    }
+
+    #[test]
+    fn oversized_band_metadata_fails_before_touching_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("oversized.pmtiles");
+        write_published_band(&input, "parks", &[(3, 0, 0)], meta());
+        let mut raw = std::fs::read(&input).unwrap();
+        let mut header = Header::from_bytes(&raw).unwrap();
+        header.json_metadata_length = MAX_INTERNAL_BYTES + 1;
+        raw[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        std::fs::write(&input, raw).unwrap();
+
+        let existing = dir.path().join("existing.pmtiles");
+        std::fs::write(&existing, b"previous archive").unwrap();
+        let absent = dir.path().join("absent.pmtiles");
+        for output in [&existing, &absent] {
+            let err = merge_bands(&[band(&input, "parks", 3, 3)], output).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, Error::PMTilesWrite(_)), "{msg}");
+            assert!(msg.contains("oversized.pmtiles"), "{msg}");
+            assert!(
+                msg.contains(&format!("metadata claims {} bytes", MAX_INTERNAL_BYTES + 1)),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("{MAX_INTERNAL_BYTES}-byte ceiling")),
+                "{msg}"
+            );
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous archive");
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn unparseable_band_metadata_keeps_tiles_and_explicit_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("invalid-json.pmtiles");
+        let out = dir.path().join("out.pmtiles");
+        write_published_band(
+            &input,
+            "parks",
+            &[(3, 0, 0)],
+            meta().with_attribution("discarded"),
+        );
+        let mut raw = std::fs::read(&input).unwrap();
+        let mut header = Header::from_bytes(&raw).unwrap();
+        let gz = compression::compress(b"{", header.internal_compression).unwrap();
+        header.json_metadata_offset = raw.len() as u64;
+        header.json_metadata_length = gz.len() as u64;
+        raw[..HEADER_BYTES].copy_from_slice(&header.to_bytes());
+        raw.extend_from_slice(&gz);
+        std::fs::write(&input, raw).unwrap();
+
+        let expected = meta().with_name("Parks").with_attribution("NPS");
+        merge_bands_with_metadata(&[band(&input, "parks", 3, 3)], &out, false, &expected).unwrap();
+        assert_eq!(publication(&out), expected);
+        let source = crate::archive_index::ArchiveIndex::open(&input).unwrap();
+        let merged = crate::archive_index::ArchiveIndex::open(&out).unwrap();
+        let source_tile = source.tiles().next().unwrap().unwrap();
+        let merged_tile = merged.tiles().next().unwrap().unwrap();
+        assert_eq!((merged_tile.z, merged_tile.x, merged_tile.y), (3, 0, 0));
+        assert_eq!(merged.tiles().count(), 1);
+        assert_eq!(
+            merged.read_range(merged_tile.range).unwrap(),
+            source.read_range(source_tile.range).unwrap()
+        );
+        assert_eq!(
+            merged.metadata_json().unwrap()["vector_layers"][0]["fields"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn disjoint_bands_inherit_publication_metadata_in_any_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (coarse, fine) = (dir.path().join("c.pmtiles"), dir.path().join("f.pmtiles"));
+        write_published_band(
+            &coarse,
+            "parks",
+            &[(0, 0, 0)],
+            meta().with_name("Parks").with_attribution("USGS"),
+        );
+        write_published_band(
+            &fine,
+            "parks",
+            &[(1, 0, 0)],
+            meta().with_name("Parks").with_attribution("NPS"),
+        );
+        let want = meta().with_name("Parks").with_attribution("NPS | USGS");
+        let bands = [band(&coarse, "parks", 0, 0), band(&fine, "parks", 1, 1)];
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        merge_bands(&bands, &a).unwrap();
+        merge_bands(&[bands[1].clone(), bands[0].clone()], &b).unwrap();
+        assert_eq!(publication(&a), want);
+        assert_eq!(publication(&b), want);
+    }
+
+    #[test]
+    fn shared_zoom_bands_keep_publication_metadata_and_every_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (roads, parks) = (dir.path().join("r.pmtiles"), dir.path().join("p.pmtiles"));
+        write_published_payload(
+            &roads,
+            "roads",
+            &[(1, 0, 0)],
+            &layer_tile("roads"),
+            meta().with_name("Roads").with_attribution("OSM"),
+        );
+        write_published_payload(
+            &parks,
+            "parks",
+            &[(1, 0, 0)],
+            &layer_tile("parks"),
+            meta().with_attribution("NPS").with_description("Parks"),
+        );
+        let out = dir.path().join("out.pmtiles");
+        merge_bands_with_metadata(
+            &[band(&roads, "roads", 1, 1), band(&parks, "parks", 1, 1)],
+            &out,
+            false,
+            &meta().with_name("Base map"),
+        )
+        .unwrap();
+        assert_eq!(
+            publication(&out),
+            meta()
+                .with_name("Base map")
+                .with_description("Parks")
+                .with_attribution("NPS | OSM")
+        );
+        assert_eq!(merged_layer_names(&out, 1, 0, 0), vec!["roads", "parks"]);
+    }
+
+    #[test]
+    fn final_overrides_win_and_conflicts_name_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (east, west) = (dir.path().join("e.pmtiles"), dir.path().join("w.pmtiles"));
+        write_published_band(
+            &east,
+            "regions",
+            &[(0, 0, 0)],
+            meta().with_name("East region").with_attribution("East"),
+        );
+        write_published_band(
+            &west,
+            "regions",
+            &[(1, 0, 0)],
+            meta().with_name("West region").with_attribution("West"),
+        );
+        let bands = [band(&east, "regions", 0, 0), band(&west, "regions", 1, 1)];
+        let out = dir.path().join("out.pmtiles");
+        // The wrappers inherit, so they hit the conflict.
+        let err = merge_bands(&bands, &out).unwrap_err().to_string();
+        assert!(err.contains("--name"), "{err}");
+        // An attribution override does not settle a name conflict.
+        let err = merge_bands_with_metadata(&bands, &out, false, &meta().with_attribution(""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--name"), "{err}");
+        assert!(!out.exists());
+        merge_bands_with_metadata(&bands, &out, false, &meta().with_name("Combined regions"))
+            .unwrap();
+        assert_eq!(
+            publication(&out),
+            meta()
+                .with_name("Combined regions")
+                .with_attribution("East | West")
+        );
+    }
+
+    #[test]
+    fn subrange_band_keeps_its_archive_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.pmtiles");
+        write_published_band(
+            &src,
+            "parks",
+            &[(0, 0, 0), (1, 0, 0), (2, 0, 0)],
+            meta().with_attribution("NPS"),
+        );
+        let out = dir.path().join("out.pmtiles");
+        merge_bands(&[band(&src, "parks", 1, 2)], &out).unwrap();
+        assert_eq!(publication(&out).attribution.as_deref(), Some("NPS"));
+    }
+
+    /// Order of the `build_pyramid` preflight: a never-written source band
+    /// listed first would fail with "convert failed" if it were tiled before
+    /// the publication metadata was checked.
+    #[test]
+    fn build_pyramid_checks_publication_metadata_before_tiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (east, west) = (dir.path().join("e.pmtiles"), dir.path().join("w.pmtiles"));
+        write_published_band(&east, "e", &[(8, 0, 0)], meta().with_name("East"));
+        write_published_band(&west, "w", &[(9, 0, 0)], meta().with_name("West"));
+        let missing = dir.path().join("does-not-exist.parquet");
+        let out = dir.path().join("out.pmtiles");
+        let bands = [
+            band(&missing, "fine", 6, 7),
+            band(&east, "e", 8, 8),
+            band(&west, "w", 9, 9),
+        ];
+        let err = build_pyramid(&bands, &out, &PyramidOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--name"), "{err}");
+        assert!(!err.contains("convert failed"), "{err}");
+
+        // A raw band's export metadata takes part in the same preflight.
+        let one = [band(&missing, "fine", 6, 7), band(&east, "e", 8, 8)];
+        let opts = PyramidOptions {
+            export: ExportOptions {
+                metadata: meta().with_name("Fine"),
+                ..PyramidOptions::default().export
+            },
+            ..Default::default()
+        };
+        let err = build_pyramid(&one, &out, &opts).unwrap_err().to_string();
+        assert!(err.contains("--name"), "{err}");
+        assert!(!err.contains("convert failed"), "{err}");
+
+        // Generated bands must fit even when a small final override would.
+        let huge = "\"".repeat(MAX_INTERNAL_BYTES as usize / 2);
+        let opts = PyramidOptions {
+            export: ExportOptions {
+                metadata: meta().with_attribution(huge),
+                ..PyramidOptions::default().export
+            },
+            metadata: meta().with_attribution("small"),
+            ..Default::default()
+        };
+        let err = build_pyramid(&one, &out, &opts).unwrap_err().to_string();
+        assert!(err.contains("attribution"), "{err}");
+        assert!(!err.contains("convert failed"), "{err}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn build_pyramid_publishes_source_band_metadata_and_final_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let coarse = dir.path().join("coarse.parquet");
+        write_cell_source(&coarse, 40, 0.6);
+        let pre = dir.path().join("pre.pmtiles");
+        write_published_band(
+            &pre,
+            "features",
+            &[(3, 0, 0)],
+            meta().with_name("Cells").with_attribution("Survey"),
+        );
+        let bands = [
+            band(&coarse, "aggregate", 0, 2),
+            band(&pre, "features", 3, 3),
+        ];
+        let opts = |export: crate::TilesetMetadata, last: crate::TilesetMetadata| PyramidOptions {
+            work_dir: Some(dir.path().to_path_buf()),
+            export: ExportOptions {
+                metadata: export,
+                ..PyramidOptions::default().export
+            },
+            metadata: last,
+            ..Default::default()
+        };
+        // A GeoParquet band infers nothing; the archive band's values pass through.
+        let out = dir.path().join("plain.pmtiles");
+        build_pyramid(&bands, &out, &opts(meta(), meta())).unwrap();
+        assert_eq!(
+            publication(&out),
+            meta().with_name("Cells").with_attribution("Survey")
+        );
+        // Generated bands carry the export metadata, and it is inherited.
+        let out = dir.path().join("export.pmtiles");
+        build_pyramid(
+            &bands,
+            &out,
+            &opts(meta().with_name("Cells").with_attribution("Census"), meta()),
+        )
+        .unwrap();
+        assert_eq!(
+            publication(&out),
+            meta()
+                .with_name("Cells")
+                .with_attribution("Census | Survey")
+        );
+        // Final overrides apply per field, over both.
+        let out = dir.path().join("final.pmtiles");
+        build_pyramid(
+            &bands,
+            &out,
+            &opts(
+                meta().with_attribution("Census"),
+                meta()
+                    .with_description("All cells")
+                    .with_attribution("Everyone"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            publication(&out),
+            meta()
+                .with_name("Cells")
+                .with_description("All cells")
+                .with_attribution("Everyone")
+        );
+    }
+
+    #[test]
+    fn source_only_pyramid_writes_final_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let coarse = dir.path().join("coarse.parquet");
+        write_cell_source(&coarse, 40, 0.6);
+        let out = dir.path().join("out.pmtiles");
+        let last = meta().with_name("Cells").with_attribution("");
+        build_pyramid(
+            &[band(&coarse, "aggregate", 0, 2)],
+            &out,
+            &PyramidOptions {
+                work_dir: Some(dir.path().to_path_buf()),
+                metadata: last.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(publication(&out), last);
     }
 }
