@@ -572,6 +572,30 @@ impl OverviewReader {
         &self.metadata
     }
 
+    /// The uncompressed bytes of the top-level column `root` (every leaf
+    /// under it) and the row count, summed over `row_groups`. For the
+    /// export's tile-size estimate (#745).
+    pub(crate) fn column_bytes_and_rows(&self, row_groups: &[usize], root: &str) -> (u64, u64) {
+        let (mut bytes, mut rows) = (0u64, 0u64);
+        for &rg in row_groups {
+            let meta = self.metadata.row_group(rg);
+            rows += meta.num_rows().max(0) as u64;
+            for col in meta.columns() {
+                if col
+                    .column_descr()
+                    .path()
+                    .parts()
+                    .first()
+                    .map(String::as_str)
+                    == Some(root)
+                {
+                    bytes += col.uncompressed_size().max(0) as u64;
+                }
+            }
+        }
+        (bytes, rows)
+    }
+
     /// `(band, rows)` for each of `row_groups`, in the order given: the level
     /// band each row group belongs to (§3.3) and its row count. The export's
     /// size valve (#745) walks this alongside a read of the same row groups

@@ -150,6 +150,7 @@ use coalesce_valve::RowGapCursor;
 #[cfg(test)]
 use coalesce_valve::GAP_NONE;
 mod feature_id;
+mod valve_predict;
 use feature_id::{
     feature_id_values, resolve_feature_id, validate_feature_id_column, ResolvedFeatureId,
 };
@@ -1831,6 +1832,45 @@ fn with_level_mingaps(mut plans: Vec<LevelPlan>, mingaps: Option<&[u64]>) -> Vec
     plans
 }
 
+/// Scan every level, predict [`SizeValve::Hybrid`]'s thresholds from the
+/// full scan, then restrict the scan to the export's tile range.
+fn scan_levels(
+    reader: &OverviewReader,
+    crs: Crs,
+    meta: &OverviewsMeta,
+    level_zooms: &[u8],
+    options: &ExportOptions,
+    timers: &ExportTimers,
+) -> Result<(Vec<LevelScan>, Option<Vec<u64>>), ExportError> {
+    let mut scans = scan_all_levels(reader, crs, meta, options, timers)?;
+    let predicted = hybrid_mingaps(reader, crs, &scans, level_zooms, options, timers)?;
+    // #498: a sharded build's export owns a slice of the tile space, not all
+    // of it. Restricting the SCAN — the per-zoom tile-count map every
+    // partition, key window and wave-read bbox is derived from — is what makes
+    // the restriction free rather than a filter bolted on at write time: an
+    // out-of-range tile is never planned, so it is never clipped, encoded,
+    // hashed or read for.
+    restrict_scans_to_range(&mut scans, level_zooms, options);
+    Ok((scans, predicted))
+}
+
+/// [`SizeValve::Hybrid`]'s predicted level thresholds (#745), `None` for
+/// every other valve. Runs on the unrestricted scan, so a sharded export
+/// predicts what a full one would.
+fn hybrid_mingaps(
+    reader: &OverviewReader,
+    crs: Crs,
+    scans: &[LevelScan],
+    zooms: &[u8],
+    options: &ExportOptions,
+    timers: &ExportTimers,
+) -> Result<Option<Vec<u64>>, ExportError> {
+    if options.size_valve != SizeValve::Hybrid {
+        return Ok(None);
+    }
+    valve_predict::predict_level_mingaps(reader, crs, scans, zooms, options, timers).map(Some)
+}
+
 /// [`SIZE_VALVE_ENV`], when set.
 fn size_valve_from_env() -> Result<Option<SizeValve>, ExportError> {
     match std::env::var(SIZE_VALVE_ENV) {
@@ -2103,16 +2143,7 @@ fn export_pmtiles_run(
     let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
     let timers = Arc::<ExportTimers>::default();
-    let mut scans = scan_all_levels(&reader, crs, &meta, options, &timers)?;
-
-    // #498: a sharded build's export owns a slice of the tile space, not all
-    // of it. Restricting the SCAN — the per-zoom tile-count map every
-    // partition, key window and wave-read bbox is derived from — is what makes
-    // the restriction free rather than a filter bolted on at write time: an
-    // out-of-range tile is never planned, so it is never clipped, encoded,
-    // hashed or read for.
-    restrict_scans_to_range(&mut scans, &level_zooms, options);
-    let scans = scans;
+    let (scans, predicted) = scan_levels(&reader, crs, &meta, &level_zooms, options, &timers)?;
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {
@@ -2154,7 +2185,10 @@ fn export_pmtiles_run(
         available_ram,
         knobs.memory_limit.or_else(probe_oom_memory_limit),
     )?;
-    let plans = with_level_mingaps(plans, knobs.level_mingaps.as_deref());
+    let plans = with_level_mingaps(
+        plans,
+        knobs.level_mingaps.as_deref().or(predicted.as_deref()),
+    );
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -13140,6 +13174,12 @@ mod tests {
                 r_one.merged_features > 0,
                 "{valve:?}: the valve must merge here"
             );
+            if matches!(valve, SizeValve::Zoom | SizeValve::Hybrid) {
+                assert!(
+                    r_one.zooms.iter().any(|z| z.start_mingap > 0),
+                    "{valve:?}: some level must start from a threshold"
+                );
+            }
             assert_eq!(r_one.valve_dropped_features, 0, "{valve:?}");
             assert_eq!(
                 std::fs::read(t_many.path()).unwrap(),
