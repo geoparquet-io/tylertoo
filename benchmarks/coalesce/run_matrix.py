@@ -93,17 +93,8 @@ def wait_for_quiet() -> tuple[float, float]:
 
 
 def tree_rss_kib(pid: int) -> int:
-    """Resident KiB of pid and every descendant, from /proc."""
-    children: dict[int, list[int]] = {}
-    for d in Path("/proc").iterdir():
-        if not d.name.isdigit():
-            continue
-        try:
-            stat = (d / "stat").read_text()
-            ppid = int(stat.rsplit(")", 1)[1].split()[1])
-            children.setdefault(ppid, []).append(int(d.name))
-        except (OSError, ValueError, IndexError):
-            continue
+    """Resident KiB of pid and every descendant, walking /proc/<pid>/task/*/
+    children so the cost is the tree's size, not the whole process table."""
     total, stack = 0, [pid]
     while stack:
         p = stack.pop()
@@ -112,10 +103,22 @@ def tree_rss_kib(pid: int) -> int:
                 if line.startswith("VmRSS:"):
                     total += int(line.split()[1])
                     break
-        except OSError:
+            for task in Path(f"/proc/{p}/task").iterdir():
+                stack.extend(int(c) for c in (task / "children").read_text().split())
+        except (OSError, ValueError):
             pass
-        stack.extend(children.get(p, []))
     return total
+
+
+def gnu_elapsed_s(stderr: str) -> float | None:
+    """GNU time's wall clock, `h:mm:ss` or `m:ss.ss`."""
+    m = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([\d:.]+)", stderr)
+    if not m:
+        return None
+    secs = 0.0
+    for part in m.group(1).split(":"):
+        secs = secs * 60 + float(part)
+    return secs
 
 
 def run_capped(argv: list[str], wall_s: float, rss_gib: float, env: dict | None = None) -> dict:
@@ -142,21 +145,22 @@ def run_capped(argv: list[str], wall_s: float, rss_gib: float, env: dict | None 
                 except ProcessLookupError:
                     pass
                 return
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     stdout, stderr = proc.communicate()
+    wall_poll = time.monotonic() - t0
     watcher.join()
-    wall = time.monotonic() - t0
     m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr)
     user = re.search(r"User time \(seconds\):\s*([\d.]+)", stderr)
     sys_t = re.search(r"System time \(seconds\):\s*([\d.]+)", stderr)
     status = outcome["status"] or ("ok" if proc.returncode == 0 else "FAILED")
+    wall = gnu_elapsed_s(stderr) if status == "ok" else None
     return {
         "argv": argv,
         "status": status,
-        "wall_s": round(wall, 3),
+        "wall_s": round(wall if wall is not None else wall_poll, 3),
         "cpu_s": round(float(user.group(1)) + float(sys_t.group(1)), 2) if user and sys_t else None,
         "peak_rss_kib": int(m.group(1)) if m and status == "ok" else outcome["peak_poll_kib"],
         "stderr_tail": stderr[-3000:] if status != "ok" else None,
