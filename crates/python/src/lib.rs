@@ -22,6 +22,7 @@ use tylertoo_core::overview::convert::{
 };
 use tylertoo_core::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions, ExportReport, FeatureOrder,
+    SizeValve,
 };
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 use tylertoo_core::overview::level::{MemoryProfile, Mode};
@@ -208,6 +209,10 @@ fn convert(
         tile_buffer: 8,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
+        // #745: not exposed yet while the merging valves are evaluated;
+        // `TYLERTOO_SIZE_VALVE` still selects one.
+        compressed_tile_size_limit: None,
+        size_valve: SizeValve::default(),
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
@@ -835,6 +840,10 @@ fn export_pmtiles(
         extent,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
+        // #745: not exposed yet while the merging valves are evaluated;
+        // `TYLERTOO_SIZE_VALVE` still selects one.
+        compressed_tile_size_limit: None,
+        size_valve: SizeValve::default(),
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,

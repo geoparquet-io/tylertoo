@@ -89,13 +89,13 @@
 //! `>=` the overview level's feature count, the excess being border
 //! duplication.
 
-use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -145,6 +145,10 @@ use super::stream::{
 };
 use super::writer::LEVEL_COLUMN;
 
+mod coalesce_valve;
+use coalesce_valve::RowGapCursor;
+#[cfg(test)]
+use coalesce_valve::GAP_NONE;
 mod feature_id;
 use feature_id::{
     feature_id_values, resolve_feature_id, validate_feature_id_column, ResolvedFeatureId,
@@ -205,6 +209,74 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
 /// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
 pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
 
+/// Environment override for [`ExportOptions::size_valve`] (#745), so one
+/// binary can run every valve in a benchmark. Takes the same values as the
+/// hidden `--size-valve` flag.
+pub const SIZE_VALVE_ENV: &str = "TYLERTOO_SIZE_VALVE";
+
+/// How the export brings a tile that is over its size limit back under it
+/// (#745).
+///
+/// The merging valves follow tippecanoe's `--coalesce-densest-as-needed`: the
+/// densest lines and polygons are merged into the feature kept just before
+/// them, so a polygon coverage keeps drawing its whole area, and the tile is
+/// re-measured until it fits. They differ in where the merge threshold comes
+/// from. Points are never merged; a tile of points keeps the stride valve.
+/// See `overview::export::coalesce_valve`.
+///
+/// EXPERIMENTAL: the merging valves are under evaluation (#745) and the
+/// default is still [`SizeValve::Drop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizeValve {
+    /// One pass that drops features: the largest sized geometries survive, or
+    /// a uniform stride of points. The valve before #745.
+    #[default]
+    Drop,
+    /// Merge, re-measure and repeat, each tile on its own.
+    Tile,
+    /// One threshold per zoom: a first export pass measures the threshold
+    /// each tile needs, and the real pass applies the largest to every tile
+    /// of the zoom, with [`SizeValve::Tile`]'s loop as a backstop. Costs a
+    /// second export pass.
+    Zoom,
+    /// One threshold per zoom, predicted from the scan before any tile is
+    /// encoded, with [`SizeValve::Tile`]'s loop as a backstop.
+    Hybrid,
+}
+
+impl SizeValve {
+    /// The value as the CLI and [`SIZE_VALVE_ENV`] spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Tile => "tile",
+            Self::Zoom => "zoom",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    /// Whether this valve merges instead of dropping.
+    fn merges(self) -> bool {
+        !matches!(self, Self::Drop)
+    }
+}
+
+impl std::str::FromStr for SizeValve {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "drop" => Ok(Self::Drop),
+            "tile" => Ok(Self::Tile),
+            "zoom" => Ok(Self::Zoom),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "unknown size valve {other:?}: expected drop, tile, zoom or hybrid"
+            )),
+        }
+    }
+}
+
 /// Web Mercator projected half-extent in meters (EPSG:3857 axis range is
 /// `±WEBMERC_HALF_M`). Used only to reproject a 3857 overview to lon/lat so the
 /// (geographic) tile grid math applies.
@@ -237,6 +309,14 @@ pub struct ExportOptions {
     /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (500 KiB — tippecanoe
     /// parity, issue #280).
     pub tile_size_limit: Option<usize>,
+    /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
+    /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
+    /// [`Self::tile_size_limit`]; a tile must satisfy both. `None` (the
+    /// default) or `Some(0)` sets no compressed limit.
+    pub compressed_tile_size_limit: Option<usize>,
+    /// How a tile over a size limit is brought back under it (#745). Default
+    /// [`SizeValve::Drop`]. [`SIZE_VALVE_ENV`] overrides it.
+    pub size_valve: SizeValve,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
     /// boundary-following clip is a self-touching polygon that is area- and
@@ -382,6 +462,8 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
+            compressed_tile_size_limit: None,
+            size_valve: SizeValve::Drop,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
@@ -483,6 +565,22 @@ pub struct ZoomReport {
     /// at a buffered tile edge. Expected on ordinary data; informational, and
     /// never a warning.
     pub encode_quantized_features: usize,
+    /// Tile members at this zoom the size valve merged into another member
+    /// (#745). Always 0 with [`SizeValve::Drop`].
+    pub merged_features: usize,
+    /// Tile members at this zoom the size valve dropped (#745): all of the
+    /// drop valve's, or a merging valve's when merging alone could not make
+    /// a tile fit.
+    pub valve_dropped_features: usize,
+    /// The most encodes any tile at this zoom took (#745); 1 when every tile
+    /// fit at once.
+    pub max_valve_passes: u32,
+    /// The merge threshold every tile at this zoom started from (#745):
+    /// [`SizeValve::Zoom`]'s measured or [`SizeValve::Hybrid`]'s predicted
+    /// threshold, `0` otherwise.
+    pub start_mingap: u64,
+    /// The largest merge threshold any tile at this zoom ended on (#745).
+    pub max_mingap: u64,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -522,6 +620,10 @@ pub struct ExportReport {
     /// Total tile members that collapsed at the tile extent, across all
     /// zooms — see [`ZoomReport::encode_quantized_features`] (#431).
     pub encode_quantized_features: usize,
+    /// Total tile members the size valve merged, across all zooms (#745).
+    pub merged_features: usize,
+    /// Total tile members the size valve dropped, across all zooms (#745).
+    pub valve_dropped_features: usize,
     /// Wall-clock export duration in seconds.
     pub duration_secs: f64,
 }
@@ -916,6 +1018,8 @@ struct EncodedTile {
     /// [`TileMvt::quantized`].
     encode_quantized: usize,
     oversized: bool,
+    /// What the size valve did to the tile (#745).
+    valve: ValveTally,
 }
 
 /// Resolve the Web Mercator zoom for overview level `level_idx`.
@@ -1636,6 +1740,7 @@ fn plan_levels(
                 zoom,
                 partitions,
                 wave,
+                start_mingap: 0,
             })
         })
         .collect::<Result<Vec<_>, ExportError>>()?;
@@ -1690,21 +1795,109 @@ fn export_pmtiles_impl(
     force_legacy_pass2: bool,
     backing_override: Option<SinkBacking>,
 ) -> Result<ExportReport, ExportError> {
+    let mut options = std::borrow::Cow::Borrowed(options);
+    if let Some(valve) = size_valve_from_env()? {
+        options.to_mut().size_valve = valve;
+    }
+    let mut knobs = Pass2Knobs {
+        force_legacy_pass2,
+        backing_override,
+        concurrent_levels: true,
+        checkpoint_interval: CHECKPOINT_INTERVAL,
+        fail_level: None,
+        memory_limit: None,
+        level_mingaps: None,
+        probes: None,
+    };
+    if options.size_valve == SizeValve::Zoom {
+        knobs.level_mingaps = Some(measure_level_mingaps(
+            input_path.as_ref(),
+            output_path.as_ref(),
+            &options,
+            partition_target,
+            &knobs,
+        )?);
+    }
+    export_pmtiles_run(input_path, output_path, &options, partition_target, &knobs)
+        .map(|run| run.report)
+}
+
+/// `plans` with each level's starting merge threshold set from `mingaps`
+/// (#745): what [`SizeValve::Zoom`]'s measuring pass found.
+fn with_level_mingaps(mut plans: Vec<LevelPlan>, mingaps: Option<&[u64]>) -> Vec<LevelPlan> {
+    for (plan, &mingap) in plans.iter_mut().zip(mingaps.unwrap_or_default()) {
+        plan.start_mingap = mingap;
+    }
+    plans
+}
+
+/// [`SIZE_VALVE_ENV`], when set.
+fn size_valve_from_env() -> Result<Option<SizeValve>, ExportError> {
+    match std::env::var(SIZE_VALVE_ENV) {
+        Ok(v) if !v.is_empty() => v.parse().map(Some).map_err(|reason| {
+            ExportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{SIZE_VALVE_ENV}: {reason}"),
+            ))
+        }),
+        _ => Ok(None),
+    }
+}
+
+/// [`SizeValve::Zoom`]'s measuring pass (#745): run the whole export once
+/// with [`SizeValve::Tile`] into a throwaway archive, recording per level the
+/// largest merge threshold any tile needed to fit. The real pass then starts
+/// every tile of the level from that threshold, as tippecanoe redoes a zoom
+/// with the largest `mingap` any of its tiles chose.
+///
+/// EXPERIMENTAL: a whole second export is the simplest correct form, and an
+/// upper bound on the cost. Redoing only the levels that had an oversized
+/// tile would be cheaper.
+fn measure_level_mingaps(
+    input_path: &Path,
+    output_path: &Path,
+    options: &ExportOptions,
+    partition_target: usize,
+    knobs: &Pass2Knobs,
+) -> Result<Vec<u64>, ExportError> {
+    let num_levels = OverviewReader::open(input_path)?.num_levels();
+    let probes: Arc<Vec<AtomicU64>> =
+        Arc::new((0..num_levels).map(|_| AtomicU64::new(0)).collect());
+    let dir = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::Builder::new()
+        .prefix(".tylertoo-zoom-probe")
+        .tempdir_in(dir)?;
+    let probe_opts = ExportOptions {
+        size_valve: SizeValve::Tile,
+        ..options.clone()
+    };
+    let probe_knobs = Pass2Knobs {
+        force_legacy_pass2: knobs.force_legacy_pass2,
+        backing_override: knobs.backing_override,
+        concurrent_levels: knobs.concurrent_levels,
+        checkpoint_interval: knobs.checkpoint_interval,
+        fail_level: None,
+        memory_limit: knobs.memory_limit,
+        level_mingaps: None,
+        probes: Some(Arc::clone(&probes)),
+    };
+    let t = Instant::now();
     export_pmtiles_run(
         input_path,
-        output_path,
-        options,
+        scratch.path().join("probe.pmtiles"),
+        &probe_opts,
         partition_target,
-        &Pass2Knobs {
-            force_legacy_pass2,
-            backing_override,
-            concurrent_levels: true,
-            checkpoint_interval: CHECKPOINT_INTERVAL,
-            fail_level: None,
-            memory_limit: None,
-        },
-    )
-    .map(|run| run.report)
+        &probe_knobs,
+    )?;
+    let mingaps: Vec<u64> = probes.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+    log::info!(
+        "[export] size valve zoom: measuring pass took {:.1}s; level thresholds {mingaps:?}",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(mingaps)
 }
 
 /// The pass-2 test knobs [`export_pmtiles_impl`] forwards, plus #647's.
@@ -1725,6 +1918,13 @@ struct Pass2Knobs {
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
+    /// Per-level merge thresholds every tile starts from (#745): what
+    /// [`SizeValve::Zoom`]'s measuring pass found. `None` leaves the
+    /// planned ones.
+    level_mingaps: Option<Vec<u64>>,
+    /// [`SizeValve::Zoom`]'s measuring pass: one slot per level for the
+    /// largest threshold any of its tiles needed.
+    probes: Option<Arc<Vec<AtomicU64>>>,
 }
 
 /// What [`export_pmtiles_run`] returns: the report, plus the level schedule
@@ -1954,6 +2154,7 @@ fn export_pmtiles_run(
         available_ram,
         knobs.memory_limit.or_else(probe_oom_memory_limit),
     )?;
+    let plans = with_level_mingaps(plans, knobs.level_mingaps.as_deref());
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -2027,6 +2228,7 @@ fn export_pmtiles_run(
             feature_id: feature_id.as_ref(),
             options,
             start,
+            probe: knobs.probes.as_ref().map(|p| &p[level_idx]),
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
@@ -2102,6 +2304,8 @@ impl ExportReport {
             skipped_property_columns,
             encode_dropped_features: warn_encode_drops(&zooms),
             encode_quantized_features: zooms.iter().map(|z| z.encode_quantized_features).sum(),
+            merged_features: zooms.iter().map(|z| z.merged_features).sum(),
+            valve_dropped_features: zooms.iter().map(|z| z.valve_dropped_features).sum(),
             zooms,
             duration_secs: start.elapsed().as_secs_f64(),
         }
@@ -2465,6 +2669,9 @@ struct ExportLevelCtx<'a> {
     options: &'a ExportOptions,
     /// Start of the whole export, for the elapsed-time progress lines.
     start: Instant,
+    /// [`SizeValve::Zoom`]'s measuring pass (#745): where the level's tiles
+    /// record the largest merge threshold any of them needed.
+    probe: Option<&'a AtomicU64>,
 }
 
 impl<'a> ExportLevelCtx<'a> {
@@ -2479,6 +2686,16 @@ impl<'a> ExportLevelCtx<'a> {
             published: self.published,
             feature_id: self.feature_id,
             timers,
+            encode: self.encode(),
+        }
+    }
+
+    /// The level's size-valve state for the encode path (#745).
+    fn encode(&self) -> LevelEncode<'a> {
+        LevelEncode {
+            zoom: self.plan.zoom,
+            start_mingap: self.plan.start_mingap,
+            probe: self.probe,
         }
     }
 }
@@ -2519,7 +2736,15 @@ fn export_level(
     let mut last_wave_log = Instant::now();
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
         let results: Vec<Vec<EncodedTile>> = match store.as_deref_mut() {
-            Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options, timers)?,
+            Some(s) => encode_wave_from_store(
+                s,
+                level_idx,
+                wave_idx,
+                wave,
+                level.encode(),
+                options,
+                timers,
+            )?,
             None => process_wave(&ctx, wave)?,
         };
         write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
@@ -2653,7 +2878,7 @@ fn export_level_group(
             let (commit, timers) = (&commit, &*timers);
             scope.spawn(move |_| {
                 let t_encode = Instant::now();
-                let tiles = encode_buckets(buckets, level.plan.zoom, level.options, timers);
+                let tiles = encode_buckets(buckets, level.encode(), level.options, timers);
                 let encoded = tiles.map(|tiles| EncodedLevel {
                     tiles,
                     start,
@@ -2848,6 +3073,9 @@ struct LevelTally {
     encode_quantized: usize,
     write_secs: f64,
     bytes_written: u64,
+    /// The size valve's per-tile tallies, summed (#745): `merged` and
+    /// `dropped` add up; `passes` and `mingap` are the largest seen.
+    valve: ValveTally,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
@@ -2863,6 +3091,10 @@ fn write_encoded_tiles(
     for t in results.iter().flatten() {
         tally.encode_dropped += t.encode_dropped;
         tally.encode_quantized += t.encode_quantized;
+        tally.valve.merged += t.valve.merged;
+        tally.valve.dropped += t.valve.dropped;
+        tally.valve.passes = tally.valve.passes.max(t.valve.passes);
+        tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
         if t.feature_count == 0 {
             // #431: an all-dropped tile is a tally carrier, not a tile.
             continue;
@@ -2951,6 +3183,11 @@ fn finish_level(
         oversized_tiles: tally.oversized,
         encode_dropped_features: tally.encode_dropped,
         encode_quantized_features: tally.encode_quantized,
+        merged_features: tally.valve.merged,
+        valve_dropped_features: tally.valve.dropped,
+        max_valve_passes: tally.valve.passes,
+        start_mingap: level.plan.start_mingap,
+        max_mingap: tally.valve.mingap,
     }
 }
 
@@ -3015,6 +3252,16 @@ struct Member {
     /// not, in which case [`build_mvt`] falls back to the tile-local member
     /// index.
     id: Option<u64>,
+    /// The feature's density gap (#745): how far it lies from the row before
+    /// it, in squared Web Mercator world units. The size valve merges the
+    /// densest members (smallest gap) first. [`GAP_NONE`] when the row has no
+    /// predecessor in its row group. Computed once per row on the unclipped
+    /// geometry, so every tile copy of a feature carries the same value. See
+    /// [`coalesce_valve`].
+    gap: u64,
+    /// The level band the row was read from. In partitioning mode a tile
+    /// holds several bands, and the valve merges only within one.
+    band: u16,
 }
 
 /// One level's result from the scan pass ([`scan_all_levels`]).
@@ -3056,6 +3303,8 @@ struct LevelCtx<'a> {
     feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
+    /// The level's size-valve state (#745).
+    encode: LevelEncode<'a>,
 }
 
 /// The per-export constants the single-read fan-out reads for every batch:
@@ -3083,6 +3332,9 @@ struct LevelPlan {
     zoom: u8,
     partitions: Vec<Partition>,
     wave: usize,
+    /// The merge threshold every tile of the level starts from (#745): set
+    /// for [`SizeValve::Zoom`] and [`SizeValve::Hybrid`], `0` otherwise.
+    start_mingap: u64,
 }
 
 // ============================================================================
@@ -3244,12 +3496,15 @@ fn encode_geometry(buf: &mut Vec<u8>, g: &Geometry<f64>) {
     }
 }
 
-/// Serialize one member: key, seq, feature id, properties, geometry.
+/// Serialize one member: key, seq, gap, band, feature id, properties,
+/// geometry.
 /// Property floats spill as bit patterns for the same exactness guarantee as
 /// coordinates.
 fn encode_member(buf: &mut Vec<u8>, m: &Member) {
     put_u64(buf, m.key);
     put_u64(buf, m.seq);
+    put_u64(buf, m.gap);
+    put_u32(buf, u32::from(m.band));
     match m.id {
         Some(id) => {
             buf.push(1);
@@ -3442,6 +3697,8 @@ impl SpillNames {
 fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Member, ExportError> {
     let key = cur.u64()?;
     let seq = cur.u64()?;
+    let gap = cur.u64()?;
+    let band = u16::try_from(cur.u32()?).map_err(|_| spill_corrupt())?;
     let id = match cur.u8()? {
         0 => None,
         1 => Some(cur.u64()?),
@@ -3469,6 +3726,8 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
         geom,
         props: Arc::new(props),
         id,
+        gap,
+        band,
     })
 }
 
@@ -3478,7 +3737,7 @@ fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Me
 /// costs only its 16 B `Arc<str>` handle: the text lives once in the
 /// per-schema table (#461).
 fn member_bytes_estimate(m: &Member) -> usize {
-    48 + m.geom.coords_count() * 16
+    64 + m.geom.coords_count() * 16
         + m.props
             .iter()
             .map(|(_, v)| {
@@ -3692,8 +3951,13 @@ fn fill_member_store(
     let mut store = MemberStore::new(plans, backing, ctx.opts.spill_dir.as_deref())?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
+    // #745: every band is read whole and in order, so the rows arrive in
+    // file order across every row group.
+    let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
+    let mut gaps = RowGapCursor::new(reader.row_group_bands(&all_row_groups));
     let store_ref = &mut store;
     let seq_ref = &mut seq;
+    let gaps_ref = &mut gaps;
     scoped_pipe(
         SINGLE_READ_IN_FLIGHT,
         |tx: &Sender<(usize, RecordBatch)>| -> Result<(), ExportError> {
@@ -3721,7 +3985,7 @@ fn fill_member_store(
         // derives from.
         |rx: Receiver<(usize, RecordBatch)>| -> Result<(), ExportError> {
             for (band, batch) in rx.iter() {
-                fanout_batch_members(&batch, band, ctx, seq_ref, store_ref)?;
+                fanout_batch_members(&batch, band, ctx, seq_ref, gaps_ref, store_ref)?;
             }
             Ok(())
         },
@@ -3748,6 +4012,7 @@ fn fanout_batch_members(
     band: usize,
     ctx: &FanoutCtx<'_>,
     seq: &mut u64,
+    gaps: &mut RowGapCursor,
     store: &mut MemberStore,
 ) -> Result<(), ExportError> {
     let FanoutCtx {
@@ -3761,6 +4026,8 @@ fn fanout_batch_members(
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, published.geometry.as_deref())?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers)?;
+    let row_gaps = ExportTimers::time(&timers.decode, || gaps.batch(&geoms));
+    debug_assert!(row_gaps.iter().all(|&(_, b)| usize::from(b) == band));
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
     // prefix). A level with no planned partitions sized no tiles, so no
@@ -3792,7 +4059,9 @@ fn fanout_batch_members(
     let t_route = Instant::now();
     let flushed_before = store.flush_time;
     let cols = AttrColumns::new(&schema, geom_idx, published, feature_id);
-    let routed = route_fanout_rows(batch, &cols, plans, &targets, per_level, seq, store);
+    let routed = route_fanout_rows(
+        batch, &cols, plans, &targets, per_level, &row_gaps, seq, store,
+    );
     let flushed = store.flush_time.saturating_sub(flushed_before);
     add_nanos(&timers.decode, t_route.elapsed().saturating_sub(flushed));
     routed
@@ -3813,12 +4082,14 @@ type SharedProps = Arc<Vec<(Arc<str>, PropertyValue)>>;
 /// [`fanout_batch_members`]' second half: attach each member-producing row's
 /// properties (materialized once per row, shared via `Arc`) and push its
 /// members into their `(level, wave)` store buckets, in band order.
+#[allow(clippy::too_many_arguments)]
 fn route_fanout_rows(
     batch: &RecordBatch,
     cols: &AttrColumns<'_>,
     plans: &[LevelPlan],
     targets: &[usize],
     mut per_level: Vec<RowMembers>,
+    row_gaps: &[(u64, u16)],
     seq: &mut u64,
     store: &mut MemberStore,
 ) -> Result<(), ExportError> {
@@ -3837,6 +4108,7 @@ fn route_fanout_rows(
             continue;
         }
         let (props, id) = attrs.row(row)?;
+        let (gap, band) = row_gaps[row];
         for (ti, &k) in targets.iter().enumerate() {
             let items = std::mem::take(&mut per_level[ti][row]);
             let plan = &plans[k];
@@ -3852,6 +4124,8 @@ fn route_fanout_rows(
                         geom,
                         props: Arc::clone(&props),
                         id,
+                        gap,
+                        band,
                     },
                 )?;
             }
@@ -3871,12 +4145,12 @@ fn encode_wave_from_store(
     level_idx: usize,
     wave_idx: usize,
     wave: &[Partition],
-    zoom: u8,
+    lvl: LevelEncode<'_>,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     let members = ExportTimers::time(&timers.spill_read, || store.take_wave(level_idx, wave_idx))?;
-    encode_buckets(bucket_members(members, wave), zoom, opts, timers)
+    encode_buckets(bucket_members(members, wave), lvl, opts, timers)
 }
 
 /// Route a wave's members to their partitions, one bucket per partition, as
@@ -3893,13 +4167,13 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 /// ascending partition order.
 fn encode_buckets(
     buckets: Vec<Vec<Member>>,
-    zoom: u8,
+    lvl: LevelEncode<'_>,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
-        .map(|members| encode_members(members, zoom, opts, timers))
+        .map(|members| encode_members(members, lvl, opts, timers))
         .collect::<Result<_, _>>()
 }
 
@@ -4441,7 +4715,7 @@ fn process_wave(
     let n_members: usize = buckets.iter().map(Vec::len).sum();
 
     let t_encode = Instant::now();
-    let tiles = encode_buckets(buckets, ctx.zoom, ctx.opts, ctx.timers)?;
+    let tiles = encode_buckets(buckets, ctx.encode, ctx.opts, ctx.timers)?;
     let n_tiles: usize = tiles.iter().map(Vec::len).sum();
     log::debug!(
         "[profile]     z{} wave [{:x}..{:x}] ({} partitions): rows_read={rows_read} \
@@ -4512,8 +4786,15 @@ fn collect_wave(ctx: &LevelCtx<'_>, wave: &[Partition]) -> Result<CollectedWave,
     // in read order, so `seq` — the band-order counter the within-tile
     // ordering derives from — advances exactly as it did serially, and the
     // consumer does the same work in the same order.
+    // #745: the same row groups the read below selects, so the cursor knows
+    // where each one starts and which band it belongs to.
+    let selected = ctx
+        .reader
+        .selected_row_groups_any(ctx.level_idx, bboxes.as_ref().map(|b| b.as_slice()))?;
+    let mut gaps = RowGapCursor::new(ctx.reader.row_group_bands(&selected));
     let buckets_ref = &mut buckets;
     let seq_ref = &mut seq;
+    let gaps_ref = &mut gaps;
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
@@ -4535,7 +4816,7 @@ fn collect_wave(ctx: &LevelCtx<'_>, wave: &[Partition]) -> Result<CollectedWave,
         },
         |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
             for batch in rx.iter() {
-                collect_wave_members(ctx, wave, &batch, seq_ref, buckets_ref)?;
+                collect_wave_members(ctx, wave, &batch, seq_ref, gaps_ref, buckets_ref)?;
             }
             Ok(())
         },
@@ -4603,6 +4884,7 @@ fn collect_wave_members(
     wave: &[Partition],
     batch: &RecordBatch,
     seq: &mut u64,
+    gaps: &mut RowGapCursor,
     buckets: &mut [Vec<Member>],
 ) -> Result<(), ExportError> {
     debug_assert_eq!(buckets.len(), wave.len());
@@ -4613,6 +4895,7 @@ fn collect_wave_members(
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, ctx.published.geometry.as_deref())?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers)?;
+    let row_gaps = ExportTimers::time(&timers.decode, || gaps.batch(&geoms));
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
@@ -4643,6 +4926,7 @@ fn collect_wave_members(
             continue;
         }
         let (props, id) = attrs.row(row)?;
+        let (gap, band) = row_gaps[row];
         for (key, geom) in items {
             buckets[route_partition(wave, key)].push(Member {
                 key,
@@ -4650,6 +4934,8 @@ fn collect_wave_members(
                 geom,
                 props: Arc::clone(&props),
                 id,
+                gap,
+                band,
             });
         }
         *seq += 1;
@@ -5597,10 +5883,11 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
 
 fn encode_members(
     mut members: Vec<Member>,
-    zoom: u8,
+    lvl: LevelEncode<'_>,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<EncodedTile>, ExportError> {
+    let zoom = lvl.zoom;
     sort_members_for_encode(&mut members, &opts.feature_order);
 
     // Runs of equal key. `members` is sorted by key above, so consecutive
@@ -5618,7 +5905,7 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let mvt = encode_tile(g, &tb, opts);
+            let mvt = encode_tile(g, &tb, opts, lvl);
             if mvt.features == 0 {
                 // Every member encoded to nothing (#431). There is no tile
                 // to write, but the drops must still reach the report, so
@@ -5633,13 +5920,17 @@ fn encode_members(
                     encode_dropped: mvt.unencodable,
                     encode_quantized: mvt.quantized,
                     oversized: mvt.oversized,
+                    valve: mvt.valve,
                 }));
             }
             let hash = TileHasher::hash(&mvt.data);
             let raw_len = mvt.data.len();
-            let compressed = match compression::compress(&mvt.data, Compression::Gzip) {
-                Ok(c) => c,
-                Err(e) => return Some(Err(ExportError::from(e))),
+            let compressed = match mvt.gzip {
+                Some(gz) => gz,
+                None => match compression::compress(&mvt.data, Compression::Gzip) {
+                    Ok(c) => c,
+                    Err(e) => return Some(Err(ExportError::from(e))),
+                },
             };
             Some(Ok(EncodedTile {
                 x,
@@ -5651,6 +5942,7 @@ fn encode_members(
                 encode_dropped: mvt.unencodable,
                 encode_quantized: mvt.quantized,
                 oversized: mvt.oversized,
+                valve: mvt.valve,
             }))
         })
         .collect()
@@ -5671,6 +5963,10 @@ fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool
 struct TileMvt {
     /// Raw (uncompressed) MVT bytes.
     data: Vec<u8>,
+    /// The gzip bytes of `data`, when the valve already compressed it to
+    /// check [`ExportOptions::compressed_tile_size_limit`] (#745), so
+    /// [`encode_members`] need not compress it again.
+    gzip: Option<Vec<u8>>,
     /// MVT features actually written to the layer. A `GeometryCollection`
     /// member contributes one per geometry kind it holds (#431).
     features: usize,
@@ -5683,35 +5979,255 @@ struct TileMvt {
     quantized: usize,
     /// Whether the oversized valve fired.
     oversized: bool,
+    /// What the size valve did to the tile (#745).
+    valve: ValveTally,
 }
 
-/// Encode a single tile's members to MVT bytes, applying the oversized valve.
-fn encode_tile(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
-    let full = build_mvt(members, tb, opts);
+/// What the size valve did to one tile (#745), for the report and the
+/// [`SizeValve::Zoom`] measuring pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ValveTally {
+    /// Members merged into another member.
+    merged: usize,
+    /// Members dropped: by the drop valve, or by a merging valve's fallback
+    /// when merging alone could not make the tile fit.
+    dropped: usize,
+    /// Encodes the tile took, the first included (`0` when no valve ran).
+    passes: u32,
+    /// The merge threshold the tile ended on.
+    mingap: u64,
+}
 
-    match opts.tile_size_limit {
-        // `limit > 0` so `Some(0)` is a no-op off switch (the CLI/Python `0`
-        // disable value never reaches here as `Some`, but guard the core API too).
-        Some(limit) if limit > 0 && full.data.len() > limit && members.len() > 1 => {
-            // Single, non-iterative drop pass. Keep a proportional count and let
-            // `select_kept_members` decide *which* features survive.
-            let keep_frac = limit as f64 / full.data.len() as f64;
-            let keep = ((members.len() as f64 * keep_frac).floor() as usize).max(1);
-            let kept = shed_to_fit(members, keep, opts);
-            let keep = kept.len();
-            let shed = build_mvt(&kept, tb, opts);
-            log::warn!(
-                "oversized tile ({} bytes > {limit} limit): dropped {} of {} features (one pass)",
-                shed.data.len(),
-                members.len() - keep,
-                members.len()
-            );
-            TileMvt {
-                oversized: true,
-                ..shed
+/// The per-level state the size valve reads (#745), passed down the encode
+/// path with the zoom.
+#[derive(Clone, Copy)]
+struct LevelEncode<'a> {
+    zoom: u8,
+    /// The merge threshold every tile of the level starts from:
+    /// [`SizeValve::Zoom`]'s measured or [`SizeValve::Hybrid`]'s predicted
+    /// level threshold; `0` otherwise.
+    start_mingap: u64,
+    /// [`SizeValve::Zoom`]'s measuring pass: the largest threshold any tile
+    /// of the level needed.
+    probe: Option<&'a AtomicU64>,
+}
+
+impl LevelEncode<'_> {
+    /// No level threshold and no probe: what every valve but
+    /// [`SizeValve::Zoom`] and [`SizeValve::Hybrid`] runs with.
+    #[cfg(test)]
+    fn plain(zoom: u8) -> Self {
+        Self {
+            zoom,
+            start_mingap: 0,
+            probe: None,
+        }
+    }
+}
+
+/// What [`build_mvt`] needs from a tile feature: a plain member, or a member
+/// with others merged into it (#745).
+trait TileFeature: Sync {
+    fn geometry(&self) -> &Geometry<f64>;
+    fn properties(&self) -> &SharedProps;
+    fn feature_id(&self) -> Option<u64>;
+}
+
+impl TileFeature for Member {
+    fn geometry(&self) -> &Geometry<f64> {
+        &self.geom
+    }
+    fn properties(&self) -> &SharedProps {
+        &self.props
+    }
+    fn feature_id(&self) -> Option<u64> {
+        self.id
+    }
+}
+
+impl TileFeature for coalesce_valve::Merged<'_> {
+    fn geometry(&self) -> &Geometry<f64> {
+        &self.geom
+    }
+    fn properties(&self) -> &SharedProps {
+        self.props()
+    }
+    fn feature_id(&self) -> Option<u64> {
+        self.target.id
+    }
+}
+
+impl<T: TileFeature + ?Sized> TileFeature for &T {
+    fn geometry(&self) -> &Geometry<f64> {
+        (**self).geometry()
+    }
+    fn properties(&self) -> &SharedProps {
+        (**self).properties()
+    }
+    fn feature_id(&self) -> Option<u64> {
+        (**self).feature_id()
+    }
+}
+
+/// Encode a single tile's members to MVT bytes, applying the size valve.
+fn encode_tile(
+    members: &[Member],
+    tb: &TileBounds,
+    opts: &ExportOptions,
+    lvl: LevelEncode<'_>,
+) -> TileMvt {
+    if opts.size_valve.merges() && !is_point_like(members) {
+        return merge_to_fit(members, tb, opts, lvl);
+    }
+    drop_to_fit(members, tb, opts)
+}
+
+/// Whether every member has at most one coordinate: a tile of points (or of
+/// polygons collapsed to centroid points, the #259 dot-fill recipe).
+fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
+    members.iter().all(|m| m.geometry().coords_count() <= 1)
+}
+
+/// The share of a tile that fits its size limits: the smallest
+/// `limit / size` over the limits in force, so `>= 1.0` fits (infinite with
+/// no limit). Compresses the tile only when a compressed limit is set, and
+/// keeps the bytes for the writer.
+fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
+    let mut fit = f64::INFINITY;
+    if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
+        fit = fit.min(limit as f64 / mvt.data.len() as f64);
+    }
+    if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
+        let gz = compression::compress(&mvt.data, Compression::Gzip)?;
+        fit = fit.min(limit as f64 / gz.len() as f64);
+        mvt.gzip = Some(gz);
+    }
+    Ok(fit)
+}
+
+/// The pre-#745 valve: if the tile is over its limit, keep a proportional
+/// count of members in one pass and re-encode once.
+fn drop_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    let mut full = build_mvt(members, tb, opts);
+    let fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
+    if fit >= 1.0 || members.len() <= 1 {
+        return full;
+    }
+    // Single, non-iterative drop pass. Keep a proportional count and let
+    // `select_kept_members` decide *which* features survive.
+    let keep = ((members.len() as f64 * fit).floor() as usize).max(1);
+    let kept = shed_to_fit(members, keep, opts);
+    let keep = kept.len();
+    let shed = build_mvt(&kept, tb, opts);
+    log::warn!(
+        "oversized tile ({} bytes, {:.2}x its limit): dropped {} of {} features (one pass)",
+        full.data.len(),
+        1.0 / fit,
+        members.len() - keep,
+        members.len()
+    );
+    TileMvt {
+        oversized: true,
+        valve: ValveTally {
+            dropped: members.len() - keep,
+            passes: 2,
+            ..ValveTally::default()
+        },
+        ..shed
+    }
+}
+
+/// The merging valves (#745): merge members whose gap is below the
+/// threshold into the member kept before them, re-encode, and raise the
+/// threshold until the tile fits. See [`coalesce_valve`].
+///
+/// Starts from the level's threshold (`0` for [`SizeValve::Tile`]). With a
+/// zero threshold and a tile under its limit this encodes exactly what
+/// [`drop_to_fit`] would. If the threshold cannot rise any further and the
+/// tile is still over, the merged features go through the drop valve.
+fn merge_to_fit(
+    members: &[Member],
+    tb: &TileBounds,
+    opts: &ExportOptions,
+    lvl: LevelEncode<'_>,
+) -> TileMvt {
+    // The merge walks the file's spatial order; `--feature-order` sorted the
+    // tile by a column instead.
+    let mut ordered: Vec<&Member> = members.iter().collect();
+    if !matches!(opts.feature_order, FeatureOrder::Input) {
+        ordered.sort_unstable_by_key(|m| m.seq);
+    }
+    let mut gaps: Option<Vec<u64>> = None;
+    let mut mingap = lvl.start_mingap;
+    let mut keep_fraction = 1.0_f64;
+    let mut passes = 0u32;
+    loop {
+        passes += 1;
+        let merged = coalesce_valve::coalesce_members(&ordered, mingap);
+        let absorbed: usize = merged.iter().map(|m| m.absorbed).sum();
+        let mut feats: Vec<&coalesce_valve::Merged<'_>> = merged.iter().collect();
+        if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+            feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
+        }
+        let mut mvt = build_mvt(&feats, tb, opts);
+        let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
+        let tally = ValveTally {
+            merged: absorbed,
+            dropped: 0,
+            passes,
+            mingap,
+        };
+        if fit >= 1.0 || feats.len() <= 1 {
+            if let Some(probe) = lvl.probe {
+                probe.fetch_max(mingap, Ordering::Relaxed);
+            }
+            return TileMvt {
+                oversized: passes > 1,
+                valve: tally,
+                ..mvt
+            };
+        }
+        // tippecanoe's `mingap_fraction`: aim for the share of features
+        // that would fit, with a 20% margin, never keeping more than 80%.
+        keep_fraction = (keep_fraction * fit * 0.8).min(0.8);
+        let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
+        match coalesce_valve::next_mingap(g, keep_fraction, mingap) {
+            Some(next) => mingap = next,
+            None => {
+                // Merged as far as the gaps allow and still over: drop.
+                // DIVERGENCE FROM TIPPECANOE: tippecanoe exits ("Can't
+                // increase feature gap threshold further"); we finish the
+                // tile and say so.
+                if let Some(probe) = lvl.probe {
+                    probe.fetch_max(mingap, Ordering::Relaxed);
+                }
+                let keep = ((feats.len() as f64 * fit).floor() as usize).max(1);
+                let mut kept = select_kept_members(&feats, keep);
+                kept.sort_by_key(|m| m.target.seq);
+                if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+                    kept.sort_by(|a, b| {
+                        compare_by_feature_order(a.target, b.target, name, *descending)
+                    });
+                }
+                let shed = build_mvt(&kept, tb, opts);
+                log::warn!(
+                    "oversized tile still {:.2}x its limit after merging {absorbed} of {} \
+                     features: dropped {} more",
+                    1.0 / fit,
+                    members.len(),
+                    feats.len() - kept.len()
+                );
+                return TileMvt {
+                    oversized: true,
+                    valve: ValveTally {
+                        dropped: feats.len() - kept.len(),
+                        passes: passes + 1,
+                        ..tally
+                    },
+                    ..shed
+                };
             }
         }
-        _ => full,
     }
 }
 
@@ -5746,24 +6262,23 @@ fn shed_to_fit<'a>(members: &'a [Member], keep: usize, opts: &ExportOptions) -> 
 ///   recipe collapses dense polygons to centroid points): vertex count carries
 ///   no signal, so a size-ranked prefix would just keep whichever points happen
 ///   to sort first and clump them in one corner. Instead keep a uniform stride
-///   across member order. Overview rows are Hilbert-sorted (§ writer), so a
-///   tile's members arrive in space-filling-curve order; an even stride
-///   therefore spreads the survivors across the tile — the same spatially
-///   uniform thinning tippecanoe achieves by dropping every Nth feature in
-///   sequence.
+///   across member order. Overview rows are in the source file's order, which
+///   for gpio-optimized input is Hilbert order, so a tile's members arrive in
+///   space-filling-curve order; an even stride then spreads the survivors
+///   across the tile — the same spatially uniform thinning tippecanoe
+///   achieves by dropping every Nth feature in sequence.
 ///
 /// `keep` is clamped to `1..=members.len()`.
-fn select_kept_members(members: &[Member], keep: usize) -> Vec<&Member> {
+fn select_kept_members<M: TileFeature>(members: &[M], keep: usize) -> Vec<&M> {
     let n = members.len();
     let keep = keep.clamp(1, n);
-    let point_like = members.iter().all(|m| m.geom.coords_count() <= 1);
-    if point_like {
+    if is_point_like(members) {
         // Evenly spaced indices 0, n/keep, 2n/keep, … — strictly increasing and
         // in-bounds because keep ≤ n.
         (0..keep).map(|i| &members[i * n / keep]).collect()
     } else {
-        let mut ranked: Vec<&Member> = members.iter().collect();
-        ranked.sort_by_key(|m| std::cmp::Reverse(m.geom.coords_count()));
+        let mut ranked: Vec<&M> = members.iter().collect();
+        ranked.sort_by_key(|m| std::cmp::Reverse(m.geometry().coords_count()));
         ranked.truncate(keep);
         ranked
     }
@@ -5785,13 +6300,13 @@ const PARALLEL_ENCODE_MIN_COORDS: usize = 4096;
 /// Whether [`build_mvt`] encodes these members' geometries in parallel: two
 /// or more members holding at least [`PARALLEL_ENCODE_MIN_COORDS`] vertices.
 /// The count stops at the threshold, so a small tile costs one short scan.
-fn encode_in_parallel<M: Borrow<Member>>(members: &[M]) -> bool {
+fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
     if members.len() < 2 {
         return false;
     }
     let mut coords = 0usize;
     for m in members {
-        coords += m.borrow().geom.coords_count();
+        coords += m.geometry().coords_count();
         if coords >= PARALLEL_ENCODE_MIN_COORDS {
             return true;
         }
@@ -5806,29 +6321,23 @@ fn encode_in_parallel<M: Borrow<Member>>(members: &[M]) -> bool {
 /// parallel. Tag interning stays serial, in member order, which keeps the
 /// key/value tables and the bytes identical to the serial loop. A smaller
 /// tile encodes and interns each member in turn, with no buffer.
-fn build_mvt<M: Borrow<Member> + Sync>(
-    members: &[M],
-    tb: &TileBounds,
-    opts: &ExportOptions,
-) -> TileMvt {
+fn build_mvt<M: TileFeature>(members: &[M], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
-    let id_of = |i: usize, m: &Member| Some(m.id.unwrap_or(i as u64));
+    let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     if encode_in_parallel(members) {
         let encoded: Vec<EncodedFeatureGeometry> = members
             .par_iter()
-            .map(|m| EncodedFeatureGeometry::encode(&m.borrow().geom, tb, opts.extent))
+            .map(|m| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
             .collect();
         for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
-            let m = m.borrow();
-            layer.add_encoded_feature(id_of(i, m), geom, &m.props);
+            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     } else {
         for (i, m) in members.iter().enumerate() {
-            let m = m.borrow();
-            let geom = EncodedFeatureGeometry::encode(&m.geom, tb, opts.extent);
-            layer.add_encoded_feature(id_of(i, m), geom, &m.props);
+            let geom = EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent);
+            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     }
     let features = layer.feature_count();
@@ -5838,10 +6347,12 @@ fn build_mvt<M: Borrow<Member> + Sync>(
     tb_builder.add_layer(layer.build());
     TileMvt {
         data: tb_builder.build().encode_to_vec(),
+        gzip: None,
         features,
         unencodable,
         quantized,
         oversized: false,
+        valve: ValveTally::default(),
     }
 }
 
@@ -5864,6 +6375,7 @@ fn encode_level_tiles(
     opts: &ExportOptions,
 ) -> Result<Vec<EncodedTile>, ExportError> {
     let mut members = Vec::new();
+    let mut gaps = RowGapCursor::new(vec![(0, features.len() as u64)]);
     for (fi, f) in features.iter().enumerate() {
         let seq = fi as u64;
         let id = match &opts.feature_id {
@@ -5882,6 +6394,8 @@ fn encode_level_tiles(
                 .map(|(n, v)| (Arc::from(n.as_str()), v.clone()))
                 .collect(),
         );
+        // #745: the slice stands in for one row group of one band.
+        let (gap, band) = gaps.next_row(f.geom.bounding_rect());
         for (key, geom) in feature_tile_members(&f.geom, zoom, opts, 0, u64::MAX) {
             members.push(Member {
                 key,
@@ -5889,6 +6403,8 @@ fn encode_level_tiles(
                 geom,
                 props: Arc::clone(&props),
                 id,
+                gap,
+                band,
             });
         }
     }
@@ -5896,8 +6412,13 @@ fn encode_level_tiles(
     // compression into the parallel encode section). This helper exists to
     // exercise MVT *encoding*, so decompress each tile back to raw MVT bytes;
     // the assertions in the tests below operate on the uncompressed payload.
-    let mut tiles = encode_members(members, zoom, opts, &ExportTimers::default())
-        .expect("in-memory gzip is infallible");
+    let mut tiles = encode_members(
+        members,
+        LevelEncode::plain(zoom),
+        opts,
+        &ExportTimers::default(),
+    )
+    .expect("in-memory gzip is infallible");
     // #431: all-dropped carriers hold no tile bytes; the writer skips them too.
     tiles.retain(|t| t.feature_count > 0);
     for t in &mut tiles {
@@ -7910,6 +8431,7 @@ mod tests {
             zoom,
             partitions,
             wave: 1,
+            start_mingap: 0,
         }];
         let scans = [LevelScan {
             feature_count: 32 * 1_024,
@@ -7933,11 +8455,13 @@ mod tests {
                 zoom,
                 partitions: plan_partitions(&BTreeMap::new(), zoom, 1),
                 wave: 1,
+                start_mingap: 0,
             },
             LevelPlan {
                 zoom,
                 partitions: plan_partitions(&tile_counts, zoom, 1),
                 wave: 1,
+                start_mingap: 0,
             },
         ];
         let scans = [
@@ -8100,6 +8624,7 @@ mod tests {
             zoom,
             partitions: partitions_with_members(counts),
             wave,
+            start_mingap: 0,
         }
     }
 
@@ -8199,6 +8724,8 @@ mod tests {
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
             memory_limit: None,
+            level_mingaps: None,
+            probes: None,
         }
     }
 
@@ -8472,6 +8999,8 @@ mod tests {
             geom,
             props: Arc::new(Vec::new()),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         let quarter = PARALLEL_ENCODE_MIN_COORDS / 4;
         let ring: Vec<(f64, f64)> = (0..=quarter)
@@ -8540,6 +9069,8 @@ mod tests {
                     geom,
                     props: Arc::new(props),
                     id: None,
+                    gap: GAP_NONE,
+                    band: 0,
                 }
             })
             .collect();
@@ -9090,6 +9621,8 @@ mod tests {
             geom: geom.clone(),
             props: Arc::new(Vec::new()),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         build_mvt(std::slice::from_ref(&m), &tb, opts).data
     }
@@ -11370,6 +11903,8 @@ mod tests {
             geom: poly.clone(),
             props: Arc::new(vec![]),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         let expected = build_mvt(&[&member], &tc.bounds(), &opts).data;
         assert_eq!(
@@ -11473,6 +12008,8 @@ mod tests {
             geom: Geometry::Point(Point::new(x, y)),
             props: Arc::new(Vec::new()),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         }
     }
 
@@ -11487,6 +12024,8 @@ mod tests {
             geom: Geometry::Point(Point::new(seq as f64 * 0.001, 0.0)),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         }
     }
 
@@ -11643,6 +12182,8 @@ mod tests {
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("level".into(), PropertyValue::Double(level))]),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         // Tile 1's low value must not migrate ahead of tile 0's high value.
         let mut members = vec![mk(1, 0, 0.1), mk(0, 1, 0.9), mk(0, 2, 0.2)];
@@ -11673,6 +12214,8 @@ mod tests {
             geom: Geometry::Point(Point::new(0.0, 0.0)),
             props: Arc::new(vec![("n".into(), v)]),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         let members = vec![
             mk(0, PropertyValue::Int(10)),
@@ -11751,6 +12294,8 @@ mod tests {
                     geom: Geometry::LineString(LineString::from(coords)),
                     props: Arc::new(Vec::new()),
                     id: None,
+                    gap: GAP_NONE,
+                    band: 0,
                 }
             })
             .collect();
@@ -11858,6 +12403,8 @@ mod tests {
                     geom: Geometry::LineString(coords.into_iter().collect()),
                     props: Arc::new(vec![("level".into(), PropertyValue::Double(i as f64))]),
                     id: None,
+                    gap: GAP_NONE,
+                    band: 0,
                 }
             })
             .collect();
@@ -11915,7 +12462,7 @@ mod tests {
             tile_size_limit: Some(0),
             ..Default::default()
         };
-        let mvt = encode_tile(&members, &tb, &opts);
+        let mvt = encode_tile(&members, &tb, &opts, LevelEncode::plain(0));
         assert!(!mvt.oversized, "Some(0) must disable the cap");
         assert_eq!(mvt.features, members.len());
         assert_eq!(mvt.unencodable, 0);
@@ -12000,6 +12547,13 @@ mod tests {
                 geom: g,
                 props: Arc::new(props.clone()),
                 id,
+                // #745: both the "no predecessor" sentinel and real values.
+                gap: if i % 3 == 0 {
+                    GAP_NONE
+                } else {
+                    12_345 * i as u64
+                },
+                band: i as u16,
             };
             let mut buf = Vec::new();
             encode_member(&mut buf, &m);
@@ -12008,6 +12562,7 @@ mod tests {
             assert!(cur.is_empty(), "trailing bytes after decode (geometry {i})");
             assert_eq!(back.key, m.key);
             assert_eq!(back.seq, m.seq);
+            assert_eq!((back.gap, back.band), (m.gap, m.band));
             assert_eq!(
                 back.id, m.id,
                 "feature id must survive the spill (geometry {i})"
@@ -12052,6 +12607,7 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10]),
             wave: 1,
+            start_mingap: 0,
         }];
         let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
         assert_eq!(
@@ -12077,6 +12633,7 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
+            start_mingap: 0,
         }];
         let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
@@ -12085,6 +12642,8 @@ mod tests {
             geom: Geometry::Point(Point::new(seq as f64, -1.0)),
             props: Arc::new(vec![("id".into(), PropertyValue::Int(seq as i64))]),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         store.push(0, 0, mk(0, 0)).unwrap();
         store.push(0, 1, mk(1, 1)).unwrap();
@@ -12114,15 +12673,17 @@ mod tests {
             geom: Geometry::LineString(LineString::from(vec![(0.0, 0.0), (1.0, 1.0)])),
             props: Arc::new(props),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
-        assert_eq!(member_bytes_estimate(&m(vec![])), 48 + 2 * 16);
+        assert_eq!(member_bytes_estimate(&m(vec![])), 64 + 2 * 16);
         let long_name: Arc<str> = "a_very_long_property_name".into();
         assert_eq!(
             member_bytes_estimate(&m(vec![
                 (long_name, PropertyValue::String("hello world!".into())),
                 ("rank".into(), PropertyValue::Int(7)),
             ])),
-            48 + 2 * 16 + (16 + 12) + (16 + 8)
+            64 + 2 * 16 + (16 + 12) + (16 + 8)
         );
     }
 
@@ -12136,6 +12697,7 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10]),
             wave: 1,
+            start_mingap: 0,
         }];
         let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
@@ -12144,6 +12706,8 @@ mod tests {
             geom: Geometry::Point(Point::new(seq as f64, 0.0)),
             props: Arc::new(props),
             id: None,
+            gap: GAP_NONE,
+            band: 0,
         };
         let full = |seq: u64| {
             mk(

@@ -30,7 +30,7 @@ use indicatif::HumanBytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
-use tylertoo_core::overview::export::FeatureOrder;
+use tylertoo_core::overview::export::{FeatureOrder, SizeValve};
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
@@ -600,6 +600,21 @@ struct ExportPmtilesArgs {
     /// no cap. A tile over the cap drops features until it fits.
     #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
     tile_size_limit: usize,
+
+    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
+    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
+    /// both caps.
+    #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_bytes)]
+    max_compressed_tile_size: usize,
+
+    /// How a tile over its cap is brought under it. Experimental (#745).
+    #[arg(
+        long,
+        value_name = "drop|tile|zoom|hybrid",
+        default_value = "drop",
+        hide = true
+    )]
+    size_valve: SizeValve,
 
     /// Write the JSON export report, with per-zoom tile and feature counts,
     /// to this path.
@@ -1345,6 +1360,21 @@ struct TilesArgs {
     #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
+    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
+    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
+    /// both caps.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
+    max_compressed_tile_size: Option<usize>,
+
+    /// How a tile over its cap is brought under it. Experimental (#745).
+    #[arg(
+        long,
+        value_name = "drop|tile|zoom|hybrid",
+        default_value = "drop",
+        hide = true
+    )]
+    size_valve: SizeValve,
+
     /// Clip all polygons with the full overlay for byte-stable tiles. The
     /// simple-ring fast path renders identically but can change a ring's
     /// starting vertex.
@@ -2067,6 +2097,14 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
         ("--description", args.publication.description.is_some()),
         ("--attribution", args.publication.attribution.is_some()),
         ("--max-tile-size", args.max_tile_size.is_some()),
+        (
+            "--max-compressed-tile-size",
+            args.max_compressed_tile_size.is_some(),
+        ),
+        (
+            "--size-valve",
+            args.size_valve != ExportOptions::default().size_valve,
+        ),
         ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
         (
             "--tile-buffer",
@@ -2316,6 +2354,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_range: manual_range,
         tile_buffer: args.tile_buffer,
         tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
+        compressed_tile_size_limit: args.max_compressed_tile_size.and_then(size_limit_opt),
+        size_valve: args.size_valve,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
@@ -2948,6 +2988,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         tile_buffer: args.tile_buffer,
         extent: 4096,
         tile_size_limit: size_limit_opt(args.tile_size_limit),
+        compressed_tile_size_limit: size_limit_opt(args.max_compressed_tile_size),
+        size_valve: args.size_valve,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
