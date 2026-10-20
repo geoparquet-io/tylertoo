@@ -63,15 +63,16 @@ tiles:
 
 | `--simplify-factor` | Area drawn | Build time | Peak memory | Archive |
 |---|---|---|---|---|
-| 2 | 87.3% | 10.8 s | 2.6 GiB | 132 MB |
-| 1 (default) | 97.4% | 14.2 s | 3.0 GiB | 144 MB |
-| 0.5 | 98.8% | 17.2 s | 4.2 GiB | 150 MB |
-| 0.25 | 99.3% | 21.1 s | 4.5 GiB | 156 MB |
-| 0.1 | 99.5% | 21.5 s | 4.5 GiB | 158 MB |
-| 0 (no simplification) | 99.9% | 15.1 s | 3.1 GiB | 149 MB |
+| 2 | 87.4% | 10.8 s | 2.6 GiB | 132 MB |
+| 1 (default) | 97.6% | 13.8 s | 3.2 GiB | 145 MB |
+| 0.5 | 98.9% | 17.3 s | 4.0 GiB | 150 MB |
+| 0.25 | 99.5% | 22.4 s | 4.5 GiB | 155 MB |
+| 0.1 | 99.6% | 21.9 s | 4.5 GiB | 157 MB |
+| 0 (no simplification) | 99.99% | 17.1 s | 3.2 GiB | 155 MB |
 
 Tippecanoe drew 99.5–99.6% of the same tiles. Coverage flattens below
-about 0.25; smaller factors cost time and memory for little gain. With
+about 0.25, at 99.6–99.7%; smaller factors cost time and memory for
+little gain. With
 `--simplify-factor 0` only the tile grid reduces vertices, and it snaps a
 shared border identically on both sides, so no slivers form. Export then
 costs about the same as at the default, but every level of the overview

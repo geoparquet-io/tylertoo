@@ -161,23 +161,27 @@ roughly 4× tippecanoe's 1-tile-unit tolerance. On an Auckland subset
 ### Coverage against `--simplify-factor` (`sweep_simplify.py`)
 
 Auckland subset (about 400k parcels, `--bbox 174.5,-37.1,175.0,-36.6`),
-defaults plus the 2 MB gzip cap, z0–z14; area drawn is the mean of the
+defaults plus the 2 MB gzip cap, z0–z14, release build on a quiet host;
+area drawn is the mean of the
 three named z12 tiles, scored against the subset's own parcels:
 
 | factor | area drawn | z12 median | build | peak RSS | archive |
 |---|---|---|---|---|---|
-| 2 | 87.3% | 99.41% | 10.8 s | 2.6 GiB | 132 MB |
-| 1 (default) | 97.4% | 99.81% | 14.2 s | 3.0 GiB | 144 MB |
-| 0.75 | 98.2% | 99.89% | 15.2 s | 3.6 GiB | 147 MB |
-| 0.5 | 98.8% | 99.92% | 17.2 s | 4.2 GiB | 150 MB |
-| 0.35 | 99.1% | 99.95% | 21.0 s | 3.8 GiB | 153 MB |
-| 0.25 | 99.3% | 99.96% | 21.1 s | 4.5 GiB | 156 MB |
-| 0.15 | 99.45% | 99.97% | 22.0 s | 4.7 GiB | 157 MB |
-| 0.1 | 99.48% | 99.97% | 21.5 s | 4.5 GiB | 158 MB |
-| 0.05 | 99.50% | 99.96% | 21.9 s | 4.4 GiB | 159 MB |
-| 0 | 99.85% | 99.99% | 15.1 s | 3.1 GiB | 149 MB |
+| 2 | 87.40% | 99.50% | 10.8 s | 2.6 GiB | 132 MB |
+| 1 (default) | 97.60% | 99.84% | 13.8 s | 3.2 GiB | 145 MB |
+| 0.75 | 98.39% | 99.91% | 15.6 s | 3.5 GiB | 147 MB |
+| 0.5 | 98.92% | 99.93% | 17.3 s | 4.0 GiB | 150 MB |
+| 0.35 | 99.28% | 99.95% | 20.0 s | 4.0 GiB | 154 MB |
+| 0.25 | 99.48% | 99.96% | 22.4 s | 4.5 GiB | 155 MB |
+| 0.15 | 99.60% | 99.97% | 21.5 s | 4.5 GiB | 157 MB |
+| 0.1 | 99.63% | 99.97% | 21.9 s | 4.5 GiB | 157 MB |
+| 0.05 | 99.65% | 99.96% | 22.4 s | 4.6 GiB | 157 MB |
+| 0 | 99.99% | 100.00% | 17.1 s | 3.2 GiB | 155 MB |
 
-Asymptotic above zero, toward tippecanoe's 99.5%; the knee is near 0.25.
+With the shipped defaults (polygon thinning off). Asymptotic above zero,
+at about 99.65%, level with tippecanoe's 99.5–99.6%; the knee is near
+0.25. With polygon thinning on, every row sat 0.1–0.2 points lower and
+`0` reached only 99.85%: the rest was one nested parcel (below).
 At 0 the only vertex reduction is the tile grid, which snaps both sides of
 a shared border to the same points. On all of NZ (2 MB gzip cap):
 

@@ -352,12 +352,13 @@ tile and rasterized at 128 px per tile, that the tile draws.
   point at `gpio sort hilbert`.
 - Against tippecanoe 2.79.0 itself (`--coalesce-densest-as-needed
   -M 2000000`, scored the same way), on the three Auckland z12 tiles:
-  tippecanoe 99.5–99.6%, `C1` 97.1–97.7%. The gap is slivers between
+  tippecanoe 99.5–99.6%, `C1` 97.1–97.7% (97.3–97.9% with polygon
+  thinning off, as shipped). The gap is slivers between
   neighbouring parcels, each simplified on its own (#450). A
-  `--simplify-factor` sweep on an Auckland subset traced the curve: 87.3%
-  at 2, 97.4% at 1, 98.8% at 0.5, 99.3% at 0.25, flattening at 99.5% by
-  0.1, and 99.9% at 0 (no simplification: the tile grid snaps shared
-  borders identically). Time and memory rise as the factor falls toward
+  `--simplify-factor` sweep on an Auckland subset traced the curve (shipped
+  defaults): 87.4% at 2, 97.6% at 1, 98.9% at 0.5, 99.5% at 0.25,
+  flattening at about 99.65% by 0.1, and 99.99% at 0 (no simplification:
+  the tile grid snaps shared borders identically). Time and memory rise as the factor falls toward
   0.1; at 0 export costs about what it does at 1, but every overview level
   stores full-resolution geometry (NZ: overview 7.9 GB against 2.9 GB;
   convert 19 GiB under the default memory profile, 4.9 GiB with
