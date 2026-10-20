@@ -26,6 +26,7 @@ __all__ = [
     "LevelReport",
     "OutOfRangeExemplar",
     "OverviewReport",
+    "PublicationMetadata",
     "PyramidBandReport",
     "PyramidReport",
     "RemoteFetch",
@@ -193,6 +194,20 @@ class PyramidBandReport(TypedDict):
     tiles: int
 
 
+class PublicationMetadata(TypedDict):
+    """An archive's `name`, `description` and `attribution`.
+
+    Attributes:
+        name: The tileset name, or `None` when the archive has none.
+        description: The description, or `None`.
+        attribution: The attribution text or HTML, or `None`.
+    """
+
+    name: str | None
+    description: str | None
+    attribution: str | None
+
+
 class PyramidReport(TypedDict):
     """What `pyramid()` merged.
 
@@ -203,12 +218,21 @@ class PyramidReport(TypedDict):
             is split across several bands.
         bands_without_bounds: Bands whose archive declared no bounds,
             and so did not widen the merged archive's bounds.
+        metadata: The `name`, `description` and `attribution` written:
+            the keywords, over what the PMTiles bands carry.
+        metadata_conflicts: Fields (`"name"`, `"description"`) the
+            PMTiles bands disagreed on, and so left out.
+        bands_without_metadata: PMTiles bands whose metadata is not
+            valid JSON, and so passed on no credit.
     """
 
     total_tiles: int
     bands: list[PyramidBandReport]
     skipped_tiles: int
     bands_without_bounds: list[str]
+    metadata: PublicationMetadata
+    metadata_conflicts: list[str]
+    bands_without_metadata: list[str]
 
 
 class DecodeReport(TypedDict):
@@ -439,6 +463,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
 
@@ -468,13 +495,19 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         feature_id: Integer column to use as the MVT feature ID.
         spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
             used when memory runs short.
+        name: Human-readable tileset name, stored in the metadata.
+        description: Description of the tileset, stored in the metadata.
+        attribution: Attribution text or HTML stored in the archive
+            metadata; MapLibre shows it in its attribution control.
+            Each value is stored as given, and `""` is kept as `""`.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.
 
     Raises:
-        ValueError: Invalid `feature_order` syntax, or a property
-            selection the overview file cannot satisfy.
+        ValueError: Invalid `feature_order` syntax, a property selection
+            the overview file cannot satisfy, or a `name`, `description`
+            and `attribution` too large for the 16 MiB archive metadata.
         RuntimeError: Not an overview file, an option is out of range,
             or reading or writing failed.
 
@@ -482,6 +515,13 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
         >>> report["max_zoom"]
         10
+        >>> credited = export_pmtiles(
+        ...     "overview.parquet",
+        ...     "credited.pmtiles",
+        ...     attribution="\u00a9 Example contributors",
+        ... )
+        >>> credited["zooms"] == report["zooms"]
+        True
     """
     # Every argument goes to the extension unchanged, by keyword.
     return cast("ExportReport", _tylertoo.export_pmtiles(**locals()))
@@ -496,6 +536,9 @@ def pyramid(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     feature_order: Literal["input"] | str = "input",
     work_dir: str | os.PathLike[str] | None = None,
     allow_missing_zooms: bool = False,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> PyramidReport:
     """Build one PMTiles archive from per-zoom-band inputs.
 
@@ -524,15 +567,23 @@ def pyramid(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             the build, or `None` for the system temporary directory.
         allow_missing_zooms: Accept a pre-tiled band with fewer zooms
             than declared. Missing zooms render empty.
+        name: The output's tileset name. Unset, the PMTiles bands'
+            name is kept when they agree and left out when they don't.
+        description: Description for the output, inherited the same way.
+        attribution: Attribution text or HTML for the output, `""`
+            included. Unset, every PMTiles band's credit is kept, joined
+            with `" | "`; GeoParquet bands carry none.
 
     Returns:
-        Tile counts per band, with merge diagnostics.
+        Tile counts per band, with merge diagnostics and the metadata
+        written.
 
     Raises:
         ValueError: A malformed band spec, overlapping bands of one
             layer, a missing band input, or invalid `feature_order`
             syntax.
-        RuntimeError: A band failed to convert, export, or merge.
+        RuntimeError: A band failed to convert, export, or merge, or
+            the metadata is too large for an archive.
 
     Example:
         >>> report = pyramid(
@@ -632,7 +683,8 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
-    Use `overview()` followed by `export_pmtiles()` for all options.
+    Use `overview()` followed by `export_pmtiles()` for all options,
+    including the `name`, `description` and `attribution` metadata.
     Runs the same core facade as `tylertoo tiles`, so the chain — the
     removed-after-export intermediate overview, its free-space
     preflight, and the declared zoom range — matches the CLI.

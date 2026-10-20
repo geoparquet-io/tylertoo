@@ -290,6 +290,81 @@ enum Command {
     GenReferenceDocs,
 }
 
+/// Top-level publication metadata for a PMTiles archive.
+///
+/// `--layer-name` names the MVT layer; these describe the tileset. Each is
+/// stored exactly as given, and an empty string is kept as one.
+#[derive(Args, Debug, Clone, Default)]
+pub struct TilesetMetadataArgs {
+    /// Human-readable name stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub name: Option<String>,
+
+    /// Description stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Attribution text or HTML stored in the archive metadata.
+    #[arg(long, value_name = "TEXT")]
+    pub attribution: Option<String>,
+}
+
+impl TilesetMetadataArgs {
+    /// The core value these flags describe.
+    fn to_metadata(&self) -> tylertoo_core::TilesetMetadata {
+        let mut meta = tylertoo_core::TilesetMetadata::new();
+        meta.name.clone_from(&self.name);
+        meta.description.clone_from(&self.description);
+        meta.attribution.clone_from(&self.attribution);
+        meta
+    }
+}
+
+/// Print a composed archive's publication metadata (`merge`, `pyramid`).
+///
+/// The values written, since an inherited attribution is HTML the map will
+/// render and should be visible without re-reading the archive. Marked `!`
+/// like the bounds-less inputs: each field left out because the `inputs`
+/// disagreed, and the inputs whose metadata did not decode, any of which
+/// may have been meant to carry a credit.
+fn print_publication(
+    meta: &tylertoo_core::TilesetMetadata,
+    conflicts: &[String],
+    without_metadata: &[String],
+    inputs: &str,
+) {
+    for (key, value) in [
+        ("name", &meta.name),
+        ("description", &meta.description),
+        ("attribution", &meta.attribution),
+    ] {
+        if let Some(value) = value {
+            say!("  {key}: {}", quoted_preview(value));
+        }
+    }
+    for key in conflicts {
+        say!("  ! the {inputs} carry different {key}s, so the output has none; set --{key} to give it one");
+    }
+    if !without_metadata.is_empty() {
+        say!(
+            "  ! {} of the {inputs} carried no readable metadata, so passed on no name, \
+             description or attribution:",
+            without_metadata.len()
+        );
+        for name in without_metadata {
+            say!("      {name}");
+        }
+    }
+}
+
+/// `value` quoted and escaped for one output line, cut after 200 characters.
+fn quoted_preview(value: &str) -> String {
+    match value.char_indices().nth(200) {
+        None => format!("{value:?}"),
+        Some((cut, _)) => format!("{:?}… ({} bytes)", &value[..cut], value.len()),
+    }
+}
+
 /// Arguments for `tylertoo pyramid`.
 ///
 /// The band rules are documented in the pyramid section of
@@ -306,6 +381,11 @@ pub struct PyramidArgs {
     /// <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>.
     #[arg(long = "band", required = true, value_name = "LO-HI:INPUT[:LAYER]")]
     pub bands: Vec<String>,
+
+    /// Publication metadata for the output. An unset field is inherited from
+    /// the band archives.
+    #[command(flatten)]
+    pub publication: TilesetMetadataArgs,
 
     /// Generalize each GeoParquet band instead of tiling it verbatim. Use
     /// for raw features spanning several zooms.
@@ -352,6 +432,11 @@ pub struct MergeArgs {
     /// `vector_layers` are the union of the inputs'.
     #[arg(required = true, value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
+
+    /// Publication metadata for the output. An unset field is inherited from
+    /// the inputs.
+    #[command(flatten)]
+    pub publication: TilesetMetadataArgs,
 
     /// Directory for the spool file that holds tile data until the archive
     /// is complete. Defaults to the system temp directory.
@@ -482,6 +567,9 @@ struct ExportPmtilesArgs {
     /// MVT layer name written into every tile.
     #[arg(long, default_value = "overview")]
     layer_name: String,
+
+    #[command(flatten)]
+    publication: TilesetMetadataArgs,
 
     /// Minimum zoom in archive metadata, including empty coarse overview
     /// levels. Defaults to the coarsest level's zoom.
@@ -1248,6 +1336,9 @@ struct TilesArgs {
     #[arg(long)]
     layer_name: Option<String>,
 
+    #[command(flatten)]
+    publication: TilesetMetadataArgs,
+
     /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
     /// (default 500K, or no cap with `--verbatim`). A tile over the cap drops
     /// features until it fits.
@@ -1404,9 +1495,9 @@ fn gen_reference_markdown() -> String {
 
 /// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
 ///
-/// If the first non-flag token is already a subcommand (`tiles`/`overview`/
-/// `validate`/`help`) or the invocation is a help/version query, the arguments
-/// are returned unchanged.
+/// If the first token after the global flags is already a subcommand
+/// (`tiles`/`overview`/`validate`/`help`) or the invocation is a
+/// help/version query, the arguments are returned unchanged.
 fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -1434,11 +1525,15 @@ where
         return argv;
     }
 
-    let first_positional = argv
+    // A subcommand can only follow the global flags, none of which takes a
+    // value. Looking past any other flag for "the first positional" would
+    // take a flag's value for one: `tylertoo --name overview in out` named
+    // the tileset `overview` and was routed to the `overview` subcommand.
+    let first_after_globals = argv
         .iter()
         .skip(1)
-        .find(|a| !a.to_string_lossy().starts_with('-'));
-    let is_subcommand = first_positional
+        .find(|a| !matches!(a.to_string_lossy().as_ref(), "-q" | "--quiet"));
+    let is_subcommand = first_after_globals
         .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
         .unwrap_or(false);
     let is_help_or_version = argv.iter().skip(1).any(|a| {
@@ -1914,8 +2009,9 @@ fn tiles_convert_options(
 }
 
 /// The export knobs `tiles` can check without reading anything (#433): the
-/// `--tile-buffer` cap, the `--tile-range` syntax, and the `--keep-overview`
-/// directory. Returns the parsed `--tile-range`.
+/// `--tile-buffer` cap, the size of the publication metadata, the
+/// `--tile-range` syntax, and the `--keep-overview` directory. Returns the
+/// parsed `--tile-range`.
 ///
 /// Shared by the full run and `--plan-only` (#600): plan-only ignores these
 /// flags, but it is the fleet's preflight, so a value the coarse job would
@@ -1929,6 +2025,7 @@ fn preflight_export_flags(args: &TilesArgs) -> Result<Option<tylertoo_core::shar
     // values that are already known.
     ExportOptions {
         tile_buffer: args.tile_buffer,
+        metadata: args.publication.to_metadata(),
         ..ExportOptions::default()
     }
     .validate()
@@ -1966,6 +2063,9 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
 
     [
         ("--layer-name", args.layer_name.is_some()),
+        ("--name", args.publication.name.is_some()),
+        ("--description", args.publication.description.is_some()),
+        ("--attribution", args.publication.attribution.is_some()),
         ("--max-tile-size", args.max_tile_size.is_some()),
         ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
         (
@@ -2220,6 +2320,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
         feature_id: args.feature_id.clone(),
+        metadata: args.publication.to_metadata(),
     };
     let input = tiles_input(&spec);
 
@@ -2865,6 +2966,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         zoom_ceiling: args.zoom_ceiling,
         feature_id: args.feature_id.clone(),
         spill_dir: args.spill_dir.clone(),
+        metadata: args.publication.to_metadata(),
     };
 
     say!(
@@ -2998,6 +3100,12 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     if let Some(line) = pyramid_shared_note(per_band_sum, report.total_tiles) {
         say!("{line}");
     }
+    print_publication(
+        &report.metadata,
+        &report.metadata_conflicts,
+        &report.bands_without_metadata,
+        "bands",
+    );
     say!(
         "✓ Built {} band(s) → {} ({} tiles)",
         bands.len(),
@@ -3032,6 +3140,9 @@ fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions
         },
         work_dir: args.work_dir.clone(),
         allow_missing_zooms: args.allow_missing_zooms,
+        // The final archive's overrides; the band exports write none, so
+        // GeoParquet bands contribute no inherited value.
+        metadata: args.publication.to_metadata(),
     }
 }
 
@@ -3237,6 +3348,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     );
     let opts = MergeOptions {
         work_dir: args.work_dir.clone(),
+        metadata: args.publication.to_metadata(),
     };
     let report = merge_shards(&args.inputs, &args.output, &opts)
         .map_err(|e| anyhow::anyhow!("merge failed: {e}"))?;
@@ -3256,6 +3368,12 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             say!("      {name}");
         }
     }
+    print_publication(
+        &report.metadata,
+        &report.metadata_conflicts,
+        &report.inputs_without_metadata,
+        "inputs",
+    );
     say!(
         "\n✓ {} tiles ({} unique) from {} archive(s), z{}..z{} in {:.2}s",
         format_number(report.tiles_total),
@@ -4968,5 +5086,162 @@ mod tests {
         std::fs::write(&existing, b"keep me").unwrap();
         preflight_writable(&existing).unwrap();
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
+    }
+
+    // --- Publication metadata (--name / --description / --attribution) ----
+
+    const PUBLICATION_FLAGS: [&str; 3] = ["name", "description", "attribution"];
+
+    /// Which of the three flags `cmd` shows, in `PUBLICATION_FLAGS` order.
+    fn publication_flags_of(cmd: &clap::Command) -> Vec<bool> {
+        PUBLICATION_FLAGS
+            .iter()
+            .map(|flag| {
+                cmd.get_arguments()
+                    .any(|a| a.get_long() == Some(flag) && !a.is_hide_set())
+            })
+            .collect()
+    }
+
+    /// The flags are on every command that writes a PMTiles archive, as one
+    /// optional single string each, and on no command that does not.
+    #[test]
+    fn publication_flags_are_on_every_producer_and_no_other_command() {
+        use clap::CommandFactory;
+        for (label, cmd) in [
+            ("tiles", TilesArgs::command()),
+            ("export-pmtiles", ExportPmtilesArgs::command()),
+            ("pyramid", PyramidArgs::command()),
+            ("merge", MergeArgs::command()),
+        ] {
+            assert_eq!(publication_flags_of(&cmd), [true; 3], "{label}");
+            for arg in cmd
+                .get_arguments()
+                .filter(|a| a.get_long().is_some_and(|l| PUBLICATION_FLAGS.contains(&l)))
+            {
+                assert!(!arg.is_required_set(), "{label} {arg:?}");
+                assert!(matches!(arg.get_action(), clap::ArgAction::Set), "{label}");
+            }
+        }
+        for (label, cmd) in [
+            ("overview", OverviewArgs::command()),
+            ("validate", ValidateArgs::command()),
+            ("decode", DecodeArgs::command()),
+            ("stats", StatsArgs::command()),
+            ("shard-plan", ShardPlanArgs::command()),
+        ] {
+            assert_eq!(publication_flags_of(&cmd), [false; 3], "{label}");
+        }
+    }
+
+    #[test]
+    fn publication_flags_keep_values_exactly() {
+        use tylertoo_core::TilesetMetadata;
+        let html = "<a href=\"https://www.nps.gov/\">\u{a9} NPS</a>\nline";
+        let a = parse_tiles(&[
+            "--name",
+            "tiles",
+            "--description",
+            "",
+            "--attribution",
+            html,
+        ]);
+        assert_eq!(
+            a.publication.to_metadata(),
+            TilesetMetadata::new()
+                .with_name("tiles")
+                .with_description("")
+                .with_attribution(html)
+        );
+        assert_eq!(
+            parse_tiles(&[]).publication.to_metadata(),
+            TilesetMetadata::new()
+        );
+        // A value that looks like a flag needs the `=` form.
+        assert_eq!(
+            parse_tiles(&["--name=--help"]).publication.name.as_deref(),
+            Some("--help")
+        );
+        // One value per flag: clap's ordinary refusal, no appending.
+        assert!(Cli::try_parse_from([
+            "tylertoo",
+            "tiles",
+            "in.parquet",
+            "out.pmtiles",
+            "--name",
+            "a",
+            "--name",
+            "b"
+        ])
+        .is_err());
+        // The bare form with the flags after INPUT OUTPUT, even with a value
+        // that names a subcommand.
+        let argv = rewrite_bare_args(
+            ["tylertoo", "in.parquet", "out.pmtiles", "--name", "tiles"].map(Into::into),
+        );
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Tiles(a) => assert_eq!(a.publication.name.as_deref(), Some("tiles")),
+            other => panic!("expected tiles, got {other:?}"),
+        }
+        // ...and before them: the value is not taken for the subcommand.
+        for value in ["overview", "merge", "help"] {
+            let argv = rewrite_bare_args(
+                ["tylertoo", "--name", value, "in.parquet", "out.pmtiles"].map(Into::into),
+            );
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Tiles(a) => {
+                    assert_eq!(a.publication.name.as_deref(), Some(value));
+                    assert_eq!(a.input.as_deref(), Some(Path::new("in.parquet")));
+                }
+                other => panic!("--name {value}: expected tiles, got {other:?}"),
+            }
+        }
+        // A subcommand after the global `-q` is still a subcommand.
+        let argv: Vec<std::ffi::OsString> = ["tylertoo", "-q", "merge", "a.pmtiles", "out.pmtiles"]
+            .map(Into::into)
+            .to_vec();
+        assert_eq!(rewrite_bare_args(argv.clone()), argv);
+    }
+
+    /// `--plan-only` writes no archive, so the three flags are reported as
+    /// ignored, in `--help` order, and change nothing about the plan.
+    #[test]
+    fn plan_only_names_publication_flags_as_ignored() {
+        for (argv, name) in [
+            (&["--name", ""][..], "--name"),
+            (&["--description", "d"][..], "--description"),
+            (&["--attribution", ""][..], "--attribution"),
+        ] {
+            let a = parse_plan_only(argv).unwrap();
+            assert_eq!(ignored_export_options(&a), vec![name], "{argv:?}");
+        }
+        let a = parse_plan_only(&[
+            "--attribution",
+            "a",
+            "--force",
+            "--layer-name",
+            "x",
+            "--name",
+            "n",
+        ])
+        .unwrap();
+        assert_eq!(
+            ignored_export_options(&a),
+            vec!["--layer-name", "--name", "--attribution", "--force"]
+        );
+    }
+
+    /// Too large for any archive's metadata: refused by the preflight, on a
+    /// full run and on `--plan-only` alike, before anything is converted.
+    #[test]
+    fn oversized_publication_values_fail_the_export_preflight() {
+        let huge = "\"".repeat(tylertoo_core::compression::MAX_INTERNAL_BYTES as usize / 2);
+        let err = preflight_export_flags(&parse_tiles(&["--attribution", &huge]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("attribution"), "{err}");
+        let a = parse_plan_only(&["--description", &huge]).unwrap();
+        let err = preflight_export_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("description"), "{err}");
     }
 }

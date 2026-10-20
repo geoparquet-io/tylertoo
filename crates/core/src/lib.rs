@@ -56,6 +56,7 @@ pub mod ioverlay_clip;
 pub mod merge;
 pub mod mvt;
 pub mod overview;
+mod pmtiles_metadata;
 pub mod pmtiles_writer;
 pub mod pyramid;
 pub mod quality;
@@ -69,6 +70,8 @@ pub mod world_coord;
 
 // Re-export Compression from compression module for public API
 pub use compression::Compression;
+// Re-export the archive-level publication metadata type
+pub use pmtiles_metadata::TilesetMetadata;
 // Re-export StreamingPmtilesWriter and related types
 pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 // Re-export CRS validation for public API

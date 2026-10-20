@@ -116,3 +116,46 @@ class TestPyramidIntegration:
         assert [b["layer"] for b in report["bands"]] == ["road-detections", "coarse"]
         assert all(b["tiles"] > 0 for b in report["bands"])
         assert report["skipped_tiles"] > 0
+
+
+class TestPyramidMetadata:
+    """`name=`, `description=` and `attribution=`, and what the report says."""
+
+    def test_keywords_and_inherited_credit_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            credited = Path(tmpdir) / "credited.pmtiles"
+            first = tylertoo.pyramid(
+                [f"8-9:{STREAMING_SMALL}:b"],
+                str(credited),
+                attribution="<b>Survey</b>",
+            )
+            out = Path(tmpdir) / "out.pmtiles"
+            report = tylertoo.pyramid(
+                [f"8-9:{credited}:b", f"10-11:{STREAMING_SMALL}:c"],
+                str(out),
+                name="Buildings",
+            )
+        assert first["metadata"] == {
+            "name": None,
+            "description": None,
+            "attribution": "<b>Survey</b>",
+        }
+        # The PMTiles band passes its credit on; the keyword sets the name.
+        assert report["metadata"] == {
+            "name": "Buildings",
+            "description": None,
+            "attribution": "<b>Survey</b>",
+        }
+        assert report["metadata_conflicts"] == []
+        assert report["bands_without_metadata"] == []
+
+    def test_defaults_write_and_report_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = tylertoo.pyramid(
+                [f"8-9:{STREAMING_SMALL}:b"], str(Path(tmpdir) / "o.pmtiles")
+            )
+        assert report["metadata"] == {
+            "name": None,
+            "description": None,
+            "attribution": None,
+        }

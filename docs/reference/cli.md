@@ -68,6 +68,9 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
+| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
+| `--description <TEXT>` | Description stored in the archive metadata. |
+| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--max-tile-size <SIZE>` [alias: `tile-size-limit`] | Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap (default 500K, or no cap with `--verbatim`). A tile over the cap drops features until it fits. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
@@ -155,6 +158,9 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--layer-name <LAYER_NAME>` | MVT layer name written into every tile. Default: `overview`. |
+| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
+| `--description <TEXT>` | Description stored in the archive metadata. |
+| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--min-zoom <ZOOM>` | Minimum zoom in archive metadata, including empty coarse overview levels. Defaults to the coarsest level's zoom. |
 | `--include-property <NAME>` | Keep only these properties in the tiles (repeatable). The overview file keeps every column, and the `--feature-order` column must stay. |
 | `--exclude-property <NAME>` | Drop these properties from the tiles (repeatable). `--include-property` overrides it. |
@@ -264,6 +270,9 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--band <LO-HI:INPUT[:LAYER]>` | One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and `LAYER` defaults to its file stem. The tuning guide covers the colon rules and the `LO-HI=INPUT[=LAYER]` form: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
+| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
+| `--description <TEXT>` | Description stored in the archive metadata. |
+| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--generalize` | Generalize each GeoParquet band instead of tiling it verbatim. Use for raw features spanning several zooms. |
 | `--max-tile-size <SIZE>` | Per-tile MVT size cap for bands tiled here, such as `500K`. Unset means no cap, preserving every cell in the band. |
 | `--feature-order <input\|COLUMN[:asc\|:desc]>` | Within-tile feature order for GeoParquet bands: `input`, or a property name with optional `:asc` or `:desc`. A band without that column keeps input order with a warning. Default: `input`. |
@@ -290,6 +299,9 @@ tylertoo merge [OPTIONS] <OUTPUT> <INPUT>...
 
 | Option | Description |
 | --- | --- |
+| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
+| `--description <TEXT>` | Description stored in the archive metadata. |
+| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--work-dir <DIR>` | Directory for the spool file that holds tile data until the archive is complete. Defaults to the system temp directory. |
 | `--report <PATH>` | Write the JSON merge report, with per-zoom tile counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |

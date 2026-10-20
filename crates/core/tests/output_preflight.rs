@@ -11,7 +11,9 @@ use tylertoo_core::merge::{merge_shards, MergeOptions};
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
 use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
 use tylertoo_core::overview::tiles::{convert_to_pmtiles, TilesInput, TilesOptions};
-use tylertoo_core::pyramid::{build_pyramid, merge_bands_with_options, Band, PyramidOptions};
+use tylertoo_core::pyramid::{
+    build_pyramid, merge_bands_with_options, Band, BandMergeOptions, PyramidOptions,
+};
 
 struct Case {
     _dir: tempfile::TempDir,
@@ -128,7 +130,11 @@ fn build_pyramid_checks_the_output_first() {
     c.assert_output_error("build_pyramid", &err.to_string());
 
     let c = Case::new("in.pmtiles");
-    let err =
-        merge_bands_with_options(&[band(&c.input)], &c.output("out.pmtiles"), false).unwrap_err();
+    let err = merge_bands_with_options(
+        &[band(&c.input)],
+        &c.output("out.pmtiles"),
+        &BandMergeOptions::default(),
+    )
+    .unwrap_err();
     c.assert_output_error("merge_bands_with_options", &err.to_string());
 }

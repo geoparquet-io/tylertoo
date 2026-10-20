@@ -214,6 +214,8 @@ fn convert(
         feature_order: parse_feature_order(feature_order)?,
         // #443: not exposed here; `export_pmtiles(..., feature_id=...)`.
         feature_id: None,
+        // Publication metadata is not exposed on this deprecated facade.
+        metadata: Default::default(),
     };
 
     // Release the GIL while the Rust pipelines run.
@@ -799,7 +801,7 @@ fn overview(
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -818,8 +820,15 @@ fn export_pmtiles(
     exclude_all_properties: bool,
     feature_id: Option<String>,
     spill_dir: Option<PathBuf>,
+    name: Option<String>,
+    description: Option<String>,
+    attribution: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
+    let mut metadata = tylertoo_core::TilesetMetadata::new();
+    metadata.name = name;
+    metadata.description = description;
+    metadata.attribution = attribution;
     let options = ExportOptions {
         layer_name: layer_name.to_string(),
         tile_buffer,
@@ -843,6 +852,7 @@ fn export_pmtiles(
         zoom_ceiling: None,
         feature_id,
         spill_dir,
+        metadata,
     };
     let input_path = Path::new(input).to_path_buf();
     let output_path = Path::new(output).to_path_buf();
@@ -855,16 +865,16 @@ fn export_pmtiles(
 }
 
 /// Map an [`ExportError`] to a Python exception: a property selection the
-/// overview file cannot satisfy is the caller's input problem, so
-/// `ValueError`; everything else keeps the `RuntimeError` it always was.
+/// overview file cannot satisfy, or publication metadata too large for an
+/// archive, is the caller's input problem, so `ValueError`; everything else
+/// keeps the `RuntimeError` it always was.
 fn export_error_to_py(e: ExportError) -> PyErr {
     match e {
         ExportError::UnknownProperty { .. }
         | ExportError::UnsupportedProperty { .. }
         | ExportError::CoveringProperty { .. }
-        | ExportError::PropertyRequiredByKnob { .. } => {
-            PyErr::new::<PyValueError, _>(format!("{e}"))
-        }
+        | ExportError::PropertyRequiredByKnob { .. }
+        | ExportError::MetadataTooLarge(_) => PyErr::new::<PyValueError, _>(format!("{e}")),
         other => PyErr::new::<PyRuntimeError, _>(format!("export failed: {other}")),
     }
 }
@@ -996,7 +1006,7 @@ fn decode_error_to_py(e: DecodeError) -> PyErr {
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false))]
+#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false, name=None, description=None, attribution=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn pyramid(
     py: Python<'_>,
@@ -1007,14 +1017,22 @@ fn pyramid(
     feature_order: &str,
     work_dir: Option<PathBuf>,
     allow_missing_zooms: bool,
+    name: Option<String>,
+    description: Option<String>,
+    attribution: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let bands = parse_bands(&bands).map_err(PyErr::new::<PyValueError, _>)?;
+    let mut metadata = tylertoo_core::TilesetMetadata::new();
+    metadata.name = name;
+    metadata.description = description;
+    metadata.attribution = attribution;
     let mut options = PyramidOptions {
         work_dir,
         allow_missing_zooms,
+        metadata,
         ..PyramidOptions::default()
     };
     // The default tiles each GeoParquet band verbatim (an aggregate band
@@ -1050,6 +1068,19 @@ fn pyramid(
     dict.set_item(
         "bands_without_bounds",
         PyList::new(py, &report.bands_without_bounds)?,
+    )?;
+    let metadata = PyDict::new(py);
+    metadata.set_item("name", &report.metadata.name)?;
+    metadata.set_item("description", &report.metadata.description)?;
+    metadata.set_item("attribution", &report.metadata.attribution)?;
+    dict.set_item("metadata", metadata)?;
+    dict.set_item(
+        "metadata_conflicts",
+        PyList::new(py, &report.metadata_conflicts)?,
+    )?;
+    dict.set_item(
+        "bands_without_metadata",
+        PyList::new(py, &report.bands_without_metadata)?,
     )?;
     Ok(dict.into())
 }

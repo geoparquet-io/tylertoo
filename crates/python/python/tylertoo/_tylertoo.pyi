@@ -95,6 +95,9 @@ def export_pmtiles(
     exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | Path | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
 def decode(
@@ -114,4 +117,7 @@ def pyramid(
     feature_order: str = "input",
     work_dir: str | Path | None = None,
     allow_missing_zooms: bool = False,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> dict[str, Any]: ...
