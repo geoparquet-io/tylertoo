@@ -59,7 +59,7 @@ use serde_json::Value;
 use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::Compression;
 use crate::dedup::TileHasher;
-use crate::pmtiles_metadata::MetadataCollector;
+use crate::pmtiles_metadata::{MetadataCollector, Resolved};
 use crate::pmtiles_writer::{tile_id_to_zxy, StreamingPmtilesWriter, TileType};
 use crate::pyramid::{declared_zoom_range, layer_zoom_range, vector_layers_json, LayerMeta};
 use crate::tile::TileBounds;
@@ -76,8 +76,9 @@ pub struct MergeOptions {
     /// The merged archive's `name`, `description` and `attribution`, each
     /// overriding what the inputs carry for that field (`Some("")`
     /// included). An unset field is inherited: one value the inputs agree
-    /// on is kept, differing names or descriptions are an error, and every
-    /// input's attribution credit is kept, joined with `" | "`.
+    /// on is kept, a name or description they disagree on is left out
+    /// ([`MergeReport::metadata_conflicts`]), and every input's attribution
+    /// credit is kept, joined with `" | "`.
     pub metadata: TilesetMetadata,
 }
 
@@ -116,6 +117,17 @@ pub struct MergeReport {
     /// the output's extent describes only the inputs that did (#495's
     /// `bands_without_bounds`, for shards).
     pub inputs_without_bounds: Vec<String>,
+    /// The publication metadata written to the merged archive: the
+    /// [`MergeOptions::metadata`] overrides over what the inputs carry.
+    pub metadata: TilesetMetadata,
+    /// The publication fields (`"name"`, `"description"`) the inputs
+    /// disagreed on, and which the merged archive therefore leaves out.
+    pub metadata_conflicts: Vec<String>,
+    /// Every input whose metadata is absent or does not decode as JSON. It
+    /// passes on no name, description or attribution, so non-empty means
+    /// the merged archive may be missing a credit an input was meant to
+    /// carry (a truncated upload, say).
+    pub inputs_without_metadata: Vec<String>,
     pub duration_secs: f64,
 }
 
@@ -198,12 +210,15 @@ pub fn merge_shards(
     // Layers, zoom range and publication metadata come from one pass over the
     // inputs, each metadata document parsed, folded in and dropped before the
     // next is read: peak memory is one input's metadata, not all of them.
-    // Resolved before any tile is copied, so a name conflict fails in
-    // milliseconds rather than after the whole copy.
+    // Resolved before any tile is copied, so credits that cannot fit an
+    // archive's metadata on their own fail in milliseconds rather than after
+    // the whole copy. (The finished metadata, `vector_layers` included, is
+    // checked again when the archive is assembled.)
     let InputMetadata {
         mut layers,
         declared,
         publication,
+        without_metadata: inputs_without_metadata,
     } = read_input_metadata(&indexes, &has_tiles, &options.metadata)?;
 
     let mut writer = match &options.work_dir {
@@ -211,7 +226,7 @@ pub fn merge_shards(
         None => StreamingPmtilesWriter::new(tile_compression),
     }
     .map_err(|e| Error::PMTilesWrite(format!("failed to create streaming writer: {e}")))?;
-    writer.set_metadata(publication);
+    writer.set_metadata(publication.metadata.clone());
     // The k-way heap emits ids in ascending order, so the merge is clustered
     // by construction; #506's hook turns that doc claim into a checked
     // contract (debug assertion per add, release warn at finalize).
@@ -333,6 +348,9 @@ pub fn merge_shards(
         unique_tiles: stats.unique_tiles,
         bytes_written: stats.bytes_written,
         inputs_without_bounds,
+        metadata: publication.metadata,
+        metadata_conflicts: publication.conflicts,
+        inputs_without_metadata,
         duration_secs: started.elapsed().as_secs_f64(),
     })
 }
@@ -406,7 +424,9 @@ fn duplicate_tile_id(first: &ArchiveIndex, second: &ArchiveIndex, id: u64) -> Er
 struct InputMetadata {
     layers: Vec<LayerMeta>,
     declared: Option<(u8, u8)>,
-    publication: TilesetMetadata,
+    publication: Resolved,
+    /// Inputs whose metadata is absent or not valid JSON.
+    without_metadata: Vec<String>,
 }
 
 /// Every `vector_layers` entry every input declares, in input order (the
@@ -442,18 +462,24 @@ fn read_input_metadata(
     let mut collector = MetadataCollector::new(overrides);
     let mut layers = Vec::new();
     let mut declared: Option<(u8, u8)> = None;
+    let mut without_metadata = Vec::new();
     for (idx, &tiles) in indexes.iter().zip(has_tiles) {
         let meta = idx.metadata_json();
+        let label = idx.path().display().to_string();
         match &meta {
             Some(root) => collector
-                .add_json(&idx.path().display().to_string(), root)
+                .add_json(&label, root)
                 .map_err(Error::InvalidConfig)?,
-            None if !tiles => log::warn!(
-                "{}: metadata is absent or not valid JSON; no name, description or attribution \
-                 is inherited from it",
-                idx.path().display()
-            ),
-            None => {}
+            None => {
+                // `input_layers` warns about a tile-holding one.
+                if !tiles {
+                    log::warn!(
+                        "{label}: metadata is absent or not valid JSON; no name, description \
+                         or attribution is inherited from it"
+                    );
+                }
+                without_metadata.push(label);
+            }
         }
         if tiles {
             let (found, zooms) = input_layers(idx, meta.as_ref());
@@ -465,10 +491,12 @@ fn read_input_metadata(
         }
     }
     let publication = collector.resolve().map_err(Error::InvalidConfig)?;
+    collector.log_resolution();
     Ok(InputMetadata {
         layers,
         declared,
         publication,
+        without_metadata,
     })
 }
 
@@ -1232,7 +1260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (data, empty) = (dir.path().join("d.pmtiles"), dir.path().join("e.pmtiles"));
         write_published_shard(&data, 0, TilesetMetadata::new().with_name("Parks"));
-        crate::overview::export::write_empty_archive_with_metadata(
+        crate::overview::export::write_empty_archive(
             &empty,
             "l",
             6,
@@ -1339,25 +1367,49 @@ mod tests {
         );
     }
 
+    /// Differing names are left out, not an error: a merge of third-party
+    /// archives (tippecanoe names each after its own file) must keep
+    /// working. The report says which fields were dropped.
     #[test]
-    fn conflicting_names_fail_before_the_output_is_written() {
+    fn disagreeing_names_are_left_out_and_reported() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
-        write_published_shard(&a, 0, TilesetMetadata::new().with_name("East region"));
-        write_published_shard(&b, 1, TilesetMetadata::new().with_name("West region"));
-        let existing = dir.path().join("existing.pmtiles");
-        std::fs::write(&existing, b"previous").unwrap();
-        let err = merge_with(&[a.clone(), b.clone()], &existing, TilesetMetadata::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--name"), "{err}");
-        assert!(
-            err.contains("a.pmtiles") && err.contains("b.pmtiles"),
-            "{err}"
+        write_published_shard(
+            &a,
+            0,
+            TilesetMetadata::new()
+                .with_name("a.pmtiles")
+                .with_description("a.pmtiles")
+                .with_attribution("NPS"),
         );
-        assert_eq!(std::fs::read(&existing).unwrap(), b"previous");
+        write_published_shard(
+            &b,
+            1,
+            TilesetMetadata::new()
+                .with_name("b.pmtiles")
+                .with_description("b.pmtiles"),
+        );
+        let out = dir.path().join("out.pmtiles");
+        let report = merge_with(&[a.clone(), b.clone()], &out, TilesetMetadata::new()).unwrap();
+        assert_eq!(publication_of(&out), (None, None, Some(json!("NPS"))));
+        assert_eq!(
+            report.metadata,
+            TilesetMetadata::new().with_attribution("NPS")
+        );
+        assert_eq!(report.metadata_conflicts, vec!["name", "description"]);
+        assert!(report.inputs_without_metadata.is_empty());
 
-        // A non-string attribution in a foreign archive: same, unless overridden.
+        let report = merge_with(
+            &[a.clone(), b],
+            &out,
+            TilesetMetadata::new().with_name("Parks"),
+        )
+        .unwrap();
+        assert_eq!(report.metadata_conflicts, vec!["description"]);
+        assert_eq!(publication_of(&out).0, Some(json!("Parks")));
+
+        // A non-string attribution in a foreign archive is ignored, unless
+        // overridden.
         let odd = dir.path().join("odd.pmtiles");
         write_shard(
             &odd,
@@ -1372,15 +1424,8 @@ mod tests {
         meta["attribution"] = json!({"html": "<b>x</b>"});
         let rewritten = rewrite_metadata(&raw, &header, &meta);
         std::fs::write(&odd, rewritten).unwrap();
-        let out = dir.path().join("out.pmtiles");
-        let err = merge_with(&[a.clone(), odd.clone()], &out, TilesetMetadata::new())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("odd.pmtiles: attribution must be a string"),
-            "{err}"
-        );
-        assert!(!out.exists());
+        merge_with(&[a.clone(), odd.clone()], &out, TilesetMetadata::new()).unwrap();
+        assert_eq!(publication_of(&out).2, Some(json!("NPS")));
         merge_with(
             &[a, odd],
             &out,

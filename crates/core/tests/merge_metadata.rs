@@ -59,7 +59,7 @@ fn unparseable_metadata_warns_and_keeps_tiles_without_empty_shard_zooms() {
     writer.set_metadata(TilesetMetadata::new().with_attribution("discarded"));
     writer.add_tile(6, 0, 0, &[0x1a, 0x02, 0x08, 0x00]).unwrap();
     writer.finalize(&data).unwrap();
-    write_empty_archive(&empty, "parks", 0, 0).unwrap();
+    write_empty_archive(&empty, "parks", 0, 0, &TilesetMetadata::new()).unwrap();
 
     // Missing metadata and invalid JSON carry no fields, whether or not
     // the shard holds tiles. The tiles themselves are still copyable.
@@ -90,6 +90,11 @@ fn unparseable_metadata_warns_and_keeps_tiles_without_empty_shard_zooms() {
         .unwrap();
         assert_eq!(tiles_of(&out), tiles_of(&data));
         assert_eq!((report.min_zoom, report.max_zoom), (6, 6));
+        // On the report as well as in the log: each may have lost a credit.
+        assert_eq!(
+            report.inputs_without_metadata,
+            vec![data.display().to_string(), empty.display().to_string()]
+        );
         let metadata = ArchiveIndex::open(&out).unwrap().metadata_json().unwrap();
         assert_eq!(metadata["name"], "Parks");
         assert!(metadata.get("description").is_none());

@@ -255,8 +255,8 @@ or overlapping shards from an earlier run.
 
 Give every job the same `--name`, `--description`, and `--attribution`, or none.
 An empty shard writes them too, and merge combines what the archives carry. See
-[attribution](attribution.md#merged-and-pyramid-archives) for the rules and the
-error on conflicting names.
+[attribution](attribution.md#merged-and-pyramid-archives) for the rules,
+including what merge does with names that differ.
 
 Tile bodies match a single-machine run byte for byte, as checked by
 `crates/core/tests/shard_merge_parity.rs`. The merged archive has a different

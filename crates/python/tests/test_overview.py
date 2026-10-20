@@ -873,7 +873,11 @@ class TestPublicationMetadata:
         assert meta["name"] == "Buildings"
         assert meta["description"] == ""
         assert meta["attribution"] == self.HTML
-        assert report.keys() == base.keys()
+
+        def timeless(r):
+            return {k: v for k, v in r.items() if k != "duration_secs"}
+
+        assert timeless(report) == timeless(base)
         assert self._tiles(pm) == self._tiles(plain)
 
     @needs_buildings
@@ -900,6 +904,18 @@ class TestPublicationMetadata:
             tylertoo.export_pmtiles(
                 str(overview_file), str(tmp_path / "pm.pmtiles"), **kwargs
             )
+
+    @pytest.mark.parametrize("key", KEYS)
+    def test_oversized_value_is_a_value_error(self, tmp_path, key):
+        # Checked with the other option values, before the input is opened,
+        # so the input need not exist.
+        kwargs: dict[str, Any] = {key: "x" * (16 * 1024 * 1024)}
+        out = tmp_path / "pm.pmtiles"
+        with pytest.raises(ValueError, match=key):
+            tylertoo.export_pmtiles(
+                str(tmp_path / "missing.parquet"), str(out), **kwargs
+            )
+        assert not out.exists()
 
     @needs_buildings
     def test_keywords_are_keyword_only(self, overview_file, tmp_path):

@@ -220,7 +220,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 
 ### Raises
 
-* `ValueError`: Invalid `feature_order` syntax, or a property selection the overview file cannot satisfy.
+* `ValueError`: Invalid `feature_order` syntax, a property selection the overview file cannot satisfy, or a `name`, `description` and `attribution` too large for the 16 MiB archive metadata.
 * `RuntimeError`: Not an overview file, an option is out of range, or reading or writing failed.
 
 ### Example
@@ -229,11 +229,13 @@ Export an overview file to a PMTiles archive, one zoom per level.
 >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
 >>> report["max_zoom"]
 10
->>> report = export_pmtiles(
+>>> credited = export_pmtiles(
 ...     "overview.parquet",
-...     "out.pmtiles",
+...     "credited.pmtiles",
 ...     attribution="© Example contributors",
 ... )
+>>> credited["zooms"] == report["zooms"]
+True
 ```
 
 ## `pyramid`

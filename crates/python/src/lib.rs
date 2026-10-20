@@ -865,16 +865,16 @@ fn export_pmtiles(
 }
 
 /// Map an [`ExportError`] to a Python exception: a property selection the
-/// overview file cannot satisfy is the caller's input problem, so
-/// `ValueError`; everything else keeps the `RuntimeError` it always was.
+/// overview file cannot satisfy, or publication metadata too large for an
+/// archive, is the caller's input problem, so `ValueError`; everything else
+/// keeps the `RuntimeError` it always was.
 fn export_error_to_py(e: ExportError) -> PyErr {
     match e {
         ExportError::UnknownProperty { .. }
         | ExportError::UnsupportedProperty { .. }
         | ExportError::CoveringProperty { .. }
-        | ExportError::PropertyRequiredByKnob { .. } => {
-            PyErr::new::<PyValueError, _>(format!("{e}"))
-        }
+        | ExportError::PropertyRequiredByKnob { .. }
+        | ExportError::MetadataTooLarge(_) => PyErr::new::<PyValueError, _>(format!("{e}")),
         other => PyErr::new::<PyRuntimeError, _>(format!("export failed: {other}")),
     }
 }

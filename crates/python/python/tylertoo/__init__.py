@@ -481,8 +481,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         Tile counts for each zoom written, with encoding diagnostics.
 
     Raises:
-        ValueError: Invalid `feature_order` syntax, or a property
-            selection the overview file cannot satisfy.
+        ValueError: Invalid `feature_order` syntax, a property selection
+            the overview file cannot satisfy, or a `name`, `description`
+            and `attribution` too large for the 16 MiB archive metadata.
         RuntimeError: Not an overview file, an option is out of range,
             or reading or writing failed.
 
@@ -490,11 +491,13 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
         >>> report["max_zoom"]
         10
-        >>> report = export_pmtiles(
+        >>> credited = export_pmtiles(
         ...     "overview.parquet",
-        ...     "out.pmtiles",
+        ...     "credited.pmtiles",
         ...     attribution="\u00a9 Example contributors",
         ... )
+        >>> credited["zooms"] == report["zooms"]
+        True
     """
     # Every argument goes to the extension unchanged, by keyword.
     return cast("ExportReport", _tylertoo.export_pmtiles(**locals()))

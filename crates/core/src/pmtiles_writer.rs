@@ -7041,11 +7041,10 @@ mod tests {
         let s = fs::read(&streaming).unwrap();
         assert_eq!(archive_metadata_json(&b), PRE_PUBLICATION_METADATA);
         assert_eq!(archive_metadata_json(&s), PRE_PUBLICATION_METADATA);
-        // Whole-archive checksum captured on the pre-feature writers, which
-        // agreed byte for byte on this fixture.
-        const PRE_PUBLICATION_XXH3: u64 = 2_244_932_714_967_856_363;
-        assert_eq!(xxhash_rust::xxh3::xxh3_64(&b), PRE_PUBLICATION_XXH3);
-        assert_eq!(xxhash_rust::xxh3::xxh3_64(&s), PRE_PUBLICATION_XXH3);
+        // The pre-feature writers agreed byte for byte on this fixture. Not
+        // pinned to a whole-archive hash: that would pin the deflate encoder's
+        // output too, and fail on a `flate2` bump that changed nothing here.
+        assert_eq!(b, s, "the two writers agree byte for byte");
     }
 
     fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {

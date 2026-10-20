@@ -39,6 +39,11 @@
 # to the corpus + synthetic sweep the quick-tier `smoke_scorecard_*` test
 # runs. Only that one test is slow; the binary's other tests stay in `quick`.
 #
+# `publication_metadata::a_sharded_fleet_carries_the_values_through_empty_shards`
+# (#668) runs a whole sharded fleet (shard-plan, coarse job, four shards,
+# merge) through the CLI, ~22s alone. The binary's other tests stay in
+# `quick`.
+#
 # `test(large_polygon_regression)` also lives in the exclusion: it's a
 # manual, `--release`-only regression test documented in
 # `tests/fixtures/realdata/README.md` against a 1.8GB fixture that isn't
@@ -69,6 +74,7 @@ not (
   | test(=test_real_data_conversion_keeps_the_root_directory_small)
   | test(large_polygon_regression)
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
+  | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
 )
 """
 
@@ -95,6 +101,7 @@ filter = """
   | test(=test_real_data_conversion_keeps_the_root_directory_small)
   | test(large_polygon_regression)
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
+  | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
 """
 slow-timeout = { period = "120s", terminate-after = 15 }
 

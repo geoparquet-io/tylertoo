@@ -320,6 +320,51 @@ impl TilesetMetadataArgs {
     }
 }
 
+/// Print a composed archive's publication metadata (`merge`, `pyramid`).
+///
+/// The values written, since an inherited attribution is HTML the map will
+/// render and should be visible without re-reading the archive. Marked `!`
+/// like the bounds-less inputs: each field left out because the `inputs`
+/// disagreed, and the inputs whose metadata did not decode, any of which
+/// may have been meant to carry a credit.
+fn print_publication(
+    meta: &tylertoo_core::TilesetMetadata,
+    conflicts: &[String],
+    without_metadata: &[String],
+    inputs: &str,
+) {
+    for (key, value) in [
+        ("name", &meta.name),
+        ("description", &meta.description),
+        ("attribution", &meta.attribution),
+    ] {
+        if let Some(value) = value {
+            say!("  {key}: {}", quoted_preview(value));
+        }
+    }
+    for key in conflicts {
+        say!("  ! the {inputs} carry different {key}s, so the output has none; set --{key} to give it one");
+    }
+    if !without_metadata.is_empty() {
+        say!(
+            "  ! {} of the {inputs} carried no readable metadata, so passed on no name, \
+             description or attribution:",
+            without_metadata.len()
+        );
+        for name in without_metadata {
+            say!("      {name}");
+        }
+    }
+}
+
+/// `value` quoted and escaped for one output line, cut after 200 characters.
+fn quoted_preview(value: &str) -> String {
+    match value.char_indices().nth(200) {
+        None => format!("{value:?}"),
+        Some((cut, _)) => format!("{:?}… ({} bytes)", &value[..cut], value.len()),
+    }
+}
+
 /// Arguments for `tylertoo pyramid`.
 ///
 /// The band rules are documented in the pyramid section of
@@ -1450,9 +1495,9 @@ fn gen_reference_markdown() -> String {
 
 /// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
 ///
-/// If the first non-flag token is already a subcommand (`tiles`/`overview`/
-/// `validate`/`help`) or the invocation is a help/version query, the arguments
-/// are returned unchanged.
+/// If the first token after the global flags is already a subcommand
+/// (`tiles`/`overview`/`validate`/`help`) or the invocation is a
+/// help/version query, the arguments are returned unchanged.
 fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -1480,11 +1525,15 @@ where
         return argv;
     }
 
-    let first_positional = argv
+    // A subcommand can only follow the global flags, none of which takes a
+    // value. Looking past any other flag for "the first positional" would
+    // take a flag's value for one: `tylertoo --name overview in out` named
+    // the tileset `overview` and was routed to the `overview` subcommand.
+    let first_after_globals = argv
         .iter()
         .skip(1)
-        .find(|a| !a.to_string_lossy().starts_with('-'));
-    let is_subcommand = first_positional
+        .find(|a| !matches!(a.to_string_lossy().as_ref(), "-q" | "--quiet"));
+    let is_subcommand = first_after_globals
         .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
         .unwrap_or(false);
     let is_help_or_version = argv.iter().skip(1).any(|a| {
@@ -3051,6 +3100,12 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     if let Some(line) = pyramid_shared_note(per_band_sum, report.total_tiles) {
         say!("{line}");
     }
+    print_publication(
+        &report.metadata,
+        &report.metadata_conflicts,
+        &report.bands_without_metadata,
+        "bands",
+    );
     say!(
         "✓ Built {} band(s) → {} ({} tiles)",
         bands.len(),
@@ -3313,6 +3368,12 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             say!("      {name}");
         }
     }
+    print_publication(
+        &report.metadata,
+        &report.metadata_conflicts,
+        &report.inputs_without_metadata,
+        "inputs",
+    );
     say!(
         "\n✓ {} tiles ({} unique) from {} archive(s), z{}..z{} in {:.2}s",
         format_number(report.tiles_total),
@@ -5122,6 +5183,24 @@ mod tests {
             Command::Tiles(a) => assert_eq!(a.publication.name.as_deref(), Some("tiles")),
             other => panic!("expected tiles, got {other:?}"),
         }
+        // ...and before them: the value is not taken for the subcommand.
+        for value in ["overview", "merge", "help"] {
+            let argv = rewrite_bare_args(
+                ["tylertoo", "--name", value, "in.parquet", "out.pmtiles"].map(Into::into),
+            );
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Tiles(a) => {
+                    assert_eq!(a.publication.name.as_deref(), Some(value));
+                    assert_eq!(a.input.as_deref(), Some(Path::new("in.parquet")));
+                }
+                other => panic!("--name {value}: expected tiles, got {other:?}"),
+            }
+        }
+        // A subcommand after the global `-q` is still a subcommand.
+        let argv: Vec<std::ffi::OsString> = ["tylertoo", "-q", "merge", "a.pmtiles", "out.pmtiles"]
+            .map(Into::into)
+            .to_vec();
+        assert_eq!(rewrite_bare_args(argv.clone()), argv);
     }
 
     /// `--plan-only` writes no archive, so the three flags are reported as

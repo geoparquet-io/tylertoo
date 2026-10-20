@@ -40,7 +40,10 @@ refer to. The three flags describe the tileset as a whole.
 tylertoo stores each string exactly as given. It doesn't trim it, escape it, or
 check the HTML. Quotes, newlines, and Unicode survive, and a consuming
 application decides how to render the markup, so write only attribution HTML
-you trust.
+you trust. That includes characters that are valid JSON but hostile to some
+consumers: a NUL cuts the string short in anything that passes it to a C API,
+and a raw U+2028 or U+2029 breaks a page that pastes the metadata into a
+`<script>` block.
 
 An unset flag leaves its key out of the archive. This differs from tippecanoe,
 which names the tileset after the output file when `-n` is unset and copies the
@@ -77,14 +80,29 @@ resolves on its own, from this order:
 |---|---|
 | Nothing | The key is left out |
 | One value, or the same value repeated | That value |
-| Different names, or different descriptions | An error that asks for `--name` or `--description` |
+| Different names, or different descriptions | The key is left out, with a warning |
 | Different attributions | Every distinct credit, sorted, joined with `" \| "` |
 
-tylertoo refuses to choose between two names because the answer would depend
-on the order of the inputs. Credits are different: dropping one would stop crediting a source, so
-all are kept. An already-joined credit stays one string and isn't split, so
-merging a merged archive can repeat a source's name. Pass an explicit
-`--attribution` for the final archive if that matters.
+tylertoo doesn't choose between two names, because the answer would depend on
+the order of the inputs, and it doesn't stop either: tippecanoe names every
+archive after its own output file, so two of its archives always disagree.
+Pass `--name` or `--description` to set one. Credits are different: dropping
+one would stop crediting a source, so all are kept. An already-joined credit
+stays one string and isn't split, so merging a merged archive can repeat a
+source's name. Pass an explicit `--attribution` for the final archive if that
+matters. Credits that differ only in case or spacing are all kept too, with a
+warning, since that's usually one job with a mistyped flag.
+
+Both commands print the values they wrote, and mark with `!` each field left
+out and each input whose metadata couldn't be read. Such an input passes on no
+credit, so check it before you publish. The log, at `info`, names the input
+each inherited value came from.
+
+An inherited attribution is trusted exactly like your own `--attribution`:
+tylertoo copies it from the input archive byte for byte, and a map that shows
+the archive's attribution renders it as HTML. Composing archives from someone
+else, such as a partner's shards or a downloaded band, means publishing their
+markup on your page. Read what the command printed, or override it.
 
 An input's empty attribution (`""`) counts only when no input carries a
 credit: with any non-empty credit present, the empty ones are discarded. If

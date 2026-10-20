@@ -177,6 +177,39 @@ pub struct ArchiveIndex {
     bounds: Option<TileBounds>,
 }
 
+/// The raw metadata section `header` points at, still under its internal
+/// compression: the one place an archive's metadata bytes are read, shared
+/// by [`ArchiveIndex::open`] and [`ArchiveIndex::read_metadata_only`].
+fn read_metadata_raw(src: &FileBytes, header: &Header, path: &Path) -> Result<Vec<u8>> {
+    // Capped before the allocation, like `ArchiveIndex::open`'s directory
+    // reads (#417/#510): `json_metadata_length` is archive-supplied and bounded
+    // only by the file, so a header claiming 256 MiB of metadata used to
+    // make `open` allocate that much — per input, and a merge opens every
+    // shard at once — and then SUCCEED, holding it raw for the index's
+    // lifetime. `metadata_json` decompresses it under the same ceiling, so
+    // a larger compressed block cannot be legitimate metadata.
+    if header.json_metadata_length > MAX_INTERNAL_BYTES {
+        return Err(Error::PMTilesWrite(format!(
+            "{}: metadata claims {} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+             ceiling on an archive's internal sections",
+            path.display(),
+            header.json_metadata_length
+        )));
+    }
+    let meta_end = header
+        .json_metadata_offset
+        .checked_add(header.json_metadata_length)
+        .filter(|&e| e <= src.len)
+        .ok_or_else(|| Error::PMTilesWrite(format!("metadata past end of {}", path.display())))?;
+    Ok(src
+        .read_range(
+            header.json_metadata_offset as usize,
+            (meta_end - header.json_metadata_offset) as usize,
+        )
+        .map_err(|e| Error::PMTilesWrite(format!("{}: {e}", path.display())))?
+        .into_owned())
+}
+
 impl ArchiveIndex {
     /// Open `path`: header, directories and metadata, nothing else.
     ///
@@ -192,46 +225,16 @@ impl ArchiveIndex {
         let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
         let src = FileBytes::open(path)
             .map_err(|e| Error::PMTilesRead(format!("failed to open {}: {e}", path.display())))?;
-        let len = src.len;
-
         // The header is a fixed 127 bytes at offset 0; `Header::from_bytes`
         // validates magic, version and the fields #417 made load-bearing.
         let head = src
-            .read_range(0, HEADER_BYTES.min(len as usize))
+            .read_range(0, HEADER_BYTES.min(src.len as usize))
             .map_err(at)?;
         let header = Header::from_bytes(&head).map_err(at)?;
 
         let entries = read_all_entries_from(&src, &header).map_err(at)?;
 
-        // Capped before the allocation, like the directory reads above
-        // (#417/#510): `json_metadata_length` is archive-supplied and bounded
-        // only by the file, so a header claiming 256 MiB of metadata used to
-        // make `open` allocate that much — per input, and a merge opens every
-        // shard at once — and then SUCCEED, holding it raw for the index's
-        // lifetime. `metadata_json` decompresses it under the same ceiling, so
-        // a larger compressed block cannot be legitimate metadata.
-        if header.json_metadata_length > MAX_INTERNAL_BYTES {
-            return Err(Error::PMTilesWrite(format!(
-                "{}: metadata claims {} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
-                 ceiling on an archive's internal sections",
-                path.display(),
-                header.json_metadata_length
-            )));
-        }
-        let meta_end = header
-            .json_metadata_offset
-            .checked_add(header.json_metadata_length)
-            .filter(|&e| e <= len)
-            .ok_or_else(|| {
-                Error::PMTilesWrite(format!("metadata past end of {}", path.display()))
-            })?;
-        let metadata_raw = src
-            .read_range(
-                header.json_metadata_offset as usize,
-                (meta_end - header.json_metadata_offset) as usize,
-            )
-            .map_err(at)?
-            .into_owned();
+        let metadata_raw = read_metadata_raw(&src, &header, path)?;
 
         let bounds = usable_bounds(&header);
         Ok(ArchiveIndex {
@@ -293,6 +296,32 @@ impl ArchiveIndex {
         )
         .ok()?;
         serde_json::from_slice(&plain).ok()
+    }
+
+    /// The decompressed metadata of the archive at `path`, read without its
+    /// directories: the header, then the metadata section under the checks
+    /// [`Self::open`] applies.
+    ///
+    /// For a caller that needs every input's metadata before walking any
+    /// input's directories; `pyramid`'s disjoint-zoom merge opens one band
+    /// at a time on purpose, and resolves its publication metadata from
+    /// every band first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], less the directory reads, and if the metadata does
+    /// not decompress within the internal-section ceiling.
+    pub fn read_metadata_only(path: &Path) -> Result<Vec<u8>> {
+        let at = |e: Error| Error::PMTilesWrite(format!("{}: {e}", path.display()));
+        let src = FileBytes::open(path)
+            .map_err(|e| Error::PMTilesRead(format!("failed to open {}: {e}", path.display())))?;
+        let head = src
+            .read_range(0, HEADER_BYTES.min(src.len as usize))
+            .map_err(at)?;
+        let header = Header::from_bytes(&head).map_err(at)?;
+        let raw = read_metadata_raw(&src, &header, path)?;
+        compression::decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
+            .map_err(|e| Error::PMTilesWrite(format!("{}: metadata: {e}", path.display())))
     }
 
     /// Bytes at an absolute file range — a [`TileRef::range`], typically.

@@ -236,40 +236,48 @@ fn merge_inherits_and_overrides() {
     );
 }
 
-/// Differing inherited names need `--name`, on both composing commands. The
-/// refusal comes before anything is written, so `--force` over an existing
-/// output leaves it as it was.
+/// Differing inherited names are left out, on both composing commands, and
+/// stdout says so next to the values that were written; `--name` sets one.
 #[test]
-fn conflicting_names_are_refused_without_touching_the_output() {
+fn disagreeing_names_are_left_out_and_reported() {
     let dir = tempfile::tempdir().unwrap();
     let (coarse, fine) = two_bands(dir.path(), "Other grid");
-    let existing = dir.path().join("existing.pmtiles");
-    std::fs::write(&existing, b"previous").unwrap();
     let (b0, b1) = (
         format!("0-1:{}:grid", s(&coarse)),
         format!("2-3:{}:grid", s(&fine)),
     );
-    for argv in [
-        vec!["merge", s(&existing), s(&coarse), s(&fine), "--force"],
-        vec![
-            "pyramid",
-            s(&existing),
-            "--band",
-            &b0,
-            "--band",
-            &b1,
-            "--force",
-        ],
+    let (merged, pyramid) = (
+        dir.path().join("merged.pmtiles"),
+        dir.path().join("pyramid.pmtiles"),
+    );
+    for (argv, out) in [
+        (vec!["merge", s(&merged), s(&coarse), s(&fine)], &merged),
+        (
+            vec!["pyramid", s(&pyramid), "--band", &b0, "--band", &b1],
+            &pyramid,
+        ),
     ] {
         let (ok, log) = run(&argv);
-        assert!(!ok, "{argv:?} must fail: {log}");
-        assert!(log.contains("--name"), "{argv:?}: {log}");
-        assert_eq!(std::fs::read(&existing).unwrap(), b"previous", "{argv:?}");
+        assert!(ok, "{argv:?}: {log}");
+        assert_eq!(
+            publication(out),
+            [None, None, Some(json!("NPS | USGS"))],
+            "{argv:?}"
+        );
+        assert!(
+            log.contains(r#"attribution: "NPS | USGS""#),
+            "{argv:?}: {log}"
+        );
+        assert!(
+            log.contains("different names, so the output has none; set --name"),
+            "{argv:?}: {log}"
+        );
     }
     let out = dir.path().join("named.pmtiles");
     let (ok, log) = run(&["merge", s(&out), s(&coarse), s(&fine), "--name", "Both"]);
     assert!(ok, "{log}");
     assert_eq!(publication(&out)[0], Some(json!("Both")));
+    assert!(!log.contains("different names"), "{log}");
 }
 
 /// A sharded build: every job gets the same flags, the shards that own no

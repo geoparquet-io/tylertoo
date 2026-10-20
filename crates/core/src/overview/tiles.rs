@@ -30,8 +30,7 @@ use super::convert::{
     ConvertReport, LevelPlan,
 };
 use super::export::{
-    export_pmtiles, write_empty_archive_with_metadata, ExportError, ExportOptions, ExportReport,
-    FeatureOrder,
+    export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
 };
 use super::writer::WriterError;
 use crate::input_set::ConvertSource;
@@ -650,7 +649,7 @@ pub fn convert_to_pmtiles_observed(
                     // The shard owns [pivot, finest]; a GSD ladder has no
                     // finest zoom to declare, so the pivot stands alone.
                     let max_zoom = zoom_plan.map_or_else(|| range.pivot_zoom(), |(_, max)| max);
-                    write_empty_archive_with_metadata(
+                    write_empty_archive(
                         output,
                         &layer_name,
                         range.pivot_zoom(),
@@ -683,14 +682,8 @@ pub fn convert_to_pmtiles_observed(
                     // ladder), so the fallback is unreachable in practice.
                     let min_zoom = zoom_plan.map_or(0, |(min, _)| min);
                     let max_zoom = job.pivot_zoom.saturating_sub(1);
-                    write_empty_archive_with_metadata(
-                        output,
-                        &layer_name,
-                        min_zoom,
-                        max_zoom,
-                        &options.metadata,
-                    )
-                    .map_err(TilesError::EmptyCoarseArchive)?;
+                    write_empty_archive(output, &layer_name, min_zoom, max_zoom, &options.metadata)
+                        .map_err(TilesError::EmptyCoarseArchive)?;
                     log::info!(
                         "[tiles] shard job {} has nothing to write ({e}); wrote an empty archive",
                         job.role

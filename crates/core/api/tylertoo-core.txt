@@ -11,6 +11,7 @@ pub fn tylertoo_core::archive_index::ArchiveIndex::metadata_json(&self) -> core:
 pub fn tylertoo_core::archive_index::ArchiveIndex::metadata_raw(&self) -> &[u8]
 pub fn tylertoo_core::archive_index::ArchiveIndex::open(&std::path::Path) -> tylertoo_core::Result<Self>
 pub fn tylertoo_core::archive_index::ArchiveIndex::path(&self) -> &std::path::Path
+pub fn tylertoo_core::archive_index::ArchiveIndex::read_metadata_only(&std::path::Path) -> tylertoo_core::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::archive_index::ArchiveIndex::read_range(&self, core::ops::range::Range<usize>) -> tylertoo_core::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::archive_index::ArchiveIndex::tile_id_range(&self) -> tylertoo_core::Result<core::option::Option<(u64, u64)>>
 pub fn tylertoo_core::archive_index::ArchiveIndex::tiles(&self) -> tylertoo_core::archive_index::TileIter<'_>
@@ -659,7 +660,10 @@ pub tylertoo_core::merge::MergeReport::bytes_written: u64
 pub tylertoo_core::merge::MergeReport::duration_secs: f64
 pub tylertoo_core::merge::MergeReport::inputs: usize
 pub tylertoo_core::merge::MergeReport::inputs_without_bounds: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::merge::MergeReport::inputs_without_metadata: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::merge::MergeReport::max_zoom: u8
+pub tylertoo_core::merge::MergeReport::metadata: tylertoo_core::TilesetMetadata
+pub tylertoo_core::merge::MergeReport::metadata_conflicts: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::merge::MergeReport::min_zoom: u8
 pub tylertoo_core::merge::MergeReport::per_zoom_tile_counts: alloc::collections::btree::map::BTreeMap<u8, u64>
 pub tylertoo_core::merge::MergeReport::tiles_total: u64
@@ -1701,6 +1705,7 @@ pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previo
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::zoom: u8
+pub tylertoo_core::overview::export::ExportError::MetadataTooLarge(alloc::string::String)
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportError::Output(tylertoo_core::atomic_output::OutputNotWritable)
@@ -1945,8 +1950,7 @@ pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
-pub fn tylertoo_core::overview::export::write_empty_archive(&std::path::Path, &str, u8, u8) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
-pub fn tylertoo_core::overview::export::write_empty_archive_with_metadata(&std::path::Path, &str, u8, u8, &tylertoo_core::TilesetMetadata) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
+pub fn tylertoo_core::overview::export::write_empty_archive(&std::path::Path, &str, u8, u8, &tylertoo_core::TilesetMetadata) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::zoom_for_level(&tylertoo_core::overview::level::OverviewsMeta, usize) -> core::result::Result<u8, tylertoo_core::overview::export::ExportError>
 pub mod tylertoo_core::overview::filter
 pub enum tylertoo_core::overview::filter::CmpOp
@@ -2933,6 +2937,7 @@ pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Opti
 pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::tiles::TilesOptions::layer_name: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::tiles::TilesOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
 pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
 pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
@@ -3376,6 +3381,22 @@ impl core::marker::Unpin for tylertoo_core::pyramid::Band
 impl core::marker::UnsafeUnpin for tylertoo_core::pyramid::Band
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::Band
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::Band
+pub struct tylertoo_core::pyramid::BandMergeOptions
+pub tylertoo_core::pyramid::BandMergeOptions::allow_missing_zooms: bool
+pub tylertoo_core::pyramid::BandMergeOptions::metadata: tylertoo_core::TilesetMetadata
+impl core::clone::Clone for tylertoo_core::pyramid::BandMergeOptions
+pub fn tylertoo_core::pyramid::BandMergeOptions::clone(&self) -> tylertoo_core::pyramid::BandMergeOptions
+impl core::default::Default for tylertoo_core::pyramid::BandMergeOptions
+pub fn tylertoo_core::pyramid::BandMergeOptions::default() -> tylertoo_core::pyramid::BandMergeOptions
+impl core::fmt::Debug for tylertoo_core::pyramid::BandMergeOptions
+pub fn tylertoo_core::pyramid::BandMergeOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::pyramid::BandMergeOptions
+impl core::marker::Send for tylertoo_core::pyramid::BandMergeOptions
+impl core::marker::Sync for tylertoo_core::pyramid::BandMergeOptions
+impl core::marker::Unpin for tylertoo_core::pyramid::BandMergeOptions
+impl core::marker::UnsafeUnpin for tylertoo_core::pyramid::BandMergeOptions
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::BandMergeOptions
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::BandMergeOptions
 pub struct tylertoo_core::pyramid::PyramidOptions
 pub tylertoo_core::pyramid::PyramidOptions::allow_missing_zooms: bool
 pub tylertoo_core::pyramid::PyramidOptions::convert: tylertoo_core::overview::convert::ConvertOptions
@@ -3397,6 +3418,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pyramid::Pyramid
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidOptions
 pub struct tylertoo_core::pyramid::PyramidReport
 pub tylertoo_core::pyramid::PyramidReport::bands_without_bounds: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::pyramid::PyramidReport::bands_without_metadata: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::pyramid::PyramidReport::metadata: tylertoo_core::TilesetMetadata
+pub tylertoo_core::pyramid::PyramidReport::metadata_conflicts: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::per_band_tiles: alloc::vec::Vec<(alloc::string::String, u8, u8, usize)>
 pub tylertoo_core::pyramid::PyramidReport::skipped: usize
 pub tylertoo_core::pyramid::PyramidReport::total_tiles: usize
@@ -3414,8 +3438,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidRep
 pub fn tylertoo_core::pyramid::build_pyramid(&[tylertoo_core::pyramid::Band], &std::path::Path, &tylertoo_core::pyramid::PyramidOptions) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::classify_band_input(&std::path::Path) -> tylertoo_core::pyramid::BandSource
 pub fn tylertoo_core::pyramid::merge_bands(&[tylertoo_core::pyramid::Band], &std::path::Path) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
-pub fn tylertoo_core::pyramid::merge_bands_with_metadata(&[tylertoo_core::pyramid::Band], &std::path::Path, bool, &tylertoo_core::TilesetMetadata) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
-pub fn tylertoo_core::pyramid::merge_bands_with_options(&[tylertoo_core::pyramid::Band], &std::path::Path, bool) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
+pub fn tylertoo_core::pyramid::merge_bands_with_options(&[tylertoo_core::pyramid::Band], &std::path::Path, &tylertoo_core::pyramid::BandMergeOptions) -> core::result::Result<tylertoo_core::pyramid::PyramidReport, tylertoo_core::Error>
 pub fn tylertoo_core::pyramid::parse_bands<S: core::convert::AsRef<str>>(&[S]) -> core::result::Result<alloc::vec::Vec<tylertoo_core::pyramid::Band>, alloc::string::String>
 pub fn tylertoo_core::pyramid::validate_bands(&[tylertoo_core::pyramid::Band]) -> core::result::Result<(), alloc::string::String>
 pub mod tylertoo_core::quality
@@ -4199,6 +4222,8 @@ pub fn tylertoo_core::TilesetMetadata::default() -> tylertoo_core::TilesetMetada
 impl core::fmt::Debug for tylertoo_core::TilesetMetadata
 pub fn tylertoo_core::TilesetMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::TilesetMetadata
+impl serde_core::ser::Serialize for tylertoo_core::TilesetMetadata
+pub fn tylertoo_core::TilesetMetadata::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl core::marker::Freeze for tylertoo_core::TilesetMetadata
 impl core::marker::Send for tylertoo_core::TilesetMetadata
 impl core::marker::Sync for tylertoo_core::TilesetMetadata

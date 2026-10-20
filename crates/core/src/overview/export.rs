@@ -416,8 +416,8 @@ impl ExportOptions {
     /// Returns [`ExportError::InvalidExtent`] if `extent` is 0,
     /// [`ExportError::TileBufferTooWide`] if `tile_buffer` is above
     /// [`MAX_TILE_BUFFER_PX`], [`ExportError::SpillDirNotDirectory`] for a
-    /// missing spill directory, or [`ExportError::Core`] if `metadata` is too
-    /// large for an archive's metadata.
+    /// missing spill directory, or [`ExportError::MetadataTooLarge`] if
+    /// `metadata` is too large for an archive's metadata.
     pub fn validate(&self) -> Result<(), ExportError> {
         if self.extent == 0 {
             return Err(ExportError::InvalidExtent {
@@ -453,9 +453,7 @@ impl ExportOptions {
 /// [`TilesetMetadata`] too large for any archive's metadata, as an
 /// [`ExportError`].
 fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ExportError> {
-    metadata
-        .check_size()
-        .map_err(|msg| ExportError::Core(crate::Error::InvalidConfig(msg)))
+    metadata.check_size().map_err(ExportError::MetadataTooLarge)
 }
 
 /// Per-zoom statistics in an [`ExportReport`].
@@ -842,6 +840,11 @@ pub enum ExportError {
     /// only surface deep into the export.
     #[error("spill-dir {} is not an existing directory", .0.display())]
     SpillDirNotDirectory(PathBuf),
+
+    /// [`ExportOptions::metadata`] cannot fit an archive's metadata section
+    /// on its own. Checked before any work, like the other option values.
+    #[error("{0}")]
+    MetadataTooLarge(String),
 
     /// A level's densest tile is estimated to need more memory than the
     /// machine has, even exported on its own (#665). Raised after the scan,
@@ -1542,37 +1545,17 @@ fn restrict_scans_to_range(scans: &mut [LevelScan], level_zooms: &[u8], options:
 /// archive with no tiles has no extent, and claiming its range's extent would
 /// widen the merged bbox on the word of a job that contributed nothing.
 ///
-/// # Errors
-///
-/// Returns an [`ExportError`] if the archive cannot be created or written at
-/// `output`.
-pub fn write_empty_archive(
-    output: &Path,
-    layer_name: &str,
-    min_zoom: u8,
-    max_zoom: u8,
-) -> Result<(), ExportError> {
-    write_empty_archive_with_metadata(
-        output,
-        layer_name,
-        min_zoom,
-        max_zoom,
-        &TilesetMetadata::default(),
-    )
-}
-
-/// [`write_empty_archive`] carrying publication metadata.
-///
-/// An empty shard or coarse job writes the same `name`, `description` and
-/// `attribution` as its siblings, so the merged archive keeps them whether
-/// or not this job received any data.
+/// `metadata` is the publication metadata the job's export would have
+/// written: an empty shard or coarse job carries the same `name`,
+/// `description` and `attribution` as its siblings, so the merged archive
+/// keeps them whether or not this job received any data.
 ///
 /// # Errors
 ///
 /// Returns an [`ExportError`] if `metadata` is too large for an archive's
 /// metadata (checked before `output` is touched), or if the archive cannot
 /// be created or written at `output`.
-pub fn write_empty_archive_with_metadata(
+pub fn write_empty_archive(
     output: &Path,
     layer_name: &str,
     min_zoom: u8,
@@ -13917,8 +13900,8 @@ mod tests {
             dir.path().join("plain.pmtiles"),
             dir.path().join("published.pmtiles"),
         );
-        write_empty_archive(&plain, "parks", 3, 9).unwrap();
-        write_empty_archive_with_metadata(&published, "parks", 3, 9, &park_metadata()).unwrap();
+        write_empty_archive(&plain, "parks", 3, 9, &TilesetMetadata::default()).unwrap();
+        write_empty_archive(&published, "parks", 3, 9, &park_metadata()).unwrap();
 
         let mut plain = metadata_object(&std::fs::read(&plain).unwrap());
         let mut published = metadata_object(&std::fs::read(&published).unwrap());
@@ -13958,8 +13941,7 @@ mod tests {
         assert!(err.to_string().contains("description"), "{err}");
         assert!(!out.exists());
 
-        let err =
-            write_empty_archive_with_metadata(&out, "parks", 0, 4, &opts.metadata).unwrap_err();
+        let err = write_empty_archive(&out, "parks", 0, 4, &opts.metadata).unwrap_err();
         assert!(err.to_string().contains("description"), "{err}");
         assert!(!out.exists() && !out.with_extension("pmtiles.partial").exists());
     }

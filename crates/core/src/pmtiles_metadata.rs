@@ -6,8 +6,9 @@
 //! as the PMTiles JavaScript adapter copy them into TileJSON, where MapLibre
 //! shows `attribution` in its attribution control.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::compression::MAX_INTERNAL_BYTES;
@@ -28,7 +29,7 @@ use crate::compression::MAX_INTERNAL_BYTES;
 /// assert_eq!(meta.name.as_deref(), Some("Park Tiles"));
 /// assert_eq!(meta.description, None);
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct TilesetMetadata {
     /// Human-readable tileset name.
@@ -91,11 +92,10 @@ impl TilesetMetadata {
     }
 
     /// Bytes [`Self::append_json_fields`] appends, counted without building
-    /// the escaped strings.
+    /// the appended string.
     pub(crate) fn serialized_len(&self) -> u64 {
         self.fields()
-            // `,"key":` plus the escaped, quoted value
-            .map(|(key, value)| key.len() as u64 + 4 + json_string_len(value))
+            .map(|(key, value)| field_len(key, json_string_len(value)))
             .sum()
     }
 
@@ -105,9 +105,7 @@ impl TilesetMetadata {
     /// checked again when the archive is assembled; this is the cheap lower
     /// bound a caller can apply before any conversion work starts.
     pub(crate) fn check_size(&self) -> Result<(), String> {
-        // A standalone object of just these fields: the leading comma
-        // becomes `{`, plus the closing `}`.
-        let len = self.serialized_len() + 1;
+        let len = self.serialized_len() + STANDALONE_FRAMING;
         if len <= MAX_INTERNAL_BYTES {
             return Ok(());
         }
@@ -119,6 +117,16 @@ impl TilesetMetadata {
         ))
     }
 }
+
+/// What [`TilesetMetadata::append_json_fields`] appends for one field,
+/// `,"key":` plus a value serialized to `value_len` bytes (quotes included).
+fn field_len(key: &str, value_len: u64) -> u64 {
+    key.len() as u64 + 4 + value_len
+}
+
+/// Bytes the appended fields gain as an object of their own: the leading
+/// comma becomes `{`, plus the closing `}`.
+const STANDALONE_FRAMING: u64 = 1;
 
 /// One of the three publication fields.
 #[derive(Debug, Clone, Copy)]
@@ -152,33 +160,79 @@ impl Field {
 /// Joins inherited attribution credits.
 const CREDIT_SEPARATOR: &str = " | ";
 
+/// Where an inherited value came from: the first input that carried it, and
+/// how many inputs carried it.
+#[derive(Debug)]
+struct Source {
+    first: String,
+    count: usize,
+}
+
+impl Source {
+    fn new(label: &str) -> Self {
+        Self {
+            first: label.to_string(),
+            count: 1,
+        }
+    }
+
+    /// `a.pmtiles`, or `a.pmtiles and 3 other inputs`.
+    fn describe(&self) -> String {
+        match self.count {
+            1 => self.first.clone(),
+            2 => format!("{} and 1 other input", self.first),
+            n => format!("{} and {} other inputs", self.first, n - 1),
+        }
+    }
+}
+
+/// What the inputs carry for a name or a description.
+#[derive(Debug, Default)]
+enum Inherited {
+    /// No input carried a value.
+    #[default]
+    None,
+    /// Every input that carried a value carried this one.
+    One(String, Source),
+    /// Two inputs carried different values; these are their labels. The
+    /// values themselves are dropped, so a fleet of differing names costs
+    /// no more memory than two.
+    Conflict(String, String),
+}
+
 /// Resolves the publication metadata of an archive composed from others
 /// (`merge`, `pyramid`).
 ///
 /// Each field resolves on its own. An explicit override (including `""`)
 /// wins and that field's inherited values are not even read. Otherwise:
-/// a name or description the inputs agree on is kept, and two different
-/// ones are an error asking for an override; attribution credits are all
-/// kept, deduplicated exactly, sorted by Rust string order and joined with
-/// `" | "` (an inherited `""` counts only when no input has a credit).
-/// Absent and `null` fields are no value; any other non-string is an error.
+/// a name or description the inputs agree on is kept, and one they
+/// disagree on is left out ([`Resolved::conflicts`]); attribution credits
+/// are all kept, deduplicated exactly, sorted by Rust string order and
+/// joined with `" | "` (an inherited `""` counts only when no input has a
+/// credit). Absent and `null` fields are no value, and any other non-string
+/// is ignored with a warning.
 ///
-/// The result does not depend on the order inputs are added in.
+/// A disagreement is not an error because composing archives from other
+/// tools has to keep working: tippecanoe names every archive after its
+/// output file, so two of its archives always disagree. Leaving the field
+/// out is order-independent, and the same thing an unset field does.
+///
+/// The resolved metadata does not depend on the order inputs are added in.
+/// Which inputs a message names can.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tile-join keeps the last input's attribution
 /// and description, joins differing names with " + ", and ignores an empty
 /// override (tile-join.cpp, near L1220). We keep every input's credit so a
-/// composed map still credits all of its sources, refuse to guess a combined
-/// name or description, and let `""` clear a field explicitly.
+/// composed map still credits all of its sources, leave out a name or
+/// description rather than build one from the input order, and let `""`
+/// clear a field explicitly.
 #[derive(Debug)]
 pub(crate) struct MetadataCollector {
     overrides: TilesetMetadata,
-    /// The inherited name and the first input that carried it.
-    name: Option<(String, String)>,
-    /// The inherited description and the first input that carried it.
-    description: Option<(String, String)>,
-    /// Distinct non-empty attribution credits.
-    credits: BTreeSet<String>,
+    name: Inherited,
+    description: Inherited,
+    /// Distinct non-empty attribution credits, and where each came from.
+    credits: BTreeMap<String, Source>,
     /// Escaped bytes of every credit in `credits`, without quotes or
     /// separators: what the joined value costs in the metadata JSON.
     credit_bytes: u64,
@@ -186,14 +240,24 @@ pub(crate) struct MetadataCollector {
     empty_credit: bool,
 }
 
+/// What [`MetadataCollector::resolve`] settled on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resolved {
+    /// The output archive's publication metadata.
+    pub(crate) metadata: TilesetMetadata,
+    /// The keys (`"name"`, `"description"`) the inputs disagreed on, which
+    /// the output leaves out.
+    pub(crate) conflicts: Vec<String>,
+}
+
 impl MetadataCollector {
     /// A collector whose result applies `overrides` field by field.
     pub(crate) fn new(overrides: &TilesetMetadata) -> Self {
         Self {
             overrides: overrides.clone(),
-            name: None,
-            description: None,
-            credits: BTreeSet::new(),
+            name: Inherited::None,
+            description: Inherited::None,
+            credits: BTreeMap::new(),
             credit_bytes: 0,
             empty_credit: false,
         }
@@ -206,12 +270,13 @@ impl MetadataCollector {
     /// Add one input archive's metadata JSON, by its whole root.
     ///
     /// A root that is not an object carries no publication fields. Unknown
-    /// keys are ignored.
+    /// keys are ignored, and so, with a warning naming `label`, is a field
+    /// that is neither a string nor `null`.
     ///
     /// # Errors
     ///
-    /// Returns a message naming `label` if a field the output inherits is
-    /// neither a string nor `null`, or conflicts with an earlier input.
+    /// Returns a message naming `label` if its attribution credit takes the
+    /// inputs' joined credits past what an archive's metadata can hold.
     pub(crate) fn add_json(&mut self, label: &str, root: &Value) -> Result<(), String> {
         let Value::Object(map) = root else {
             return Ok(());
@@ -224,31 +289,10 @@ impl MetadataCollector {
                 None | Some(Value::Null) => {}
                 Some(Value::String(value)) => self.add_value(label, field, value)?,
                 // Named, never printed: the value could be anything, of any size.
-                Some(_) => {
-                    return Err(format!(
-                        "{label}: {key} must be a string or null; set --{key} to override it",
-                        key = field.key()
-                    ))
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Add values an input is known to carry, such as the export metadata a
-    /// generated pyramid band will be written with.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::add_json`].
-    pub(crate) fn add_metadata(
-        &mut self,
-        label: &str,
-        meta: &TilesetMetadata,
-    ) -> Result<(), String> {
-        for field in Field::ALL {
-            if let (false, Some(value)) = (self.overridden(field), field.of(meta)) {
-                self.add_value(label, field, value)?;
+                Some(_) => log::warn!(
+                    "{label}: its {key} is not a string, so the output does not inherit it",
+                    key = field.key()
+                ),
             }
         }
         Ok(())
@@ -258,100 +302,162 @@ impl MetadataCollector {
         let slot = match field {
             Field::Name => &mut self.name,
             Field::Description => &mut self.description,
-            Field::Attribution => return self.add_credit(value),
+            Field::Attribution => return self.add_credit(label, value),
         };
         match slot {
-            None => *slot = Some((value.to_string(), label.to_string())),
-            Some((seen, _)) if seen == value => {}
-            // Labels only, not the values: either could be long HTML.
-            Some((_, first)) => {
-                return Err(format!(
-                    "conflicting PMTiles {key}s in {first} and {label}; set --{key} for the output",
-                    key = field.key()
-                ))
+            Inherited::None => *slot = Inherited::One(value.to_string(), Source::new(label)),
+            Inherited::One(seen, source) if seen == value => source.count += 1,
+            Inherited::One(_, source) => {
+                let first = std::mem::take(&mut source.first);
+                *slot = Inherited::Conflict(first, label.to_string());
             }
+            Inherited::Conflict(..) => {}
         }
         Ok(())
     }
 
-    fn add_credit(&mut self, credit: &str) -> Result<(), String> {
+    fn add_credit(&mut self, label: &str, credit: &str) -> Result<(), String> {
         if credit.is_empty() {
             self.empty_credit = true;
             return Ok(());
         }
-        if self.credits.contains(credit) {
+        if let Some(source) = self.credits.get_mut(credit) {
+            source.count += 1;
             return Ok(());
         }
+        // Without its quotes: the joined value is quoted once, below.
         self.credit_bytes += json_string_len(credit) - 2;
-        self.credits.insert(credit.to_string());
+        self.credits.insert(credit.to_string(), Source::new(label));
         // Checked as credits arrive, so a merge of many inputs fails at the
-        // first credit that cannot fit rather than after joining them all.
-        // `{"attribution":"` + credits + separators + `"}`.
+        // input whose credit cannot fit rather than after joining them all.
+        // The bound is the one `check_size` applies to the joined value.
         let separators = (self.credits.len() as u64 - 1) * CREDIT_SEPARATOR.len() as u64;
-        let len = 16 + self.credit_bytes + separators + 2;
+        let joined = self.credit_bytes + separators + 2;
+        let len = field_len(Field::Attribution.key(), joined) + STANDALONE_FRAMING;
         if len > MAX_INTERNAL_BYTES {
             return Err(format!(
-                "the inputs' attribution credits join to over {MAX_INTERNAL_BYTES} bytes, the \
-                 limit on an archive's metadata; set --attribution for the output"
+                "{label}: its attribution credit takes the inputs' joined credits to {len} \
+                 bytes, over the {MAX_INTERNAL_BYTES}-byte limit on an archive's metadata; \
+                 override the output's attribution (--attribution)"
             ));
         }
         Ok(())
     }
 
-    /// The output's publication metadata.
+    /// The output's publication metadata, and the fields left out because
+    /// the inputs disagreed on them.
     ///
     /// # Errors
     ///
     /// Returns a message if the resolved values are too large for an
     /// archive's metadata.
-    pub(crate) fn resolve(&self) -> Result<TilesetMetadata, String> {
-        let inherited = |slot: &Option<(String, String)>| slot.as_ref().map(|(v, _)| v.clone());
-        let attribution = if !self.credits.is_empty() {
-            let credits: Vec<&str> = self.credits.iter().map(String::as_str).collect();
-            Some(credits.join(CREDIT_SEPARATOR))
-        } else if self.empty_credit {
-            Some(String::new())
-        } else {
-            None
+    pub(crate) fn resolve(&self) -> Result<Resolved, String> {
+        let mut conflicts = Vec::new();
+        let mut inherit = |field: Field, slot: &Inherited| {
+            if let Some(value) = field.of(&self.overrides) {
+                return Some(value.to_string());
+            }
+            match slot {
+                Inherited::None => None,
+                Inherited::One(value, _) => Some(value.clone()),
+                Inherited::Conflict(..) => {
+                    conflicts.push(field.key().to_string());
+                    None
+                }
+            }
         };
-        let resolved = TilesetMetadata {
-            name: self
-                .overrides
-                .name
-                .clone()
-                .or_else(|| inherited(&self.name)),
-            description: self
-                .overrides
-                .description
-                .clone()
-                .or_else(|| inherited(&self.description)),
-            attribution: self.overrides.attribution.clone().or(attribution),
+        let name = inherit(Field::Name, &self.name);
+        let description = inherit(Field::Description, &self.description);
+        let attribution = self.overrides.attribution.clone().or_else(|| {
+            if !self.credits.is_empty() {
+                let credits: Vec<&str> = self.credits.keys().map(String::as_str).collect();
+                Some(credits.join(CREDIT_SEPARATOR))
+            } else {
+                self.empty_credit.then(String::new)
+            }
+        });
+        let metadata = TilesetMetadata {
+            name,
+            description,
+            attribution,
         };
-        resolved.check_size()?;
-        Ok(resolved)
+        metadata.check_size()?;
+        Ok(Resolved {
+            metadata,
+            conflicts,
+        })
+    }
+
+    /// Log where the output's publication metadata came from.
+    ///
+    /// Every inherited value at `info`, naming the input that carried it: an
+    /// input archive's attribution is HTML the output's map will render, so
+    /// what was inherited, and from which input, belongs on record. At
+    /// `warn`, each field the inputs disagreed on, and credits that differ
+    /// only in case or spacing (one mistyped job in a fleet joins as a second
+    /// credit).
+    pub(crate) fn log_resolution(&self) {
+        for (field, slot) in [
+            (Field::Name, &self.name),
+            (Field::Description, &self.description),
+        ] {
+            match slot {
+                Inherited::None => {}
+                Inherited::One(value, source) => log::info!(
+                    "inherited the PMTiles {} {} from {}",
+                    field.key(),
+                    preview(value),
+                    source.describe()
+                ),
+                Inherited::Conflict(first, second) => log::warn!(
+                    "{first} and {second} carry different PMTiles {key}s, so the output has \
+                     none; set its {key} (--{key}) to give it one",
+                    key = field.key()
+                ),
+            }
+        }
+        for (credit, source) in &self.credits {
+            log::info!(
+                "inherited the attribution credit {} from {}",
+                preview(credit),
+                source.describe()
+            );
+        }
+        let mut by_shape: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for credit in self.credits.keys() {
+            let shape = credit.split_whitespace().collect::<Vec<_>>().join(" ");
+            by_shape
+                .entry(shape.to_lowercase())
+                .or_default()
+                .push(credit);
+        }
+        for near in by_shape.values().filter(|credits| credits.len() > 1) {
+            let listed: Vec<String> = near.iter().map(|c| preview(c)).collect();
+            log::warn!(
+                "attribution credits {} differ only in case or spacing, and all of them are \
+                 kept; check the inputs, or set the output's attribution (--attribution)",
+                listed.join(", ")
+            );
+        }
     }
 }
 
-/// Counts bytes written to it and discards them.
-struct ByteCounter(u64);
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += buf.len() as u64;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+/// `value` quoted and escaped for a message, cut after its first 200
+/// characters: a credit can be long HTML.
+pub(crate) fn preview(value: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    match value.char_indices().nth(MAX_CHARS) {
+        None => format!("{value:?}"),
+        Some((cut, _)) => format!("{:?}… ({} bytes)", &value[..cut], value.len()),
     }
 }
 
 /// Length of `value` once serialized as a JSON string, quotes included.
 fn json_string_len(value: &str) -> u64 {
-    let mut counter = ByteCounter(0);
-    // Writing a `str` to an infallible sink cannot fail.
-    serde_json::to_writer(&mut counter, value).expect("JSON string serialization");
-    counter.0
+    // Serializing a `str` cannot fail.
+    serde_json::to_string(value)
+        .expect("JSON string serialization")
+        .len() as u64
 }
 
 #[cfg(test)]
@@ -367,18 +473,6 @@ pub(crate) mod tests {
         meta.append_json_fields(&mut json);
         json.push('}');
         serde_json::from_str(&json).expect("appended fields must form a JSON object")
-    }
-
-    #[test]
-    fn metadata_byte_counter_flush_preserves_written_length() {
-        use std::io::Write;
-
-        let mut counter = ByteCounter(0);
-        counter.write_all(b"first").unwrap();
-        counter.flush().unwrap();
-        counter.write_all("\u{a9}".as_bytes()).unwrap();
-        counter.flush().unwrap();
-        assert_eq!(counter.0, 7);
     }
 
     #[test]
@@ -466,16 +560,55 @@ pub(crate) mod tests {
         assert!(err.contains("attribution"), "names the fields: {err}");
     }
 
+    #[test]
+    fn credit_check_and_check_size_agree_at_the_limit() {
+        // The largest single credit both accept, and one byte more.
+        let fits = MAX_INTERNAL_BYTES as usize - 18;
+        let at = |n: usize| credits(&["x".repeat(n).as_str()]);
+        assert!(inherit(&at(fits)).is_ok());
+        assert!(TilesetMetadata::new()
+            .with_attribution("x".repeat(fits))
+            .check_size()
+            .is_ok());
+        assert!(inherit(&at(fits + 1)).is_err());
+        assert!(TilesetMetadata::new()
+            .with_attribution("x".repeat(fits + 1))
+            .check_size()
+            .is_err());
+    }
+
+    #[test]
+    fn previews_quote_and_cut_long_values() {
+        assert_eq!(preview("<b>\"x\"</b>"), r#""<b>\"x\"</b>""#);
+        let long = "\u{e9}".repeat(300);
+        let cut = preview(&long);
+        assert!(
+            cut.starts_with(&format!("\"{}\"…", "\u{e9}".repeat(200))),
+            "{cut}"
+        );
+        assert!(cut.ends_with("(600 bytes)"), "{cut}");
+        assert_eq!(Source::new("a").describe(), "a");
+        let mut s = Source::new("a");
+        s.count = 2;
+        assert_eq!(s.describe(), "a and 1 other input");
+        s.count = 4;
+        assert_eq!(s.describe(), "a and 3 other inputs");
+    }
+
     // -------------------------------------------------------------------------
     // MetadataCollector
     // -------------------------------------------------------------------------
 
-    fn collect(overrides: &TilesetMetadata, inputs: &[Value]) -> Result<TilesetMetadata, String> {
+    fn resolve(overrides: &TilesetMetadata, inputs: &[Value]) -> Result<Resolved, String> {
         let mut c = MetadataCollector::new(overrides);
         for (i, root) in inputs.iter().enumerate() {
             c.add_json(&format!("input{i}"), root)?;
         }
         c.resolve()
+    }
+
+    fn collect(overrides: &TilesetMetadata, inputs: &[Value]) -> Result<TilesetMetadata, String> {
+        resolve(overrides, inputs).map(|r| r.metadata)
     }
 
     fn inherit(inputs: &[Value]) -> Result<TilesetMetadata, String> {
@@ -526,24 +659,47 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn differing_names_and_descriptions_need_an_override() {
+    fn differing_names_and_descriptions_are_left_out() {
         for key in ["name", "description"] {
-            let err = inherit(&[json!({ key: "East region" }), json!({ key: "West region" })])
-                .unwrap_err();
-            assert!(err.contains(&format!("--{key}")), "{err}");
-            assert!(err.contains("input0") && err.contains("input1"), "{err}");
-            assert!(!err.contains("region"), "values are not printed: {err}");
+            let got = resolve(
+                &TilesetMetadata::new(),
+                &[json!({ key: "East region" }), json!({ key: "West region" })],
+            )
+            .unwrap();
+            assert_eq!(got.metadata, TilesetMetadata::new(), "{key}");
+            assert_eq!(got.conflicts, vec![key]);
         }
-        // An override for one field does not settle another's conflict.
+        // Every field is settled at once, and an override for one field does
+        // not settle another's disagreement.
         let inputs = [
-            json!({"name": "East", "attribution": "A"}),
-            json!({"name": "West", "attribution": "B"}),
+            json!({"name": "East", "description": "E", "attribution": "A"}),
+            json!({"name": "West", "description": "W", "attribution": "B"}),
         ];
-        let err = collect(&TilesetMetadata::new().with_attribution("C"), &inputs).unwrap_err();
-        assert!(err.contains("--name"), "{err}");
-        let ok = collect(&TilesetMetadata::new().with_name("Both"), &inputs).unwrap();
-        assert_eq!(ok.name.as_deref(), Some("Both"));
-        assert_eq!(ok.attribution.as_deref(), Some("A | B"));
+        let got = resolve(&TilesetMetadata::new().with_attribution("C"), &inputs).unwrap();
+        assert_eq!(got.conflicts, vec!["name", "description"]);
+        assert_eq!(got.metadata.attribution.as_deref(), Some("C"));
+        let got = resolve(&TilesetMetadata::new().with_name("Both"), &inputs).unwrap();
+        assert_eq!(got.conflicts, vec!["description"]);
+        assert_eq!(got.metadata.name.as_deref(), Some("Both"));
+        assert_eq!(got.metadata.attribution.as_deref(), Some("A | B"));
+    }
+
+    /// tippecanoe names every archive after its output file and copies the
+    /// name into `description`, so composing two of them is the common case
+    /// for a disagreement; it must not depend on how many inputs agree first.
+    #[test]
+    fn a_disagreement_stays_one_in_any_order() {
+        let inputs = [
+            json!({"name": "a.pmtiles", "description": "a.pmtiles"}),
+            json!({"name": "a.pmtiles", "description": "a.pmtiles"}),
+            json!({"name": "b.pmtiles", "description": "b.pmtiles"}),
+        ];
+        for perm in [[0, 1, 2], [2, 0, 1], [0, 2, 1]] {
+            let shuffled: Vec<Value> = perm.iter().map(|&i| inputs[i].clone()).collect();
+            let got = resolve(&TilesetMetadata::new(), &shuffled).unwrap();
+            assert_eq!(got.metadata, TilesetMetadata::new(), "{perm:?}");
+            assert_eq!(got.conflicts, vec!["name", "description"], "{perm:?}");
+        }
     }
 
     #[test]
@@ -587,12 +743,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn non_string_fields_are_errors_unless_overridden() {
+    fn non_string_fields_are_ignored() {
         for bad in [json!({}), json!([]), json!(1), json!(true)] {
             for key in ["name", "description", "attribution"] {
-                let err = inherit(&[json!({}), json!({ key: bad })]).unwrap_err();
-                assert!(err.starts_with("input1: "), "{err}");
-                assert!(err.contains(&format!("--{key}")), "{err}");
+                let got = inherit(&[json!({ key: "kept" }), json!({ key: bad })]).unwrap();
+                assert_eq!(
+                    got,
+                    collect(&TilesetMetadata::new(), &[json!({ key: "kept" })]).unwrap(),
+                    "{key}: {bad}"
+                );
             }
         }
         let overridden = TilesetMetadata::new().with_attribution("credit");
@@ -617,30 +776,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn known_metadata_participates_like_json() {
-        let mut c = MetadataCollector::new(&TilesetMetadata::new());
-        c.add_json("archive", &json!({"name": "N", "attribution": "B"}))
-            .unwrap();
-        c.add_metadata(
-            "band",
-            &TilesetMetadata::new().with_name("N").with_attribution("A"),
-        )
-        .unwrap();
-        let got = c.resolve().unwrap();
-        assert_eq!(got.name.as_deref(), Some("N"));
-        assert_eq!(got.attribution.as_deref(), Some("A | B"));
-        let err = c
-            .add_metadata("other", &TilesetMetadata::new().with_name("M"))
-            .unwrap_err();
-        assert!(err.contains("archive") && err.contains("other"), "{err}");
-    }
-
-    #[test]
     fn credits_that_cannot_fit_fail_as_they_arrive() {
         let half = MAX_INTERNAL_BYTES as usize / 2;
         let inputs = credits(&[&"a".repeat(half), &"b".repeat(half)]);
         let err = inherit(&inputs).unwrap_err();
         assert!(err.contains("--attribution"), "{err}");
+        assert!(err.starts_with("input1: "), "names the input: {err}");
         // Duplicates cost nothing, and an override discards them all.
         assert!(inherit(&credits(&[&"a".repeat(half), &"a".repeat(half)])).is_ok());
         let small = TilesetMetadata::new().with_attribution("credit");
