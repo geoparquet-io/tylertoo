@@ -11942,6 +11942,232 @@ mod tests {
         }
     }
 
+    /// Net polygon area of a decoded MVT feature, in tile units: the
+    /// surveyor's formula per ring (`MoveTo` starts a ring), outer rings
+    /// positive and holes negative under MVT's winding rule.
+    fn mvt_polygon_area(geom: &[u32]) -> f64 {
+        let mut area = 0.0;
+        let mut ring: Vec<(f64, f64)> = Vec::new();
+        let close = |ring: &mut Vec<(f64, f64)>, area: &mut f64| {
+            let n = ring.len();
+            for k in 0..n {
+                let (x0, y0) = ring[k];
+                let (x1, y1) = ring[(k + 1) % n];
+                *area += (x0 * y1 - x1 * y0) / 2.0;
+            }
+            ring.clear();
+        };
+        let (mut cx, mut cy) = (0i64, 0i64);
+        let mut i = 0;
+        while i < geom.len() {
+            let (cmd, count) = crate::mvt::command_decode(geom[i]);
+            i += 1;
+            if cmd == 7 {
+                close(&mut ring, &mut area);
+                continue;
+            }
+            for _ in 0..count {
+                if cmd == 1 && !ring.is_empty() {
+                    close(&mut ring, &mut area);
+                }
+                cx += i64::from(crate::mvt::zigzag_decode(geom[i]));
+                cy += i64::from(crate::mvt::zigzag_decode(geom[i + 1]));
+                ring.push((cx as f64, cy as f64));
+                i += 2;
+            }
+        }
+        area
+    }
+
+    /// (raw bytes, net polygon area, vertex count, features) of one encoded
+    /// tile.
+    fn tile_area_stats(t: &EncodedTile) -> (usize, f64, usize, usize) {
+        let tile = decode_tile(&t.data);
+        let mut area = 0.0;
+        let mut vertices = 0;
+        let mut features = 0;
+        for layer in &tile.layers {
+            for f in &layer.features {
+                area += mvt_polygon_area(&f.geometry);
+                vertices += decode_coords(&f.geometry).len();
+                features += 1;
+            }
+        }
+        (t.data.len(), area.abs(), vertices, features)
+    }
+
+    /// A 30×30 grid of touching squares, all inside tile 10/512/511, with a
+    /// few properties each: a contiguous polygon coverage in one tile.
+    fn coverage_grid() -> Vec<Feature> {
+        let d = 0.005;
+        let mut out = Vec::new();
+        for row in 0..30 {
+            for col in 0..30 {
+                let (x, y) = (0.1 + col as f64 * d, 0.1 + row as f64 * d);
+                out.push(Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(
+                        LineString::from(vec![
+                            (x, y),
+                            (x + d, y),
+                            (x + d, y + d),
+                            (x, y + d),
+                            (x, y),
+                        ]),
+                        vec![],
+                    )),
+                    props: vec![
+                        (
+                            "name".to_string(),
+                            PropertyValue::String(format!("parcel-{row}-{col}")),
+                        ),
+                        ("row".to_string(), PropertyValue::Int(row)),
+                    ],
+                });
+            }
+        }
+        out
+    }
+
+    /// #745: on a polygon coverage over its size limit, the drop valve
+    /// leaves holes; every merging valve fits the limit, draws the whole
+    /// area, and dissolves the shared edges.
+    #[test]
+    fn merging_valves_keep_a_coverage_whole() {
+        let feats = coverage_grid();
+        let reference = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reference.len(), 1, "the grid sits in one tile");
+        let (full_bytes, full_area, full_vertices, full_features) = tile_area_stats(&reference[0]);
+        assert_eq!(full_features, 900);
+        let limit = full_bytes / 4;
+
+        let run = |valve: SizeValve| {
+            let tiles = encode_level_tiles(
+                &feats,
+                10,
+                &ExportOptions {
+                    tile_size_limit: Some(limit),
+                    size_valve: valve,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(tiles.len(), 1);
+            (tile_area_stats(&tiles[0]), tiles[0].valve)
+        };
+
+        let ((_, drop_area, _, _), drop_tally) = run(SizeValve::Drop);
+        assert!(drop_tally.dropped > 0 && drop_tally.merged == 0);
+        assert!(
+            drop_area < 0.5 * full_area,
+            "the drop valve should leave holes ({drop_area} of {full_area})"
+        );
+
+        for valve in [SizeValve::Tile, SizeValve::Zoom, SizeValve::Hybrid] {
+            let ((bytes, area, vertices, features), tally) = run(valve);
+            assert!(bytes <= limit, "{valve:?}: {bytes} > {limit}");
+            assert!(
+                (area - full_area).abs() <= 1e-6 * full_area,
+                "{valve:?}: drew {area} of {full_area}"
+            );
+            assert_eq!(tally.dropped, 0, "{valve:?} must not fall back to dropping");
+            assert_eq!(tally.merged + features, full_features, "{valve:?}");
+            assert!(tally.passes > 1 && tally.mingap > 0, "{valve:?}: {tally:?}");
+            assert!(
+                vertices < full_vertices / 2,
+                "{valve:?}: shared edges should dissolve ({vertices} vs {full_vertices})"
+            );
+        }
+    }
+
+    /// #745: a merging valve leaves a tile that fits exactly as the drop
+    /// valve would: nothing merges, nothing is re-encoded.
+    #[test]
+    fn merging_valve_leaves_fitting_tiles_alone() {
+        let feats = coverage_grid();
+        let encode = |valve: SizeValve| {
+            encode_level_tiles(
+                &feats,
+                10,
+                &ExportOptions {
+                    size_valve: valve,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let (drop, tile) = (encode(SizeValve::Drop), encode(SizeValve::Tile));
+        assert_eq!(drop[0].data, tile[0].data);
+        assert_eq!(tile[0].valve.merged, 0);
+        assert_eq!(tile[0].valve.passes, 1);
+    }
+
+    /// #745: the compressed limit is measured on the gzip bytes. It trips the
+    /// one-pass drop valve (which, as with the raw limit, never re-measures),
+    /// and a merging valve, which re-measures, fits it.
+    #[test]
+    fn compressed_limit_is_enforced() {
+        let feats = coverage_grid();
+        let reference = encode_members_for_test(&feats, None, SizeValve::Drop);
+        let limit = reference.len() / 3;
+        let dropped = encode_members_for_test(&feats, Some(limit), SizeValve::Drop);
+        assert!(dropped.len() < reference.len(), "the drop valve must fire");
+        let merged = encode_members_for_test(&feats, Some(limit), SizeValve::Tile);
+        assert!(merged.len() <= limit, "{} > {limit}", merged.len());
+    }
+
+    /// The gzip bytes of the grid's one tile, with no raw limit.
+    fn encode_members_for_test(
+        feats: &[Feature],
+        compressed_limit: Option<usize>,
+        valve: SizeValve,
+    ) -> Vec<u8> {
+        let opts = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: compressed_limit,
+            size_valve: valve,
+            ..Default::default()
+        };
+        let mut members = Vec::new();
+        let mut gaps = RowGapCursor::new(vec![(0, feats.len() as u64)]);
+        for (i, f) in feats.iter().enumerate() {
+            let (gap, band) = gaps.next_row(f.geom.bounding_rect());
+            let props: SharedProps = Arc::new(
+                f.props
+                    .iter()
+                    .map(|(n, v)| (Arc::from(n.as_str()), v.clone()))
+                    .collect(),
+            );
+            for (key, geom) in feature_tile_members(&f.geom, 10, &opts, 0, u64::MAX) {
+                members.push(Member {
+                    key,
+                    seq: i as u64,
+                    geom,
+                    props: Arc::clone(&props),
+                    id: None,
+                    gap,
+                    band,
+                });
+            }
+        }
+        let tiles = encode_members(
+            members,
+            LevelEncode::plain(10),
+            &opts,
+            &ExportTimers::default(),
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        tiles.into_iter().next().unwrap().data
+    }
+
     #[test]
     fn oversized_valve_fires_with_tiny_limit() {
         // Many vertices in one tile; a tiny byte limit forces the single-pass
