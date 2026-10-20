@@ -6989,7 +6989,10 @@ pub(super) fn coalesce_level_chains(
     crs: Crs,
     options: &ConvertOptions,
 ) -> Vec<super::coalesce::CoalescedLine> {
+    // #745: the chain budget thins lines, so it follows the budget's line
+    // switch.
     let budget = if options.density.enabled
+        && options.density.kinds.lines
         && options.density.drop_rate > 1.0
         && !options.density.drop_rate.is_nan()
         && level < finest

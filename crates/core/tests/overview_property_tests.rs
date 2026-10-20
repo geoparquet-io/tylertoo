@@ -178,6 +178,7 @@ fn budget_config() -> impl Strategy<Value = DensityBudgetConfig> {
             enabled,
             drop_rate,
             gamma,
+            ..DensityBudgetConfig::default()
         }
     })
 }
@@ -385,7 +386,12 @@ proptest! {
         crs in crs(),
     ) {
         let cw = assign_levels(&table(&feats), &gsds, &config, crs);
-        let mk = |drop_rate: f64| DensityBudgetConfig { enabled: true, drop_rate, gamma };
+        let mk = |drop_rate: f64| DensityBudgetConfig {
+            enabled: true,
+            drop_rate,
+            gamma,
+            ..DensityBudgetConfig::default()
+        };
         let loose = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate), crs);
         let strict = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate * factor), crs);
         for level in 0..gsds.len() as u8 {

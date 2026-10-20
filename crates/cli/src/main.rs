@@ -29,6 +29,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use indicatif::HumanBytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tylertoo_core::overview::assign::BudgetKinds;
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::export::{FeatureOrder, SizeValve};
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
@@ -904,6 +905,16 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
 
+    /// Geometry kinds the density budget thins, comma-separated
+    /// (`points,lines,polygons`, or `none`). Experimental (#745).
+    #[arg(
+        long,
+        value_name = "KINDS",
+        default_value = "points,lines,polygons",
+        hide = true
+    )]
+    density_drop_kinds: BudgetKinds,
+
     /// Merge each thinning cell's points into its surviving point, which
     /// gains a `point_count` column. Duplicating mode only.
     #[arg(long, help_heading = "Clustering")]
@@ -1235,6 +1246,7 @@ impl ConvertTuningArgs {
                 enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
+                kinds: self.density_drop_kinds,
             },
             gsd_base: self.gsd_base,
             cogp_compat_key: cogp_compat,
