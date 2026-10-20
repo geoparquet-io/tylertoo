@@ -106,7 +106,8 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
+use arrow_schema::{DataType, Field, Schema};
 use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
@@ -2357,6 +2358,16 @@ fn resolve_export_columns(
         geometry_index(reader.schema()).ok_or_else(|| ExportError::NoGeometryColumn {
             path: Some(reader.path().display().to_string()),
         })?;
+    if let Some(by_name) = geometry_name_disagreement(reader.schema(), geom_idx) {
+        log::warn!(
+            "[export] tiling geometry column {:?}, the file's `primary_column`, not {:?}, \
+             which its name suggests; an overview converted before #675 may declare the \
+             wrong one when its input had several geometry columns: re-convert it if \
+             the tiles show the wrong geometry",
+            reader.schema().field(geom_idx).name(),
+            by_name
+        );
+    }
     let mut published = PublishedNames::from_reader(reader).with_selection(
         reader.schema(),
         geom_idx,
@@ -5950,6 +5961,26 @@ fn decode_batch(
 /// in schema order, which is not necessarily the primary one.
 fn geometry_index(schema: &Schema) -> Option<usize> {
     find_geometry_column(schema)
+}
+
+/// The other geometry column the name heuristic alone would pick, when it
+/// differs from `geom_idx` ([`geometry_index`]).
+///
+/// Overview files converted before #675 left `primary_column` to the
+/// geoparquet crate, which names the alphabetically first geometry column,
+/// so an input with `geom` and a `centroid` beside it was written declaring
+/// `centroid`. Export used to take `geom` by name and now follows the footer;
+/// only a re-convert fixes such a file, so the export says so.
+fn geometry_name_disagreement(schema: &Schema, geom_idx: usize) -> Option<&str> {
+    let is_geometry = |f: &Field| {
+        f.metadata()
+            .get(EXTENSION_TYPE_NAME_KEY)
+            .is_some_and(|name| name.starts_with("geoarrow"))
+    };
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let by_name = crate::covering::geometry_column_by_name(&names)?;
+    (by_name != names[geom_idx] && schema.field_with_name(by_name).is_ok_and(is_geometry))
+        .then_some(by_name)
 }
 
 /// The name of the overview file's geometry column ([`geometry_index`]).
@@ -13689,5 +13720,24 @@ mod tests {
             batch_geometry_index(&batch, Some("geometry")),
             Err(ExportError::NoGeometryColumn { path: None })
         ));
+    }
+
+    /// #675 review: a footer naming a different geometry column than the
+    /// name heuristic is flagged; an attribute the heuristic would pick, or
+    /// agreement, is not.
+    #[test]
+    fn geometry_name_disagreement_flags_only_another_geometry_column() {
+        let stale = geometry_schema(&[("centroid", true), ("geom", true)], Some("centroid"));
+        assert_eq!(geometry_name_disagreement(&stale, 0), Some("geom"));
+        let pinned = geometry_schema(&[("centroid", true), ("geom", true)], Some("geom"));
+        assert_eq!(geometry_name_disagreement(&pinned, 1), None);
+        let shape = geometry_schema(&[("geom_type", false), ("SHAPE", true)], Some("SHAPE"));
+        assert_eq!(
+            geometry_name_disagreement(&shape, 1),
+            None,
+            "geom_type is no geometry"
+        );
+        let lone = geometry_schema(&[("id", false), ("footprint", true)], Some("footprint"));
+        assert_eq!(geometry_name_disagreement(&lone, 1), None);
     }
 }
