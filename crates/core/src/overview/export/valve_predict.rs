@@ -30,7 +30,7 @@ use super::coalesce_valve::{RowGapCursor, GAP_NONE};
 use super::{
     buffer_deg_at_zoom, covering_batch_bboxes, decode_batch_bboxes, geometry_index, member_ranges,
     near_world_edge, scoped_pipe, tile_key, tiles_in_ranges, ExportError, ExportOptions,
-    ExportTimers, LevelScan, ScanBboxSource, EXPORT_BATCH_SIZE, WAVE_READ_IN_FLIGHT,
+    ExportTimers, LevelScan, ScanBboxSource, EXPORT_BATCH_SIZE, LEVEL_COLUMN, WAVE_READ_IN_FLIGHT,
 };
 use crate::overview::level::{Crs, Mode};
 use crate::overview::reader::OverviewReader;
@@ -150,7 +150,9 @@ fn flag_tiles(
 
 /// Estimated MVT bytes of one member of level `k`: its vertices from the
 /// geometry column's uncompressed size (16 bytes a vertex in WKB or native
-/// encoding), plus its tags and feature overhead.
+/// encoding), its tags, and its attribute values, which are mostly distinct
+/// per feature and so land in the tile's value table about as large as they
+/// are in the file.
 fn member_bytes_estimate(reader: &OverviewReader, k: usize) -> f64 {
     let Ok(rgs) = reader.row_groups_for_level(k) else {
         return 0.0;
@@ -159,14 +161,30 @@ fn member_bytes_estimate(reader: &OverviewReader, k: usize) -> f64 {
     let Some(g) = geometry_index(schema) else {
         return 0.0;
     };
-    let (bytes, rows) = reader.column_bytes_and_rows(&rgs, schema.field(g).name());
+    let (bytes, rows) = reader.column_bytes_and_rows(&rgs);
     if rows == 0 {
         return 0.0;
     }
-    let vertices = bytes as f64 / rows as f64 / 16.0;
-    // Every column but the geometry, `level` and a bbox covering is a tag.
-    let props = schema.fields().len().saturating_sub(3) as f64;
-    BYTES_PER_FEATURE + BYTES_PER_VERTEX * vertices + BYTES_PER_PROPERTY * props
+    let geometry = schema.field(g).name();
+    let covering = match ScanBboxSource::for_reader(reader) {
+        ScanBboxSource::Covering { column, .. } => Some(column),
+        ScanBboxSource::Geometry => None,
+    };
+    let per_row = |b: u64| b as f64 / rows as f64;
+    let vertices = per_row(bytes.get(geometry).copied().unwrap_or(0)) / 16.0;
+    let mut props = 0usize;
+    let mut attr_bytes = 0u64;
+    for (name, &b) in &bytes {
+        if name == geometry || name == LEVEL_COLUMN || covering.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        props += 1;
+        attr_bytes += b;
+    }
+    BYTES_PER_FEATURE
+        + BYTES_PER_VERTEX * vertices
+        + BYTES_PER_PROPERTY * props as f64
+        + per_row(attr_bytes)
 }
 
 /// Read every band's bboxes once, in file order, and add each row's gap to

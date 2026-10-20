@@ -17,7 +17,7 @@
 //! [`OverviewReader::selected_row_groups`]) operate purely on parsed metadata and
 //! carry over unchanged.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -572,24 +572,22 @@ impl OverviewReader {
         &self.metadata
     }
 
-    /// The uncompressed bytes of the top-level column `root` (every leaf
-    /// under it) and the row count, summed over `row_groups`. For the
-    /// export's tile-size estimate (#745).
-    pub(crate) fn column_bytes_and_rows(&self, row_groups: &[usize], root: &str) -> (u64, u64) {
-        let (mut bytes, mut rows) = (0u64, 0u64);
+    /// The uncompressed bytes of each top-level column (every leaf under it)
+    /// and the row count, summed over `row_groups`. For the export's
+    /// tile-size estimate (#745).
+    pub(crate) fn column_bytes_and_rows(
+        &self,
+        row_groups: &[usize],
+    ) -> (HashMap<String, u64>, u64) {
+        let mut bytes: HashMap<String, u64> = HashMap::new();
+        let mut rows = 0u64;
         for &rg in row_groups {
             let meta = self.metadata.row_group(rg);
             rows += meta.num_rows().max(0) as u64;
             for col in meta.columns() {
-                if col
-                    .column_descr()
-                    .path()
-                    .parts()
-                    .first()
-                    .map(String::as_str)
-                    == Some(root)
-                {
-                    bytes += col.uncompressed_size().max(0) as u64;
+                if let Some(root) = col.column_descr().path().parts().first() {
+                    *bytes.entry(root.clone()).or_insert(0) +=
+                        col.uncompressed_size().max(0) as u64;
                 }
             }
         }
