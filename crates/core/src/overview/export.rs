@@ -13081,6 +13081,112 @@ mod tests {
         }
     }
 
+    /// A 40×40 grid of touching 0.5° squares spanning several z4 and many z6
+    /// tiles, split into `bands` level bands in row order.
+    fn coverage_bands(bands: usize) -> Vec<(Vec<i64>, Vec<Geometry<f64>>)> {
+        let mut all: Vec<(i64, Geometry<f64>)> = Vec::new();
+        for row in 0..40 {
+            for col in 0..40 {
+                let (x, y) = (-10.0 + col as f64 * 0.5, -10.0 + row as f64 * 0.5);
+                let g = Geometry::Polygon(geo::Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.5, y),
+                        (x + 0.5, y + 0.5),
+                        (x, y + 0.5),
+                        (x, y),
+                    ]),
+                    vec![],
+                ));
+                all.push((row * 40 + col, g));
+            }
+        }
+        let per = all.len().div_ceil(bands);
+        all.chunks(per).map(|c| c.iter().cloned().unzip()).collect()
+    }
+
+    /// #745: every merging valve gives the same bytes whatever the partition
+    /// target or wave width, and the partitioning single-read pass 2 gives
+    /// the same bytes as the legacy wave read under both store backings.
+    /// Gaps reset at each row group, and the small row groups here make
+    /// those resets fall inside tiles and partitions.
+    #[test]
+    fn merging_valves_are_partition_and_path_invariant() {
+        for valve in [SizeValve::Tile, SizeValve::Zoom, SizeValve::Hybrid] {
+            let opts = |wave: usize| ExportOptions {
+                layer_name: "ref".to_string(),
+                tile_size_limit: Some(3_000),
+                size_valve: valve,
+                partition_wave: wave,
+                ..Default::default()
+            };
+
+            // Duplicating: every level holds the whole grid.
+            let dup = tempfile::NamedTempFile::new().unwrap();
+            let grid = coverage_bands(1).remove(0);
+            write_mode_fixture(
+                dup.path(),
+                &[grid.clone(), grid.clone(), grid],
+                Mode::Duplicating,
+                97,
+            );
+            let t_many = tempfile::NamedTempFile::new().unwrap();
+            let t_one = tempfile::NamedTempFile::new().unwrap();
+            let r_many =
+                export_pmtiles_with_partition_target(dup.path(), t_many.path(), &opts(1), 1)
+                    .unwrap();
+            let r_one = export_pmtiles(dup.path(), t_one.path(), &opts(16)).unwrap();
+            assert!(
+                r_one.merged_features > 0,
+                "{valve:?}: the valve must merge here"
+            );
+            assert_eq!(r_one.valve_dropped_features, 0, "{valve:?}");
+            assert_eq!(
+                std::fs::read(t_many.path()).unwrap(),
+                std::fs::read(t_one.path()).unwrap(),
+                "{valve:?}: duplicating archives diverge across partition targets"
+            );
+            assert_eq!(r_many.zooms, r_one.zooms, "{valve:?}");
+
+            // Partitioning: three bands; single-read vs legacy.
+            let part = tempfile::NamedTempFile::new().unwrap();
+            write_mode_fixture(part.path(), &coverage_bands(3), Mode::Partitioning, 97);
+            for (target, wave) in [(1usize, 1usize), (1, 3), (DEFAULT_PARTITION_TARGET, 2)] {
+                let t_legacy = tempfile::NamedTempFile::new().unwrap();
+                let r_legacy = export_pmtiles_impl(
+                    part.path(),
+                    t_legacy.path(),
+                    &opts(wave),
+                    target,
+                    true,
+                    None,
+                )
+                .unwrap();
+                assert!(r_legacy.merged_features > 0, "{valve:?}");
+                let legacy_bytes = std::fs::read(t_legacy.path()).unwrap();
+                for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+                    let t_new = tempfile::NamedTempFile::new().unwrap();
+                    let r_new = export_pmtiles_impl(
+                        part.path(),
+                        t_new.path(),
+                        &opts(wave),
+                        target,
+                        false,
+                        Some(backing),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        std::fs::read(t_new.path()).unwrap(),
+                        legacy_bytes,
+                        "{valve:?}: single-read ({backing:?}, target {target}, wave {wave}) \
+                         diverges from legacy"
+                    );
+                    assert_eq!(r_new.zooms, r_legacy.zooms, "{valve:?}");
+                }
+            }
+        }
+    }
+
     /// #235: the production partitioning path (auto backing) is partition- and
     /// wave-invariant, mirroring `partitioned_export_is_partition_invariant`
     /// for the new pass 2.
