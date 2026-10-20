@@ -779,7 +779,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::accumulat
 pub const tylertoo_core::overview::accumulate::ACCUMULATE_CELL_GSD: f64
 pub fn tylertoo_core::overview::accumulate::is_carrier(&[usize], usize) -> bool
 pub fn tylertoo_core::overview::accumulate::level_accumulates(tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::simplify::Representation) -> bool
-pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs, f64) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
+pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
 pub mod tylertoo_core::overview::assign
 pub enum tylertoo_core::overview::assign::Crs
 pub tylertoo_core::overview::assign::Crs::Epsg3857

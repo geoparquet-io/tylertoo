@@ -60,9 +60,7 @@ use crate::batch_processor::extract_geometries_opt_from_array;
 use crate::shard::TileRange;
 use crate::tile::MAX_ZOOM;
 
-use super::accumulate::{
-    is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
-};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
     DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
@@ -3970,13 +3968,9 @@ fn build_emitted_levels(
                 // #384: a carrier is not a member — it stands in for its
                 // cell's dropped area as one placeholder square.
                 if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
-                    if let Some(sq) = carrier_square(
-                        &geometries[i],
-                        gsd_m,
-                        level_specs[level].1,
-                        crs,
-                        &options.simplify,
-                    ) {
+                    if let Some(sq) =
+                        carrier_square(&geometries[i], gsd_m, level_specs[level].1, crs)
+                    {
                         vertex_count += count_vertices(&sq);
                         indices.push(i);
                         geoms.push(sq);
@@ -4449,11 +4443,8 @@ fn in_memory_carriers(
 ) -> Vec<Vec<usize>> {
     let num_levels = level_specs.len();
     let finest = num_levels.saturating_sub(1);
-    // `placeholder_has_size` last: it logs, and only when the accumulator
-    // would otherwise run.
     let enabled = matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse.is_square() || level_reprs.contains(&Representation::Square))
-        && placeholder_has_size(options.simplify.factor);
+        && (options.simplify.collapse.is_square() || level_reprs.contains(&Representation::Square));
     let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
@@ -4478,14 +4469,7 @@ fn in_memory_carriers(
             _ => 0.0,
         })
         .collect();
-    tiny_polygon_carriers(
-        features,
-        row_min_levels,
-        &areas,
-        &acc_levels,
-        crs,
-        options.simplify.factor,
-    )
+    tiny_polygon_carriers(features, row_min_levels, &areas, &acc_levels, crs)
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a

@@ -607,8 +607,9 @@ The footer provenance records the bands, as
 
 ### `--collapse-square`: tippecanoe tiny-polygon squares as the global disposition
 
-`--collapse-square` replaces below-tolerance polygons with `tol × tol`
-squares, where `tol` is `simplify-factor × GSD`, converted to CRS units.
+`--collapse-square` replaces polygons too small for a level with squares
+one GSD (one pixel) on a side, converted to CRS units, whatever
+`--simplify-factor` is.
 Like tippecanoe's tiny-polygon reduction, it keeps dense fields, buildings,
 and parcels visible at coarse zooms with existing fill styles.
 `geometry_types` stays `["Polygon"]`, so no spec-Q4 geometry-type opt-in
@@ -622,8 +623,8 @@ delete the small features the ladder promotes; pass `--collapse-square` to
 keep squares anyway. The footer provenance records squares as
 `generalization.collapse: "square"`, and `--collapse` records `"point"`.
 
-Two mechanisms share the threshold `T = side²`, where `side` is `tol` floored
-at one tile unit of the level's zoom (see the divergences below).
+Two mechanisms share the threshold `T = side²`, where `side` is one GSD,
+floored at one tile unit of the level's zoom (see the divergences below).
 
 #### Area accumulation and dithering
 
@@ -670,14 +671,13 @@ See also `context/ARCHITECTURE.md`.
   thinning already dropped a non-member here, so there is no geometry to keep.
 - **Placement.** Tippecanoe places the placeholder at the ring's first vertex
   with side `tiny_polygon_size` (default 2 px). tylertoo places it at the
-  polygon's representative point with side `simplify-factor × GSD`.
+  polygon's representative point with side one GSD.
 - **A floor of one tile unit.** Tippecanoe's placeholder side is a fixed count
-  of tile units. tylertoo's is `simplify-factor × GSD`, **floored at one tile
-  unit** at the level's zoom. One unit is `40,075,016.69 m / 2^zoom / 4096`,
-  which for a `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`. At the
-  default `--gsd-base 1024` that is a quarter of the GSD, so the floor applies
-  when `--simplify-factor` is below 0.25. At `--gsd-base 8192`, even the
-  default 1.0 floors to 2 × GSD.
+  of tile units. tylertoo's is one GSD, **floored at one tile unit** at the
+  level's zoom. One unit is `40,075,016.69 m / 2^zoom / 4096`, which for a
+  `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`. At the default
+  `--gsd-base 1024` that is a quarter of the GSD, so the floor never binds.
+  At `--gsd-base 8192` it floors the side to 2 × GSD.
   The tile encoder keeps a square of side `s < 1` unit only with probability
   `s²`. The floor lets the encoder draw every placeholder, reducing their
   count. The log names affected zooms. On those levels a patch's
@@ -687,16 +687,19 @@ See also `context/ARCHITECTURE.md`.
   at. A larger Python `export(extent=…)` draws floored squares over more than
   one unit, and a smaller one draws them under a unit, where they thin as
   described above.
-- **No placeholder at `--simplify-factor 0`.** tylertoo skips the
-  accumulator and logs it, as tippecanoe skips its reduction at
-  `tiny_polygon_size` 0.
+- **Independent of `--simplify-factor`.** As in tippecanoe, the
+  placeholder's size does not follow the simplification setting. Before #745
+  it was `simplify-factor × GSD`: at 0.25 a quarter-size square stood in for
+  a quarter of the area, and at 0 there was no square at all, so lowering the
+  factor to close slivers emptied dense areas at middle zooms.
 - **Duplicating mode only.** A carrier is a second appearance of a feature,
   which partitioning's feature-once contract cannot represent. In
   partitioning mode the levels are verbatim, so tylertoo accepts
   `--collapse-square` and logs it as inert.
 
-Dense squares at mid zooms can exceed `--max-tile-size`, which removes
-squares per tile. Raise the cap to retain more.
+Dense squares at mid zooms can push a tile over its size cap; the
+[merge valve](#tile-size-cap)
+then folds them into their neighbours.
 [`tylertoo stats`](#export-and-archive-commands-export-pmtiles-merge-stats)
 reports sizes by zoom.
 

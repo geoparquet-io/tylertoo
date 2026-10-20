@@ -251,29 +251,32 @@ pub(crate) fn tile_unit_meters(gsd_meters: f64, zoom: Option<u8>) -> f64 {
     WEBMERC_CIRCUMFERENCE_M / export_zoom(gsd_meters, zoom).exp2() / f64::from(DEFAULT_EXTENT)
 }
 
-/// Side of a level's placeholder square in coordinate units: the level
-/// tolerance `factor × gsd`, floored at [`MIN_SURVIVING_SQUARE_SIDE`] tile
-/// units at the level's export zoom ([`tile_unit_meters`]). One value serves
-/// the `--collapse-square` dither ([`squarify_polygon`]), the accumulator
+/// Side of a level's placeholder square in coordinate units: one GSD (a
+/// pixel at the level), floored at [`MIN_SURVIVING_SQUARE_SIDE`] tile units
+/// at the level's export zoom ([`tile_unit_meters`]). One value serves the
+/// `--collapse-square` dither ([`squarify_polygon`]), the accumulator
 /// threshold (`side²`) and [`carrier_square`], so the three stay
-/// interchangeable (#407).
+/// interchangeable (#407). The floor binds only when a level's GSD is
+/// under one tile unit, as at a large `--gsd-base`.
 ///
-/// `0.0` when the tolerance is `0` (`--simplify-factor 0`): there is no
-/// placeholder then, and no floor is applied.
+/// `--simplify-factor` does not size it (#745). It used to (`factor ×
+/// gsd`): a quarter-size square at 0.25 stood in for a quarter of the
+/// area, and at 0 there was no square at all, so lowering the factor to
+/// close slivers emptied dense areas at middle zooms.
+///
+/// `0.0` only for a non-positive GSD.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's placeholder is a fixed
 /// `tiny_polygon_size` in tile units (clip.cpp, `reduce_tiny_poly`); ours is
-/// `factor × gsd` with this one-unit floor, so it follows the simplify knob
-/// down to the smallest square a tile can draw and no further. Like
-/// tippecanoe (which skips the reduction at size 0), a zero factor means no
-/// placeholder at all.
-pub(crate) fn placeholder_side(gsd_meters: f64, zoom: Option<u8>, crs: Crs, factor: f64) -> f64 {
-    let tol = level_tolerance(gsd_meters, crs, factor);
-    if tol <= 0.0 {
+/// a fixed one GSD with this one-unit floor. Both ignore the simplification
+/// setting.
+pub(crate) fn placeholder_side(gsd_meters: f64, zoom: Option<u8>, crs: Crs) -> f64 {
+    let gsd = level_tolerance(gsd_meters, crs, 1.0);
+    if gsd <= 0.0 {
         return 0.0;
     }
     let floor = crs.meters_to_units(MIN_SURVIVING_SQUARE_SIDE * tile_unit_meters(gsd_meters, zoom));
-    tol.max(floor)
+    gsd.max(floor)
 }
 
 /// Simplify one feature's geometry for a level of the given GSD.
@@ -330,7 +333,7 @@ pub(super) fn simplify_for_level_checked(
     // The placeholder side only matters to the square disposition; skip the
     // zoom arithmetic otherwise.
     let side = if opts.collapse.is_square() {
-        placeholder_side(gsd_meters, zoom, crs, opts.factor)
+        placeholder_side(gsd_meters, zoom, crs)
     } else {
         tol
     };
@@ -1330,8 +1333,8 @@ fn placeholder_square(anchor: Point<f64>, tol: f64) -> Polygon<f64> {
 /// Area-dithered placeholder square for a below-tolerance polygon (#279):
 /// survives as a `side × side` square at the polygon's representative point
 /// with probability `min(1, area / side²)` (see [`dither_u01`]). `side` is
-/// the level's [`placeholder_side`]: the tolerance, floored at one tile unit
-/// (#407).
+/// the level's [`placeholder_side`]: one GSD, floored at one tile unit
+/// (#407, #745).
 fn squarify_polygon(poly: &Polygon<f64>, side: f64) -> Simplified {
     let Some(anchor) = polygon_anchor(poly) else {
         return Simplified::Dropped;
@@ -1360,7 +1363,6 @@ pub(super) fn carrier_square(
     gsd_meters: f64,
     zoom: Option<u8>,
     crs: Crs,
-    opts: &SimplifyOptions,
 ) -> Option<Geometry<f64>> {
     let anchor = match geom {
         Geometry::Polygon(p) => polygon_anchor(p),
@@ -1373,7 +1375,7 @@ pub(super) fn carrier_square(
     }?;
     Some(Geometry::Polygon(placeholder_square(
         anchor,
-        placeholder_side(gsd_meters, zoom, crs, opts.factor),
+        placeholder_side(gsd_meters, zoom, crs),
     )))
 }
 
@@ -1489,20 +1491,19 @@ mod tests {
         assert_eq!(export_zoom(1e9, None), 0.0, "floored at z0");
     }
 
-    /// The `--collapse-square` dither uses the floored side: at factor 0.1
-    /// on a z5 level (GSD 1000 m, unit 305.7 m) a collapsing 50 m field
-    /// survives as a one-unit square, with probability 2,500 / unit² rather
-    /// than 2,500 / 100², so the expected area is unchanged and every kept
-    /// square is wide enough to draw.
+    /// The `--collapse-square` dither emits one-GSD squares whatever the
+    /// factor (#745): at factor 0.1 on a z5 level (GSD 1000 m) a collapsing
+    /// 50 m field survives as a 1000 m square with probability
+    /// 2,500 / 1000², so the expected area is unchanged. On a level whose
+    /// GSD is under one tile unit the side is floored at the unit.
     #[test]
-    fn square_dither_uses_the_floored_side() {
+    fn square_dither_uses_the_one_gsd_side() {
         let opts = SimplifyOptions {
             factor: 0.1,
             collapse: CollapseMode::Square,
             ..SimplifyOptions::default()
         };
-        let unit = tile_unit_meters(1000.0, None);
-        let n = 4000;
+        let n = 40_000;
         let mut kept = 0usize;
         for i in 0..n {
             let (cx, cy) = (i as f64 * 1_117.3, (i % 97) as f64 * 733.1);
@@ -1517,14 +1518,14 @@ mod tests {
             ) {
                 let r = g.bounding_rect().unwrap();
                 assert!(
-                    (r.width() - unit).abs() < 1e-6,
-                    "width {} vs unit {unit}",
+                    (r.width() - 1000.0).abs() < 1e-6,
+                    "width {} vs one GSD",
                     r.width()
                 );
                 kept += 1;
             }
         }
-        let p = 2_500.0 / (unit * unit);
+        let p = 2_500.0 / (1000.0 * 1000.0);
         let expected = p * n as f64;
         let sd = (n as f64 * p * (1.0 - p)).sqrt();
         assert!(
@@ -1532,9 +1533,9 @@ mod tests {
             "kept {kept} of {n}, expected {expected:.1} ± {sd:.1}"
         );
         // The same GSD recorded at z2 (a `--gsd-base` near 10,000): one unit
-        // there is ~2,446 m, so that is the square's side.
+        // there is ~2,446 m, wider than the GSD, so that is the side.
         let poly = Geometry::Polygon(square(0.0, 0.0, 25.0));
-        let side = placeholder_side(1000.0, Some(2), Crs::Epsg3857, 0.1);
+        let side = placeholder_side(1000.0, Some(2), Crs::Epsg3857);
         assert!((side - WEBMERC_CIRCUMFERENCE_M / 4.0 / 4096.0).abs() < 1e-9);
         if let Simplified::Keep(g) = simplify_step_at(
             &poly,
