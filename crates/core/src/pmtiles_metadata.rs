@@ -238,6 +238,11 @@ pub(crate) struct MetadataCollector {
     credit_bytes: u64,
     /// Whether some input carried `"attribution": ""`.
     empty_credit: bool,
+    /// Inputs carrying a field that is neither a string nor `null`, with
+    /// the field's key. Warned about by [`Self::log_resolution`], so a
+    /// caller that collects twice (`pyramid`'s preflight, then its merge)
+    /// warns once.
+    non_strings: Vec<(String, &'static str)>,
 }
 
 /// What [`MetadataCollector::resolve`] settled on.
@@ -260,6 +265,7 @@ impl MetadataCollector {
             credits: BTreeMap::new(),
             credit_bytes: 0,
             empty_credit: false,
+            non_strings: Vec::new(),
         }
     }
 
@@ -270,8 +276,8 @@ impl MetadataCollector {
     /// Add one input archive's metadata JSON, by its whole root.
     ///
     /// A root that is not an object carries no publication fields. Unknown
-    /// keys are ignored, and so, with a warning naming `label`, is a field
-    /// that is neither a string nor `null`.
+    /// keys are ignored, and so is a field that is neither a string nor
+    /// `null` ([`Self::log_resolution`] warns about it, naming `label`).
     ///
     /// # Errors
     ///
@@ -288,11 +294,7 @@ impl MetadataCollector {
             match map.get(field.key()) {
                 None | Some(Value::Null) => {}
                 Some(Value::String(value)) => self.add_value(label, field, value)?,
-                // Named, never printed: the value could be anything, of any size.
-                Some(_) => log::warn!(
-                    "{label}: its {key} is not a string, so the output does not inherit it",
-                    key = field.key()
-                ),
+                Some(_) => self.non_strings.push((label.to_string(), field.key())),
             }
         }
         Ok(())
@@ -393,10 +395,14 @@ impl MetadataCollector {
     /// Every inherited value at `info`, naming the input that carried it: an
     /// input archive's attribution is HTML the output's map will render, so
     /// what was inherited, and from which input, belongs on record. At
-    /// `warn`, each field the inputs disagreed on, and credits that differ
-    /// only in case or spacing (one mistyped job in a fleet joins as a second
-    /// credit).
+    /// `warn`, each field the inputs disagreed on, each ignored non-string
+    /// field, and credits that differ only in case or spacing (one mistyped
+    /// job in a fleet joins as a second credit).
     pub(crate) fn log_resolution(&self) {
+        // Named, never printed: the value could be anything, of any size.
+        for (label, key) in &self.non_strings {
+            log::warn!("{label}: its {key} is not a string, so the output does not inherit it");
+        }
         for (field, slot) in [
             (Field::Name, &self.name),
             (Field::Description, &self.description),

@@ -1006,7 +1006,7 @@ fn decode_error_to_py(e: DecodeError) -> PyErr {
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false))]
+#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false, name=None, description=None, attribution=None))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn pyramid(
     py: Python<'_>,
@@ -1017,14 +1017,22 @@ fn pyramid(
     feature_order: &str,
     work_dir: Option<PathBuf>,
     allow_missing_zooms: bool,
+    name: Option<String>,
+    description: Option<String>,
+    attribution: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let bands = parse_bands(&bands).map_err(PyErr::new::<PyValueError, _>)?;
+    let mut metadata = tylertoo_core::TilesetMetadata::new();
+    metadata.name = name;
+    metadata.description = description;
+    metadata.attribution = attribution;
     let mut options = PyramidOptions {
         work_dir,
         allow_missing_zooms,
+        metadata,
         ..PyramidOptions::default()
     };
     // The default tiles each GeoParquet band verbatim (an aggregate band
@@ -1060,6 +1068,19 @@ fn pyramid(
     dict.set_item(
         "bands_without_bounds",
         PyList::new(py, &report.bands_without_bounds)?,
+    )?;
+    let metadata = PyDict::new(py);
+    metadata.set_item("name", &report.metadata.name)?;
+    metadata.set_item("description", &report.metadata.description)?;
+    metadata.set_item("attribution", &report.metadata.attribution)?;
+    dict.set_item("metadata", metadata)?;
+    dict.set_item(
+        "metadata_conflicts",
+        PyList::new(py, &report.metadata_conflicts)?,
+    )?;
+    dict.set_item(
+        "bands_without_metadata",
+        PyList::new(py, &report.bands_without_metadata)?,
     )?;
     Ok(dict.into())
 }

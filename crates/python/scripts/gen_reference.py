@@ -58,6 +58,7 @@ TYPE_ORDER = [
     "SkippedPropertyColumn",
     "PyramidReport",
     "PyramidBandReport",
+    "PublicationMetadata",
     "DecodeReport",
     "ValidationReport",
     "ValidationCheck",

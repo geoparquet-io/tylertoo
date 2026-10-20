@@ -250,6 +250,9 @@ pyramid(
     feature_order: Literal['input'] | str = "input",
     work_dir: str | os.PathLike[str] | None = None,
     allow_missing_zooms: bool = False,
+    name: str | None = None,
+    description: str | None = None,
+    attribution: str | None = None,
 ) -> PyramidReport
 ```
 
@@ -266,15 +269,18 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
 * `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
 * `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
+* `name`: The output's tileset name. Unset, the PMTiles bands' name is kept when they agree and left out when they don't.
+* `description`: Description for the output, inherited the same way.
+* `attribution`: Attribution text or HTML for the output, `""` included. Unset, every PMTiles band's credit is kept, joined with `" | "`; GeoParquet bands carry none.
 
 ### Returns
 
-[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics.
+[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics and the metadata written.
 
 ### Raises
 
 * `ValueError`: A malformed band spec, overlapping bands of one layer, a missing band input, or invalid `feature_order` syntax.
-* `RuntimeError`: A band failed to convert, export, or merge.
+* `RuntimeError`: A band failed to convert, export, or merge, or the metadata is too large for an archive.
 
 ### Example
 
@@ -569,11 +575,17 @@ class PyramidReport(TypedDict):
     bands: list[PyramidBandReport]
     skipped_tiles: int
     bands_without_bounds: list[str]
+    metadata: PublicationMetadata
+    metadata_conflicts: list[str]
+    bands_without_metadata: list[str]
 ```
 
 * `bands`: One entry per band, by zoom range, coarsest first.
 * `skipped_tiles`: Tiles in a pre-tiled band at zooms outside its declared range, and so left out. Expected when one archive is split across several bands.
 * `bands_without_bounds`: Bands whose archive declared no bounds, and so did not widen the merged archive's bounds.
+* `metadata`: The `name`, `description` and `attribution` written: the keywords, over what the PMTiles bands carry.
+* `metadata_conflicts`: Fields (`"name"`, `"description"`) the PMTiles bands disagreed on, and so left out.
+* `bands_without_metadata`: PMTiles bands whose metadata is not valid JSON, and so passed on no credit.
 
 ### `PyramidBandReport`
 
@@ -586,6 +598,21 @@ class PyramidBandReport(TypedDict):
     max_zoom: int
     tiles: int
 ```
+
+### `PublicationMetadata`
+
+An archive's `name`, `description` and `attribution`.
+
+```python
+class PublicationMetadata(TypedDict):
+    name: str | None
+    description: str | None
+    attribution: str | None
+```
+
+* `name`: The tileset name, or `None` when the archive has none.
+* `description`: The description, or `None`.
+* `attribution`: The attribution text or HTML, or `None`.
 
 ### `DecodeReport`
 

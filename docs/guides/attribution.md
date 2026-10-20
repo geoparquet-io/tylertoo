@@ -29,7 +29,8 @@ The flags work on every command that writes an archive:
 - `merge`
 
 In Python, pass the same three names as keywords to
-[`export_pmtiles()`](../reference/python.md). `overview()` and the deprecated
+[`export_pmtiles()`](../reference/python.md) and `pyramid()`; the `pyramid()`
+report also returns what was written. `overview()` and the deprecated
 `convert()` take none; run `overview()` and then `export_pmtiles()`.
 
 `--layer-name` is a different setting: it names the MVT layer that styles
