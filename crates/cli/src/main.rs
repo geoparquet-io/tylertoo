@@ -911,8 +911,8 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
 
-    /// Let the density budget thin lines as well as points. More complete
-    /// tiles without it; smaller, faster ones with it (tippecanoe's
+    /// Let the density budget thin lines as well as points: smaller, faster
+    /// tiles that drop line features at coarse zooms (tippecanoe's
     /// `--drop-lines`).
     #[arg(long, help_heading = "Density budget")]
     drop_lines: bool,

@@ -68,10 +68,9 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--gsd <GSDS>` | Comma-separated ground sample distances (GSDs) in meters, each smaller than the last. Overrides `--min-zoom` and `--max-zoom`. |
 | `--bbox <XMIN,YMIN,XMAX,YMAX>` | Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box. |
 | `--layer-name <LAYER_NAME>` | Layer name for the tiles. Defaults to the input's file stem. |
-| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
-| `--description <TEXT>` | Description stored in the archive metadata. |
-| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
-| `--max-tile-size <SIZE>` [alias: `tile-size-limit`] | Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap (default 500K, or no cap with `--verbatim`). A tile over the cap drops features until it fits. |
+| `--max-tile-size <SIZE>` [alias: `tile-size-limit`] | Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap (default 500K, or no cap with `--verbatim`). A tile over the cap is merged or thinned until it fits; see `--size-valve`. |
+| `--max-compressed-tile-size <SIZE>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit both caps. |
+| `--size-valve <merge\|drop>` | How a tile over its cap is brought under it: `merge` folds the densest lines and polygons into a neighbour, which keeps its own attributes; `drop` removes features, leaving holes but every kept feature intact. Points are always dropped. Default: `merge`. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
@@ -158,15 +157,14 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--layer-name <LAYER_NAME>` | MVT layer name written into every tile. Default: `overview`. |
-| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
-| `--description <TEXT>` | Description stored in the archive metadata. |
-| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--min-zoom <ZOOM>` | Minimum zoom in archive metadata, including empty coarse overview levels. Defaults to the coarsest level's zoom. |
 | `--include-property <NAME>` | Keep only these properties in the tiles (repeatable). The overview file keeps every column, and the `--feature-order` column must stay. |
 | `--exclude-property <NAME>` | Drop these properties from the tiles (repeatable). `--include-property` overrides it. |
 | `--exclude-all-properties` | Drop every property, writing geometry-only tiles. `--include-property` overrides it. |
 | `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
-| `--tile-size-limit <SIZE>` [alias: `max-tile-size`] | Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for no cap. A tile over the cap drops features until it fits. Default: `500K`. |
+| `--tile-size-limit <SIZE>` [alias: `max-tile-size`] | Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for no cap. A tile over the cap is merged or thinned until it fits; see `--size-valve`. Default: `500K`. |
+| `--max-compressed-tile-size <SIZE>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit both caps. Default: `0`. |
+| `--size-valve <merge\|drop>` | How a tile over its cap is brought under it: `merge` folds the densest lines and polygons into a neighbour, which keeps its own attributes; `drop` removes features, leaving holes but every kept feature intact. Points are always dropped. Default: `merge`. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
@@ -270,9 +268,6 @@ tylertoo pyramid [OPTIONS] --band <LO-HI:INPUT[:LAYER]> <OUTPUT>
 | Option | Description |
 | --- | --- |
 | `--band <LO-HI:INPUT[:LAYER]>` | One zoom band as `LO-HI:INPUT[:LAYER]` (repeatable). `INPUT` is a GeoParquet source or PMTiles archive for zooms `LO` to `HI`, and `LAYER` defaults to its file stem. The tuning guide covers the colon rules and the `LO-HI=INPUT[=LAYER]` form: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
-| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
-| `--description <TEXT>` | Description stored in the archive metadata. |
-| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--generalize` | Generalize each GeoParquet band instead of tiling it verbatim. Use for raw features spanning several zooms. |
 | `--max-tile-size <SIZE>` | Per-tile MVT size cap for bands tiled here, such as `500K`. Unset means no cap, preserving every cell in the band. |
 | `--feature-order <input\|COLUMN[:asc\|:desc]>` | Within-tile feature order for GeoParquet bands: `input`, or a property name with optional `:asc` or `:desc`. A band without that column keeps input order with a warning. Default: `input`. |
@@ -299,9 +294,6 @@ tylertoo merge [OPTIONS] <OUTPUT> <INPUT>...
 
 | Option | Description |
 | --- | --- |
-| `--name <TEXT>` | Human-readable name stored in the archive metadata. |
-| `--description <TEXT>` | Description stored in the archive metadata. |
-| `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--work-dir <DIR>` | Directory for the spool file that holds tile data until the archive is complete. Defaults to the system temp directory. |
 | `--report <PATH>` | Write the JSON merge report, with per-zoom tile counts, to this path. |
 | `-f`, `--force` | Overwrite the output if it exists. |
@@ -376,8 +368,9 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | --- | --- |
 | `--gsd-base <F>` | Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`. Default: `1024.0`. |
 | `--simplify-factor <SIMPLIFY_FACTOR>` | Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices. |
-| `--collapse` | Replace polygons too small for a level with a point. Fill styles ignore points; add a circle layer or use `--collapse-square`. |
-| `--collapse-square` | Replace polygons dropped at coarse levels with small placeholder squares marking their location. Duplicating mode only; output remains Polygon. |
+| `--collapse` | Replace polygons too small for a level with a point instead of the default placeholder square. Fill styles ignore points; add a circle layer. |
+| `--collapse-square` | Replace polygons too small for a level, and those thinned out at coarse levels, with small placeholder squares marking their area. The default; duplicating mode only; output remains Polygon. |
+| `--no-collapse` | Drop polygons too small for a level instead of replacing them with placeholder squares: smaller files, but a polygon coverage shows holes at coarse zooms (the default before #745). |
 | `--representation <SPEC>` | Polygon representation by zoom band: comma-separated `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as `0-7:point,8-14:geom`. Band rules: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 | `--no-cascade` | Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source. |
 
@@ -388,6 +381,8 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `1.65`. |
 | `--drop-gamma <F>` | Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more. Default: `1.5`. |
 | `--no-density-drop` | Turn off the per-level density budget, leaving cell-winner thinning only. |
+| `--drop-lines` | Let the density budget thin lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
+| `--drop-polygons` | Let the density budget thin polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the default leaves them alone (tippecanoe's `--drop-polygons`). |
 
 ### Clustering
 

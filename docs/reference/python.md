@@ -37,6 +37,7 @@ overview(
     simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
+    no_collapse: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -47,6 +48,8 @@ overview(
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool | None = None,
+    drop_lines: bool = False,
+    drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
     coalesce_lines: bool | None = None,
@@ -100,8 +103,9 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 * `verbatim`: Turn off thinning, visibility gates, simplification, the density budget, and line coalescing, for pre-aggregated or pre-levelled input. Sets the defaults of the options below to off; an option you pass still applies.
 * `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1 (0 with `verbatim`).
-* `collapse`: Represent small polygons as points.
-* `collapse_square`: Represent small polygons as small squares.
+* `collapse`: Represent small polygons as points instead of the default placeholder squares.
+* `collapse_square`: Represent small polygons as small squares, also under an entry-zoom ladder, which otherwise switches to points. Squares are the default.
+* `no_collapse`: Drop small polygons instead of representing them, the default before #745. Smaller output, but a polygon coverage shows holes at coarse zooms.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
 * `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
@@ -111,7 +115,9 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
 * `drop_gamma`: How strongly the budget spares sparse areas.
-* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`).
+* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`). It thins points only unless `drop_lines` or `drop_polygons` is set.
+* `drop_lines`: Let the feature budget thin lines too.
+* `drop_polygons`: Let the feature budget thin polygons too, which leaves holes in a polygon coverage.
 
 #### Clustering
 
@@ -185,9 +191,8 @@ export_pmtiles(
     exclude_all_properties: bool = False,
     feature_id: str | None = None,
     spill_dir: str | os.PathLike[str] | None = None,
-    name: str | None = None,
-    description: str | None = None,
-    attribution: str | None = None,
+    size_valve: Literal['merge', 'drop'] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ExportReport
 ```
 
@@ -210,9 +215,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
-* `name`: Human-readable tileset name, stored in the metadata.
-* `description`: Description of the tileset, stored in the metadata.
-* `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
+* `size_valve`: How a tile over its limit is reduced: `"merge"` folds the densest lines and polygons into a neighbour, which keeps its own attributes; `"drop"` removes features, leaving holes. Points are always dropped.
+* `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`, or `0` for no limit.
 
 ### Returns
 
@@ -220,7 +224,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 
 ### Raises
 
-* `ValueError`: Invalid `feature_order` syntax, a property selection the overview file cannot satisfy, or a `name`, `description` and `attribution` too large for the 16 MiB archive metadata.
+* `ValueError`: Invalid `feature_order` syntax, or a property selection the overview file cannot satisfy.
 * `RuntimeError`: Not an overview file, an option is out of range, or reading or writing failed.
 
 ### Example
@@ -229,13 +233,6 @@ Export an overview file to a PMTiles archive, one zoom per level.
 >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
 >>> report["max_zoom"]
 10
->>> credited = export_pmtiles(
-...     "overview.parquet",
-...     "credited.pmtiles",
-...     attribution="© Example contributors",
-... )
->>> credited["zooms"] == report["zooms"]
-True
 ```
 
 ## `pyramid`
@@ -250,9 +247,6 @@ pyramid(
     feature_order: Literal['input'] | str = "input",
     work_dir: str | os.PathLike[str] | None = None,
     allow_missing_zooms: bool = False,
-    name: str | None = None,
-    description: str | None = None,
-    attribution: str | None = None,
 ) -> PyramidReport
 ```
 
@@ -269,18 +263,15 @@ Each band names a zoom range, an input, and an MVT layer. Bands of different lay
 * `feature_order`: Paint order within a tile for GeoParquet bands; see `export_pmtiles()`. A band without that column keeps input order, with a warning.
 * `work_dir`: Directory for temporary per-band files, deleted after the build, or `None` for the system temporary directory.
 * `allow_missing_zooms`: Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty.
-* `name`: The output's tileset name. Unset, the PMTiles bands' name is kept when they agree and left out when they don't.
-* `description`: Description for the output, inherited the same way.
-* `attribution`: Attribution text or HTML for the output, `""` included. Unset, every PMTiles band's credit is kept, joined with `" | "`; GeoParquet bands carry none.
 
 ### Returns
 
-[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics and the metadata written.
+[`PyramidReport`](#pyramidreport): Tile counts per band, with merge diagnostics.
 
 ### Raises
 
 * `ValueError`: A malformed band spec, overlapping bands of one layer, a missing band input, or invalid `feature_order` syntax.
-* `RuntimeError`: A band failed to convert, export, or merge, or the metadata is too large for an archive.
+* `RuntimeError`: A band failed to convert, export, or merge.
 
 ### Example
 
@@ -386,12 +377,14 @@ convert(
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
+    size_valve: Literal['merge', 'drop'] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ConvertReport
 ```
 
 Convert GeoParquet to PMTiles in one call (deprecated).
 
-Use `overview()` followed by `export_pmtiles()` for all options, including the `name`, `description` and `attribution` metadata. Runs the same core facade as `tylertoo tiles`, so the chain — the removed-after-export intermediate overview, its free-space preflight, and the declared zoom range — matches the CLI.
+Use `overview()` followed by `export_pmtiles()` for all options. Runs the same core facade as `tylertoo tiles`, so the chain — the removed-after-export intermediate overview, its free-space preflight, and the declared zoom range — matches the CLI.
 
 ### Parameters
 
@@ -407,6 +400,8 @@ Use `overview()` followed by `export_pmtiles()` for all options, including the `
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
+* `size_valve`: See `export_pmtiles()`.
+* `max_compressed_tile_size`: See `export_pmtiles()`.
 
 ### Returns
 
@@ -528,13 +523,17 @@ class ExportReport(TypedDict):
     total_tiles: int
     total_tile_features: int
     oversized_tiles: int
+    merged_features: int
+    valve_dropped_features: int
     encode_dropped_features: int
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
 ```
 
-* `oversized_tiles`: Tiles that dropped features to fit `tile_size_limit`.
+* `oversized_tiles`: Tiles that went over a size limit and were reduced to fit.
+* `merged_features`: Tile features merged into a neighbour to fit a size limit (`size_valve="merge"`).
+* `valve_dropped_features`: Tile features dropped to fit a size limit.
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
 * `encode_quantized_features`: Features that collapsed at the tile extent, usually harmless edge slivers.
 * `skipped_property_columns`: Columns MVT cannot encode, such as binary. Struct, list, and map columns become JSON strings.
@@ -553,6 +552,9 @@ class ZoomReport(TypedDict):
     oversized_tiles: int
     encode_dropped_features: int
     encode_quantized_features: int
+    merged_features: int
+    valve_dropped_features: int
+    max_valve_passes: int
 ```
 
 ### `SkippedPropertyColumn`
@@ -575,17 +577,11 @@ class PyramidReport(TypedDict):
     bands: list[PyramidBandReport]
     skipped_tiles: int
     bands_without_bounds: list[str]
-    metadata: PublicationMetadata
-    metadata_conflicts: list[str]
-    bands_without_metadata: list[str]
 ```
 
 * `bands`: One entry per band, by zoom range, coarsest first.
 * `skipped_tiles`: Tiles in a pre-tiled band at zooms outside its declared range, and so left out. Expected when one archive is split across several bands.
 * `bands_without_bounds`: Bands whose archive declared no bounds, and so did not widen the merged archive's bounds.
-* `metadata`: The `name`, `description` and `attribution` written: the keywords, over what the PMTiles bands carry.
-* `metadata_conflicts`: Fields (`"name"`, `"description"`) the PMTiles bands disagreed on, and so left out.
-* `bands_without_metadata`: PMTiles bands whose metadata is not valid JSON, and so passed on no credit.
 
 ### `PyramidBandReport`
 
@@ -598,21 +594,6 @@ class PyramidBandReport(TypedDict):
     max_zoom: int
     tiles: int
 ```
-
-### `PublicationMetadata`
-
-An archive's `name`, `description` and `attribution`.
-
-```python
-class PublicationMetadata(TypedDict):
-    name: str | None
-    description: str | None
-    attribution: str | None
-```
-
-* `name`: The tileset name, or `None` when the archive has none.
-* `description`: The description, or `None`.
-* `attribution`: The attribution text or HTML, or `None`.
 
 ### `DecodeReport`
 
