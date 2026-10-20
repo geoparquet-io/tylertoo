@@ -1573,6 +1573,7 @@ fn create_level_writer(
         renames,
         options,
     )?;
+    writer_opts.primary_column = Some(geom_name.clone());
     record_coalesce_merged(writer_opts.generalization.as_mut(), facts.coalesce_merged);
     if let Some(g) = writer_opts.generalization.as_mut() {
         g.zoom_ceiling = facts.zoom_ceiling;

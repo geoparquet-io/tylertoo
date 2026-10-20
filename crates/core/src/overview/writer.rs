@@ -76,7 +76,8 @@ use parquet::schema::types::ColumnPath;
 
 use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
-    GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
+    GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptions,
+    GeoParquetWriterOptionsBuilder,
 };
 
 use super::level::{
@@ -200,6 +201,14 @@ pub struct OverviewWriterOptions {
     /// WKB chunks of at most [`WKB_ENCODE_CHUNK_ROWS`] rows encode alongside
     /// the in-flight row groups, adding `O(encode_concurrency × chunk)` memory.
     pub encode_concurrency: usize,
+    /// The geometry column the footer's `geo` metadata declares as
+    /// `primary_column`. `None` leaves it to the geoparquet crate, which picks
+    /// `geometry` (else `geography`) when present and otherwise the
+    /// alphabetically first geometry column, so a source with a `centroid`
+    /// column beside its primary `footprint` would declare `centroid`, and
+    /// every reader of the overview would tile the wrong column. The convert
+    /// paths set it to the input's primary column. Default `None`.
+    pub primary_column: Option<String>,
 }
 
 impl OverviewWriterOptions {
@@ -217,6 +226,7 @@ impl OverviewWriterOptions {
             version: SPEC_VERSION.to_string(),
             generalization: None,
             encode_concurrency: 1,
+            primary_column: None,
         }
     }
 }
@@ -533,13 +543,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             source_schema.metadata().clone(),
         ));
 
-        // GeoParquet writer options: WKB encoding (GeoParquet 1.0/1.1-safe) with
-        // bbox covering generation (§4.4).
-        let gpq_options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(true)
-            .build();
-
+        let gpq_options = geoparquet_options(options.primary_column.as_deref());
         let encoder = GeoParquetRecordBatchEncoder::try_new(&augmented_schema, &gpq_options)
             .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
         let target_schema = encoder.target_schema();
@@ -814,6 +818,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             }
         }
         let augmented_schema = self.augmented_schema.clone();
+        let primary_column = self.options.primary_column.clone();
         #[cfg(test)]
         let faults = self.encode_faults;
         let (tx, rx) = bounded::<WkbEncodeResult>(1);
@@ -823,7 +828,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             let result = catch_encode_panic(WKB_TASK, move || {
                 #[cfg(test)]
                 faults.trip_wkb();
-                wkb_encode_chunk(&augmented_schema, &chunk)
+                wkb_encode_chunk(&augmented_schema, primary_column.as_deref(), &chunk)
             })
             .unwrap_or_else(Err);
             let _ = tx.send(result);
@@ -1147,19 +1152,34 @@ fn encode_row_group(
     writers.into_iter().map(|w| w.close()).collect()
 }
 
+/// The geoparquet encoder options every overview encoder shares: WKB encoding
+/// (GeoParquet 1.0/1.1-safe), bbox covering generation (§4.4), and the pinned
+/// [`OverviewWriterOptions::primary_column`].
+fn geoparquet_options(primary_column: Option<&str>) -> GeoParquetWriterOptions {
+    let builder = GeoParquetWriterOptionsBuilder::default()
+        .set_encoding(GeoParquetWriterEncoding::WKB)
+        .set_generate_covering(true);
+    match primary_column {
+        Some(name) => builder.set_primary_column(name.to_string()),
+        None => builder,
+    }
+    .build()
+}
+
 /// One WKB-encode task (#304): GeoParquet-encode one chunk with a task-local
 /// encoder, returning the encoded rows plus the chunk's `geo` covering
 /// contribution for the writer thread to fold in submission order. Runs on
 /// the Rayon pool.
-fn wkb_encode_chunk(augmented_schema: &SchemaRef, chunk: &RecordBatch) -> WkbEncodeResult {
+fn wkb_encode_chunk(
+    augmented_schema: &SchemaRef,
+    primary_column: Option<&str>,
+    chunk: &RecordBatch,
+) -> WkbEncodeResult {
     // Identical options to the writer's shared encoder ([`OverviewWriter::try_new`]),
     // so every task-local encoder derives the identical target schema and
     // per-column encoding. The encode itself is a pure per-row transform (WKB
     // bytes + covering bbox per row), so chunk outputs match a serial encode.
-    let gpq_options = GeoParquetWriterOptionsBuilder::default()
-        .set_encoding(GeoParquetWriterEncoding::WKB)
-        .set_generate_covering(true)
-        .build();
+    let gpq_options = geoparquet_options(primary_column);
     let mut encoder = GeoParquetRecordBatchEncoder::try_new(augmented_schema, &gpq_options)
         .map_err(|e| e.to_string())?;
     let encoded = encoder
@@ -2163,6 +2183,55 @@ mod tests {
             first, second,
             "geo footer JSON differs across identical parallel-encode runs (#508)"
         );
+    }
+
+    /// #675: the footer's `primary_column` is the column the options pin,
+    /// even when another geometry column sorts first. Unpinned, the
+    /// geoparquet crate picks that first one, and every reader of the
+    /// overview would tile it. Serial and parallel encodes alike.
+    #[test]
+    fn pinned_primary_column_wins_over_an_earlier_geometry_column() {
+        let geom = |name: &str| build_geometry_array(&[0]).data_type().to_field(name, true);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            geom("centroid"),
+            geom("footprint"),
+        ]));
+        let batch = |ids: &[i64]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(build_geometry_array(ids).to_array_ref()),
+                    Arc::new(build_geometry_array(ids).to_array_ref()),
+                ],
+            )
+            .unwrap()
+        };
+        let ids: Vec<i64> = (0..(WKB_ENCODE_CHUNK_ROWS as i64 + 37)).collect();
+        for (pinned, want) in [(None, "centroid"), (Some("footprint"), "footprint")] {
+            for concurrency in [1, 4] {
+                let mut opts = duplicating_options();
+                opts.encode_concurrency = concurrency;
+                opts.primary_column = pinned.map(str::to_string);
+                let tmp = tempfile::NamedTempFile::new().unwrap();
+                let mut writer = OverviewWriter::create(tmp.path(), &schema, opts).unwrap();
+                let _ = writer
+                    .write_level(0, Some(ids.len()), std::iter::once(batch(&ids)))
+                    .unwrap();
+                for level in 1..3 {
+                    let _ = writer
+                        .write_level(level, Some(1), std::iter::once(batch(&[0])))
+                        .unwrap();
+                }
+                writer.finish().unwrap();
+                assert_eq!(
+                    geo_footer(tmp.path())["primary_column"],
+                    want,
+                    "pinned {pinned:?}, encode concurrency {concurrency}"
+                );
+            }
+        }
     }
 
     #[test]

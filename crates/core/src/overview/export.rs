@@ -106,7 +106,6 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Schema};
 use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
@@ -3714,7 +3713,7 @@ fn fanout_batch_members(
         timers,
     } = *ctx;
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
+    let geom_idx = batch_geometry_index(batch, published.geometry.as_deref())?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, crs, timers)?;
 
     // Band `j` belongs to every level `k >= j`'s render set (partitioning
@@ -3993,6 +3992,7 @@ fn scan_all_levels_from(
     // column's field (name and metadata), so the bboxes — and the scan — are
     // unchanged. With no recognizable geometry column the read stays
     // unprojected, so the error surfaces from the decode exactly as before.
+    let geometry = geometry_name(reader);
     let root = match source {
         ScanBboxSource::Covering { column, .. } => reader.schema().index_of(column).ok(),
         ScanBboxSource::Geometry => geometry_index(reader.schema()),
@@ -4032,7 +4032,9 @@ fn scan_all_levels_from(
                     ScanBboxSource::Covering { column, names } => {
                         covering_batch_bboxes(&batch, column, names, crs)
                     }
-                    ScanBboxSource::Geometry => decode_batch_bboxes(&batch, crs).map(Some),
+                    ScanBboxSource::Geometry => {
+                        decode_batch_bboxes(&batch, geometry, crs).map(Some)
+                    }
                 })?;
                 let Some(bboxes) = bboxes else {
                     // Dropping the receiver stops the producer cleanly.
@@ -4146,10 +4148,11 @@ fn lnglat_bbox(x0: f64, y0: f64, x1: f64, y1: f64, crs: Crs) -> TileBounds {
 /// hence bit-identical to the bbox of the reprojected geometry.
 fn decode_batch_bboxes(
     batch: &RecordBatch,
+    geometry: Option<&str>,
     crs: Crs,
 ) -> Result<Vec<Option<TileBounds>>, ExportError> {
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
+    let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
@@ -4294,7 +4297,7 @@ fn scan_level(
         tile_counts: BTreeMap::new(),
     };
     for batch in batch_reader {
-        let bboxes = decode_batch_bboxes(&batch?, crs)?;
+        let bboxes = decode_batch_bboxes(&batch?, geometry_name(reader), crs)?;
         scan.feature_count += bboxes.len();
         let (batch_bounds, batch_counts) = size_bboxes(&bboxes, zoom, opts);
         if let Some(b) = batch_bounds {
@@ -4562,7 +4565,7 @@ fn collect_wave_members(
     let timers = ctx.timers;
 
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
+    let geom_idx = batch_geometry_index(batch, ctx.published.geometry.as_deref())?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers)?;
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
@@ -5884,7 +5887,7 @@ fn read_level_features(
     let mut out = Vec::new();
     for batch in batch_reader {
         let batch = batch?;
-        decode_batch(&batch, crs, &mut out)?;
+        decode_batch(&batch, geometry_name(reader), crs, &mut out)?;
     }
     Ok(out)
 }
@@ -5893,9 +5896,14 @@ fn read_level_features(
 /// `level` column and any struct/list column (the bbox covering) from
 /// properties.
 #[cfg(test)]
-fn decode_batch(batch: &RecordBatch, crs: Crs, out: &mut Vec<Feature>) -> Result<(), ExportError> {
+fn decode_batch(
+    batch: &RecordBatch,
+    geometry: Option<&str>,
+    crs: Crs,
+    out: &mut Vec<Feature>,
+) -> Result<(), ExportError> {
     let schema = batch.schema();
-    let geom_idx = geometry_index(&schema).ok_or(ExportError::NoGeometryColumn { path: None })?;
+    let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
 
     // Decode geometries.
@@ -5929,23 +5937,39 @@ fn decode_batch(batch: &RecordBatch, crs: Crs, out: &mut Vec<Feature>) -> Result
     Ok(())
 }
 
-/// The index of the overview file's geometry column.
+/// The index of the overview file's geometry column in the file's schema
+/// ([`OverviewReader::schema`], which carries the footer's `geo` key).
 ///
-/// The overview writer marks its geometry field with a `geoarrow.*` extension
-/// type, so that marker decides first, whatever the column is called (`SHAPE`
-/// from an Esri file geodatabase, for example). Files without it fall back to
-/// [`find_geometry_column`]: the `geo` metadata's `primary_column`, then the
-/// name heuristic, the same resolution convert applies to its input.
+/// Resolved exactly as convert resolves its input and as
+/// [`crate::covering::resolve_geometry_column_name`] resolves the footer for
+/// pruning (#518): the `geo` metadata's `primary_column`, then the name
+/// heuristic (`geometry`, else the first `geom*`). The overview writer pins
+/// `primary_column` to convert's geometry column, so a column named `SHAPE`
+/// (an Esri file geodatabase) resolves by name (#675). Choosing by `geoarrow.*`
+/// extension type instead would pick the first of several geometry columns
+/// in schema order, which is not necessarily the primary one.
 fn geometry_index(schema: &Schema) -> Option<usize> {
-    schema
-        .fields()
-        .iter()
-        .position(|f| {
-            f.metadata()
-                .get(EXTENSION_TYPE_NAME_KEY)
-                .is_some_and(|name| name.starts_with("geoarrow"))
-        })
-        .or_else(|| find_geometry_column(schema))
+    find_geometry_column(schema)
+}
+
+/// The name of the overview file's geometry column ([`geometry_index`]).
+fn geometry_name(reader: &OverviewReader) -> Option<&str> {
+    let schema = reader.schema();
+    geometry_index(schema).map(|i| schema.field(i).name().as_str())
+}
+
+/// The index of the geometry column `geometry` ([`geometry_name`]) in a batch
+/// read from the overview file.
+///
+/// [`geometry_index`] cannot resolve a batch: the Parquet reader builds each
+/// batch's schema from its columns alone, so the file's `geo` key, and with
+/// it `primary_column`, is gone, and the name heuristic would take an
+/// attribute such as `geom_type` over a geometry column named `SHAPE`. Field
+/// names survive in every batch, projected ones included.
+fn batch_geometry_index(batch: &RecordBatch, geometry: Option<&str>) -> Result<usize, ExportError> {
+    geometry
+        .and_then(|name| batch.schema().index_of(name).ok())
+        .ok_or(ExportError::NoGeometryColumn { path: None })
 }
 
 /// The MVT property key each overview-file column is published under (#359).
@@ -5994,6 +6018,9 @@ struct PublishedNames {
     /// property (see [`super::writer::is_covering_column`]); this is the declared spelling,
     /// alongside the default names and the shape rule.
     covering: Option<String>,
+    /// The geometry column's name ([`geometry_name`]), resolved once from the
+    /// file schema for the batches read from it ([`batch_geometry_index`]).
+    geometry: Option<String>,
 }
 
 impl PublishedNames {
@@ -6057,6 +6084,7 @@ impl PublishedNames {
             restored,
             suppressed,
             covering: None,
+            geometry: None,
         }
     }
 
@@ -6119,14 +6147,15 @@ impl PublishedNames {
         // as its top-level struct name (the spec paths are `["bbox","xmin"]`
         // and so on). A parse failure or an absent declaration leaves the
         // default-name and shape rules to recognise it.
-        names.covering = geometry_index(reader.schema()).and_then(|gi| {
-            let geom = reader.schema().field(gi).name().as_str();
+        let geometry = geometry_name(reader);
+        names.covering = geometry.and_then(|geom| {
             let json = reader.geo_metadata_json()?;
             crate::covering::parse_covering_metadata(json, Some(geom))
                 .ok()
                 .flatten()
                 .and_then(|spec| spec.xmin_path.first().cloned())
         });
+        names.geometry = geometry.map(str::to_string);
         names
     }
 
@@ -13581,5 +13610,84 @@ mod tests {
                 "single-read ({backing:?}) diverges from legacy with --feature-id"
             );
         }
+    }
+
+    /// A schema of `(name, is_geometry)` fields, with a `geo` key naming
+    /// `primary` when given.
+    fn geometry_schema(fields: &[(&str, bool)], primary: Option<&str>) -> Schema {
+        let fields: Vec<Field> = fields
+            .iter()
+            .map(|&(name, geom)| {
+                if geom {
+                    GeometryType::new(Default::default()).to_field(name, true)
+                } else {
+                    Field::new(name, DataType::Utf8, true)
+                }
+            })
+            .collect();
+        let metadata = primary
+            .map(|p| {
+                let json =
+                    format!(r#"{{"version":"1.1.0","primary_column":"{p}","columns":{{}}}}"#);
+                HashMap::from([("geo".to_string(), json)])
+            })
+            .unwrap_or_default();
+        Schema::new_with_metadata(fields, metadata)
+    }
+
+    /// #675: the file schema resolves by `primary_column`, wherever the
+    /// column sits and whatever it is called, and only then by name.
+    #[test]
+    fn geometry_index_follows_primary_column_then_the_name_heuristic() {
+        let primary_second = geometry_schema(
+            &[
+                ("geom_type", false),
+                ("centroid", true),
+                ("footprint", true),
+            ],
+            Some("footprint"),
+        );
+        assert_eq!(
+            geometry_index(&primary_second),
+            Some(2),
+            "primary_column, not the first geoarrow field"
+        );
+        let shape = geometry_schema(&[("geom_type", false), ("SHAPE", true)], Some("SHAPE"));
+        assert_eq!(geometry_index(&shape), Some(1));
+        // No `geo` key and no extension metadata: the name heuristic.
+        let bare = geometry_schema(&[("name", false), ("geometry", false)], None);
+        assert_eq!(geometry_index(&bare), Some(1), "`geometry` by name");
+        let geom_prefix = geometry_schema(&[("name", false), ("the_geom", false)], None);
+        assert_eq!(
+            geometry_index(&geom_prefix),
+            Some(1),
+            "first `geom*` by name"
+        );
+        let none = geometry_schema(&[("id", false), ("name", false)], None);
+        assert_eq!(geometry_index(&none), None, "no geometry column at all");
+    }
+
+    /// #675: a batch's schema has lost the file's `geo` key, so it is looked
+    /// up by the name the file schema resolved, not re-resolved: a fresh
+    /// heuristic would take `geom_type` over `SHAPE`.
+    #[test]
+    fn batch_geometry_index_uses_the_file_resolved_name() {
+        let file = geometry_schema(&[("geom_type", false), ("SHAPE", true)], Some("SHAPE"));
+        let batch_schema = Arc::new(Schema::new(file.fields().clone()));
+        assert_eq!(
+            geometry_index(&batch_schema),
+            Some(0),
+            "the heuristic misfires"
+        );
+        let batch = RecordBatch::new_empty(batch_schema);
+        assert_eq!(batch_geometry_index(&batch, Some("SHAPE")).unwrap(), 1);
+        assert!(matches!(
+            batch_geometry_index(&batch, None),
+            Err(ExportError::NoGeometryColumn { path: None })
+        ));
+        assert!(matches!(
+            batch_geometry_index(&batch, Some("geometry")),
+            Err(ExportError::NoGeometryColumn { path: None })
+        ));
     }
 }
