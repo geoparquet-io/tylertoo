@@ -333,7 +333,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--verbatim` | Disable thinning, simplification, and density reduction for pre-aggregated or pre-levelled input. Explicit tuning flags override these defaults. |
 | `--point-thinning <POINT_THINNING>` | Point thinning grid cell, as a multiple of the level's GSD (default 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points. |
 | `--line-thinning <LINE_THINNING>` | Line thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer lines. |
-| `--polygon-thinning <POLYGON_THINNING>` | Polygon thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer polygons. |
+| `--polygon-thinning <POLYGON_THINNING>` | Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons, and can drop a polygon whose center falls in a larger neighbor's cell. |
 | `--line-visibility <LINE_VISIBILITY>` | Drop lines whose bbox diagonal is shorter than this many GSDs at a level (default 2.0). |
 | `--polygon-visibility <POLYGON_VISIBILITY>` | Drop polygons whose bbox diagonal is shorter than this many GSDs at a level (default 2.0). |
 

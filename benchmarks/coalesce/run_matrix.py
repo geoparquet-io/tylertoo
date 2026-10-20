@@ -64,6 +64,15 @@ CONVERTS = {
     # C1, plus no polygon visibility gate and no polygon thinning: every
     # polygon reaches every level, simplified for it.
     "C2": ["--polygon-visibility", "0", "--polygon-thinning", "0"],
+    # C1 with a tighter simplification tolerance: closes the slivers between
+    # neighbouring polygons that each simplify on their own.
+    "C1s": ["--simplify-factor", "0.25"],
+    # C1 with no simplification: only the tile grid's quantization reduces
+    # vertices, and it snaps shared borders identically.
+    "C1z": ["--simplify-factor", "0"],
+    # C1 without polygon thinning: the size gate still applies, but no
+    # polygon loses its cell to a neighbour whose bbox centre lands there.
+    "C1t": ["--polygon-thinning", "0"],
 }
 
 VALVES = ["drop", "merge"]
@@ -88,6 +97,11 @@ STAGES = {
     "G3": {"datasets": ["nz-parcels"], "orders": ["hilbert"],
            "cells": [("C0", "drop"), ("C1", "merge")], "wall_s": 2700, "rss_gib": 96,
            "max_zoom": 14},
+    # NZ re-timing on a quiet host, with the tighter-simplification recipe.
+    "G3t": {"datasets": ["nz-parcels"], "orders": ["hilbert"],
+            "cells": [("C0", "drop"), ("C1", "merge"), ("C1s", "merge"), ("C1z", "merge")],
+            "wall_s": 2700,
+            "rss_gib": 96, "max_zoom": 14},
 }
 
 LOAD_MAX = 3.0

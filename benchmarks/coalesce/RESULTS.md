@@ -105,8 +105,7 @@ into an arbitrary one. Convert therefore warns on unsorted input.
 | 4,583,000 | 678 MB | 51.49 s | 67.39 s | 1.31× | 6.04 → 7.45 GiB |
 
 Time is linear in input size for both; the overhead does not grow with N.
-Peak RSS is set by convert. One run each; load rose during the 1M today
-run and the 4.58M new-default run.
+Peak RSS is set by convert. One run each.
 
 ## NZ Parcels (4,343,547 polygons, LINZ layer 51571), z0–z14
 
@@ -118,8 +117,12 @@ run and the 4.58M new-default run.
 | Today, 2 MB gzip cap | 8.1 s | 48.3 s | 56 s | 6.0 / 3.8 GiB | 0 | 0 |
 | C1 + merge, 2 MB gzip cap | 11.6 s | 95.6 s | 107 s | 9.2 / 6.4 GiB | 2.65M | 54 |
 
-The load average rose to 10–18 during the C1 exports; see the quiet-host
-re-timing below before quoting the NZ ratio.
+Re-timed on a quiet host, 2 MB gzip cap, two repeats each (they agreed
+within 1%): today 8.2 s + 48.7 s = 57 s; C1 + merge 11.7 s + 98.7 s = 110 s,
+**1.94×**. (The load averages logged after these exports include the export
+itself, which uses every core.) Parcels are denser than fields, so more
+tiles reach the cap and merge than on the Mato Grosso ladder (1.31×).
+Against tippecanoe's 31 min 41 s that is about 17× faster.
 
 Drawn-area share on palmerj's three Auckland z12 tiles (#246):
 
@@ -130,3 +133,86 @@ Drawn-area share on palmerj's three Auckland z12 tiles (#246):
 | C2 + merge | 97.3% | 97.9% | 97.6% | 99.89% (97.1%) |
 
 No tile exceeds either cap with C1 or C2.
+
+### Against tippecanoe
+
+tippecanoe 2.79.0 (the pinned tag, built from source against a local
+SQLite), `-Z0 -z14 -b 8 -M 2000000 --coalesce-densest-as-needed`, on the
+same NZ Parcels input converted to FlatGeobuf with gpio. 31 min 41 s, peak
+RSS 6.3 GiB, 884 MB archive. Scored with the same `tile_metrics.py`:
+
+| | 12/4035/2500 | 12/4036/2499 | 12/4036/2500 | z12 median (worst) | z10 worst |
+|---|---|---|---|---|---|
+| tippecanoe | 99.5% | 99.6% | 99.6% | 99.98% (99.5%) | 99.6% |
+| C1 + merge | 97.1% | 97.7% | 97.5% | 99.88% (94.0%) | 93.8% |
+
+The gap is not thinning (C2 barely moves it) but slivers along shared
+borders: each parcel is simplified on its own at 1 GSD (about 9.5 m at z12),
+roughly 4× tippecanoe's 1-tile-unit tolerance. On an Auckland subset
+(`--bbox 174.5,-37.1,175.0,-36.6`, same caps):
+
+| Settings | 12/4035/2500 | 12/4036/2499 | 12/4036/2500 | archive |
+|---|---|---|---|---|
+| C1, `--simplify-factor 1.0` (default) | 97.1% | 97.7% | 97.5% | 144 MB |
+| C1, `--simplify-factor 0.5` | 98.5% | 99.0% | 98.8% | 150 MB |
+| C1, `--simplify-factor 0.25` | 99.2% | 99.4% | 99.4% | 156 MB |
+| C2, `--simplify-factor 0.25` | 99.4% | 99.6% | 99.5% | 161 MB |
+
+### Coverage against `--simplify-factor` (`sweep_simplify.py`)
+
+Auckland subset (about 400k parcels, `--bbox 174.5,-37.1,175.0,-36.6`),
+defaults plus the 2 MB gzip cap, z0–z14; area drawn is the mean of the
+three named z12 tiles, scored against the subset's own parcels:
+
+| factor | area drawn | z12 median | build | peak RSS | archive |
+|---|---|---|---|---|---|
+| 2 | 87.3% | 99.41% | 10.8 s | 2.6 GiB | 132 MB |
+| 1 (default) | 97.4% | 99.81% | 14.2 s | 3.0 GiB | 144 MB |
+| 0.75 | 98.2% | 99.89% | 15.2 s | 3.6 GiB | 147 MB |
+| 0.5 | 98.8% | 99.92% | 17.2 s | 4.2 GiB | 150 MB |
+| 0.35 | 99.1% | 99.95% | 21.0 s | 3.8 GiB | 153 MB |
+| 0.25 | 99.3% | 99.96% | 21.1 s | 4.5 GiB | 156 MB |
+| 0.15 | 99.45% | 99.97% | 22.0 s | 4.7 GiB | 157 MB |
+| 0.1 | 99.48% | 99.97% | 21.5 s | 4.5 GiB | 158 MB |
+| 0.05 | 99.50% | 99.96% | 21.9 s | 4.4 GiB | 159 MB |
+| 0 | 99.85% | 99.99% | 15.1 s | 3.1 GiB | 149 MB |
+
+Asymptotic above zero, toward tippecanoe's 99.5%; the knee is near 0.25.
+At 0 the only vertex reduction is the tile grid, which snaps both sides of
+a shared border to the same points. On all of NZ (2 MB gzip cap):
+
+| factor | convert | convert peak RSS | overview | export | PMTiles | total |
+|---|---|---|---|---|---|---|
+| 1 (default) | 11.7 s | 9.3 GiB | 2.9 GB | 98.7 s | 1,409 MB | 110 s |
+| 0.25 | 14.8 s | 12.7 GiB | 4.1 GB | 141.1 s | 1,568 MB | 156 s |
+| 0 | 15.4 s | 19.0 GiB | 7.9 GB | 104.1 s | 1,610 MB | 120 s |
+| 0, `--profile bounded` | 38.2 s | 4.9 GiB | 7.9 GB | | | |
+
+The 19 GiB is the default memory profile choosing RAM on a 123 GB host;
+the bounded profile spills to disk and needs less than today's defaults.
+The cost that remains is the overview file: every level stores full
+resolution.
+
+### Polygon thinning off (`--polygon-thinning 0`, now the default)
+
+A z12 hole in Auckland that every tylertoo setting showed and tippecanoe
+did not was parcel 5197556 (about 340 m across), inside a larger ring-
+shaped parcel: both bbox centres fall in one thinning cell, the larger one
+wins, and the smaller one survives only as a placeholder square about one
+GSD wide. With polygon thinning off:
+
+| | total | convert peak RSS | PMTiles | z12 worst sampled tile | named tiles |
+|---|---|---|---|---|---|
+| NZ, C1 | 110.4 s | 9.3 GiB | 1,409 MB | 94.0% | 97.1–97.7% |
+| NZ, C1 + thinning off | 106.3 s | 9.3 GiB | 1,418 MB | 97.05% | 97.3–97.9% |
+| Moldova, C1 | 8.6 s | 2.45 GiB | 83 MB | | |
+| Moldova, C1 + thinning off | 8.8 s | 2.41 GiB | 84 MB | | |
+
+### A placeholder bug found on the way (#749)
+
+With the polygon visibility gate at 0 (`C2`, or `--verbatim` with a
+nonzero `--simplify-factor`), placeholder squares survive every coarse level
+under the cascade: on `open-buildings` (1,000 buildings) 229–263 squares
+about 35 km across at z0–z9, drawing 19× the real area at z8. Pre-existing
+(`main` with `--collapse-square`); the default gate of 2 avoids it, and the
+docs no longer recommend a zero gate.

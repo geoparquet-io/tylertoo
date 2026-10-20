@@ -350,11 +350,42 @@ tile and rasterized at 128 px per tile, that the tile draws.
   edge colour changes appear even at z10 (seam excess 0.24 against 0.00
   for Hilbert order), so convert warns on unsorted input and the docs
   point at `gpio sort hilbert`.
+- Against tippecanoe 2.79.0 itself (`--coalesce-densest-as-needed
+  -M 2000000`, scored the same way), on the three Auckland z12 tiles:
+  tippecanoe 99.5–99.6%, `C1` 97.1–97.7%. The gap is slivers between
+  neighbouring parcels, each simplified on its own (#450). A
+  `--simplify-factor` sweep on an Auckland subset traced the curve: 87.3%
+  at 2, 97.4% at 1, 98.8% at 0.5, 99.3% at 0.25, flattening at 99.5% by
+  0.1, and 99.9% at 0 (no simplification: the tile grid snaps shared
+  borders identically). Time and memory rise as the factor falls toward
+  0.1; at 0 export costs about what it does at 1, but every overview level
+  stores full-resolution geometry (NZ: overview 7.9 GB against 2.9 GB;
+  convert 19 GiB under the default memory profile, 4.9 GiB with
+  `--profile bounded`). tippecanoe took 31.7 min on NZ Parcels; tylertoo
+  about 2 min.
+- `--polygon-visibility 0` with placeholder squares has a pre-existing bug
+  (#749): under the cascade, squares survive every coarse level, so small
+  features draw as huge squares at low zooms. The `C2` recipe was dropped
+  from the docs for that reason and because `--simplify-factor` closes more
+  of the gap for less.
 
-**Decision:** ship `C1` and the per-tile `merge` valve as the defaults.
+- Polygon thinning: a thinning cell keeps one polygon by bbox centre, so on
+  NZ Parcels a parcel sitting inside a ring-shaped neighbour lost every
+  coarse level and drew as a hole at all simplification settings (worst
+  sampled z12 tile 94.0%). `--polygon-thinning 0` raised that tile to
+  97.05% at no cost (NZ 106 s against 110 s, Moldova +2%, same memory,
+  archive +0.6%), and tippecanoe does not thin polygons either.
+
+**Decision:** ship `C1` with polygon thinning off, and the per-tile `merge`
+valve, as the defaults.
 The density budget thins points only (`--drop-lines` / `--drop-polygons`
 opt back in); `CollapseMode::Auto` makes placeholder squares (points under
 an entry-zoom ladder); `--size-valve merge` merges oversized tiles, with
-`--size-valve drop` for attribute-exact tiles. `C2` is documented as the
-"fewer dropped polygons" recipe and the pre-#745 output as the "smaller,
-faster" one (`docs/OVERVIEW_TUNING.md` § Complete tiles or small tiles).
+`--size-valve drop` for attribute-exact tiles. The default simplification
+tolerance (Decision 1) is unchanged: slivers at the default are mostly
+narrower than a pixel, the tolerance applies to every geometry class, and a
+tighter one costs memory and bytes everywhere. The curve is documented
+instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
+`0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
+file) as recipes, next to the pre-#745 output as the "smaller, faster" one.
+Simplifying shared borders identically stays with #450.

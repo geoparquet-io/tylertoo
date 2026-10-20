@@ -872,7 +872,8 @@ struct ConvertTuningArgs {
     line_thinning: Option<f64>,
 
     /// Polygon thinning grid cell, as a multiple of the level's GSD
-    /// (default 1.0). Larger cells keep fewer polygons.
+    /// (default 0, off). Larger cells keep fewer polygons, and can drop a
+    /// polygon whose center falls in a larger neighbor's cell.
     #[arg(long, help_heading = "Thinning & visibility")]
     polygon_thinning: Option<f64>,
 
@@ -4579,7 +4580,7 @@ mod tests {
         // A default run is unchanged.
         let plain = verbatim_opts(&[]);
         assert_eq!(plain.simplify.factor, 1.0);
-        assert_eq!(plain.assign.polygon_thinning, 1.0);
+        assert_eq!(plain.assign.polygon_thinning, 0.0);
         assert_eq!(plain.assign.line_visibility, 2.0);
         assert_eq!(plain.assign.polygon_visibility, 2.0);
         assert_eq!(plain.assign.line_thinning, 1.0);

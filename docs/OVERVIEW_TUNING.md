@@ -24,8 +24,9 @@ does. Admin areas, parcels, land cover, and fields draw without holes at
 coarse and middle zooms. Three defaults work together:
 
 - The [density budget](#density-budget-drop-rate-drop-gamma-no-density-drop)
-  thins points only. Lines and polygons keep every feature that passes
-  thinning and the visibility gates.
+  thins points only, and polygons are not
+  [thinned](#feature-thinning-pointlinepolygon-thinning) per cell. Lines and
+  polygons keep every feature that passes the visibility gates.
 - A polygon too small to draw at a level becomes a small
   [placeholder square](#collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
   and the polygons that thinning removes are represented by squares too, so
@@ -34,15 +35,50 @@ coarse and middle zooms. Three defaults work together:
   polygons are merged into a neighbour instead of being dropped, and the tile
   is measured again until it fits.
 
-These defaults cost time. On 632k FTW field polygons (z0–z12), a build took
-about 1.3× as long as with the defaults before #745, and used about 6% more
-peak memory. Choose a different trade-off with these settings:
+These defaults cost time. A build took about 1.3× as long as with the
+defaults before #745 on 632k FTW field polygons (z0–z12), and 1.3× on 4.6M,
+scaling linearly; peak memory, set by the convert step, rose 6% and 23%.
+Choose a different trade-off with these settings:
 
 | Goal | Settings | Cost and effect |
 |---|---|---|
-| Fewer dropped polygons | `--polygon-visibility 0 --polygon-thinning 0` | Every polygon reaches every level, simplified for it. About 1.7–2.2× the build time of the old defaults on the field benchmark; tiles go over the cap more often, so more polygons are merged. |
+| Fewer slivers between neighbours | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
+| No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbours meet without gaps. The overview file grows about 2.7×. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
 | Every kept feature exactly as in the source | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
+
+### Coverage and simplification
+
+Each polygon is simplified on its own, so neighbours that share a border can
+end up with slightly different edges: thin gaps (slivers) open along shared
+borders. At the default tolerance they are mostly narrower than a pixel at
+the zoom they are drawn at, and visible only as faint lines in a solid fill
+of dense polygons. Tippecanoe does the same by default, at a finer
+tolerance (1 tile unit, about a quarter of tylertoo's), so its slivers are
+smaller.
+
+`--simplify-factor` sets the trade-off. Measured on about 400,000 NZ parcels
+around Auckland (z0–z14), share of the area drawn on the three densest z12
+tiles:
+
+| `--simplify-factor` | Area drawn | Build time | Peak memory | Archive |
+|---|---|---|---|---|
+| 2 | 87.3% | 10.8 s | 2.6 GiB | 132 MB |
+| 1 (default) | 97.4% | 14.2 s | 3.0 GiB | 144 MB |
+| 0.5 | 98.8% | 17.2 s | 4.2 GiB | 150 MB |
+| 0.25 | 99.3% | 21.1 s | 4.5 GiB | 156 MB |
+| 0.1 | 99.5% | 21.5 s | 4.5 GiB | 158 MB |
+| 0 (no simplification) | 99.9% | 15.1 s | 3.1 GiB | 149 MB |
+
+Tippecanoe drew 99.5–99.6% of the same tiles. Coverage flattens below
+about 0.25; smaller factors cost time and memory for little gain. With
+`--simplify-factor 0` only the tile grid reduces vertices, and it snaps a
+shared border identically on both sides, so no slivers form. Export then
+costs about the same as at the default, but every level of the overview
+file stores full-resolution geometry: on all 4.3M NZ parcels the overview
+file grew from 2.9 GB to 7.9 GB, and the convert step used 19 GiB under the
+default memory profile, or 4.9 GiB with `--profile bounded` (which took
+38 s instead of 15 s).
 
 ### What merging does to attributes
 
@@ -315,14 +351,20 @@ cell_size = thinning_factor * gsd(level)          (in the CRS's units)
 |------|---------|-------|-----------|
 | `--point-thinning` | `4.0` (`16.0` with `--cluster`) | × GSD (cell size) | **bigger = sparser** |
 | `--line-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
-| `--polygon-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
+| `--polygon-thinning` | `0` (off) | × GSD (cell size) | **bigger = sparser** |
 
 Larger factors give larger cells and fewer survivors. Lower
 `--line-thinning` if coarse roads look too sparse.
 
-Points use 4.0 because they clutter sooner than lines and polygons, which
-use 1.0. In the Portland roads sweep, 1.0 kept roads more continuous at
-coarse zooms with little loss of legibility
+Points use 4.0 because they clutter sooner than lines, which use 1.0. In
+the Portland roads sweep, 1.0 kept roads more continuous at coarse zooms
+with little loss of legibility. Polygon thinning is off since #745: a cell
+keeps one polygon by bbox centre, so a polygon whose centre falls in a
+larger neighbour's cell, such as a parcel inside a ring-shaped one, lost
+every coarse level and left a hole. The visibility gate and
+[placeholder squares](#collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition)
+already handle polygons too small to draw, so turning it off cost nothing
+measurable on NZ Parcels
 ([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
 The factor multiplies the GSD, so it stacks with `--gsd-base`. Doubling
 `--gsd-base` halves the GSD, which halves the cell size for the same factor.

@@ -34,7 +34,10 @@
 #       road detections ~100 m, adm4 polygons ~5 km) tippecanoe carries far
 #       more features than tylertoo, and tylertoo may emit no tile at all.
 #       The features/vertices/bytes ratios ramp from ~0 to 1.0 over 4-6
-#       zooms; the ramp is what #387 tracks.
+#       zooms; the ramp is what #387 tracks. Since #745 tylertoo also turns
+#       collapsed polygons into placeholder squares by default (about one
+#       GSD across, area-dithered), which shortened the ramp; the bands
+#       that moved say so.
 #   (B) Simplification tolerance: metres-of-GSD (tylertoo) vs tile units
 #       (tippecanoe), so tylertoo's rings carry fewer vertices at every
 #       generalized zoom (vertices ratio 0.5-0.85 at mid zooms) and the
@@ -74,33 +77,39 @@ distinct_ids = [0.76, 0.82]   # measured 0.790: same ramp, deduplicated per zoom
 vertices = [0.72, 0.80]       # measured 0.759: (B) at every zoom below z14
 bytes = [0.93, 1.01]          # measured 0.972 (archive size): (B) minus (C)
 
-# z0: tylertoo emits no tile (D); z1-z2: 40 and 787 of tippecanoe's 4,894
-# and 10,383 features - almost everything collapses at a 10-20 km GSD (A).
-# Ceiling only: a floor of 0.0 cannot be breached, the ceiling catches a
-# tylertoo that starts emitting placeholders or stops simplifying.
+# z1-z2: polygons collapse at a 10-20 km GSD (A). Since #745 a collapsed
+# polygon becomes a placeholder square by default, as in tippecanoe, so
+# tylertoo carries 1,721 and 1,624 of tippecanoe's 4,894 and 10,383 features
+# (before #745: 40 and 787). z0 now holds a tile too (1,853 vs 1,646, not
+# gated). Re-measured 2026-10-20 (#745 branch).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [1, 2]
-features = [0.0, 0.15]        # measured z1 0.008, z2 0.076
-distinct_ids = [0.0, 0.15]    # measured z1 0.008, z2 0.076
-vertices = [0.0, 0.12]        # measured z1 0.007, z2 0.063
-bytes = [0.0, 0.20]           # measured z1 0.025, z2 0.109
+features = [0.12, 0.40]       # measured z1 0.352, z2 0.156
+distinct_ids = [0.12, 0.40]   # measured z1 0.352, z2 0.156
+vertices = [0.28, 0.55]       # measured z1 0.485, z2 0.339
+bytes = [0.20, 0.55]          # measured z1 0.492, z2 0.258
 
 # z3-z6: the ramp (A). tippecanoe keeps 13-19k feature instances per zoom
-# (placeholders included); tylertoo keeps 4-10k.
+# (placeholders included); tylertoo keeps 4-8k. Since #745 the 500K cap
+# merges polygons instead of dropping them (features and ids down a little,
+# vertices up: merged parts keep their geometry), and collapsed polygons are
+# squares. Re-measured 2026-10-20.
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [3, 6]
 tiles = [0.99, 1.01]          # measured 1.000 at every zoom (2/2, 4/4, 4/4, 7/7)
-features = [0.28, 0.70]       # measured 0.325, 0.517, 0.616, 0.554
-distinct_ids = [0.27, 0.65]   # measured 0.319, 0.476, 0.592, 0.554
-vertices = [0.20, 0.50]       # measured 0.251, 0.368, 0.434, 0.377
-bytes = [0.30, 0.70]          # measured 0.369, 0.535, 0.622, 0.549
+features = [0.24, 0.52]       # measured 0.270, 0.393, 0.472, 0.394
+distinct_ids = [0.24, 0.49]   # measured 0.267, 0.375, 0.443, 0.381
+vertices = [0.41, 0.74]       # measured 0.589, 0.665, 0.697, 0.455
+bytes = [0.35, 0.65]          # measured 0.391, 0.507, 0.592, 0.468
 
-# z7: end of the ramp; 16,160 of 17,463 distinct polygons present.
+# z7: end of the ramp. Two tiles are over the 500K cap; since #745 they
+# merge their densest polygons into neighbours, so 14,536 of 17,463
+# polygons keep their own id here (all of them still draw).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [7, 7]
 tiles = [0.99, 1.01]          # measured 1.000 (16/16)
-features = [0.88, 0.96]       # measured 0.922
-distinct_ids = [0.88, 0.96]   # measured 0.925
+features = [0.79, 0.87]       # measured 0.830 (0.922 before #745)
+distinct_ids = [0.79, 0.87]   # measured 0.832 (0.925 before #745)
 vertices = [0.45, 0.60]       # measured 0.532 (B)
 bytes = [0.70, 0.85]          # measured 0.772
 
@@ -131,43 +140,49 @@ tile_features_median = [0.99, 1.01]  # measured 1.000 over 113,991 shared tiles
 # smoke test; the sub-pixel regime (A) lasts until z13.
 # ---------------------------------------------------------------------------
 
+# The gated run is --verbatim --simplify-factor 1.0: visibility gate 0, so
+# since #745 every building is a placeholder square wherever it collapses,
+# and under the cascade those squares survive every coarse level (#749):
+# 229-257 squares at z0-z8 against tippecanoe's 0-97. That overshoot is
+# what lifts the totals past 1.0. Re-measured 2026-10-20; these move again
+# when #749 is fixed.
 [datasets."open-buildings".totals]
-tiles = [0.88, 0.94]          # measured 0.911 (82 / 90): the 8 tippecanoe-only
-                              # tiles are z5-z8 (D) and z11-z12 placeholders (A)
-features = [0.50, 0.58]       # measured 0.537: (A) at z9-z13
-vertices = [0.48, 0.56]       # measured 0.519
-bytes = [0.71, 0.80]          # measured 0.754 (archive size)
+tiles = [1.03, 1.12]          # measured 1.078 (97 / 90): tylertoo tiles at z0-z4
+features = [1.25, 1.38]       # measured 1.316 (0.537 before #745)
+vertices = [1.10, 1.21]       # measured 1.157 (0.519 before #745)
+bytes = [1.26, 1.39]          # measured 1.326 (archive size; 0.754 before #745)
 
 # z5-z8: tippecanoe emits one tile per zoom holding 1-97 placeholder squares;
-# tylertoo emits no tile (D). Below min_reference anyway; not gated.
+# tylertoo 249-257 (the #749 overshoot). Below min_reference; not gated.
 
 # z9-z10: buildings are far below a pixel; tippecanoe keeps 415 / 711
-# placeholder instances, tylertoo 2 / 31. Ceiling only.
+# placeholder instances, tylertoo 382 / 353 squares since #745 (2 / 31
+# before).
 [[datasets."open-buildings".zoom_bands]]
 zooms = [9, 10]
-features = [0.0, 0.08]        # measured z9 0.005, z10 0.044
-vertices = [0.0, 0.08]        # measured z9 0.004, z10 0.038
-bytes = [0.0, 0.12]           # measured z9 0.039, z10 0.080
+features = [0.44, 0.97]       # measured z9 0.920, z10 0.496
+vertices = [0.42, 0.95]       # measured z9 0.906, z10 0.471
+bytes = [0.50, 1.03]          # measured z9 0.980, z10 0.553
 
 [[datasets."open-buildings".zoom_bands]]
 zooms = [11, 11]
-features = [0.14, 0.24]       # measured 0.189 (174 / 919)
-vertices = [0.11, 0.21]       # measured 0.156
-bytes = [0.18, 0.30]          # measured 0.240
+features = [0.58, 0.71]       # measured 0.644 (592 / 919; 0.189 before #745)
+vertices = [0.50, 0.62]       # measured 0.560
+bytes = [0.59, 0.72]          # measured 0.655
 
 [[datasets."open-buildings".zoom_bands]]
 zooms = [12, 12]
-features = [0.50, 0.65]       # measured 0.576 (611 / 1,060)
-vertices = [0.40, 0.53]       # measured 0.465
-bytes = [0.55, 0.70]          # measured 0.623
+features = [0.79, 0.91]       # measured 0.852 (903 / 1,060; 0.576 before #745)
+vertices = [0.62, 0.75]       # measured 0.684
+bytes = [0.80, 0.93]          # measured 0.867
 
 [[datasets."open-buildings".zoom_bands]]
 zooms = [13, 13]
 tiles = [0.95, 1.05]          # measured 1.000 (20 / 20)
-features = [0.85, 0.95]       # measured 0.897 (949 / 1,058): last of the ramp
-vertices = [0.68, 0.82]       # measured 0.744
-bytes = [0.88, 1.00]          # measured 0.941
-tile_features_median = [0.80, 0.93]  # measured 0.863 over 20 shared tiles
+features = [0.97, 1.04]       # measured 1.003 (1,061 / 1,058; 0.897 before #745)
+vertices = [0.77, 0.87]       # measured 0.823
+bytes = [0.97, 1.07]          # measured 1.022
+tile_features_median = [0.95, 1.05]  # measured 1.000 over 20 shared tiles
 
 [[datasets."open-buildings".zoom_bands]]
 zooms = [14, 14]

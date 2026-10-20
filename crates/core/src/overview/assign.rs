@@ -774,7 +774,13 @@ impl Default for AssignConfig {
         Self {
             point_thinning: 4.0,
             line_thinning: 1.0,
-            polygon_thinning: 1.0,
+            // #745: off. A thinning cell keeps one polygon per pixel-sized
+            // cell by bbox centre, so a polygon whose centre lands in a
+            // larger neighbour's cell (a parcel inside a ring-shaped one)
+            // lost every coarse level and left a hole. The visibility gate
+            // and placeholder squares already handle polygons too small to
+            // draw; on NZ Parcels this cost nothing (106 s against 110 s).
+            polygon_thinning: 0.0,
             line_visibility: 2.0,
             polygon_visibility: 2.0,
             sort_direction: SortDirection::Desc,
@@ -2417,6 +2423,16 @@ mod tests {
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
     /// conversion exists only here.
+    /// The default config with polygon thinning at its pre-#745 1×GSD, for
+    /// the tests of the cell-winner mechanics themselves (the default is
+    /// now off for polygons).
+    fn thinning_cfg() -> AssignConfig {
+        AssignConfig {
+            polygon_thinning: 1.0,
+            ..AssignConfig::default()
+        }
+    }
+
     fn table(feats: &[AssignFeature]) -> FeatureTable {
         feats.iter().collect()
     }
@@ -3056,7 +3072,7 @@ mod tests {
         let a = poly(7, 0.0, 0.0, 50_000.0, 50_000.0);
         let b = poly(42, 100.0, 100.0, 50_100.0, 50_100.0);
         let gsds = [gsd(2), gsd(8)];
-        let cfg = AssignConfig::default();
+        let cfg = thinning_cfg();
         let out1 = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg3857);
         let out2 = assign_levels(&table(&[b, a]), &gsds, &cfg, Crs::Epsg3857);
         // Find level-0 winner index in each ordering; must match.
@@ -3322,7 +3338,7 @@ mod tests {
     fn oracle_fixture_reproduces_main() {
         let feats = oracle_fixture();
         let gsds = oracle_gsds();
-        let cfg = AssignConfig::default();
+        let cfg = thinning_cfg();
         // The oracle was taken with the budget on every kind (#745 made
         // points the default).
         let budget = DensityBudgetConfig {
@@ -3549,12 +3565,7 @@ mod tests {
             .map(|i| poly(i, 0.0, 0.0, 40_000.0, 40_000.0))
             .collect();
         let gsds = [gsd(2), gsd(10)];
-        let out = assign_levels(
-            &table(&feats),
-            &gsds,
-            &AssignConfig::default(),
-            Crs::Epsg3857,
-        );
+        let out = assign_levels(&table(&feats), &gsds, &thinning_cfg(), Crs::Epsg3857);
         let at0 = out.duplicating_at_level(0);
         assert_eq!(at0.len(), 1, "one winner at coarsest level");
     }
@@ -3701,7 +3712,7 @@ mod tests {
         let out = assign_levels(
             &table(&[big_null, small_key]),
             &gsds,
-            &AssignConfig::default(),
+            &thinning_cfg(),
             Crs::Epsg3857,
         );
         assert!(
@@ -4503,7 +4514,7 @@ mod tests {
         let out = assign_levels(
             &table(&[antimeridian, local]),
             &gsds,
-            &AssignConfig::default(),
+            &thinning_cfg(),
             Crs::Epsg4326,
         );
         assert_eq!(

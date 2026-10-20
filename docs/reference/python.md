@@ -110,7 +110,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
 * `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
 * `line_thinning`: Line grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
-* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 0 (off).
 * `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
