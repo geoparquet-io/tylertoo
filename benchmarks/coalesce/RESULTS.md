@@ -220,3 +220,34 @@ under the cascade: on `open-buildings` (1,000 buildings) 229–263 squares
 about 35 km across at z0–z9, drawing 19× the real area at z8. Pre-existing
 (`main` with `--collapse-square`); the default gate of 2 avoids it, and the
 docs no longer recommend a zero gate.
+
+## Rendered coverage at every zoom (MapLibre)
+
+`render_maplibre.py` draws each archive with MapLibre GL JS 4.7.1 in
+headless Chromium and compares it pixel by pixel with the source,
+rasterized by the same pixel-centre rule. Missing share of the source area
+in each window (orange, area drawn where the source has nothing, in
+brackets when at least 0.5%). Differences under about 3% are tile-grid
+noise: at full detail small fields show about 2.5% missing and 2.5% added.
+
+| Window | Zoom | Before #745 | #745 defaults | 0.25 | 0 | tippecanoe |
+|---|---|---|---|---|---|---|
+| Auckland city, 2.4 km | 8 | 100% | 28.5% | 28.1% | 26.4% | 5.7% |
+| | 10 | 91.6% | 28.3% | 17.0% | 16.1% | 0.0% |
+| | 12 | 57.7% | 3.2% | 0.8% | 0.0% | 0.6% |
+| Upper North Island, z5 tile 31/19 | 3 | 56.4% | 13.3% | 10.4% | 9.9% | 12.1% |
+| | 5 | 34.9% | 10.2% | 5.9% | 4.7% | 0.4% |
+| | 7 | 16.1% | 5.1% | 1.6% | 0.7% | 0.2% |
+| Moldova, whole country | 3 | 99.8% | 15.8% (+51%) | 15.5% (+52%) | 15.3% (+52%) | |
+| | 5 | 71.6% | 22.3% (+25%) | 13.4% (+24%) | 12.3% (+24%) | |
+| | 7 | 29.2% | 12.4% (+9%) | 6.0% (+8%) | 5.3% (+8%) | |
+| Madagascar adm4, z4 tile 10/8 | 3 | 74.9% | 23.6% | 8.1% | 5.4% | |
+| | 4 | 64.5% | 14.4% | 2.9% | 0.8% | |
+| | 6 | 43.6% | 2.1% | 0.3% | 0.0% | |
+
+0.25 and 0 are with the fixed one-GSD placeholder square. Before that fix
+the square shrank with the factor (and factor 0 had none): Auckland city at
+z10 missed 50.4% at 0.25 and 57.3% at 0, Moldova at z5 31.4% and 41.4%.
+
+What remains at the defaults, dense sub-pixel polygons drawn as overlapping
+squares (and squares spilling over the gaps between fields), is #750.

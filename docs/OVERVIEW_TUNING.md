@@ -43,7 +43,7 @@ Choose a different trade-off with these settings:
 | Goal | Settings | Cost and effect |
 |---|---|---|
 | Fewer slivers between neighbours | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
-| No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbours meet without gaps. The overview file grows about 2.7×. |
+| No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbours meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
 | Every kept feature exactly as in the source | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
 
@@ -79,7 +79,15 @@ costs about the same as at the default, but every level of the overview
 file stores full-resolution geometry: on all 4.3M NZ parcels the overview
 file grew from 2.9 GB to 7.9 GB, and the convert step used 19 GiB under the
 default memory profile, or 4.9 GiB with `--profile bounded` (which took
-38 s instead of 15 s).
+38 s instead of 15 s). On dense small fields it costs far more: FTW Moldova
+(632k fields) took 94 s against 9 s at the default, with 2.7× the memory.
+
+These numbers are for z12, where parcels are still drawn as shapes. At
+coarser zooms most polygons are smaller than a pixel and are drawn as
+placeholder squares, which the factor does not size. There a smaller factor
+still helps where polygons stay drawable (Moldova at z5: 22% of the field
+area missing at the default, 13% at 0.25, 12% at 0), but in dense blocks the
+squares themselves overlap and leave gaps whatever the factor (#750).
 
 ### What merging does to attributes
 
