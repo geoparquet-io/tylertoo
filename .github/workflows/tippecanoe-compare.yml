@@ -22,14 +22,15 @@
 #      artifact, and on a scheduled/manual failure opens (or updates) an
 #      issue labelled `tippecanoe-parity` so a drift has an owner.
 #
-# Runs on every PR and on push to main (the push is what makes the
-# tippecanoe and cargo caches available to PR runs — caches made on a PR
-# branch are private to it), weekly against main so an upstream-independent
-# drift (a runner image change, a dependency bump that moved the geometry
-# engine) is caught between PRs, and on demand. The whole job is well
-# under 15 minutes with warm caches (the compare itself is ~2 minutes on a
-# 4-core runner); making it a REQUIRED check is a branch-protection
-# setting ("tippecanoe parity"), which this file cannot set.
+# Runs on every PR, in the merge queue, and on push to main (the push is
+# what makes the tippecanoe and cargo caches available to PR runs — caches
+# made on a PR branch are private to it), weekly against main so an
+# upstream-independent drift (a runner image change, a dependency bump that
+# moved the geometry engine) is caught between PRs, and on demand. The
+# whole job is well under 15 minutes with warm caches (the compare itself
+# is ~2 minutes on a 4-core runner); making it a REQUIRED check is a
+# branch-protection setting ("tippecanoe parity"), which this file cannot
+# set.
 #
 # When a PR moves a ratio on purpose (a closed divergence, a new default),
 # it updates the band in tippecanoe_tolerances.toml in the same PR with the
@@ -44,6 +45,8 @@ on:
   # Every PR, whatever its base: a stacked PR changes what lands on main
   # just as much as one opened against it, and the gate is cheap enough.
   pull_request:
+  # The merge queue: required checks must report on the queue's commit too.
+  merge_group:
   schedule:
     # Every Monday at 07:00 UTC (an hour after the security audit).
     - cron: '0 7 * * 1'
@@ -83,7 +86,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if [ "$EVENT" = pull_request ] \
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
             && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
             code=false
           fi
@@ -180,9 +183,12 @@ jobs:
           if-no-files-found: ignore
 
       - name: Open or update the parity issue
-        # Scheduled and manual runs only: a PR run's failure is the PR's
-        # red check, and an issue per red PR would be noise.
-        if: steps.compare.outcome == 'failure' && github.event_name != 'pull_request'
+        # Not on PR or merge-queue runs: their failure is the PR's red
+        # check, and an issue per red PR would be noise.
+        if: >-
+          steps.compare.outcome == 'failure'
+          && github.event_name != 'pull_request'
+          && github.event_name != 'merge_group'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

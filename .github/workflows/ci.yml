@@ -39,6 +39,9 @@
 #   pull_request    Test on ubuntu + macos stable; Slow Tests on ubuntu.
 #                   A PR that touches only docs (scripts/ci/docs_only.sh)
 #                   runs just Plan, Lint, Docs and the gate.
+#   merge_group     the merge queue: the same set as pull_request, on the
+#                   queue's commit (the PR on top of main and anything
+#                   queued ahead of it).
 #   push to main    everything: adds the beta Test lanes and the macOS Slow
 #                   Tests, so a macOS-only or beta break shows up on the
 #                   merge that caused it.
@@ -68,6 +71,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The merge queue: required checks must report on the queue's commit too.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -107,12 +112,12 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if [ "$EVENT" = pull_request ] \
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
             && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
             code=false
           fi
 
-          if [ "$EVENT" = pull_request ]; then
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; then
             test_matrix='{"os":["ubuntu-latest","macos-latest"],"rust":["stable"]}'
             slow_os='["ubuntu-latest"]'
           else
