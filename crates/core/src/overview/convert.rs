@@ -4084,14 +4084,8 @@ pub(crate) fn convert_to_overviews_source_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
-    let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options)? {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+    let adjusted = normalize_convert_options(source, options)?;
+    let options: &ConvertOptions = adjusted.as_ref().unwrap_or(options);
     // #452: the output is created after pass 1; a missing or read-only
     // directory must not cost the whole scan first. After the option checks
     // above (which read at most a footer, for a property selection), so a
