@@ -110,7 +110,7 @@ pub(crate) fn placeholder_has_size(simplify_factor: f64) -> bool {
 pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
     match repr {
         Representation::Square => true,
-        Representation::Geometry => collapse == CollapseMode::Square,
+        Representation::Geometry => collapse.is_square(),
         Representation::Point => false,
     }
 }

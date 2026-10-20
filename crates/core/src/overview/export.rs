@@ -95,7 +95,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -150,7 +149,6 @@ use coalesce_valve::RowGapCursor;
 #[cfg(test)]
 use coalesce_valve::GAP_NONE;
 mod feature_id;
-mod valve_predict;
 use feature_id::{
     feature_id_values, resolve_feature_id, validate_feature_id_column, ResolvedFeatureId,
 };
@@ -210,55 +208,38 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
 /// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
 pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
 
-/// Environment override for [`ExportOptions::size_valve`] (#745), so one
-/// binary can run every valve in a benchmark. Takes the same values as the
-/// hidden `--size-valve` flag.
-pub const SIZE_VALVE_ENV: &str = "TYLERTOO_SIZE_VALVE";
-
 /// How the export brings a tile that is over its size limit back under it
 /// (#745).
 ///
-/// The merging valves follow tippecanoe's `--coalesce-densest-as-needed`: the
-/// densest lines and polygons are merged into the feature kept just before
-/// them, so a polygon coverage keeps drawing its whole area, and the tile is
-/// re-measured until it fits. They differ in where the merge threshold comes
-/// from. Points are never merged; a tile of points keeps the stride valve.
-/// See `overview::export::coalesce_valve`.
-///
-/// EXPERIMENTAL: the merging valves are under evaluation (#745) and the
-/// default is still [`SizeValve::Drop`].
+/// [`SizeValve::Merge`] follows tippecanoe's `--coalesce-densest-as-needed`:
+/// the densest lines and polygons are merged into the feature kept just
+/// before them, so a polygon coverage keeps drawing its whole area, and the
+/// tile is re-measured until it fits. As in tippecanoe, a merged feature
+/// keeps the attributes of the feature it was merged into; the absorbed
+/// features' attributes are not carried. Points are never merged; a tile of
+/// points always takes the stride of [`SizeValve::Drop`]. See
+/// `overview::export::coalesce_valve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SizeValve {
-    /// One pass that drops features: the largest sized geometries survive, or
-    /// a uniform stride of points. The valve before #745.
+    /// Merge the densest lines and polygons, re-measure, and repeat until
+    /// the tile fits (the default).
     #[default]
+    Merge,
+    /// Drop features until the tile fits: the largest sized geometries
+    /// survive, or a uniform stride of points. Every feature that remains
+    /// keeps exactly its own geometry and attributes; dropped ones leave
+    /// holes. The valve before #745 (which dropped once, without
+    /// re-measuring).
     Drop,
-    /// Merge, re-measure and repeat, each tile on its own.
-    Tile,
-    /// One threshold per zoom: a first export pass measures the threshold
-    /// each tile needs, and the real pass applies the largest to every tile
-    /// of the zoom, with [`SizeValve::Tile`]'s loop as a backstop. Costs a
-    /// second export pass.
-    Zoom,
-    /// One threshold per zoom, predicted from the scan before any tile is
-    /// encoded, with [`SizeValve::Tile`]'s loop as a backstop.
-    Hybrid,
 }
 
 impl SizeValve {
-    /// The value as the CLI and [`SIZE_VALVE_ENV`] spell it.
+    /// The value as the CLI spells it.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Merge => "merge",
             Self::Drop => "drop",
-            Self::Tile => "tile",
-            Self::Zoom => "zoom",
-            Self::Hybrid => "hybrid",
         }
-    }
-
-    /// Whether this valve merges instead of dropping.
-    fn merges(self) -> bool {
-        !matches!(self, Self::Drop)
     }
 }
 
@@ -267,12 +248,10 @@ impl std::str::FromStr for SizeValve {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "merge" => Ok(Self::Merge),
             "drop" => Ok(Self::Drop),
-            "tile" => Ok(Self::Tile),
-            "zoom" => Ok(Self::Zoom),
-            "hybrid" => Ok(Self::Hybrid),
             other => Err(format!(
-                "unknown size valve {other:?}: expected drop, tile, zoom or hybrid"
+                "unknown size valve {other:?}: expected merge or drop"
             )),
         }
     }
@@ -316,7 +295,7 @@ pub struct ExportOptions {
     /// default) or `Some(0)` sets no compressed limit.
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
-    /// [`SizeValve::Drop`]. [`SIZE_VALVE_ENV`] overrides it.
+    /// [`SizeValve::Merge`].
     pub size_valve: SizeValve,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
@@ -464,7 +443,7 @@ impl Default for ExportOptions {
             extent: DEFAULT_EXTENT,
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
             compressed_tile_size_limit: None,
-            size_valve: SizeValve::Drop,
+            size_valve: SizeValve::Merge,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
             feature_order: FeatureOrder::default(),
@@ -576,12 +555,6 @@ pub struct ZoomReport {
     /// The most encodes any tile at this zoom took (#745); 1 when every tile
     /// fit at once.
     pub max_valve_passes: u32,
-    /// The merge threshold every tile at this zoom started from (#745):
-    /// [`SizeValve::Zoom`]'s measured or [`SizeValve::Hybrid`]'s predicted
-    /// threshold, `0` otherwise.
-    pub start_mingap: u64,
-    /// The largest merge threshold any tile at this zoom ended on (#745).
-    pub max_mingap: u64,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -1741,7 +1714,6 @@ fn plan_levels(
                 zoom,
                 partitions,
                 wave,
-                start_mingap: 0,
             })
         })
         .collect::<Result<Vec<_>, ExportError>>()?;
@@ -1796,148 +1768,21 @@ fn export_pmtiles_impl(
     force_legacy_pass2: bool,
     backing_override: Option<SinkBacking>,
 ) -> Result<ExportReport, ExportError> {
-    let mut options = std::borrow::Cow::Borrowed(options);
-    if let Some(valve) = size_valve_from_env()? {
-        options.to_mut().size_valve = valve;
-    }
-    let mut knobs = Pass2Knobs {
-        force_legacy_pass2,
-        backing_override,
-        concurrent_levels: true,
-        checkpoint_interval: CHECKPOINT_INTERVAL,
-        fail_level: None,
-        memory_limit: None,
-        level_mingaps: None,
-        probes: None,
-    };
-    if options.size_valve == SizeValve::Zoom {
-        knobs.level_mingaps = Some(measure_level_mingaps(
-            input_path.as_ref(),
-            output_path.as_ref(),
-            &options,
-            partition_target,
-            &knobs,
-        )?);
-    }
-    export_pmtiles_run(input_path, output_path, &options, partition_target, &knobs)
-        .map(|run| run.report)
-}
-
-/// `plans` with each level's starting merge threshold set from `mingaps`
-/// (#745): what [`SizeValve::Zoom`]'s measuring pass found.
-fn with_level_mingaps(mut plans: Vec<LevelPlan>, mingaps: Option<&[u64]>) -> Vec<LevelPlan> {
-    for (plan, &mingap) in plans.iter_mut().zip(mingaps.unwrap_or_default()) {
-        plan.start_mingap = mingap;
-    }
-    plans
-}
-
-/// Scan every level, predict [`SizeValve::Hybrid`]'s thresholds from the
-/// full scan, then restrict the scan to the export's tile range.
-fn scan_levels(
-    reader: &OverviewReader,
-    crs: Crs,
-    meta: &OverviewsMeta,
-    level_zooms: &[u8],
-    options: &ExportOptions,
-    timers: &ExportTimers,
-) -> Result<(Vec<LevelScan>, Option<Vec<u64>>), ExportError> {
-    let mut scans = scan_all_levels(reader, crs, meta, options, timers)?;
-    let predicted = hybrid_mingaps(reader, crs, &scans, level_zooms, options, timers)?;
-    // #498: a sharded build's export owns a slice of the tile space, not all
-    // of it. Restricting the SCAN — the per-zoom tile-count map every
-    // partition, key window and wave-read bbox is derived from — is what makes
-    // the restriction free rather than a filter bolted on at write time: an
-    // out-of-range tile is never planned, so it is never clipped, encoded,
-    // hashed or read for.
-    restrict_scans_to_range(&mut scans, level_zooms, options);
-    Ok((scans, predicted))
-}
-
-/// [`SizeValve::Hybrid`]'s predicted level thresholds (#745), `None` for
-/// every other valve. Runs on the unrestricted scan, so a sharded export
-/// predicts what a full one would.
-fn hybrid_mingaps(
-    reader: &OverviewReader,
-    crs: Crs,
-    scans: &[LevelScan],
-    zooms: &[u8],
-    options: &ExportOptions,
-    timers: &ExportTimers,
-) -> Result<Option<Vec<u64>>, ExportError> {
-    if options.size_valve != SizeValve::Hybrid {
-        return Ok(None);
-    }
-    valve_predict::predict_level_mingaps(reader, crs, scans, zooms, options, timers).map(Some)
-}
-
-/// [`SIZE_VALVE_ENV`], when set.
-fn size_valve_from_env() -> Result<Option<SizeValve>, ExportError> {
-    match std::env::var(SIZE_VALVE_ENV) {
-        Ok(v) if !v.is_empty() => v.parse().map(Some).map_err(|reason| {
-            ExportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{SIZE_VALVE_ENV}: {reason}"),
-            ))
-        }),
-        _ => Ok(None),
-    }
-}
-
-/// [`SizeValve::Zoom`]'s measuring pass (#745): run the whole export once
-/// with [`SizeValve::Tile`] into a throwaway archive, recording per level the
-/// largest merge threshold any tile needed to fit. The real pass then starts
-/// every tile of the level from that threshold, as tippecanoe redoes a zoom
-/// with the largest `mingap` any of its tiles chose.
-///
-/// EXPERIMENTAL: a whole second export is the simplest correct form, and an
-/// upper bound on the cost. Redoing only the levels that had an oversized
-/// tile would be cheaper.
-fn measure_level_mingaps(
-    input_path: &Path,
-    output_path: &Path,
-    options: &ExportOptions,
-    partition_target: usize,
-    knobs: &Pass2Knobs,
-) -> Result<Vec<u64>, ExportError> {
-    let num_levels = OverviewReader::open(input_path)?.num_levels();
-    let probes: Arc<Vec<AtomicU64>> =
-        Arc::new((0..num_levels).map(|_| AtomicU64::new(0)).collect());
-    let dir = output_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let scratch = tempfile::Builder::new()
-        .prefix(".tylertoo-zoom-probe")
-        .tempdir_in(dir)?;
-    let probe_opts = ExportOptions {
-        size_valve: SizeValve::Tile,
-        ..options.clone()
-    };
-    let probe_knobs = Pass2Knobs {
-        force_legacy_pass2: knobs.force_legacy_pass2,
-        backing_override: knobs.backing_override,
-        concurrent_levels: knobs.concurrent_levels,
-        checkpoint_interval: knobs.checkpoint_interval,
-        fail_level: None,
-        memory_limit: knobs.memory_limit,
-        level_mingaps: None,
-        probes: Some(Arc::clone(&probes)),
-    };
-    let t = Instant::now();
     export_pmtiles_run(
         input_path,
-        scratch.path().join("probe.pmtiles"),
-        &probe_opts,
+        output_path,
+        options,
         partition_target,
-        &probe_knobs,
-    )?;
-    let mingaps: Vec<u64> = probes.iter().map(|p| p.load(Ordering::Relaxed)).collect();
-    log::info!(
-        "[export] size valve zoom: measuring pass took {:.1}s; level thresholds {mingaps:?}",
-        t.elapsed().as_secs_f64()
-    );
-    Ok(mingaps)
+        &Pass2Knobs {
+            force_legacy_pass2,
+            backing_override,
+            concurrent_levels: true,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            fail_level: None,
+            memory_limit: None,
+        },
+    )
+    .map(|run| run.report)
 }
 
 /// The pass-2 test knobs [`export_pmtiles_impl`] forwards, plus #647's.
@@ -1958,13 +1803,6 @@ struct Pass2Knobs {
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
-    /// Per-level merge thresholds every tile starts from (#745): what
-    /// [`SizeValve::Zoom`]'s measuring pass found. `None` leaves the
-    /// planned ones.
-    level_mingaps: Option<Vec<u64>>,
-    /// [`SizeValve::Zoom`]'s measuring pass: one slot per level for the
-    /// largest threshold any of its tiles needed.
-    probes: Option<Arc<Vec<AtomicU64>>>,
 }
 
 /// What [`export_pmtiles_run`] returns: the report, plus the level schedule
@@ -2143,7 +1981,16 @@ fn export_pmtiles_run(
     let rss_sampler = RssSampler::start_if(profile_json_target().is_some(), "scan");
     let t_scan = Instant::now();
     let timers = Arc::<ExportTimers>::default();
-    let (scans, predicted) = scan_levels(&reader, crs, &meta, &level_zooms, options, &timers)?;
+    let mut scans = scan_all_levels(&reader, crs, &meta, options, &timers)?;
+
+    // #498: a sharded build's export owns a slice of the tile space, not all
+    // of it. Restricting the SCAN — the per-zoom tile-count map every
+    // partition, key window and wave-read bbox is derived from — is what makes
+    // the restriction free rather than a filter bolted on at write time: an
+    // out-of-range tile is never planned, so it is never clipped, encoded,
+    // hashed or read for.
+    restrict_scans_to_range(&mut scans, &level_zooms, options);
+    let scans = scans;
 
     let mut overall_bounds: Option<TileBounds> = None;
     for scan in &scans {
@@ -2185,10 +2032,6 @@ fn export_pmtiles_run(
         available_ram,
         knobs.memory_limit.or_else(probe_oom_memory_limit),
     )?;
-    let plans = with_level_mingaps(
-        plans,
-        knobs.level_mingaps.as_deref().or(predicted.as_deref()),
-    );
     progress.end_scan(t_scan);
 
     // Pass 2 read strategy (#235): in partitioning mode a level's render set
@@ -2262,7 +2105,6 @@ fn export_pmtiles_run(
             feature_id: feature_id.as_ref(),
             options,
             start,
-            probe: knobs.probes.as_ref().map(|p| &p[level_idx]),
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
@@ -2703,9 +2545,6 @@ struct ExportLevelCtx<'a> {
     options: &'a ExportOptions,
     /// Start of the whole export, for the elapsed-time progress lines.
     start: Instant,
-    /// [`SizeValve::Zoom`]'s measuring pass (#745): where the level's tiles
-    /// record the largest merge threshold any of them needed.
-    probe: Option<&'a AtomicU64>,
 }
 
 impl<'a> ExportLevelCtx<'a> {
@@ -2720,16 +2559,6 @@ impl<'a> ExportLevelCtx<'a> {
             published: self.published,
             feature_id: self.feature_id,
             timers,
-            encode: self.encode(),
-        }
-    }
-
-    /// The level's size-valve state for the encode path (#745).
-    fn encode(&self) -> LevelEncode<'a> {
-        LevelEncode {
-            zoom: self.plan.zoom,
-            start_mingap: self.plan.start_mingap,
-            probe: self.probe,
         }
     }
 }
@@ -2770,15 +2599,7 @@ fn export_level(
     let mut last_wave_log = Instant::now();
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
         let results: Vec<Vec<EncodedTile>> = match store.as_deref_mut() {
-            Some(s) => encode_wave_from_store(
-                s,
-                level_idx,
-                wave_idx,
-                wave,
-                level.encode(),
-                options,
-                timers,
-            )?,
+            Some(s) => encode_wave_from_store(s, level_idx, wave_idx, wave, zoom, options, timers)?,
             None => process_wave(&ctx, wave)?,
         };
         write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
@@ -2912,7 +2733,7 @@ fn export_level_group(
             let (commit, timers) = (&commit, &*timers);
             scope.spawn(move |_| {
                 let t_encode = Instant::now();
-                let tiles = encode_buckets(buckets, level.encode(), level.options, timers);
+                let tiles = encode_buckets(buckets, level.plan.zoom, level.options, timers);
                 let encoded = tiles.map(|tiles| EncodedLevel {
                     tiles,
                     start,
@@ -3220,8 +3041,6 @@ fn finish_level(
         merged_features: tally.valve.merged,
         valve_dropped_features: tally.valve.dropped,
         max_valve_passes: tally.valve.passes,
-        start_mingap: level.plan.start_mingap,
-        max_mingap: tally.valve.mingap,
     }
 }
 
@@ -3337,8 +3156,6 @@ struct LevelCtx<'a> {
     feature_id: Option<&'a ResolvedFeatureId>,
     /// Profiling stage timers (#535); diagnostics only.
     timers: &'a ExportTimers,
-    /// The level's size-valve state (#745).
-    encode: LevelEncode<'a>,
 }
 
 /// The per-export constants the single-read fan-out reads for every batch:
@@ -3366,9 +3183,6 @@ struct LevelPlan {
     zoom: u8,
     partitions: Vec<Partition>,
     wave: usize,
-    /// The merge threshold every tile of the level starts from (#745): set
-    /// for [`SizeValve::Zoom`] and [`SizeValve::Hybrid`], `0` otherwise.
-    start_mingap: u64,
 }
 
 // ============================================================================
@@ -4179,12 +3993,12 @@ fn encode_wave_from_store(
     level_idx: usize,
     wave_idx: usize,
     wave: &[Partition],
-    lvl: LevelEncode<'_>,
+    zoom: u8,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     let members = ExportTimers::time(&timers.spill_read, || store.take_wave(level_idx, wave_idx))?;
-    encode_buckets(bucket_members(members, wave), lvl, opts, timers)
+    encode_buckets(bucket_members(members, wave), zoom, opts, timers)
 }
 
 /// Route a wave's members to their partitions, one bucket per partition, as
@@ -4201,13 +4015,13 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 /// ascending partition order.
 fn encode_buckets(
     buckets: Vec<Vec<Member>>,
-    lvl: LevelEncode<'_>,
+    zoom: u8,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
-        .map(|members| encode_members(members, lvl, opts, timers))
+        .map(|members| encode_members(members, zoom, opts, timers))
         .collect::<Result<_, _>>()
 }
 
@@ -4749,7 +4563,7 @@ fn process_wave(
     let n_members: usize = buckets.iter().map(Vec::len).sum();
 
     let t_encode = Instant::now();
-    let tiles = encode_buckets(buckets, ctx.encode, ctx.opts, ctx.timers)?;
+    let tiles = encode_buckets(buckets, ctx.zoom, ctx.opts, ctx.timers)?;
     let n_tiles: usize = tiles.iter().map(Vec::len).sum();
     log::debug!(
         "[profile]     z{} wave [{:x}..{:x}] ({} partitions): rows_read={rows_read} \
@@ -5917,11 +5731,10 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
 
 fn encode_members(
     mut members: Vec<Member>,
-    lvl: LevelEncode<'_>,
+    zoom: u8,
     opts: &ExportOptions,
     timers: &ExportTimers,
 ) -> Result<Vec<EncodedTile>, ExportError> {
-    let zoom = lvl.zoom;
     sort_members_for_encode(&mut members, &opts.feature_order);
 
     // Runs of equal key. `members` is sorted by key above, so consecutive
@@ -5939,7 +5752,7 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let mvt = encode_tile(g, &tb, opts, lvl);
+            let mvt = encode_tile(g, &tb, opts);
             if mvt.features == 0 {
                 // Every member encoded to nothing (#431). There is no tile
                 // to write, but the drops must still reach the report, so
@@ -6017,46 +5830,18 @@ struct TileMvt {
     valve: ValveTally,
 }
 
-/// What the size valve did to one tile (#745), for the report and the
-/// [`SizeValve::Zoom`] measuring pass.
+/// What the size valve did to one tile (#745), for the report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ValveTally {
     /// Members merged into another member.
     merged: usize,
-    /// Members dropped: by the drop valve, or by a merging valve's fallback
+    /// Members dropped: by the drop valve, or by the merge valve's fallback
     /// when merging alone could not make the tile fit.
     dropped: usize,
     /// Encodes the tile took, the first included (`0` when no valve ran).
     passes: u32,
     /// The merge threshold the tile ended on.
     mingap: u64,
-}
-
-/// The per-level state the size valve reads (#745), passed down the encode
-/// path with the zoom.
-#[derive(Clone, Copy)]
-struct LevelEncode<'a> {
-    zoom: u8,
-    /// The merge threshold every tile of the level starts from:
-    /// [`SizeValve::Zoom`]'s measured or [`SizeValve::Hybrid`]'s predicted
-    /// level threshold; `0` otherwise.
-    start_mingap: u64,
-    /// [`SizeValve::Zoom`]'s measuring pass: the largest threshold any tile
-    /// of the level needed.
-    probe: Option<&'a AtomicU64>,
-}
-
-impl LevelEncode<'_> {
-    /// No level threshold and no probe: what every valve but
-    /// [`SizeValve::Zoom`] and [`SizeValve::Hybrid`] runs with.
-    #[cfg(test)]
-    fn plain(zoom: u8) -> Self {
-        Self {
-            zoom,
-            start_mingap: 0,
-            probe: None,
-        }
-    }
 }
 
 /// What [`build_mvt`] needs from a tile feature: a plain member, or a member
@@ -6104,14 +5889,9 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
 }
 
 /// Encode a single tile's members to MVT bytes, applying the size valve.
-fn encode_tile(
-    members: &[Member],
-    tb: &TileBounds,
-    opts: &ExportOptions,
-    lvl: LevelEncode<'_>,
-) -> TileMvt {
-    if opts.size_valve.merges() && !is_point_like(members) {
-        return merge_to_fit(members, tb, opts, lvl);
+fn encode_tile(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    if opts.size_valve == SizeValve::Merge && !is_point_like(members) {
+        return merge_to_fit(members, tb, opts);
     }
     drop_to_fit(members, tb, opts)
 }
@@ -6139,60 +5919,84 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
     Ok(fit)
 }
 
-/// The pre-#745 valve: if the tile is over its limit, keep a proportional
-/// count of members in one pass and re-encode once.
+/// Encodes the drop valve may take before it gives up and writes the tile
+/// over its limit. Each pass keeps the share of the last that fit, so a
+/// tile needing more than a few is pathological.
+const MAX_DROP_PASSES: u32 = 8;
+
+/// The drop valve: while the tile is over its limit, keep a proportional
+/// count of members and re-encode. `select_kept_members` decides which
+/// survive.
+///
+/// Before #745 this was a single pass that never re-measured, and a tile
+/// whose survivors still encoded too big was written over its limit (45 of
+/// 1,286 tiles on the FTW Moldova benchmark). The first pass is unchanged,
+/// so a tile that fit after one pass is byte-identical to before.
 fn drop_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
     let mut full = build_mvt(members, tb, opts);
-    let fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
+    let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
     if fit >= 1.0 || members.len() <= 1 {
         return full;
     }
-    // Single, non-iterative drop pass. Keep a proportional count and let
-    // `select_kept_members` decide *which* features survive.
-    let keep = ((members.len() as f64 * fit).floor() as usize).max(1);
-    let kept = shed_to_fit(members, keep, opts);
-    let keep = kept.len();
-    let shed = build_mvt(&kept, tb, opts);
-    log::warn!(
-        "oversized tile ({} bytes, {:.2}x its limit): dropped {} of {} features (one pass)",
-        full.data.len(),
-        1.0 / fit,
-        members.len() - keep,
-        members.len()
-    );
-    TileMvt {
-        oversized: true,
-        valve: ValveTally {
-            dropped: members.len() - keep,
-            passes: 2,
-            ..ValveTally::default()
-        },
-        ..shed
+    let mut keep = members.len();
+    let mut passes = 1u32;
+    loop {
+        passes += 1;
+        keep = ((keep as f64 * fit).floor() as usize).clamp(1, keep.saturating_sub(1).max(1));
+        let kept = shed_to_fit(members, keep, opts);
+        let mut shed = build_mvt(&kept, tb, opts);
+        fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
+        if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
+            log::warn!(
+                "oversized tile ({} bytes): dropped {} of {} features ({passes} encodes){}",
+                full.data.len(),
+                members.len() - keep,
+                members.len(),
+                if fit < 1.0 {
+                    "; still over the limit"
+                } else {
+                    ""
+                },
+            );
+            return TileMvt {
+                oversized: true,
+                valve: ValveTally {
+                    dropped: members.len() - keep,
+                    passes,
+                    ..ValveTally::default()
+                },
+                ..shed
+            };
+        }
     }
 }
 
-/// The merging valves (#745): merge members whose gap is below the
-/// threshold into the member kept before them, re-encode, and raise the
-/// threshold until the tile fits. See [`coalesce_valve`].
+/// The merge valve (#745): merge members whose gap is below the threshold
+/// into the member kept before them, re-encode, and raise the threshold
+/// until the tile fits. See [`coalesce_valve`].
 ///
-/// Starts from the level's threshold (`0` for [`SizeValve::Tile`]). With a
-/// zero threshold and a tile under its limit this encodes exactly what
-/// [`drop_to_fit`] would. If the threshold cannot rise any further and the
-/// tile is still over, the merged features go through the drop valve.
-fn merge_to_fit(
-    members: &[Member],
-    tb: &TileBounds,
-    opts: &ExportOptions,
-    lvl: LevelEncode<'_>,
-) -> TileMvt {
+/// A tile under its limit is encoded exactly as [`drop_to_fit`] would. When
+/// the threshold cannot rise any further and the tile is still over, the
+/// unmerged features are dropped, smallest first; a merged feature is never
+/// dropped, since it carries every feature merged into it and dropping it
+/// would open a hole the size of all of them. If the tile is still over
+/// with only merged features left, it is written over its limit, with a
+/// warning.
+fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
     // The merge walks the file's spatial order; `--feature-order` sorted the
     // tile by a column instead.
     let mut ordered: Vec<&Member> = members.iter().collect();
     if !matches!(opts.feature_order, FeatureOrder::Input) {
         ordered.sort_unstable_by_key(|m| m.seq);
     }
+    let draw_order = |feats: &mut Vec<&coalesce_valve::Merged<'_>>| {
+        feats.sort_by_key(|m| m.target.seq);
+        if let FeatureOrder::Column { name, descending } = &opts.feature_order {
+            feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
+        }
+    };
     let mut gaps: Option<Vec<u64>> = None;
-    let mut mingap = lvl.start_mingap;
+    let mut mingap = 0u64;
     let mut keep_fraction = 1.0_f64;
     let mut passes = 0u32;
     loop {
@@ -6200,9 +6004,7 @@ fn merge_to_fit(
         let merged = coalesce_valve::coalesce_members(&ordered, mingap);
         let absorbed: usize = merged.iter().map(|m| m.absorbed).sum();
         let mut feats: Vec<&coalesce_valve::Merged<'_>> = merged.iter().collect();
-        if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-            feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
-        }
+        draw_order(&mut feats);
         let mut mvt = build_mvt(&feats, tb, opts);
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
         let tally = ValveTally {
@@ -6212,9 +6014,6 @@ fn merge_to_fit(
             mingap,
         };
         if fit >= 1.0 || feats.len() <= 1 {
-            if let Some(probe) = lvl.probe {
-                probe.fetch_max(mingap, Ordering::Relaxed);
-            }
             return TileMvt {
                 oversized: passes > 1,
                 valve: tally,
@@ -6225,43 +6024,54 @@ fn merge_to_fit(
         // that would fit, with a 20% margin, never keeping more than 80%.
         keep_fraction = (keep_fraction * fit * 0.8).min(0.8);
         let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
-        match coalesce_valve::next_mingap(g, keep_fraction, mingap) {
-            Some(next) => mingap = next,
-            None => {
-                // Merged as far as the gaps allow and still over: drop.
-                // DIVERGENCE FROM TIPPECANOE: tippecanoe exits ("Can't
-                // increase feature gap threshold further"); we finish the
-                // tile and say so.
-                if let Some(probe) = lvl.probe {
-                    probe.fetch_max(mingap, Ordering::Relaxed);
-                }
-                let keep = ((feats.len() as f64 * fit).floor() as usize).max(1);
-                let mut kept = select_kept_members(&feats, keep);
-                kept.sort_by_key(|m| m.target.seq);
-                if let FeatureOrder::Column { name, descending } = &opts.feature_order {
-                    kept.sort_by(|a, b| {
-                        compare_by_feature_order(a.target, b.target, name, *descending)
-                    });
-                }
-                let shed = build_mvt(&kept, tb, opts);
-                log::warn!(
-                    "oversized tile still {:.2}x its limit after merging {absorbed} of {} \
-                     features: dropped {} more",
-                    1.0 / fit,
-                    members.len(),
-                    feats.len() - kept.len()
-                );
-                return TileMvt {
-                    oversized: true,
-                    valve: ValveTally {
-                        dropped: feats.len() - kept.len(),
-                        passes: passes + 1,
-                        ..tally
-                    },
-                    ..shed
-                };
-            }
+        if let Some(next) = coalesce_valve::next_mingap(g, keep_fraction, mingap) {
+            mingap = next;
+            continue;
         }
+        // Merged as far as the gaps allow and still over.
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe exits ("Can't increase
+        // feature gap threshold further"); we finish the tile.
+        let (whole, single): (Vec<_>, Vec<_>) = feats.into_iter().partition(|m| m.absorbed > 0);
+        let mut kept = whole.clone();
+        let mut dropped = 0;
+        let mut out = mvt;
+        let mut fit = fit;
+        if !single.is_empty() {
+            // Drop unmerged features, keeping the largest, until it fits.
+            let mut keep = single.len();
+            for _ in 0..MAX_DROP_PASSES {
+                keep = ((keep as f64 * fit).floor() as usize).min(keep.saturating_sub(1));
+                kept = whole.clone();
+                kept.extend(select_kept_members(&single, keep));
+                draw_order(&mut kept);
+                out = build_mvt(&kept, tb, opts);
+                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
+                passes += 1;
+                if fit >= 1.0 || keep == 0 {
+                    break;
+                }
+            }
+            dropped = single.len() - (kept.len() - whole.len());
+        }
+        log::warn!(
+            "oversized tile: merged {absorbed} of {} features and dropped {dropped} unmerged \
+             ones{}",
+            members.len(),
+            if fit < 1.0 {
+                "; still over the limit, written as is (merged features are never dropped)"
+            } else {
+                ""
+            },
+        );
+        return TileMvt {
+            oversized: true,
+            valve: ValveTally {
+                dropped,
+                passes,
+                ..tally
+            },
+            ..out
+        };
     }
 }
 
@@ -6446,13 +6256,8 @@ fn encode_level_tiles(
     // compression into the parallel encode section). This helper exists to
     // exercise MVT *encoding*, so decompress each tile back to raw MVT bytes;
     // the assertions in the tests below operate on the uncompressed payload.
-    let mut tiles = encode_members(
-        members,
-        LevelEncode::plain(zoom),
-        opts,
-        &ExportTimers::default(),
-    )
-    .expect("in-memory gzip is infallible");
+    let mut tiles = encode_members(members, zoom, opts, &ExportTimers::default())
+        .expect("in-memory gzip is infallible");
     // #431: all-dropped carriers hold no tile bytes; the writer skips them too.
     tiles.retain(|t| t.feature_count > 0);
     for t in &mut tiles {
@@ -8465,7 +8270,6 @@ mod tests {
             zoom,
             partitions,
             wave: 1,
-            start_mingap: 0,
         }];
         let scans = [LevelScan {
             feature_count: 32 * 1_024,
@@ -8489,13 +8293,11 @@ mod tests {
                 zoom,
                 partitions: plan_partitions(&BTreeMap::new(), zoom, 1),
                 wave: 1,
-                start_mingap: 0,
             },
             LevelPlan {
                 zoom,
                 partitions: plan_partitions(&tile_counts, zoom, 1),
                 wave: 1,
-                start_mingap: 0,
             },
         ];
         let scans = [
@@ -8658,7 +8460,6 @@ mod tests {
             zoom,
             partitions: partitions_with_members(counts),
             wave,
-            start_mingap: 0,
         }
     }
 
@@ -8758,8 +8559,6 @@ mod tests {
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
             memory_limit: None,
-            level_mingaps: None,
-            probes: None,
         }
     }
 
@@ -12104,7 +11903,8 @@ mod tests {
             "the drop valve should leave holes ({drop_area} of {full_area})"
         );
 
-        for valve in [SizeValve::Tile, SizeValve::Zoom, SizeValve::Hybrid] {
+        {
+            let valve = SizeValve::Merge;
             let ((bytes, area, vertices, features), tally) = run(valve);
             assert!(bytes <= limit, "{valve:?}: {bytes} > {limit}");
             assert!(
@@ -12119,6 +11919,63 @@ mod tests {
                 "{valve:?}: shared edges should dissolve ({vertices} vs {full_vertices})"
             );
         }
+    }
+
+    /// #745: when merging alone cannot fit a tile, the valve drops only
+    /// unmerged features and never a merged one, which would open a hole the
+    /// size of every feature merged into it. Disjoint squares cannot
+    /// dissolve, so with a tiny limit the tile stays over even fully merged:
+    /// every square must still be drawn.
+    #[test]
+    fn merge_fallback_never_drops_a_merged_feature() {
+        let d = 0.005;
+        let feats: Vec<Feature> = (0..400)
+            .map(|i| {
+                let (x, y) = (
+                    0.1 + (i % 20) as f64 * 2.0 * d,
+                    0.1 + (i / 20) as f64 * 2.0 * d,
+                );
+                Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(
+                        LineString::from(vec![
+                            (x, y),
+                            (x + d, y),
+                            (x + d, y + d),
+                            (x, y + d),
+                            (x, y),
+                        ]),
+                        vec![],
+                    )),
+                    props: vec![("n".to_string(), PropertyValue::Int(i))],
+                }
+            })
+            .collect();
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (full_bytes, full_area, _, _) = tile_area_stats(&full[0]);
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(full_bytes / 20),
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, area, _, _) = tile_area_stats(&tiles[0]);
+        assert!(tiles[0].valve.merged > 0, "{:?}", tiles[0].valve);
+        assert!(
+            (area - full_area).abs() <= 1e-6 * full_area,
+            "merged features were dropped: drew {area} of {full_area}"
+        );
     }
 
     /// #745: a merging valve leaves a tile that fits exactly as the drop
@@ -12137,7 +11994,7 @@ mod tests {
             )
             .unwrap()
         };
-        let (drop, tile) = (encode(SizeValve::Drop), encode(SizeValve::Tile));
+        let (drop, tile) = (encode(SizeValve::Drop), encode(SizeValve::Merge));
         assert_eq!(drop[0].data, tile[0].data);
         assert_eq!(tile[0].valve.merged, 0);
         assert_eq!(tile[0].valve.passes, 1);
@@ -12153,7 +12010,7 @@ mod tests {
         let limit = reference.len() / 3;
         let dropped = encode_members_for_test(&feats, Some(limit), SizeValve::Drop);
         assert!(dropped.len() < reference.len(), "the drop valve must fire");
-        let merged = encode_members_for_test(&feats, Some(limit), SizeValve::Tile);
+        let merged = encode_members_for_test(&feats, Some(limit), SizeValve::Merge);
         assert!(merged.len() <= limit, "{} > {limit}", merged.len());
     }
 
@@ -12191,13 +12048,7 @@ mod tests {
                 });
             }
         }
-        let tiles = encode_members(
-            members,
-            LevelEncode::plain(10),
-            &opts,
-            &ExportTimers::default(),
-        )
-        .unwrap();
+        let tiles = encode_members(members, 10, &opts, &ExportTimers::default()).unwrap();
         assert_eq!(tiles.len(), 1);
         tiles.into_iter().next().unwrap().data
     }
@@ -12722,7 +12573,7 @@ mod tests {
             tile_size_limit: Some(0),
             ..Default::default()
         };
-        let mvt = encode_tile(&members, &tb, &opts, LevelEncode::plain(0));
+        let mvt = encode_tile(&members, &tb, &opts);
         assert!(!mvt.oversized, "Some(0) must disable the cap");
         assert_eq!(mvt.features, members.len());
         assert_eq!(mvt.unencodable, 0);
@@ -12867,7 +12718,6 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10]),
             wave: 1,
-            start_mingap: 0,
         }];
         let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
         assert_eq!(
@@ -12893,7 +12743,6 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
-            start_mingap: 0,
         }];
         let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
@@ -12957,7 +12806,6 @@ mod tests {
             zoom: 4,
             partitions: partitions_with_members(&[10]),
             wave: 1,
-            start_mingap: 0,
         }];
         let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
@@ -13146,7 +12994,8 @@ mod tests {
     /// those resets fall inside tiles and partitions.
     #[test]
     fn merging_valves_are_partition_and_path_invariant() {
-        for valve in [SizeValve::Tile, SizeValve::Zoom, SizeValve::Hybrid] {
+        {
+            let valve = SizeValve::Merge;
             let opts = |wave: usize| ExportOptions {
                 layer_name: "ref".to_string(),
                 tile_size_limit: Some(3_000),
@@ -13174,12 +13023,6 @@ mod tests {
                 r_one.merged_features > 0,
                 "{valve:?}: the valve must merge here"
             );
-            if matches!(valve, SizeValve::Zoom | SizeValve::Hybrid) {
-                assert!(
-                    r_one.zooms.iter().any(|z| z.start_mingap > 0),
-                    "{valve:?}: some level must start from a threshold"
-                );
-            }
             assert_eq!(r_one.valve_dropped_features, 0, "{valve:?}");
             assert_eq!(
                 std::fs::read(t_many.path()).unwrap(),

@@ -120,10 +120,12 @@ use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
     cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
 };
+#[cfg(test)]
+use super::simplify::CollapseMode;
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step_at,
-    validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
-    Simplified, SimplifyOptions,
+    validation_skip_count, CascadeFold, CascadeStep, FoldStep, Representation, Simplified,
+    SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -921,7 +923,7 @@ fn accumulator_enabled(options: &ConvertOptions) -> bool {
 /// disposition is on somewhere in a duplicating run.
 fn accumulator_requested(options: &ConvertOptions) -> bool {
     matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse == CollapseMode::Square
+        && (options.simplify.collapse.is_square()
             || options
                 .representation
                 .iter()

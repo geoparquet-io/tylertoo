@@ -121,14 +121,36 @@ const MIN_LINESTRING_POINTS: usize = 2;
 ///   `["Polygon"]`, so fill-styled renderers need no style changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CollapseMode {
-    /// Omit the collapsed feature (default).
-    #[default]
+    /// Omit the collapsed feature (the default before #745).
     Drop,
     /// Replace with a representative point (centroid; spec Q4 opt-in).
     Point,
     /// Replace with an area-dithered ~1×tolerance placeholder square
     /// (tippecanoe tiny-polygon reduction, #279).
     Square,
+    /// The default (#745): [`Square`](Self::Square), so a polygon coverage
+    /// keeps drawing the area of polygons too small for a level instead of
+    /// showing holes there; but [`Point`](Self::Point) under an entry-zoom
+    /// ladder (#364), whose promoted features the square's area dither
+    /// would otherwise delete. An explicit `Square` is never switched.
+    #[default]
+    Auto,
+}
+
+impl CollapseMode {
+    /// The disposition that applies when no ladder has resolved
+    /// [`Auto`](Self::Auto): `Auto` acts as `Square`.
+    pub fn resolved(self) -> Self {
+        match self {
+            Self::Auto => Self::Square,
+            mode => mode,
+        }
+    }
+
+    /// Whether collapsed polygons become placeholder squares.
+    pub fn is_square(self) -> bool {
+        self.resolved() == Self::Square
+    }
 }
 
 /// Options controlling per-level simplification.
@@ -138,7 +160,7 @@ pub struct SimplifyOptions {
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
     pub factor: f64,
     /// Disposition of polygons that collapse below the visibility gate
-    /// (default [`CollapseMode::Drop`]; see [`CollapseMode`]).
+    /// (default [`CollapseMode::Auto`]; see [`CollapseMode`]).
     pub collapse: CollapseMode,
     /// Cascading simplification (#218, default **on**). When `true`:
     ///
@@ -161,7 +183,7 @@ impl Default for SimplifyOptions {
     fn default() -> Self {
         Self {
             factor: DEFAULT_SIMPLIFY_FACTOR,
-            collapse: CollapseMode::Drop,
+            collapse: CollapseMode::Auto,
             cascade: true,
         }
     }
@@ -307,7 +329,7 @@ pub(super) fn simplify_for_level_checked(
     let tol = world_tolerance(gsd_meters, crs, opts);
     // The placeholder side only matters to the square disposition; skip the
     // zoom arithmetic otherwise.
-    let side = if opts.collapse == CollapseMode::Square {
+    let side = if opts.collapse.is_square() {
         placeholder_side(gsd_meters, zoom, crs, opts.factor)
     } else {
         tol
@@ -367,7 +389,7 @@ pub(super) fn simplify_for_level_checked(
             // dense multipolygon block keeps per-part density instead of
             // collapsing to a single square. A repaired part (cascade path)
             // may itself be a MultiPolygon; its parts are flattened in.
-            let part_mode = match opts.collapse {
+            let part_mode = match opts.collapse.resolved() {
                 CollapseMode::Square => CollapseMode::Square,
                 _ => CollapseMode::Drop,
             };
@@ -397,9 +419,11 @@ pub(super) fn simplify_for_level_checked(
                     unchanged,
                 )
             } else {
-                match opts.collapse {
+                match opts.collapse.resolved() {
                     // Every part had its own dither under Square; nothing more.
-                    CollapseMode::Drop | CollapseMode::Square => (Simplified::Dropped, false),
+                    CollapseMode::Drop | CollapseMode::Square | CollapseMode::Auto => {
+                        (Simplified::Dropped, false)
+                    }
                     CollapseMode::Point => match mp.centroid() {
                         Some(pt) => (Simplified::Keep(Geometry::Point(pt)), false),
                         None => (Simplified::Dropped, false),
@@ -1364,7 +1388,7 @@ fn collapse_polygon(poly: &Polygon<f64>, mode: CollapseMode, side: f64) -> Simpl
             Some(p) => Simplified::Keep(Geometry::Point(p)),
             None => Simplified::Dropped,
         },
-        CollapseMode::Square => squarify_polygon(poly, side),
+        CollapseMode::Square | CollapseMode::Auto => squarify_polygon(poly, side),
     }
 }
 
@@ -2084,7 +2108,11 @@ mod tests {
     /// geometry's area even when the geometry cascade died earlier.
     #[test]
     fn test_cascade_square_step_revives_dropped_geometry() {
-        let opts = SimplifyOptions::default();
+        // The geometry step must drop, so not the square default (#745).
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Drop,
+            ..SimplifyOptions::default()
+        };
         // Scan anchors for one the dither keeps (deterministic per anchor).
         let mut revived = 0;
         for i in 0..300 {

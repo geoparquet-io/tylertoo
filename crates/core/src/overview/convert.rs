@@ -2863,8 +2863,11 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
     // simplification tolerance, so the drop default deletes it again at exactly
     // the levels it was promoted to — and a level left with nothing is omitted
     // from the file entirely.
-    let collapse_to_point =
-        options.entry_zoom.is_some() && matches!(options.simplify.collapse, CollapseMode::Drop);
+    let collapse_to_point = options.entry_zoom.is_some()
+        && matches!(
+            options.simplify.collapse,
+            CollapseMode::Drop | CollapseMode::Auto
+        );
     if collapse_to_point {
         log::info!(
             "an entry-zoom ladder implies collapse-to-point: a promoted feature is \
@@ -4416,8 +4419,7 @@ fn in_memory_carriers(
     // `placeholder_has_size` last: it logs, and only when the accumulator
     // would otherwise run.
     let enabled = matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse == CollapseMode::Square
-            || level_reprs.contains(&Representation::Square))
+        && (options.simplify.collapse.is_square() || level_reprs.contains(&Representation::Square))
         && placeholder_has_size(options.simplify.factor);
     let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
@@ -7384,7 +7386,7 @@ pub(super) fn build_generalization(
             mode => Some(
                 match mode {
                     CollapseMode::Point => "point",
-                    CollapseMode::Square => "square",
+                    CollapseMode::Square | CollapseMode::Auto => "square",
                     CollapseMode::Drop => unreachable!(),
                 }
                 .to_string(),
@@ -11220,7 +11222,9 @@ mod tests {
         assert_eq!(bands.len(), 1);
         assert_eq!(bands[0].zooms, [2, 5]);
         assert_eq!(bands[0].repr, "point");
-        assert!(gen.collapse.is_none(), "no global collapse requested");
+        // The default collapse (#745: squares) is recorded like an explicit
+        // one; it applies outside the point band.
+        assert_eq!(gen.collapse.as_deref(), Some("square"));
     }
 
     /// Streaming and in-memory pipelines produce identical per-level rows

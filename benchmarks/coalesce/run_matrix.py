@@ -50,19 +50,23 @@ import threading
 import time
 from pathlib import Path
 
+# Spelled for the #745 defaults (density budget on points only, placeholder
+# squares, merge valve). The G0-G2 results in RESULTS.md were taken with the
+# pre-default spellings of the same settings (`--density-drop-kinds points
+# --collapse-square` for C1); the overview files are the same.
 CONVERTS = {
-    # Today's defaults.
-    "C0": [],
-    # Density budget off for lines and polygons; sub-tolerance polygons
-    # (and the gate's and thinning's losers) become squares.
-    "C1": ["--density-drop-kinds", "points", "--collapse-square"],
+    # The defaults before #745: the density budget thins every kind, and
+    # polygons too small for a level are dropped.
+    "C0": ["--drop-polygons", "--drop-lines", "--no-collapse"],
+    # The #745 default: the budget thins points only; polygons too small for
+    # a level, or thinned out, become placeholder squares.
+    "C1": [],
     # C1, plus no polygon visibility gate and no polygon thinning: every
     # polygon reaches every level, simplified for it.
-    "C2": ["--density-drop-kinds", "points", "--collapse-square",
-           "--polygon-visibility", "0", "--polygon-thinning", "0"],
+    "C2": ["--polygon-visibility", "0", "--polygon-thinning", "0"],
 }
 
-VALVES = ["drop", "tile", "zoom", "hybrid"]
+VALVES = ["drop", "merge"]
 
 STAGES = {
     "G0": {"datasets": ["madagascar"], "orders": ["hilbert"], "converts": ["C0", "C2"],
@@ -70,11 +74,20 @@ STAGES = {
            "determinism": True},
     "G1": {"datasets": ["moldova"], "orders": ["hilbert"], "converts": ["C0", "C1", "C2"],
            "valves": VALVES, "wall_s": 600, "rss_gib": 24, "max_zoom": 12},
+    # Sort order: today against the new default, per order.
     "G2": {"datasets": ["moldova"], "orders": ["hilbert", "str", "unsorted", "as-delivered"],
-           "converts": ["C2"], "valves": ["tile", "hybrid"], "wall_s": 600, "rss_gib": 24,
+           "cells": [("C0", "drop"), ("C1", "merge")], "wall_s": 600, "rss_gib": 24,
            "max_zoom": 12},
-    "G3": {"datasets": ["nz-parcels"], "orders": ["hilbert"], "converts": ["C2"],
-           "valves": ["hybrid"], "wall_s": 2700, "rss_gib": 96, "max_zoom": 14},
+    # Scaling ladder: Hilbert prefixes of Mato Grosso (prepare_data.py
+    # --prefixes), today against the new default.
+    "L": {"datasets": ["mato-grosso"],
+          "orders": ["hilbert-250000", "hilbert-500000", "hilbert-1000000",
+                     "hilbert-2000000", "hilbert"],
+          "cells": [("C0", "drop"), ("C1", "merge")], "wall_s": 1800, "rss_gib": 96,
+          "max_zoom": 12},
+    "G3": {"datasets": ["nz-parcels"], "orders": ["hilbert"],
+           "cells": [("C0", "drop"), ("C1", "merge")], "wall_s": 2700, "rss_gib": 96,
+           "max_zoom": 14},
 }
 
 LOAD_MAX = 3.0
@@ -210,6 +223,13 @@ def main() -> int:
     for key in ("datasets", "orders", "converts", "valves"):
         if getattr(args, key):
             stage[key] = getattr(args, key).split(",")
+    # A stage either crosses converts with valves, or names its cells.
+    if "cells" in stage and not (args.converts or args.valves):
+        cells = stage["cells"]
+    else:
+        cells = [(c, v) for c in stage.get("converts", []) for v in stage.get("valves", VALVES)]
+    stage["converts"] = list(dict.fromkeys(c for c, _ in cells))
+    stage["valves_for"] = {c: [v for cc, v in cells if cc == c] for c in stage["converts"]}
     max_zoom = args.max_zoom or stage["max_zoom"]
     data = args.data.expanduser()
     out = args.out.expanduser() / args.stage
@@ -255,7 +275,7 @@ def main() -> int:
                     continue
                 record({"kind": "convert", "cell": cell, "dataset": ds, "order": order,
                         "convert": cv, "prep": prep_rec, "convert_run": conv})
-                for valve in stage["valves"]:
+                for valve in stage["valves_for"][cv]:
                     pm = out / f"{ds}.{order}.{cv}.{valve}.pmtiles"
                     for rep in range(args.repeats):
                         report = out / f"{ds}.{order}.{cv}.{valve}.report.json"

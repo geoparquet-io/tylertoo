@@ -1340,6 +1340,8 @@ fn zero_thinning_is_the_off_switch_not_an_error() {
     o.assign.polygon_thinning = 0.0;
     o.assign.polygon_visibility = 0.0;
     o.density.enabled = false;
+    // Count features, not placeholders: no square disposition (#745 default).
+    o.simplify.collapse = CollapseMode::Drop;
     let report = convert_to_overviews(tin.path(), tout.path(), &o)
         .expect("0 must be accepted as the off switch");
     assert!(
@@ -2828,9 +2830,11 @@ fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
         })
         .sum();
 
-    // Drop (the default): nothing survives at z2..z5.
+    // Drop (the default before #745): nothing survives at z2..z5.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    let mut drop = opts(true);
+    drop.simplify.collapse = CollapseMode::Drop;
+    let report = convert_to_overviews(tin.path(), tout.path(), &drop).unwrap();
     assert!(
         report.skipped_empty_levels.len() >= 3,
         "coarse levels must be empty without the accumulator: {:?}",

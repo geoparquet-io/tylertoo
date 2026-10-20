@@ -1939,8 +1939,9 @@ pub struct DensityBudgetConfig {
     /// `1/gamma` power of their population).
     pub gamma: f64,
     /// Which geometry kinds the budget thins (#745). A kind left out keeps
-    /// its cell-winner level and does not count toward `N`. Default: every
-    /// kind.
+    /// its cell-winner level and does not count toward `N`. Default: points
+    /// only, as tippecanoe's `-r` (lines and polygons opt in, its
+    /// `--drop-lines` / `--drop-polygons`).
     pub kinds: BudgetKinds,
 }
 
@@ -1982,7 +1983,7 @@ impl BudgetKinds {
 
 impl Default for BudgetKinds {
     fn default() -> Self {
-        Self::ALL
+        Self::POINTS
     }
 }
 
@@ -3322,7 +3323,12 @@ mod tests {
         let feats = oracle_fixture();
         let gsds = oracle_gsds();
         let cfg = AssignConfig::default();
-        let budget = DensityBudgetConfig::default();
+        // The oracle was taken with the budget on every kind (#745 made
+        // points the default).
+        let budget = DensityBudgetConfig {
+            kinds: BudgetKinds::ALL,
+            ..DensityBudgetConfig::default()
+        };
 
         // Production shapes are really exercised at this size.
         assert!(feats.len() > WINNER_CHUNK_FEATURES);
@@ -3847,7 +3853,8 @@ mod tests {
             enabled,
             drop_rate,
             gamma,
-            kinds: BudgetKinds::default(),
+            // The budget mechanics, on every kind (the default is points only).
+            kinds: BudgetKinds::ALL,
         }
     }
 

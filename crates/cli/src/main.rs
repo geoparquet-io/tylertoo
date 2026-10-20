@@ -598,7 +598,8 @@ struct ExportPmtilesArgs {
     tile_buffer: u32,
 
     /// Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for
-    /// no cap. A tile over the cap drops features until it fits.
+    /// no cap. A tile over the cap is merged or thinned until it fits; see
+    /// `--size-valve`.
     #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
     tile_size_limit: usize,
 
@@ -608,13 +609,11 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_bytes)]
     max_compressed_tile_size: usize,
 
-    /// How a tile over its cap is brought under it. Experimental (#745).
-    #[arg(
-        long,
-        value_name = "drop|tile|zoom|hybrid",
-        default_value = "drop",
-        hide = true
-    )]
+    /// How a tile over its cap is brought under it: `merge` folds the
+    /// densest lines and polygons into a neighbour, which keeps its own
+    /// attributes; `drop` removes features, leaving holes but every kept
+    /// feature intact. Points are always dropped.
+    #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
     /// Write the JSON export report, with per-zoom tile and feature counts,
@@ -831,16 +830,23 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Generalization")]
     simplify_factor: Option<f64>,
 
-    /// Replace polygons too small for a level with a point. Fill styles
-    /// ignore points; add a circle layer or use `--collapse-square`.
-    #[arg(long, help_heading = "Generalization")]
+    /// Replace polygons too small for a level with a point instead of the
+    /// default placeholder square. Fill styles ignore points; add a circle
+    /// layer.
+    #[arg(long, conflicts_with_all = ["collapse_square", "no_collapse"], help_heading = "Generalization")]
     collapse: bool,
 
-    /// Replace polygons dropped at coarse levels with small placeholder
-    /// squares marking their location. Duplicating mode only; output
-    /// remains Polygon.
-    #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
+    /// Replace polygons too small for a level, and those thinned out at
+    /// coarse levels, with small placeholder squares marking their area.
+    /// The default; duplicating mode only; output remains Polygon.
+    #[arg(long, conflicts_with = "no_collapse", help_heading = "Generalization")]
     collapse_square: bool,
+
+    /// Drop polygons too small for a level instead of replacing them with
+    /// placeholder squares: smaller files, but a polygon coverage shows holes
+    /// at coarse zooms (the default before #745).
+    #[arg(long, help_heading = "Generalization")]
+    no_collapse: bool,
 
     /// Polygon representation by zoom band: comma-separated
     /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
@@ -905,15 +911,17 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
 
-    /// Geometry kinds the density budget thins, comma-separated
-    /// (`points,lines,polygons`, or `none`). Experimental (#745).
-    #[arg(
-        long,
-        value_name = "KINDS",
-        default_value = "points,lines,polygons",
-        hide = true
-    )]
-    density_drop_kinds: BudgetKinds,
+    /// Let the density budget thin lines as well as points. More complete
+    /// tiles without it; smaller, faster ones with it (tippecanoe's
+    /// `--drop-lines`).
+    #[arg(long, help_heading = "Density budget")]
+    drop_lines: bool,
+
+    /// Let the density budget thin polygons as well as points. Removing a
+    /// polygon leaves a hole in a coverage such as admin areas or parcels,
+    /// so the default leaves them alone (tippecanoe's `--drop-polygons`).
+    #[arg(long, help_heading = "Density budget")]
+    drop_polygons: bool,
 
     /// Merge each thinning cell's points into its surviving point, which
     /// gains a `point_count` column. Duplicating mode only.
@@ -1231,12 +1239,15 @@ impl ConvertTuningArgs {
                 // gets it — the Python bindings and direct library users
                 // included, where the drop default silently deletes the
                 // promoted features and can empty the coarsest level outright.
-                collapse: if self.collapse_square {
-                    CollapseMode::Square
-                } else if self.collapse {
+                collapse: if self.collapse {
                     CollapseMode::Point
-                } else {
+                } else if self.no_collapse {
                     CollapseMode::Drop
+                } else if self.collapse_square {
+                    CollapseMode::Square
+                } else {
+                    // #745: squares, or points under an entry-zoom ladder.
+                    CollapseMode::Auto
                 },
                 cascade: !self.no_cascade,
             },
@@ -1246,7 +1257,11 @@ impl ConvertTuningArgs {
                 enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
-                kinds: self.density_drop_kinds,
+                kinds: BudgetKinds {
+                    points: true,
+                    lines: self.drop_lines,
+                    polygons: self.drop_polygons,
+                },
             },
             gsd_base: self.gsd_base,
             cogp_compat_key: cogp_compat,
@@ -1367,8 +1382,8 @@ struct TilesArgs {
     publication: TilesetMetadataArgs,
 
     /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
-    /// (default 500K, or no cap with `--verbatim`). A tile over the cap drops
-    /// features until it fits.
+    /// (default 500K, or no cap with `--verbatim`). A tile over the cap is
+    /// merged or thinned until it fits; see `--size-valve`.
     #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
@@ -1378,13 +1393,11 @@ struct TilesArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     max_compressed_tile_size: Option<usize>,
 
-    /// How a tile over its cap is brought under it. Experimental (#745).
-    #[arg(
-        long,
-        value_name = "drop|tile|zoom|hybrid",
-        default_value = "drop",
-        hide = true
-    )]
+    /// How a tile over its cap is brought under it: `merge` folds the
+    /// densest lines and polygons into a neighbour, which keeps its own
+    /// attributes; `drop` removes features, leaving holes but every kept
+    /// feature intact. Points are always dropped.
+    #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
     /// Clip all polygons with the full overlay for byte-stable tiles. The
@@ -2500,10 +2513,10 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .map(|z| format!("z{z}"))
         .collect();
     if !empty_zooms.is_empty() {
-        // Point at the collapse flags only when neither was passed; with one
-        // on, the level was empty because there was less than one placeholder
-        // of area in it, and the hint would name the flag already given.
-        if args.tuning.collapse || args.tuning.collapse_square {
+        // Point at the collapse flags only when collapse is off; with it on,
+        // the level was empty because there was less than one placeholder
+        // of area in it, and the hint would name a flag already in effect.
+        if !args.tuning.no_collapse {
             say!(
                 "  {} declared but empty: less than one placeholder of area there",
                 empty_zooms.join(", ")
@@ -2511,8 +2524,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         } else {
             say!(
                 "  {} declared but empty: every feature generalized away there \
-                 (see --collapse / --collapse-square), or an entry-zoom ladder \
-                 holds every feature out of them",
+                 (drop --no-collapse to keep placeholders), or an entry-zoom \
+                 ladder holds every feature out of them",
                 empty_zooms.join(", ")
             );
         }
@@ -4228,7 +4241,9 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(opts.simplify.collapse, CollapseMode::Drop);
+        // #745: no flag is the auto disposition (squares, points under a
+        // ladder).
+        assert_eq!(opts.simplify.collapse, CollapseMode::Auto);
 
         // A malformed spec is a CLI-level error.
         let bad = parse_tiles(&["--representation", "0-7:blob"]);
@@ -4422,7 +4437,7 @@ mod tests {
 
         // The CLI itself leaves the mode alone...
         let cli = verbatim_opts(&["--magnitude-ladder", "level"]);
-        assert_eq!(cli.simplify.collapse, CollapseMode::Drop);
+        assert_eq!(cli.simplify.collapse, CollapseMode::Auto);
         assert_eq!(
             verbatim_opts(&["--magnitude-ladder", "level", "--collapse-square"])
                 .simplify

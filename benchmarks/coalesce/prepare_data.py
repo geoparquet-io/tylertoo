@@ -25,6 +25,11 @@ gpio is pinned (GPIO below) and run through uvx, so the sort is reproducible.
     uv run benchmarks/coalesce/prepare_data.py --out ~/bench-data/745 \\
         --dataset moldova=~/bench-data/745/raw/moldova.parquet \\
         --orders hilbert,str,unsorted,as-delivered
+
+For the scaling ladder, prefixes of a prepared file:
+
+    uv run benchmarks/coalesce/prepare_data.py --prefixes \\
+        ~/bench-data/745/mato-grosso/hilbert.parquet 250000,500000,1000000,2000000
 """
 
 from __future__ import annotations
@@ -127,9 +132,26 @@ def prepare(name: str, src: Path, order: str, out: Path) -> dict:
     raise SystemExit(f"unknown order {order!r}")
 
 
+def write_prefixes(src: Path, rows: list[int]) -> None:
+    """The first N rows of src, for each N, as `<stem>-<N>.parquet` beside
+    it: the scaling ladder. On a Hilbert-sorted file a prefix is a compact
+    region, so density stays about the same while N grows."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(src)
+    for n in rows:
+        dst = src.with_name(f"{src.stem}-{n}.parquet")
+        pq.write_table(table.slice(0, min(n, table.num_rows)), dst,
+                       row_group_size=ROW_GROUP_ROWS, compression="zstd")
+        print(f"[prep] {dst.name}: {min(n, table.num_rows)} rows", flush=True)
+
+
 def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "--shuffle":
         do_shuffle(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "--prefixes":
+        write_prefixes(Path(sys.argv[2]).expanduser(), [int(n) for n in sys.argv[3].split(",")])
         return 0
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", type=Path, required=True)

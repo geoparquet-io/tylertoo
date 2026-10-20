@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
+use tylertoo_core::overview::assign::{
+    AssignConfig, BudgetKinds, DensityBudgetConfig, SortDirection,
+};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
@@ -51,6 +53,12 @@ fn refresh_log_levels() {
 
 /// Parse the `feature_order` kwarg into the core enum, surfacing a bad
 /// spelling as a Python `ValueError` rather than a panic (#361).
+/// `size_valve=` as the CLI spells `--size-valve`: `merge` or `drop` (#745).
+fn parse_size_valve(s: &str) -> PyResult<SizeValve> {
+    s.parse()
+        .map_err(|e: String| PyErr::new::<PyValueError, _>(format!("size_valve: {e}")))
+}
+
 fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
     s.parse::<FeatureOrder>()
         .map_err(pyo3::exceptions::PyValueError::new_err)
@@ -140,8 +148,8 @@ fn resolve_max_zoom_py(
 /// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False)"
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=512000, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false, size_valve="merge", max_compressed_tile_size=0),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=512000, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False, size_valve='merge', max_compressed_tile_size=0)"
 )]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
@@ -158,6 +166,8 @@ fn convert(
     include_properties: Option<Vec<String>>,
     exclude_properties: Option<Vec<String>>,
     exclude_all_properties: bool,
+    size_valve: &str,
+    max_compressed_tile_size: usize,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let input_path = Path::new(input).to_path_buf();
@@ -209,10 +219,9 @@ fn convert(
         tile_buffer: 8,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
-        // #745: not exposed yet while the merging valves are evaluated;
-        // `TYLERTOO_SIZE_VALVE` still selects one.
-        compressed_tile_size_limit: None,
-        size_valve: SizeValve::default(),
+        // #745: tippecanoe's `-M`; 0 sets no compressed limit.
+        compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
+        size_valve: parse_size_valve(size_valve)?,
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
@@ -522,6 +531,7 @@ fn entry_zoom_spec(
     simplify_factor=None,
     collapse=false,
     collapse_square=false,
+    no_collapse=false,
     representation=None,
     cascade=true,
     point_thinning=None,
@@ -532,6 +542,8 @@ fn entry_zoom_spec(
     drop_rate=1.65,
     drop_gamma=1.5,
     density_drop=None,
+    drop_lines=false,
+    drop_polygons=false,
     cluster=false,
     accumulate_attributes=None,
     coalesce_lines=None,
@@ -553,7 +565,7 @@ fn entry_zoom_spec(
     read_workers=0,
     spill_dir=None,
 ),
-    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, entry_zoom=None, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
+    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, entry_zoom=None, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, no_collapse=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, drop_lines=False, drop_polygons=False, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
 )]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn overview(
@@ -578,6 +590,7 @@ fn overview(
     simplify_factor: Option<f64>,
     collapse: bool,
     collapse_square: bool,
+    no_collapse: bool,
     representation: Option<String>,
     cascade: bool,
     point_thinning: Option<f64>,
@@ -588,6 +601,8 @@ fn overview(
     drop_rate: f64,
     drop_gamma: f64,
     density_drop: Option<bool>,
+    drop_lines: bool,
+    drop_polygons: bool,
     cluster: bool,
     accumulate_attributes: Option<BTreeMap<String, String>>,
     coalesce_lines: Option<bool>,
@@ -664,17 +679,26 @@ fn overview(
     // Below-tolerance collapse disposition (#279) + zoom-band representation
     // selector (#317); mirrors the CLI flags. Structural validity of the
     // bands against the level plan is enforced by core convert validation.
-    if collapse && collapse_square {
+    if [collapse, collapse_square, no_collapse]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+        > 1
+    {
         return Err(PyErr::new::<PyValueError, _>(
-            "collapse and collapse_square are mutually exclusive",
+            "collapse, collapse_square and no_collapse are mutually exclusive",
         ));
     }
-    let collapse_mode = if collapse_square {
-        CollapseMode::Square
-    } else if collapse {
+    // #745: placeholder squares are the default; `no_collapse` restores the
+    // drop disposition.
+    let collapse_mode = if collapse {
         CollapseMode::Point
-    } else {
+    } else if no_collapse {
         CollapseMode::Drop
+    } else if collapse_square {
+        CollapseMode::Square
+    } else {
+        CollapseMode::Auto
     };
     let representation_bands = match &representation {
         Some(spec) => parse_representation_spec(spec)
@@ -717,6 +741,12 @@ fn overview(
         density: DensityBudgetConfig {
             drop_rate,
             gamma: drop_gamma,
+            // #745: points always; lines and polygons only when asked.
+            kinds: BudgetKinds {
+                points: true,
+                lines: drop_lines,
+                polygons: drop_polygons,
+            },
             ..DensityBudgetConfig::default()
         },
         gsd_base,
@@ -806,7 +836,7 @@ fn overview(
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=512000, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None, size_valve="merge", max_compressed_tile_size=0))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -828,6 +858,8 @@ fn export_pmtiles(
     name: Option<String>,
     description: Option<String>,
     attribution: Option<String>,
+    size_valve: &str,
+    max_compressed_tile_size: usize,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let mut metadata = tylertoo_core::TilesetMetadata::new();
@@ -840,10 +872,9 @@ fn export_pmtiles(
         extent,
         // 0 (or None) disables the cap; any positive value is the byte limit.
         tile_size_limit: tile_size_limit.filter(|&n| n > 0),
-        // #745: not exposed yet while the merging valves are evaluated;
-        // `TYLERTOO_SIZE_VALVE` still selects one.
-        compressed_tile_size_limit: None,
-        size_valve: SizeValve::default(),
+        // #745: tippecanoe's `-M`; 0 sets no compressed limit.
+        compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
+        size_valve: parse_size_valve(size_valve)?,
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,
