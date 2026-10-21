@@ -51,14 +51,14 @@ fn refresh_log_levels() {
     }
 }
 
-/// Parse the `feature_order` kwarg into the core enum, surfacing a bad
-/// spelling as a Python `ValueError` rather than a panic (#361).
 /// `size_valve=` as the CLI spells `--size-valve`: `merge` or `drop` (#745).
 fn parse_size_valve(s: &str) -> PyResult<SizeValve> {
     s.parse()
         .map_err(|e: String| PyErr::new::<PyValueError, _>(format!("size_valve: {e}")))
 }
 
+/// Parse the `feature_order` kwarg into the core enum, surfacing a bad
+/// spelling as a Python `ValueError` rather than a panic (#361).
 fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
     s.parse::<FeatureOrder>()
         .map_err(pyo3::exceptions::PyValueError::new_err)

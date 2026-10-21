@@ -553,7 +553,7 @@ pub struct ZoomReport {
     /// a tile fit.
     pub valve_dropped_features: usize,
     /// The most encodes any tile at this zoom took (#745); 1 when every tile
-    /// fit at once.
+    /// fit at once, whichever the valve, and 0 for a zoom with no tiles.
     pub max_valve_passes: u32,
 }
 
@@ -3802,7 +3802,8 @@ fn fill_member_store(
     // #745: every band is read whole and in order, so the rows arrive in
     // file order across every row group.
     let all_row_groups: Vec<usize> = (0..reader.num_row_groups()).collect();
-    let mut gaps = RowGapCursor::new(reader.row_group_bands(&all_row_groups));
+    let mut gaps = RowGapCursor::new(reader.row_group_bands(&all_row_groups))
+        .measuring(valve_merges(ctx.opts));
     let store_ref = &mut store;
     let seq_ref = &mut seq;
     let gaps_ref = &mut gaps;
@@ -4639,7 +4640,8 @@ fn collect_wave(ctx: &LevelCtx<'_>, wave: &[Partition]) -> Result<CollectedWave,
     let selected = ctx
         .reader
         .selected_row_groups_any(ctx.level_idx, bboxes.as_ref().map(|b| b.as_slice()))?;
-    let mut gaps = RowGapCursor::new(ctx.reader.row_group_bands(&selected));
+    let mut gaps =
+        RowGapCursor::new(ctx.reader.row_group_bands(&selected)).measuring(valve_merges(ctx.opts));
     let buckets_ref = &mut buckets;
     let seq_ref = &mut seq;
     let gaps_ref = &mut gaps;
@@ -5838,7 +5840,8 @@ struct ValveTally {
     /// Members dropped: by the drop valve, or by the merge valve's fallback
     /// when merging alone could not make the tile fit.
     dropped: usize,
-    /// Encodes the tile took, the first included (`0` when no valve ran).
+    /// Encodes the tile took, the first included: 1 for a tile that fit at
+    /// once, under either valve.
     passes: u32,
     /// The merge threshold the tile ended on.
     mingap: u64,
@@ -5896,6 +5899,15 @@ fn encode_tile(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Til
     drop_to_fit(members, tb, opts)
 }
 
+/// Whether the size valve can merge anything: [`SizeValve::Merge`] with a
+/// size limit in force. Otherwise no gap is ever compared, and the read
+/// skips measuring them (#745).
+fn valve_merges(opts: &ExportOptions) -> bool {
+    opts.size_valve == SizeValve::Merge
+        && (opts.tile_size_limit.is_some_and(|l| l > 0)
+            || opts.compressed_tile_size_limit.is_some_and(|l| l > 0))
+}
+
 /// Whether every member has at most one coordinate: a tile of points (or of
 /// polygons collapsed to centroid points, the #259 dot-fill recipe).
 fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
@@ -5936,7 +5948,14 @@ fn drop_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Til
     let mut full = build_mvt(members, tb, opts);
     let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
     if fit >= 1.0 || members.len() <= 1 {
-        return full;
+        // One encode, as the merge valve counts a tile that fits at once.
+        return TileMvt {
+            valve: ValveTally {
+                passes: 1,
+                ..ValveTally::default()
+            },
+            ..full
+        };
     }
     let mut keep = members.len();
     let mut passes = 1u32;
@@ -11997,19 +12016,20 @@ mod tests {
         let (drop, tile) = (encode(SizeValve::Drop), encode(SizeValve::Merge));
         assert_eq!(drop[0].data, tile[0].data);
         assert_eq!(tile[0].valve.merged, 0);
+        // Both valves count the one encode a fitting tile took.
         assert_eq!(tile[0].valve.passes, 1);
+        assert_eq!(drop[0].valve, tile[0].valve);
     }
 
-    /// #745: the compressed limit is measured on the gzip bytes. It trips the
-    /// one-pass drop valve (which, as with the raw limit, never re-measures),
-    /// and a merging valve, which re-measures, fits it.
+    /// #745: the compressed limit is measured on the gzip bytes, and both
+    /// valves, which re-measure, bring the tile under it.
     #[test]
     fn compressed_limit_is_enforced() {
         let feats = coverage_grid();
         let reference = encode_members_for_test(&feats, None, SizeValve::Drop);
         let limit = reference.len() / 3;
         let dropped = encode_members_for_test(&feats, Some(limit), SizeValve::Drop);
-        assert!(dropped.len() < reference.len(), "the drop valve must fire");
+        assert!(dropped.len() <= limit, "drop: {} > {limit}", dropped.len());
         let merged = encode_members_for_test(&feats, Some(limit), SizeValve::Merge);
         assert!(merged.len() <= limit, "{} > {limit}", merged.len());
     }

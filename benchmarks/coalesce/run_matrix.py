@@ -17,10 +17,9 @@ What it records, per run, so a slowdown can be traced to its source:
   * convert and export each on their own: wall, CPU, peak RSS (GNU time),
     and the cap outcome (ok, TIMEOUT, RSS_CAP, FAILED). A capped run is a
     result, and the matrix moves on.
-  * export phase timings from TYLERTOO_PROFILE_JSON (the last line, which is
-    the real pass for the zoom valve, whose measuring pass writes a line too).
-  * the export report's valve tallies per zoom (merged, dropped, passes,
-    start and end thresholds) and tile counts.
+  * export phase timings from TYLERTOO_PROFILE_JSON (the last line).
+  * the export report's valve tallies per zoom (merged, dropped, passes)
+    and tile counts.
   * totals with and without the input's preparation (prep.json from
     prepare_data.py), so a sorted input does not look cheaper because its
     sort ran outside the timer.
@@ -55,24 +54,26 @@ from pathlib import Path
 # pre-default spellings of the same settings (`--density-drop-kinds points
 # --collapse-square` for C1); the overview files are the same.
 CONVERTS = {
-    # The defaults before #745: the density budget thins every kind, and
-    # polygons too small for a level are dropped.
-    "C0": ["--drop-polygons", "--drop-lines", "--no-collapse"],
-    # The #745 default: the budget thins points only; polygons too small for
-    # a level, or thinned out, become placeholder squares.
-    "C1": [],
+    # The defaults before #745: the density budget thins every kind, polygon
+    # thinning is on, and polygons too small for a level are dropped.
+    "C0": ["--drop-polygons", "--drop-lines", "--polygon-thinning", "1", "--no-collapse"],
+    # The #745 default as first measured: the budget thins points only;
+    # polygons too small for a level, or thinned out, become placeholder
+    # squares. Polygon thinning was still on then.
+    "C1": ["--polygon-thinning", "1"],
     # C1, plus no polygon visibility gate and no polygon thinning: every
     # polygon reaches every level, simplified for it.
     "C2": ["--polygon-visibility", "0", "--polygon-thinning", "0"],
-    # C1 with a tighter simplification tolerance: closes the slivers between
+    # C1t with a tighter simplification tolerance: closes the slivers between
     # neighbouring polygons that each simplify on their own.
     "C1s": ["--simplify-factor", "0.25"],
-    # C1 with no simplification: only the tile grid's quantization reduces
+    # C1t with no simplification: only the tile grid's quantization reduces
     # vertices, and it snaps shared borders identically.
     "C1z": ["--simplify-factor", "0"],
-    # C1 without polygon thinning: the size gate still applies, but no
-    # polygon loses its cell to a neighbour whose bbox centre lands there.
-    "C1t": ["--polygon-thinning", "0"],
+    # The shipped default: C1 without polygon thinning. The size gate still
+    # applies, but no polygon loses its cell to a neighbour whose bbox
+    # centre lands there.
+    "C1t": [],
 }
 
 VALVES = ["drop", "merge"]
@@ -212,7 +213,7 @@ def last_json_line(path: Path) -> dict | None:
 
 def zoom_summary(report: dict) -> list[dict]:
     keep = ("zoom", "tile_count", "tile_feature_count", "oversized_tiles", "merged_features",
-            "valve_dropped_features", "max_valve_passes", "start_mingap", "max_mingap")
+            "valve_dropped_features", "max_valve_passes")
     return [{k: z.get(k) for k in keep} for z in report.get("zooms", [])]
 
 

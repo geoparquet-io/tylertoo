@@ -2314,6 +2314,26 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
 /// parsed arguments onto [`TilesOptions`] and prints.
 ///
 /// [`TilesOptions`]: tylertoo_core::overview::tiles::TilesOptions
+/// Whether a convert with `options` stands in for dropped polygons with
+/// placeholder squares (#745), for the empty-zoom hint: duplicating mode,
+/// with the square disposition globally (the default, unless an entry-zoom
+/// ladder turns it into points) or in a `--representation` square band.
+fn makes_placeholder_squares(options: &tylertoo_core::overview::convert::ConvertOptions) -> bool {
+    use tylertoo_core::overview::level::Mode;
+    use tylertoo_core::overview::simplify::{CollapseMode, Representation};
+
+    let global = match options.simplify.collapse {
+        CollapseMode::Square => true,
+        CollapseMode::Auto => options.entry_zoom.is_none(),
+        CollapseMode::Point | CollapseMode::Drop => false,
+    };
+    let banded = options
+        .representation
+        .iter()
+        .any(|b| b.repr == Representation::Square);
+    matches!(options.mode, Mode::Duplicating) && (global || banded)
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::convert::ConvertReport;
     use tylertoo_core::overview::tiles::{
@@ -2364,6 +2384,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     let manual_range = preflight_export_flags(&args)?;
 
     let (options, shard) = tiles_convert_options(&args, &spec)?;
+    let squares = makes_placeholder_squares(&options);
 
     let tiles_options = TilesOptions {
         convert: options,
@@ -2514,20 +2535,24 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .map(|z| format!("z{z}"))
         .collect();
     if !empty_zooms.is_empty() {
-        // Point at the collapse flags only when collapse is off; with it on,
-        // the level was empty because there was less than one placeholder
-        // of area in it, and the hint would name a flag already in effect.
-        if !args.tuning.no_collapse {
+        // With placeholder squares on, the level was empty because there was
+        // less than one placeholder of area in it. Otherwise point at the
+        // generalization, and at `--no-collapse` only when it was given.
+        if squares {
             say!(
                 "  {} declared but empty: less than one placeholder of area there",
                 empty_zooms.join(", ")
             );
         } else {
             say!(
-                "  {} declared but empty: every feature generalized away there \
-                 (drop --no-collapse to keep placeholders), or an entry-zoom \
-                 ladder holds every feature out of them",
-                empty_zooms.join(", ")
+                "  {} declared but empty: every feature generalized away there{}, \
+                 or an entry-zoom ladder holds every feature out of them",
+                empty_zooms.join(", "),
+                if args.tuning.no_collapse {
+                    " (drop --no-collapse to keep placeholders)"
+                } else {
+                    ""
+                },
             );
         }
     }
@@ -4426,6 +4451,40 @@ mod tests {
                 false,
             )
             .unwrap()
+    }
+
+    /// #745: the empty-zoom hint blames "less than one placeholder" only when
+    /// squares are actually made: not under a ladder's points, `--collapse`
+    /// or `--no-collapse`, and not in partitioning mode.
+    #[test]
+    fn placeholder_squares_follow_the_resolved_disposition() {
+        assert!(makes_placeholder_squares(&verbatim_opts(&[])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--collapse-square"
+        ])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&["--collapse"])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse"
+        ])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&[
+            "--magnitude-ladder",
+            "level"
+        ])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--magnitude-ladder",
+            "level",
+            "--collapse-square"
+        ])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse",
+            "--representation",
+            "0-3:square,4-6:geom"
+        ])));
+        let partitioning = tylertoo_core::overview::convert::ConvertOptions {
+            mode: tylertoo_core::overview::level::Mode::Partitioning,
+            ..verbatim_opts(&[])
+        };
+        assert!(!makes_placeholder_squares(&partitioning));
     }
 
     /// #364: a ladder implies collapse-to-point, and that is applied in CORE so

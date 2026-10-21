@@ -15,9 +15,12 @@ The decision these tables back is
   build uses mimalloc and is faster in absolute terms; ratios are what to
   read). Inputs ordered with gpio 1.7.0 (`prepare_data.py`).
 - Settings, spelled for the new defaults (`run_matrix.py` `CONVERTS`):
-  - `C0`: `--drop-polygons --drop-lines --no-collapse`, the defaults before
-    #745.
-  - `C1`: no flags, the new default.
+  - `C0`: `--drop-polygons --drop-lines --polygon-thinning 1
+    --no-collapse`, the defaults before #745.
+  - `C1`: `--polygon-thinning 1`, the new default as first measured, with
+    polygon thinning still on.
+  - `C1t`: no flags, the shipped default (`C1` with polygon thinning off;
+    see § Polygon thinning off).
   - `C2`: `--polygon-visibility 0 --polygon-thinning 0`.
   - Valves: `--size-valve drop` (re-measuring) or `merge` (the new
     default). The G0 and G1 runs also measured the removed `zoom` and

@@ -104,6 +104,9 @@ pub(super) struct RowGapCursor {
     left: u64,
     band: u16,
     prev: Option<(f64, f64)>,
+    /// Whether [`Self::batch`] measures gaps. Off, every row gets
+    /// [`GAP_NONE`] and no bbox is computed.
+    measure: bool,
 }
 
 impl RowGapCursor {
@@ -114,7 +117,16 @@ impl RowGapCursor {
             left: 0,
             band: 0,
             prev: None,
+            measure: true,
         }
+    }
+
+    /// Whether [`Self::batch`] measures gaps (default on). Off when nothing
+    /// will merge (`--size-valve drop`, or no size limit), so a read pays no
+    /// bbox per row. Bands are reported either way.
+    pub(super) fn measuring(mut self, measure: bool) -> Self {
+        self.measure = measure;
+        self
     }
 
     /// The next row's `(gap, band)`, given its bbox (`None` for an empty
@@ -150,6 +162,9 @@ impl RowGapCursor {
     /// [`Self::next_row`] over a whole batch of decoded geometries. The
     /// bboxes are computed in parallel; the walk itself is sequential.
     pub(super) fn batch(&mut self, geoms: &[Geometry<f64>]) -> Vec<(u64, u16)> {
+        if !self.measure {
+            return geoms.iter().map(|_| self.next_row(None)).collect();
+        }
         let rects: Vec<Option<Rect<f64>>> = geoms.par_iter().map(|g| g.bounding_rect()).collect();
         rects.into_iter().map(|r| self.next_row(r)).collect()
     }
@@ -438,6 +453,25 @@ mod tests {
         let mut d = RowGapCursor::new(vec![(0, 2)]);
         d.next_row(r(0.0));
         assert_eq!(c.next_row(r(1.0)).0, d.next_row(r(1.0)).0);
+    }
+
+    #[test]
+    fn a_cursor_not_measuring_reports_bands_and_no_gaps() {
+        let g =
+            || Geometry::Polygon(polygon![(x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 0.0, y: 1.0)]);
+        let geoms: Vec<Geometry<f64>> = (0..4).map(|_| g()).collect();
+        let groups = vec![(0, 2), (1, 2)];
+        let off = RowGapCursor::new(groups.clone())
+            .measuring(false)
+            .batch(&geoms);
+        assert_eq!(
+            off,
+            [(GAP_NONE, 0), (GAP_NONE, 0), (GAP_NONE, 1), (GAP_NONE, 1)]
+        );
+        let on = RowGapCursor::new(groups).batch(&geoms);
+        let bands: Vec<u16> = on.iter().map(|&(_, b)| b).collect();
+        assert_eq!(bands, [0, 0, 1, 1]);
+        assert!(on[1].0 < GAP_NONE, "measured by default");
     }
 
     #[test]

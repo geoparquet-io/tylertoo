@@ -48,7 +48,7 @@ use geo::{Geometry, LineString, MultiLineString, Point};
 use proptest::prelude::*;
 
 use tylertoo_core::overview::assign::{
-    apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, Crs,
+    apply_density_budget, assign_levels, AssignConfig, AssignFeature, Assignment, BudgetKinds, Crs,
     DensityBudgetConfig, FeatureKind, FeatureTable, SortDirection, MIN_DENSITY_LEVEL_FEATURES,
 };
 use tylertoo_core::overview::cluster::{build_cluster_tables, verify_sum_invariant, AccumulateOp};
@@ -171,16 +171,28 @@ fn crs() -> impl Strategy<Value = Crs> {
     prop_oneof![Just(Crs::Epsg3857), Just(Crs::Epsg4326)]
 }
 
+/// Any subset of the geometry kinds the budget thins (#745), the empty one
+/// included.
+fn budget_kinds() -> impl Strategy<Value = BudgetKinds> {
+    (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(points, lines, polygons)| {
+        BudgetKinds {
+            points,
+            lines,
+            polygons,
+        }
+    })
+}
+
 /// A valid, enabled-or-not density budget within sensible knob bounds.
 fn budget_config() -> impl Strategy<Value = DensityBudgetConfig> {
-    (any::<bool>(), 1.05..4.0f64, 1.0..3.0f64).prop_map(|(enabled, drop_rate, gamma)| {
-        DensityBudgetConfig {
+    (any::<bool>(), 1.05..4.0f64, 1.0..3.0f64, budget_kinds()).prop_map(
+        |(enabled, drop_rate, gamma, kinds)| DensityBudgetConfig {
             enabled,
             drop_rate,
             gamma,
-            ..DensityBudgetConfig::default()
-        }
-    })
+            kinds,
+        },
+    )
 }
 
 /// The per-level budget ceiling `apply_density_budget` enforces (mirrors its
@@ -354,10 +366,23 @@ proptest! {
             "canonical level must keep every feature"
         );
 
-        if budget.enabled && budget.drop_rate > 1.0 && !feats.is_empty() && num_levels >= 2 {
+        // #745: a kind the budget leaves alone keeps its cell-winner level.
+        for (a, b) in cw.assignments.iter().zip(&out.assignments) {
+            if !budget.kinds.includes(feats[a.index].kind) {
+                prop_assert_eq!(a.min_level, b.min_level, "an unbudgeted kind was moved");
+            }
+        }
+        let budgeted = |i: usize| budget.kinds.includes(feats[i].kind);
+        let n_budgeted = feats.iter().filter(|f| budget.kinds.includes(f.kind)).count();
+
+        if budget.enabled && budget.drop_rate > 1.0 && n_budgeted > 0 && num_levels >= 2 {
             for level in 0..num_levels - 1 {
-                let count = out.duplicating_at_level(level as u8).len();
-                let ceiling = budget_ceiling(feats.len(), num_levels, level, budget.drop_rate);
+                let count = out
+                    .duplicating_at_level(level as u8)
+                    .into_iter()
+                    .filter(|&i| budgeted(i))
+                    .count();
+                let ceiling = budget_ceiling(n_budgeted, num_levels, level, budget.drop_rate);
                 prop_assert!(
                     count <= ceiling,
                     "level {level} has {count} rows over its budget ceiling {ceiling}"
@@ -383,6 +408,7 @@ proptest! {
         rate in 1.05..4.0f64,
         factor in 1.01..2.0f64,
         gamma in 1.0..3.0f64,
+        kinds in budget_kinds(),
         crs in crs(),
     ) {
         let cw = assign_levels(&table(&feats), &gsds, &config, crs);
@@ -390,7 +416,7 @@ proptest! {
             enabled: true,
             drop_rate,
             gamma,
-            ..DensityBudgetConfig::default()
+            kinds,
         };
         let loose = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate), crs);
         let strict = apply_density_budget(&cw, &table(&feats), &gsds, &config, &mk(rate * factor), crs);
