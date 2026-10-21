@@ -64,7 +64,7 @@ gpio inspect prepared.parquet
 ```
 
 ```text
-Output: prepared.parquet (17.12 MB)
+Output: prepared.parquet (17.57 MB)
 ✓ Output passes GeoParquet validation (metadata checks)
 ...
 Rows: 17,465
