@@ -72,11 +72,11 @@ bbox+attribute filter: reading 5/167 input row groups
 remote input: 11 range requests, 119.46 MiB fetched of a 2988.72 MiB object (4.0%)
 ...
 ✓ Overview states.txt → fields-ov.parquet  (Duplicating mode)
-  534 input features → 2,506 rows across 11 levels in 77.31s
+  534 input features → 4,447 rows across 13 levels in 1.65s
   lvl        gsd(m)    features    vertices         bytes
-    0       2445.98           3          21  1.15 KiB
+    0       9783.94           3          15  1.03 KiB
 ...
-   10          2.39         534     172,653  504.61 KiB
+   12          2.39         534     172,653  504.61 KiB
 ```
 
 Five of 167 row groups matched: 4% of the three files' bytes. The download
@@ -260,7 +260,7 @@ tylertoo stats brazil.pmtiles
  0      1      143     143     143     143     143
 ...
  7      1    3,142   3,142   3,142   3,142   3,142
- 8      2   19,574   9,787   9,113  10,461  10,461
+ 8      2   30,685  15,342  14,615  16,070  16,070
 ...
 14    125  233,094   1,864   1,799   4,586   5,055
 ...

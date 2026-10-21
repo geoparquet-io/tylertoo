@@ -34,17 +34,20 @@ class TestVerbatim:
         assert counts == {INPUT_FEATURES}
 
     def test_an_explicit_knob_wins_over_verbatim(self) -> None:
-        # The visibility gate alone hides these small polygons below z8;
-        # empty levels are omitted from `levels` and listed as skipped.
+        # The visibility gate alone hides these small polygons below z8.
+        # Placeholder squares stand in for them where a square's worth of
+        # area has been hidden (z6, z7; since #745 at every simplify
+        # factor, verbatim's 0 included); the levels above that stay empty
+        # and are listed as skipped.
         report = _overview(max_zoom=8, verbatim=True, polygon_visibility=2.0)
-        assert [s["zoom"] for s in report["skipped_empty_levels"]] == list(range(8))
+        assert [s["zoom"] for s in report["skipped_empty_levels"]] == list(range(6))
 
     def test_unset_knobs_keep_the_documented_defaults(self) -> None:
         explicit = _overview(
             max_zoom=8,
             simplify_factor=1.0,
             line_thinning=1.0,
-            polygon_thinning=1.0,
+            polygon_thinning=0.0,
             line_visibility=2.0,
             polygon_visibility=2.0,
             density_drop=True,

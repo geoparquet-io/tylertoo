@@ -28,7 +28,7 @@ coarse and middle zooms. Three defaults work together:
   [thinned](#feature-thinning-pointlinepolygon-thinning) per cell. Lines and
   polygons keep every feature that passes the visibility gates.
 - A polygon too small to draw at a level becomes a small
-  [placeholder square](#collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
+  [placeholder square](#-collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
   and the polygons that thinning removes are represented by squares too, so
   dense areas stay filled.
 - When a tile goes over the [size cap](#tile-size-cap), its densest lines and
@@ -371,7 +371,7 @@ with little loss of legibility. Polygon thinning is off since #745: a cell
 keeps one polygon by bbox centre, so a polygon whose centre falls in a
 larger neighbour's cell, such as a parcel inside a ring-shaped one, lost
 every coarse level and left a hole. The visibility gate and
-[placeholder squares](#collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition)
+[placeholder squares](#-collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition)
 already handle polygons too small to draw, so turning it off cost nothing
 measurable on NZ Parcels
 ([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
