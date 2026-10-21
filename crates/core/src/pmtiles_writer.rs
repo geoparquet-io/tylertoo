@@ -3541,15 +3541,19 @@ mod tests {
         assert_eq!(tile_id(2, 0, 0), 5);
     }
 
-    /// #371: the cumulative base is now the closed form `(4^z - 4) / 3`
-    /// instead of `sum(4^i for i in 1..z)` with `4u64.pow`, which overflowed
-    /// u64 at z32. The two must agree everywhere the old one was defined.
+    /// #371: the cumulative base is the closed form `(4^z - 1) / 3`
+    /// ([`crate::tile::hilbert_zoom_base`]) instead of `sum(4^i for i in 0..z)`
+    /// with `4u64.pow`, which overflowed u64 at z32. The two must agree
+    /// everywhere the old one was defined.
     #[test]
     fn tile_id_base_closed_form_matches_the_summation() {
-        for z in 1..=MAX_TILE_ID_ZOOM {
-            let summed: u64 = (1..u64::from(z)).map(|i| 4u64.pow(i as u32)).sum();
-            let closed = ((1u64 << (2 * u32::from(z))) - 4) / 3;
-            assert_eq!(closed, summed, "base id mismatch at z{z}");
+        for z in 0..=MAX_TILE_ID_ZOOM {
+            let summed: u64 = (0..u32::from(z)).map(|i| 4u64.pow(i)).sum();
+            assert_eq!(
+                crate::tile::hilbert_zoom_base(z),
+                summed,
+                "base id mismatch at z{z}"
+            );
         }
     }
 
