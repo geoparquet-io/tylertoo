@@ -258,13 +258,13 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 /// The first PMTiles tile id at zoom `z`: `(4^z - 1) / 3`, the count of tiles
 /// at every shallower zoom (`sum(4^i for i in 0..z)`).
 ///
-/// This is the same cumulative base [`crate::pmtiles_writer::tile_id`] adds
-/// its within-zoom Hilbert index to (that function's `base_id` is this value
-/// minus 1, folded into a `+ hilbert_idx + 1` for `z >= 1`; both forms agree
-/// for every `z`, this one included at `z = 0`).
+/// This is the cumulative base [`crate::pmtiles_writer::tile_id`] adds its
+/// within-zoom Hilbert index to. Valid for `z <= 32`: the value at 32 is the
+/// one-past-the-end of z31's block, so it is computed in u128.
 #[inline]
 pub(crate) fn hilbert_zoom_base(z: u8) -> u64 {
-    ((1u64 << (2 * u32::from(z))) - 1) / 3
+    debug_assert!(z <= 32);
+    (((1u128 << (2 * u32::from(z))) - 1) / 3) as u64
 }
 
 /// The inclusive range of PMTiles tile ids, at `target_z`, addressed by

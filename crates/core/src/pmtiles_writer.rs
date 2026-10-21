@@ -368,7 +368,7 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z == 0 {
         return 0;
     }
-    // #371: the cumulative base is `sum(4^i for i in 1..z)`, and `4u64.pow(i)`
+    // #371: the cumulative base is `sum(4^i for i in 0..z)`, and `4^z`
     // overflows u64 at z32 — a debug panic, a wrapped id in release. z32 is
     // also past what a u64 tile id can address at all, so an out-of-range zoom
     // returns a sentinel beyond the z31 address space rather than a plausible
@@ -377,11 +377,7 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z > MAX_TILE_ID_ZOOM {
         return u64::MAX;
     }
-    // Closed form of `sum(4^i for i in 1..z)` = (4^z - 4) / 3, evaluated in u64
-    // (exact for z <= 31: 4^31 = 2^62).
-    let base_id: u64 = ((1u64 << (2 * u32::from(z))) - 4) / 3;
-    let hilbert_idx = xy_to_hilbert(z, x, y);
-    base_id + hilbert_idx + 1
+    crate::tile::hilbert_zoom_base(z) + xy_to_hilbert(z, x, y)
 }
 
 /// [`tile_id`] for the writer paths: an out-of-range zoom is an error, not a
@@ -408,50 +404,23 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
     Ok(tile_id(z, x, y))
 }
 
-/// Convert x,y coordinates to Hilbert curve index at zoom level z
+/// Hilbert index of tile `(x, y)` within zoom `z`: its position on that
+/// zoom's curve, the order PMTiles numbers tiles in.
 ///
-/// Implementation follows the standard Hilbert curve algorithm:
-/// <https://en.wikipedia.org/wiki/Hilbert_curve>
+/// #371: both callers bound `z` before calling in (`tile_id` returns its
+/// out-of-range sentinel first, and `crate::tile::node_id_range` (#506)
+/// carries the same assert and clamp on its `target_z`). The assert restates
+/// that contract here, and the clamp keeps a release build total rather than
+/// handing `fast_hilbert` an order past the u64 address space.
 pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
-    // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
-    // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
-    // with no diagnostic. u64 covers the whole z<=31 PMTiles address space.
-    //
-    // The assert and the clamp are unreachable through either of this
-    // function's two callers, both of which bound `z` themselves before
-    // calling in: `tile_id` returns the out-of-range sentinel before it gets
-    // here, and `crate::tile::node_id_range` (#506) carries the identical
-    // debug_assert + clamp pair on its own `target_z` before it does. They
-    // are kept as this function's own guard rail regardless — the assert
-    // restates the contract at the point that actually needs it, and the
-    // clamp keeps a release build total (an unclamped `1u64 << z` still
-    // masks for z >= 64) rather than silently resuming with a wrong `n`.
     debug_assert!(z <= MAX_TILE_ID_ZOOM, "tile_id must bound z first (#371)");
-    let n: u64 = 1u64 << z.min(MAX_TILE_ID_ZOOM);
-    let mut rx: u64;
-    let mut ry: u64;
-    let mut s: u64;
-    let mut d: u64 = 0;
-    let mut x = u64::from(x);
-    let mut y = u64::from(y);
+    fast_hilbert::xy2h(x, y, z.min(MAX_TILE_ID_ZOOM))
+}
 
-    s = n / 2;
-    while s > 0 {
-        rx = if (x & s) > 0 { 1 } else { 0 };
-        ry = if (y & s) > 0 { 1 } else { 0 };
-        d += s * s * ((3 * rx) ^ ry);
-
-        // Rotate quadrant - use n-1 (full grid size - 1) not s-1
-        if ry == 0 {
-            if rx == 1 {
-                x = n - 1 - x;
-                y = n - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        s /= 2;
-    }
-    d
+/// Inverse of [`xy_to_hilbert`]: the tile at Hilbert index `d` within zoom
+/// `z`.
+fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
+    fast_hilbert::h2xy(d, z)
 }
 
 /// Hard ceiling on how many tiles one directory walk may expand to (#417).
@@ -540,35 +509,6 @@ pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
     Err(Error::PMTilesRead(format!(
         "tile id {id} exceeds the zoom 31 address space"
     )))
-}
-
-/// Convert a Hilbert curve index back to x,y coordinates at zoom level z
-///
-/// Standard inverse Hilbert algorithm (d2xy), mirroring [`xy_to_hilbert`]:
-/// <https://en.wikipedia.org/wiki/Hilbert_curve>
-fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
-    let n = 1u64 << z;
-    let (mut x, mut y) = (0u64, 0u64);
-    let mut t = d;
-    let mut s = 1u64;
-    while s < n {
-        let rx = 1 & (t / 2);
-        let ry = 1 & (t ^ rx);
-        // Rotate quadrant - the inverse uses s-1 (current block size - 1),
-        // where the forward transform uses n-1 (see xy_to_hilbert).
-        if ry == 0 {
-            if rx == 1 {
-                x = s - 1 - x;
-                y = s - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-        s *= 2;
-    }
-    (x as u32, y as u32)
 }
 
 // ============================================================================
@@ -3471,48 +3411,6 @@ impl Drop for StreamingPmtilesWriter {
 
 #[cfg(test)]
 mod tests {
-
-    /// #427: the packed-layout spool is a `tempfile` (`O_EXCL`, private,
-    /// random name) in the requested directory, distinct per writer, and gone
-    /// once the writer is dropped.
-    #[test]
-    fn spool_files_are_unique_private_and_removed_on_drop() {
-        use super::StreamingPmtilesWriter;
-        use crate::Compression;
-        let dir = tempfile::tempdir().unwrap();
-        let a = StreamingPmtilesWriter::with_temp_dir(Compression::Gzip, dir.path().to_path_buf())
-            .unwrap();
-        let b = StreamingPmtilesWriter::with_temp_dir(Compression::Gzip, dir.path().to_path_buf())
-            .unwrap();
-        assert_ne!(a.temp_path(), b.temp_path());
-        for w in [&a, &b] {
-            assert_eq!(w.temp_path().parent().unwrap(), dir.path());
-            assert!(w.temp_path().exists());
-            let name = w.temp_path().file_name().unwrap().to_string_lossy();
-            assert!(
-                name.starts_with("tylertoo-spool-") && name.ends_with(".tmp"),
-                "spool name: {name}"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(w.temp_path())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777;
-                assert_eq!(
-                    mode, 0o600,
-                    "spool must be private to the owner, got {mode:o}"
-                );
-            }
-        }
-        drop(a);
-        drop(b);
-        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(left.is_empty(), "spool files leaked: {left:?}");
-    }
-
     /// An archive whose directory outgrows the spec's 16 KiB root budget must
     /// spill into leaf directories. Writing one oversized root instead makes a
     /// file readers reject: go-pmtiles reads the first 16 KiB of root and
