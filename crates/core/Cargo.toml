@@ -69,7 +69,7 @@ flate2 = "1"
 # Dependabot ignores newer majors; move them only with parquet (#649).
 brotli = "8"
 zstd = "0.13"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
 # PMTiles tile ids: the Hilbert index at each zoom (the crate pmtiles-rs uses).
 fast_hilbert = "2.1"
 # Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
