@@ -49,7 +49,7 @@ class LevelReport(TypedDict):
 
     level: int
     gsd: float
-    zoom: int
+    zoom: int | None
     feature_count: int
     vertex_count: int
     uncompressed_bytes: int
@@ -61,7 +61,7 @@ class SkippedLevel(TypedDict):
 
     planned_level: int
     gsd: float
-    zoom: int
+    zoom: int | None
 
 
 class OutOfRangeExemplar(TypedDict):
