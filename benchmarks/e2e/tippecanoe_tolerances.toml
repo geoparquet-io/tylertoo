@@ -71,47 +71,52 @@ zoom_range = [0, 14]
 # ---------------------------------------------------------------------------
 
 [datasets."madagascar-adm4".totals]
-tiles = [0.99, 1.01]          # measured 1.000 (153,052 / 153,047): same pyramid
+tiles = [0.99, 1.01]          # measured 1.000 (153,053 / 153,047): same pyramid
 features = [0.90, 0.95]       # measured 0.922: the z1-z6 ramp (A) is the whole gap
-distinct_ids = [0.76, 0.82]   # measured 0.790: same ramp, deduplicated per zoom
-vertices = [0.72, 0.80]       # measured 0.759: (B) at every zoom below z14
-bytes = [0.93, 1.01]          # measured 0.972 (archive size): (B) minus (C)
+distinct_ids = [0.76, 0.82]   # measured 0.794: same ramp, deduplicated per zoom
+vertices = [0.72, 0.80]       # measured 0.776: (B) at every zoom below z14
+bytes = [0.93, 1.01]          # measured 0.974 (archive size): (B) minus (C)
 
 # z1-z2: polygons collapse at a 10-20 km GSD (A). Since #745 a collapsed
 # polygon becomes a placeholder square by default, as in tippecanoe, so
-# tylertoo carries 1,721 and 1,624 of tippecanoe's 4,894 and 10,383 features
-# (before #745: 40 and 787). z0 now holds a tile too (1,853 vs 1,646, not
-# gated). Re-measured 2026-10-20 (#745 branch).
+# tylertoo carries 2,099 and 2,127 of tippecanoe's 4,894 and 10,383 features
+# (before #745: 40 and 787). z0 now holds a tile too (2,089 vs 1,646, not
+# gated). The size valve's merge threshold now stops at the quantile gap
+# instead of snapping up to a power of two, so the oversized z1-z2 tiles
+# merge fewer polygons (z1 0.352 and z2 0.156 with the snap). Re-measured
+# 2026-10-21 (CI, #745 branch).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [1, 2]
-features = [0.12, 0.40]       # measured z1 0.352, z2 0.156
-distinct_ids = [0.12, 0.40]   # measured z1 0.352, z2 0.156
-vertices = [0.28, 0.55]       # measured z1 0.485, z2 0.339
-bytes = [0.20, 0.55]          # measured z1 0.492, z2 0.258
+features = [0.18, 0.47]       # measured z1 0.429, z2 0.205
+distinct_ids = [0.18, 0.47]   # measured z1 0.429, z2 0.205
+vertices = [0.32, 0.59]       # measured z1 0.536, z2 0.352
+bytes = [0.27, 0.61]          # measured z1 0.558, z2 0.305
 
 # z3-z6: the ramp (A). tippecanoe keeps 13-19k feature instances per zoom
-# (placeholders included); tylertoo keeps 4-8k. Since #745 the 500K cap
+# (placeholders included); tylertoo keeps 4-9k. Since #745 the 500K cap
 # merges polygons instead of dropping them (features and ids down a little,
 # vertices up: merged parts keep their geometry), and collapsed polygons are
-# squares. Re-measured 2026-10-20.
+# squares. Re-measured 2026-10-21 (CI), after the merge threshold stopped
+# snapping up to a power of two (features were 0.270-0.472 with the snap).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [3, 6]
 tiles = [0.99, 1.01]          # measured 1.000 at every zoom (2/2, 4/4, 4/4, 7/7)
-features = [0.24, 0.52]       # measured 0.270, 0.393, 0.472, 0.394
-distinct_ids = [0.24, 0.49]   # measured 0.267, 0.375, 0.443, 0.381
-vertices = [0.41, 0.74]       # measured 0.589, 0.665, 0.697, 0.455
-bytes = [0.35, 0.65]          # measured 0.391, 0.507, 0.592, 0.468
+features = [0.29, 0.55]       # measured 0.321, 0.451, 0.503, 0.470
+distinct_ids = [0.28, 0.52]   # measured 0.315, 0.421, 0.473, 0.457
+vertices = [0.43, 0.77]       # measured 0.597, 0.674, 0.704, 0.473
+bytes = [0.39, 0.68]          # measured 0.432, 0.551, 0.617, 0.518
 
 # z7: end of the ramp. Two tiles are over the 500K cap; since #745 they
-# merge their densest polygons into neighbours, so 14,536 of 17,463
-# polygons keep their own id here (all of them still draw).
+# merge their densest polygons into neighbours, so 15,248 of 17,463
+# polygons keep their own id here (all of them still draw; 14,536 when the
+# merge threshold snapped up to a power of two). Re-measured 2026-10-21 (CI).
 [[datasets."madagascar-adm4".zoom_bands]]
 zooms = [7, 7]
 tiles = [0.99, 1.01]          # measured 1.000 (16/16)
-features = [0.79, 0.87]       # measured 0.830 (0.922 before #745)
-distinct_ids = [0.79, 0.87]   # measured 0.832 (0.925 before #745)
-vertices = [0.45, 0.60]       # measured 0.532 (B)
-bytes = [0.70, 0.85]          # measured 0.772
+features = [0.83, 0.92]       # measured 0.876 (0.830 with the snap, 0.922 before #745)
+distinct_ids = [0.83, 0.92]   # measured 0.873 (0.832 with the snap, 0.925 before #745)
+vertices = [0.45, 0.60]       # measured 0.540 (B)
+bytes = [0.68, 0.82]          # measured 0.741
 
 # z8-z13: every polygon reaches every tile on both sides; the residual is
 # (B) on vertices/bytes and (C) on feature instances.
@@ -119,7 +124,7 @@ bytes = [0.70, 0.85]          # measured 0.772
 zooms = [8, 13]
 tiles = [0.99, 1.01]          # measured 1.000-1.001 (at most 2 tiles apart)
 features = [0.98, 1.02]       # measured 1.001-1.004
-distinct_ids = [0.99, 1.005]  # measured 0.997 (z8: 17,406/17,465), then 1.000
+distinct_ids = [0.99, 1.005]  # measured 0.999 (z8: 17,454/17,465), then 1.000
 vertices = [0.50, 0.80]       # measured 0.554 (z8) rising to 0.760 (z13): (B)
 bytes = [0.74, 1.00]          # measured 0.784 (z8) rising to 0.980 (z13)
 tile_features_median = [0.98, 1.02]  # measured 1.003 (z8), 1.000 (z9-z13)
