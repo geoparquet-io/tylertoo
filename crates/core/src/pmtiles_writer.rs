@@ -1222,6 +1222,27 @@ pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 // Task 9: Full PMTiles Writer
 // ============================================================================
 
+/// Quote `s` as a JSON string. Layer and field names come from the user
+/// (`--layer-name`, the input file stem, Parquet column names), so they go
+/// through `serde_json`, never between hand-written quotes. A plain name
+/// comes out exactly as `format!("\"{s}\"")` would write it.
+fn json_string(s: &str) -> String {
+    // Serializing a `str` into a `String` cannot fail.
+    serde_json::to_string(s).expect("JSON string serialization")
+}
+
+/// Render the single-layer `vector_layers` array both writers fall back to
+/// when no explicit `vector_layers` JSON was supplied.
+fn single_vector_layer_json(layer_name: &str, min_zoom: u8, max_zoom: u8, fields: &str) -> String {
+    format!(
+        r#"[{{"id":{},"minzoom":{},"maxzoom":{},"fields":{}}}]"#,
+        json_string(layer_name),
+        min_zoom,
+        max_zoom,
+        fields
+    )
+}
+
 /// Render the TileJSON `fields` object for a layer.
 ///
 /// Shared by `PmtilesWriter` and `StreamingPmtilesWriter`: both emit the same
@@ -1237,7 +1258,7 @@ fn fields_json(fields: &HashMap<String, String>) -> String {
 
     let field_strings: Vec<String> = field_pairs
         .iter()
-        .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+        .map(|(name, type_str)| format!("{}:{}", json_string(name), json_string(type_str)))
         .collect();
 
     format!("{{{}}}", field_strings.join(","))
@@ -1253,8 +1274,10 @@ fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> 
     }
 
     format!(
-        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
-        layer_name, total_features, field_count
+        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":{},"count":{},"attributeCount":{}}}]}},"#,
+        json_string(layer_name),
+        total_features,
+        field_count
     )
 }
 
@@ -1826,13 +1849,9 @@ impl PmtilesWriter {
         let tilestats_json = self.build_tilestats_json();
         let vector_layers = match &self.vector_layers_json {
             Some(json) => json.clone(),
-            None => format!(
-                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
-                self.layer_name,
-                min_z,
-                max_z,
-                self.build_fields_json()
-            ),
+            None => {
+                single_vector_layer_json(&self.layer_name, min_z, max_z, &self.build_fields_json())
+            }
         };
         let metadata = metadata_json(&vector_layers, &tilestats_json, &self.metadata);
         let compressed_metadata = encode_metadata(&metadata, self.internal_compression)?;
@@ -3394,13 +3413,9 @@ impl StreamingPmtilesWriter {
         let tilestats_json = self.build_tilestats_json();
         let vector_layers = match &self.vector_layers_json {
             Some(json) => json.clone(),
-            None => format!(
-                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
-                self.layer_name,
-                min_z,
-                max_z,
-                self.build_fields_json()
-            ),
+            None => {
+                single_vector_layer_json(&self.layer_name, min_z, max_z, &self.build_fields_json())
+            }
         };
 
         metadata_json(&vector_layers, &tilestats_json, &self.metadata)
@@ -7045,6 +7060,33 @@ mod tests {
         // pinned to a whole-archive hash: that would pin the deflate encoder's
         // output too, and fail on a `flate2` bump that changed nothing here.
         assert_eq!(b, s, "the two writers agree byte for byte");
+    }
+
+    /// Layer and field names come from the user (`--layer-name`, the input
+    /// file stem, Parquet column names), so quotes, backslashes and control
+    /// characters in them must stay valid JSON.
+    #[test]
+    fn hostile_layer_and_field_names_stay_valid_json() {
+        let hostile_field = "a \"quoted\" \\ name\n";
+        let hostile_layer = "parks \"2026\" \\ v1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.pmtiles");
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(hostile_layer);
+        w.set_fields(HashMap::from([(
+            hostile_field.to_string(),
+            "String".to_string(),
+        )]));
+        for (z, x, y, data, n) in PUB_TILES {
+            w.add_tile_with_count(z, x, y, data, n).unwrap();
+        }
+        w.finalize(&path).unwrap();
+
+        let map = metadata_object(&fs::read(&path).unwrap());
+        let layer = &map["vector_layers"][0];
+        assert_eq!(layer["id"], hostile_layer);
+        assert_eq!(layer["fields"][hostile_field], "String");
+        assert_eq!(map["tilestats"]["layers"][0]["layer"], hostile_layer);
     }
 
     fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
