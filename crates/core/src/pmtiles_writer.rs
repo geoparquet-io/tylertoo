@@ -9,12 +9,11 @@
 //! - Clustered mode for efficient sequential reads
 
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES};
-use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::pmtiles_metadata::TilesetMetadata;
 use crate::tile::TileBounds;
-use crate::world_coord::MAX_LATITUDE;
+use crate::tile::MAX_LATITUDE;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -368,7 +367,7 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z == 0 {
         return 0;
     }
-    // #371: the cumulative base is `sum(4^i for i in 1..z)`, and `4u64.pow(i)`
+    // #371: the cumulative base is `sum(4^i for i in 0..z)`, and `4^z`
     // overflows u64 at z32 — a debug panic, a wrapped id in release. z32 is
     // also past what a u64 tile id can address at all, so an out-of-range zoom
     // returns a sentinel beyond the z31 address space rather than a plausible
@@ -377,11 +376,7 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
     if z > MAX_TILE_ID_ZOOM {
         return u64::MAX;
     }
-    // Closed form of `sum(4^i for i in 1..z)` = (4^z - 4) / 3, evaluated in u64
-    // (exact for z <= 31: 4^31 = 2^62).
-    let base_id: u64 = ((1u64 << (2 * u32::from(z))) - 4) / 3;
-    let hilbert_idx = xy_to_hilbert(z, x, y);
-    base_id + hilbert_idx + 1
+    crate::tile::hilbert_zoom_base(z) + xy_to_hilbert(z, x, y)
 }
 
 /// [`tile_id`] for the writer paths: an out-of-range zoom is an error, not a
@@ -393,6 +388,10 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
 /// `finalize` would happily produce an archive addressing one impossible tile.
 /// The `add_tile*` family already returns [`std::io::Result`], so the zoom is
 /// rejected there — before the id is computed, before any bytes are written.
+///
+/// So is a tile outside its zoom's `2^z x 2^z` grid: the Hilbert index sizes
+/// its curve from `x | y`, so such a tile gets the id of a tile at a deeper
+/// zoom and would overwrite that tile's directory entry.
 fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
     if z > MAX_TILE_ID_ZOOM {
         return Err(std::io::Error::new(
@@ -405,53 +404,32 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
             ),
         ));
     }
+    if u64::from(x | y) >= 1u64 << z {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("tile {z}/{x}/{y} is outside the zoom {z} grid (x and y must be < 2^{z})"),
+        ));
+    }
     Ok(tile_id(z, x, y))
 }
 
-/// Convert x,y coordinates to Hilbert curve index at zoom level z
+/// Hilbert index of tile `(x, y)` within zoom `z`: its position on that
+/// zoom's curve, the order PMTiles numbers tiles in.
 ///
-/// Implementation follows the standard Hilbert curve algorithm:
-/// <https://en.wikipedia.org/wiki/Hilbert_curve>
+/// #371: both callers bound `z` before calling in (`tile_id` returns its
+/// out-of-range sentinel first, and `crate::tile::node_id_range` (#506)
+/// carries the same assert and clamp on its `target_z`). The assert restates
+/// that contract here, and the clamp keeps a release build total rather than
+/// handing `fast_hilbert` an order past the u64 address space.
 pub(crate) fn xy_to_hilbert(z: u8, x: u32, y: u32) -> u64 {
-    // #371: `1u32 << z` overflows at z32 — in release it masks the shift to
-    // `z & 31`, so z32 yields n = 1 and every tile id in the archive is wrong
-    // with no diagnostic. u64 covers the whole z<=31 PMTiles address space.
-    //
-    // The assert and the clamp are unreachable through either of this
-    // function's two callers, both of which bound `z` themselves before
-    // calling in: `tile_id` returns the out-of-range sentinel before it gets
-    // here, and `crate::tile::node_id_range` (#506) carries the identical
-    // debug_assert + clamp pair on its own `target_z` before it does. They
-    // are kept as this function's own guard rail regardless — the assert
-    // restates the contract at the point that actually needs it, and the
-    // clamp keeps a release build total (an unclamped `1u64 << z` still
-    // masks for z >= 64) rather than silently resuming with a wrong `n`.
     debug_assert!(z <= MAX_TILE_ID_ZOOM, "tile_id must bound z first (#371)");
-    let n: u64 = 1u64 << z.min(MAX_TILE_ID_ZOOM);
-    let mut rx: u64;
-    let mut ry: u64;
-    let mut s: u64;
-    let mut d: u64 = 0;
-    let mut x = u64::from(x);
-    let mut y = u64::from(y);
+    fast_hilbert::xy2h(x, y, z.min(MAX_TILE_ID_ZOOM))
+}
 
-    s = n / 2;
-    while s > 0 {
-        rx = if (x & s) > 0 { 1 } else { 0 };
-        ry = if (y & s) > 0 { 1 } else { 0 };
-        d += s * s * ((3 * rx) ^ ry);
-
-        // Rotate quadrant - use n-1 (full grid size - 1) not s-1
-        if ry == 0 {
-            if rx == 1 {
-                x = n - 1 - x;
-                y = n - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        s /= 2;
-    }
-    d
+/// Inverse of [`xy_to_hilbert`]: the tile at Hilbert index `d` within zoom
+/// `z`.
+fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
+    fast_hilbert::h2xy(d, z)
 }
 
 /// Hard ceiling on how many tiles one directory walk may expand to (#417).
@@ -540,35 +518,6 @@ pub fn tile_id_to_zxy(id: u64) -> Result<(u8, u32, u32)> {
     Err(Error::PMTilesRead(format!(
         "tile id {id} exceeds the zoom 31 address space"
     )))
-}
-
-/// Convert a Hilbert curve index back to x,y coordinates at zoom level z
-///
-/// Standard inverse Hilbert algorithm (d2xy), mirroring [`xy_to_hilbert`]:
-/// <https://en.wikipedia.org/wiki/Hilbert_curve>
-fn hilbert_d2xy(z: u8, d: u64) -> (u32, u32) {
-    let n = 1u64 << z;
-    let (mut x, mut y) = (0u64, 0u64);
-    let mut t = d;
-    let mut s = 1u64;
-    while s < n {
-        let rx = 1 & (t / 2);
-        let ry = 1 & (t ^ rx);
-        // Rotate quadrant - the inverse uses s-1 (current block size - 1),
-        // where the forward transform uses n-1 (see xy_to_hilbert).
-        if ry == 0 {
-            if rx == 1 {
-                x = s - 1 - x;
-                y = s - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-        s *= 2;
-    }
-    (x as u32, y as u32)
 }
 
 // ============================================================================
@@ -1222,11 +1171,30 @@ pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 // Task 9: Full PMTiles Writer
 // ============================================================================
 
+/// Quote `s` as a JSON string. Layer and field names come from the user
+/// (`--layer-name`, the input file stem, Parquet column names), so they go
+/// through `serde_json`, never between hand-written quotes. A plain name
+/// comes out exactly as `format!("\"{s}\"")` would write it.
+fn json_string(s: &str) -> String {
+    // Serializing a `str` into a `String` cannot fail.
+    serde_json::to_string(s).expect("JSON string serialization")
+}
+
+/// Render the single-layer `vector_layers` array the writer falls back to
+/// when no explicit `vector_layers` JSON was supplied.
+fn single_vector_layer_json(layer_name: &str, min_zoom: u8, max_zoom: u8, fields: &str) -> String {
+    format!(
+        r#"[{{"id":{},"minzoom":{},"maxzoom":{},"fields":{}}}]"#,
+        json_string(layer_name),
+        min_zoom,
+        max_zoom,
+        fields
+    )
+}
+
 /// Render the TileJSON `fields` object for a layer.
 ///
-/// Shared by `PmtilesWriter` and `StreamingPmtilesWriter`: both emit the same
-/// metadata, and a second copy of this drifted once already. Field names are
-/// sorted so the output is byte-for-byte deterministic.
+/// Field names are sorted so the output is byte-for-byte deterministic.
 fn fields_json(fields: &HashMap<String, String>) -> String {
     if fields.is_empty() {
         return "{}".to_string();
@@ -1237,7 +1205,7 @@ fn fields_json(fields: &HashMap<String, String>) -> String {
 
     let field_strings: Vec<String> = field_pairs
         .iter()
-        .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+        .map(|(name, type_str)| format!("{}:{}", json_string(name), json_string(type_str)))
         .collect();
 
     format!("{{{}}}", field_strings.join(","))
@@ -1246,24 +1214,25 @@ fn fields_json(fields: &HashMap<String, String>) -> String {
 /// Render the TileJSON `tilestats` fragment, including its trailing comma.
 ///
 /// Returns an empty string when the archive holds no features, which keeps the
-/// surrounding metadata object valid. Shared with `fields_json` above.
+/// surrounding metadata object valid.
 fn tilestats_json(layer_name: &str, total_features: u64, field_count: usize) -> String {
     if total_features == 0 {
         return String::new();
     }
 
     format!(
-        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
-        layer_name, total_features, field_count
+        r#""tilestats":{{"layerCount":1,"layers":[{{"layer":{},"count":{},"attributeCount":{}}}]}},"#,
+        json_string(layer_name),
+        total_features,
+        field_count
     )
 }
 
 /// Assemble the archive's metadata JSON.
 ///
-/// Shared by both writers so their metadata cannot drift. The structural keys
-/// keep their historical layout and order; publication fields follow them, so
-/// an archive without publication metadata is byte-identical to one written
-/// before those fields existed.
+/// The structural keys keep their historical layout and order; publication
+/// fields follow them, so an archive without publication metadata is
+/// byte-identical to one written before those fields existed.
 fn metadata_json(
     vector_layers: &str,
     tilestats_json: &str,
@@ -1311,651 +1280,6 @@ fn encode_metadata_capped(json: &str, compression: Compression, cap: u64) -> Res
         )));
     }
     Ok(encoded)
-}
-
-/// Tile entry with its content key for deduplication
-#[derive(Debug, Clone)]
-struct TileEntry {
-    /// Compressed tile data (only stored for unique tiles)
-    data: Option<Vec<u8>>,
-    /// Which stored body this tile is (for deduplication)
-    key: ContentKey,
-}
-
-/// The identity of one stored tile body: its content hash, plus an ordinal
-/// that tells apart bodies whose bytes differ under one hash (#531). Two
-/// entries with equal keys hold equal bytes, because
-/// [`PmtilesWriter::content_key`] compares the bytes before it hands out an
-/// existing key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ContentKey {
-    hash: u64,
-    ordinal: u32,
-}
-
-/// PMTiles v3 writer
-///
-/// Accumulates tiles in memory (sorted by `tile_id` via `BTreeMap`),
-/// then writes the complete archive on finalize.
-///
-/// Supports tile deduplication: identical tiles are stored once and
-/// referenced via PMTiles' `run_length` feature.
-pub struct PmtilesWriter {
-    /// `tile_id` -> tile entry (data + hash)
-    tiles: BTreeMap<u64, TileEntry>,
-    min_zoom: u8,
-    max_zoom: u8,
-    bounds: TileBounds,
-    layer_name: String,
-    /// Field metadata: field name -> MVT type ("String", "Number", "Boolean")
-    fields: HashMap<String, String>,
-    /// Total feature count across all tiles
-    total_features: u64,
-    /// Feature count per zoom level
-    features_per_zoom: HashMap<u8, u64>,
-    /// Compression algorithm for tile data
-    tile_compression: Compression,
-    /// Compression algorithm for internal data (directories, metadata)
-    internal_compression: Compression,
-    /// Whether deduplication is enabled
-    dedup_enabled: bool,
-    /// Deduplication cache for tracking seen tiles
-    dedup_cache: DeduplicationCache,
-    /// Hash → the tile id that first stored each distinct body under that
-    /// hash, indexed by [`ContentKey::ordinal`]. One entry per hash unless
-    /// xxh3-64 collided (#531).
-    carriers: HashMap<u64, Vec<u64>>,
-    /// Verbatim `vector_layers` array, when the archive holds more than the one
-    /// layer `layer_name`/`fields` can describe (a merged band pyramid). When
-    /// set it replaces the single-layer entry the writer would otherwise build.
-    vector_layers_json: Option<String>,
-    /// Top-level publication metadata (`name`, `description`, `attribution`).
-    metadata: TilesetMetadata,
-}
-
-impl PmtilesWriter {
-    /// Create a new PMTiles writer with default gzip compression
-    ///
-    /// Deduplication is disabled by default for backward compatibility.
-    /// Call `enable_deduplication(true)` to enable it.
-    pub fn new() -> Self {
-        Self {
-            tiles: BTreeMap::new(),
-            min_zoom: 255,
-            max_zoom: 0,
-            bounds: TileBounds::empty(),
-            layer_name: "layer".to_string(),
-            fields: HashMap::new(),
-            total_features: 0,
-            features_per_zoom: HashMap::new(),
-            tile_compression: Compression::Gzip,
-            internal_compression: Compression::Gzip,
-            dedup_enabled: false,
-            dedup_cache: DeduplicationCache::new(),
-            carriers: HashMap::new(),
-            vector_layers_json: None,
-            metadata: TilesetMetadata::default(),
-        }
-    }
-
-    /// Create a new PMTiles writer with specified compression
-    ///
-    /// Both tile data and internal data (directories, metadata) will use
-    /// the same compression algorithm. Deduplication is disabled by default.
-    pub fn with_compression(compression: Compression) -> Self {
-        Self {
-            tiles: BTreeMap::new(),
-            min_zoom: 255,
-            max_zoom: 0,
-            bounds: TileBounds::empty(),
-            layer_name: "layer".to_string(),
-            fields: HashMap::new(),
-            total_features: 0,
-            features_per_zoom: HashMap::new(),
-            tile_compression: compression,
-            internal_compression: compression,
-            dedup_enabled: false,
-            dedup_cache: DeduplicationCache::new(),
-            carriers: HashMap::new(),
-            vector_layers_json: None,
-            metadata: TilesetMetadata::default(),
-        }
-    }
-
-    /// Enable or disable tile deduplication
-    pub fn enable_deduplication(&mut self, enabled: bool) {
-        self.dedup_enabled = enabled;
-    }
-
-    /// Set the compression algorithm for tile data
-    pub fn set_tile_compression(&mut self, compression: Compression) {
-        self.tile_compression = compression;
-    }
-
-    /// Set the compression algorithm for internal data (directories, metadata)
-    pub fn set_internal_compression(&mut self, compression: Compression) {
-        self.internal_compression = compression;
-    }
-
-    /// Get the current tile compression setting
-    pub fn tile_compression(&self) -> Compression {
-        self.tile_compression
-    }
-
-    /// Get the current internal compression setting
-    pub fn internal_compression(&self) -> Compression {
-        self.internal_compression
-    }
-
-    /// Check if deduplication is enabled
-    pub fn is_dedup_enabled(&self) -> bool {
-        self.dedup_enabled
-    }
-
-    /// Get current deduplication statistics
-    pub fn dedup_stats(&self) -> &DeduplicationStats {
-        self.dedup_cache.stats()
-    }
-
-    /// Set the layer name for `vector_layers` metadata
-    pub fn set_layer_name(&mut self, name: &str) {
-        self.layer_name = name.to_string();
-    }
-
-    /// Replace the whole `vector_layers` array with a verbatim JSON array.
-    ///
-    /// A single-layer archive is described by `layer_name` + `fields`; a merged
-    /// band pyramid has several layers, each with its own zoom range and field
-    /// set, which that pair cannot express.
-    pub fn set_vector_layers_json(&mut self, json: String) {
-        self.vector_layers_json = Some(json);
-    }
-
-    /// Set field metadata for `vector_layers.fields`
-    ///
-    /// Field types should be MVT-style: "String", "Number", or "Boolean"
-    pub fn set_fields(&mut self, fields: HashMap<String, String>) {
-        self.fields = fields;
-    }
-
-    /// Set the archive's [`TilesetMetadata`], replacing any earlier value.
-    ///
-    /// These are the top-level `name`, `description` and `attribution`
-    /// strings, separate from the layer metadata [`Self::set_fields`] and
-    /// [`Self::set_layer_name`] describe.
-    pub fn set_metadata(&mut self, metadata: TilesetMetadata) {
-        self.metadata = metadata;
-    }
-
-    /// Build the fields JSON object string
-    fn build_fields_json(&self) -> String {
-        fields_json(&self.fields)
-    }
-
-    /// Build the tilestats JSON fragment
-    fn build_tilestats_json(&self) -> String {
-        tilestats_json(&self.layer_name, self.total_features, self.fields.len())
-    }
-
-    /// Add a tile (will be gzip compressed)
-    ///
-    /// The tile data should be uncompressed MVT bytes.
-    /// Use `add_tile_with_count` if you have feature count available.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error in the cases [`Self::add_tile_with_count`] does.
-    pub fn add_tile(&mut self, z: u8, x: u32, y: u32, data: &[u8]) -> std::io::Result<()> {
-        self.add_tile_with_count(z, x, y, data, 0)
-    }
-
-    /// Add a tile with feature count for tilestats
-    ///
-    /// The tile data should be uncompressed MVT bytes.
-    ///
-    /// If deduplication is enabled, identical tiles will be stored once
-    /// and referenced via PMTiles' `run_length` feature.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
-    /// can address, or if compressing the tile fails.
-    pub fn add_tile_with_count(
-        &mut self,
-        z: u8,
-        x: u32,
-        y: u32,
-        data: &[u8],
-        feature_count: usize,
-    ) -> std::io::Result<()> {
-        self.add_tile_with_hash(z, x, y, data, TileHasher::hash(data), feature_count)
-    }
-
-    /// [`Self::add_tile_with_count`] with the content hash supplied, so a
-    /// test can force two different bodies onto one hash.
-    fn add_tile_with_hash(
-        &mut self,
-        z: u8,
-        x: u32,
-        y: u32,
-        data: &[u8],
-        hash: u64,
-        feature_count: usize,
-    ) -> std::io::Result<()> {
-        let id = checked_tile_id(z, x, y)?;
-        let uncompressed_size = data.len() as u32;
-
-        // Track zoom range
-        self.min_zoom = self.min_zoom.min(z);
-        self.max_zoom = self.max_zoom.max(z);
-
-        // Track feature counts for tilestats
-        self.total_features += feature_count as u64;
-        *self.features_per_zoom.entry(z).or_insert(0) += feature_count as u64;
-
-        // Compressed before the dedup lookup, duplicate or not: a hash hit is
-        // verified against the carrier's stored (compressed) bytes (#531).
-        // Compression is deterministic and injective, so the compressed bytes
-        // are equal exactly when the tiles are.
-        let compressed = compression::compress(data, self.tile_compression)?;
-        let (key, already_stored) = self.content_key(hash, &compressed);
-
-        if self.dedup_enabled && already_stored {
-            // Duplicate tile - store reference only (no data)
-            self.dedup_cache.record_duplicate(uncompressed_size);
-            self.tiles.insert(
-                id,
-                TileEntry {
-                    data: None, // No data stored for duplicates
-                    key,
-                },
-            );
-        } else {
-            if self.dedup_enabled {
-                // Record in cache (offset will be calculated at write time)
-                self.dedup_cache
-                    .record_new(hash, 0, compressed.len() as u32, uncompressed_size);
-            }
-            if !already_stored {
-                self.carriers.entry(hash).or_default().push(id);
-            }
-            self.tiles.insert(
-                id,
-                TileEntry {
-                    data: Some(compressed),
-                    key,
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    /// The key for a body hashing to `hash`: an existing key whose carrier
-    /// still holds these bytes (`true`), or the next unused ordinal (`false`).
-    ///
-    /// xxh3-64 is fast, not collision-resistant, so a hash hit is only a
-    /// candidate until the bytes agree (#531).
-    fn content_key(&self, hash: u64, compressed: &[u8]) -> (ContentKey, bool) {
-        let carriers = self.carriers.get(&hash).map_or(&[][..], Vec::as_slice);
-        for (ordinal, carrier) in carriers.iter().enumerate() {
-            let key = ContentKey {
-                hash,
-                ordinal: ordinal as u32,
-            };
-            // A carrier re-added since then holds some other body, or none.
-            if let Some(TileEntry {
-                data: Some(stored),
-                key: held,
-            }) = self.tiles.get(carrier)
-            {
-                if *held == key && stored.as_slice() == compressed {
-                    return (key, true);
-                }
-            }
-        }
-        let next = ContentKey {
-            hash,
-            ordinal: carriers.len() as u32,
-        };
-        (next, false)
-    }
-
-    /// Add a pre-compressed tile
-    ///
-    /// Use this if the tile data is already gzip compressed.
-    /// Note: Deduplication is not available for pre-compressed tiles
-    /// since we cannot hash the original content.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if `z` is above the highest zoom a PMTiles tile id
-    /// can address.
-    pub fn add_tile_compressed(
-        &mut self,
-        z: u8,
-        x: u32,
-        y: u32,
-        compressed_data: Vec<u8>,
-    ) -> std::io::Result<()> {
-        let id = checked_tile_id(z, x, y)?;
-        // For pre-compressed tiles, use a unique hash based on the compressed data
-        // This won't deduplicate as effectively but preserves the API
-        let hash = TileHasher::hash(&compressed_data);
-        let (key, already_stored) = self.content_key(hash, &compressed_data);
-        if !already_stored {
-            self.carriers.entry(hash).or_default().push(id);
-        }
-        self.tiles.insert(
-            id,
-            TileEntry {
-                data: Some(compressed_data),
-                key,
-            },
-        );
-
-        self.min_zoom = self.min_zoom.min(z);
-        self.max_zoom = self.max_zoom.max(z);
-
-        Ok(())
-    }
-
-    /// Set geographic bounds for the tileset
-    ///
-    /// Latitude values are clamped to the Web Mercator bound
-    /// (`±`[`crate::world_coord::MAX_LATITUDE`]).
-    pub fn set_bounds(&mut self, bounds: &TileBounds) {
-        self.bounds = TileBounds::new(
-            bounds.lng_min,
-            bounds.lat_min.clamp(-MAX_LATITUDE, MAX_LATITUDE),
-            bounds.lng_max,
-            bounds.lat_max.clamp(-MAX_LATITUDE, MAX_LATITUDE),
-        );
-    }
-
-    /// Get the number of tiles added
-    pub fn tile_count(&self) -> usize {
-        self.tiles.len()
-    }
-
-    /// Write the PMTiles archive to a file
-    ///
-    /// Layout: [Header (127)] [Root Directory] `Metadata` [Tile Data]
-    ///
-    /// When deduplication is enabled, identical tiles share storage and
-    /// consecutive identical tiles use `run_length` encoding in the directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::PMTilesWrite`] if the file cannot be created or
-    /// written, if a directory or the metadata cannot be compressed, or if
-    /// the metadata exceeds the 16 MiB limit readers accept. A rejected
-    /// metadata section leaves `path` untouched.
-    pub fn write_to_file(&self, path: &Path) -> Result<()> {
-        // Build tile data buffer and directory entries with deduplication
-        let mut tile_data_buf = Vec::new();
-        let mut entries = Vec::new();
-
-        // Map content key -> (offset, length) for deduplication
-        let mut key_to_offset: HashMap<ContentKey, (u64, u32)> = HashMap::new();
-        let mut unique_contents = 0u64;
-
-        if self.dedup_enabled {
-            // With deduplication: store unique tiles, reference duplicates.
-            //
-            // Two passes (#516): a duplicate's tile_id is not necessarily
-            // greater than the tile_id of the tile that carries its bytes --
-            // which one "carries" the data is decided by add order
-            // (whichever `add_tile` call for a given body happened first),
-            // not by tile_id. A single pass over `self.tiles` in tile_id
-            // order can therefore reach a duplicate before its carrier and
-            // find no entry in `key_to_offset` yet.
-            //
-            // Pass 1: write every carrying tile's bytes and record its
-            // offset, walking tile_id order (matters for determinism and
-            // clusteredness, not byte correctness -- pass 2 resolves every
-            // key regardless of the order this pass visits carriers in).
-            //
-            // First carrier wins: more than one tile can hold data for the
-            // same key (`add_tile_compressed` stores bytes even when they
-            // match an earlier body, so two identical pre-compressed blobs
-            // both arrive carrying bytes, under one key). Storing each of
-            // them and letting the last `insert` win would append dead bytes
-            // nothing references and
-            // leave `tile_contents_count` above the directory's distinct
-            // offset count -- which go-pmtiles `verify` rejects outright.
-            // Skipping the later carriers deduplicates them instead.
-            for entry in self.tiles.values() {
-                if let Some(ref data) = entry.data {
-                    if key_to_offset.contains_key(&entry.key) {
-                        // another carrier already stored these bytes
-                        continue;
-                    }
-                    let offset = tile_data_buf.len() as u64;
-                    let length = data.len() as u32;
-                    tile_data_buf.extend_from_slice(data);
-                    key_to_offset.insert(entry.key, (offset, length));
-                    unique_contents += 1;
-                }
-            }
-
-            // Pass 2: build directory entries in tile_id order. Every key
-            // now resolves, regardless of how add order and tile_id order
-            // related to each other.
-            for (&id, entry) in &self.tiles {
-                // Not infallible: re-adding a tile_id with different content
-                // replaces the only `TileEntry` that carried some earlier
-                // key's bytes, orphaning any duplicate still pointing at it.
-                let (offset, length) = *key_to_offset.get(&entry.key).ok_or_else(|| {
-                    Error::PMTilesWrite(format!(
-                        "no stored bytes for tile id {id} (content hash {:#018x}): \
-                         its carrier tile was overwritten by a later add",
-                        entry.key.hash
-                    ))
-                })?;
-
-                // Check if this can extend the previous entry's run_length
-                // (same offset = same content, consecutive tile_id)
-                if let Some(last) = entries.last_mut() {
-                    let last_entry: &mut DirEntry = last;
-                    if last_entry.offset == offset
-                        && id == last_entry.tile_id + last_entry.run_length as u64
-                    {
-                        // Extend run_length instead of adding new entry
-                        last_entry.run_length += 1;
-                        continue;
-                    }
-                }
-
-                entries.push(DirEntry {
-                    tile_id: id,
-                    offset,
-                    length,
-                    run_length: 1,
-                });
-            }
-        } else {
-            // Without deduplication: store every tile
-            for (&id, entry) in &self.tiles {
-                // Not infallible either: `enable_deduplication(false)` after
-                // tiles were added leaves behind entries recorded as
-                // references to a carrier tile, with no data of their own,
-                // which this branch has no `key_to_offset` to resolve.
-                let data = entry.data.as_ref().ok_or_else(|| {
-                    Error::PMTilesWrite(format!(
-                        "no stored bytes for tile id {id} (content hash {:#018x}): \
-                         it was recorded as a deduplication reference to a carrier \
-                         tile, but this archive is being written with deduplication \
-                         disabled",
-                        entry.key.hash
-                    ))
-                })?;
-                entries.push(DirEntry {
-                    tile_id: id,
-                    offset: tile_data_buf.len() as u64,
-                    length: data.len() as u32,
-                    run_length: 1,
-                });
-                tile_data_buf.extend_from_slice(data);
-                unique_contents += 1;
-            }
-        }
-
-        // Split into a root directory plus leaf directories when the entries do
-        // not fit the spec's 16 KiB root budget. Writing one oversized root
-        // instead produces an archive that readers reject outright: go-pmtiles
-        // reads the first 16 KiB and panics slicing past it. This only bites
-        // above a few thousand tiles, which is why it went unnoticed while this
-        // writer was exercised solely by small tests.
-        let layout = make_root_leaves(&entries, self.internal_compression)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to build directories: {}", e)))?;
-        let compressed_dir = layout.root_bytes;
-        let leaves_bytes = layout.leaves_bytes;
-
-        // JSON metadata with vector_layers and tilestats
-        let min_z = if self.min_zoom == 255 {
-            0
-        } else {
-            self.min_zoom
-        };
-        let max_z = if self.max_zoom == 0 && self.tiles.is_empty() {
-            0
-        } else {
-            self.max_zoom
-        };
-        let tilestats_json = self.build_tilestats_json();
-        let vector_layers = match &self.vector_layers_json {
-            Some(json) => json.clone(),
-            None => format!(
-                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
-                self.layer_name,
-                min_z,
-                max_z,
-                self.build_fields_json()
-            ),
-        };
-        let metadata = metadata_json(&vector_layers, &tilestats_json, &self.metadata);
-        let compressed_metadata = encode_metadata(&metadata, self.internal_compression)?;
-
-        // Calculate section offsets
-        let root_dir_offset = 127u64;
-        let root_dir_length = compressed_dir.len() as u64;
-        let metadata_offset = root_dir_offset + root_dir_length;
-        let metadata_length = compressed_metadata.len() as u64;
-        // Leaf directories sit between the metadata and the tile data, and
-        // `DirEntry::offset` for a leaf is relative to leaf_dirs_offset.
-        let leaf_dirs_offset = metadata_offset + metadata_length;
-        let leaf_dirs_length = leaves_bytes.len() as u64;
-        let tile_data_offset = leaf_dirs_offset + leaf_dirs_length;
-        let tile_data_length = tile_data_buf.len() as u64;
-
-        // Without deduplication, `self.tiles` (a `BTreeMap`) walked in
-        // tile_id order is clustered by construction: each tile's offset is
-        // the buffer's length at that point in the ascending walk, so
-        // offsets are strictly monotonic. With deduplication (#516), a
-        // duplicate's tile_id can fall anywhere relative to the tile_id of
-        // the tile that carries its bytes (carrying is decided by add
-        // order), so a duplicate can be the first entry, in tile_id order,
-        // to reference an offset that some *other* hash's carrier claimed
-        // later in the walk -- a legitimate multi-hash interleaving the
-        // panic this predicate replaced would have hit too. So this is
-        // derived honestly from the entries actually written, the same way
-        // `StreamingPmtilesWriter::entries_are_clustered` does, rather than
-        // asserted.
-        let clustered =
-            offsets_are_clustered(entries.iter().map(|e| (e.offset, u64::from(e.length))));
-
-        // A non-clustered archive is still valid, but it costs readers extra
-        // seeks, so say so rather than shipping the regression silently --
-        // the same signal `StreamingPmtilesWriter::write_archive` emits.
-        if !clustered {
-            log::warn!(
-                "PMTiles writer: {} is not clustered -- a duplicate's bytes are \
-                 carried by a tile that sorts after it, so a streaming reader must \
-                 seek backwards; readers still serve every tile correctly",
-                path.display()
-            );
-        }
-
-        // Build header
-        let header = Header {
-            root_dir_offset,
-            root_dir_length,
-            json_metadata_offset: metadata_offset,
-            json_metadata_length: metadata_length,
-            // Always the section position, never 0 -- even with no leaves. See
-            // the note on `leaf_dirs_offset` in `StreamingPmtilesWriter`.
-            leaf_dirs_offset,
-            leaf_dirs_length,
-            tile_data_offset,
-            tile_data_length,
-            addressed_tiles_count: self.tiles.len() as u64,
-            tile_entries_count: entries.len() as u64,
-            tile_contents_count: unique_contents,
-            clustered,
-            internal_compression: self.internal_compression,
-            tile_compression: self.tile_compression,
-            tile_type: TileType::Mvt,
-            min_zoom: if self.min_zoom == 255 {
-                0
-            } else {
-                self.min_zoom
-            },
-            max_zoom: if self.max_zoom == 0 && self.tiles.is_empty() {
-                0
-            } else {
-                self.max_zoom
-            },
-            min_lon: self.bounds.lng_min,
-            min_lat: self.bounds.lat_min,
-            max_lon: self.bounds.lng_max,
-            max_lat: self.bounds.lat_max,
-            center_zoom: if self.tiles.is_empty() {
-                0
-            } else {
-                (self.min_zoom + self.max_zoom) / 2
-            },
-            center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
-            center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
-        };
-
-        // Created only now, once everything that can be rejected (directories,
-        // metadata size) has been built: a rejected archive must neither
-        // truncate an existing output nor leave an empty new one behind.
-        let file = File::create(path).map_err(|e| {
-            Error::PMTilesWrite(format!("Failed to create file {}: {e}", path.display()))
-        })?;
-        let mut writer = BufWriter::new(file);
-
-        // Write all sections
-        writer
-            .write_all(&header.to_bytes())
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
-        writer
-            .write_all(&compressed_dir)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write directory: {}", e)))?;
-        writer
-            .write_all(&compressed_metadata)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
-        writer
-            .write_all(&leaves_bytes)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write leaf directories: {}", e)))?;
-        writer
-            .write_all(&tile_data_buf)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile data: {}", e)))?;
-
-        writer
-            .flush()
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to flush: {}", e)))?;
-
-        Ok(())
-    }
-}
-
-impl Default for PmtilesWriter {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ============================================================================
@@ -2009,16 +1333,9 @@ impl StreamingWriteStats {
 
 /// PMTiles writer that streams tile data to disk immediately.
 ///
-/// Unlike `PmtilesWriter` which accumulates all tiles in memory,
-/// `StreamingPmtilesWriter` writes compressed tile data to a temp file
-/// as tiles are added. Only the small directory entries (~32 bytes each)
-/// are kept in memory.
-///
-/// # Memory Usage
-///
-/// For 30,000 tiles:
-/// - `PmtilesWriter`: ~1.2 GB (all tile data in memory)
-/// - `StreamingPmtilesWriter`: ~2-3 MB (only directory entries)
+/// Compressed tile data goes to a temp file (or the output's tail) as tiles
+/// are added. Only the small directory entries (~32 bytes each) are kept in
+/// memory: about 2-3 MB for 30,000 tiles.
 ///
 /// # Example
 ///
@@ -2600,7 +1917,7 @@ impl StreamingPmtilesWriter {
     /// Set geographic bounds.
     ///
     /// Latitude values are clamped to the Web Mercator bound
-    /// (`±`[`crate::world_coord::MAX_LATITUDE`]).
+    /// (`±`[`crate::tile::MAX_LATITUDE`]).
     pub fn set_bounds(&mut self, bounds: &TileBounds) {
         self.bounds = TileBounds::new(
             bounds.lng_min,
@@ -2712,7 +2029,7 @@ impl StreamingPmtilesWriter {
     /// the caller compresses tile bytes off-thread (e.g. inside a Rayon
     /// `par_iter`) and hands the finished bytes here so the serial ordering loop
     /// never runs gzip. To keep deduplication byte-for-byte identical to the
-    /// serial path, `hash` must be the [`TileHasher::hash`] of the tile's
+    /// serial path, `hash` must be the [`TileHasher::hash`](crate::dedup::TileHasher::hash) of the tile's
     /// **uncompressed** MVT bytes, and `raw_len` the uncompressed length (used
     /// only for the dedup byte-savings stat). Because compression is
     /// deterministic, identical uncompressed bytes give identical compressed
@@ -3394,13 +2711,9 @@ impl StreamingPmtilesWriter {
         let tilestats_json = self.build_tilestats_json();
         let vector_layers = match &self.vector_layers_json {
             Some(json) => json.clone(),
-            None => format!(
-                r#"[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}]"#,
-                self.layer_name,
-                min_z,
-                max_z,
-                self.build_fields_json()
-            ),
+            None => {
+                single_vector_layer_json(&self.layer_name, min_z, max_z, &self.build_fields_json())
+            }
         };
 
         metadata_json(&vector_layers, &tilestats_json, &self.metadata)
@@ -3506,7 +2819,7 @@ mod tests {
     /// written through this path, so it stayed hidden.
     #[test]
     fn large_archive_spills_into_leaf_directories() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         // Matching the scale that exposed this: tens of thousands of tiles, so
         // the entry offsets and lengths do not delta-encode down to nothing.
         // z8 is 256x256, comfortably more than 24,000 addresses.
@@ -3525,12 +2838,14 @@ mod tests {
             // Pre-compressed, the path a band merge uses: it also skips 40k
             // gzip calls that would make this test take half a minute.
             let len = 64 + (rng >> 33) as usize % 4096;
+            let body = vec![(i % 251) as u8; len];
+            let hash = crate::dedup::TileHasher::hash(&body);
             writer
-                .add_tile_compressed(14, x, y, vec![(i % 251) as u8; len])
+                .add_tile_precompressed(14, x, y, hash, &body, len, 0)
                 .unwrap();
         }
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        writer.write_to_file(tmp.path()).unwrap();
+        writer.finalize(tmp.path()).unwrap();
 
         let bytes = std::fs::read(tmp.path()).unwrap();
         let header = Header::from_bytes(&bytes).unwrap();
@@ -4226,15 +3541,19 @@ mod tests {
         assert_eq!(tile_id(2, 0, 0), 5);
     }
 
-    /// #371: the cumulative base is now the closed form `(4^z - 4) / 3`
-    /// instead of `sum(4^i for i in 1..z)` with `4u64.pow`, which overflowed
-    /// u64 at z32. The two must agree everywhere the old one was defined.
+    /// #371: the cumulative base is the closed form `(4^z - 1) / 3`
+    /// ([`crate::tile::hilbert_zoom_base`]) instead of `sum(4^i for i in 0..z)`
+    /// with `4u64.pow`, which overflowed u64 at z32. The two must agree
+    /// everywhere the old one was defined.
     #[test]
     fn tile_id_base_closed_form_matches_the_summation() {
-        for z in 1..=MAX_TILE_ID_ZOOM {
-            let summed: u64 = (1..u64::from(z)).map(|i| 4u64.pow(i as u32)).sum();
-            let closed = ((1u64 << (2 * u32::from(z))) - 4) / 3;
-            assert_eq!(closed, summed, "base id mismatch at z{z}");
+        for z in 0..=MAX_TILE_ID_ZOOM {
+            let summed: u64 = (0..u32::from(z)).map(|i| 4u64.pow(i)).sum();
+            assert_eq!(
+                crate::tile::hilbert_zoom_base(z),
+                summed,
+                "base id mismatch at z{z}"
+            );
         }
     }
 
@@ -4301,12 +3620,6 @@ mod tests {
             assert!(streaming
                 .add_tile_precompressed(z, 0, 0, 0, &tile, tile.len(), 0)
                 .is_err());
-
-            let mut buffered = PmtilesWriter::new();
-            assert!(buffered.add_tile(z, 0, 0, &tile).is_err());
-            assert!(buffered
-                .add_tile_compressed(z, 0, 0, tile.to_vec())
-                .is_err());
         }
 
         // The ceiling itself is still writable, and the archive finalizes.
@@ -4319,6 +3632,46 @@ mod tests {
             Header::from_bytes(&data[..127]).unwrap().max_zoom,
             MAX_TILE_ID_ZOOM
         );
+    }
+
+    /// A tile outside its zoom's `2^z x 2^z` grid has no tile id at that zoom.
+    /// `fast_hilbert` sizes the curve from `x | y`, so `tile_id(0, 1, 2)` is 5,
+    /// the id of (2, 0, 0): the writer would store the tile under another
+    /// tile's entry. Refuse it like a zoom past the address space.
+    #[test]
+    fn writers_reject_coordinates_outside_the_zoom() {
+        let tile = [0x1a, 0x00];
+        for (z, x, y) in [
+            (0u8, 1u32, 0u32),
+            (0, 0, 1),
+            (1, 2, 2),
+            (3, 5, 40),
+            (MAX_TILE_ID_ZOOM, 1 << 31, 0),
+            (MAX_TILE_ID_ZOOM, 0, u32::MAX),
+        ] {
+            let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            streaming.set_layer_name("t");
+            let err = streaming
+                .add_tile(z, x, y, &tile)
+                .expect_err("a tile outside its zoom must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(&format!("{z}/{x}/{y}")),
+                "error names the tile: {err}"
+            );
+            assert!(streaming
+                .add_tile_precompressed(z, x, y, 0, &tile, tile.len(), 0)
+                .is_err());
+        }
+
+        // The grid's far corner is still writable.
+        let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        streaming.set_layer_name("t");
+        streaming.add_tile(3, 7, 7, &tile).unwrap();
+        let max = u32::MAX >> (32 - u32::from(MAX_TILE_ID_ZOOM));
+        streaming
+            .add_tile(MAX_TILE_ID_ZOOM, max, max, &tile)
+            .unwrap();
     }
 
     #[test]
@@ -4910,23 +4263,17 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_writer_creation() {
-        let writer = PmtilesWriter::new();
-        assert_eq!(writer.tile_count(), 0);
-    }
-
-    #[test]
     fn test_writer_add_single_tile() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         let mvt_data = vec![0x1a, 0x00]; // Minimal MVT-like data
 
         writer.add_tile(0, 0, 0, &mvt_data).unwrap();
-        assert_eq!(writer.tile_count(), 1);
+        assert_eq!(writer.stats().total_tiles, 1);
     }
 
     #[test]
     fn test_writer_creates_valid_pmtiles_file() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         // Add a minimal tile
         let mvt_data = vec![0x1a, 0x00];
@@ -4936,7 +4283,7 @@ mod tests {
         let path = Path::new("/tmp/test-pmtiles-writer.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write file");
+        writer.finalize(path).expect("Should write file");
 
         // Verify file exists and has correct structure
         assert!(path.exists(), "File should exist");
@@ -4960,7 +4307,7 @@ mod tests {
 
     #[test]
     fn test_writer_multiple_tiles_multiple_zooms() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         // Add tiles at zooms 0, 1, 2
         for z in 0..3u8 {
@@ -4974,14 +4321,14 @@ mod tests {
         }
 
         // Should have 1 + 4 + 16 = 21 tiles
-        assert_eq!(writer.tile_count(), 21);
+        assert_eq!(writer.stats().total_tiles, 21);
 
         writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
 
         let path = Path::new("/tmp/test-pmtiles-multi.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write file");
+        writer.finalize(path).expect("Should write file");
 
         // Verify basic structure
         let data = fs::read(path).unwrap();
@@ -5002,12 +4349,12 @@ mod tests {
 
     #[test]
     fn test_writer_empty_tileset() {
-        let writer = PmtilesWriter::new();
+        let writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         let path = Path::new("/tmp/test-pmtiles-empty.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write empty file");
+        writer.finalize(path).expect("Should write empty file");
 
         let data = fs::read(path).unwrap();
         assert_eq!(&data[0..7], b"PMTiles");
@@ -5018,20 +4365,19 @@ mod tests {
 
     #[test]
     fn test_writer_tile_ordering() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         // Add tiles in random order
         writer.add_tile(2, 3, 3, &[1, 2, 3]).unwrap();
         writer.add_tile(0, 0, 0, &[4, 5, 6]).unwrap();
         writer.add_tile(1, 1, 0, &[7, 8, 9]).unwrap();
 
-        // BTreeMap should maintain Hilbert curve order
-        assert_eq!(writer.tile_count(), 3);
+        assert_eq!(writer.stats().total_tiles, 3);
 
         let path = Path::new("/tmp/test-pmtiles-ordering.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write file");
+        writer.finalize(path).expect("Should write file");
 
         // Should succeed (clustered mode requires sorted tiles)
         assert!(path.exists());
@@ -5041,7 +4387,7 @@ mod tests {
 
     #[test]
     fn test_writer_bounds_preserved() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         writer.add_tile(0, 0, 0, &[1, 2, 3]).unwrap();
 
         let bounds = TileBounds::new(-122.5, 37.7, -122.3, 37.9);
@@ -5050,7 +4396,7 @@ mod tests {
         let path = Path::new("/tmp/test-pmtiles-bounds.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write file");
+        writer.finalize(path).expect("Should write file");
 
         let data = fs::read(path).unwrap();
 
@@ -5080,7 +4426,7 @@ mod tests {
     /// every world-spanning archive (#416).
     #[test]
     fn test_writer_bounds_keep_exact_mercator_latitude() {
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         writer.add_tile(0, 0, 0, &[1, 2, 3]).unwrap();
         writer.set_bounds(&TileBounds::new(
             -180.0,
@@ -5091,7 +4437,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bounds-mercator-clamp.pmtiles");
-        writer.write_to_file(&path).expect("Should write file");
+        writer.finalize(&path).expect("Should write file");
 
         let data = fs::read(&path).unwrap();
         let min_lat = i32::from_le_bytes(data[106..110].try_into().unwrap());
@@ -5107,19 +4453,15 @@ mod tests {
 
     #[test]
     fn test_build_fields_json_empty() {
-        let writer = PmtilesWriter::new();
-        assert_eq!(writer.build_fields_json(), "{}");
+        assert_eq!(fields_json(&HashMap::new()), "{}");
     }
 
     #[test]
     fn test_build_fields_json_with_fields() {
-        let mut writer = PmtilesWriter::new();
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), "String".to_string());
         fields.insert("area".to_string(), "Number".to_string());
-        writer.set_fields(fields);
-
-        let json = writer.build_fields_json();
+        let json = fields_json(&fields);
         // Fields are sorted alphabetically
         assert_eq!(json, r#"{"area":"Number","name":"String"}"#);
     }
@@ -5129,7 +4471,7 @@ mod tests {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
-        let mut writer = PmtilesWriter::new();
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         writer.add_tile(0, 0, 0, &[1, 2, 3]).unwrap();
         writer.set_layer_name("buildings");
 
@@ -5141,7 +4483,7 @@ mod tests {
         let path = Path::new("/tmp/test-pmtiles-fields.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer.write_to_file(path).expect("Should write file");
+        writer.finalize(path).expect("Should write file");
 
         let data = fs::read(path).unwrap();
 
@@ -5263,27 +4605,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_writer_with_compression_constructor() {
-        let writer = PmtilesWriter::with_compression(Compression::Brotli);
-        assert_eq!(writer.tile_compression(), Compression::Brotli);
-        assert_eq!(writer.internal_compression(), Compression::Brotli);
-    }
-
-    #[test]
-    fn test_writer_set_compression() {
-        let mut writer = PmtilesWriter::new();
-        assert_eq!(writer.tile_compression(), Compression::Gzip); // default
-
-        writer.set_tile_compression(Compression::Zstd);
-        assert_eq!(writer.tile_compression(), Compression::Zstd);
-
-        writer.set_internal_compression(Compression::Brotli);
-        assert_eq!(writer.internal_compression(), Compression::Brotli);
-    }
-
-    #[test]
     fn test_writer_brotli_compression() {
-        let mut writer = PmtilesWriter::with_compression(Compression::Brotli);
+        let mut writer = StreamingPmtilesWriter::new(Compression::Brotli).unwrap();
         let mvt_data = vec![0x1a; 100]; // Compressible data
 
         writer.add_tile(0, 0, 0, &mvt_data).unwrap();
@@ -5293,7 +4616,7 @@ mod tests {
         let _ = fs::remove_file(path);
 
         writer
-            .write_to_file(path)
+            .finalize(path)
             .expect("Should write file with brotli");
 
         let data = fs::read(path).unwrap();
@@ -5311,7 +4634,7 @@ mod tests {
 
     #[test]
     fn test_writer_zstd_compression() {
-        let mut writer = PmtilesWriter::with_compression(Compression::Zstd);
+        let mut writer = StreamingPmtilesWriter::new(Compression::Zstd).unwrap();
         let mvt_data = vec![0x1a; 100];
 
         writer.add_tile(0, 0, 0, &mvt_data).unwrap();
@@ -5320,9 +4643,7 @@ mod tests {
         let path = Path::new("/tmp/test-pmtiles-zstd.pmtiles");
         let _ = fs::remove_file(path);
 
-        writer
-            .write_to_file(path)
-            .expect("Should write file with zstd");
+        writer.finalize(path).expect("Should write file with zstd");
 
         let data = fs::read(path).unwrap();
 
@@ -5335,7 +4656,7 @@ mod tests {
 
     #[test]
     fn test_writer_no_compression() {
-        let mut writer = PmtilesWriter::with_compression(Compression::None);
+        let mut writer = StreamingPmtilesWriter::new(Compression::None).unwrap();
         let mvt_data = vec![0x1a, 0x00];
 
         writer.add_tile(0, 0, 0, &mvt_data).unwrap();
@@ -5345,7 +4666,7 @@ mod tests {
         let _ = fs::remove_file(path);
 
         writer
-            .write_to_file(path)
+            .finalize(path)
             .expect("Should write file without compression");
 
         let data = fs::read(path).unwrap();
@@ -5357,141 +4678,13 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[test]
-    fn test_writer_mixed_compression() {
-        // Test different compression for internal vs tile data
-        let mut writer = PmtilesWriter::new();
-        writer.set_internal_compression(Compression::Gzip);
-        writer.set_tile_compression(Compression::Zstd);
-
-        let mvt_data = vec![0x1a; 100];
-        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
-        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
-
-        let path = Path::new("/tmp/test-pmtiles-mixed.pmtiles");
-        let _ = fs::remove_file(path);
-
-        writer
-            .write_to_file(path)
-            .expect("Should write file with mixed compression");
-
-        let data = fs::read(path).unwrap();
-
-        // Check compression bytes in header
-        assert_eq!(data[97], Compression::Gzip as u8); // internal
-        assert_eq!(data[98], Compression::Zstd as u8); // tile
-
-        let _ = fs::remove_file(path);
-    }
-
     // -------------------------------------------------------------------------
     // Tile Deduplication Tests
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_writer_dedup_identical_tiles() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
-        // Add 3 identical tiles at consecutive positions
-        let ocean_tile = vec![0x1a, 0x00]; // Same content
-        writer.add_tile(1, 0, 0, &ocean_tile).unwrap();
-        writer.add_tile(1, 0, 1, &ocean_tile).unwrap();
-        writer.add_tile(1, 1, 1, &ocean_tile).unwrap();
-
-        // 3 tiles addressed, but only 1 unique content
-        assert_eq!(writer.tile_count(), 3);
-
-        let stats = writer.dedup_stats();
-        assert_eq!(stats.total_tiles, 3);
-        assert_eq!(stats.unique_tiles, 1);
-        assert_eq!(stats.duplicates_eliminated, 2);
-    }
-
-    #[test]
-    fn test_writer_dedup_mixed_tiles() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
-        // Add tiles: A, A, B, A, B, B
-        let tile_a = vec![0x1a, 0x01];
-        let tile_b = vec![0x1a, 0x02];
-
-        writer.add_tile(0, 0, 0, &tile_a).unwrap();
-        writer.add_tile(1, 0, 0, &tile_a).unwrap(); // dup
-        writer.add_tile(1, 0, 1, &tile_b).unwrap();
-        writer.add_tile(1, 1, 1, &tile_a).unwrap(); // dup
-        writer.add_tile(1, 1, 0, &tile_b).unwrap(); // dup
-        writer.add_tile(2, 0, 0, &tile_b).unwrap(); // dup
-
-        let stats = writer.dedup_stats();
-        assert_eq!(stats.total_tiles, 6);
-        assert_eq!(stats.unique_tiles, 2);
-        assert_eq!(stats.duplicates_eliminated, 4);
-    }
-
-    #[test]
-    fn test_writer_dedup_disabled_by_default() {
-        let writer = PmtilesWriter::new();
-        // Deduplication should be disabled by default for backward compatibility
-        assert!(!writer.is_dedup_enabled());
-    }
-
-    #[test]
-    fn test_writer_dedup_file_size_reduction() {
-        // Test with deduplication
-        let mut writer_dedup = PmtilesWriter::new();
-        writer_dedup.enable_deduplication(true);
-
-        let ocean_tile = vec![0x1a, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
-        for z in 0..3u8 {
-            let n = 1u32 << z;
-            for x in 0..n {
-                for y in 0..n {
-                    writer_dedup.add_tile(z, x, y, &ocean_tile).unwrap();
-                }
-            }
-        }
-
-        let path_dedup = Path::new("/tmp/test-pmtiles-dedup-enabled.pmtiles");
-        let _ = fs::remove_file(path_dedup);
-        writer_dedup.write_to_file(path_dedup).unwrap();
-        let size_dedup = fs::metadata(path_dedup).unwrap().len();
-
-        // Test without deduplication
-        let mut writer_no_dedup = PmtilesWriter::new();
-        // Dedup disabled by default
-
-        for z in 0..3u8 {
-            let n = 1u32 << z;
-            for x in 0..n {
-                for y in 0..n {
-                    writer_no_dedup.add_tile(z, x, y, &ocean_tile).unwrap();
-                }
-            }
-        }
-
-        let path_no_dedup = Path::new("/tmp/test-pmtiles-dedup-disabled.pmtiles");
-        let _ = fs::remove_file(path_no_dedup);
-        writer_no_dedup.write_to_file(path_no_dedup).unwrap();
-        let size_no_dedup = fs::metadata(path_no_dedup).unwrap().len();
-
-        // Deduplicated file should be smaller
-        assert!(
-            size_dedup < size_no_dedup,
-            "Deduplicated file ({} bytes) should be smaller than non-deduplicated ({} bytes)",
-            size_dedup,
-            size_no_dedup
-        );
-
-        let _ = fs::remove_file(path_dedup);
-        let _ = fs::remove_file(path_no_dedup);
-    }
-
-    #[test]
     fn test_writer_dedup_run_length_consecutive() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         // Add consecutive tiles with same content (should use run_length)
         let tile = vec![0x1a, 0x10];
@@ -5503,7 +4696,7 @@ mod tests {
 
         let path = Path::new("/tmp/test-pmtiles-runlength.pmtiles");
         let _ = fs::remove_file(path);
-        writer.write_to_file(path).unwrap();
+        writer.finalize(path).unwrap();
 
         let data = fs::read(path).unwrap();
 
@@ -5524,22 +4717,11 @@ mod tests {
 
     #[test]
     fn test_writer_dedup_header_stats() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
         // 10 tiles, 3 unique contents
         let tile_a = vec![0x1a, 0x01];
         let tile_b = vec![0x1a, 0x02];
         let tile_c = vec![0x1a, 0x03];
-
-        // Pattern: A A A B B C A B C C
-        for _ in 0..3 {
-            writer.add_tile(0, 0, 0, &tile_a).unwrap(); // Will deduplicate
-        }
-        // Only first A is added at z=0, rest are different coords
-        // Actually, let me use different coords properly:
-        let mut writer2 = PmtilesWriter::new();
-        writer2.enable_deduplication(true);
+        let mut writer2 = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
 
         // Add 10 tiles with 3 unique contents at zoom 0-2
         writer2.add_tile(0, 0, 0, &tile_a).unwrap();
@@ -5555,7 +4737,7 @@ mod tests {
 
         let path = Path::new("/tmp/test-pmtiles-header-stats.pmtiles");
         let _ = fs::remove_file(path);
-        writer2.write_to_file(path).unwrap();
+        writer2.finalize(path).unwrap();
 
         let data = fs::read(path).unwrap();
 
@@ -5744,67 +4926,6 @@ mod tests {
         );
 
         // Clean up (finalize not needed for this test)
-    }
-
-    #[test]
-    fn test_streaming_writer_matches_non_streaming_output() {
-        // Create identical content with both writers and compare output
-        let tiles_data = vec![
-            (0, 0, 0, vec![0x1a, 0x00]),
-            (1, 0, 0, vec![0x1a, 0x01]),
-            (1, 0, 1, vec![0x1a, 0x02]),
-            (1, 1, 1, vec![0x1a, 0x00]), // Duplicate content
-        ];
-
-        // Non-streaming writer (with dedup enabled for fair comparison)
-        let mut non_streaming = PmtilesWriter::with_compression(Compression::Gzip);
-        non_streaming.enable_deduplication(true);
-        non_streaming.set_layer_name("test");
-        non_streaming.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
-        for (z, x, y, data) in &tiles_data {
-            non_streaming.add_tile(*z, *x, *y, data).unwrap();
-        }
-
-        let non_streaming_path = Path::new("/tmp/test-compare-non-streaming.pmtiles");
-        let _ = fs::remove_file(non_streaming_path);
-        non_streaming.write_to_file(non_streaming_path).unwrap();
-
-        // Streaming writer
-        let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
-        streaming.set_layer_name("test");
-        streaming.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
-        for (z, x, y, data) in &tiles_data {
-            streaming.add_tile(*z, *x, *y, data).unwrap();
-        }
-
-        let streaming_path = Path::new("/tmp/test-compare-streaming.pmtiles");
-        let _ = fs::remove_file(streaming_path);
-        streaming.finalize(streaming_path).unwrap();
-
-        // Compare key header fields
-        let ns_data = fs::read(non_streaming_path).unwrap();
-        let s_data = fs::read(streaming_path).unwrap();
-
-        // Magic and version should match
-        assert_eq!(
-            &ns_data[0..8],
-            &s_data[0..8],
-            "Header magic/version should match"
-        );
-
-        // Addressed tiles count should match
-        let ns_addressed = u64::from_le_bytes(ns_data[72..80].try_into().unwrap());
-        let s_addressed = u64::from_le_bytes(s_data[72..80].try_into().unwrap());
-        assert_eq!(ns_addressed, s_addressed, "Addressed tiles should match");
-
-        // Unique contents should match
-        let ns_contents = u64::from_le_bytes(ns_data[88..96].try_into().unwrap());
-        let s_contents = u64::from_le_bytes(s_data[88..96].try_into().unwrap());
-        assert_eq!(ns_contents, s_contents, "Unique contents should match");
-
-        // Clean up
-        let _ = fs::remove_file(non_streaming_path);
-        let _ = fs::remove_file(streaming_path);
     }
 
     #[test]
@@ -6055,7 +5176,7 @@ mod tests {
         parallel.set_layer_name("test");
         parallel.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
         for (z, x, y, data) in &tiles {
-            let hash = TileHasher::hash(data);
+            let hash = crate::dedup::TileHasher::hash(data);
             let compressed = compression::compress(data, Compression::Gzip).unwrap();
             parallel
                 .add_tile_precompressed(*z, *x, *y, hash, &compressed, data.len(), 1)
@@ -6338,113 +5459,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // #516: PmtilesWriter dedup panics on out-of-order adds
-    // -------------------------------------------------------------------------
-
-    /// Offset-assignment regression for the two-pass rewrite (#516): the same
-    /// tiles as `test_writer_dedup_run_length_consecutive` (every duplicate
-    /// added after its carrier -- a "currently-working" input under the
-    /// pre-#516 single-pass code too). A change here means the two-pass
-    /// assignment altered the layout for an input the single-pass code
-    /// already wrote correctly, which it must not.
-    ///
-    /// Pinned structurally -- the decoded directory tuples and the tile-data
-    /// section bytes -- rather than as a whole-file length plus xxh3 (#516
-    /// review, S4). A whole-file pin also fails whenever the metadata JSON or
-    /// the compression library's output shifts by a byte, neither of which
-    /// this test has anything to say about; what #516 touched is which offset
-    /// each directory entry gets, and that is what is pinned.
-    #[test]
-    fn dedup_two_pass_offset_assignment_preserves_layout_for_existing_working_input() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-        let tile = vec![0x1a, 0x10];
-        writer.add_tile(1, 0, 0, &tile).unwrap();
-        writer.add_tile(1, 0, 1, &tile).unwrap();
-        writer.add_tile(1, 1, 1, &tile).unwrap();
-        writer.add_tile(1, 1, 0, &tile).unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        writer.write_to_file(path).unwrap();
-        let bytes = fs::read(path).unwrap();
-        let header = Header::from_bytes(&bytes).unwrap();
-
-        // The four z1 tile ids are 1..=4 and all four share one blob at
-        // offset 0, so the directory collapses to a single run-length-4
-        // entry -- exactly what the pre-#516 single-pass code produced.
-        let expected_blob = compression::compress(&tile, Compression::Gzip).unwrap();
-        let entries = read_all_entries(&bytes, &header).unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
-                .collect::<Vec<_>>(),
-            vec![(1u64, 0u64, expected_blob.len() as u32, 4u32)],
-            "one blob at offset 0, addressed by a single run of four consecutive tile ids"
-        );
-
-        let tile_data = &bytes[header.tile_data_offset as usize
-            ..(header.tile_data_offset + header.tile_data_length) as usize];
-        assert_eq!(
-            tile_data,
-            &expected_blob[..],
-            "the tile-data section must be exactly the one shared compressed blob"
-        );
-        assert_eq!(header.addressed_tiles_count, 4);
-        assert_eq!(header.tile_entries_count, 1);
-        assert_eq!(header.tile_contents_count, 1);
-    }
-
-    /// #516 repro: `hash_to_offset.get(&entry.hash).expect("Hash must exist")`
-    /// panicked when a duplicate's `tile_id` was lower than the `tile_id` of the
-    /// tile that carries the bytes, because `self.tiles` (a `BTreeMap`) is
-    /// walked in `tile_id` order and the single pass had not yet recorded the
-    /// carrier's offset when it reached the duplicate. `add_tile(2,3,3,...)`
-    /// then `add_tile(0,0,0,...)` with identical content is exactly that:
-    /// the second add's `tile_id` (0) is lower than the first's, but the first
-    /// add is the one that carries the bytes (it was added -- and hashed --
-    /// first).
-    #[test]
-    fn dedup_survives_duplicate_with_lower_tile_id_than_its_carrier() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
-        writer.add_tile(2, 3, 3, b"shared").unwrap();
-        writer.add_tile(0, 0, 0, b"shared").unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        writer.write_to_file(path).expect("must not panic (#516)");
-
-        let stats = writer.dedup_stats();
-        assert_eq!(stats.total_tiles, 2);
-        assert_eq!(
-            stats.unique_tiles, 1,
-            "identical content must collapse to one stored blob"
-        );
-        assert_eq!(stats.duplicates_eliminated, 1);
-
-        let bytes = fs::read(path).unwrap();
-        let header = Header::from_bytes(&bytes).unwrap();
-
-        assert_eq!(header.addressed_tiles_count, 2, "both tiles are addressed");
-        assert_eq!(
-            header.tile_contents_count, 1,
-            "only one unique blob is stored, regardless of which tile_id carried it"
-        );
-        let actually_clustered = verify_clustered(path).unwrap();
-        assert!(
-            actually_clustered,
-            "a single unique blob referenced by two tile_ids is trivially clustered"
-        );
-        assert_eq!(
-            header.clustered, actually_clustered,
-            "the header's own clustered claim must match the independent, file-side check"
-        );
-    }
-
-    // -------------------------------------------------------------------------
     // #516 review: pass-1 carrier clobber, strict predicate, O(1) clustered
     // -------------------------------------------------------------------------
 
@@ -6463,143 +5477,6 @@ mod tests {
         assert!(!offsets_are_clustered([(0, 10), (10, 5), (10, 999)]));
         // An exact whole-tile back-reference, then a fresh append: still fine.
         assert!(offsets_are_clustered([(0, 10), (0, 10), (10, 4)]));
-    }
-
-    /// Two carriers for one hash must not each write their bytes (#516
-    /// review, S2). `add_tile_compressed` never consults the dedup cache, so
-    /// two identical pre-compressed blobs both arrive as `TileEntry`s holding
-    /// data. Pass 1 used to `insert` per carrier, last write winning: the
-    /// first blob's bytes stayed in the tile-data section with nothing
-    /// pointing at them, and `tile_contents_count` (2) outran the directory's
-    /// distinct offset count (1) -- which go-pmtiles `verify` rejects with a
-    /// hard error, not a warning. First-carrier-wins is strictly better than
-    /// the pre-#516 behaviour: it actually deduplicates the second blob.
-    #[test]
-    fn dedup_pass_one_stores_shared_bytes_once_across_carriers() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-        let blob = compression::compress(b"identical tile bytes", Compression::Gzip).unwrap();
-        writer.add_tile_compressed(1, 0, 0, blob.clone()).unwrap();
-        writer.add_tile_compressed(1, 1, 0, blob.clone()).unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        writer.write_to_file(path).unwrap();
-        let bytes = fs::read(path).unwrap();
-        let header = Header::from_bytes(&bytes).unwrap();
-
-        // z1 tile ids 1 and 4 are not consecutive, so no run-length merge --
-        // two entries sharing the single blob at offset 0.
-        let entries = read_all_entries(&bytes, &header).unwrap();
-        let len = blob.len() as u32;
-        assert_eq!(
-            entries
-                .iter()
-                .map(|e| (e.tile_id, e.offset, e.length, e.run_length))
-                .collect::<Vec<_>>(),
-            vec![(1u64, 0u64, len, 1u32), (4u64, 0u64, len, 1u32)],
-            "both carriers must reference the one stored blob"
-        );
-
-        assert_eq!(
-            header.tile_data_length,
-            blob.len() as u64,
-            "the second carrier's bytes must not be appended as dead weight"
-        );
-        let distinct: HashSet<u64> = entries.iter().map(|e| e.offset).collect();
-        assert_eq!(
-            distinct.len() as u64,
-            header.tile_contents_count,
-            "go-pmtiles `verify` hard-errors when TileContentsCount disagrees with \
-             the directory's distinct referenced offsets (pmtiles/verify.go:148-150)"
-        );
-        assert_eq!(header.tile_contents_count, 1);
-        assert_eq!(header.addressed_tiles_count, 2);
-        assert!(header.clustered, "one blob, referenced twice, is clustered");
-        assert!(
-            verify_clustered(path).unwrap(),
-            "the file-side re-derivation must agree with the header"
-        );
-    }
-
-    /// Re-adding a tile id with different content replaces the only
-    /// `TileEntry` that carried an earlier hash's bytes, orphaning the
-    /// duplicate still pointing at it. That used to `expect`-panic in pass 2
-    /// (#516 review, S3-1); `write_to_file` already returns `Result`, so it
-    /// must report the orphan rather than abort the process.
-    #[test]
-    fn dedup_errors_when_a_carrier_tile_is_overwritten() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
-        writer.add_tile(0, 0, 0, b"XXXX").unwrap(); // carries hash(XXXX)
-        writer.add_tile(1, 0, 0, b"XXXX").unwrap(); // duplicate, no data
-        writer.add_tile(0, 0, 0, b"YYYY").unwrap(); // replaces the carrier
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let err = writer
-            .write_to_file(tmp.path())
-            .expect_err("the orphaned hash must surface as an error, not a panic");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("carrier"),
-            "the error must name the cause (an overwritten carrier tile), got: {msg}"
-        );
-    }
-
-    /// The scenario the pass-2 comment describes, pinned (#516 review, S3-6):
-    /// a duplicate whose carrier sorts *after* it, interleaved with a second
-    /// hash whose carrier sorts between them. `(2,3,3)` carries `X`, `(1,0,0)`
-    /// carries `Y`, `(0,0,0)` duplicates `X`. In tile-id order the directory
-    /// reads `[0 -> offset(X), 1 -> offset(Y)=0, 15 -> offset(X)]`, whose very
-    /// first entry already points past the frontier: legitimately unclustered,
-    /// and both the header and the file-side check must say so rather than
-    /// claim otherwise. The archive is still byte-correct -- every tile serves
-    /// its own content -- it just costs a reader a backward seek.
-    #[test]
-    fn interleaved_carriers_produce_an_honestly_unclustered_archive() {
-        let mut writer = PmtilesWriter::new();
-        writer.enable_deduplication(true);
-
-        writer.add_tile(2, 3, 3, b"XXXXXXXX").unwrap();
-        writer.add_tile(1, 0, 0, b"YYYYYYYY").unwrap();
-        writer.add_tile(0, 0, 0, b"XXXXXXXX").unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path();
-        writer.write_to_file(path).unwrap();
-        let bytes = fs::read(path).unwrap();
-        let header = Header::from_bytes(&bytes).unwrap();
-
-        assert!(
-            !header.clustered,
-            "the header must not claim clustered for an interleaved dedup layout"
-        );
-        assert!(
-            !verify_clustered(path).unwrap(),
-            "and the independent file-side check must agree"
-        );
-
-        // Byte correctness is untouched: each tile id still serves its own
-        // content, unclustered or not.
-        let entries = read_all_entries(&bytes, &header).unwrap();
-        let expected: Vec<(u64, &[u8])> = vec![
-            (tile_id(0, 0, 0), b"XXXXXXXX".as_slice()),
-            (tile_id(1, 0, 0), b"YYYYYYYY".as_slice()),
-            (tile_id(2, 3, 3), b"XXXXXXXX".as_slice()),
-        ];
-        assert_eq!(entries.len(), expected.len());
-        for (e, (want_id, want_bytes)) in entries.iter().zip(expected) {
-            assert_eq!(e.tile_id, want_id);
-            let start = (header.tile_data_offset + e.offset) as usize;
-            let raw = &bytes[start..start + e.length as usize];
-            let served = compression::decompress(raw, header.tile_compression).unwrap();
-            assert_eq!(
-                served, want_bytes,
-                "tile id {} must serve its own content",
-                e.tile_id
-            );
-        }
     }
 
     /// Ascending adds imply a clustered archive by construction, so
@@ -6793,88 +5670,6 @@ mod tests {
         assert_eq!(tiles[&tile_id(1, 1, 1)], big_a);
     }
 
-    /// The in-memory writer's dedup key is the hash too. A colliding body
-    /// must get its own bytes in the archive, and the write pass must not
-    /// fold it into the first body's offset.
-    #[test]
-    fn in_memory_dedup_verifies_a_hash_hit() {
-        let mut writer = PmtilesWriter::with_compression(Compression::None);
-        writer.enable_deduplication(true);
-
-        let body_a = vec![0xA1u8; 300];
-        let body_b = vec![0xB2u8; 300];
-        let body_c = vec![0xC3u8; 7];
-        // Out of tile-id order on purpose: the write pass walks tile ids,
-        // the add-time verify walks add order, and they must agree.
-        writer
-            .add_tile_with_hash(2, 3, 3, &body_a, FORCED_HASH, 0)
-            .unwrap();
-        writer
-            .add_tile_with_hash(1, 0, 0, &body_b, FORCED_HASH, 0)
-            .unwrap();
-        writer
-            .add_tile_with_hash(2, 0, 0, &body_c, FORCED_HASH, 0)
-            .unwrap();
-        writer
-            .add_tile_with_hash(2, 1, 1, &body_a, FORCED_HASH, 0)
-            .unwrap();
-        writer
-            .add_tile_with_hash(0, 0, 0, &body_b, FORCED_HASH, 0)
-            .unwrap();
-        assert_eq!(writer.dedup_stats().unique_tiles, 3);
-        assert_eq!(writer.dedup_stats().duplicates_eliminated, 2);
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        writer.write_to_file(tmp.path()).unwrap();
-        let bytes = fs::read(tmp.path()).unwrap();
-        let header = Header::from_bytes(&bytes).unwrap();
-        assert_eq!(header.tile_contents_count, 3);
-        assert_eq!(header.tile_data_length, 300 + 300 + 7);
-
-        let tiles = read_archive_tiles(&bytes);
-        assert_eq!(tiles[&tile_id(2, 3, 3)], body_a);
-        assert_eq!(tiles[&tile_id(1, 0, 0)], body_b);
-        assert_eq!(tiles[&tile_id(2, 0, 0)], body_c);
-        assert_eq!(tiles[&tile_id(2, 1, 1)], body_a);
-        assert_eq!(tiles[&tile_id(0, 0, 0)], body_b);
-    }
-
-    /// `add_tile_compressed` stores its bytes either way, but it must still
-    /// register a new body as a carrier. Otherwise a later colliding body
-    /// gets the same ordinal and the write pass folds it into this one.
-    #[test]
-    fn in_memory_precompressed_body_takes_its_own_ordinal() {
-        // `Compression::None`, so a raw body and its "compressed" bytes are
-        // the same and both entry points hash to one value.
-        let mut writer = PmtilesWriter::with_compression(Compression::None);
-        writer.enable_deduplication(true);
-
-        let body_a = vec![0xA1u8; 300];
-        let body_b = vec![0xB2u8; 300];
-        let body_c = vec![0xC3u8; 300];
-        let hash = TileHasher::hash(&body_b);
-        writer
-            .add_tile_with_hash(1, 0, 0, &body_a, hash, 0)
-            .unwrap();
-        writer.add_tile_compressed(1, 0, 1, body_b.clone()).unwrap();
-        writer
-            .add_tile_with_hash(1, 1, 1, &body_c, hash, 0)
-            .unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        writer.write_to_file(tmp.path()).unwrap();
-        let bytes = fs::read(tmp.path()).unwrap();
-        assert_eq!(Header::from_bytes(&bytes).unwrap().tile_contents_count, 3);
-        let tiles = read_archive_tiles(&bytes);
-        assert_eq!(tiles[&tile_id(1, 0, 0)], body_a);
-        assert_eq!(tiles[&tile_id(1, 0, 1)], body_b);
-        assert_eq!(
-            tiles[&tile_id(1, 1, 1)],
-            body_c,
-            "C must not be served B's bytes"
-        );
-    }
-
     /// Past [`MAX_COLLIDING_BODIES`] a colliding body is stored but no longer
     /// offered for dedup, so its repeat is stored again. Every tile still
     /// reads back as its own bytes.
@@ -6959,11 +5754,6 @@ mod tests {
         spooled.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
         let msg = spooled.finalize(&output).unwrap_err().to_string();
         assert!(msg.contains(&output.display().to_string()), "{msg}");
-
-        let mut writer = PmtilesWriter::new();
-        writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
-        let msg = writer.write_to_file(&output).unwrap_err().to_string();
-        assert!(msg.contains(&output.display().to_string()), "{msg}");
     }
 
     // -------------------------------------------------------------------------
@@ -6981,8 +5771,7 @@ mod tests {
         String::from_utf8(plain).expect("metadata must be UTF-8")
     }
 
-    /// Fixed tiles + structural setters shared by the publication tests, so a
-    /// buffered and a streaming archive describe the same content.
+    /// Fixed tiles + structural setters shared by the publication tests.
     const PUB_TILES: [(u8, u32, u32, &[u8], usize); 3] = [
         (0, 0, 0, &[0x1a, 0x05, b'h', b'e', b'l', b'l', b'o'], 2),
         (1, 0, 0, &[0x1a, 0x03, b'a', b'b', b'c'], 1),
@@ -6991,17 +5780,6 @@ mod tests {
 
     fn pub_fields() -> HashMap<String, String> {
         HashMap::from([("name".to_string(), "String".to_string())])
-    }
-
-    fn buffered_fixture() -> PmtilesWriter {
-        let mut w = PmtilesWriter::new();
-        w.set_layer_name("parks");
-        w.set_fields(pub_fields());
-        w.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
-        for (z, x, y, data, n) in PUB_TILES {
-            w.add_tile_with_count(z, x, y, data, n).unwrap();
-        }
-        w
     }
 
     fn fill_streaming(w: &mut StreamingPmtilesWriter) {
@@ -7019,7 +5797,7 @@ mod tests {
         w
     }
 
-    /// The metadata both writers emitted before publication metadata
+    /// The metadata the writer emitted before publication metadata
     /// existed. Pinned verbatim: comparing the two modified writers with
     /// each other could not show that either preserved the old output.
     const PRE_PUBLICATION_METADATA: &str = concat!(
@@ -7032,19 +5810,37 @@ mod tests {
     #[test]
     fn default_metadata_is_unchanged_from_pre_publication_output() {
         let dir = tempfile::tempdir().unwrap();
-        let buffered = dir.path().join("buffered.pmtiles");
         let streaming = dir.path().join("streaming.pmtiles");
-        buffered_fixture().write_to_file(&buffered).unwrap();
         streaming_fixture().finalize(&streaming).unwrap();
-
-        let b = fs::read(&buffered).unwrap();
         let s = fs::read(&streaming).unwrap();
-        assert_eq!(archive_metadata_json(&b), PRE_PUBLICATION_METADATA);
         assert_eq!(archive_metadata_json(&s), PRE_PUBLICATION_METADATA);
-        // The pre-feature writers agreed byte for byte on this fixture. Not
-        // pinned to a whole-archive hash: that would pin the deflate encoder's
-        // output too, and fail on a `flate2` bump that changed nothing here.
-        assert_eq!(b, s, "the two writers agree byte for byte");
+    }
+
+    /// Layer and field names come from the user (`--layer-name`, the input
+    /// file stem, Parquet column names), so quotes, backslashes and control
+    /// characters in them must stay valid JSON.
+    #[test]
+    fn hostile_layer_and_field_names_stay_valid_json() {
+        let hostile_field = "a \"quoted\" \\ name\n";
+        let hostile_layer = "parks \"2026\" \\ v1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.pmtiles");
+        let mut w = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        w.set_layer_name(hostile_layer);
+        w.set_fields(HashMap::from([(
+            hostile_field.to_string(),
+            "String".to_string(),
+        )]));
+        for (z, x, y, data, n) in PUB_TILES {
+            w.add_tile_with_count(z, x, y, data, n).unwrap();
+        }
+        w.finalize(&path).unwrap();
+
+        let map = metadata_object(&fs::read(&path).unwrap());
+        let layer = &map["vector_layers"][0];
+        assert_eq!(layer["id"], hostile_layer);
+        assert_eq!(layer["fields"][hostile_field], "String");
+        assert_eq!(map["tilestats"]["layers"][0]["layer"], hostile_layer);
     }
 
     fn metadata_object(bytes: &[u8]) -> serde_json::Map<String, serde_json::Value> {
@@ -7081,45 +5877,26 @@ mod tests {
     }
 
     #[test]
-    fn buffered_writer_writes_publication_metadata() {
+    fn streaming_writer_writes_publication_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.pmtiles");
-        let mut w = buffered_fixture();
-        w.set_metadata(all_publication());
-        w.write_to_file(&path).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        assert_publication(&bytes, &all_publication());
+        let streaming = dir.path().join("s.pmtiles");
+        let mut s = streaming_fixture();
+        s.set_metadata(all_publication());
+        s.finalize(&streaming).unwrap();
+        let s_bytes = fs::read(&streaming).unwrap();
+        assert_publication(&s_bytes, &all_publication());
         // Appended after the structural keys, in the documented order.
-        let json = archive_metadata_json(&bytes);
+        let json = archive_metadata_json(&s_bytes);
         assert!(
             json.starts_with(PRE_PUBLICATION_METADATA.trim_end_matches('}')),
             "{json}"
         );
         // Tile payloads are untouched.
         let path_default = dir.path().join("default.pmtiles");
-        buffered_fixture().write_to_file(&path_default).unwrap();
+        streaming_fixture().finalize(&path_default).unwrap();
         assert_eq!(
-            read_archive_tiles(&bytes),
+            read_archive_tiles(&s_bytes),
             read_archive_tiles(&fs::read(&path_default).unwrap())
-        );
-    }
-
-    #[test]
-    fn streaming_writer_matches_buffered_publication_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let buffered = dir.path().join("b.pmtiles");
-        let streaming = dir.path().join("s.pmtiles");
-        let mut b = buffered_fixture();
-        b.set_metadata(all_publication());
-        b.write_to_file(&buffered).unwrap();
-        let mut s = streaming_fixture();
-        s.set_metadata(all_publication());
-        s.finalize(&streaming).unwrap();
-        let s_bytes = fs::read(&streaming).unwrap();
-        assert_publication(&s_bytes, &all_publication());
-        assert_eq!(
-            archive_metadata_json(&s_bytes),
-            archive_metadata_json(&fs::read(&buffered).unwrap())
         );
     }
 
@@ -7133,10 +5910,10 @@ mod tests {
             Compression::Zstd,
         ] {
             let path = dir.path().join(format!("{codec:?}.pmtiles"));
-            let mut w = PmtilesWriter::with_compression(codec);
+            let mut w = StreamingPmtilesWriter::new(codec).unwrap();
             w.set_metadata(all_publication());
             w.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
-            w.write_to_file(&path).unwrap();
+            w.finalize(&path).unwrap();
             let map = metadata_object(&fs::read(&path).unwrap());
             assert_eq!(
                 map["attribution"],
@@ -7163,26 +5940,15 @@ mod tests {
     #[test]
     fn publication_metadata_survives_structural_setters_and_is_replaced_whole() {
         let dir = tempfile::tempdir().unwrap();
-        let (bp, sp) = (dir.path().join("b.pmtiles"), dir.path().join("s.pmtiles"));
+        let sp = dir.path().join("s.pmtiles");
         let second = TilesetMetadata::new().with_description("second");
 
-        let mut b = PmtilesWriter::new();
-        b.set_metadata(all_publication());
-        b.set_metadata(second.clone());
         let mut s = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         s.set_metadata(all_publication());
         s.set_metadata(second.clone());
         // Structural setters after the metadata must not erase it.
-        b.set_layer_name("parks");
-        b.set_fields(pub_fields());
-        b.set_bounds(&TileBounds::new(-10.0, -5.0, 10.0, 5.0));
-        for (z, x, y, data, n) in PUB_TILES {
-            b.add_tile_with_count(z, x, y, data, n).unwrap();
-        }
         fill_streaming(&mut s);
-        b.write_to_file(&bp).unwrap();
         s.finalize(&sp).unwrap();
-        assert_publication(&fs::read(&bp).unwrap(), &second);
         assert_publication(&fs::read(&sp).unwrap(), &second);
     }
 
@@ -7240,18 +6006,13 @@ mod tests {
     #[test]
     fn zero_tile_archives_keep_publication_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let (bp, sp) = (dir.path().join("b.pmtiles"), dir.path().join("s.pmtiles"));
-        let mut b = PmtilesWriter::new();
-        b.set_metadata(all_publication());
-        b.write_to_file(&bp).unwrap();
+        let sp = dir.path().join("s.pmtiles");
         let mut s = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
         s.set_metadata(all_publication());
         s.finalize(&sp).unwrap();
-        for bytes in [fs::read(&bp).unwrap(), fs::read(&sp).unwrap()] {
-            let map = metadata_object(&bytes);
-            assert_eq!(map["description"], "National park boundaries");
-            assert_eq!(map["attribution"], crate::pmtiles_metadata::tests::HOSTILE);
-        }
+        let map = metadata_object(&fs::read(&sp).unwrap());
+        assert_eq!(map["description"], "National park boundaries");
+        assert_eq!(map["attribution"], crate::pmtiles_metadata::tests::HOSTILE);
     }
 
     #[test]
@@ -7280,22 +6041,6 @@ mod tests {
     /// counting the quotes the escaping adds.
     fn oversized_publication() -> TilesetMetadata {
         TilesetMetadata::new().with_attribution("\"".repeat(MAX_INTERNAL_BYTES as usize / 2))
-    }
-
-    #[test]
-    fn rejected_metadata_leaves_buffered_destination_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("existing.pmtiles");
-        fs::write(&existing, b"previous archive").unwrap();
-        let absent = dir.path().join("absent.pmtiles");
-        for path in [&existing, &absent] {
-            let mut w = buffered_fixture();
-            w.set_metadata(oversized_publication());
-            let err = w.write_to_file(path).unwrap_err();
-            assert!(err.to_string().contains("metadata"), "{err}");
-        }
-        assert_eq!(fs::read(&existing).unwrap(), b"previous archive");
-        assert!(!absent.exists(), "no output created for rejected metadata");
     }
 
     #[test]

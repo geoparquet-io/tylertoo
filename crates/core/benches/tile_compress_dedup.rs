@@ -1,11 +1,13 @@
 //! Tile gzip + dedup benchmark (#448): the two per-tile steps
 //! `overview::export` runs on every encoded MVT payload before it is
 //! written to the PMTiles archive — content hashing for run-length dedup
-//! ([`TileHasher`] / [`DeduplicationCache`]) and gzip compression
+//! ([`TileHasher`] keying a hash -> stored-location map, as the streaming
+//! PMTiles writer does) and gzip compression
 //! ([`compression::compress`]).
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `tile_compress_dedup`
 
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use geo::{Coord, Geometry, LineString, Point};
 use prost::Message;
 use tylertoo_core::compression::{compress, Compression};
-use tylertoo_core::dedup::{DeduplicationCache, TileHasher};
+use tylertoo_core::dedup::TileHasher;
 use tylertoo_core::mvt::{LayerBuilder, PropertyValue};
 use tylertoo_core::tile::TileBounds;
 
@@ -113,19 +115,16 @@ fn bench_dedup(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &stream, |b, stream| {
             b.iter(|| {
-                let mut cache = DeduplicationCache::new();
+                let mut seen: HashMap<u64, (u64, u32)> = HashMap::new();
                 let mut offset = 0u64;
                 for tile in stream {
-                    let hash = TileHasher::hash(tile);
-                    match cache.check(hash) {
-                        Some(_) => cache.record_duplicate(tile.len() as u32),
-                        None => {
-                            cache.record_new(hash, offset, tile.len() as u32, tile.len() as u32);
-                            offset += tile.len() as u64;
-                        }
-                    }
+                    seen.entry(TileHasher::hash(tile)).or_insert_with(|| {
+                        let at = offset;
+                        offset += tile.len() as u64;
+                        (at, tile.len() as u32)
+                    });
                 }
-                black_box(cache.into_stats())
+                black_box((seen.len(), offset))
             });
         });
     }

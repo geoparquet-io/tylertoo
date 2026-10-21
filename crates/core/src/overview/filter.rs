@@ -55,13 +55,20 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
+use arrow_arith::boolean::{and_kleene, not, or_kleene};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::types::Float64Type;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float64Array, LargeStringArray, RecordBatch, Scalar,
+    StringArray, StringViewArray,
+};
+use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+use arrow_ord::cmp;
 use arrow_schema::{DataType, Schema, TimeUnit};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
-
-use super::convert::extract_numeric_values;
 
 /// Errors from parsing or binding a `--filter` expression.
 #[derive(Debug, thiserror::Error)]
@@ -786,7 +793,7 @@ impl BoundFilter {
         batch: &RecordBatch,
         proj: &dyn Fn(usize) -> usize,
     ) -> Vec<Option<bool>> {
-        eval_expr(&self.expr, batch, proj)
+        eval_expr(&self.expr, batch, proj).iter().collect()
     }
 
     /// Row groups of `metadata` the filter could match, by column chunk
@@ -957,79 +964,72 @@ fn bind_expr(
 // ---------------------------------------------------------------------------
 // Evaluation (per-batch, three-valued)
 // ---------------------------------------------------------------------------
+//
+// Comparisons run on arrow-ord's kernels and the Kleene connectives on
+// arrow-arith's, so a batch is evaluated column-at-a-time. Two shims keep
+// the SQL reading the kernels' total order would change: a numeric column
+// is read as `extract_numeric_values` reads it (NaN → null, UNKNOWN per #428),
+// and signed zeros are folded to +0.0 on both sides (`-0.0 = 0` holds, as
+// in IEEE and every SQL engine, where arrow-ord orders -0.0 below 0.0).
 
-fn cmp_num(v: f64, op: CmpOp, lit: f64) -> bool {
-    match op {
-        CmpOp::Eq => v == lit,
-        CmpOp::Ne => v != lit,
-        CmpOp::Lt => v < lit,
-        CmpOp::Le => v <= lit,
-        CmpOp::Gt => v > lit,
-        CmpOp::Ge => v >= lit,
-    }
+/// The kernel result, or all-UNKNOWN if the kernel rejects the operand
+/// types (unreachable after bind-time type checking).
+fn kernel(
+    op: CmpOp,
+    lhs: &dyn arrow_array::Datum,
+    rhs: &dyn arrow_array::Datum,
+    len: usize,
+) -> BooleanArray {
+    let result = match op {
+        CmpOp::Eq => cmp::eq(lhs, rhs),
+        CmpOp::Ne => cmp::neq(lhs, rhs),
+        CmpOp::Lt => cmp::lt(lhs, rhs),
+        CmpOp::Le => cmp::lt_eq(lhs, rhs),
+        CmpOp::Gt => cmp::gt(lhs, rhs),
+        CmpOp::Ge => cmp::gt_eq(lhs, rhs),
+    };
+    result.unwrap_or_else(|_| BooleanArray::new_null(len))
 }
 
-fn cmp_ord<T: Ord + ?Sized>(v: &T, op: CmpOp, lit: &T) -> bool {
-    match op {
-        CmpOp::Eq => v == lit,
-        CmpOp::Ne => v != lit,
-        CmpOp::Lt => v < lit,
-        CmpOp::Le => v <= lit,
-        CmpOp::Gt => v > lit,
-        CmpOp::Ge => v >= lit,
+/// A numeric column as f64 for comparison, read as `extract_numeric_values`
+/// reads it (each value `as f64`; NaN is null, UNKNOWN per #428), with
+/// -0.0 folded to +0.0. Cast and masked column-at-a-time.
+fn num_operand(col: &dyn Array) -> Float64Array {
+    let Ok(cast) = arrow_cast::cast(col, &DataType::Float64) else {
+        // Bind-time type checking admits only castable numeric columns.
+        return Float64Array::new_null(col.len());
+    };
+    let a = cast.as_primitive::<Float64Type>();
+    if !matches!(col.data_type(), DataType::Float32 | DataType::Float64) {
+        // An integer never casts to NaN or -0.0.
+        return a.clone();
     }
+    let values: ScalarBuffer<f64> = a.values().iter().map(|v| v + 0.0).collect();
+    let not_nan = NullBuffer::new(BooleanBuffer::collect_bool(a.len(), |i| {
+        !a.value(i).is_nan()
+    }));
+    Float64Array::new(values, NullBuffer::union(a.nulls(), Some(&not_nan)))
 }
 
-/// Apply `f` to each row of a string-kinded column (Utf8 / `LargeUtf8` /
-/// `Utf8View` / dictionary-of-string), producing `None` for null rows.
-fn str_mask(col: &dyn Array, f: &dyn Fn(&str) -> bool) -> Vec<Option<bool>> {
-    let n = col.len();
-    match col.data_type() {
-        DataType::Utf8 => {
-            let a = col.as_string::<i32>();
-            (0..n)
-                .map(|i| (!a.is_null(i)).then(|| f(a.value(i))))
-                .collect()
-        }
-        DataType::LargeUtf8 => {
-            let a = col.as_string::<i64>();
-            (0..n)
-                .map(|i| (!a.is_null(i)).then(|| f(a.value(i))))
-                .collect()
-        }
-        DataType::Utf8View => {
-            let a = col.as_string_view();
-            (0..n)
-                .map(|i| (!a.is_null(i)).then(|| f(a.value(i))))
-                .collect()
-        }
-        DataType::Dictionary(_, _) => {
-            let Some(d) = col.as_any_dictionary_opt() else {
-                return vec![None; n];
-            };
-            let values = d.values();
-            let keys = d.normalized_keys();
-            (0..n)
-                .map(|i| {
-                    if col.is_null(i) {
-                        return None;
-                    }
-                    let k = keys[i];
-                    if values.is_null(k) {
-                        return None;
-                    }
-                    let s = match values.data_type() {
-                        DataType::Utf8 => values.as_string::<i32>().value(k),
-                        DataType::LargeUtf8 => values.as_string::<i64>().value(k),
-                        DataType::Utf8View => values.as_string_view().value(k),
-                        _ => return None,
-                    };
-                    Some(f(s))
-                })
-                .collect()
-        }
-        _ => vec![None; n],
-    }
+fn num_scalar(lit: f64) -> Scalar<Float64Array> {
+    Float64Array::new_scalar(lit + 0.0)
+}
+
+/// A string literal typed to match `col` (or its dictionary's values), so
+/// the kernel compares Utf8 / `LargeUtf8` / `Utf8View` / dictionary columns
+/// in place. `None` for a non-string column.
+fn str_scalar(col: &dyn Array, lit: &str) -> Option<Scalar<ArrayRef>> {
+    let value_type = match col.data_type() {
+        DataType::Dictionary(_, values) => values.as_ref(),
+        other => other,
+    };
+    let array: ArrayRef = match value_type {
+        DataType::Utf8 => Arc::new(StringArray::from(vec![lit])),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vec![lit])),
+        DataType::Utf8View => Arc::new(StringViewArray::from(vec![lit])),
+        _ => return None,
+    };
+    Some(Scalar::new(array))
 }
 
 /// Per-row raw `i64` values of a timestamp column (any unit), `None` for
@@ -1058,38 +1058,62 @@ fn ts_values(col: &dyn Array) -> Vec<Option<i64>> {
     }
 }
 
-fn eval_expr(
-    expr: &BoundExpr,
-    batch: &RecordBatch,
-    proj: &dyn Fn(usize) -> usize,
-) -> Vec<Option<bool>> {
+/// Timestamps compare in `i128` epoch nanoseconds, so a literal is never
+/// rounded into the column's unit.
+fn ts_cmp(col: &dyn Array, unit: TimeUnit, pred: impl Fn(i128) -> bool) -> BooleanArray {
+    let f = ts_factor(unit);
+    ts_values(col)
+        .into_iter()
+        .map(|v| v.map(|v| pred(i128::from(v) * f)))
+        .collect()
+}
+
+fn ord_holds(ord: std::cmp::Ordering, op: CmpOp) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match op {
+        CmpOp::Eq => ord == Equal,
+        CmpOp::Ne => ord != Equal,
+        CmpOp::Lt => ord == Less,
+        CmpOp::Le => ord != Greater,
+        CmpOp::Gt => ord == Greater,
+        CmpOp::Ge => ord != Less,
+    }
+}
+
+/// OR of `eq(lhs, lit)` over `lits`, starting from FALSE on every present
+/// row (and UNKNOWN on every null one) so an empty list is FALSE, as
+/// `x IN ()` would be.
+fn any_eq<S: arrow_array::Datum>(lhs: &dyn Array, lits: impl Iterator<Item = S>) -> BooleanArray {
+    let len = lhs.len();
+    let start = BooleanArray::new(BooleanBuffer::new_unset(len), lhs.logical_nulls());
+    lits.fold(start, |acc, lit| {
+        let hit = kernel(CmpOp::Eq, &lhs, &lit, len);
+        or_kleene(&acc, &hit).expect("equal lengths")
+    })
+}
+
+fn eval_expr(expr: &BoundExpr, batch: &RecordBatch, proj: &dyn Fn(usize) -> usize) -> BooleanArray {
+    let rows = batch.num_rows();
     match expr {
         BoundExpr::Compare { col, op, value } => {
             let arr = batch.column(proj(col.idx));
             match (col.kind, value) {
-                (ColKind::Num, Literal::Number(lit)) => extract_numeric_values(arr.as_ref())
-                    .into_iter()
-                    .map(|v| v.map(|v| cmp_num(v, *op, *lit)))
-                    .collect(),
-                (ColKind::Str, Literal::String(lit)) => {
-                    str_mask(arr.as_ref(), &|s| cmp_ord(s, *op, lit.as_str()))
+                (ColKind::Num, Literal::Number(lit)) => {
+                    kernel(*op, &num_operand(arr.as_ref()), &num_scalar(*lit), rows)
                 }
+                (ColKind::Str, Literal::String(lit)) => match str_scalar(arr.as_ref(), lit) {
+                    Some(lit) => kernel(*op, arr, &lit, rows),
+                    None => BooleanArray::new_null(rows),
+                },
                 (ColKind::Bool, Literal::Bool(lit)) => {
-                    let a = arr.as_boolean();
-                    (0..a.len())
-                        .map(|i| (!a.is_null(i)).then(|| cmp_ord(&a.value(i), *op, lit)))
-                        .collect()
+                    kernel(*op, arr, &BooleanArray::new_scalar(*lit), rows)
                 }
                 (ColKind::Ts(unit), Literal::Timestamp(lit)) => {
-                    let f = ts_factor(unit);
-                    let lit = *lit as i128;
-                    ts_values(arr.as_ref())
-                        .into_iter()
-                        .map(|v| v.map(|v| cmp_ord(&(v as i128 * f), *op, &lit)))
-                        .collect()
+                    let lit = i128::from(*lit);
+                    ts_cmp(arr.as_ref(), unit, |v| ord_holds(v.cmp(&lit), *op))
                 }
                 // Bind-time type checking makes this unreachable.
-                _ => vec![None; batch.num_rows()],
+                _ => BooleanArray::new_null(rows),
             }
         }
         BoundExpr::In {
@@ -1098,99 +1122,72 @@ fn eval_expr(
             negated,
         } => {
             let arr = batch.column(proj(col.idx));
-            let member: Vec<Option<bool>> = match col.kind {
+            let member = match col.kind {
                 ColKind::Num => {
-                    let lits: Vec<f64> = values
-                        .iter()
-                        .filter_map(|l| match l {
-                            Literal::Number(v) => Some(*v),
+                    let lhs = num_operand(arr.as_ref());
+                    any_eq(
+                        &lhs,
+                        values.iter().filter_map(|l| match l {
+                            Literal::Number(v) => Some(num_scalar(*v)),
                             _ => None,
-                        })
-                        .collect();
-                    extract_numeric_values(arr.as_ref())
-                        .into_iter()
-                        .map(|v| v.map(|v| lits.contains(&v)))
-                        .collect()
+                        }),
+                    )
                 }
                 ColKind::Str => {
-                    let lits: Vec<&str> = values
+                    let lits: Option<Vec<_>> = values
                         .iter()
                         .filter_map(|l| match l {
-                            Literal::String(s) => Some(s.as_str()),
+                            Literal::String(s) => Some(str_scalar(arr.as_ref(), s)),
                             _ => None,
                         })
                         .collect();
-                    str_mask(arr.as_ref(), &|s| lits.contains(&s))
+                    match lits {
+                        Some(lits) => any_eq(arr.as_ref(), lits.into_iter()),
+                        None => BooleanArray::new_null(rows),
+                    }
                 }
-                ColKind::Bool => {
-                    let lits: Vec<bool> = values
-                        .iter()
-                        .filter_map(|l| match l {
-                            Literal::Bool(b) => Some(*b),
-                            _ => None,
-                        })
-                        .collect();
-                    let a = arr.as_boolean();
-                    (0..a.len())
-                        .map(|i| (!a.is_null(i)).then(|| lits.contains(&a.value(i))))
-                        .collect()
-                }
+                ColKind::Bool => any_eq(
+                    arr.as_ref(),
+                    values.iter().filter_map(|l| match l {
+                        Literal::Bool(b) => Some(BooleanArray::new_scalar(*b)),
+                        _ => None,
+                    }),
+                ),
                 ColKind::Ts(unit) => {
-                    let f = ts_factor(unit);
                     let lits: Vec<i128> = values
                         .iter()
                         .filter_map(|l| match l {
-                            Literal::Timestamp(ns) => Some(*ns as i128),
+                            Literal::Timestamp(ns) => Some(i128::from(*ns)),
                             _ => None,
                         })
                         .collect();
-                    ts_values(arr.as_ref())
-                        .into_iter()
-                        .map(|v| v.map(|v| lits.contains(&(v as i128 * f))))
-                        .collect()
+                    ts_cmp(arr.as_ref(), unit, |v| lits.contains(&v))
                 }
             };
             if *negated {
-                member.into_iter().map(|m| m.map(|b| !b)).collect()
+                not(&member).expect("NOT of a boolean array")
             } else {
                 member
             }
         }
+        // Reads the array's own validity: a NaN is a present value, and so
+        // is a dictionary key pointing at a null value (comparisons still
+        // see that one as UNKNOWN).
         BoundExpr::IsNull { col, negated } => {
             let arr = batch.column(proj(col.idx));
-            (0..arr.len())
-                .map(|i| Some(arr.is_null(i) != *negated))
-                .collect()
+            let present = arr
+                .nulls()
+                .map_or_else(|| BooleanBuffer::new_set(rows), |n| n.inner().clone());
+            BooleanArray::new(if *negated { present } else { !&present }, None)
         }
         // Kleene: NOT UNKNOWN = UNKNOWN.
-        BoundExpr::Not(inner) => eval_expr(inner, batch, proj)
-            .into_iter()
-            .map(|v| v.map(|b| !b))
-            .collect(),
-        BoundExpr::And(a, b) => {
-            let va = eval_expr(a, batch, proj);
-            let vb = eval_expr(b, batch, proj);
-            va.into_iter()
-                .zip(vb)
-                .map(|(x, y)| match (x, y) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                })
-                .collect()
+        BoundExpr::Not(inner) => {
+            not(&eval_expr(inner, batch, proj)).expect("NOT of a boolean array")
         }
-        BoundExpr::Or(a, b) => {
-            let va = eval_expr(a, batch, proj);
-            let vb = eval_expr(b, batch, proj);
-            va.into_iter()
-                .zip(vb)
-                .map(|(x, y)| match (x, y) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                })
-                .collect()
-        }
+        BoundExpr::And(a, b) => and_kleene(&eval_expr(a, batch, proj), &eval_expr(b, batch, proj))
+            .expect("both sides cover the batch"),
+        BoundExpr::Or(a, b) => or_kleene(&eval_expr(a, batch, proj), &eval_expr(b, batch, proj))
+            .expect("both sides cover the batch"),
     }
 }
 
@@ -1837,6 +1834,153 @@ mod tests {
             vec![Some(true), Some(true), Some(true), Some(false)],
             "...and IS NOT NULL does"
         );
+    }
+
+    /// Corners the row-level evaluator must keep: signed zeros compare equal
+    /// (IEEE, not a total order), infinities are ordered values, a
+    /// dictionary's null *value* is UNKNOWN to comparisons but not NULL to
+    /// `IS NULL` (which reads the key's validity), every string encoding
+    /// compares byte-wise.
+    #[test]
+    fn eval_signed_zero_infinity_dictionary_and_string_encodings() {
+        use arrow_array::{
+            DictionaryArray, Int32Array, LargeStringArray, StringArray, StringViewArray,
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Float64, true),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("l", DataType::LargeUtf8, true),
+            Field::new("v", DataType::Utf8View, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        let x: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::NAN),
+            None,
+        ]));
+        let d: ArrayRef = Arc::new(DictionaryArray::new(
+            Int32Array::from(vec![Some(0), Some(1), Some(2), None, Some(0), Some(2)]),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])),
+        ));
+        let strings = [Some("a"), Some("b"), Some("é"), None, Some(""), Some("B")];
+        let l: ArrayRef = Arc::new(LargeStringArray::from(strings.to_vec()));
+        let v: ArrayRef = Arc::new(StringViewArray::from(strings.to_vec()));
+        let b: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![x, d, l, v, b]).unwrap();
+        let eval = |src: &str| {
+            let expr = parse_filter(src).unwrap();
+            BoundFilter::bind(&expr, &batch.schema(), &[])
+                .unwrap()
+                .eval_mask(&batch, &|i| i)
+        };
+        let (t, f, u) = (Some(true), Some(false), None);
+
+        assert_eq!(eval("x = 0"), vec![t, t, f, f, u, u]);
+        assert_eq!(eval("x = -0.0"), vec![t, t, f, f, u, u]);
+        assert_eq!(eval("x < 0"), vec![f, f, f, t, u, u]);
+        assert_eq!(eval("x >= 0"), vec![t, t, t, f, u, u]);
+        assert_eq!(eval("x > 1e308"), vec![f, f, t, f, u, u]);
+        assert_eq!(eval("x IN (0, 1)"), vec![t, t, f, f, u, u]);
+        assert_eq!(eval("x NOT IN (-0.0)"), vec![f, f, t, t, u, u]);
+
+        assert_eq!(eval("d = 'a'"), vec![t, u, f, u, t, f]);
+        assert_eq!(eval("d >= 'b'"), vec![f, u, t, u, f, t]);
+        assert_eq!(eval("d IN ('a', 'b')"), vec![t, u, t, u, t, t]);
+        assert_eq!(eval("d NOT IN ('a')"), vec![f, u, t, u, f, t]);
+        assert_eq!(eval("d IS NULL"), vec![f, f, f, t, f, f]);
+
+        for col in ["l", "v"] {
+            assert_eq!(eval(&format!("{col} = 'b'")), vec![f, t, f, u, f, f]);
+            // Byte order: 'B' < 'a' < 'b' < 'é'; '' is smallest.
+            assert_eq!(eval(&format!("{col} > 'a'")), vec![f, t, t, u, f, f]);
+            assert_eq!(eval(&format!("{col} < 'a'")), vec![f, f, f, u, t, t]);
+            assert_eq!(eval(&format!("{col} IN ('', 'é')")), vec![f, f, t, u, t, f]);
+        }
+
+        assert_eq!(eval("b != false"), vec![t, f, u, t, f, u]);
+        assert_eq!(eval("b IN (false)"), vec![f, t, u, f, t, u]);
+    }
+
+    /// `num_operand` casts column-at-a-time; it must read every numeric type
+    /// exactly as `extract_numeric_values` (the pass-1 reader) does, apart
+    /// from folding -0.0 to +0.0.
+    #[test]
+    fn num_operand_reads_columns_like_extract_numeric_values() {
+        use super::super::convert::extract_numeric_values;
+        use arrow_array::{
+            Float32Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array,
+            UInt64Array, UInt8Array,
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![
+                Some(i8::MIN),
+                None,
+                Some(0),
+                Some(i8::MAX),
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(i16::MIN),
+                None,
+                Some(-1),
+                Some(i16::MAX),
+            ])),
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                None,
+                Some(7),
+                Some(i32::MAX),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                None,
+                Some((1 << 53) + 1),
+                Some(i64::MAX),
+            ])),
+            Arc::new(UInt8Array::from(vec![Some(0), None, Some(u8::MAX)])),
+            Arc::new(UInt16Array::from(vec![Some(0), None, Some(u16::MAX)])),
+            Arc::new(UInt32Array::from(vec![Some(0), None, Some(u32::MAX)])),
+            Arc::new(UInt64Array::from(vec![Some(0), None, Some(u64::MAX)])),
+            Arc::new(Float32Array::from(vec![
+                Some(-0.0),
+                Some(f32::NAN),
+                None,
+                Some(f32::INFINITY),
+                Some(f32::MIN_POSITIVE),
+                Some(0.1),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(f64::NAN),
+                None,
+                Some(f64::NEG_INFINITY),
+                Some(f64::MAX),
+                Some(0.1),
+            ])),
+        ];
+        for col in &columns {
+            let want: Vec<Option<f64>> = extract_numeric_values(col.as_ref())
+                .into_iter()
+                .map(|v| v.map(|v| v + 0.0))
+                .collect();
+            let got: Vec<Option<f64>> = num_operand(col.as_ref()).iter().collect();
+            let bits =
+                |v: &[Option<f64>]| v.iter().map(|x| x.map(f64::to_bits)).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "{:?}", col.data_type());
+        }
     }
 
     #[test]

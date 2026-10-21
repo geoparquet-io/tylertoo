@@ -91,13 +91,9 @@ pub mod tylertoo_core::clip
 pub const tylertoo_core::clip::DEFAULT_BUFFER_PIXELS: u32
 pub const tylertoo_core::clip::DEFAULT_EXTENT: u32
 pub fn tylertoo_core::clip::buffer_pixels_to_degrees(u32, &tylertoo_core::tile::TileBounds, u32) -> f64
-pub fn tylertoo_core::clip::buffer_pixels_to_world(u8, u32, u32) -> u32
 pub fn tylertoo_core::clip::clip_geometry(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::clip::clip_geometry_simple(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, bool, bool) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::clip::clip_point_world(&tylertoo_core::world_coord::WorldCoord, &tylertoo_core::world_coord::WorldBounds) -> core::option::Option<tylertoo_core::world_coord::WorldCoord>
-pub fn tylertoo_core::clip::clip_polygon_world(&[tylertoo_core::world_coord::WorldCoord], &[alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>], &tylertoo_core::world_coord::WorldBounds) -> core::option::Option<(alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>, alloc::vec::Vec<alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>>)>
 pub fn tylertoo_core::clip::geometry_is_simple(&geo_types::geometry::Geometry<f64>) -> bool
-pub fn tylertoo_core::clip::polygon_to_world_rings(&geo_types::geometry::polygon::Polygon<f64>) -> (alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>, alloc::vec::Vec<alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>>)
 pub mod tylertoo_core::compression
 #[repr(u8)] pub enum tylertoo_core::compression::Compression
 pub tylertoo_core::compression::Compression::Brotli = 3
@@ -200,7 +196,6 @@ impl core::marker::Unpin for tylertoo_core::covering::RowGroupBounds
 impl core::marker::UnsafeUnpin for tylertoo_core::covering::RowGroupBounds
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::covering::RowGroupBounds
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::covering::RowGroupBounds
-pub fn tylertoo_core::covering::covering_tiles(&tylertoo_core::tile::TileBounds, u8) -> impl core::iter::traits::iterator::Iterator<Item = tylertoo_core::tile::TileCoord>
 pub fn tylertoo_core::covering::extract_row_group_bounds(&std::path::Path) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::extract_row_group_bounds_from_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::extract_row_group_bounds_from_reader(&parquet::file::serialized_reader::SerializedFileReader<std::fs::File>) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
@@ -208,7 +203,6 @@ pub fn tylertoo_core::covering::find_bbox_column_indices(&parquet::file::metadat
 pub fn tylertoo_core::covering::get_geo_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<core::option::Option<alloc::string::String>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::parse_bounds(&str) -> core::result::Result<tylertoo_core::tile::TileBounds, tylertoo_core::Error>
 pub fn tylertoo_core::covering::parse_covering_metadata(&str, core::option::Option<&str>) -> core::result::Result<core::option::Option<tylertoo_core::covering::CoveringSpec>, tylertoo_core::Error>
-pub fn tylertoo_core::covering::tile_to_bounds(u8, u32, u32) -> tylertoo_core::tile::TileBounds
 pub mod tylertoo_core::decode
 pub enum tylertoo_core::decode::DecodeError
 pub tylertoo_core::decode::DecodeError::Archive(tylertoo_core::Error)
@@ -310,52 +304,6 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::decode::DecodeRepor
 pub fn tylertoo_core::decode::decode_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::decode::DecodeOptions) -> core::result::Result<tylertoo_core::decode::DecodeReport, tylertoo_core::decode::DecodeError>
 pub fn tylertoo_core::decode::tile_local_to_lonlat(u8, u32, u32, u32, i64, i64) -> (f64, f64)
 pub mod tylertoo_core::dedup
-pub struct tylertoo_core::dedup::DeduplicationCache
-impl tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::check(&self, u64) -> core::option::Option<(u64, u32)>
-pub fn tylertoo_core::dedup::DeduplicationCache::into_stats(self) -> tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationCache::new() -> Self
-pub fn tylertoo_core::dedup::DeduplicationCache::record_duplicate(&mut self, u32)
-pub fn tylertoo_core::dedup::DeduplicationCache::record_new(&mut self, u64, u64, u32, u32)
-pub fn tylertoo_core::dedup::DeduplicationCache::stats(&self) -> &tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationCache::unique_count(&self) -> usize
-impl core::default::Default for tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::default() -> tylertoo_core::dedup::DeduplicationCache
-impl core::fmt::Debug for tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Send for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Sync for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Unpin for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::UnsafeUnpin for tylertoo_core::dedup::DeduplicationCache
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::DeduplicationCache
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::DeduplicationCache
-pub struct tylertoo_core::dedup::DeduplicationStats
-pub tylertoo_core::dedup::DeduplicationStats::bytes_saved: u64
-pub tylertoo_core::dedup::DeduplicationStats::duplicates_eliminated: u64
-pub tylertoo_core::dedup::DeduplicationStats::total_tiles: u64
-pub tylertoo_core::dedup::DeduplicationStats::unique_tiles: u64
-impl tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::dedup_ratio(&self) -> f64
-pub fn tylertoo_core::dedup::DeduplicationStats::new() -> Self
-pub fn tylertoo_core::dedup::DeduplicationStats::savings_percent(&self) -> f64
-impl core::clone::Clone for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::clone(&self) -> tylertoo_core::dedup::DeduplicationStats
-impl core::cmp::Eq for tylertoo_core::dedup::DeduplicationStats
-impl core::cmp::PartialEq for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::eq(&self, &tylertoo_core::dedup::DeduplicationStats) -> bool
-impl core::default::Default for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::default() -> tylertoo_core::dedup::DeduplicationStats
-impl core::fmt::Debug for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Freeze for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Send for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Sync for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Unpin for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::UnsafeUnpin for tylertoo_core::dedup::DeduplicationStats
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::DeduplicationStats
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::DeduplicationStats
 pub struct tylertoo_core::dedup::TileHasher
 impl tylertoo_core::dedup::TileHasher
 pub fn tylertoo_core::dedup::TileHasher::hash(&[u8]) -> u64
@@ -858,6 +806,9 @@ impl core::fmt::Debug for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::SortDirection
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::SortDirection
+impl core::str::traits::FromStr for tylertoo_core::overview::assign::SortDirection
+pub type tylertoo_core::overview::assign::SortDirection::Err = alloc::string::String
+pub fn tylertoo_core::overview::assign::SortDirection::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::overview::assign::SortDirection
 impl core::marker::Send for tylertoo_core::overview::assign::SortDirection
 impl core::marker::Sync for tylertoo_core::overview::assign::SortDirection
@@ -2197,6 +2148,9 @@ impl core::fmt::Debug for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::MemoryProfile
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::MemoryProfile
+impl core::str::traits::FromStr for tylertoo_core::overview::level::MemoryProfile
+pub type tylertoo_core::overview::level::MemoryProfile::Err = alloc::string::String
+pub fn tylertoo_core::overview::level::MemoryProfile::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl serde_core::ser::Serialize for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::MemoryProfile
@@ -2220,6 +2174,9 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Mode
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Mode
+impl core::str::traits::FromStr for tylertoo_core::overview::level::Mode
+pub type tylertoo_core::overview::level::Mode::Err = alloc::string::String
+pub fn tylertoo_core::overview::level::Mode::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl serde_core::ser::Serialize for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Mode
@@ -3041,6 +2998,9 @@ impl core::fmt::Debug for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::writer::RowGroupSizePolicy
+impl core::str::traits::FromStr for tylertoo_core::overview::writer::RowGroupSizePolicy
+pub type tylertoo_core::overview::writer::RowGroupSizePolicy::Err = alloc::string::String
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::Send for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::Sync for tylertoo_core::overview::writer::RowGroupSizePolicy
@@ -3247,36 +3207,6 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::Header
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::Header
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::Header
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Header
-pub struct tylertoo_core::pmtiles_writer::PmtilesWriter
-impl tylertoo_core::pmtiles_writer::PmtilesWriter
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile_compressed(&mut self, u8, u32, u32, alloc::vec::Vec<u8>) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::dedup_stats(&self) -> &tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::enable_deduplication(&mut self, bool)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::internal_compression(&self) -> tylertoo_core::compression::Compression
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::is_dedup_enabled(&self) -> bool
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::new() -> Self
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_internal_compression(&mut self, tylertoo_core::compression::Compression)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_layer_name(&mut self, &str)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_metadata(&mut self, tylertoo_core::TilesetMetadata)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_tile_compression(&mut self, tylertoo_core::compression::Compression)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::tile_compression(&self) -> tylertoo_core::compression::Compression
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::tile_count(&self) -> usize
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::with_compression(tylertoo_core::compression::Compression) -> Self
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::write_to_file(&self, &std::path::Path) -> tylertoo_core::Result<()>
-impl core::default::Default for tylertoo_core::pmtiles_writer::PmtilesWriter
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::default() -> Self
-impl core::marker::Freeze for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Send for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Sync for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Unpin for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::PmtilesWriter
 pub struct tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
@@ -3742,32 +3672,8 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::stats::ZoomStats
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::stats::ZoomStats
 pub fn tylertoo_core::stats::compute_stats(&tylertoo_core::archive_index::ArchiveIndex, usize) -> tylertoo_core::Result<tylertoo_core::stats::StatsReport>
 pub mod tylertoo_core::sutherland_hodgman
-pub struct tylertoo_core::sutherland_hodgman::ClipCoord
-pub tylertoo_core::sutherland_hodgman::ClipCoord::x: i64
-pub tylertoo_core::sutherland_hodgman::ClipCoord::y: i64
-impl tylertoo_core::sutherland_hodgman::ClipCoord
-pub fn tylertoo_core::sutherland_hodgman::ClipCoord::from_world(tylertoo_core::world_coord::WorldCoord) -> Self
-pub const fn tylertoo_core::sutherland_hodgman::ClipCoord::new(i64, i64) -> Self
-pub fn tylertoo_core::sutherland_hodgman::ClipCoord::to_world(&self) -> tylertoo_core::world_coord::WorldCoord
-impl core::clone::Clone for tylertoo_core::sutherland_hodgman::ClipCoord
-pub fn tylertoo_core::sutherland_hodgman::ClipCoord::clone(&self) -> tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::cmp::Eq for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::cmp::PartialEq for tylertoo_core::sutherland_hodgman::ClipCoord
-pub fn tylertoo_core::sutherland_hodgman::ClipCoord::eq(&self, &tylertoo_core::sutherland_hodgman::ClipCoord) -> bool
-impl core::fmt::Debug for tylertoo_core::sutherland_hodgman::ClipCoord
-pub fn tylertoo_core::sutherland_hodgman::ClipCoord::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::StructuralPartialEq for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::Freeze for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::Send for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::Sync for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::Unpin for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::marker::UnsafeUnpin for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::sutherland_hodgman::ClipCoord
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::sutherland_hodgman::ClipCoord
 pub fn tylertoo_core::sutherland_hodgman::clip_multipolygon_sh(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::multi_polygon::MultiPolygon<f64>>
 pub fn tylertoo_core::sutherland_hodgman::clip_polygon_sh(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::sutherland_hodgman::clip_polygon_sh_world(&[tylertoo_core::world_coord::WorldCoord], &[alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>], &tylertoo_core::world_coord::WorldBounds) -> core::option::Option<(alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>, alloc::vec::Vec<alloc::vec::Vec<tylertoo_core::world_coord::WorldCoord>>)>
 pub mod tylertoo_core::tile
 pub struct tylertoo_core::tile::TileBounds
 pub tylertoo_core::tile::TileBounds::lat_max: f64
@@ -3824,6 +3730,7 @@ impl core::marker::Unpin for tylertoo_core::tile::TileCoord
 impl core::marker::UnsafeUnpin for tylertoo_core::tile::TileCoord
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::tile::TileCoord
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::tile::TileCoord
+pub const tylertoo_core::tile::MAX_LATITUDE: f64
 pub const tylertoo_core::tile::MAX_ZOOM: u8
 pub fn tylertoo_core::tile::lng_lat_to_tile(f64, f64, u8) -> tylertoo_core::tile::TileCoord
 pub fn tylertoo_core::tile::max_tile_index(u8) -> u32
@@ -4006,73 +3913,6 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::wkb::WkbError
 pub fn tylertoo_core::wkb::geometry_to_wkb(&geo_types::geometry::Geometry) -> tylertoo_core::wkb::Result<alloc::vec::Vec<u8>>
 pub fn tylertoo_core::wkb::wkb_to_geometry(&[u8]) -> tylertoo_core::wkb::Result<geo_types::geometry::Geometry>
 pub type tylertoo_core::wkb::Result<T> = core::result::Result<T, tylertoo_core::wkb::WkbError>
-pub mod tylertoo_core::world_coord
-pub struct tylertoo_core::world_coord::WorldBounds
-pub tylertoo_core::world_coord::WorldBounds::x_max: u32
-pub tylertoo_core::world_coord::WorldBounds::x_min: u32
-pub tylertoo_core::world_coord::WorldBounds::y_max: u32
-pub tylertoo_core::world_coord::WorldBounds::y_min: u32
-impl tylertoo_core::world_coord::WorldBounds
-pub fn tylertoo_core::world_coord::WorldBounds::contains(&self, &tylertoo_core::world_coord::WorldCoord) -> bool
-pub fn tylertoo_core::world_coord::WorldBounds::contains_bounds(&self, &tylertoo_core::world_coord::WorldBounds) -> bool
-pub fn tylertoo_core::world_coord::WorldBounds::from_tile(&tylertoo_core::tile::TileCoord) -> Self
-pub fn tylertoo_core::world_coord::WorldBounds::from_tile_bounds(&tylertoo_core::tile::TileBounds) -> Self
-pub fn tylertoo_core::world_coord::WorldBounds::from_tile_with_buffer(&tylertoo_core::tile::TileCoord, u32, u32) -> Self
-pub fn tylertoo_core::world_coord::WorldBounds::height(&self) -> u32
-pub fn tylertoo_core::world_coord::WorldBounds::intersects(&self, &tylertoo_core::world_coord::WorldBounds) -> bool
-pub const fn tylertoo_core::world_coord::WorldBounds::new(u32, u32, u32, u32) -> Self
-pub fn tylertoo_core::world_coord::WorldBounds::to_tile_bounds(&self) -> tylertoo_core::tile::TileBounds
-pub fn tylertoo_core::world_coord::WorldBounds::width(&self) -> u32
-impl core::clone::Clone for tylertoo_core::world_coord::WorldBounds
-pub fn tylertoo_core::world_coord::WorldBounds::clone(&self) -> tylertoo_core::world_coord::WorldBounds
-impl core::cmp::Eq for tylertoo_core::world_coord::WorldBounds
-impl core::cmp::PartialEq for tylertoo_core::world_coord::WorldBounds
-pub fn tylertoo_core::world_coord::WorldBounds::eq(&self, &tylertoo_core::world_coord::WorldBounds) -> bool
-impl core::fmt::Debug for tylertoo_core::world_coord::WorldBounds
-pub fn tylertoo_core::world_coord::WorldBounds::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::hash::Hash for tylertoo_core::world_coord::WorldBounds
-pub fn tylertoo_core::world_coord::WorldBounds::hash<__H: core::hash::Hasher>(&self, &mut __H)
-impl core::marker::Copy for tylertoo_core::world_coord::WorldBounds
-impl core::marker::StructuralPartialEq for tylertoo_core::world_coord::WorldBounds
-impl core::marker::Freeze for tylertoo_core::world_coord::WorldBounds
-impl core::marker::Send for tylertoo_core::world_coord::WorldBounds
-impl core::marker::Sync for tylertoo_core::world_coord::WorldBounds
-impl core::marker::Unpin for tylertoo_core::world_coord::WorldBounds
-impl core::marker::UnsafeUnpin for tylertoo_core::world_coord::WorldBounds
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::world_coord::WorldBounds
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::world_coord::WorldBounds
-pub struct tylertoo_core::world_coord::WorldCoord
-pub tylertoo_core::world_coord::WorldCoord::x: u32
-pub tylertoo_core::world_coord::WorldCoord::y: u32
-impl tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::WorldCoord::from_lng_lat(f64, f64) -> Self
-pub const fn tylertoo_core::world_coord::WorldCoord::new(u32, u32) -> Self
-pub fn tylertoo_core::world_coord::WorldCoord::to_tile(&self, u8) -> tylertoo_core::tile::TileCoord
-pub fn tylertoo_core::world_coord::WorldCoord::to_tile_local(&self, &tylertoo_core::tile::TileCoord, u32) -> (i32, i32)
-impl core::clone::Clone for tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::WorldCoord::clone(&self) -> tylertoo_core::world_coord::WorldCoord
-impl core::cmp::Eq for tylertoo_core::world_coord::WorldCoord
-impl core::cmp::PartialEq for tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::WorldCoord::eq(&self, &tylertoo_core::world_coord::WorldCoord) -> bool
-impl core::fmt::Debug for tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::WorldCoord::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::hash::Hash for tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::WorldCoord::hash<__H: core::hash::Hasher>(&self, &mut __H)
-impl core::marker::Copy for tylertoo_core::world_coord::WorldCoord
-impl core::marker::StructuralPartialEq for tylertoo_core::world_coord::WorldCoord
-impl core::marker::Freeze for tylertoo_core::world_coord::WorldCoord
-impl core::marker::Send for tylertoo_core::world_coord::WorldCoord
-impl core::marker::Sync for tylertoo_core::world_coord::WorldCoord
-impl core::marker::Unpin for tylertoo_core::world_coord::WorldCoord
-impl core::marker::UnsafeUnpin for tylertoo_core::world_coord::WorldCoord
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::world_coord::WorldCoord
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::world_coord::WorldCoord
-pub const tylertoo_core::world_coord::MAX_LATITUDE: f64
-pub const tylertoo_core::world_coord::WORLD_HALF: u32
-pub const tylertoo_core::world_coord::WORLD_SCALE: u64
-pub fn tylertoo_core::world_coord::lng_lat_to_world(f64, f64) -> tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::tile_local_to_world(&tylertoo_core::tile::TileCoord, i32, i32, u32) -> tylertoo_core::world_coord::WorldCoord
-pub fn tylertoo_core::world_coord::world_to_lng_lat(tylertoo_core::world_coord::WorldCoord) -> (f64, f64)
 #[repr(u8)] pub enum tylertoo_core::Compression
 pub tylertoo_core::Compression::Brotli = 3
 pub tylertoo_core::Compression::Gzip = 2

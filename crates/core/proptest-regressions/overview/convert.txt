@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 85eff82d93b18fb7a97fd57b300e9908dc61d1286bbac566dc6c27779b66562d # shrinks to g = GEOMETRYCOLLECTION(POLYGON(EMPTY,EMPTY))

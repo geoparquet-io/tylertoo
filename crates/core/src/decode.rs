@@ -1362,8 +1362,8 @@ fn flush_batch(
 mod tests {
     use super::*;
     use crate::mvt::{command_encode, encode_geometry, zigzag_encode};
+    use crate::tile::MAX_LATITUDE;
     use crate::tile::{tile_bounds, TileBounds};
-    use crate::world_coord::MAX_LATITUDE;
     use geo::{MultiLineString, MultiPoint, MultiPolygon};
 
     // ---- Coordinate transform ---------------------------------------------

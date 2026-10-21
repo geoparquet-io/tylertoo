@@ -319,6 +319,15 @@ class TestOverviewIntegration:
             assert len(result["checks"]) > 0
             assert all(c["passed"] for c in result["checks"])
 
+    def test_overview_report_keys_match_the_typed_dict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, report = self._overview(tmpdir)
+            # The dict is the Rust report's serde shape: exactly the keys the
+            # TypedDict declares.
+            assert set(report) == set(tylertoo.OverviewReport.__annotations__)
+            # The requested row-group cap was used as is.
+            assert report["effective_max_row_group_size"] is None
+
     def test_overview_report_clamp_accounting(self):
         """Auto-clamp accounting (#211): written + skipped == planned (z0..z6),
         and every skipped entry names its planned level, GSD, and zoom."""
@@ -657,6 +666,7 @@ class TestExportPmtilesIntegration:
 
             assert pm.exists()
             assert pm.stat().st_size > 0
+            assert set(report) == set(tylertoo.ExportReport.__annotations__)
             assert report["mode"] == "duplicating"
             assert report["min_zoom"] == 11
             assert report["max_zoom"] == 14

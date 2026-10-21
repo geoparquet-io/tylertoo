@@ -115,6 +115,19 @@ pub enum Mode {
     Partitioning,
 }
 
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    /// Parse the CLI / Python spelling (duplicating|partitioning), case-sensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "duplicating" => Ok(Mode::Duplicating),
+            "partitioning" => Ok(Mode::Partitioning),
+            other => Err(format!("invalid mode '{other}' (duplicating|partitioning)")),
+        }
+    }
+}
+
 /// Memory/throughput profile for the streaming pass-2 engine.
 ///
 /// The engine reads the input **once** and pipelines Parquet read/decode with
@@ -140,6 +153,20 @@ pub enum MemoryProfile {
     /// Spill each output level's rows to a temporary Arrow IPC file and stream
     /// them back at write time, capping peak RAM.
     Bounded,
+}
+
+impl std::str::FromStr for MemoryProfile {
+    type Err = String;
+
+    /// Parse the CLI / Python spelling (auto|speed|bounded), case-sensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(MemoryProfile::Auto),
+            "speed" => Ok(MemoryProfile::Speed),
+            "bounded" => Ok(MemoryProfile::Bounded),
+            other => Err(format!("invalid profile '{other}' (auto|speed|bounded)")),
+        }
+    }
 }
 
 /// OPTIONAL, informative per-level generalization provenance (§3.5).
@@ -768,18 +795,49 @@ struct CogpLevel {
     gsd: f64,
 }
 
+/// The `MAJOR`, `MINOR` and `PATCH` of a minimal semver: three non-empty,
+/// all-digit parts and nothing else (the spec allows no pre-release or
+/// build suffix). Shared with the §6.2 checker's major-version test.
+pub(super) fn semver_parts(v: &str) -> Option<[&str; 3]> {
+    let mut parts = v.split('.');
+    let triple = [parts.next()?, parts.next()?, parts.next()?];
+    let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    (parts.next().is_none() && triple.iter().all(|p| numeric(p))).then_some(triple)
+}
+
 /// Minimal `MAJOR.MINOR.PATCH` semver check (all numeric, three parts).
 fn is_semver(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    semver_parts(v).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's `--mode` / `--profile` / `--row-group-size-policy` values and
+    /// Python's `sort_direction` parse through core, exactly and only as
+    /// spelled (the CLI reference lists them as the possible values).
+    #[test]
+    fn option_enums_parse_their_cli_spellings() {
+        use crate::overview::assign::SortDirection;
+        use crate::overview::writer::RowGroupSizePolicy;
+
+        assert_eq!("duplicating".parse(), Ok(Mode::Duplicating));
+        assert_eq!("partitioning".parse(), Ok(Mode::Partitioning));
+        assert_eq!("auto".parse(), Ok(MemoryProfile::Auto));
+        assert_eq!("speed".parse(), Ok(MemoryProfile::Speed));
+        assert_eq!("bounded".parse(), Ok(MemoryProfile::Bounded));
+        assert_eq!("desc".parse(), Ok(SortDirection::Desc));
+        assert_eq!("asc".parse(), Ok(SortDirection::Asc));
+        assert_eq!("constant".parse(), Ok(RowGroupSizePolicy::Constant));
+        assert_eq!("zoom-scaled".parse(), Ok(RowGroupSizePolicy::ZoomScaled));
+
+        let err = "Duplicating".parse::<Mode>().unwrap_err();
+        assert!(err.contains("'Duplicating'") && err.contains("duplicating|partitioning"));
+        assert!("zoom_scaled".parse::<RowGroupSizePolicy>().is_err());
+        assert!("".parse::<MemoryProfile>().is_err());
+        assert!("ASC".parse::<SortDirection>().is_err());
+    }
 
     /// Build a valid 3-level duplicating meta matching §9.1 for reuse.
     fn duplicating_example() -> OverviewsMeta {

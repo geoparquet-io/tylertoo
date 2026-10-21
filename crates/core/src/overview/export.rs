@@ -205,10 +205,7 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
 /// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
 pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
 
-/// Web Mercator projected half-extent in meters (EPSG:3857 axis range is
-/// `±WEBMERC_HALF_M`). Used only to reproject a 3857 overview to lon/lat so the
-/// (geographic) tile grid math applies.
-const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
+use crate::tile::WEBMERC_HALF_M;
 
 /// Options controlling a PMTiles export.
 #[derive(Debug, Clone)]
