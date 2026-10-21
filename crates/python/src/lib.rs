@@ -321,81 +321,14 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
 
 /// Convert a [`ConvertReport`] to a Python dict.
 fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(
-        "mode",
-        match report.mode {
-            Mode::Duplicating => "duplicating",
-            Mode::Partitioning => "partitioning",
-        },
-    )?;
-    let levels = PyList::empty(py);
-    for lvl in &report.levels {
-        let d = PyDict::new(py);
-        d.set_item("level", lvl.level)?;
-        d.set_item("gsd", lvl.gsd)?;
-        d.set_item("zoom", lvl.zoom)?;
-        d.set_item("feature_count", lvl.feature_count)?;
-        d.set_item("vertex_count", lvl.vertex_count)?;
-        d.set_item("uncompressed_bytes", lvl.uncompressed_bytes)?;
-        d.set_item("compressed_bytes", lvl.compressed_bytes)?;
-        levels.append(d)?;
-    }
-    dict.set_item("levels", levels)?;
-    let skipped = PyList::empty(py);
-    for s in &report.skipped_empty_levels {
-        let d = PyDict::new(py);
-        d.set_item("planned_level", s.planned_level)?;
-        d.set_item("gsd", s.gsd)?;
-        d.set_item("zoom", s.zoom)?;
-        skipped.append(d)?;
-    }
-    dict.set_item("skipped_empty_levels", skipped)?;
-    dict.set_item("input_features", report.input_features)?;
-    dict.set_item("total_rows", report.total_rows)?;
-    dict.set_item("total_vertices", report.total_vertices)?;
-    dict.set_item("total_compressed_bytes", report.total_compressed_bytes)?;
-    dict.set_item("row_groups_total", report.row_groups_total)?;
-    dict.set_item("row_groups_read", report.row_groups_read)?;
-    // Input-quality counters: antimeridian suspects (#188) and the two #429
-    // losses (outside the declared CRS's range; valid lon/lat outside the Web
-    // Mercator tiling domain). Python callers get the same honesty the CLI
-    // summary does.
-    dict.set_item(
-        "antimeridian_suspect_features",
-        report.antimeridian_suspect_features,
-    )?;
-    dict.set_item("out_of_range_features", report.out_of_range_features)?;
-    dict.set_item("unprojectable_features", report.unprojectable_features)?;
-    // #553: the first few out-of-range features, by row and coordinate.
-    let exemplars = PyList::empty(py);
-    for e in &report.out_of_range_exemplars {
-        let d = PyDict::new(py);
-        d.set_item("part", e.part)?;
-        d.set_item("row", e.row)?;
-        d.set_item("axis", e.axis)?;
-        d.set_item("value", e.value)?;
-        exemplars.append(d)?;
-    }
-    dict.set_item("out_of_range_exemplars", exemplars)?;
-    // #644: features drawn wrapped across the antimeridian. Informational.
-    dict.set_item("wrapped_features", report.wrapped_features)?;
-    // #451: the input declared no CRS at all and WGS84 lon/lat was assumed —
-    // the same visibility the Rust report (and its warning) gives.
-    dict.set_item("crs_assumed_wgs84", report.crs_assumed_wgs84)?;
-    dict.set_item("duration_secs", report.duration_secs)?;
-    // Remote-input fetch counters (#210); None for local inputs.
-    match &report.remote_fetch {
-        Some(stats) => {
-            let rf = PyDict::new(py);
-            rf.set_item("requests", stats.requests)?;
-            rf.set_item("bytes_fetched", stats.bytes_fetched)?;
-            rf.set_item("object_size", stats.object_size)?;
-            dict.set_item("remote_fetch", rf)?;
-        }
-        None => dict.set_item("remote_fetch", py.None())?,
-    }
-    Ok(dict.into())
+    report_dict(pythonize::pythonize(py, report)?)
+}
+
+/// A pythonized core report as the dict it is: every report struct
+/// serializes as a map, keyed by its serde field names (the keys of the
+/// CLI's `--report` JSON), so the Python and CLI reports cannot drift.
+fn report_dict(value: Bound<'_, PyAny>) -> PyResult<Py<PyDict>> {
+    Ok(value.cast_into::<PyDict>()?.unbind())
 }
 
 /// The Python `accumulate_attributes` mapping as core's per-cluster
@@ -865,42 +798,7 @@ fn export_error_to_py(e: ExportError) -> PyErr {
 /// Convert an [`ExportReport`] to a Python dict (shared by
 /// `export_pmtiles()` and the `convert()` facade's combined report, #439).
 fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("mode", &report.mode)?;
-    dict.set_item("min_zoom", report.min_zoom)?;
-    dict.set_item("max_zoom", report.max_zoom)?;
-    let zooms = PyList::empty(py);
-    for z in &report.zooms {
-        let d = PyDict::new(py);
-        d.set_item("zoom", z.zoom)?;
-        d.set_item("level", z.level)?;
-        d.set_item("level_feature_count", z.level_feature_count)?;
-        d.set_item("tile_count", z.tile_count)?;
-        d.set_item("tile_feature_count", z.tile_feature_count)?;
-        d.set_item("oversized_tiles", z.oversized_tiles)?;
-        d.set_item("encode_dropped_features", z.encode_dropped_features)?;
-        d.set_item("encode_quantized_features", z.encode_quantized_features)?;
-        zooms.append(d)?;
-    }
-    dict.set_item("zooms", zooms)?;
-    dict.set_item("total_tiles", report.total_tiles)?;
-    dict.set_item("total_tile_features", report.total_tile_features)?;
-    dict.set_item("oversized_tiles", report.oversized_tiles)?;
-    let skipped = PyList::empty(py);
-    for col in &report.skipped_property_columns {
-        let d = PyDict::new(py);
-        d.set_item("name", &col.name)?;
-        d.set_item("data_type", &col.data_type)?;
-        skipped.append(d)?;
-    }
-    dict.set_item("skipped_property_columns", skipped)?;
-    dict.set_item("encode_dropped_features", report.encode_dropped_features)?;
-    dict.set_item(
-        "encode_quantized_features",
-        report.encode_quantized_features,
-    )?;
-    dict.set_item("duration_secs", report.duration_secs)?;
-    Ok(dict.into())
+    report_dict(pythonize::pythonize(py, report)?)
 }
 
 /// Native body of `tylertoo.validate()`.
@@ -957,15 +855,8 @@ fn decode(
         .map_err(decode_error_to_py)?;
 
     // Keyed like the CLI's `decode --report` JSON (`DecodeReport`'s serde
-    // names).
-    let dict = PyDict::new(py);
-    dict.set_item("tiles_read", report.tiles_read)?;
-    dict.set_item("features_written", report.features_written)?;
-    dict.set_item("features_skipped", report.features_skipped)?;
-    dict.set_item("layers", PyList::new(py, &report.layers)?)?;
-    dict.set_item("zoom_range", report.zoom_range)?;
-    dict.set_item("elapsed_secs", report.elapsed_secs)?;
-    Ok(dict.into())
+    // names); `zoom_range` stays a tuple.
+    report_dict(pythonize::pythonize(py, &report)?)
 }
 
 /// Map a [`DecodeError`] to a Python exception: an inverted zoom range, a

@@ -291,6 +291,11 @@ class TestOverviewIntegration:
             out, report = self._overview(tmpdir)
 
             assert report["mode"] == "duplicating"
+            # The dict is the Rust report's serde shape: exactly the keys the
+            # TypedDict declares.
+            assert set(report) == set(tylertoo.OverviewReport.__annotations__)
+            # The requested row-group cap was used as is.
+            assert report["effective_max_row_group_size"] is None
             assert report["input_features"] > 0
             assert report["total_rows"] >= report["input_features"]
             assert report["duration_secs"] > 0
@@ -657,6 +662,7 @@ class TestExportPmtilesIntegration:
 
             assert pm.exists()
             assert pm.stat().st_size > 0
+            assert set(report) == set(tylertoo.ExportReport.__annotations__)
             assert report["mode"] == "duplicating"
             assert report["min_zoom"] == 11
             assert report["max_zoom"] == 14

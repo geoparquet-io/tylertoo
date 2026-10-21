@@ -3243,6 +3243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pythonize"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ec376e1216e0c929a74964ce2020012a1a39f32d80e78aa688721219ea7fb89"
+dependencies = [
+ "pyo3",
+ "serde",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4484,6 +4494,7 @@ version = "0.8.0"
 dependencies = [
  "pyo3",
  "pyo3-log",
+ "pythonize",
  "tylertoo-core",
 ]
 

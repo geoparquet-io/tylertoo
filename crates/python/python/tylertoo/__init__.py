@@ -106,6 +106,9 @@ class OverviewReport(TypedDict):
         crs_assumed_wgs84: True when the input declared no CRS and
             lon/lat WGS84 was assumed. If the coordinates are not
             lon/lat degrees, the output is misplaced.
+        effective_max_row_group_size: The row-group cap actually used,
+            when it had to be raised above `row_group_size` to keep the
+            file under Parquet's row-group limit. None otherwise.
     """
 
     mode: Literal["duplicating", "partitioning"]
@@ -125,6 +128,7 @@ class OverviewReport(TypedDict):
     wrapped_features: int
     duration_secs: float
     remote_fetch: RemoteFetch | None
+    effective_max_row_group_size: int | None
 
 
 class ZoomReport(TypedDict):
