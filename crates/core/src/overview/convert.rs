@@ -8175,8 +8175,12 @@ mod tests {
             (bits(old), bits(scan_feature_traits(&item)))
         }
 
+        /// geozero, not `crate::wkb`: the strategies generate polygons with an
+        /// empty exterior and holes, which geozero writes as valid WKB (an
+        /// empty first ring) and the `wkb` writer cannot (#754).
         fn wkb_of(g: &Geometry<f64>) -> Vec<u8> {
-            crate::wkb::geometry_to_wkb(g).expect("encode")
+            use geozero::{CoordDimensions, ToWkb};
+            g.to_wkb(CoordDimensions::xy()).expect("encode")
         }
 
         fn le(v: f64) -> [u8; 8] {
