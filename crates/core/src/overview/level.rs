@@ -768,13 +768,19 @@ struct CogpLevel {
     gsd: f64,
 }
 
+/// The `MAJOR`, `MINOR` and `PATCH` of a minimal semver: three non-empty,
+/// all-digit parts and nothing else (the spec allows no pre-release or
+/// build suffix). Shared with the §6.2 checker's major-version test.
+pub(super) fn semver_parts(v: &str) -> Option<[&str; 3]> {
+    let mut parts = v.split('.');
+    let triple = [parts.next()?, parts.next()?, parts.next()?];
+    let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    (parts.next().is_none() && triple.iter().all(|p| numeric(p))).then_some(triple)
+}
+
 /// Minimal `MAJOR.MINOR.PATCH` semver check (all numeric, three parts).
 fn is_semver(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    semver_parts(v).is_some()
 }
 
 #[cfg(test)]
