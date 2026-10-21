@@ -1340,6 +1340,8 @@ fn zero_thinning_is_the_off_switch_not_an_error() {
     o.assign.polygon_thinning = 0.0;
     o.assign.polygon_visibility = 0.0;
     o.density.enabled = false;
+    // Count features, not placeholders: no square disposition (#745 default).
+    o.simplify.collapse = CollapseMode::Drop;
     let report = convert_to_overviews(tin.path(), tout.path(), &o)
         .expect("0 must be accepted as the off switch");
     assert!(
@@ -2828,9 +2830,11 @@ fn tiny_polygon_accumulator_preserves_dropped_area_at_coarse_levels() {
         })
         .sum();
 
-    // Drop (the default): nothing survives at z2..z5.
+    // Drop (the default before #745): nothing survives at z2..z5.
     let tout = tempfile::NamedTempFile::new().unwrap();
-    let report = convert_to_overviews(tin.path(), tout.path(), &opts(true)).unwrap();
+    let mut drop = opts(true);
+    drop.simplify.collapse = CollapseMode::Drop;
+    let report = convert_to_overviews(tin.path(), tout.path(), &drop).unwrap();
     assert!(
         report.skipped_empty_levels.len() >= 3,
         "coarse levels must be empty without the accumulator: {:?}",
@@ -2931,75 +2935,77 @@ fn scattered_fields(n: usize) -> Vec<Option<Geometry<f64>>> {
         .collect()
 }
 
-/// #407 end to end: convert → export → decode at a sub-unit
-/// `--simplify-factor` with `--collapse-square`. At 0.1 × GSD the
-/// placeholder would be 0.4 tile units wide; it is floored at one unit, so
-/// every placeholder square the overview holds must reach the tiles, and
-/// every coarse level must hold some. (Skipping the accumulator, the first
-/// #407 attempt, emptied z3-z7 and started the archive at z8; leaving the
-/// side at 0.4 units let the MVT cleaner drop ~84% of the squares.)
+/// #407, #745 end to end: convert → export → decode with
+/// `--collapse-square` at a small and a zero `--simplify-factor`. The
+/// placeholder is one GSD wide (four tile units) whatever the factor, so
+/// every coarse level must hold placeholder squares of that width and every
+/// one must reach the tiles. (Before #745 the square shrank with the factor
+/// and factor 0 had none, which emptied dense areas at middle zooms.)
 #[test]
-fn sub_unit_factor_placeholders_reach_the_tiles() {
+fn small_factor_placeholders_reach_the_tiles() {
     use std::collections::HashSet;
     use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
 
     let tin = tempfile::NamedTempFile::new().unwrap();
     write_input(tin.path(), &scattered_fields(6_000), true, None);
-    let o = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom: 3,
-            max_zoom: 8,
-        },
-        simplify: SimplifyOptions {
-            factor: 0.1,
-            collapse: CollapseMode::Square,
-            ..SimplifyOptions::default()
-        },
-        ..Default::default()
-    };
-    let tov = tempfile::NamedTempFile::new().unwrap();
-    let report = convert_to_overviews(tin.path(), tov.path(), &o).unwrap();
-    let zooms: Vec<u8> = report.levels.iter().map(|l| l.zoom.unwrap()).collect();
-    assert_eq!(zooms, (3..=8).collect::<Vec<_>>(), "every level is present");
+    for factor in [0.1, 0.0] {
+        let o = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 3,
+                max_zoom: 8,
+            },
+            simplify: SimplifyOptions {
+                factor,
+                collapse: CollapseMode::Square,
+                ..SimplifyOptions::default()
+            },
+            ..Default::default()
+        };
+        let tov = tempfile::NamedTempFile::new().unwrap();
+        let report = convert_to_overviews(tin.path(), tov.path(), &o).unwrap();
+        let zooms: Vec<u8> = report.levels.iter().map(|l| l.zoom.unwrap()).collect();
+        assert_eq!(zooms, (3..=8).collect::<Vec<_>>(), "every level is present");
 
-    let tpm = tempfile::NamedTempFile::new().unwrap();
-    export_pmtiles(tov.path(), tpm.path(), &ExportOptions::default()).unwrap();
-    let dec = tempfile::NamedTempFile::new().unwrap();
-    decode_pmtiles(tpm.path(), dec.path(), &DecodeOptions::default()).unwrap();
-    let decoded = read_decoded_rows(dec.path());
+        let tpm = tempfile::NamedTempFile::new().unwrap();
+        export_pmtiles(tov.path(), tpm.path(), &ExportOptions::default()).unwrap();
+        let dec = tempfile::NamedTempFile::new().unwrap();
+        decode_pmtiles(tpm.path(), dec.path(), &DecodeOptions::default()).unwrap();
+        let decoded = read_decoded_rows(dec.path());
 
-    for (li, &z) in zooms.iter().enumerate().take(zooms.len() - 1) {
-        // One tile unit at z, in degrees of longitude (default extent 4096).
-        let unit_deg = 40_075_016.69 / f64::from(1u32 << z) / 4096.0 / 111_320.0;
-        let squares: Vec<i64> = read_level_ids_geoms(tov.path(), li)
-            .into_iter()
-            .filter(|(_, g)| {
-                let Geometry::Polygon(p) = g else {
-                    return false;
-                };
-                let r = geo::BoundingRect::bounding_rect(p).unwrap();
-                p.exterior().0.len() == 5
-                    && (r.width() - unit_deg).abs() < unit_deg * 1e-6
-                    && (r.height() - unit_deg).abs() < unit_deg * 1e-6
-            })
-            .map(|(id, _)| id)
-            .collect();
-        assert!(
-            !squares.is_empty(),
-            "z{z}: no one-unit placeholder squares in the overview"
-        );
-        let drawn: HashSet<i64> = decoded
-            .iter()
-            .filter(|(dz, _, g)| *dz == z && matches!(g, Geometry::Polygon(_)))
-            .filter_map(|(_, id, _)| *id)
-            .collect();
-        let missing = squares.iter().filter(|id| !drawn.contains(id)).count();
-        assert_eq!(
-            missing,
-            0,
-            "z{z}: {missing} of {} placeholder squares did not reach the tiles",
-            squares.len()
-        );
+        for (li, &z) in zooms.iter().enumerate().take(zooms.len() - 1) {
+            // One GSD at z, in degrees of longitude: four tile units at the
+            // default extent 4096.
+            let gsd_deg = 4.0 * 40_075_016.69 / f64::from(1u32 << z) / 4096.0 / 111_320.0;
+            let squares: Vec<i64> = read_level_ids_geoms(tov.path(), li)
+                .into_iter()
+                .filter(|(_, g)| {
+                    let Geometry::Polygon(p) = g else {
+                        return false;
+                    };
+                    let r = geo::BoundingRect::bounding_rect(p).unwrap();
+                    p.exterior().0.len() == 5
+                        && (r.width() - gsd_deg).abs() < gsd_deg * 1e-6
+                        && (r.height() - gsd_deg).abs() < gsd_deg * 1e-6
+                })
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                !squares.is_empty(),
+                "factor {factor} z{z}: no one-GSD placeholder squares in the overview"
+            );
+            let drawn: HashSet<i64> = decoded
+                .iter()
+                .filter(|(dz, _, g)| *dz == z && matches!(g, Geometry::Polygon(_)))
+                .filter_map(|(_, id, _)| *id)
+                .collect();
+            let missing = squares.iter().filter(|id| !drawn.contains(id)).count();
+            assert_eq!(
+                missing,
+                0,
+                "factor {factor} z{z}: {missing} of {} placeholder squares did not reach the tiles",
+                squares.len()
+            );
+        }
     }
 }
 

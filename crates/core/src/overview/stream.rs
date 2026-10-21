@@ -92,9 +92,7 @@ use crate::batch_processor::{
 };
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
-use super::accumulate::{
-    is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
-};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignFeature, FeatureKind, FeatureTable,
 };
@@ -120,10 +118,12 @@ use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
     cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
 };
+#[cfg(test)]
+use super::simplify::CollapseMode;
 use super::simplify::{
     carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step_at,
-    validation_skip_count, CascadeFold, CascadeStep, CollapseMode, FoldStep, Representation,
-    Simplified, SimplifyOptions,
+    validation_skip_count, CascadeFold, CascadeStep, FoldStep, Representation, Simplified,
+    SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -881,7 +881,7 @@ fn streaming_carriers(
                 gsd,
                 zoom,
                 l != finest_planned
-                    && accumulator_enabled(options)
+                    && accumulator_requested(options)
                     && level_accumulates(options.simplify.collapse, level_reprs[l]),
             )
         })
@@ -890,14 +890,7 @@ fn streaming_carriers(
         return vec![Vec::new(); level_specs.len()];
     }
     let t = Instant::now();
-    let carriers = tiny_polygon_carriers(
-        features,
-        feat_min_levels,
-        &areas,
-        &acc_levels,
-        crs,
-        options.simplify.factor,
-    );
+    let carriers = tiny_polygon_carriers(features, feat_min_levels, &areas, &acc_levels, crs);
     let total: usize = carriers.iter().map(Vec::len).sum();
     log::info!(
         "[convert] tiny-polygon accumulator: {total} placeholder square(s) across {} \
@@ -912,16 +905,11 @@ fn streaming_carriers(
 /// duplicating mode (a carrier is a second appearance of a feature, which
 /// partitioning's feature-once contract cannot represent) with the square
 /// disposition somewhere — globally via `--collapse-square`, or in a
-/// `--representation` square band.
-fn accumulator_enabled(options: &ConvertOptions) -> bool {
-    accumulator_requested(options) && options.simplify.factor > 0.0
-}
-
-/// [`accumulator_enabled`] before the #407 zero-factor check: the square
-/// disposition is on somewhere in a duplicating run.
+/// `--representation` square band. The simplify factor plays no part: the
+/// placeholder is one GSD wide whatever it is (#745).
 fn accumulator_requested(options: &ConvertOptions) -> bool {
     matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse == CollapseMode::Square
+        && (options.simplify.collapse.is_square()
             || options
                 .representation
                 .iter()
@@ -5023,10 +5011,7 @@ fn run_pass1_with_chunk_rows(
         let _ = features.try_reserve_exact(usize::try_from(selected_rows).unwrap_or(0));
     }
     // #384: polygon areas for the tiny-polygon accumulator, when it is on.
-    // #407: a zero simplify factor has no placeholder, so pass 1 collects no
-    // areas; `placeholder_has_size` says so once, here.
-    let want_areas =
-        accumulator_requested(options) && placeholder_has_size(options.simplify.factor);
+    let want_areas = accumulator_requested(options);
     let mut areas: Vec<f32> = Vec::new();
     let mut num_rows = 0usize;
     let mut skipped_rows = 0usize;
@@ -5795,7 +5780,7 @@ pub(super) fn process_level_batch(
                 } else if ctx.is_carrier_row(row_offset + i) {
                     // #384: a carrier stands in for its neighbourhood's
                     // dropped area as one placeholder square.
-                    carrier_square(g, ctx.gsd_m, ctx.zoom, ctx.crs, ctx.simplify)
+                    carrier_square(g, ctx.gsd_m, ctx.zoom, ctx.crs)
                         .map_or(Simplified::Dropped, Simplified::Keep)
                 } else if !ctx.cascade_chain.is_empty() {
                     simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
@@ -6118,13 +6103,9 @@ pub(super) fn process_batch_cascade(
                     // #384: not a member, but the carrier of its cell's
                     // dropped area — one placeholder square.
                     debug_assert_ne!(pos, u32::MAX, "carrier row missing from cascade superset");
-                    if let Some(sq) = carrier_square(
-                        geoms[pos as usize].as_ref(),
-                        ctx.gsd_m,
-                        ctx.zoom,
-                        ctx.crs,
-                        ctx.simplify,
-                    ) {
+                    if let Some(sq) =
+                        carrier_square(geoms[pos as usize].as_ref(), ctx.gsd_m, ctx.zoom, ctx.crs)
+                    {
                         verts += count_vertices(&sq);
                         kept_idx.push(i);
                         kept_geoms.push(Arc::new(sq));
@@ -8489,39 +8470,24 @@ mod tests {
         );
     }
 
-    /// #407, the zero case: `--simplify-factor 0` makes the placeholder
-    /// threshold `(0 × gsd)² = 0`. The accumulator must not run (there is
-    /// no placeholder, as in tippecanoe at `tiny_polygon_size` 0) rather than let every dropped polygon cross a
-    /// zero threshold and come back as a zero-size carrier square.
+    /// #745: the placeholder square is one GSD wide whatever
+    /// `--simplify-factor` is, as tippecanoe's tiny-polygon size is
+    /// independent of its simplification. A smaller square used to stand in
+    /// for less area (a quarter-size square at 0.25), and factor 0 had none
+    /// at all (#407 skipped the accumulator because `(0 × gsd)²` gave the
+    /// square no size), so lowering the factor to close slivers emptied
+    /// dense areas at middle zooms.
     #[test]
-    fn streaming_carriers_skip_a_zero_simplify_factor() {
-        let carriers = carriers_for_factor(0.0);
-        assert!(
-            carriers[0].is_empty(),
-            "factor 0 must accumulate nothing, got carriers {:?}",
-            carriers[0]
-        );
-    }
-
-    /// #407, the tiny-factor case: at 1e-6 × GSD (a 1 mm side, T = 1e-6
-    /// m²) every dropped polygon used to cross the threshold on its own and
-    /// become a carrier. The side is now floored at one tile unit at the
-    /// level's export zoom (z5 for a 1000 m GSD: 305.7 m, T ≈ 93,500 m²), so
-    /// ten 20,000 m² fields make two carriers, exactly as at the one-unit
-    /// factor itself.
-    #[test]
-    fn streaming_carriers_floor_a_sub_unit_simplify_factor() {
-        use super::super::simplify::tile_unit_meters;
-        let small = vec![20_000.0f32; 10];
-        let carriers = carriers_for(1e-6, small.clone());
-        assert_eq!(
-            carriers[0].len(),
-            2,
-            "200,000 m² over T ≈ 93,500 m² is two carriers: {:?}",
-            carriers[0]
-        );
-        let one_unit = tile_unit_meters(1000.0, None) / 1000.0;
-        assert_eq!(carriers, carriers_for(one_unit, small));
+    fn streaming_carriers_ignore_the_simplify_factor() {
+        let at_default = carriers_for_factor(1.0);
+        assert_eq!(at_default[0].len(), 1, "the control carrier");
+        for factor in [0.0, 1e-6, 0.1, 0.25, 3.7] {
+            assert_eq!(
+                carriers_for_factor(factor),
+                at_default,
+                "factor {factor} changed the carriers"
+            );
+        }
     }
 
     // ---- #570: the chain tables are built once, in pass 1 -------------------

@@ -38,7 +38,8 @@
 //! by the gate or thinning here, so there is no geometry to keep; (b) it
 //! places the placeholder at the ring's first vertex with side
 //! `tiny_polygon_size` (default 2 px), whereas ours sits at the polygon's
-//! representative point with side `factor × gsd`. Features placed by an
+//! representative point with side one GSD, whatever the simplify factor
+//! (#745). Features placed by an
 //! entry-zoom ladder (#364) are never accumulated: the ladder decides where
 //! they first appear.
 
@@ -83,23 +84,6 @@ impl AccumulateLevel {
     }
 }
 
-/// Whether the accumulator has a placeholder to emit at this simplify
-/// factor. `--simplify-factor 0` gives the square no size, so the run skips
-/// the accumulator (and pass 1's area collection) and says so once — the
-/// same as tippecanoe, which skips its tiny-polygon reduction at
-/// `tiny_polygon_size` 0. Call it once per conversion, where the decision
-/// is made, not per level.
-pub(crate) fn placeholder_has_size(simplify_factor: f64) -> bool {
-    if simplify_factor > 0.0 {
-        return true;
-    }
-    log::info!(
-        "[convert] tiny-polygon accumulator off: --simplify-factor {simplify_factor} gives \
-         placeholder squares no size, so dropped polygons are not stood in for"
-    );
-    false
-}
-
 /// Whether a level's effective disposition is the placeholder square.
 ///
 /// That is, whether the accumulator runs there: a `square` representation band, or
@@ -110,7 +94,7 @@ pub(crate) fn placeholder_has_size(simplify_factor: f64) -> bool {
 pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
     match repr {
         Representation::Square => true,
-        Representation::Geometry => collapse == CollapseMode::Square,
+        Representation::Geometry => collapse.is_square(),
         Representation::Point => false,
     }
 }
@@ -124,30 +108,24 @@ pub fn level_accumulates(collapse: CollapseMode, repr: Representation) -> bool {
 ///
 /// `features`, `min_levels` and `areas` are parallel; `areas` holds each
 /// feature's unsigned area in CRS units² (anything for non-polygons).
-/// `simplify_factor` is the simplify knob the placeholder side derives from.
 ///
 /// The threshold is `side²`, `side` being the level's `placeholder_side`:
-/// `factor × gsd`, floored at one tile unit at the level's export zoom
-/// (#407). On a floored level each patch's residual is dithered into one
-/// more carrier with probability `residual / T` (see below). The floor
-/// bounds the carrier count by the dropped area over one unit², where a
-/// small factor used to make every dropped polygon a carrier, and makes
-/// every carrier square wide enough for the tile encoder to draw. One
-/// `log::info` names the zooms where the floor applies. A zero factor has
-/// no placeholder: nothing accumulates (`placeholder_has_size`).
+/// one GSD, floored at one tile unit at the level's export zoom (#407,
+/// #745). On a floored level (a GSD under one unit, as at a large
+/// `--gsd-base`) each patch's residual is dithered into one more carrier
+/// with probability `residual / T` (see below). The floor makes every
+/// carrier square wide enough for the tile encoder to draw. One `log::info`
+/// names the zooms where the floor applies.
 ///
 /// DIVERGENCE FROM TIPPECANOE: tippecanoe's placeholder side is a fixed
-/// `tiny_polygon_size` in tile units (clip.cpp `reduce_tiny_poly`), whatever
-/// the simplification. Ours follows `factor × gsd` down to that one-unit
-/// floor, so the accumulator and the `--collapse-square` dither share one
-/// square.
+/// `tiny_polygon_size` in tile units (clip.cpp `reduce_tiny_poly`); ours is
+/// a fixed one GSD. Neither depends on the simplification setting.
 pub fn tiny_polygon_carriers(
     features: &FeatureTable,
     min_levels: &[u8],
     areas: &[f32],
     levels: &[AccumulateLevel],
     crs: Crs,
-    simplify_factor: f64,
 ) -> Vec<Vec<usize>> {
     debug_assert_eq!(features.len(), min_levels.len());
     debug_assert_eq!(features.len(), areas.len());
@@ -158,8 +136,8 @@ pub fn tiny_polygon_carriers(
             continue;
         }
         let gsd_units = gsd_to_coord_units(level.gsd_meters, crs);
-        let side = placeholder_side(level.gsd_meters, level.zoom, crs, simplify_factor);
-        let floored = side > level_tolerance(level.gsd_meters, crs, simplify_factor);
+        let side = placeholder_side(level.gsd_meters, level.zoom, crs);
+        let floored = side > level_tolerance(level.gsd_meters, crs, 1.0);
         if floored {
             floored_zooms.push(export_zoom(level.gsd_meters, level.zoom));
         }
@@ -206,7 +184,7 @@ pub fn tiny_polygon_carriers(
             }
         }
         // A patch keeps less than one `T` unemitted. At a floored level `T`
-        // is up to several times what the factor asked for, so that
+        // is up to several times one GSD², so that
         // truncation would thin sparse patches noticeably (at `--gsd-base
         // 8192`, ~12% of the z3 area in the #407 probe). There, dither the
         // residual instead: the patch's last non-carrier contributor also
@@ -230,9 +208,8 @@ pub fn tiny_polygon_carriers(
     if !floored_zooms.is_empty() {
         let zooms: Vec<String> = floored_zooms.iter().map(|z| format!("z{z}")).collect();
         log::info!(
-            "[convert] tiny-polygon accumulator: at {} a --simplify-factor {simplify_factor} \
-             placeholder is narrower than one tile unit, so its side is raised to one unit \
-             (fewer, visible squares)",
+            "[convert] tiny-polygon accumulator: at {} a one-GSD placeholder is narrower \
+             than one tile unit, so its side is raised to one unit (fewer, visible squares)",
             zooms.join(", ")
         );
     }
@@ -267,7 +244,6 @@ mod tests {
         feats.iter().collect()
     }
     use super::*;
-    use crate::mvt::MIN_SURVIVING_SQUARE_SIDE;
 
     fn square(index: usize, x: f64, y: f64, side: f64) -> AssignFeature {
         AssignFeature {
@@ -298,14 +274,8 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10];
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         assert_eq!(out[0], vec![6]);
         assert!(out[1].is_empty(), "disabled level accumulates nothing");
     }
@@ -317,14 +287,8 @@ mod tests {
         let mut min_levels = vec![1u8; 10];
         min_levels[0] = 0; // already a member of level 0
         let areas = vec![160_000.0f32; 10];
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         // 8 polygons accumulate (10 minus the member minus the point):
         // 1.28e6 ⇒ one carrier, and it is the 7th accumulated (index 8).
         assert_eq!(out[0], vec![8]);
@@ -342,25 +306,13 @@ mod tests {
         }
         let min_levels = vec![1u8; 10];
         let areas = vec![160_000.0f32; 10]; // 5 × 160k = 800k < 1e6 per cell
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         assert!(out[0].is_empty(), "{:?}", out[0]);
         // Bigger fields: 5 × 300k = 1.5e6 per cell ⇒ one carrier per cell.
         let areas = vec![300_000.0f32; 10];
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         assert_eq!(out[0].len(), 2);
         assert_eq!(out[0], vec![3, 8], "the 4th field of each cell crosses");
     }
@@ -378,14 +330,8 @@ mod tests {
         let min_levels = vec![1u8; 11];
         let mut areas = vec![1_400_000.0f32; 10];
         areas.push(500_000.0);
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         assert_eq!(
             out[0],
             (0..10).collect::<Vec<_>>(),
@@ -409,14 +355,8 @@ mod tests {
             areas.push((0.1 * t) as f32);
         }
         let min_levels = vec![1u8; feats.len()];
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         let expected: f64 = areas.iter().map(|&a| f64::from(a).min(t)).sum();
         let emitted = out[0].len() as f64 * t;
         assert!(
@@ -440,14 +380,8 @@ mod tests {
         }
         let min_levels = vec![3u8; 3];
         let areas = vec![25_000_000.0f32; 3]; // 25 T each
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         assert!(
             out[0].is_empty(),
             "laddered features became carriers: {:?}",
@@ -470,59 +404,17 @@ mod tests {
         assert!(!level_accumulates(C::Point, R::Point));
     }
 
-    // ---- #407: the placeholder side is floored at one tile unit ---------
+    // ---- #407, #745: one GSD, floored at one tile unit -----------------
 
-    /// Carriers at level 0 of [`level`] for the ten-field fixture of
-    /// [`one_carrier_per_threshold_of_dropped_area`] under `factor`.
-    fn ten_fields_at(factor: f64) -> Vec<usize> {
-        let feats: Vec<AssignFeature> = (0..10)
-            .map(|i| square(i, 10.0 + i as f64 * 5.0, 10.0, 400.0))
-            .collect();
-        let min_levels = vec![1u8; 10];
-        let areas = vec![160_000.0f32; 10];
-        tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            factor,
-        )
-        .swap_remove(0)
-    }
-
-    /// The factor at which level 0's `factor × gsd` is exactly one tile unit.
-    fn one_unit_factor() -> f64 {
-        use super::super::simplify::tile_unit_meters;
-        let lvl = level()[0];
-        MIN_SURVIVING_SQUARE_SIDE * tile_unit_meters(lvl.gsd_meters, lvl.zoom) / lvl.gsd_meters
-    }
-
-    /// `--simplify-factor 0`: the placeholder has no side at all, so the
-    /// level must not accumulate (every field would cross `T = 0`).
-    #[test]
-    fn zero_factor_accumulates_nothing() {
-        assert!(ten_fields_at(0.0).is_empty());
-        assert!(!placeholder_has_size(0.0));
-        assert!(placeholder_has_size(1e-9));
-    }
-
-    /// A factor so small that `factor × gsd` is a millimetre: the side is
-    /// floored at one tile unit, so the level carries exactly what it carries
-    /// at the one-unit factor — not one carrier per dropped polygon (the
-    /// #407 blow-up) and not nothing.
-    #[test]
-    fn sub_unit_factor_is_floored_at_one_tile_unit() {
-        let at_unit = ten_fields_at(one_unit_factor());
-        assert!(!at_unit.is_empty());
-        assert_eq!(ten_fields_at(1e-6), at_unit, "1e-6 is floored to one unit");
-        assert_eq!(ten_fields_at(one_unit_factor() * 0.5), at_unit);
-        // Carriers are bounded by the dropped area over one unit²:
-        // each 160,000 m² field is clamped to T = unit² (305.7 m)², so all
-        // ten cross — and no more than ten can.
-        assert!(at_unit.len() <= 10);
-        // Above the floor the factor is used as is.
-        assert_ne!(ten_fields_at(one_unit_factor() * 2.0), at_unit);
+    /// A level whose GSD is under one tile unit: z7 at `--gsd-base 8192`
+    /// has an eighth of the default GSD and one unit is two of them, so
+    /// its placeholder side is floored.
+    fn floored_level() -> Vec<AccumulateLevel> {
+        use super::super::level::gsd_with_base;
+        vec![
+            AccumulateLevel::new(gsd_with_base(7, 8192.0), Some(7), true),
+            AccumulateLevel::new(10.0, None, false),
+        ]
     }
 
     /// On a floored level the per-patch residual is dithered, not
@@ -531,89 +423,73 @@ mod tests {
     /// unfloored level keeps the plain truncation and yields none.
     #[test]
     fn floored_levels_dither_the_patch_residual() {
-        use super::super::simplify::tile_unit_meters;
-        let unit = tile_unit_meters(1000.0, None);
+        use super::super::simplify::placeholder_side;
+        let floored_lv = floored_level();
+        let side = placeholder_side(floored_lv[0].gsd_meters, floored_lv[0].zoom, Crs::Epsg3857);
+        // One feature per patch at both levels (the coarser has 32 km
+        // patches).
+        let spacing = 40_000.0;
         let n = 400;
         let feats: Vec<AssignFeature> = (0..n)
-            .map(|i| square(i, i as f64 * 40_000.0 + 7.3 * i as f64, 10.0, 100.0))
+            .map(|i| square(i, i as f64 * spacing + 7.3 * i as f64, 10.0, 10.0))
             .collect();
         let min_levels = vec![1u8; n];
-        let run = |factor: f64, area: f64| {
+        let run = |levels: &[AccumulateLevel], area: f64| {
             let areas = vec![area as f32; n];
-            tiny_polygon_carriers(
-                &table(&feats),
-                &min_levels,
-                &areas,
-                &level(),
-                Crs::Epsg3857,
-                factor,
-            )
-            .swap_remove(0)
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, levels, Crs::Epsg3857)
+                .swap_remove(0)
         };
-        let floored = run(1e-6, 0.5 * unit * unit);
+        let floored = run(&floored_lv, 0.5 * side * side);
         let sd = (n as f64 * 0.25).sqrt();
         assert!(
             (floored.len() as f64 - n as f64 / 2.0).abs() < 4.0 * sd,
             "{} residual carriers of {n} half-full patches",
             floored.len()
         );
-        // Unfloored (factor 1: T = 1e6 m²), half a T per patch stays unemitted.
-        assert!(run(1.0, 500_000.0).is_empty());
+        // Unfloored (1000 m GSD: T = 1e6 m²), half a T per patch stays unemitted.
+        assert!(run(&level(), 500_000.0).is_empty());
     }
 
     /// One side serves the accumulator's threshold and [`carrier_square`]:
-    /// `placeholder_side` is the tolerance when that is at least one tile
-    /// unit (equal, within 4 ulp, to both pre-#407 formulas), the unit
-    /// otherwise; the carrier square is exactly that wide.
+    /// `placeholder_side` is one GSD when that is at least one tile unit,
+    /// the unit otherwise, and the carrier square is exactly that wide.
     #[test]
     fn accumulator_and_carrier_square_share_one_side() {
         use super::super::simplify::{
-            carrier_square, level_tolerance, placeholder_side, tile_unit_meters, SimplifyOptions,
+            carrier_square, level_tolerance, placeholder_side, tile_unit_meters,
         };
         use geo::{BoundingRect, Geometry};
         for crs in [Crs::Epsg3857, Crs::Epsg4326] {
             for gsd_m in [0.3, 9.55, 1000.0, 39_135.76] {
-                for factor in [1e-6, 0.1, 0.25, 1.0, 3.7] {
-                    let tol = level_tolerance(gsd_m, crs, factor);
-                    let old_acc = factor * gsd_to_coord_units(gsd_m, crs);
-                    let old_sq = crs.meters_to_units(factor * gsd_m);
-                    let ulps = 4.0 * f64::EPSILON * tol;
-                    assert!((tol - old_acc).abs() <= ulps, "{crs:?} {gsd_m} {factor}");
-                    assert!((tol - old_sq).abs() <= ulps, "{crs:?} {gsd_m} {factor}");
-                    let unit = crs.meters_to_units(tile_unit_meters(gsd_m, None));
-                    let side = placeholder_side(gsd_m, None, crs, factor);
-                    assert_eq!(side, tol.max(unit), "{crs:?} {gsd_m} {factor}");
-                    let poly = geo::Rect::new((0.0, 0.0), (side * 0.1, side * 0.1)).to_polygon();
-                    let opts = SimplifyOptions {
-                        factor,
-                        ..SimplifyOptions::default()
-                    };
-                    let sq = carrier_square(&Geometry::Polygon(poly), gsd_m, None, crs, &opts)
-                        .and_then(|g| g.bounding_rect())
-                        .expect("a polygon has a carrier square");
-                    assert!(
-                        (sq.width() - side).abs() <= 1e3 * f64::EPSILON * side,
-                        "{crs:?} {gsd_m} {factor}"
-                    );
-                }
+                let gsd = level_tolerance(gsd_m, crs, 1.0);
+                let unit = crs.meters_to_units(tile_unit_meters(gsd_m, None));
+                let side = placeholder_side(gsd_m, None, crs);
+                assert_eq!(side, gsd.max(unit), "{crs:?} {gsd_m}");
+                let poly = geo::Rect::new((0.0, 0.0), (side * 0.1, side * 0.1)).to_polygon();
+                let sq = carrier_square(&Geometry::Polygon(poly), gsd_m, None, crs)
+                    .and_then(|g| g.bounding_rect())
+                    .expect("a polygon has a carrier square");
+                assert!(
+                    (sq.width() - side).abs() <= 1e3 * f64::EPSILON * side,
+                    "{crs:?} {gsd_m}"
+                );
             }
         }
-        assert_eq!(placeholder_side(1000.0, None, Crs::Epsg3857, 0.0), 0.0);
-        assert_eq!(placeholder_side(0.0, None, Crs::Epsg3857, 1.0), 0.0);
+        assert_eq!(placeholder_side(0.0, None, Crs::Epsg3857), 0.0);
     }
 
     /// The recorded zoom, not the GSD, fixes the floor: at `--gsd-base 8192`
     /// a z7 level has an eighth of the default GSD, and one unit is two of
-    /// them, so the default factor 1.0 is floored there.
+    /// them.
     #[test]
     fn the_floor_follows_the_recorded_zoom() {
         use super::super::level::gsd_with_base;
         use super::super::simplify::placeholder_side;
         let g = gsd_with_base(7, 8192.0);
-        let side = placeholder_side(g, Some(7), Crs::Epsg3857, 1.0);
+        let side = placeholder_side(g, Some(7), Crs::Epsg3857);
         assert!((side - 2.0 * g).abs() < 1e-9, "{side} vs 2 × {g}");
-        // Without the zoom the GSD alone implies z10, where 1 × gsd is 4 units.
-        assert_eq!(placeholder_side(g, None, Crs::Epsg3857, 1.0), g);
+        // Without the zoom the GSD alone implies z10, where one GSD is 4 units.
+        assert_eq!(placeholder_side(g, None, Crs::Epsg3857), g);
     }
 
     #[test]
@@ -626,14 +502,8 @@ mod tests {
             .collect();
         let min_levels = vec![1u8; 1000];
         let areas = vec![90_000.0f32; 1000];
-        let out = tiny_polygon_carriers(
-            &table(&feats),
-            &min_levels,
-            &areas,
-            &level(),
-            Crs::Epsg3857,
-            1.0,
-        );
+        let out =
+            tiny_polygon_carriers(&table(&feats), &min_levels, &areas, &level(), Crs::Epsg3857);
         let cells = 4; // 128 km / 32 km patches
         let n = out[0].len();
         assert!((90 - cells..=90).contains(&n), "{n} carriers");

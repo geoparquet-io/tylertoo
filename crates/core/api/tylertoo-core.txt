@@ -727,7 +727,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::accumulat
 pub const tylertoo_core::overview::accumulate::ACCUMULATE_CELL_GSD: f64
 pub fn tylertoo_core::overview::accumulate::is_carrier(&[usize], usize) -> bool
 pub fn tylertoo_core::overview::accumulate::level_accumulates(tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::simplify::Representation) -> bool
-pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs, f64) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
+pub fn tylertoo_core::overview::accumulate::tiny_polygon_carriers(&tylertoo_core::overview::assign::FeatureTable, &[u8], &[f32], &[tylertoo_core::overview::accumulate::AccumulateLevel], tylertoo_core::overview::level::Crs) -> alloc::vec::Vec<alloc::vec::Vec<usize>>
 pub mod tylertoo_core::overview::assign
 pub enum tylertoo_core::overview::assign::Crs
 pub tylertoo_core::overview::assign::Crs::Epsg3857
@@ -876,10 +876,40 @@ impl core::marker::Unpin for tylertoo_core::overview::assign::Assignment
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::assign::Assignment
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::assign::Assignment
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::assign::Assignment
+pub struct tylertoo_core::overview::assign::BudgetKinds
+pub tylertoo_core::overview::assign::BudgetKinds::lines: bool
+pub tylertoo_core::overview::assign::BudgetKinds::points: bool
+pub tylertoo_core::overview::assign::BudgetKinds::polygons: bool
+impl tylertoo_core::overview::assign::BudgetKinds
+pub const tylertoo_core::overview::assign::BudgetKinds::ALL: Self
+pub const tylertoo_core::overview::assign::BudgetKinds::POINTS: Self
+pub fn tylertoo_core::overview::assign::BudgetKinds::includes(self, tylertoo_core::overview::assign::FeatureKind) -> bool
+impl core::clone::Clone for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::clone(&self) -> tylertoo_core::overview::assign::BudgetKinds
+impl core::cmp::Eq for tylertoo_core::overview::assign::BudgetKinds
+impl core::cmp::PartialEq for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::eq(&self, &tylertoo_core::overview::assign::BudgetKinds) -> bool
+impl core::default::Default for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::assign::BudgetKinds
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::BudgetKinds
+impl core::str::traits::FromStr for tylertoo_core::overview::assign::BudgetKinds
+pub type tylertoo_core::overview::assign::BudgetKinds::Err = alloc::string::String
+pub fn tylertoo_core::overview::assign::BudgetKinds::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::overview::assign::BudgetKinds
+impl core::marker::Send for tylertoo_core::overview::assign::BudgetKinds
+impl core::marker::Sync for tylertoo_core::overview::assign::BudgetKinds
+impl core::marker::Unpin for tylertoo_core::overview::assign::BudgetKinds
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::assign::BudgetKinds
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::assign::BudgetKinds
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::assign::BudgetKinds
 pub struct tylertoo_core::overview::assign::DensityBudgetConfig
 pub tylertoo_core::overview::assign::DensityBudgetConfig::drop_rate: f64
 pub tylertoo_core::overview::assign::DensityBudgetConfig::enabled: bool
 pub tylertoo_core::overview::assign::DensityBudgetConfig::gamma: f64
+pub tylertoo_core::overview::assign::DensityBudgetConfig::kinds: tylertoo_core::overview::assign::BudgetKinds
 impl core::clone::Clone for tylertoo_core::overview::assign::DensityBudgetConfig
 pub fn tylertoo_core::overview::assign::DensityBudgetConfig::clone(&self) -> tylertoo_core::overview::assign::DensityBudgetConfig
 impl core::default::Default for tylertoo_core::overview::assign::DensityBudgetConfig
@@ -1791,7 +1821,34 @@ impl core::marker::Unpin for tylertoo_core::overview::export::InvalidFeatureIdRe
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::InvalidFeatureIdReason
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::InvalidFeatureIdReason
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::InvalidFeatureIdReason
+pub enum tylertoo_core::overview::export::SizeValve
+pub tylertoo_core::overview::export::SizeValve::Drop
+pub tylertoo_core::overview::export::SizeValve::Merge
+impl tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::as_str(self) -> &'static str
+impl core::clone::Clone for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::clone(&self) -> tylertoo_core::overview::export::SizeValve
+impl core::cmp::Eq for tylertoo_core::overview::export::SizeValve
+impl core::cmp::PartialEq for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::eq(&self, &tylertoo_core::overview::export::SizeValve) -> bool
+impl core::default::Default for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::default() -> tylertoo_core::overview::export::SizeValve
+impl core::fmt::Debug for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::export::SizeValve
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::SizeValve
+impl core::str::traits::FromStr for tylertoo_core::overview::export::SizeValve
+pub type tylertoo_core::overview::export::SizeValve::Err = alloc::string::String
+pub fn tylertoo_core::overview::export::SizeValve::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl core::marker::Freeze for tylertoo_core::overview::export::SizeValve
+impl core::marker::Send for tylertoo_core::overview::export::SizeValve
+impl core::marker::Sync for tylertoo_core::overview::export::SizeValve
+impl core::marker::Unpin for tylertoo_core::overview::export::SizeValve
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::SizeValve
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::SizeValve
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::SizeValve
 pub struct tylertoo_core::overview::export::ExportOptions
+pub tylertoo_core::overview::export::ExportOptions::compressed_tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::extent: u32
 pub tylertoo_core::overview::export::ExportOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
@@ -1801,6 +1858,7 @@ pub tylertoo_core::overview::export::ExportOptions::min_zoom: core::option::Opti
 pub tylertoo_core::overview::export::ExportOptions::partition_wave: usize
 pub tylertoo_core::overview::export::ExportOptions::properties: tylertoo_core::overview::properties::PropertySelection
 pub tylertoo_core::overview::export::ExportOptions::simple_clip_fastpath: bool
+pub tylertoo_core::overview::export::ExportOptions::size_valve: tylertoo_core::overview::export::SizeValve
 pub tylertoo_core::overview::export::ExportOptions::spill_dir: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::export::ExportOptions::tile_buffer: u32
 pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
@@ -1826,12 +1884,14 @@ pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
 pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ExportReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ExportReport::max_zoom: u8
+pub tylertoo_core::overview::export::ExportReport::merged_features: usize
 pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
 pub tylertoo_core::overview::export::ExportReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::skipped_property_columns: alloc::vec::Vec<tylertoo_core::overview::export::SkippedPropertyColumn>
 pub tylertoo_core::overview::export::ExportReport::total_tile_features: usize
 pub tylertoo_core::overview::export::ExportReport::total_tiles: usize
+pub tylertoo_core::overview::export::ExportReport::valve_dropped_features: usize
 pub tylertoo_core::overview::export::ExportReport::zooms: alloc::vec::Vec<tylertoo_core::overview::export::ZoomReport>
 impl core::clone::Clone for tylertoo_core::overview::export::ExportReport
 pub fn tylertoo_core::overview::export::ExportReport::clone(&self) -> tylertoo_core::overview::export::ExportReport
@@ -1874,9 +1934,12 @@ pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
+pub tylertoo_core::overview::export::ZoomReport::max_valve_passes: u32
+pub tylertoo_core::overview::export::ZoomReport::merged_features: usize
 pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_count: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_feature_count: usize
+pub tylertoo_core::overview::export::ZoomReport::valve_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::zoom: u8
 impl core::clone::Clone for tylertoo_core::overview::export::ZoomReport
 pub fn tylertoo_core::overview::export::ZoomReport::clone(&self) -> tylertoo_core::overview::export::ZoomReport
@@ -2643,9 +2706,13 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::reader
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::reader::OverviewReader
 pub mod tylertoo_core::overview::simplify
 pub enum tylertoo_core::overview::simplify::CollapseMode
+pub tylertoo_core::overview::simplify::CollapseMode::Auto
 pub tylertoo_core::overview::simplify::CollapseMode::Drop
 pub tylertoo_core::overview::simplify::CollapseMode::Point
 pub tylertoo_core::overview::simplify::CollapseMode::Square
+impl tylertoo_core::overview::simplify::CollapseMode
+pub fn tylertoo_core::overview::simplify::CollapseMode::is_square(self) -> bool
+pub fn tylertoo_core::overview::simplify::CollapseMode::resolved(self) -> Self
 impl core::clone::Clone for tylertoo_core::overview::simplify::CollapseMode
 pub fn tylertoo_core::overview::simplify::CollapseMode::clone(&self) -> tylertoo_core::overview::simplify::CollapseMode
 impl core::cmp::Eq for tylertoo_core::overview::simplify::CollapseMode
@@ -2889,6 +2956,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateO
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 pub struct tylertoo_core::overview::tiles::TilesOptions
+pub tylertoo_core::overview::tiles::TilesOptions::compressed_tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
 pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
@@ -2898,6 +2966,7 @@ pub tylertoo_core::overview::tiles::TilesOptions::metadata: tylertoo_core::Tiles
 pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
 pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
 pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
+pub tylertoo_core::overview::tiles::TilesOptions::size_valve: tylertoo_core::overview::export::SizeValve
 pub tylertoo_core::overview::tiles::TilesOptions::tile_buffer: u32
 pub tylertoo_core::overview::tiles::TilesOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
 pub tylertoo_core::overview::tiles::TilesOptions::tile_size_limit: core::option::Option<usize>

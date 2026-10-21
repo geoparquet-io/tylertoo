@@ -426,7 +426,7 @@ impl OverviewReader {
 
     /// [`Self::selected_row_groups`] pruned by the union of several bboxes:
     /// a row group is kept when its statistics intersect any of them.
-    fn selected_row_groups_any(
+    pub(crate) fn selected_row_groups_any(
         &self,
         level_idx: usize,
         bboxes: Option<&[[f64; 4]]>,
@@ -570,6 +570,22 @@ impl OverviewReader {
     /// The parsed Parquet footer (row-group sizes and column statistics).
     pub(crate) fn parquet_metadata(&self) -> &ParquetMetaData {
         &self.metadata
+    }
+
+    /// `(band, rows)` for each of `row_groups`, in the order given: the level
+    /// band each row group belongs to (§3.3) and its row count. The export's
+    /// size valve (#745) walks this alongside a read of the same row groups
+    /// to tell which band each row came from and where each row group starts.
+    pub(crate) fn row_group_bands(&self, row_groups: &[usize]) -> Vec<(u16, u64)> {
+        let ends: Vec<i64> = self.meta.levels.iter().map(|l| l.row_group_end).collect();
+        row_groups
+            .iter()
+            .map(|&rg| {
+                let band = ends.partition_point(|&end| end < rg as i64);
+                let rows = self.metadata.row_group(rg).num_rows().max(0) as u64;
+                (u16::try_from(band).unwrap_or(u16::MAX), rows)
+            })
+            .collect()
     }
 
     /// A reader builder over `level_idx`'s own row-group band.

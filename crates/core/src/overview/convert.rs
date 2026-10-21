@@ -60,9 +60,7 @@ use crate::batch_processor::extract_geometries_opt_from_array;
 use crate::shard::TileRange;
 use crate::tile::MAX_ZOOM;
 
-use super::accumulate::{
-    is_carrier, level_accumulates, placeholder_has_size, tiny_polygon_carriers, AccumulateLevel,
-};
+use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
     apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
     DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
@@ -2863,8 +2861,11 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
     // simplification tolerance, so the drop default deletes it again at exactly
     // the levels it was promoted to — and a level left with nothing is omitted
     // from the file entirely.
-    let collapse_to_point =
-        options.entry_zoom.is_some() && matches!(options.simplify.collapse, CollapseMode::Drop);
+    let collapse_to_point = options.entry_zoom.is_some()
+        && matches!(
+            options.simplify.collapse,
+            CollapseMode::Drop | CollapseMode::Auto
+        );
     if collapse_to_point {
         log::info!(
             "an entry-zoom ladder implies collapse-to-point: a promoted feature is \
@@ -2903,6 +2904,44 @@ pub(crate) fn adjusted_for_ladder_and_mode(options: &ConvertOptions) -> Option<C
         },
         ..options.clone()
     })
+}
+
+#[cfg(test)]
+mod sortedness_tests {
+    use super::*;
+    use crate::covering::RowGroupBounds;
+
+    fn rg(i: usize, xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> RowGroupBounds {
+        RowGroupBounds {
+            row_group_idx: i,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            num_rows: 1,
+        }
+    }
+
+    /// #745: sorted row groups tile the extent; unsorted ones each span it.
+    #[test]
+    fn row_group_spread_tells_sorted_from_unsorted() {
+        let sorted: Vec<_> = (0..8)
+            .map(|i| Some(rg(i, i as f64, 0.0, i as f64 + 1.0, 1.0)))
+            .collect();
+        let s = row_group_spread(&[sorted]).unwrap();
+        assert!((s - 0.125).abs() < 1e-9, "{s}");
+        let unsorted: Vec<_> = (0..8)
+            .map(|i| Some(rg(i, 0.0, 0.0, 8.0, 0.9 + 0.01 * i as f64)))
+            .collect();
+        let u = row_group_spread(&[unsorted]).unwrap();
+        assert!(u > UNSORTED_ROW_GROUP_SPREAD, "{u}");
+        // Too few row groups to tell, or no statistics.
+        assert_eq!(
+            row_group_spread(&[vec![Some(rg(0, 0.0, 0.0, 1.0, 1.0)); 3]]),
+            None
+        );
+        assert_eq!(row_group_spread(&[vec![None; 10]]), None);
+    }
 }
 
 #[cfg(test)]
@@ -3929,13 +3968,9 @@ fn build_emitted_levels(
                 // #384: a carrier is not a member — it stands in for its
                 // cell's dropped area as one placeholder square.
                 if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
-                    if let Some(sq) = carrier_square(
-                        &geometries[i],
-                        gsd_m,
-                        level_specs[level].1,
-                        crs,
-                        &options.simplify,
-                    ) {
+                    if let Some(sq) =
+                        carrier_square(&geometries[i], gsd_m, level_specs[level].1, crs)
+                    {
                         vertex_count += count_vertices(&sq);
                         indices.push(i);
                         geoms.push(sq);
@@ -4043,19 +4078,14 @@ pub(crate) fn convert_to_overviews_source_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
-    let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options)? {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+    let adjusted = normalize_convert_options(source, options)?;
+    let options: &ConvertOptions = adjusted.as_ref().unwrap_or(options);
     // #452: the output is created after pass 1; a missing or read-only
     // directory must not cost the whole scan first. After the option checks
     // above (which read at most a footer, for a property selection), so a
     // bad option is reported as such wherever the output points.
     crate::atomic_output::check_writable(output_path)?;
+    warn_if_unsorted(source);
 
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
@@ -4413,12 +4443,8 @@ fn in_memory_carriers(
 ) -> Vec<Vec<usize>> {
     let num_levels = level_specs.len();
     let finest = num_levels.saturating_sub(1);
-    // `placeholder_has_size` last: it logs, and only when the accumulator
-    // would otherwise run.
     let enabled = matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse == CollapseMode::Square
-            || level_reprs.contains(&Representation::Square))
-        && placeholder_has_size(options.simplify.factor);
+        && (options.simplify.collapse.is_square() || level_reprs.contains(&Representation::Square));
     let acc_levels: Vec<AccumulateLevel> = level_specs
         .iter()
         .enumerate()
@@ -4443,14 +4469,7 @@ fn in_memory_carriers(
             _ => 0.0,
         })
         .collect();
-    tiny_polygon_carriers(
-        features,
-        row_min_levels,
-        &areas,
-        &acc_levels,
-        crs,
-        options.simplify.factor,
-    )
+    tiny_polygon_carriers(features, row_min_levels, &areas, &acc_levels, crs)
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a
@@ -4751,6 +4770,72 @@ pub(crate) fn input_row_group_bounds(
         }
         Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
             .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
+    }
+}
+
+/// The mean share of the input's extent that one row group's bbox covers
+/// (#745): near `1/k` for spatially sorted input with `k` row groups, near 1
+/// when rows are in no spatial order. `None` with fewer than four usable
+/// bboxes, or a degenerate extent, where order cannot be told.
+pub(crate) fn row_group_spread(
+    parts: &[Vec<Option<crate::covering::RowGroupBounds>>],
+) -> Option<f64> {
+    let boxes: Vec<&crate::covering::RowGroupBounds> = parts
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|b| {
+            [b.xmin, b.ymin, b.xmax, b.ymax]
+                .iter()
+                .all(|v| v.is_finite())
+                && b.xmin <= b.xmax
+                && b.ymin <= b.ymax
+        })
+        .collect();
+    if boxes.len() < 4 {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for b in &boxes {
+        x0 = x0.min(b.xmin);
+        y0 = y0.min(b.ymin);
+        x1 = x1.max(b.xmax);
+        y1 = y1.max(b.ymax);
+    }
+    let extent = (x1 - x0) * (y1 - y0);
+    if extent <= 0.0 {
+        return None;
+    }
+    let mean = boxes
+        .iter()
+        .map(|b| (b.xmax - b.xmin) * (b.ymax - b.ymin) / extent)
+        .sum::<f64>()
+        / boxes.len() as f64;
+    Some(mean)
+}
+
+/// A row-group spread above this reads as input in no spatial order: each
+/// row group spans more than half the extent on average.
+const UNSORTED_ROW_GROUP_SPREAD: f64 = 0.5;
+
+/// Warn when the input does not look spatially sorted (#745). Row-group
+/// pruning works poorly on such input, and the merge size valve merges each
+/// feature into the one stored before it, which on unsorted input is an
+/// arbitrary feature rather than a neighbour. Footer statistics only.
+fn warn_if_unsorted(source: &ConvertSource) {
+    let Ok(parts) = source.part_row_group_bounds() else {
+        return;
+    };
+    if let Some(spread) = row_group_spread(&parts) {
+        if spread > UNSORTED_ROW_GROUP_SPREAD {
+            log::warn!(
+                "[convert] the input does not look spatially sorted: each row group spans \
+                 {:.0}% of the data's extent on average. Row-group pruning, and merging \
+                 oversized tiles into neighbouring features, work best on Hilbert-sorted \
+                 input; sort it first with `gpio sort hilbert`.",
+                spread * 100.0
+            );
+        }
     }
 }
 
@@ -6996,7 +7081,10 @@ pub(super) fn coalesce_level_chains(
     crs: Crs,
     options: &ConvertOptions,
 ) -> Vec<super::coalesce::CoalescedLine> {
+    // #745: the chain budget thins lines, so it follows the budget's line
+    // switch.
     let budget = if options.density.enabled
+        && options.density.kinds.lines
         && options.density.drop_rate > 1.0
         && !options.density.drop_rate.is_nan()
         && level < finest
@@ -7388,7 +7476,7 @@ pub(super) fn build_generalization(
             mode => Some(
                 match mode {
                     CollapseMode::Point => "point",
-                    CollapseMode::Square => "square",
+                    CollapseMode::Square | CollapseMode::Auto => "square",
                     CollapseMode::Drop => unreachable!(),
                 }
                 .to_string(),
@@ -11228,7 +11316,9 @@ mod tests {
         assert_eq!(bands.len(), 1);
         assert_eq!(bands[0].zooms, [2, 5]);
         assert_eq!(bands[0].repr, "point");
-        assert!(gen.collapse.is_none(), "no global collapse requested");
+        // The default collapse (#745: squares) is recorded like an explicit
+        // one; it applies outside the point band.
+        assert_eq!(gen.collapse.as_deref(), Some("square"));
     }
 
     /// Streaming and in-memory pipelines produce identical per-level rows

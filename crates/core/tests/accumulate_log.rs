@@ -1,4 +1,4 @@
-//! #407: the tiny-polygon accumulator's `log::info` lines, asserted.
+//! #407, #745: the tiny-polygon accumulator's `log::info` lines, asserted.
 //!
 //! Its own test binary, so this is the only code installing a logger here:
 //! `log::set_logger` is process-global and succeeds once.
@@ -52,7 +52,7 @@ fn fields() -> Vec<Option<Geometry<f64>>> {
     out
 }
 
-fn convert_at(factor: f64, streaming: bool) {
+fn convert_at(factor: f64, streaming: bool, gsd_base: f64) {
     let tin = tempfile::NamedTempFile::new().unwrap();
     testutil::write_input(tin.path(), &fields(), true, None);
     let tout = tempfile::NamedTempFile::new().unwrap();
@@ -67,39 +67,45 @@ fn convert_at(factor: f64, streaming: bool) {
             ..SimplifyOptions::default()
         },
         streaming,
+        gsd_base,
         ..Default::default()
     };
-    // Factor 0 leaves the coarse levels empty, which is not an error.
     let _ = convert_to_overviews(tin.path(), tout.path(), &o).unwrap();
 }
 
-/// Factor 0: one line saying the accumulator is off, per engine. A
-/// sub-unit factor: one line naming the zooms whose side was floored.
+/// #745: the placeholder is one GSD whatever the factor, so factor 0 no
+/// longer switches the accumulator off and no line says so. The floor
+/// binds only where a level's GSD is under one tile unit: at
+/// `--gsd-base 8192` (one unit is two GSDs) one line names the floored
+/// zooms; at the default base no line does.
 #[test]
-fn accumulator_logs_the_zero_factor_skip_and_the_floored_zooms() {
+fn accumulator_logs_only_the_floored_zooms() {
     log::set_logger(&Capture).expect("the only logger in this binary");
     log::set_max_level(log::LevelFilter::Info);
 
     for streaming in [true, false] {
-        LINES.lock().unwrap().clear();
-        convert_at(0.0, streaming);
-        let lines = LINES.lock().unwrap().clone();
-        let off: Vec<&String> = lines
-            .iter()
-            .filter(|l| l.contains("tiny-polygon accumulator off: --simplify-factor 0"))
-            .collect();
-        assert_eq!(off.len(), 1, "streaming={streaming}: {lines:#?}");
+        for factor in [0.0, 0.1, 1.0] {
+            LINES.lock().unwrap().clear();
+            convert_at(factor, streaming, 512.0);
+            let lines = LINES.lock().unwrap().clone();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.contains("accumulator off")
+                        || l.contains("narrower than one tile unit")),
+                "streaming={streaming} factor={factor}: {lines:#?}"
+            );
+        }
 
         LINES.lock().unwrap().clear();
-        convert_at(0.1, streaming);
+        convert_at(1.0, streaming, 8192.0);
         let lines = LINES.lock().unwrap().clone();
         let floored: Vec<&String> = lines
             .iter()
             .filter(|l| l.contains("narrower than one tile unit"))
             .collect();
         assert_eq!(floored.len(), 1, "streaming={streaming}: {lines:#?}");
-        // Levels z8..z11 accumulate (z12 is canonical); all are floored at
-        // factor 0.1 < 0.25, and the line names them by zoom.
+        // Levels z8..z11 accumulate (z12 is canonical) and all are floored.
         assert!(
             floored[0].contains("z8, z9, z10, z11"),
             "streaming={streaming}: {}",

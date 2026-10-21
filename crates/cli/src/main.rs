@@ -29,8 +29,9 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tylertoo_core::overview::assign::BudgetKinds;
 use tylertoo_core::overview::auto_zoom::MaxZoom;
-use tylertoo_core::overview::export::FeatureOrder;
+use tylertoo_core::overview::export::{FeatureOrder, SizeValve};
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
@@ -597,9 +598,24 @@ struct ExportPmtilesArgs {
     tile_buffer: u32,
 
     /// Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for
-    /// no cap. A tile over the cap drops features until it fits.
+    /// no cap. A tile over the cap is merged or thinned until it fits; see
+    /// `--size-valve`.
     #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
     tile_size_limit: usize,
+
+    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
+    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
+    /// both caps.
+    #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_bytes)]
+    max_compressed_tile_size: usize,
+
+    /// How to reduce a tile that exceeds its cap: `merge` merges the
+    /// densest lines and polygons into a neighbor, which keeps its own
+    /// attributes; `drop` removes features, leaving holes while preserving
+    /// each retained feature's attributes. Point tiles use feature dropping
+    /// in both modes.
+    #[arg(long, value_name = "merge|drop", default_value = "merge")]
+    size_valve: SizeValve,
 
     /// Write the JSON export report, with per-zoom tile and feature counts,
     /// to this path.
@@ -815,16 +831,23 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Generalization")]
     simplify_factor: Option<f64>,
 
-    /// Replace polygons too small for a level with a point. Fill styles
-    /// ignore points; add a circle layer or use `--collapse-square`.
-    #[arg(long, help_heading = "Generalization")]
+    /// Replace polygons too small for a level with a point instead of the
+    /// default placeholder square. Fill styles ignore points; add a circle
+    /// layer.
+    #[arg(long, conflicts_with_all = ["collapse_square", "no_collapse"], help_heading = "Generalization")]
     collapse: bool,
 
-    /// Replace polygons dropped at coarse levels with small placeholder
-    /// squares marking their location. Duplicating mode only; output
-    /// remains Polygon.
-    #[arg(long, conflicts_with = "collapse", help_heading = "Generalization")]
+    /// Replace polygons too small for a level, and those thinned out at
+    /// coarse levels, with small placeholder squares marking their area.
+    /// This is the default in duplicating mode; output remains Polygon.
+    #[arg(long, conflicts_with = "no_collapse", help_heading = "Generalization")]
     collapse_square: bool,
+
+    /// Drop polygons too small for a level instead of replacing them with
+    /// placeholder squares: smaller files, but a polygon coverage shows holes
+    /// at coarse zooms (the default before #745).
+    #[arg(long, help_heading = "Generalization")]
+    no_collapse: bool,
 
     /// Polygon representation by zoom band: comma-separated
     /// `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as
@@ -850,7 +873,8 @@ struct ConvertTuningArgs {
     line_thinning: Option<f64>,
 
     /// Polygon thinning grid cell, as a multiple of the level's GSD
-    /// (default 1.0). Larger cells keep fewer polygons.
+    /// (default 0, off). Larger cells keep fewer polygons and can remove a
+    /// polygon whose center falls in a larger neighbor's cell.
     #[arg(long, help_heading = "Thinning & visibility")]
     polygon_thinning: Option<f64>,
 
@@ -888,6 +912,19 @@ struct ConvertTuningArgs {
     /// only.
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
+
+    /// Apply the density budget to lines as well as points: smaller, faster
+    /// tiles that drop line features at coarse zooms (tippecanoe's
+    /// `--drop-lines`).
+    #[arg(long, help_heading = "Density budget")]
+    drop_lines: bool,
+
+    /// Apply the density budget to polygons as well as points. Removing a
+    /// polygon leaves a hole in a coverage such as admin areas or parcels,
+    /// so the budget excludes polygons by default (tippecanoe's
+    /// `--drop-polygons`).
+    #[arg(long, help_heading = "Density budget")]
+    drop_polygons: bool,
 
     /// Merge each thinning cell's points into its surviving point, which
     /// gains a `point_count` column. Duplicating mode only.
@@ -1196,12 +1233,15 @@ impl ConvertTuningArgs {
                 // gets it — the Python bindings and direct library users
                 // included, where the drop default silently deletes the
                 // promoted features and can empty the coarsest level outright.
-                collapse: if self.collapse_square {
-                    CollapseMode::Square
-                } else if self.collapse {
+                collapse: if self.collapse {
                     CollapseMode::Point
-                } else {
+                } else if self.no_collapse {
                     CollapseMode::Drop
+                } else if self.collapse_square {
+                    CollapseMode::Square
+                } else {
+                    // #745: squares, or points under an entry-zoom ladder.
+                    CollapseMode::Auto
                 },
                 cascade: !self.no_cascade,
             },
@@ -1211,6 +1251,11 @@ impl ConvertTuningArgs {
                 enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
+                kinds: BudgetKinds {
+                    points: true,
+                    lines: self.drop_lines,
+                    polygons: self.drop_polygons,
+                },
             },
             gsd_base: self.gsd_base,
             cogp_compat_key: cogp_compat,
@@ -1331,10 +1376,24 @@ struct TilesArgs {
     publication: TilesetMetadataArgs,
 
     /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
-    /// (default 500K, or no cap with `--verbatim`). A tile over the cap drops
-    /// features until it fits.
+    /// (default 500K, or no cap with `--verbatim`). A tile over the cap is
+    /// merged or thinned until it fits; see `--size-valve`.
     #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
+
+    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
+    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
+    /// both caps.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
+    max_compressed_tile_size: Option<usize>,
+
+    /// How to reduce a tile that exceeds its cap: `merge` merges the
+    /// densest lines and polygons into a neighbor, which keeps its own
+    /// attributes; `drop` removes features, leaving holes while preserving
+    /// each retained feature's attributes. Point tiles use feature dropping
+    /// in both modes.
+    #[arg(long, value_name = "merge|drop", default_value = "merge")]
+    size_valve: SizeValve,
 
     /// Clip all polygons with the full overlay for byte-stable tiles. The
     /// simple-ring fast path renders identically but can change a ring's
@@ -2052,6 +2111,14 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
         ("--description", args.publication.description.is_some()),
         ("--attribution", args.publication.attribution.is_some()),
         ("--max-tile-size", args.max_tile_size.is_some()),
+        (
+            "--max-compressed-tile-size",
+            args.max_compressed_tile_size.is_some(),
+        ),
+        (
+            "--size-valve",
+            args.size_valve != ExportOptions::default().size_valve,
+        ),
         ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
         (
             "--tile-buffer",
@@ -2235,6 +2302,26 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
 /// parsed arguments onto [`TilesOptions`] and prints.
 ///
 /// [`TilesOptions`]: tylertoo_core::overview::tiles::TilesOptions
+/// Whether a convert with `options` stands in for dropped polygons with
+/// placeholder squares (#745), for the empty-zoom hint: duplicating mode,
+/// with the square disposition globally (the default, unless an entry-zoom
+/// ladder turns it into points) or in a `--representation` square band.
+fn makes_placeholder_squares(options: &tylertoo_core::overview::convert::ConvertOptions) -> bool {
+    use tylertoo_core::overview::level::Mode;
+    use tylertoo_core::overview::simplify::{CollapseMode, Representation};
+
+    let global = match options.simplify.collapse {
+        CollapseMode::Square => true,
+        CollapseMode::Auto => options.entry_zoom.is_none(),
+        CollapseMode::Point | CollapseMode::Drop => false,
+    };
+    let banded = options
+        .representation
+        .iter()
+        .any(|b| b.repr == Representation::Square);
+    matches!(options.mode, Mode::Duplicating) && (global || banded)
+}
+
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::convert::ConvertReport;
     use tylertoo_core::overview::tiles::{
@@ -2285,6 +2372,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     let manual_range = preflight_export_flags(&args)?;
 
     let (options, shard) = tiles_convert_options(&args, &spec)?;
+    let squares = makes_placeholder_squares(&options);
 
     let tiles_options = TilesOptions {
         convert: options,
@@ -2301,6 +2389,8 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         tile_range: manual_range,
         tile_buffer: args.tile_buffer,
         tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
+        compressed_tile_size_limit: args.max_compressed_tile_size.and_then(size_limit_opt),
+        size_valve: args.size_valve,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
@@ -2433,20 +2523,24 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .map(|z| format!("z{z}"))
         .collect();
     if !empty_zooms.is_empty() {
-        // Point at the collapse flags only when neither was passed; with one
-        // on, the level was empty because there was less than one placeholder
-        // of area in it, and the hint would name the flag already given.
-        if args.tuning.collapse || args.tuning.collapse_square {
+        // With placeholder squares on, the level was empty because there was
+        // less than one placeholder of area in it. Otherwise point at the
+        // generalization, and at `--no-collapse` only when it was given.
+        if squares {
             say!(
                 "  {} declared but empty: less than one placeholder of area there",
                 empty_zooms.join(", ")
             );
         } else {
             say!(
-                "  {} declared but empty: every feature generalized away there \
-                 (see --collapse / --collapse-square), or an entry-zoom ladder \
-                 holds every feature out of them",
-                empty_zooms.join(", ")
+                "  {} declared but empty: every feature generalized away there{}, \
+                 or an entry-zoom ladder holds every feature out of them",
+                empty_zooms.join(", "),
+                if args.tuning.no_collapse {
+                    " (drop --no-collapse to keep placeholders)"
+                } else {
+                    ""
+                },
             );
         }
     }
@@ -2929,6 +3023,8 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         tile_buffer: args.tile_buffer,
         extent: 4096,
         tile_size_limit: size_limit_opt(args.tile_size_limit),
+        compressed_tile_size_limit: size_limit_opt(args.max_compressed_tile_size),
+        size_valve: args.size_valve,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
@@ -4195,7 +4291,9 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(opts.simplify.collapse, CollapseMode::Drop);
+        // #745: no flag is the auto disposition (squares, points under a
+        // ladder).
+        assert_eq!(opts.simplify.collapse, CollapseMode::Auto);
 
         // A malformed spec is a CLI-level error.
         let bad = parse_tiles(&["--representation", "0-7:blob"]);
@@ -4379,6 +4477,40 @@ mod tests {
             .unwrap()
     }
 
+    /// #745: the empty-zoom hint blames "less than one placeholder" only when
+    /// squares are actually made: not under a ladder's points, `--collapse`
+    /// or `--no-collapse`, and not in partitioning mode.
+    #[test]
+    fn placeholder_squares_follow_the_resolved_disposition() {
+        assert!(makes_placeholder_squares(&verbatim_opts(&[])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--collapse-square"
+        ])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&["--collapse"])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse"
+        ])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&[
+            "--magnitude-ladder",
+            "level"
+        ])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--magnitude-ladder",
+            "level",
+            "--collapse-square"
+        ])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse",
+            "--representation",
+            "0-3:square,4-6:geom"
+        ])));
+        let partitioning = tylertoo_core::overview::convert::ConvertOptions {
+            mode: tylertoo_core::overview::level::Mode::Partitioning,
+            ..verbatim_opts(&[])
+        };
+        assert!(!makes_placeholder_squares(&partitioning));
+    }
+
     /// #364: a ladder implies collapse-to-point, and that is applied in CORE so
     /// every caller gets it — the CLI is not the only entry point, and the
     /// Python bindings previously lost the entire coarsest level to the drop
@@ -4389,7 +4521,7 @@ mod tests {
 
         // The CLI itself leaves the mode alone...
         let cli = verbatim_opts(&["--magnitude-ladder", "level"]);
-        assert_eq!(cli.simplify.collapse, CollapseMode::Drop);
+        assert_eq!(cli.simplify.collapse, CollapseMode::Auto);
         assert_eq!(
             verbatim_opts(&["--magnitude-ladder", "level", "--collapse-square"])
                 .simplify
@@ -4531,7 +4663,7 @@ mod tests {
         // A default run is unchanged.
         let plain = verbatim_opts(&[]);
         assert_eq!(plain.simplify.factor, 1.0);
-        assert_eq!(plain.assign.polygon_thinning, 1.0);
+        assert_eq!(plain.assign.polygon_thinning, 0.0);
         assert_eq!(plain.assign.line_visibility, 2.0);
         assert_eq!(plain.assign.polygon_visibility, 2.0);
         assert_eq!(plain.assign.line_thinning, 1.0);

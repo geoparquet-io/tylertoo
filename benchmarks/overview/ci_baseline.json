@@ -4,161 +4,172 @@
       "input_features": 17465,
       "levels": [
         {
-          "feature_count": 40,
+          "feature_count": 410,
           "level": 0,
-          "vertex_count": 173
+          "vertex_count": 2050
         },
         {
-          "feature_count": 238,
+          "feature_count": 1537,
           "level": 1,
-          "vertex_count": 1094
+          "vertex_count": 7723
         },
         {
-          "feature_count": 253,
+          "feature_count": 4557,
           "level": 2,
-          "vertex_count": 1526
+          "vertex_count": 22579
         },
         {
-          "feature_count": 254,
+          "feature_count": 9820,
           "level": 3,
-          "vertex_count": 2394
+          "vertex_count": 47970
         },
         {
-          "feature_count": 256,
+          "feature_count": 14564,
           "level": 4,
-          "vertex_count": 3775
+          "vertex_count": 72808
         },
         {
-          "feature_count": 318,
+          "feature_count": 16504,
           "level": 5,
-          "vertex_count": 7348
+          "vertex_count": 96366
         },
         {
-          "feature_count": 525,
+          "feature_count": 17131,
           "level": 6,
-          "vertex_count": 16042
+          "vertex_count": 130448
         },
         {
-          "feature_count": 865,
+          "feature_count": 17385,
           "level": 7,
-          "vertex_count": 31531
+          "vertex_count": 177775
         },
         {
-          "feature_count": 1428,
+          "feature_count": 17456,
           "level": 8,
-          "vertex_count": 56944
+          "vertex_count": 239502
         },
         {
-          "feature_count": 2356,
+          "feature_count": 17465,
           "level": 9,
-          "vertex_count": 98323
+          "vertex_count": 322368
         },
         {
-          "feature_count": 3888,
+          "feature_count": 17465,
           "level": 10,
-          "vertex_count": 170848
+          "vertex_count": 433075
         },
         {
-          "feature_count": 6415,
+          "feature_count": 17465,
           "level": 11,
-          "vertex_count": 319805
+          "vertex_count": 573337
         },
         {
-          "feature_count": 10585,
+          "feature_count": 17465,
           "level": 12,
-          "vertex_count": 587192
+          "vertex_count": 729473
         },
         {
           "feature_count": 17465,
           "level": 13,
+          "vertex_count": 877009
+        },
+        {
+          "feature_count": 17465,
+          "level": 14,
           "vertex_count": 1749880
         }
       ],
-      "total_rows": 44886,
-      "total_vertices": 3046875
+      "total_rows": 204154,
+      "total_vertices": 5482363
     },
     "export": {
-      "archive_bytes": 104558542,
-      "decoded_features_total": 353002,
-      "total_tile_features": 353002,
-      "total_tiles": 146922,
+      "archive_bytes": 124062292,
+      "decoded_features_total": 553914,
+      "total_tile_features": 553914,
+      "total_tiles": 153053,
       "zooms": [
         {
-          "decoded_features": 40,
+          "decoded_features": 410,
           "tile_count": 1,
-          "tile_feature_count": 40,
+          "tile_feature_count": 410,
+          "zoom": 0
+        },
+        {
+          "decoded_features": 1537,
+          "tile_count": 1,
+          "tile_feature_count": 1537,
           "zoom": 1
         },
         {
-          "decoded_features": 238,
+          "decoded_features": 2055,
           "tile_count": 1,
-          "tile_feature_count": 238,
+          "tile_feature_count": 2055,
           "zoom": 2
         },
         {
-          "decoded_features": 426,
+          "decoded_features": 4275,
           "tile_count": 2,
-          "tile_feature_count": 426,
+          "tile_feature_count": 4275,
           "zoom": 3
         },
         {
-          "decoded_features": 418,
+          "decoded_features": 7607,
           "tile_count": 4,
-          "tile_feature_count": 418,
+          "tile_feature_count": 7607,
           "zoom": 4
         },
         {
-          "decoded_features": 351,
+          "decoded_features": 6561,
           "tile_count": 4,
-          "tile_feature_count": 351,
+          "tile_feature_count": 6561,
           "zoom": 5
         },
         {
-          "decoded_features": 405,
-          "tile_count": 6,
-          "tile_feature_count": 405,
+          "decoded_features": 8809,
+          "tile_count": 7,
+          "tile_feature_count": 8809,
           "zoom": 6
         },
         {
-          "decoded_features": 689,
-          "tile_count": 15,
-          "tile_feature_count": 689,
+          "decoded_features": 18081,
+          "tile_count": 16,
+          "tile_feature_count": 18081,
           "zoom": 7
         },
         {
-          "decoded_features": 1199,
-          "tile_count": 42,
-          "tile_feature_count": 1199,
+          "decoded_features": 21185,
+          "tile_count": 44,
+          "tile_feature_count": 21185,
           "zoom": 8
         },
         {
-          "decoded_features": 2209,
-          "tile_count": 138,
-          "tile_feature_count": 2209,
+          "decoded_features": 23270,
+          "tile_count": 149,
+          "tile_feature_count": 23270,
           "zoom": 9
         },
         {
-          "decoded_features": 4143,
-          "tile_count": 487,
-          "tile_feature_count": 4143,
+          "decoded_features": 26830,
+          "tile_count": 524,
+          "tile_feature_count": 26830,
           "zoom": 10
         },
         {
-          "decoded_features": 8541,
-          "tile_count": 1705,
-          "tile_feature_count": 8541,
+          "decoded_features": 34896,
+          "tile_count": 1944,
+          "tile_feature_count": 34896,
           "zoom": 11
         },
         {
-          "decoded_features": 22758,
-          "tile_count": 6036,
-          "tile_feature_count": 22758,
+          "decoded_features": 53782,
+          "tile_count": 7441,
+          "tile_feature_count": 53782,
           "zoom": 12
         },
         {
-          "decoded_features": 69191,
-          "tile_count": 24488,
-          "tile_feature_count": 69191,
+          "decoded_features": 102222,
+          "tile_count": 28922,
+          "tile_feature_count": 102222,
           "zoom": 13
         },
         {
@@ -195,29 +206,29 @@
           "vertex_count": 472
         },
         {
-          "feature_count": 256,
+          "feature_count": 383,
           "level": 4,
-          "vertex_count": 719
+          "vertex_count": 985
         },
         {
-          "feature_count": 256,
+          "feature_count": 664,
           "level": 5,
-          "vertex_count": 967
+          "vertex_count": 1863
         },
         {
-          "feature_count": 256,
+          "feature_count": 899,
           "level": 6,
-          "vertex_count": 1323
+          "vertex_count": 2803
         },
         {
-          "feature_count": 367,
+          "feature_count": 969,
           "level": 7,
-          "vertex_count": 2213
+          "vertex_count": 3609
         },
         {
-          "feature_count": 606,
+          "feature_count": 979,
           "level": 8,
-          "vertex_count": 3623
+          "vertex_count": 4435
         },
         {
           "feature_count": 1000,
@@ -225,13 +236,13 @@
           "vertex_count": 5433
         }
       ],
-      "total_rows": 3053,
-      "total_vertices": 14988
+      "total_rows": 5206,
+      "total_vertices": 19838
     },
     "export": {
-      "archive_bytes": 123212,
-      "decoded_features_total": 3787,
-      "total_tile_features": 3787,
+      "archive_bytes": 159642,
+      "decoded_features_total": 6397,
+      "total_tile_features": 6397,
       "total_tiles": 78,
       "zooms": [
         {
@@ -259,33 +270,33 @@
           "zoom": 8
         },
         {
-          "decoded_features": 280,
+          "decoded_features": 407,
           "tile_count": 2,
-          "tile_feature_count": 280,
+          "tile_feature_count": 407,
           "zoom": 9
         },
         {
-          "decoded_features": 265,
+          "decoded_features": 677,
           "tile_count": 2,
-          "tile_feature_count": 265,
+          "tile_feature_count": 677,
           "zoom": 10
         },
         {
-          "decoded_features": 338,
+          "decoded_features": 1228,
           "tile_count": 5,
-          "tile_feature_count": 338,
+          "tile_feature_count": 1228,
           "zoom": 11
         },
         {
-          "decoded_features": 462,
+          "decoded_features": 1199,
           "tile_count": 7,
-          "tile_feature_count": 462,
+          "tile_feature_count": 1199,
           "zoom": 12
         },
         {
-          "decoded_features": 763,
+          "decoded_features": 1207,
           "tile_count": 15,
-          "tile_feature_count": 763,
+          "tile_feature_count": 1207,
           "zoom": 13
         },
         {
@@ -304,71 +315,104 @@
         {
           "feature_count": 1,
           "level": 0,
-          "vertex_count": 4
+          "vertex_count": 5
         },
         {
-          "feature_count": 21,
+          "feature_count": 3,
           "level": 1,
-          "vertex_count": 96
+          "vertex_count": 15
         },
         {
-          "feature_count": 167,
+          "feature_count": 14,
           "level": 2,
-          "vertex_count": 776
+          "vertex_count": 70
         },
         {
-          "feature_count": 355,
+          "feature_count": 63,
           "level": 3,
-          "vertex_count": 1887
+          "vertex_count": 314
         },
         {
-          "feature_count": 596,
+          "feature_count": 212,
           "level": 4,
-          "vertex_count": 3467
+          "vertex_count": 1051
+        },
+        {
+          "feature_count": 541,
+          "level": 5,
+          "vertex_count": 2645
+        },
+        {
+          "feature_count": 793,
+          "level": 6,
+          "vertex_count": 4016
+        },
+        {
+          "feature_count": 968,
+          "level": 7,
+          "vertex_count": 5312
         },
         {
           "feature_count": 1000,
-          "level": 5,
+          "level": 8,
           "vertex_count": 6945
         }
       ],
-      "total_rows": 2140,
-      "total_vertices": 13175
+      "total_rows": 3595,
+      "total_vertices": 20373
     },
     "export": {
-      "archive_bytes": 111072,
-      "decoded_features_total": 2338,
-      "total_tile_features": 2338,
-      "total_tiles": 82,
+      "archive_bytes": 153172,
+      "decoded_features_total": 3911,
+      "total_tile_features": 3911,
+      "total_tiles": 87,
       "zooms": [
         {
-          "decoded_features": 2,
+          "decoded_features": 1,
+          "tile_count": 1,
+          "tile_feature_count": 1,
+          "zoom": 6
+        },
+        {
+          "decoded_features": 3,
+          "tile_count": 1,
+          "tile_feature_count": 3,
+          "zoom": 7
+        },
+        {
+          "decoded_features": 14,
+          "tile_count": 1,
+          "tile_feature_count": 14,
+          "zoom": 8
+        },
+        {
+          "decoded_features": 89,
           "tile_count": 2,
-          "tile_feature_count": 2,
+          "tile_feature_count": 89,
           "zoom": 9
         },
         {
-          "decoded_features": 31,
+          "decoded_features": 247,
           "tile_count": 2,
-          "tile_feature_count": 31,
+          "tile_feature_count": 247,
           "zoom": 10
         },
         {
-          "decoded_features": 171,
+          "decoded_features": 552,
           "tile_count": 2,
-          "tile_feature_count": 171,
+          "tile_feature_count": 552,
           "zoom": 11
         },
         {
-          "decoded_features": 366,
-          "tile_count": 4,
-          "tile_feature_count": 366,
+          "decoded_features": 842,
+          "tile_count": 6,
+          "tile_feature_count": 842,
           "zoom": 12
         },
         {
-          "decoded_features": 640,
+          "decoded_features": 1035,
           "tile_count": 20,
-          "tile_feature_count": 640,
+          "tile_feature_count": 1035,
           "zoom": 13
         },
         {

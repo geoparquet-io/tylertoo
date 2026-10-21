@@ -17,6 +17,94 @@ for a specific problem. The
 
 ---
 
+## Complete tiles or small tiles
+
+By default, tylertoo preserves polygon coverage at every zoom, as tippecanoe
+does. Admin areas, parcels, land cover, and fields draw without holes at
+coarse and middle zooms. Three defaults work together:
+
+- The [density budget](#density-budget-drop-rate-drop-gamma-no-density-drop)
+  thins points only, and polygons are not
+  [thinned](#feature-thinning-pointlinepolygon-thinning) per cell. Lines and
+  polygons keep every feature that passes the visibility gates.
+- A polygon too small to draw at a level becomes a small
+  [placeholder square](#-collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition),
+  and the polygons that thinning removes are represented by squares too, so
+  dense areas stay filled.
+- When a tile goes over the [size cap](#tile-size-cap), its densest lines and
+  polygons are merged into a neighbor instead of being dropped, and the tile
+  is measured again until it fits.
+
+These defaults cost time. A build took about 1.3× as long as with the
+defaults before #745 on 632k FTW field polygons (z0–z12), and 1.3× on 4.6M,
+scaling linearly; peak memory, set by the convert step, rose 6% and 23%.
+Use these settings to balance coverage, build time, and file size:
+
+| Goal | Settings | Cost and effect |
+|---|---|---|
+| Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
+| No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
+| Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
+| Preserve each retained feature's attributes | `--size-valve drop` | An oversized tile drops features instead of merging them, so it shows holes, but no feature takes on the geometry of another. |
+
+### Coverage and simplification
+
+Each polygon is simplified on its own, so neighbors that share a border can
+end up with slightly different edges: thin gaps (slivers) open along shared
+borders. At the default tolerance they are mostly narrower than a pixel at
+the zoom they are drawn at, and visible only as faint lines in a solid fill
+of dense polygons. Tippecanoe does the same by default, at a finer
+tolerance (1 tile unit, about a quarter of tylertoo's), so its slivers are
+smaller.
+
+Use `--simplify-factor` to balance coverage and resource use. The following
+measurements use about 400,000 NZ parcels around Auckland (z0–z14). Area
+drawn is the share of source area covered on the three densest z12 tiles:
+
+| `--simplify-factor` | Area drawn | Build time | Peak memory | Archive |
+|---|---|---|---|---|
+| 2 | 87.4% | 10.8 s | 2.6 GiB | 132 MB |
+| 1 (default) | 97.6% | 13.8 s | 3.2 GiB | 145 MB |
+| 0.5 | 98.9% | 17.3 s | 4.0 GiB | 150 MB |
+| 0.25 | 99.5% | 22.4 s | 4.5 GiB | 155 MB |
+| 0.1 | 99.6% | 21.9 s | 4.5 GiB | 157 MB |
+| 0 (no simplification) | 99.99% | 17.1 s | 3.2 GiB | 155 MB |
+
+Tippecanoe drew 99.5–99.6% of the same tiles. Coverage flattens below
+about 0.25, at 99.6–99.7%. Smaller nonzero factors increase time and memory
+use with little improvement in coverage. With
+`--simplify-factor 0` only the tile grid reduces vertices, and it snaps a
+shared border identically on both sides, so no slivers form. Export then
+costs about the same as at the default, but every level of the overview
+file stores full-resolution geometry: on all 4.3M NZ parcels the overview
+file grew from 2.9 GB to 7.9 GB, and the convert step used 19 GiB under the
+default memory profile, or 4.9 GiB with `--profile bounded` (which took
+38 s instead of 15 s). On dense small fields it costs far more: FTW Moldova
+(632k fields) took 94 s against 9 s at the default, with 2.7× the memory.
+
+These numbers are for z12, where parcels are still drawn as shapes. At
+coarser zooms most polygons are smaller than a pixel and are drawn as
+placeholder squares, whose size is independent of the factor. A smaller factor
+still helps where polygons stay drawable (Moldova at z5: 22% of the field
+area missing at the default, 13% at 0.25, 12% at 0), but in dense blocks the
+squares themselves overlap and leave gaps regardless of the factor (#750).
+
+### What merging does to attributes
+
+Merging follows tippecanoe's `--coalesce-densest-as-needed`. The merged
+feature keeps the attributes and id of the feature it was merged into. The
+absorbed features' geometry is drawn as part of it, and their attributes are
+discarded. In a choropleth, an absorbed polygon therefore takes its
+neighbor's color, and the merged areas can end at tile edges, where the
+next tile merged differently. Use `--size-valve drop` when every drawn
+polygon must retain its own attributes.
+
+Merging works in the input's row order: each feature is merged into the
+previous retained feature. First, sort the input spatially with
+`gpio sort hilbert` so consecutive features are near each other. On shuffled
+input, merged features can contain unrelated geometry, and color changes at
+tile edges become far more frequent.
+
 ## The GSD ladder: `--gsd-base` and `--gsd`
 
 A zoom-range plan (`--min-zoom` and `--max-zoom`, the default) derives each
@@ -272,14 +360,20 @@ cell_size = thinning_factor * gsd(level)          (in the CRS's units)
 |------|---------|-------|-----------|
 | `--point-thinning` | `4.0` (`16.0` with `--cluster`) | × GSD (cell size) | **bigger = sparser** |
 | `--line-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
-| `--polygon-thinning` | `1.0` | × GSD (cell size) | **bigger = sparser** |
+| `--polygon-thinning` | `0` (off) | × GSD (cell size) | **bigger = sparser** |
 
 Larger factors give larger cells and fewer survivors. Lower
 `--line-thinning` if coarse roads look too sparse.
 
-Points use 4.0 because they clutter sooner than lines and polygons, which
-use 1.0. In the Portland roads sweep, 1.0 kept roads more continuous at
-coarse zooms with little loss of legibility
+Points use 4.0 because they clutter sooner than lines, which use 1.0. In
+the Portland roads sweep, 1.0 kept roads more continuous at coarse zooms
+with little loss of legibility. Polygon thinning has been off since #745. A cell
+keeps one polygon by bounding-box center. A polygon whose center falls in a
+larger neighbor's cell, such as a parcel inside a ring-shaped one, was removed from
+every coarse level and left a hole. The visibility gate and
+[placeholder squares](#-collapse-square-tippecanoe-tiny-polygon-squares-as-the-global-disposition)
+already handle polygons too small to draw. Disabling polygon thinning had no
+measurable performance cost on NZ Parcels
 ([`corpus/SWEEPS.md`](https://github.com/geoparquet-io/tylertoo/blob/main/corpus/SWEEPS.md)).
 The factor multiplies the GSD, so it stacks with `--gsd-base`. Doubling
 `--gsd-base` halves the GSD, which halves the cell size for the same factor.
@@ -521,19 +615,24 @@ The footer provenance records the bands, as
 
 ### `--collapse-square`: tippecanoe tiny-polygon squares as the global disposition
 
-`--collapse-square` replaces below-tolerance polygons with `tol × tol`
-squares, where `tol` is `simplify-factor × GSD`, converted to CRS units.
+`--collapse-square` replaces polygons too small for a level with squares
+one GSD (one pixel) on a side, converted to CRS units, regardless of
+`--simplify-factor`.
 Like tippecanoe's tiny-polygon reduction, it keeps dense fields, buildings,
 and parcels visible at coarse zooms with existing fill styles.
 `geometry_types` stays `["Polygon"]`, so no spec-Q4 geometry-type opt-in
 applies.
 
-`--collapse-square` is opt-in, and the default disposition is still to drop. The
-footer provenance records it as `generalization.collapse: "square"`, and
-`--collapse` records `"point"`.
+Placeholder squares are the default since #745. `--no-collapse` restores the
+earlier default, which drops below-tolerance polygons. Under an
+[entry-zoom ladder](#attribute-driven-entry-zoom-magnitude-ladder-entry-zoom),
+the default switches to points, because the square's area dithering would
+delete the small features the ladder promotes; pass `--collapse-square` to
+use squares instead. The footer provenance records squares as
+`generalization.collapse: "square"`, and `--collapse` records `"point"`.
 
-Two mechanisms share the threshold `T = side²`, where `side` is `tol` floored
-at one tile unit of the level's zoom (see the divergences below).
+Two mechanisms share the threshold `T = side²`, where `side` is one GSD,
+floored at one tile unit of the level's zoom (see the divergences below).
 
 #### Area accumulation and dithering
 
@@ -580,14 +679,13 @@ See also `context/ARCHITECTURE.md`.
   thinning already dropped a non-member here, so there is no geometry to keep.
 - **Placement.** Tippecanoe places the placeholder at the ring's first vertex
   with side `tiny_polygon_size` (default 2 px). tylertoo places it at the
-  polygon's representative point with side `simplify-factor × GSD`.
+  polygon's representative point with side one GSD.
 - **A floor of one tile unit.** Tippecanoe's placeholder side is a fixed count
-  of tile units. tylertoo's is `simplify-factor × GSD`, **floored at one tile
-  unit** at the level's zoom. One unit is `40,075,016.69 m / 2^zoom / 4096`,
-  which for a `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`. At the
-  default `--gsd-base 1024` that is a quarter of the GSD, so the floor applies
-  when `--simplify-factor` is below 0.25. At `--gsd-base 8192`, even the
-  default 1.0 floors to 2 × GSD.
+  of tile units. tylertoo's is one GSD, **floored at one tile unit** at the
+  level's zoom. One unit is `40,075,016.69 m / 2^zoom / 4096`, which for a
+  `--min-zoom`/`--max-zoom` plan is `GSD × gsd-base / 4096`. At the default
+  `--gsd-base 1024` that is a quarter of the GSD, so the floor does not affect the side length.
+  At `--gsd-base 8192` the floor increases the side to 2 × GSD.
   The tile encoder keeps a square of side `s < 1` unit only with probability
   `s²`. The floor lets the encoder draw every placeholder, reducing their
   count. The log names affected zooms. On those levels a patch's
@@ -597,16 +695,19 @@ See also `context/ARCHITECTURE.md`.
   at. A larger Python `export(extent=…)` draws floored squares over more than
   one unit, and a smaller one draws them under a unit, where they thin as
   described above.
-- **No placeholder at `--simplify-factor 0`.** tylertoo skips the
-  accumulator and logs it, as tippecanoe skips its reduction at
-  `tiny_polygon_size` 0.
+- **Independent of `--simplify-factor`.** As in tippecanoe, the
+  placeholder's size is independent of the simplification setting. Before #745
+  it was `simplify-factor × GSD`: at 0.25 a smaller square represented
+  a quarter of the area, and at 0 there was no square at all, so lowering the
+  factor to close slivers reduced coverage in dense areas at middle zooms.
 - **Duplicating mode only.** A carrier is a second appearance of a feature,
   which partitioning's feature-once contract cannot represent. In
   partitioning mode the levels are verbatim, so tylertoo accepts
   `--collapse-square` and logs it as inert.
 
-Dense squares at mid zooms can exceed `--max-tile-size`, which removes
-squares per tile. Raise the cap to retain more.
+Dense squares at mid zooms can push a tile over its size cap; the
+[merge valve](#tile-size-cap)
+then merges them into their neighbors.
 [`tylertoo stats`](#export-and-archive-commands-export-pmtiles-merge-stats)
 reports sizes by zoom.
 
@@ -738,6 +839,14 @@ limits counts.
 | `--drop-rate F` | `1.65` | ratio (>1) | **bigger = sparser mid zooms** |
 | `--drop-gamma F` | `1.5` | exponent (≥1) | **bigger = more sparse-area protection** |
 | `--no-density-drop` | off | flag | disables the budget |
+| `--drop-lines` | off | flag | applies the budget to lines too |
+| `--drop-polygons` | off | flag | applies the budget to polygons too |
+
+The budget thins points only by default, as tippecanoe's `-r` does: removing
+a point leaves no hole, while removing a polygon from a coverage does. `N`
+then counts only the features the budget thins. `--drop-lines` and
+`--drop-polygons` apply the budget to lines and polygons, as tippecanoe's flags of
+the same names do; together they restore the budget before #745.
 
 ### Drop rate
 
@@ -1200,10 +1309,23 @@ precision. Other positive values are accepted with a warning.
 
 `export-pmtiles --tile-size-limit`, also spelled
 `--max-tile-size` as on `tiles`, caps each tile's encoded MVT size. The
-default of 500K matches tippecanoe, and `0` disables the cap. A tile over the
-cap sheds features for that tile only, in one non-iterative pass. It keeps
-the largest first for polygons and lines, and keeps a uniform spatial stride
-for point tiles.
+default of 500K matches tippecanoe, and `0` disables the cap.
+`--max-compressed-tile-size` caps the gzip-compressed size instead, like
+tippecanoe's `-M`; it is off by default, and when both caps are set a tile
+must fit both.
+
+A tile over a cap is reduced for that tile only, and measured again until it
+fits. `--size-valve` chooses how:
+
+- `merge` (the default) merges the densest lines and polygons into the
+  feature kept just before them, raising the merge threshold until the tile
+  fits. See [what merging does to attributes](#what-merging-does-to-attributes).
+  If the tile still exceeds the cap after all possible merges, unmerged
+  features are dropped, keeping the largest. Merged features are retained. A
+  tile that is still over after that is written as it is, with a warning.
+- `drop` drops features, keeping the largest for polygons and lines.
+
+For point tiles, the size valve retains points at uniform spatial intervals.
 
 ### Polygon clipping
 

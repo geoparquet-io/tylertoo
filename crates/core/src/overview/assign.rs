@@ -787,7 +787,13 @@ impl Default for AssignConfig {
         Self {
             point_thinning: 4.0,
             line_thinning: 1.0,
-            polygon_thinning: 1.0,
+            // #745: off. A thinning cell keeps one polygon per pixel-sized
+            // cell by bbox centre, so a polygon whose centre lands in a
+            // larger neighbour's cell (a parcel inside a ring-shaped one)
+            // lost every coarse level and left a hole. The visibility gate
+            // and placeholder squares already handle polygons too small to
+            // draw; on NZ Parcels this cost nothing (106 s against 110 s).
+            polygon_thinning: 0.0,
             line_visibility: 2.0,
             polygon_visibility: 2.0,
             sort_direction: SortDirection::Desc,
@@ -1951,6 +1957,80 @@ pub struct DensityBudgetConfig {
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the
     /// `1/gamma` power of their population).
     pub gamma: f64,
+    /// Which geometry kinds the budget thins (#745). A kind left out keeps
+    /// its cell-winner level and does not count toward `N`. Default: points
+    /// only, as tippecanoe's `-r` (lines and polygons opt in, its
+    /// `--drop-lines` / `--drop-polygons`).
+    pub kinds: BudgetKinds,
+}
+
+/// The geometry kinds a [`DensityBudgetConfig`] thins (#745).
+///
+/// tippecanoe's drop rate (`-r`) thins only points unless `--drop-lines` or
+/// `--drop-polygons` is given: removing a point leaves no hole, removing a
+/// polygon from a coverage does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetKinds {
+    pub points: bool,
+    pub lines: bool,
+    pub polygons: bool,
+}
+
+impl BudgetKinds {
+    /// Every kind: the budget before #745.
+    pub const ALL: Self = Self {
+        points: true,
+        lines: true,
+        polygons: true,
+    };
+    /// Points only: tippecanoe's default.
+    pub const POINTS: Self = Self {
+        points: true,
+        lines: false,
+        polygons: false,
+    };
+
+    /// Whether the budget thins features of `kind`.
+    pub fn includes(self, kind: FeatureKind) -> bool {
+        match kind {
+            FeatureKind::Point => self.points,
+            FeatureKind::Line => self.lines,
+            FeatureKind::Polygon => self.polygons,
+        }
+    }
+}
+
+impl Default for BudgetKinds {
+    fn default() -> Self {
+        Self::POINTS
+    }
+}
+
+impl std::str::FromStr for BudgetKinds {
+    type Err = String;
+
+    /// A comma-separated list of `points`, `lines`, `polygons`, or `none`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut kinds = Self {
+            points: false,
+            lines: false,
+            polygons: false,
+        };
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "points" => kinds.points = true,
+                "lines" => kinds.lines = true,
+                "polygons" => kinds.polygons = true,
+                "none" => {}
+                other => {
+                    return Err(format!(
+                        "unknown geometry kind {other:?}: expected points, lines, polygons or none"
+                    ))
+                }
+            }
+        }
+        Ok(kinds)
+    }
 }
 
 impl Default for DensityBudgetConfig {
@@ -1966,6 +2046,7 @@ impl Default for DensityBudgetConfig {
             // count.
             drop_rate: 1.65,
             gamma: 1.5,
+            kinds: BudgetKinds::default(),
         }
     }
 }
@@ -1995,7 +2076,20 @@ pub fn apply_density_budget(
         return assignment.clone();
     }
 
-    let n = features.len();
+    // #745: the features of a kind the budget leaves alone keep their
+    // cell-winner level and do not count toward N.
+    let budgeted: Option<Vec<bool>> = (budget.kinds != BudgetKinds::ALL).then(|| {
+        (0..features.len())
+            .into_par_iter()
+            .map(|i| budget.kinds.includes(features.kind(i)))
+            .collect()
+    });
+    let n = budgeted
+        .as_ref()
+        .map_or(features.len(), |b| b.iter().filter(|&&x| x).count());
+    if n == 0 {
+        return assignment.clone();
+    }
     let finest = num_levels - 1;
 
     // The coarsest level cell-winner permits each feature to appear at. An
@@ -2032,8 +2126,8 @@ pub fn apply_density_budget(
     // Greedy admission, coarse→fine. `admitted_at[pos]` becomes the feature's
     // final (budgeted) min_level. Features not admitted at a level are deferred
     // to a finer one; the finest level admits all remaining (canonical fidelity).
-    let mut admitted = vec![false; n];
-    let mut admitted_at = vec![finest as u8; n];
+    let mut admitted = vec![false; features.len()];
+    let mut admitted_at = vec![finest as u8; features.len()];
     let mut kept_count = 0usize;
 
     // The fold itself is STRICTLY SERIAL and stays that way (#534): it threads
@@ -2052,9 +2146,11 @@ pub fn apply_density_budget(
         // `collect` does preserve the source order here, but the result would be
         // identical if it did not.)
         let level_u8 = level as u8;
-        let cands: Vec<usize> = (0..n)
+        let cands: Vec<usize> = (0..features.len())
             .into_par_iter()
-            .filter(|&i| !admitted[i] && cw_min[i] <= level_u8)
+            .filter(|&i| {
+                !admitted[i] && cw_min[i] <= level_u8 && budgeted.as_ref().is_none_or(|b| b[i])
+            })
             .collect();
         if cands.is_empty() {
             continue;
@@ -2093,6 +2189,11 @@ pub fn apply_density_budget(
             admitted_at[i] = level as u8;
         }
         kept_count += chosen.len();
+    }
+    if let Some(b) = &budgeted {
+        for (i, _) in b.iter().enumerate().filter(|(_, &x)| !x) {
+            admitted_at[i] = cw_min[i];
+        }
     }
 
     Assignment {
@@ -2335,6 +2436,16 @@ mod tests {
     /// (#543). Tests build small `Vec<AssignFeature>`/array fixtures; the
     /// pipeline fills a [`FeatureTable`] directly from the scan, so this
     /// conversion exists only here.
+    /// The default config with polygon thinning at its pre-#745 1×GSD, for
+    /// the tests of the cell-winner mechanics themselves (the default is
+    /// now off for polygons).
+    fn thinning_cfg() -> AssignConfig {
+        AssignConfig {
+            polygon_thinning: 1.0,
+            ..AssignConfig::default()
+        }
+    }
+
     fn table(feats: &[AssignFeature]) -> FeatureTable {
         feats.iter().collect()
     }
@@ -2974,7 +3085,7 @@ mod tests {
         let a = poly(7, 0.0, 0.0, 50_000.0, 50_000.0);
         let b = poly(42, 100.0, 100.0, 50_100.0, 50_100.0);
         let gsds = [gsd(2), gsd(8)];
-        let cfg = AssignConfig::default();
+        let cfg = thinning_cfg();
         let out1 = assign_levels(&table(&[a, b]), &gsds, &cfg, Crs::Epsg3857);
         let out2 = assign_levels(&table(&[b, a]), &gsds, &cfg, Crs::Epsg3857);
         // Find level-0 winner index in each ordering; must match.
@@ -3240,8 +3351,13 @@ mod tests {
     fn oracle_fixture_reproduces_main() {
         let feats = oracle_fixture();
         let gsds = oracle_gsds();
-        let cfg = AssignConfig::default();
-        let budget = DensityBudgetConfig::default();
+        let cfg = thinning_cfg();
+        // The oracle was taken with the budget on every kind (#745 made
+        // points the default).
+        let budget = DensityBudgetConfig {
+            kinds: BudgetKinds::ALL,
+            ..DensityBudgetConfig::default()
+        };
 
         // Production shapes are really exercised at this size.
         assert!(feats.len() > WINNER_CHUNK_FEATURES);
@@ -3462,12 +3578,7 @@ mod tests {
             .map(|i| poly(i, 0.0, 0.0, 40_000.0, 40_000.0))
             .collect();
         let gsds = [gsd(2), gsd(10)];
-        let out = assign_levels(
-            &table(&feats),
-            &gsds,
-            &AssignConfig::default(),
-            Crs::Epsg3857,
-        );
+        let out = assign_levels(&table(&feats), &gsds, &thinning_cfg(), Crs::Epsg3857);
         let at0 = out.duplicating_at_level(0);
         assert_eq!(at0.len(), 1, "one winner at coarsest level");
     }
@@ -3614,7 +3725,7 @@ mod tests {
         let out = assign_levels(
             &table(&[big_null, small_key]),
             &gsds,
-            &AssignConfig::default(),
+            &thinning_cfg(),
             Crs::Epsg3857,
         );
         assert!(
@@ -3766,7 +3877,60 @@ mod tests {
             enabled,
             drop_rate,
             gamma,
+            // The budget mechanics, on every kind (the default is points only).
+            kinds: BudgetKinds::ALL,
         }
+    }
+
+    /// #745: a budget limited to points leaves lines and polygons at their
+    /// cell-winner level (tippecanoe's `-r` drops only points), budgets the
+    /// points as if they were the only features, and is the same budget as
+    /// an all-kinds one on a points-only dataset.
+    #[test]
+    fn budget_kinds_exempt_lines_and_polygons() {
+        let num_levels = 6u8;
+        let gsds: Vec<f64> = (0..num_levels).map(|z| gsd(z as u32)).collect();
+        let points: Vec<AssignFeature> = (0..4096)
+            .map(|i| point(i, (i % 64) as f64 * 5000.0, (i / 64) as f64 * 5000.0))
+            .collect();
+        let mut mixed = points.clone();
+        for i in 0..4096 {
+            let (x, y) = ((i % 64) as f64 * 5000.0, (i / 64) as f64 * 5000.0);
+            mixed.push(poly(4096 + i, x, y, x + 4000.0, y + 4000.0));
+        }
+        let points_only = DensityBudgetConfig {
+            kinds: BudgetKinds::POINTS,
+            ..budget_cfg(true, 2.0, 1.0)
+        };
+        let run = |feats: &[AssignFeature], cfg: &DensityBudgetConfig| {
+            apply_density_budget(
+                &all_at_level_zero(feats.len(), num_levels),
+                &table(feats),
+                &gsds,
+                &AssignConfig::default(),
+                cfg,
+                Crs::Epsg3857,
+            )
+        };
+        let out = run(&mixed, &points_only);
+        // Every polygon keeps its cell-winner level (0 here).
+        assert!(out.assignments[4096..].iter().all(|a| a.min_level == 0));
+        // The points get exactly the budget they would get alone.
+        let alone = run(&points, &budget_cfg(true, 2.0, 1.0));
+        let mixed_points: Vec<u8> = out.assignments[..4096]
+            .iter()
+            .map(|a| a.min_level)
+            .collect();
+        let alone_points: Vec<u8> = alone.assignments.iter().map(|a| a.min_level).collect();
+        assert_eq!(mixed_points, alone_points);
+        assert!(
+            mixed_points.iter().any(|&l| l > 0),
+            "the points budget must bind"
+        );
+        // With no budgeted feature at all, the budget is the identity.
+        let polys = &mixed[4096..];
+        let none = run(polys, &points_only);
+        assert!(none.assignments.iter().all(|a| a.min_level == 0));
     }
 
     #[test]
@@ -4363,7 +4527,7 @@ mod tests {
         let out = assign_levels(
             &table(&[antimeridian, local]),
             &gsds,
-            &AssignConfig::default(),
+            &thinning_cfg(),
             Crs::Epsg4326,
         );
         assert_eq!(

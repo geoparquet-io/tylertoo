@@ -31,6 +31,7 @@ use super::convert::{
 };
 use super::export::{
     export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
+    SizeValve,
 };
 use super::writer::WriterError;
 use crate::input_set::ConvertSource;
@@ -193,6 +194,12 @@ pub struct TilesOptions {
     pub tile_buffer: u32,
     /// Per-tile MVT size limit in bytes ([`ExportOptions::tile_size_limit`]).
     pub tile_size_limit: Option<usize>,
+    /// Per-tile compressed size limit in bytes
+    /// ([`ExportOptions::compressed_tile_size_limit`], #745).
+    pub compressed_tile_size_limit: Option<usize>,
+    /// How an oversized tile is brought under its limit
+    /// ([`ExportOptions::size_valve`], #745).
+    pub size_valve: SizeValve,
     /// See [`ExportOptions::simple_clip_fastpath`].
     pub simple_clip_fastpath: bool,
     /// See [`ExportOptions::partition_wave`].
@@ -218,6 +225,8 @@ impl Default for TilesOptions {
             tile_range: None,
             tile_buffer: export.tile_buffer,
             tile_size_limit: export.tile_size_limit,
+            compressed_tile_size_limit: export.compressed_tile_size_limit,
+            size_valve: export.size_valve,
             simple_clip_fastpath: export.simple_clip_fastpath,
             partition_wave: export.partition_wave,
             feature_order: FeatureOrder::default(),
@@ -720,6 +729,8 @@ pub fn convert_to_pmtiles_observed(
         tile_buffer: options.tile_buffer,
         extent: ExportOptions::default().extent,
         tile_size_limit: options.tile_size_limit,
+        compressed_tile_size_limit: options.compressed_tile_size_limit,
+        size_valve: options.size_valve,
         simple_clip_fastpath: options.simple_clip_fastpath,
         partition_wave: options.partition_wave,
         feature_order: options.feature_order.clone(),

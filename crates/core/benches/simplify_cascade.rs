@@ -22,7 +22,9 @@ use geo::Geometry;
 use geoarrow::array::from_arrow_array;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tylertoo_core::batch_processor::extract_geometries_from_array;
-use tylertoo_core::overview::simplify::{simplify_cascade, CascadeStep, Crs, SimplifyOptions};
+use tylertoo_core::overview::simplify::{
+    simplify_cascade, CascadeStep, CollapseMode, Crs, SimplifyOptions,
+};
 
 /// Path to the Antarctica polygon fixture (316k coords).
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
@@ -93,7 +95,16 @@ fn bench_simplify_cascade(c: &mut Criterion) {
     group.sample_size(20);
 
     let steps = cascade_steps();
-    let opts = SimplifyOptions::default();
+    // The existing ids time the fold with collapsed parts dropped, as before
+    // #745, so their history stays comparable. Since #745 the default turns
+    // collapsed parts into placeholder squares, which costs more on a
+    // boundary with many small islands (about +55% on fieldmaps_boundary);
+    // the `square/` ids track that default from here on.
+    let opts = SimplifyOptions {
+        collapse: CollapseMode::Drop,
+        ..SimplifyOptions::default()
+    };
+    let square_opts = SimplifyOptions::default();
 
     let fixtures: Vec<(&str, Option<Geometry<f64>>)> = vec![
         ("antarctica_316k", load_antarctica()),
@@ -107,16 +118,21 @@ fn bench_simplify_cascade(c: &mut Criterion) {
         };
         let verts = geo::coords_iter::CoordsIter::coords_count(&geom) as u64;
         group.throughput(Throughput::Elements(verts));
-        group.bench_with_input(BenchmarkId::from_parameter(label), &geom, |b, geom| {
-            b.iter(|| {
-                black_box(simplify_cascade(
-                    black_box(geom),
-                    black_box(&steps),
-                    Crs::Epsg3857,
-                    black_box(&opts),
-                ))
+        for (id, opts) in [
+            (BenchmarkId::from_parameter(label), &opts),
+            (BenchmarkId::new("square", label), &square_opts),
+        ] {
+            group.bench_with_input(id, &geom, |b, geom| {
+                b.iter(|| {
+                    black_box(simplify_cascade(
+                        black_box(geom),
+                        black_box(&steps),
+                        Crs::Epsg3857,
+                        black_box(opts),
+                    ))
+                });
             });
-        });
+        }
     }
 
     group.finish();

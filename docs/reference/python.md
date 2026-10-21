@@ -37,6 +37,7 @@ overview(
     simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
+    no_collapse: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -47,6 +48,8 @@ overview(
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool | None = None,
+    drop_lines: bool = False,
+    drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, Literal['sum', 'max', 'min', 'mean']] | None = None,
     coalesce_lines: bool | None = None,
@@ -100,18 +103,21 @@ Build a GeoParquet overview file: one generalized level per zoom.
 
 * `verbatim`: Turn off thinning, visibility gates, simplification, the density budget, and line coalescing, for pre-aggregated or pre-levelled input. Sets the defaults of the options below to off; an option you pass still applies.
 * `simplify_factor`: Simplification tolerance, in GSDs, or `None` for 1 (0 with `verbatim`).
-* `collapse`: Represent small polygons as points.
-* `collapse_square`: Represent small polygons as small squares.
+* `collapse`: Represent small polygons as points instead of the default placeholder squares.
+* `collapse_square`: Represent small polygons as placeholder squares. Squares are the default except with an entry-zoom ladder, which uses points unless you set this option.
+* `no_collapse`: Drop small polygons instead of using placeholders. This was the default before #745. Output is smaller, but polygon coverages have holes at coarse zooms.
 * `representation`: Geometry kind per zoom band, such as `"0-7:point,8-14:geom"`.
 * `cascade`: Speed up simplification by deriving each level from the next finer one.
 * `point_thinning`: Point grid cell size in GSDs, or `None` for 4 (16 with `cluster`, 0 with `verbatim`).
 * `line_thinning`: Line grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
-* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 1 (0 with `verbatim`).
+* `polygon_thinning`: Polygon grid cell size in GSDs, or `None` for 0 (off).
 * `line_visibility`: Smallest line bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `polygon_visibility`: Smallest polygon bounding-box diagonal kept, in GSDs, or `None` for 2 (0 with `verbatim`).
 * `drop_rate`: Ratio between feature budgets of adjacent levels.
 * `drop_gamma`: How strongly the budget spares sparse areas.
-* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`).
+* `density_drop`: Apply the per-level feature budget, or `None` for on (off with `verbatim`). It thins points only unless `drop_lines` or `drop_polygons` is set.
+* `drop_lines`: Apply the feature budget to lines too.
+* `drop_polygons`: Apply the feature budget to polygons too, which leaves holes in a polygon coverage.
 
 #### Clustering
 
@@ -188,6 +194,8 @@ export_pmtiles(
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
+    size_valve: Literal['merge', 'drop'] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ExportReport
 ```
 
@@ -213,6 +221,8 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `name`: Human-readable tileset name, stored in the metadata.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
+* `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
+* `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`, or `0` for no limit.
 
 ### Returns
 
@@ -386,6 +396,8 @@ convert(
     include_properties: Sequence[str] | None = None,
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
+    size_valve: Literal['merge', 'drop'] = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> ConvertReport
 ```
 
@@ -407,6 +419,8 @@ Use `overview()` followed by `export_pmtiles()` for all options, including the `
 * `include_properties`: See `overview()`.
 * `exclude_properties`: See `overview()`.
 * `exclude_all_properties`: See `overview()`.
+* `size_valve`: See `export_pmtiles()`.
+* `max_compressed_tile_size`: See `export_pmtiles()`.
 
 ### Returns
 
@@ -530,13 +544,17 @@ class ExportReport(TypedDict):
     total_tiles: int
     total_tile_features: int
     oversized_tiles: int
+    merged_features: int
+    valve_dropped_features: int
     encode_dropped_features: int
     encode_quantized_features: int
     skipped_property_columns: list[SkippedPropertyColumn]
     duration_secs: float
 ```
 
-* `oversized_tiles`: Tiles that dropped features to fit `tile_size_limit`.
+* `oversized_tiles`: Tiles that exceeded a size limit and triggered size reduction.
+* `merged_features`: Tile features merged into a neighbor to fit a size limit (`size_valve="merge"`).
+* `valve_dropped_features`: Tile features dropped to fit a size limit.
 * `encode_dropped_features`: Features removed by clipping. A nonzero count logs a warning for lost content.
 * `encode_quantized_features`: Features that collapsed at the tile extent, usually harmless edge slivers.
 * `skipped_property_columns`: Columns MVT cannot encode, such as binary. Struct, list, and map columns become JSON strings.
@@ -555,6 +573,9 @@ class ZoomReport(TypedDict):
     oversized_tiles: int
     encode_dropped_features: int
     encode_quantized_features: int
+    merged_features: int
+    valve_dropped_features: int
+    max_valve_passes: int
 ```
 
 ### `SkippedPropertyColumn`

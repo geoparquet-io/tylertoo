@@ -537,9 +537,12 @@ fn multi_part_output_is_byte_identical_across_read_worker_counts() {
 /// winner grid at coarse levels, and `road-detections` is a line layer, which
 /// runs the line thinning grid and the coalesce tables.
 ///
-/// Each runs twice: at the default density budget ([`DEFAULT_ARM`]), and at
+/// Each runs twice: at the default drop rate ([`DEFAULT_ARM`]), and at
 /// `--drop-rate 6` ([`BOUND_ARM`]), which makes the budget bind harder and at
-/// more levels (#565). [`density_budget_binds_in_both_plan_arms`] checks that
+/// more levels (#565). Since #745 the defaults thin and budget points only,
+/// so both arms opt lines and polygons back in (`--drop-lines
+/// --drop-polygons --polygon-thinning 1`) to keep running the polygon winner
+/// grid and the budget on these fixtures. [`density_budget_binds_in_both_plan_arms`] checks that
 /// the budget really binds in both arms.
 ///
 /// Each (fixture, arm) pair is its own test, so nextest runs the four side by
@@ -681,8 +684,21 @@ fn run_plan_only(
 
 const MADAGASCAR: (&str, u8) = ("fieldmaps-madagascar-adm4.parquet", 8);
 const ROADS: (&str, u8) = ("road-detections.parquet", 12);
-const DEFAULT_ARM: (&str, &[&str]) = ("default", &[]);
-const BOUND_ARM: (&str, &[&str]) = ("bound", &["--drop-rate", "6"]);
+const DEFAULT_ARM: (&str, &[&str]) = (
+    "default",
+    &["--drop-lines", "--drop-polygons", "--polygon-thinning", "1"],
+);
+const BOUND_ARM: (&str, &[&str]) = (
+    "bound",
+    &[
+        "--drop-lines",
+        "--drop-polygons",
+        "--polygon-thinning",
+        "1",
+        "--drop-rate",
+        "6",
+    ],
+);
 
 #[test]
 fn convert_plan_is_byte_identical_across_thread_counts_madagascar_default() {
@@ -747,7 +763,7 @@ fn density_budget_binds_in_both_plan_arms() {
             &unbudgeted,
             1,
             max_zoom,
-            &["--no-density-drop"],
+            &["--no-density-drop", "--polygon-thinning", "1"],
         ));
 
         for ((arm, _), counts) in [DEFAULT_ARM, BOUND_ARM].iter().zip(&arm_counts) {

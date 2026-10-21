@@ -24,6 +24,8 @@ def convert(
     include_properties: list[str] | None = None,
     exclude_properties: list[str] | None = None,
     exclude_all_properties: bool = False,
+    size_valve: str = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
@@ -47,6 +49,7 @@ def overview(
     simplify_factor: float | None = None,
     collapse: bool = False,
     collapse_square: bool = False,
+    no_collapse: bool = False,
     representation: str | None = None,
     cascade: bool = True,
     point_thinning: float | None = None,
@@ -57,6 +60,8 @@ def overview(
     drop_rate: float = 1.65,
     drop_gamma: float = 1.5,
     density_drop: bool | None = None,
+    drop_lines: bool = False,
+    drop_polygons: bool = False,
     cluster: bool = False,
     accumulate_attributes: dict[str, str] | None = None,
     coalesce_lines: bool | None = None,
@@ -98,6 +103,8 @@ def export_pmtiles(
     name: str | None = None,
     description: str | None = None,
     attribution: str | None = None,
+    size_valve: str = "merge",
+    max_compressed_tile_size: int = 0,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
 def decode(

@@ -295,3 +295,104 @@ batches its consumers process at once (`pipe::split_in_flight`), so depth now
 sets compute concurrency too, and the flat curve above no longer predicts
 it. The clamp is unchanged until this decision is re-swept against the
 window.
+
+## Decision 8: keep lines and polygons; merge oversized tiles (issue #745)
+
+Before #745, polygon coverages (admin areas, parcels, and fields) had
+holes at coarse and middle zooms. The density budget thinned every kind,
+so `fieldmaps-madagascar-adm4` kept 865 of 17,465 polygons at z8 (#572),
+and a tile over the size cap dropped its smallest features in one pass
+without measuring the tile again (#246). The measurements and harness are in
+`benchmarks/coalesce/` (`RESULTS.md` has the tables; `run_matrix.py`,
+`tile_metrics.py`, and `render_coverage.py` reproduce them).
+
+The comparison covered three convert settings and, initially, four ways to
+handle an oversized tile:
+
+- `C0`: the defaults before #745.
+- `C1`: the density budget thins points only (as tippecanoe's `-r`), and
+  polygons too small for a level, or removed by the gate and thinning,
+  become placeholder squares.
+- `C2`: `C1` with no polygon visibility gate and no polygon thinning, so
+  every polygon reaches every level.
+- `drop`, and three merging valves after tippecanoe's
+  `--coalesce-densest-as-needed`: a per-tile threshold (`tile`), one
+  threshold per zoom from a measuring pass (`zoom`), and a per-zoom
+  threshold predicted from the scan (`hybrid`).
+
+The benchmarks used release builds with glibc (the host had no musl
+toolchain), z0–z12 unless noted, and a 500K uncompressed tile cap. Each run
+waited for a quiet machine and had elapsed-time and RSS limits. Drawn-area
+share measures how much of the source area each tile covers, with both
+rasterized at 128 px per tile.
+
+The measurements showed the following:
+
+- On Madagascar the holes come entirely from convert: no tile is over the
+  cap at z8, so the size valve never runs there. At z8, the previous defaults miss
+  48.6% of the area; `C1` and `C2` miss 0.23%.
+- `C1` or `C2` with `drop` gives less coverage than the previous defaults at coarse zooms on dense
+  data (FTW Moldova z6: 0.41 and 0.37 of the area drawn, against 0.56):
+  more polygons reach export, and the drop valve removes more of them.
+  The convert change needs a merging valve.
+- `zoom` cost 2–5× the export time of `drop` and scored worst on tile-seam
+  color changes: one dense tile sets the threshold for the whole zoom and
+  over-merges it. `hybrid` cost more than `tile` without improving coverage.
+  Both were removed.
+- `C2` improves coverage only slightly over `C1`. Moldova z6: 0.82 against 0.79 of the area
+  drawn. NZ Parcels, palmerj's three Auckland z12 tiles: 97.3–97.9%
+  against 97.1–97.7%. But `C2` nearly doubles export time again (NZ:
+  181 s against 96 s).
+- Cost of `C1` + merge compared with the previous defaults, end to end (convert + export):
+  1.33× on Moldova (632k fields), 1.06–1.49× across Mato Grosso subsets
+  from 0.25M to 4.58M rows (1.31× at 4.58M), linear in input size. Peak
+  RSS, set by convert, rose 6% on Moldova and 23% at 4.58M rows. Those
+  runs rounded the merge threshold up to a power of two. The shipped
+  threshold uses the quantile gap plus one. This adds up to 14% on the
+  densest inputs (about 1.66× at 2M and 1.49× at 4.58M), with no measurable
+  time increase on Moldova or NZ. It merges 5–11% fewer features (`RESULTS.md` § Merge
+  threshold).
+- Row order: on shuffled input the merge targets are arbitrary and tile-
+  edge color changes appear even at z10 (seam excess 0.24 against 0.00
+  for Hilbert order), so convert warns on unsorted input and the docs
+  recommend `gpio sort hilbert`.
+- Compared with tippecanoe 2.79.0 (`--coalesce-densest-as-needed
+  -M 2000000`, scored the same way), on the three Auckland z12 tiles:
+  tippecanoe 99.5–99.6%, `C1` 97.1–97.7% (97.3–97.9% with polygon
+  thinning off, as shipped). The gap is slivers between
+  neighboring parcels, each simplified on its own (#450). A
+  `--simplify-factor` sweep on an Auckland subset measured coverage with the
+  shipped defaults: 87.4% at 2, 97.6% at 1, 98.9% at 0.5, 99.5% at 0.25,
+  flattening at about 99.65% by 0.1, and 99.99% at 0 (no simplification:
+  the tile grid snaps shared borders identically). Time and memory rise as the factor falls toward
+  0.1; at 0 export costs about what it does at 1, but every overview level
+  stores full-resolution geometry (NZ: overview 7.9 GB against 2.9 GB;
+  convert 19 GiB under the default memory profile, 4.9 GiB with
+  `--profile bounded`). tippecanoe took 31.7 min on NZ Parcels; tylertoo
+  about 2 min.
+- `--polygon-visibility 0` with placeholder squares has a pre-existing bug
+  (#749): under the cascade, squares survive every coarse level, so small
+  features appear as very large squares at low zooms. The `C2` recipe was dropped
+  from the docs for that reason and because `--simplify-factor` closes more
+  of the gap at a lower cost.
+
+- Polygon thinning: a thinning cell keeps one polygon by bbox center, so on
+  NZ Parcels, a parcel inside a ring-shaped neighbor was removed from every
+  coarse level and drew as a hole at all simplification settings (worst
+  sampled z12 tile 94.0%). `--polygon-thinning 0` raised that tile to
+  97.05% at no cost (NZ 106 s against 110 s, Moldova +2%, same memory,
+  archive +0.6%), and tippecanoe does not thin polygons either.
+
+**Decision:** ship `C1` with polygon thinning off, and the per-tile `merge`
+valve, as the defaults.
+The density budget thins points only (`--drop-lines` and `--drop-polygons`
+apply the budget to lines and polygons); `CollapseMode::Auto` makes placeholder squares (points under
+an entry-zoom ladder); `--size-valve merge` merges oversized tiles, with
+`--size-valve drop` to preserve each retained feature's attributes. The default simplification
+tolerance (Decision 1) is unchanged: slivers at the default are mostly
+narrower than a pixel. The tolerance applies to every geometry class, so
+reducing it increases memory use and file size across the dataset. The curve is documented
+instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
+`0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
+file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
+Issue #450 tracks simplifying shared borders identically.
