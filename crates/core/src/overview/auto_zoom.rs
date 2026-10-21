@@ -64,7 +64,7 @@ use geoarrow_array::GeoArrowArrayAccessor;
 use crate::batch_processor::{visit_geoarrow_array, GeoArrowVisitor};
 use crate::covering::find_f64_covering;
 use crate::input_set::{ConvertSource, ReadPlan};
-use crate::world_coord::MAX_LATITUDE;
+use crate::tile::MAX_LATITUDE;
 
 use super::convert::{
     detect_crs_from_kv, find_geometry_column, validate_options, BboxQuery, ConvertError,

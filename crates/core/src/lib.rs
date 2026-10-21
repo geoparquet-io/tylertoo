@@ -9,7 +9,7 @@
 //!
 //! The remaining top-level modules are shared infrastructure the overview
 //! pipeline builds on: Arrow/Parquet geometry decoding ([`batch_processor`],
-//! [`wkb`], [`covering`]), tile math ([`tile`], [`world_coord`]), geometry
+//! [`wkb`], [`covering`]), tile math ([`tile`]), geometry
 //! clipping ([`clip`], [`ioverlay_clip`], [`sutherland_hodgman`]), MVT
 //! encoding ([`mvt`]), and the PMTiles v3 writer ([`pmtiles_writer`],
 //! [`compression`], [`dedup`]).
@@ -66,7 +66,6 @@ pub mod sutherland_hodgman;
 pub mod tile;
 pub mod wkb;
 pub(crate) mod wkb_column;
-pub mod world_coord;
 
 // Re-export Compression from compression module for public API
 pub use compression::Compression;

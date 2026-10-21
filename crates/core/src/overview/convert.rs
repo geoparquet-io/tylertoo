@@ -4563,17 +4563,15 @@ pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
     detect_crs_from_kv(Some(&kv), "fuzz input")
 }
 
-/// Half the Web Mercator world extent in meters (`±` = the x/y range of
-/// EPSG:3857). Matches the constant used by the export reprojection.
-const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
+use crate::tile::WEBMERC_HALF_M;
 
 /// Reproject one EPSG:4326 point (lon/lat degrees) to EPSG:3857 (meters) —
 /// the exact inverse of the export path's `webmerc_to_lnglat`. Latitude is
-/// clamped to [`crate::world_coord::MAX_LATITUDE`], the edge of the square
+/// clamped to [`crate::tile::MAX_LATITUDE`], the edge of the square
 /// world extent (the projection itself diverges at the poles).
 #[inline]
 fn lnglat_to_webmerc(lng: f64, lat: f64) -> (f64, f64) {
-    use crate::world_coord::MAX_LATITUDE;
+    use crate::tile::MAX_LATITUDE;
     use std::f64::consts::{FRAC_PI_4, PI};
     let x = lng / 180.0 * WEBMERC_HALF_M;
     let lat = lat.clamp(-MAX_LATITUDE, MAX_LATITUDE);
@@ -5001,7 +4999,7 @@ pub(super) fn wrapped_note(
 /// (Svalbard, an ice-shelf polygon reaching the pole) still puts geometry in
 /// tiles and is merely clipped.
 ///
-/// The threshold is the projection's own limit ([`crate::world_coord::MAX_LATITUDE`],
+/// The threshold is the projection's own limit ([`crate::tile::MAX_LATITUDE`],
 /// 85.0511°) rather than the slightly tighter ±85.05° the tiler clamps to, so
 /// the count never overstates: a feature in that 0.001° sliver is clamped to
 /// the world's top edge, not counted as lost.
@@ -5010,7 +5008,7 @@ pub(super) fn wrapped_note(
 /// anything inside the world extent projects by construction and the range
 /// check above covers the rest.
 pub(super) fn bbox_unprojectable(bbox: &[f64; 4], crs: Crs) -> bool {
-    use crate::world_coord::MAX_LATITUDE;
+    use crate::tile::MAX_LATITUDE;
     match crs {
         Crs::Epsg3857 => false,
         Crs::Epsg4326 => bbox[1] > MAX_LATITUDE || bbox[3] < -MAX_LATITUDE,

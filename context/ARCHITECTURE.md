@@ -1313,8 +1313,7 @@ crates/core/src/
 ├── ioverlay_clip.rs    # i_overlay-based robust polygon clipping
 ├── sutherland_hodgman.rs # O(n) polygon clipping for axis-aligned rectangles
 ├── covering.rs         # bbox covering metadata, row-group bounds
-├── tile.rs             # TileCoord, TileBounds
-├── world_coord.rs      # Integer world-coordinate space
+├── tile.rs             # TileCoord, TileBounds, Web Mercator limits
 ├── mvt.rs              # MVT encoding
 ├── decode.rs           # PMTiles → GeoParquet decoding (#112)
 ├── pyramid.rs          # Multi-band pyramids: merge per-band PMTiles archives

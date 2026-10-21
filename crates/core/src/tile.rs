@@ -5,7 +5,23 @@
 
 use std::f64::consts::PI;
 
-use crate::world_coord::MAX_LATITUDE;
+/// Maximum valid latitude for Web Mercator projection.
+///
+/// This is `atan(sinh(π))` in degrees, the latitude whose projected y reaches the edge of the square
+/// world extent (normalized y = 0 at the north edge, 1 at the south edge).
+///
+/// The exact value is 85.05112877980658…°, which is not representable in
+/// `f64`; this constant is the nearest representable value *below* it. The
+/// direction matters: rounding up (e.g. the `85.05112878` this constant used
+/// to carry) puts the north edge just outside the extent, so `lat ==
+/// MAX_LATITUDE` computes a slightly negative raw tile row and only lands on
+/// y = 0 by way of a saturating cast. Rounding down keeps every clamped
+/// latitude inside `[0, 2^z]`.
+pub const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
+
+/// Half the Web Mercator world extent in meters: EPSG:3857's x and y range
+/// is `±WEBMERC_HALF_M`.
+pub(crate) const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
 
 /// The maximum Web Mercator zoom tylertoo will **write**.
 ///
@@ -204,7 +220,7 @@ impl TileBounds {
 ///
 /// * `lng` - Longitude in degrees (-180 to 180)
 /// * `lat` - Latitude in degrees. Values outside the Web Mercator bounds
-///   (`±world_coord::MAX_LATITUDE`) are silently clamped, not rejected.
+///   (`±MAX_LATITUDE`) are silently clamped, not rejected.
 /// * `zoom` - Zoom level (0-30)
 ///
 /// # Returns
