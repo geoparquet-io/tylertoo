@@ -57,8 +57,11 @@ its remaining scope; the legacy pipeline's architecture notes were moved to
 3. **Reference implementations**: generalization behavior is calibrated
    against tippecanoe output on the shared corpus; divergences are documented
    below and in the spec.
-4. **PMTiles writer**: the `pmtiles` crate is read-only; we implement our own
-   v3 writer (`pmtiles_writer.rs`, streaming, deduplicating).
+4. **PMTiles writer**: our own v3 writer (`pmtiles_writer.rs`, streaming,
+   deduplicating). The `pmtiles` crate has had a writer since 0.14, but it
+   lacks checkpoint/salvage (#459, #528), per-tile feature counts, and the
+   #417 reader ceilings, and it sizes leaf directories the go-pmtiles way,
+   not tippecanoe's, which would change the bytes of large archives.
 5. **Defaults should look right**: default knob values are chosen from
    rendered sweeps on the corpus (see `corpus/SWEEPS.md`), not guessed.
 6. **Integer overflow is a bug, never a wrap** (#432): `[profile.release]`
