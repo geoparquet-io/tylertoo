@@ -123,8 +123,8 @@ fn has_holes_without_exterior(geom: &Geometry) -> bool {
 /// # Hostile input
 ///
 /// The bytes come from `--plan` files, which are user input. They pass
-/// [`check_wkb_value`] before the `wkb` reader sees them, the same walk every
-/// GeoParquet geometry column gets (see [`crate::wkb_column`]): counts the
+/// `check_wkb_value` before the `wkb` reader sees them, the same walk every
+/// GeoParquet geometry column gets (see the `wkb_column` module): counts the
 /// remaining bytes cannot back, GeometryCollections nested more than 100
 /// deep, and the MultiPoint member that panics the reader are all rejected
 /// with an error. Both paths therefore accept exactly the same WKB.
