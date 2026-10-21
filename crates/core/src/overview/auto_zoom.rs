@@ -275,14 +275,13 @@ fn check_auto_min_zoom(min_zoom: u8, ceiling: u8) -> Result<(), ConvertError> {
     Ok(())
 }
 
-/// Nearest-rank percentile (`p` in `[0, 1]`) of a non-empty `values`, sorted
-/// in place. `total_cmp` keeps a stray NaN from panicking the sort (callers
-/// only pass finite values anyway).
+/// Nearest-rank percentile (`p` in `[0, 1]`) of a non-empty `values`, which
+/// are reordered in place (a selection, not a full sort). `total_cmp` keeps a
+/// stray NaN from panicking it (callers only pass finite values anyway).
 pub(crate) fn percentile(values: &mut [f64], p: f64) -> f64 {
     debug_assert!(!values.is_empty());
-    values.sort_by(f64::total_cmp);
     let idx = (((values.len() - 1) as f64) * p).round() as usize;
-    values[idx]
+    *values.select_nth_unstable_by(idx, f64::total_cmp).1
 }
 
 /// Length in Web Mercator meters of a `(dx, dy)` delta in the file's native
