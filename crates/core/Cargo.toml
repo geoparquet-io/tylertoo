@@ -72,6 +72,9 @@ zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # PMTiles tile ids: the Hilbert index at each zoom (the crate pmtiles-rs uses).
 fast_hilbert = "2.1"
+# Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
+# already pulls in.
+rstar = "0.12"
 serde = { workspace = true }
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
 serde_json = "1.0.129"
