@@ -83,9 +83,9 @@
       "total_vertices": 5482363
     },
     "export": {
-      "archive_bytes": 123850843,
-      "decoded_features_total": 548393,
-      "total_tile_features": 548393,
+      "archive_bytes": 124062292,
+      "decoded_features_total": 553914,
+      "total_tile_features": 553914,
       "total_tiles": 153053,
       "zooms": [
         {
@@ -101,39 +101,39 @@
           "zoom": 1
         },
         {
-          "decoded_features": 1620,
+          "decoded_features": 2055,
           "tile_count": 1,
-          "tile_feature_count": 1620,
+          "tile_feature_count": 2055,
           "zoom": 2
         },
         {
-          "decoded_features": 3738,
+          "decoded_features": 4275,
           "tile_count": 2,
-          "tile_feature_count": 3738,
+          "tile_feature_count": 4275,
           "zoom": 3
         },
         {
-          "decoded_features": 6352,
+          "decoded_features": 7607,
           "tile_count": 4,
-          "tile_feature_count": 6352,
+          "tile_feature_count": 7607,
           "zoom": 4
         },
         {
-          "decoded_features": 5444,
+          "decoded_features": 6561,
           "tile_count": 4,
-          "tile_feature_count": 5444,
+          "tile_feature_count": 6561,
           "zoom": 5
         },
         {
-          "decoded_features": 7518,
+          "decoded_features": 8809,
           "tile_count": 7,
-          "tile_feature_count": 7518,
+          "tile_feature_count": 8809,
           "zoom": 6
         },
         {
-          "decoded_features": 17195,
+          "decoded_features": 18081,
           "tile_count": 16,
-          "tile_feature_count": 17195,
+          "tile_feature_count": 18081,
           "zoom": 7
         },
         {

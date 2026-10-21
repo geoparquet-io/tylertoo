@@ -206,27 +206,27 @@ tylertoo stats madagascar.pmtiles
 Exporting madagascar-ov.parquet → madagascar.pmtiles
   mode=duplicating zooms z1..z10
   z1  (level 0):       1 tiles,      1537 features
-  z2  (level 1):       1 tiles,       878 features, 1 oversized
+  z2  (level 1):       1 tiles,      2073 features, 1 oversized
 ...
   z10 (level 9):     524 tiles,     26831 features, 8 collapsed at extent
 
-✓ 752 tiles, 115582 features, 12 oversized tiles in 1.51s
+✓ 752 tiles, 120317 features, 12 oversized tiles in 1.51s
 ...
- z  tiles      total     mean     p50      p99      max
- 1      1     74,326   74,326  74,326   74,326   74,326
+ z  tiles      total     mean      p50      p99      max
+ 1      1     74,326   74,326   74,326   74,326   74,326
 ...
-10    524  4,057,907    7,744   6,100   28,397   88,323
+10    524  4,057,907    7,744    6,100   28,397   88,323
 
 Largest 10 tile(s):
 z    x    y    bytes
-6   40   35  162,557
+6   40   35  179,805
 ...
 ```
 
 Polygons crossing tile edges appear in every tile they touch, so tile
 features outnumber overview features. Clipped slivers that vanish on the
 tile's 4096-unit grid are omitted and counted as "collapsed at extent".
-The largest tile is 163 KB compressed, at z6. Twelve tiles at z2–z7 went
+The largest tile is 180 KB compressed, at z6. Twelve tiles at z2–z7 went
 over the default 500 KB limit before compression, so the size valve merged
 their densest polygons into neighbours until each fit; the export counts
 these as "oversized".
