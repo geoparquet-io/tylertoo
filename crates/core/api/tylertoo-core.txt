@@ -304,52 +304,6 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::decode::DecodeRepor
 pub fn tylertoo_core::decode::decode_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::decode::DecodeOptions) -> core::result::Result<tylertoo_core::decode::DecodeReport, tylertoo_core::decode::DecodeError>
 pub fn tylertoo_core::decode::tile_local_to_lonlat(u8, u32, u32, u32, i64, i64) -> (f64, f64)
 pub mod tylertoo_core::dedup
-pub struct tylertoo_core::dedup::DeduplicationCache
-impl tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::check(&self, u64) -> core::option::Option<(u64, u32)>
-pub fn tylertoo_core::dedup::DeduplicationCache::into_stats(self) -> tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationCache::new() -> Self
-pub fn tylertoo_core::dedup::DeduplicationCache::record_duplicate(&mut self, u32)
-pub fn tylertoo_core::dedup::DeduplicationCache::record_new(&mut self, u64, u64, u32, u32)
-pub fn tylertoo_core::dedup::DeduplicationCache::stats(&self) -> &tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationCache::unique_count(&self) -> usize
-impl core::default::Default for tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::default() -> tylertoo_core::dedup::DeduplicationCache
-impl core::fmt::Debug for tylertoo_core::dedup::DeduplicationCache
-pub fn tylertoo_core::dedup::DeduplicationCache::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Send for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Sync for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::Unpin for tylertoo_core::dedup::DeduplicationCache
-impl core::marker::UnsafeUnpin for tylertoo_core::dedup::DeduplicationCache
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::DeduplicationCache
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::DeduplicationCache
-pub struct tylertoo_core::dedup::DeduplicationStats
-pub tylertoo_core::dedup::DeduplicationStats::bytes_saved: u64
-pub tylertoo_core::dedup::DeduplicationStats::duplicates_eliminated: u64
-pub tylertoo_core::dedup::DeduplicationStats::total_tiles: u64
-pub tylertoo_core::dedup::DeduplicationStats::unique_tiles: u64
-impl tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::dedup_ratio(&self) -> f64
-pub fn tylertoo_core::dedup::DeduplicationStats::new() -> Self
-pub fn tylertoo_core::dedup::DeduplicationStats::savings_percent(&self) -> f64
-impl core::clone::Clone for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::clone(&self) -> tylertoo_core::dedup::DeduplicationStats
-impl core::cmp::Eq for tylertoo_core::dedup::DeduplicationStats
-impl core::cmp::PartialEq for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::eq(&self, &tylertoo_core::dedup::DeduplicationStats) -> bool
-impl core::default::Default for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::default() -> tylertoo_core::dedup::DeduplicationStats
-impl core::fmt::Debug for tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::dedup::DeduplicationStats::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Freeze for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Send for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Sync for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::Unpin for tylertoo_core::dedup::DeduplicationStats
-impl core::marker::UnsafeUnpin for tylertoo_core::dedup::DeduplicationStats
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::DeduplicationStats
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::DeduplicationStats
 pub struct tylertoo_core::dedup::TileHasher
 impl tylertoo_core::dedup::TileHasher
 pub fn tylertoo_core::dedup::TileHasher::hash(&[u8]) -> u64
@@ -3241,36 +3195,6 @@ impl core::marker::Unpin for tylertoo_core::pmtiles_writer::Header
 impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::Header
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::Header
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Header
-pub struct tylertoo_core::pmtiles_writer::PmtilesWriter
-impl tylertoo_core::pmtiles_writer::PmtilesWriter
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile_compressed(&mut self, u8, u32, u32, alloc::vec::Vec<u8>) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::dedup_stats(&self) -> &tylertoo_core::dedup::DeduplicationStats
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::enable_deduplication(&mut self, bool)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::internal_compression(&self) -> tylertoo_core::compression::Compression
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::is_dedup_enabled(&self) -> bool
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::new() -> Self
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_bounds(&mut self, &tylertoo_core::tile::TileBounds)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_fields(&mut self, std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_internal_compression(&mut self, tylertoo_core::compression::Compression)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_layer_name(&mut self, &str)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_metadata(&mut self, tylertoo_core::TilesetMetadata)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_tile_compression(&mut self, tylertoo_core::compression::Compression)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::set_vector_layers_json(&mut self, alloc::string::String)
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::tile_compression(&self) -> tylertoo_core::compression::Compression
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::tile_count(&self) -> usize
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::with_compression(tylertoo_core::compression::Compression) -> Self
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::write_to_file(&self, &std::path::Path) -> tylertoo_core::Result<()>
-impl core::default::Default for tylertoo_core::pmtiles_writer::PmtilesWriter
-pub fn tylertoo_core::pmtiles_writer::PmtilesWriter::default() -> Self
-impl core::marker::Freeze for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Send for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Sync for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::Unpin for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::marker::UnsafeUnpin for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::pmtiles_writer::PmtilesWriter
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::PmtilesWriter
 pub struct tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
