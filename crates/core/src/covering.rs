@@ -410,7 +410,10 @@ pub fn find_bbox_column_indices(
 
 /// Extract a statistic value from column metadata.
 ///
-/// Handles both f32 and f64 physical types, converting to f64. A **NaN**
+/// Reads FLOAT and DOUBLE statistics through parquet's typed
+/// [`Statistics`](parquet::file::statistics::Statistics), converting to f64.
+/// Any other physical type is `None`: decoding raw stat bytes by width would
+/// read an INT64 column's 10 as about 5e-323, a bogus bound. A **NaN**
 /// statistic reads as *missing* (`None`, #428): it cannot bound anything, and
 /// a caller that treated one as a bound would prune row groups it must read
 /// (every comparison against a NaN is false). arrow-rs leaves NaN out of the
@@ -427,26 +430,11 @@ fn extract_stat_value(
     col_idx: usize,
     use_min: bool,
 ) -> Option<f64> {
-    let col_meta = row_group.column(col_idx);
-    let stats = col_meta.statistics()?;
+    use parquet::file::statistics::Statistics;
 
-    let bytes = if use_min {
-        stats.min_bytes_opt()?
-    } else {
-        stats.max_bytes_opt()?
-    };
-
-    let value = match bytes.len() {
-        4 => {
-            // FLOAT (f32)
-            let arr: [u8; 4] = bytes.try_into().ok()?;
-            f32::from_le_bytes(arr) as f64
-        }
-        8 => {
-            // DOUBLE (f64)
-            let arr: [u8; 8] = bytes.try_into().ok()?;
-            f64::from_le_bytes(arr)
-        }
+    let value = match row_group.column(col_idx).statistics()? {
+        Statistics::Float(s) => f64::from(*if use_min { s.min_opt() } else { s.max_opt() }?),
+        Statistics::Double(s) => *if use_min { s.min_opt() } else { s.max_opt() }?,
         _ => return None,
     };
     (!value.is_nan()).then_some(value)
@@ -1472,6 +1460,75 @@ mod tests {
             None,
         );
         ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// A covering column with an integer physical type has 8-byte INT64 (or
+    /// 4-byte INT32) statistics. Decoded by width as f64 (or f32) bits, the
+    /// integer 10 reads as about 5e-323, a bogus bbox that prunes row groups it
+    /// must read. Statistics of any type other than FLOAT or DOUBLE mean
+    /// "read it".
+    #[test]
+    fn integer_covering_statistics_are_not_read_as_floats() {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        for physical in [PhysicalType::INT64, PhysicalType::INT32] {
+            let fields = ["xmin", "ymin", "xmax", "ymax"]
+                .iter()
+                .map(|n| Arc::new(Type::primitive_type_builder(n, physical).build().unwrap()))
+                .collect();
+            let schema = Type::group_type_builder("schema")
+                .with_fields(fields)
+                .build()
+                .unwrap();
+            let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+            let stats = |min: i64, max: i64| match physical {
+                PhysicalType::INT64 => {
+                    Statistics::int64(Some(min), Some(max), None, Some(0), false)
+                }
+                _ => Statistics::int32(Some(min as i32), Some(max as i32), None, Some(0), false),
+            };
+            // Positive values: a negative INT64 read as f64 bits is a NaN, which
+            // the NaN guard already drops.
+            let columns = [(1, 10), (1, 10), (1, 10), (1, 10)]
+                .iter()
+                .enumerate()
+                .map(|(i, &(min, max))| {
+                    ColumnChunkMetaData::builder(descr.column(i))
+                        .set_statistics(stats(min, max))
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let rg = RowGroupMetaData::builder(descr.clone())
+                .set_num_rows(10)
+                .set_column_metadata(columns)
+                .build()
+                .unwrap();
+            let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"covering":{"bbox":{"xmin":["xmin"],"ymin":["ymin"],"xmax":["xmax"],"ymax":["ymax"]}}}}}"#;
+            let file_meta = FileMetaData::new(
+                2,
+                10,
+                None,
+                Some(vec![KeyValue::new("geo".to_string(), geo.to_string())]),
+                descr,
+                None,
+            );
+            let meta = ParquetMetaData::new(file_meta, vec![rg]);
+
+            let bounds = extract_row_group_bounds_from_metadata(&meta).unwrap();
+            assert_eq!(bounds.len(), 1);
+            assert!(
+                bounds[0].is_none(),
+                "{physical:?} statistics must not become a bbox: {:?}",
+                bounds[0]
+            );
+        }
     }
 
     /// A NaN in the stats bbox makes every AABB comparison false, which would
