@@ -49,6 +49,8 @@ arrow-cast = "59"
 arrow-buffer = "59"
 geo = "0.33"
 geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
+# The WKB reader and writer geoarrow already uses for GeoParquet columns.
+wkb = "0.9.3"
 
 # Protobuf for MVT encoding
 prost = "0.14"

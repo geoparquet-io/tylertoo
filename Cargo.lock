@@ -4463,6 +4463,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
+ "wkb",
  "xxhash-rust",
  "zstd",
 ]
