@@ -47,6 +47,8 @@ arrow-select = "59"
 arrow-ipc = "59"
 arrow-cast = "59"
 arrow-buffer = "59"
+arrow-ord = "59"
+arrow-arith = "59"
 geo = "0.33"
 geozero = { version = "0.15", features = ["with-wkb", "with-geo"] }
 # The WKB reader and writer geoarrow already uses for GeoParquet columns.

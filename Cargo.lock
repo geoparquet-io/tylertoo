@@ -4428,10 +4428,12 @@ dependencies = [
 name = "tylertoo-core"
 version = "0.8.0"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-ipc",
+ "arrow-ord",
  "arrow-schema",
  "arrow-select",
  "async-trait",

@@ -52,6 +52,10 @@ arrow-array = { workspace = true }
 arrow-select = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-cast = { workspace = true }
+# --filter evaluation kernels (overview/filter.rs).
+arrow-ord = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-buffer = { workspace = true }
 geo = { workspace = true }
 wkb = { workspace = true }
 prost = { workspace = true }
@@ -113,8 +117,6 @@ libc = "0.2"
 prost-build = { workspace = true }
 
 [dev-dependencies]
-# Only for constructing i256 test values (Decimal256 coverage).
-arrow-buffer = { workspace = true }
 # CodSpeed's criterion shim (#614): identical API, so the benches still
 # `use criterion::…`. Under `cargo codspeed` it measures instruction counts;
 # under plain `cargo bench` it is ordinary criterion.
