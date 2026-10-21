@@ -151,6 +151,21 @@ pub enum RowGroupSizePolicy {
     ZoomScaled,
 }
 
+impl std::str::FromStr for RowGroupSizePolicy {
+    type Err = String;
+
+    /// Parse the CLI / Python spelling (constant|zoom-scaled), case-sensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "constant" => Ok(RowGroupSizePolicy::Constant),
+            "zoom-scaled" => Ok(RowGroupSizePolicy::ZoomScaled),
+            other => Err(format!(
+                "invalid row group size policy '{other}' (constant|zoom-scaled)"
+            )),
+        }
+    }
+}
+
 /// Configuration for an [`OverviewWriter`].
 #[derive(Debug, Clone)]
 pub struct OverviewWriterOptions {

@@ -1080,20 +1080,11 @@ impl ConvertTuningArgs {
         use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
         use tylertoo_core::overview::writer::RowGroupSizePolicy;
 
-        let profile = match self.profile.as_str() {
-            "auto" => MemoryProfile::Auto,
-            "speed" => MemoryProfile::Speed,
-            "bounded" => MemoryProfile::Bounded,
-            other => anyhow::bail!("invalid --profile '{other}' (auto|speed|bounded)"),
-        };
-
-        let row_group_size_policy = match self.row_group_size_policy.as_str() {
-            "constant" => RowGroupSizePolicy::Constant,
-            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
-            other => {
-                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
-            }
-        };
+        let profile: MemoryProfile = self.profile.parse().map_err(anyhow::Error::msg)?;
+        let row_group_size_policy: RowGroupSizePolicy = self
+            .row_group_size_policy
+            .parse()
+            .map_err(anyhow::Error::msg)?;
 
         // `--verbatim` supplies DEFAULTS, it does not override: an explicitly
         // passed knob always wins, so `--verbatim --simplify-factor 0.5`
@@ -2713,11 +2704,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    let mode = match args.mode.as_str() {
-        "duplicating" => Mode::Duplicating,
-        "partitioning" => Mode::Partitioning,
-        other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
-    };
+    let mode: Mode = args.mode.parse().map_err(anyhow::Error::msg)?;
 
     // #444: the plan is built with `auto`'s placeholder so every cheap check
     // runs first; the estimate (which reads the input) comes last.

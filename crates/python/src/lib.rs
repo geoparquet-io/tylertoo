@@ -605,39 +605,22 @@ fn overview(
     spill_dir: Option<PathBuf>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let mode = match mode {
-        "duplicating" => Mode::Duplicating,
-        "partitioning" => Mode::Partitioning,
-        other => {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "Invalid mode: '{}'. Valid options: duplicating, partitioning",
-                other
-            )))
-        }
-    };
-
-    let profile = match profile {
-        "auto" => MemoryProfile::Auto,
-        "speed" => MemoryProfile::Speed,
-        "bounded" => MemoryProfile::Bounded,
-        other => {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "Invalid profile: '{}'. Valid options: auto, speed, bounded",
-                other
-            )))
-        }
-    };
-
-    let sort_direction = match sort_direction.to_lowercase().as_str() {
-        "desc" => SortDirection::Desc,
-        "asc" => SortDirection::Asc,
-        other => {
-            return Err(PyErr::new::<PyValueError, _>(format!(
-                "Invalid sort_direction: '{}'. Valid options: desc, asc",
-                other
-            )))
-        }
-    };
+    let mode: Mode = mode.parse().map_err(|_| {
+        PyValueError::new_err(format!(
+            "Invalid mode: '{mode}'. Valid options: duplicating, partitioning"
+        ))
+    })?;
+    let profile: MemoryProfile = profile.parse().map_err(|_| {
+        PyValueError::new_err(format!(
+            "Invalid profile: '{profile}'. Valid options: auto, speed, bounded"
+        ))
+    })?;
+    // Case-insensitive here, as it always was for this keyword.
+    let sort_direction: SortDirection = sort_direction.to_lowercase().parse().map_err(|_| {
+        PyValueError::new_err(format!(
+            "Invalid sort_direction: '{sort_direction}'. Valid options: desc, asc"
+        ))
+    })?;
 
     // Explicit GSD list overrides the zoom range (like the CLI's --gsd).
     let levels = match gsds {

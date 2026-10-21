@@ -806,6 +806,9 @@ impl core::fmt::Debug for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::SortDirection
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::SortDirection
+impl core::str::traits::FromStr for tylertoo_core::overview::assign::SortDirection
+pub type tylertoo_core::overview::assign::SortDirection::Err = alloc::string::String
+pub fn tylertoo_core::overview::assign::SortDirection::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::overview::assign::SortDirection
 impl core::marker::Send for tylertoo_core::overview::assign::SortDirection
 impl core::marker::Sync for tylertoo_core::overview::assign::SortDirection
@@ -2145,6 +2148,9 @@ impl core::fmt::Debug for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::MemoryProfile
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::MemoryProfile
+impl core::str::traits::FromStr for tylertoo_core::overview::level::MemoryProfile
+pub type tylertoo_core::overview::level::MemoryProfile::Err = alloc::string::String
+pub fn tylertoo_core::overview::level::MemoryProfile::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl serde_core::ser::Serialize for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::MemoryProfile
@@ -2168,6 +2174,9 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Mode
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Mode
+impl core::str::traits::FromStr for tylertoo_core::overview::level::Mode
+pub type tylertoo_core::overview::level::Mode::Err = alloc::string::String
+pub fn tylertoo_core::overview::level::Mode::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl serde_core::ser::Serialize for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Mode
@@ -2989,6 +2998,9 @@ impl core::fmt::Debug for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::writer::RowGroupSizePolicy
+impl core::str::traits::FromStr for tylertoo_core::overview::writer::RowGroupSizePolicy
+pub type tylertoo_core::overview::writer::RowGroupSizePolicy::Err = alloc::string::String
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::Send for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::Sync for tylertoo_core::overview::writer::RowGroupSizePolicy
