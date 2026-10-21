@@ -609,10 +609,11 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_bytes)]
     max_compressed_tile_size: usize,
 
-    /// How a tile over its cap is brought under it: `merge` folds the
-    /// densest lines and polygons into a neighbour, which keeps its own
-    /// attributes; `drop` removes features, leaving holes but every kept
-    /// feature intact. Points are always dropped.
+    /// How to reduce a tile that exceeds its cap: `merge` merges the
+    /// densest lines and polygons into a neighbor, which keeps its own
+    /// attributes; `drop` removes features, leaving holes while preserving
+    /// each retained feature's attributes. Point tiles use feature dropping
+    /// in both modes.
     #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
@@ -838,7 +839,7 @@ struct ConvertTuningArgs {
 
     /// Replace polygons too small for a level, and those thinned out at
     /// coarse levels, with small placeholder squares marking their area.
-    /// The default; duplicating mode only; output remains Polygon.
+    /// This is the default in duplicating mode; output remains Polygon.
     #[arg(long, conflicts_with = "no_collapse", help_heading = "Generalization")]
     collapse_square: bool,
 
@@ -872,7 +873,7 @@ struct ConvertTuningArgs {
     line_thinning: Option<f64>,
 
     /// Polygon thinning grid cell, as a multiple of the level's GSD
-    /// (default 0, off). Larger cells keep fewer polygons, and can drop a
+    /// (default 0, off). Larger cells keep fewer polygons and can remove a
     /// polygon whose center falls in a larger neighbor's cell.
     #[arg(long, help_heading = "Thinning & visibility")]
     polygon_thinning: Option<f64>,
@@ -912,15 +913,16 @@ struct ConvertTuningArgs {
     #[arg(long, help_heading = "Density budget")]
     no_density_drop: bool,
 
-    /// Let the density budget thin lines as well as points: smaller, faster
+    /// Apply the density budget to lines as well as points: smaller, faster
     /// tiles that drop line features at coarse zooms (tippecanoe's
     /// `--drop-lines`).
     #[arg(long, help_heading = "Density budget")]
     drop_lines: bool,
 
-    /// Let the density budget thin polygons as well as points. Removing a
+    /// Apply the density budget to polygons as well as points. Removing a
     /// polygon leaves a hole in a coverage such as admin areas or parcels,
-    /// so the default leaves them alone (tippecanoe's `--drop-polygons`).
+    /// so the budget excludes polygons by default (tippecanoe's
+    /// `--drop-polygons`).
     #[arg(long, help_heading = "Density budget")]
     drop_polygons: bool,
 
@@ -1385,10 +1387,11 @@ struct TilesArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     max_compressed_tile_size: Option<usize>,
 
-    /// How a tile over its cap is brought under it: `merge` folds the
-    /// densest lines and polygons into a neighbour, which keeps its own
-    /// attributes; `drop` removes features, leaving holes but every kept
-    /// feature intact. Points are always dropped.
+    /// How to reduce a tile that exceeds its cap: `merge` merges the
+    /// densest lines and polygons into a neighbor, which keeps its own
+    /// attributes; `drop` removes features, leaving holes while preserving
+    /// each retained feature's attributes. Point tiles use feature dropping
+    /// in both modes.
     #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
