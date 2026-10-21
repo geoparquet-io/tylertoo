@@ -79,10 +79,11 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 | `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Let the drop rate thin lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default |
+| `-pn` / `--no-simplification-of-shared-nodes` | none yet (#450) | Each polygon is simplified on its own, so thin slivers open along shared borders: on dense parcels about 2% of the area at z12 at the default factor. `--simplify-factor 0.25` reaches tippecanoe's coverage, `0` closes them; see [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification) |
+| tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses. The square is one pixel whatever `--simplify-factor` is. In dense blocks of sub-pixel polygons the squares overlap and leave gaps (#750) |
 | `-M` maximum tile bytes (default 500K) | `--max-compressed-tile-size` (default off), or `--max-tile-size` / `--tile-size-limit` (default 500K) | `-M` caps the gzip-compressed tile; `--max-tile-size` caps the uncompressed MVT. 0 disables either |
 | `--coalesce-densest-as-needed` | `--size-valve merge` (the default) | Merges the densest lines and polygons into the feature kept before them, re-measuring until the tile fits. The merged feature keeps its own attributes. Each tile picks its own threshold; tippecanoe raises one threshold for the whole zoom |
 | `--drop-densest-as-needed`, `--drop-fraction-as-needed` | `--size-valve drop` | Drops features until the tile fits, keeping the largest polygons and lines and a uniform stride of points |
-| tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |
 | `--use-attribute-for-id` | `--feature-id` | Accepts integer or `DECIMAL(p,0)` columns. Rejects string, float, null, and negative ids. Without this flag, ids are tile-local. See [stable feature ids](../OVERVIEW_TUNING.md#stable-feature-ids-feature-id) |
