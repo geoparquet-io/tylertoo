@@ -1486,29 +1486,23 @@ fn gen_reference_markdown() -> String {
 
 /// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
 ///
-/// If the first token after the global flags is already a subcommand
-/// (`tiles`/`overview`/`validate`/`help`) or the invocation is a
-/// help/version query, the arguments are returned unchanged.
+/// If the first token after the global flags is already a subcommand (any
+/// of clap's, or `help`) or the invocation is a help/version query, the
+/// arguments are returned unchanged.
 fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
-    // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
-    // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 11] = [
-        "tiles",
-        "overview",
-        "validate",
-        "export-pmtiles",
-        "decode",
-        "stats",
-        "pyramid",
-        "merge",
-        "shard-plan",
-        "gen-reference-docs",
-        "help",
-    ];
+    // The subcommands come from clap itself, so a new one cannot be missed.
+    // `help` is clap's built-in. `gen-reference-docs` is reserved even when
+    // the `gen-docs` feature compiles it out, so the bare-form rewrite never
+    // prepends `tiles` to it: clap then rejects it as unknown (correct).
+    let is_subcommand_name = |name: &str| {
+        matches!(name, "help" | "gen-reference-docs")
+            || Cli::command()
+                .get_subcommands()
+                .any(|c| c.get_name() == name)
+    };
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
 
     // Nothing to rewrite for a bare `tylertoo` (clap prints help/usage).
@@ -1525,7 +1519,7 @@ where
         .skip(1)
         .find(|a| !matches!(a.to_string_lossy().as_ref(), "-q" | "--quiet"));
     let is_subcommand = first_after_globals
-        .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
+        .map(|a| is_subcommand_name(a.to_string_lossy().as_ref()))
         .unwrap_or(false);
     let is_help_or_version = argv.iter().skip(1).any(|a| {
         matches!(
@@ -3560,6 +3554,42 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every subcommand clap knows is left alone by the bare-form rewrite,
+    /// and the names it used to hard-code still are.
+    #[test]
+    fn bare_form_rewrite_leaves_every_subcommand_alone() {
+        let mut names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        names.extend(
+            [
+                "tiles",
+                "overview",
+                "validate",
+                "export-pmtiles",
+                "decode",
+                "stats",
+                "pyramid",
+                "merge",
+                "shard-plan",
+                "gen-reference-docs",
+                "help",
+            ]
+            .map(String::from),
+        );
+        for name in names {
+            let argv: Vec<std::ffi::OsString> = ["tylertoo", name.as_str(), "a.parquet"]
+                .map(Into::into)
+                .to_vec();
+            assert_eq!(rewrite_bare_args(argv.clone()), argv, "{name}");
+        }
+        let bare: Vec<std::ffi::OsString> = ["tylertoo", "in.parquet", "out.pmtiles"]
+            .map(Into::into)
+            .to_vec();
+        assert_eq!(rewrite_bare_args(bare)[1], "tiles");
+    }
 
     #[test]
     fn format_number_groups_thousands() {
