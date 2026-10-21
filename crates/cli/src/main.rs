@@ -26,7 +26,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use indicatif::HumanBytes;
+use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
@@ -3550,22 +3550,26 @@ fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
     }
 }
 
-/// Format a number with thousands separators
+/// Format a number with thousands separators. A `String`, not the
+/// `HumanCount` itself, so the `{:>10}`-style padding at call sites applies
+/// (`HumanCount`'s `Display` ignores width).
 fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
+    HumanCount(n).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_number_groups_thousands() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+        assert_eq!(format_number(u64::MAX), "18,446,744,073,709,551,615");
+        assert_eq!(format!("{:>8}", format_number(1_000)), "   1,000");
+    }
 
     /// clap's own consistency checks over the whole command tree (conflict
     /// targets that exist, unique short flags, ...), which otherwise run
