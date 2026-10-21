@@ -73,7 +73,7 @@ tylertoo tiles [OPTIONS] [INPUT] [OUTPUT]
 | `--attribution <TEXT>` | Attribution text or HTML stored in the archive metadata. |
 | `--max-tile-size <SIZE>` [alias: `tile-size-limit`] | Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap (default 500K, or no cap with `--verbatim`). A tile over the cap is merged or thinned until it fits; see `--size-valve`. |
 | `--max-compressed-tile-size <SIZE>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit both caps. |
-| `--size-valve <merge\|drop>` | How a tile over its cap is brought under it: `merge` folds the densest lines and polygons into a neighbour, which keeps its own attributes; `drop` removes features, leaving holes but every kept feature intact. Points are always dropped. Default: `merge`. |
+| `--size-valve <merge\|drop>` | How to reduce a tile that exceeds its cap: `merge` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `drop` removes features, leaving holes while preserving each retained feature's attributes. Point tiles use feature dropping in both modes. Default: `merge`. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
@@ -170,7 +170,7 @@ tylertoo export-pmtiles [OPTIONS] <INPUT> <OUTPUT>
 | `--tile-buffer <TILE_BUFFER>` | Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width). Default: `8`. |
 | `--tile-size-limit <SIZE>` [alias: `max-tile-size`] | Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for no cap. A tile over the cap is merged or thinned until it fits; see `--size-valve`. Default: `500K`. |
 | `--max-compressed-tile-size <SIZE>` | Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit both caps. Default: `0`. |
-| `--size-valve <merge\|drop>` | How a tile over its cap is brought under it: `merge` folds the densest lines and polygons into a neighbour, which keeps its own attributes; `drop` removes features, leaving holes but every kept feature intact. Points are always dropped. Default: `merge`. |
+| `--size-valve <merge\|drop>` | How to reduce a tile that exceeds its cap: `merge` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `drop` removes features, leaving holes while preserving each retained feature's attributes. Point tiles use feature dropping in both modes. Default: `merge`. |
 | `--report <PATH>` | Write the JSON export report, with per-zoom tile and feature counts, to this path. |
 | `--no-simple-clip-fastpath` | Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex. |
 | `--partition-wave <N\|auto>` | Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>. Default: `auto`. |
@@ -345,7 +345,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--verbatim` | Disable thinning, simplification, and density reduction for pre-aggregated or pre-levelled input. Explicit tuning flags override these defaults. |
 | `--point-thinning <POINT_THINNING>` | Point thinning grid cell, as a multiple of the level's GSD (default 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points. |
 | `--line-thinning <LINE_THINNING>` | Line thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer lines. |
-| `--polygon-thinning <POLYGON_THINNING>` | Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons, and can drop a polygon whose center falls in a larger neighbor's cell. |
+| `--polygon-thinning <POLYGON_THINNING>` | Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell. |
 | `--line-visibility <LINE_VISIBILITY>` | Drop lines whose bbox diagonal is shorter than this many GSDs at a level (default 2.0). |
 | `--polygon-visibility <POLYGON_VISIBILITY>` | Drop polygons whose bbox diagonal is shorter than this many GSDs at a level (default 2.0). |
 
@@ -381,7 +381,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--gsd-base <F>` | Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`. Default: `1024.0`. |
 | `--simplify-factor <SIMPLIFY_FACTOR>` | Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices. |
 | `--collapse` | Replace polygons too small for a level with a point instead of the default placeholder square. Fill styles ignore points; add a circle layer. |
-| `--collapse-square` | Replace polygons too small for a level, and those thinned out at coarse levels, with small placeholder squares marking their area. The default; duplicating mode only; output remains Polygon. |
+| `--collapse-square` | Replace polygons too small for a level, and those thinned out at coarse levels, with small placeholder squares marking their area. This is the default in duplicating mode; output remains Polygon. |
 | `--no-collapse` | Drop polygons too small for a level instead of replacing them with placeholder squares: smaller files, but a polygon coverage shows holes at coarse zooms (the default before #745). |
 | `--representation <SPEC>` | Polygon representation by zoom band: comma-separated `LO-HI:KIND`, where `KIND` is `geom`, `point`, or `square`, such as `0-7:point,8-14:geom`. Band rules: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>. |
 | `--no-cascade` | Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source. |
@@ -393,8 +393,8 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--drop-rate <F>` | Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more. Default: `1.65`. |
 | `--drop-gamma <F>` | Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more. Default: `1.5`. |
 | `--no-density-drop` | Turn off the per-level density budget, leaving cell-winner thinning only. |
-| `--drop-lines` | Let the density budget thin lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
-| `--drop-polygons` | Let the density budget thin polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the default leaves them alone (tippecanoe's `--drop-polygons`). |
+| `--drop-lines` | Apply the density budget to lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`). |
+| `--drop-polygons` | Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`). |
 
 ### Clustering
 

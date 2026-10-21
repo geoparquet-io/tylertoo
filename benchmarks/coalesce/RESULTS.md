@@ -1,20 +1,20 @@
-# #745 benchmark results: complete tiles at coarse and middle zooms
+# Benchmark results for #745: complete tiles at coarse and middle zooms
 
-What the new defaults (density budget on points only, placeholder squares,
-merging oversized tiles) cost and buy, against the defaults before #745.
-The decision these tables back is
+These benchmarks compare the new defaults (density budget on points only, placeholder squares,
+and merging oversized tiles) with the defaults before #745 for speed, memory use, and coverage.
+For the resulting decision, see
 [`corpus/SWEEPS.md` Decision 8](../../corpus/SWEEPS.md).
 
 ## Setup
 
 - Host: AWS c7g.16xlarge (64 Arm cores, 123 GB RAM), shared with other
-  sessions. Every run waited for a 1-minute load average below 3 and logs
-  the load before and after (`results*.jsonl`); runs where the load rose
-  during the run are flagged below.
+  sessions. Each run waited for a 1-minute load average below 3 and logged
+  the load before and after (`results*.jsonl`). Results below identify runs
+  where the load increased.
 - tylertoo release build of this branch, glibc allocator (the shipped musl
-  build uses mimalloc and is faster in absolute terms; ratios are what to
-  read). Inputs ordered with gpio 1.7.0 (`prepare_data.py`).
-- Settings, spelled for the new defaults (`run_matrix.py` `CONVERTS`):
+  build uses mimalloc and is faster in absolute terms; use the ratios to
+  compare results). Inputs ordered with gpio 1.7.0 (`prepare_data.py`).
+- Settings, expressed using the new defaults (`run_matrix.py` `CONVERTS`):
   - `C0`: `--drop-polygons --drop-lines --polygon-thinning 1
     --no-collapse`, the defaults before #745.
   - `C1`: `--polygon-thinning 1`, the new default as first measured, with
@@ -22,36 +22,36 @@ The decision these tables back is
   - `C1t`: no flags, the shipped default (`C1` with polygon thinning off;
     see § Polygon thinning off).
   - `C2`: `--polygon-visibility 0 --polygon-thinning 0`.
-  - Valves: `--size-valve drop` (re-measuring) or `merge` (the new
+  - Valves: `--size-valve drop` (with repeated size measurements) or `merge` (the new
     default). The G0 and G1 runs also measured the removed `zoom` and
     `hybrid` valves.
 - Drawn-area share (`tile_metrics.py`): per tile, the source polygons and
   the decoded tile are rasterized at 128 px per tile; the share is the
-  source-covered pixels the tile also covers. Coarse for parcels about 20 m
-  wide, so read it comparatively.
-- Today's export path is unchanged: `C0` + `drop` on this branch gives the
+  source-covered pixels the tile also covers. This resolution is coarse for parcels about 20 m
+  wide, so use the results for comparisons.
+- The export path used before #745 is unchanged: `C0` + `drop` on this branch gives the
   same bytes as `main` (checked on Moldova against a `main` build).
 
 ## Madagascar admin-4 (17,465 polygons, a gap-free coverage)
 
-The #572 case. No tile is over the 500K cap at z8, so the size valve never
-runs there: the holes come from convert.
+This dataset reproduces #572. No tile is over the 500K cap at z8, so the size valve never
+runs there. The holes occur during conversion.
 
 | z8, 3×3 tiles around the densest | missing area | added area | tile features |
 |---|---|---|---|
-| Today (`C0` + drop) | 48.6% | 0.000% | 1,028 |
+| Before #745 (`C0` + drop) | 48.6% | 0.000% | 1,028 |
 | `C1` + merge | 0.23% | 0.002% | 7,782 |
 | `C2` + merge | 0.23% | 0.002% | 7,782 |
 
-At z6 (the whole island): today 65.1% missing, `C1` and `C2` 1.94%. The
+At z6 (the whole island), the previous defaults miss 65.1% of the area; `C1` and `C2` miss 1.94%. The
 remainder is simplification fringe along borders (#450). `C1` and `C2`
 match because these polygons pass the gate and thinning.
 
 ## FTW Moldova (631,910 field polygons), z0–z12
 
-End to end, median of 3, Hilbert-sorted input:
+End-to-end results use the median of three runs with Hilbert-sorted input:
 
-| Convert | Valve | Export | Peak RSS (export) | End to end | vs today |
+| Convert | Valve | Export | Peak RSS (export) | End to end | Compared with previous defaults |
 |---|---|---|---|---|---|
 | C0 | drop | 4.73 s | 1.63 GiB | 6.47 s | 1.00× |
 | C1 | merge | 6.58 s | 1.81 GiB | 8.61 s | 1.33× |
@@ -60,46 +60,47 @@ End to end, median of 3, Hilbert-sorted input:
 | C2 | drop | 9.05 s | 1.82 GiB | 11.04 s | 1.71× |
 | C2 | zoom (removed) | 30.10 s | 2.47 GiB | 32.09 s | 4.96× |
 
-Convert: 1.74 s / 2.26 GiB (C0), 2.03 s / 2.39 GiB (C1), 1.99 s /
-2.62 GiB (C2). Overview file 173 MB (C0), 233 MB (C1), 313 MB (C2).
+Conversion took 1.74 s with 2.26 GiB peak RSS (C0), 2.03 s with 2.39 GiB
+(C1), and 1.99 s with 2.62 GiB (C2). Overview files were 173 MB (C0),
+233 MB (C1), and 313 MB (C2).
 
 Drawn-area share, median per sampled tile (the densest tiles included):
 
 | | z6 | z8 | z10 (worst tile) | edge holes z6 / z8 |
 |---|---|---|---|---|
-| Today | 0.56 | 0.90 | 0.97 (0.70) | 0.43 / 0.17 |
+| Before #745 | 0.56 | 0.90 | 0.97 (0.70) | 0.43 / 0.17 |
 | C1 + drop | 0.41 | 0.81 | 0.97 (0.59) | 0.59 / 0.19 |
 | C1 + merge (measured with the removed hybrid valve) | 0.79 | 0.93 | 0.97 (0.82) | 0.22 / 0.08 |
 | C2 + merge (per-tile, as shipped) | 0.82 | 0.94 | 0.98 (0.83) | 0.14 / 0.08 |
 
-The convert change alone, with drop, is worse than today at z6: more
-polygons reach export and the drop valve throws more away. Merging also
-fixes tiles the one-pass drop valve left over the cap: 45 tiles today, 0
+The convert change alone, with drop, reduces coverage at z6 compared with the previous defaults: more
+polygons reach export and the drop valve removes more features. Merging also
+fixes tiles the one-pass drop valve left over the cap: 45 tiles with the previous defaults, 0
 with C1 + merge.
 
-Seam colour excess at z8 (colour changes across tile edges minus those
+Seam color excess at z8 (color changes across tile edges minus those
 across a control line inside the tile): 0.36 for C1, 0.69 for C2, 0.74 for
 the removed per-zoom valve. Merged features keep the attributes of the
 feature they merged into, as in tippecanoe, so merged areas can change
-colour at tile edges; C1 merges less and shows it less.
+color at tile edges. C1 merges fewer features and has fewer color changes.
 
 ### Row order (Moldova, one run each)
 
-| Order | Today total (with sort) | New default total (with sort) | merged |
+| Order | Before #745 total (with sort) | New default total (with sort) | merged |
 |---|---|---|---|
 | hilbert | 6.75 s (14.4 s) | 8.65 s (16.3 s) | 945,666 |
 | str | 6.79 s (16.4 s) | 8.84 s (18.5 s) | 933,382 |
 | unsorted (shuffled) | 8.01 s (10.7 s) | 9.72 s (12.4 s) | 1,012,614 |
 | as delivered | 6.98 s | 9.05 s | 941,911 |
 
-Quality, new default: drawn share is the same for hilbert and shuffled
-input, but tile-edge colour changes appear even at z10 on shuffled input
+With the new default, drawn-area share is the same for Hilbert-sorted and shuffled
+input, but tile-edge color changes appear even at z10 on shuffled input
 (seam excess 0.24, against 0.00 for hilbert), because each feature merges
-into an arbitrary one. Convert therefore warns on unsorted input.
+into an arbitrary target. Conversion therefore warns on unsorted input.
 
 ## Scaling: FTW Mato Grosso prefixes (Hilbert order), z0–z12
 
-| Rows | Input | Today total | New default total | Ratio | Peak RSS today → new |
+| Rows | Input | Before #745 total | New default total | Ratio | Peak RSS before #745 → new |
 |---|---|---|---|---|---|
 | 250,000 | 29 MB | 3.11 s | 3.30 s | 1.06× | 0.77 → 0.89 GiB |
 | 500,000 | 41 MB | 4.36 s | 5.09 s | 1.17× | 1.01 → 1.17 GiB |
@@ -107,16 +108,16 @@ into an arbitrary one. Convert therefore warns on unsorted input.
 | 2,000,000 | 219 MB | 16.81 s | 24.98 s | 1.49× | 3.36 → 3.70 GiB |
 | 4,583,000 | 678 MB | 51.49 s | 67.39 s | 1.31× | 6.04 → 7.45 GiB |
 
-Time is linear in input size for both; the overhead does not grow with N.
-Peak RSS is set by convert. One run each.
+Time scales linearly with input size for both settings; the relative overhead does not increase with the row count.
+Conversion determines peak RSS. Each setting was measured once.
 
-### The merge threshold (review follow-up)
+### Merge threshold
 
-The rows above were taken with the threshold snapped up to a power of two,
-which could overshoot the quantile by 2× and, on a tile whose gaps sat
-within one octave, merge every polygon in one step. It is now the quantile
-gap plus one. Same session, convert once, the two exports alternating
-(medians; Moldova 3 runs each, 4.58M 2, the rest 1):
+The measurements above rounded the threshold up to a power of two,
+which could exceed the quantile by 2× and, on a tile whose gaps fell
+within a factor of two, merge every polygon in one step. The threshold is now the quantile
+gap plus one. Both exports used the same converted file and alternated in the same session
+(medians of three runs per setting for Moldova, two for 4.58M, and one for the others):
 
 | Input | End to end, snap → +1 | Change | Merged tile members | Most encodes per tile |
 |---|---|---|---|---|
@@ -128,40 +129,41 @@ gap plus one. Same session, convert once, the two exports alternating
 
 Drawn area is unchanged everywhere (Moldova z6–z12, NZ z10/z12 and the
 three Auckland tiles to the fourth digit); Moldova's z8 seam excess falls
-from 0.43 to 0.39. The cost lands where many tiles are over the cap and
+from 0.43 to 0.39. The time increase is greatest where many tiles exceed the cap and
 need many steps. Against the table above that puts the 2M and 4.58M rows
-at about 1.66× and 1.49× of today (estimated: the two tables are from
-different sessions). A quarter-octave rung took about as many encodes as
+at about 1.66× and 1.49× of the previous defaults (estimated: the two tables are from
+different sessions). Increasing the threshold in steps of 2^0.25 took about as many encodes as
 +1 (25 against 27 at 2M) and was no faster.
 
 ## NZ Parcels (4,343,547 polygons, LINZ layer 51571), z0–z14
 
 | Setting | Convert | Export | Total | Peak RSS (convert / export) | Merged | Oversized tiles |
 |---|---|---|---|---|---|---|
-| Today, 3800K raw cap | 8.1 s | 48.8 s | 57 s | 6.1 / 3.7 GiB | 0 | 0 |
+| Before #745, 3800K raw cap | 8.1 s | 48.8 s | 57 s | 6.1 / 3.7 GiB | 0 | 0 |
 | C1 + merge, 3800K raw cap | 11.6 s | 96.1 s | 108 s | 9.3 / 6.4 GiB | 3.29M | 80 |
 | C2 + merge, 3800K raw cap | 11.8 s | 180.6 s | 192 s | 11.7 / 7.5 GiB | 12.9M | 106 |
-| Today, 2 MB gzip cap | 8.1 s | 48.3 s | 56 s | 6.0 / 3.8 GiB | 0 | 0 |
+| Before #745, 2 MB gzip cap | 8.1 s | 48.3 s | 56 s | 6.0 / 3.8 GiB | 0 | 0 |
 | C1 + merge, 2 MB gzip cap | 11.6 s | 95.6 s | 107 s | 9.2 / 6.4 GiB | 2.65M | 54 |
 
-Re-timed on a quiet host, 2 MB gzip cap, two repeats each (they agreed
-within 1%): today 8.2 s + 48.7 s = 57 s; C1 + merge 11.7 s + 98.7 s = 110 s,
+Two additional runs per setting on a quiet host, with a 2 MB gzip cap, agreed
+within 1%: the previous defaults took 8.2 s + 48.7 s = 57 s; C1 + merge took
+11.7 s + 98.7 s = 110 s,
 **1.94×**. (The load averages logged after these exports include the export
 itself, which uses every core.) Parcels are denser than fields, so more
-tiles reach the cap and merge than on the Mato Grosso ladder (1.31×).
+tiles reach the cap and merge than on the Mato Grosso subsets (1.31×).
 Against tippecanoe's 31 min 41 s that is about 17× faster.
 
 Drawn-area share on palmerj's three Auckland z12 tiles (#246):
 
 | | 12/4035/2500 | 12/4036/2499 | 12/4036/2500 | z12 median (worst sampled) |
 |---|---|---|---|---|
-| Today | 67.2% | 76.4% | 68.7% | 99.46% (66.2%) |
+| Before #745 | 67.2% | 76.4% | 68.7% | 99.46% (66.2%) |
 | C1 + merge | 97.1% | 97.7% | 97.5% | 99.88% (94.0%) |
 | C2 + merge | 97.3% | 97.9% | 97.6% | 99.89% (97.1%) |
 
 No tile exceeds either cap with C1 or C2.
 
-### Against tippecanoe
+### Comparison with tippecanoe
 
 tippecanoe 2.79.0 (the pinned tag, built from source against a local
 SQLite), `-Z0 -z14 -b 8 -M 2000000 --coalesce-densest-as-needed`, on the
@@ -173,7 +175,7 @@ RSS 6.3 GiB, 884 MB archive. Scored with the same `tile_metrics.py`:
 | tippecanoe | 99.5% | 99.6% | 99.6% | 99.98% (99.5%) | 99.6% |
 | C1 + merge | 97.1% | 97.7% | 97.5% | 99.88% (94.0%) | 93.8% |
 
-The gap is not thinning (C2 barely moves it) but slivers along shared
+The gap is not thinning (C2 changes coverage very little) but slivers along shared
 borders: each parcel is simplified on its own at 1 GSD (about 9.5 m at z12),
 roughly 4× tippecanoe's 1-tile-unit tolerance. On an Auckland subset
 (`--bbox 174.5,-37.1,175.0,-36.6`, same caps):
@@ -205,9 +207,9 @@ three named z12 tiles, scored against the subset's own parcels:
 | 0.05 | 99.65% | 99.96% | 22.4 s | 4.6 GiB | 157 MB |
 | 0 | 99.99% | 100.00% | 17.1 s | 3.2 GiB | 155 MB |
 
-With the shipped defaults (polygon thinning off). Asymptotic above zero,
-at about 99.65%, level with tippecanoe's 99.5–99.6%; the knee is near
-0.25. With polygon thinning on, every row sat 0.1–0.2 points lower and
+These measurements use the shipped defaults (polygon thinning off). For nonzero factors, coverage levels off
+at about 99.65%, comparable to tippecanoe's 99.5–99.6%; gains become smaller below
+0.25. With polygon thinning on, coverage was 0.1–0.2 percentage points lower for every setting and
 `0` reached only 99.85%: the rest was one nested parcel (below).
 At 0 the only vertex reduction is the tile grid, which snaps both sides of
 a shared border to the same points. On all of NZ (2 MB gzip cap):
@@ -219,18 +221,19 @@ a shared border to the same points. On all of NZ (2 MB gzip cap):
 | 0 | 15.4 s | 19.0 GiB | 7.9 GB | 104.1 s | 1,610 MB | 120 s |
 | 0, `--profile bounded` | 38.2 s | 4.9 GiB | 7.9 GB | | | |
 
-The 19 GiB is the default memory profile choosing RAM on a 123 GB host;
-the bounded profile spills to disk and needs less than today's defaults.
-The cost that remains is the overview file: every level stores full
+The default memory profile used 19 GiB by choosing RAM on a 123 GB host;
+the bounded profile spills to disk and uses less memory than the previous defaults.
+The overview file remains larger because every level stores full
 resolution.
 
 ### Polygon thinning off (`--polygon-thinning 0`, now the default)
 
-A z12 hole in Auckland that every tylertoo setting showed and tippecanoe
-did not was parcel 5197556 (about 340 m across), inside a larger ring-
-shaped parcel: both bbox centres fall in one thinning cell, the larger one
-wins, and the smaller one survives only as a placeholder square about one
-GSD wide. With polygon thinning off:
+Parcel 5197556 in Auckland (about 340 m across) appeared as a hole at z12
+with every tested tylertoo setting, but not with tippecanoe. The parcel sits
+inside a larger ring-shaped parcel. Both bounding-box centers fall in the
+same thinning cell, which retains the larger parcel. The smaller parcel
+appears only as a placeholder square about one GSD wide. Disabling polygon
+thinning gave these results:
 
 | | total | convert peak RSS | PMTiles | z12 worst sampled tile | named tiles |
 |---|---|---|---|---|---|
@@ -239,23 +242,24 @@ GSD wide. With polygon thinning off:
 | Moldova, C1 | 8.6 s | 2.45 GiB | 83 MB | | |
 | Moldova, C1 + thinning off | 8.8 s | 2.41 GiB | 84 MB | | |
 
-### A placeholder bug found on the way (#749)
+### Placeholder bug (#749)
 
 With the polygon visibility gate at 0 (`C2`, or `--verbatim` with a
 nonzero `--simplify-factor`), placeholder squares survive every coarse level
 under the cascade: on `open-buildings` (1,000 buildings) 229–263 squares
-about 35 km across at z0–z9, drawing 19× the real area at z8. Pre-existing
-(`main` with `--collapse-square`); the default gate of 2 avoids it, and the
-docs no longer recommend a zero gate.
+about 35 km across appear at z0–z9, drawing 19× the source area at z8. This
+bug also occurs on `main` with `--collapse-square`. The default gate of 2
+avoids it, and the docs no longer recommend a zero gate.
 
 ## Rendered coverage at every zoom (MapLibre)
 
 `render_maplibre.py` draws each archive with MapLibre GL JS 4.7.1 in
 headless Chromium and compares it pixel by pixel with the source,
-rasterized by the same pixel-centre rule. Missing share of the source area
-in each window (orange, area drawn where the source has nothing, in
-brackets when at least 0.5%). Differences under about 3% are tile-grid
-noise: at full detail small fields show about 2.5% missing and 2.5% added.
+rasterized by the same pixel-center rule. The table shows the share of
+source area missing in each window. Values in parentheses show added area
+(orange in the rendering) when it is at least 0.5%. Differences under about
+3% reflect tile-grid noise: at full detail, small fields show about 2.5%
+missing area and 2.5% added area.
 
 | Window | Zoom | Before #745 | #745 defaults | 0.25 | 0 | tippecanoe |
 |---|---|---|---|---|---|---|
@@ -276,5 +280,5 @@ noise: at full detail small fields show about 2.5% missing and 2.5% added.
 the square shrank with the factor (and factor 0 had none): Auckland city at
 z10 missed 50.4% at 0.25 and 57.3% at 0, Moldova at z5 31.4% and 41.4%.
 
-What remains at the defaults, dense sub-pixel polygons drawn as overlapping
-squares (and squares spilling over the gaps between fields), is #750.
+With the defaults, dense sub-pixel polygons still appear as overlapping
+squares that can extend into gaps between fields. Issue #750 tracks this behavior.

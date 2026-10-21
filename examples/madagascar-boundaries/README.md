@@ -123,7 +123,7 @@ The box contains 943 polygons. `gsd` (ground sample distance) is the size of
 one pixel in meters. At z0–z2, pixels span 10–40 km, wider than any of these
 polygons. A polygon below the visibility gate is drawn as a small
 placeholder square, so even the coarsest levels show where the polygons
-are. `--no-collapse` drops them instead, and `--collapse` draws dots. The
+are. Use `--no-collapse` to drop them or `--collapse` to draw dots. The
 [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
 explains the available settings.
 
@@ -172,7 +172,7 @@ Validating madagascar-ov.parquet
 ```
 
 At 19.6 km per pixel, 1,537 features remain: the polygons large enough to
-see, plus placeholder squares for the smaller ones. The count grows each
+see, plus placeholder squares for the smaller ones. The count grows at each
 level until level 8 holds every polygon. The density budget (`--drop-rate`)
 thins only points by default, so boundaries that tile the island keep
 their coverage at every zoom. Level 9 holds all 17,465 polygons at full
@@ -227,8 +227,8 @@ Polygons crossing tile edges appear in every tile they touch, so tile
 features outnumber overview features. Clipped slivers that vanish on the
 tile's 4096-unit grid are omitted and counted as "collapsed at extent".
 The largest tile is 180 KB compressed, at z6. Twelve tiles at z2–z7 went
-over the default 500 KB limit before compression, so the size valve merged
-their densest polygons into neighbours until each fit; the export counts
+over the default 500 KB limit before compression. The size valve merged
+their densest polygons into neighbors until each fit; the export counts
 these as "oversized".
 
 View `madagascar.pmtiles` at [pmtiles.io](https://pmtiles.io/), or host it on

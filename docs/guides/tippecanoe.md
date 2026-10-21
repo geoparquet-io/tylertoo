@@ -8,12 +8,11 @@ differences.
 compares speed, size, and memory use, with methods and caveats.
 
 Like tippecanoe, tylertoo thins points by default and keeps lines and
-polygons, so admin boundaries, parcels and other polygon coverages draw
-without holes at coarse and middle zooms. Polygons too small for a zoom
-become placeholder squares, and an oversized tile merges its densest
-polygons into their neighbours, as `--coalesce-densest-as-needed` does. See
-[complete tiles or small tiles](../OVERVIEW_TUNING.md#complete-tiles-or-small-tiles)
-for the settings that trade completeness for speed and size.
+polygons. This preserves polygon coverage at coarse and middle zooms.
+Polygons too small for a zoom become placeholder squares. For oversized
+tiles, tylertoo merges dense polygons into their neighbors, as
+`--coalesce-densest-as-needed` does. To adjust this behavior, see
+[complete tiles or small tiles](../OVERVIEW_TUNING.md#complete-tiles-or-small-tiles).
 
 ## How much faster — the skeptical reader's table
 
@@ -76,13 +75,13 @@ Reproduce with `./benchmarks/e2e/run_corpus.sh`.
 | `-b` buffer (default 5) | `--tile-buffer` (default 8) | Tile-pixel seam buffer |
 | `-y` / `-x` / `-X` property selection | `--include-property` / `--exclude-property` / `--exclude-all-properties` | Applied during scans for `overview` / `tiles`, during export for `export-pmtiles`. In both tools, an include list overrides exclusions |
 | `-r` drop rate (default 2.5) | `--drop-rate` (default 1.65) | Same geometric ladder. tylertoo anchors on the full canonical count, so the default differs. Thins points only by default, as in tippecanoe |
-| `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Let the drop rate thin lines and polygons too |
+| `--drop-lines` / `--drop-polygons` | `--drop-lines` / `--drop-polygons` | Apply the drop rate to lines and polygons too |
 | gamma dot-dropping | `--drop-gamma` | Applied per super-cell; per-level totals stay unchanged |
 | `-S` simplification | `--simplify-factor` | Ramer-Douglas-Peucker (RDP), cascading by default |
-| `-pn` / `--no-simplification-of-shared-nodes` | none yet (#450) | Each polygon is simplified on its own, so thin slivers open along shared borders: on dense parcels about 2% of the area at z12 at the default factor. `--simplify-factor 0.25` reaches tippecanoe's coverage, `0` closes them; see [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification) |
-| tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses. The square is one pixel whatever `--simplify-factor` is. In dense blocks of sub-pixel polygons the squares overlap and leave gaps (#750) |
+| `-pn` / `--no-simplification-of-shared-nodes` | none yet (#450) | Each polygon is simplified on its own, so thin slivers open along shared borders: on dense parcels about 2% of the area at z12 at the default factor. `--simplify-factor 0.25` reaches tippecanoe's coverage; `0` closes the slivers. See [coverage and simplification](../OVERVIEW_TUNING.md#coverage-and-simplification) |
+| tiny-polygon reduction | placeholder squares (the default; `--no-collapse` to drop) | Accumulates area per 32×GSD patch of the level, independent of tiles, with per-feature dithering for write-time collapses. The square is one pixel regardless of `--simplify-factor`. In dense blocks of sub-pixel polygons the squares overlap and leave gaps (#750) |
 | `-M` maximum tile bytes (default 500K) | `--max-compressed-tile-size` (default off), or `--max-tile-size` / `--tile-size-limit` (default 500K) | `-M` caps the gzip-compressed tile; `--max-tile-size` caps the uncompressed MVT. 0 disables either |
-| `--coalesce-densest-as-needed` | `--size-valve merge` (the default) | Merges the densest lines and polygons into the feature kept before them, re-measuring until the tile fits. The merged feature keeps its own attributes. Each tile picks its own threshold; tippecanoe raises one threshold for the whole zoom |
+| `--coalesce-densest-as-needed` | `--size-valve merge` (the default) | Merges the densest lines and polygons into the feature kept before them, measuring again until the tile fits. The merged feature keeps its own attributes. Each tile uses its own threshold; tippecanoe raises one threshold for the whole zoom |
 | `--drop-densest-as-needed`, `--drop-fraction-as-needed` | `--size-valve drop` | Drops features until the tile fits, keeping the largest polygons and lines and a uniform stride of points |
 | cluster centroid | `--cluster` | Winner keeps its own geometry and absorbs losers into `point_count` |
 | `--coalesce` family | coalescing (on by default) | Chains same-class segments before gates and thinning |

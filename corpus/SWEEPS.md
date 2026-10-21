@@ -298,15 +298,15 @@ window.
 
 ## Decision 8: keep lines and polygons; merge oversized tiles (issue #745)
 
-Before #745 a polygon coverage (admin areas, parcels, fields) drew with
+Before #745, polygon coverages (admin areas, parcels, and fields) had
 holes at coarse and middle zooms. The density budget thinned every kind,
 so `fieldmaps-madagascar-adm4` kept 865 of 17,465 polygons at z8 (#572),
 and a tile over the size cap dropped its smallest features in one pass
-that never re-measured (#246). The measurements and harness are in
+without measuring the tile again (#246). The measurements and harness are in
 `benchmarks/coalesce/` (`RESULTS.md` has the tables; `run_matrix.py`,
-`tile_metrics.py` and `render_coverage.py` reproduce them).
+`tile_metrics.py`, and `render_coverage.py` reproduce them).
 
-**What was compared.** Three convert settings and, at first, four ways to
+The comparison covered three convert settings and, initially, four ways to
 handle an oversized tile:
 
 - `C0`: the defaults before #745.
@@ -320,48 +320,49 @@ handle an oversized tile:
   threshold per zoom from a measuring pass (`zoom`), and a per-zoom
   threshold predicted from the scan (`hybrid`).
 
-Release builds (glibc; no musl toolchain on the bench host), z0–z12 unless
-noted, 500K raw tile cap, every run under a wall and RSS cap, waiting for
-a quiet machine. Drawn-area share is the fraction of the source's area, per
-tile and rasterized at 128 px per tile, that the tile draws.
+The benchmarks used release builds with glibc (the host had no musl
+toolchain), z0–z12 unless noted, and a 500K uncompressed tile cap. Each run
+waited for a quiet machine and had elapsed-time and RSS limits. Drawn-area
+share measures how much of the source area each tile covers, with both
+rasterized at 128 px per tile.
 
-**Findings.**
+The measurements showed the following:
 
 - On Madagascar the holes come entirely from convert: no tile is over the
-  cap at z8, so the size valve never runs there. At z8 today's output misses
+  cap at z8, so the size valve never runs there. At z8, the previous defaults miss
   48.6% of the area; `C1` and `C2` miss 0.23%.
-- `C1` or `C2` with `drop` is *worse* than today at coarse zooms on dense
+- `C1` or `C2` with `drop` gives less coverage than the previous defaults at coarse zooms on dense
   data (FTW Moldova z6: 0.41 and 0.37 of the area drawn, against 0.56):
-  more polygons reach export, and the drop valve throws more of them away.
+  more polygons reach export, and the drop valve removes more of them.
   The convert change needs a merging valve.
 - `zoom` cost 2–5× the export time of `drop` and scored worst on tile-seam
-  colour changes: one dense tile sets the threshold for the whole zoom and
-  over-merges it. `hybrid` cost more than `tile` with no quality gain.
+  color changes: one dense tile sets the threshold for the whole zoom and
+  over-merges it. `hybrid` cost more than `tile` without improving coverage.
   Both were removed.
-- `C2` buys little over `C1`. Moldova z6: 0.82 against 0.79 of the area
+- `C2` improves coverage only slightly over `C1`. Moldova z6: 0.82 against 0.79 of the area
   drawn. NZ Parcels, palmerj's three Auckland z12 tiles: 97.3–97.9%
   against 97.1–97.7%. But `C2` nearly doubles export time again (NZ:
   181 s against 96 s).
-- Cost of `C1` + merge against today, end to end (convert + export):
-  1.33× on Moldova (632k fields), 1.06–1.49× along a Mato Grosso ladder
+- Cost of `C1` + merge compared with the previous defaults, end to end (convert + export):
+  1.33× on Moldova (632k fields), 1.06–1.49× across Mato Grosso subsets
   from 0.25M to 4.58M rows (1.31× at 4.58M), linear in input size. Peak
   RSS, set by convert, rose 6% on Moldova and 23% at 4.58M rows. Those
-  runs snapped the merge threshold to a power of two; merging only what
-  the quantile asks for (the shipped threshold) adds up to 14% on the
-  densest inputs (about 1.66× at 2M and 1.49× at 4.58M) and nothing on
-  Moldova or NZ, and merges 5–11% fewer features (`RESULTS.md` § The
-  merge threshold).
+  runs rounded the merge threshold up to a power of two. The shipped
+  threshold uses the quantile gap plus one. This adds up to 14% on the
+  densest inputs (about 1.66× at 2M and 1.49× at 4.58M), with no measurable
+  time increase on Moldova or NZ. It merges 5–11% fewer features (`RESULTS.md` § Merge
+  threshold).
 - Row order: on shuffled input the merge targets are arbitrary and tile-
-  edge colour changes appear even at z10 (seam excess 0.24 against 0.00
+  edge color changes appear even at z10 (seam excess 0.24 against 0.00
   for Hilbert order), so convert warns on unsorted input and the docs
-  point at `gpio sort hilbert`.
-- Against tippecanoe 2.79.0 itself (`--coalesce-densest-as-needed
+  recommend `gpio sort hilbert`.
+- Compared with tippecanoe 2.79.0 (`--coalesce-densest-as-needed
   -M 2000000`, scored the same way), on the three Auckland z12 tiles:
   tippecanoe 99.5–99.6%, `C1` 97.1–97.7% (97.3–97.9% with polygon
   thinning off, as shipped). The gap is slivers between
-  neighbouring parcels, each simplified on its own (#450). A
-  `--simplify-factor` sweep on an Auckland subset traced the curve (shipped
-  defaults): 87.4% at 2, 97.6% at 1, 98.9% at 0.5, 99.5% at 0.25,
+  neighboring parcels, each simplified on its own (#450). A
+  `--simplify-factor` sweep on an Auckland subset measured coverage with the
+  shipped defaults: 87.4% at 2, 97.6% at 1, 98.9% at 0.5, 99.5% at 0.25,
   flattening at about 99.65% by 0.1, and 99.99% at 0 (no simplification:
   the tile grid snaps shared borders identically). Time and memory rise as the factor falls toward
   0.1; at 0 export costs about what it does at 1, but every overview level
@@ -371,12 +372,12 @@ tile and rasterized at 128 px per tile, that the tile draws.
   about 2 min.
 - `--polygon-visibility 0` with placeholder squares has a pre-existing bug
   (#749): under the cascade, squares survive every coarse level, so small
-  features draw as huge squares at low zooms. The `C2` recipe was dropped
+  features appear as very large squares at low zooms. The `C2` recipe was dropped
   from the docs for that reason and because `--simplify-factor` closes more
-  of the gap for less.
+  of the gap at a lower cost.
 
-- Polygon thinning: a thinning cell keeps one polygon by bbox centre, so on
-  NZ Parcels a parcel sitting inside a ring-shaped neighbour lost every
+- Polygon thinning: a thinning cell keeps one polygon by bbox center, so on
+  NZ Parcels, a parcel inside a ring-shaped neighbor was removed from every
   coarse level and drew as a hole at all simplification settings (worst
   sampled z12 tile 94.0%). `--polygon-thinning 0` raised that tile to
   97.05% at no cost (NZ 106 s against 110 s, Moldova +2%, same memory,
@@ -384,14 +385,14 @@ tile and rasterized at 128 px per tile, that the tile draws.
 
 **Decision:** ship `C1` with polygon thinning off, and the per-tile `merge`
 valve, as the defaults.
-The density budget thins points only (`--drop-lines` / `--drop-polygons`
-opt back in); `CollapseMode::Auto` makes placeholder squares (points under
+The density budget thins points only (`--drop-lines` and `--drop-polygons`
+apply the budget to lines and polygons); `CollapseMode::Auto` makes placeholder squares (points under
 an entry-zoom ladder); `--size-valve merge` merges oversized tiles, with
-`--size-valve drop` for attribute-exact tiles. The default simplification
+`--size-valve drop` to preserve each retained feature's attributes. The default simplification
 tolerance (Decision 1) is unchanged: slivers at the default are mostly
-narrower than a pixel, the tolerance applies to every geometry class, and a
-tighter one costs memory and bytes everywhere. The curve is documented
+narrower than a pixel. The tolerance applies to every geometry class, so
+reducing it increases memory use and file size across the dataset. The curve is documented
 instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
 `0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
-file) as recipes, next to the pre-#745 output as the "smaller, faster" one.
-Simplifying shared borders identically stays with #450.
+file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
+Issue #450 tracks simplifying shared borders identically.
