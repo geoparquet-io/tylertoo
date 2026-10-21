@@ -34,9 +34,10 @@
 //!   tile holds several bands, each in its own spatial order, so the row
 //!   before a band's first row belongs to another band and is spatially
 //!   unrelated.
-//! - The threshold snaps up to a power of two ([`next_mingap`]). Tippecanoe
-//!   uses the quantile itself; on a regular grid, where every gap is equal,
-//!   that never merges anything, because the test is `gap < mingap`.
+//! - The threshold is one above the quantile gap ([`next_mingap`]), so the
+//!   quantile gap itself merges. Tippecanoe uses the quantile itself; on a
+//!   regular grid, where every gap is equal, that never merges anything,
+//!   because the test is `gap < mingap`.
 
 use std::borrow::Cow;
 
@@ -308,18 +309,18 @@ pub(super) fn mergeable_gaps(ordered: &[&Member]) -> Vec<u64> {
         .collect()
 }
 
-/// The smallest power of two strictly above `g`, or [`GAP_NONE`] past
-/// `2^63`. A threshold `rung_above(g)` merges every gap `<= g`.
-pub(super) fn rung_above(g: u64) -> u64 {
-    match g.checked_add(1).and_then(u64::checked_next_power_of_two) {
-        Some(r) => r,
-        None => GAP_NONE,
-    }
-}
-
 /// The next merge threshold, tippecanoe's `choose_mingap`: keep about
 /// `keep_fraction` of the features by choosing the gap at that quantile from
-/// the top, forced above `current`, then snapped up to [`rung_above`] it.
+/// the top, forced above `current`. The threshold is that gap plus one, so
+/// it merges every gap `<=` the quantile, ties included.
+///
+/// It used to snap up to the next power of two, which overshot the quantile
+/// by up to 2×: on a tile whose gaps all sat within one octave, the first
+/// step merged every polygon into one feature. Merging only what the
+/// quantile asks for takes more encodes on a dense tile (up to 30 against
+/// 13 on 4.58M Mato Grosso fields). A quarter-octave rung, tried to win
+/// them back, took as many (25 against 27 at 2M): the shrinking
+/// `keep_fraction`, not the rounding, sets how many steps a tile needs.
 ///
 /// `None` when no gap lies above `current`: the threshold cannot rise, and
 /// the tile has merged everything it can.
@@ -338,8 +339,9 @@ pub(super) fn next_mingap(gaps: &mut [u64], keep_fraction: f64, current: u64) ->
     if gaps[ix] < current {
         return None;
     }
-    let next = rung_above(gaps[ix]);
-    (next > current).then_some(next)
+    // `gaps` never holds GAP_NONE, so this stays a real threshold, and it
+    // is above `current` because `gaps[ix] >= current`.
+    Some(gaps[ix].saturating_add(1))
 }
 
 #[cfg(test)]
@@ -559,14 +561,24 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// Gaps all within one octave, as for a near-regular grid of similar
+    /// parcels, on a tile just over its limit: the threshold merges about
+    /// the 20% the quantile asks for, not the whole tile (the power-of-two
+    /// snap merged 1000 of 1000 here).
     #[test]
-    fn rung_above_is_strictly_above() {
-        assert_eq!(rung_above(0), 1);
-        assert_eq!(rung_above(1), 2);
-        assert_eq!(rung_above(7), 8);
-        assert_eq!(rung_above(8), 16);
-        assert_eq!(rung_above(1 << 63), GAP_NONE);
-        assert_eq!(rung_above(GAP_NONE - 1), GAP_NONE);
+    fn the_threshold_does_not_overshoot_the_quantile() {
+        for (lo, hi) in [(130u64, 250u64), (100, 199), (2000, 3900)] {
+            let mut gaps: Vec<u64> = (0..1000).map(|i| lo + (hi - lo) * i / 999).collect();
+            let m = next_mingap(&mut gaps, 0.8, 0).unwrap();
+            let merged = gaps.iter().filter(|&&g| g < m).count();
+            assert!(
+                (195..=210).contains(&merged),
+                "{lo}..{hi}: {merged} of 1000"
+            );
+        }
+        // The largest real gap still yields a threshold that merges it.
+        let mut top = [GAP_NONE - 1];
+        assert_eq!(next_mingap(&mut top, 0.5, 0), Some(GAP_NONE));
     }
 
     #[test]

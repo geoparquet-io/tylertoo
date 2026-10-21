@@ -345,7 +345,12 @@ tile and rasterized at 128 px per tile, that the tile draws.
 - Cost of `C1` + merge against today, end to end (convert + export):
   1.33× on Moldova (632k fields), 1.06–1.49× along a Mato Grosso ladder
   from 0.25M to 4.58M rows (1.31× at 4.58M), linear in input size. Peak
-  RSS, set by convert, rose 6% on Moldova and 23% at 4.58M rows.
+  RSS, set by convert, rose 6% on Moldova and 23% at 4.58M rows. Those
+  runs snapped the merge threshold to a power of two; merging only what
+  the quantile asks for (the shipped threshold) adds up to 14% on the
+  densest inputs (about 1.66× at 2M and 1.49× at 4.58M) and nothing on
+  Moldova or NZ, and merges 5–11% fewer features (`RESULTS.md` § The
+  merge threshold).
 - Row order: on shuffled input the merge targets are arbitrary and tile-
   edge colour changes appear even at z10 (seam excess 0.24 against 0.00
   for Hilbert order), so convert warns on unsorted input and the docs

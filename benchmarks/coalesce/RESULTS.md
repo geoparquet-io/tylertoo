@@ -110,6 +110,30 @@ into an arbitrary one. Convert therefore warns on unsorted input.
 Time is linear in input size for both; the overhead does not grow with N.
 Peak RSS is set by convert. One run each.
 
+### The merge threshold (review follow-up)
+
+The rows above were taken with the threshold snapped up to a power of two,
+which could overshoot the quantile by 2× and, on a tile whose gaps sat
+within one octave, merge every polygon in one step. It is now the quantile
+gap plus one. Same session, convert once, the two exports alternating
+(medians; Moldova 3 runs each, 4.58M 2, the rest 1):
+
+| Input | End to end, snap → +1 | Change | Merged tile members | Most encodes per tile |
+|---|---|---|---|---|
+| Moldova (632k) | 8.74 → 8.78 s | +0.5% | 948k → 901k | 9 → 28 |
+| Mato Grosso 1M | 9.32 → 9.47 s | +1.6% | 1.59M → 1.47M | 13 → 27 |
+| Mato Grosso 2M | 24.85 → 27.80 s | +11.9% | 2.92M → 2.73M | 13 → 27 |
+| Mato Grosso 4.58M | 70.41 → 80.29 s | +14.0% | 5.59M → 5.27M | 13 → 30 |
+| NZ Parcels, 2 MB gzip cap | 109.2 → 109.7 s | +0.5% | 2.65M → 2.49M | 3 → 3 |
+
+Drawn area is unchanged everywhere (Moldova z6–z12, NZ z10/z12 and the
+three Auckland tiles to the fourth digit); Moldova's z8 seam excess falls
+from 0.43 to 0.39. The cost lands where many tiles are over the cap and
+need many steps. Against the table above that puts the 2M and 4.58M rows
+at about 1.66× and 1.49× of today (estimated: the two tables are from
+different sessions). A quarter-octave rung took about as many encodes as
++1 (25 against 27 at 2M) and was no faster.
+
 ## NZ Parcels (4,343,547 polygons, LINZ layer 51571), z0–z14
 
 | Setting | Convert | Export | Total | Peak RSS (convert / export) | Merged | Oversized tiles |
