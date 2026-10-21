@@ -1,14 +1,16 @@
 //! Bounds check for WKB values read from GeoParquet geometry columns.
 //!
 //! GeoParquet WKB columns are decoded by geoarrow-array, which hands each
-//! value to the `wkb` crate's reader (`wkb::reader::Wkb::try_new`, 0.9.2).
-//! That reader trusts the counts in the data: it reserves a `Vec` for every
-//! ring, member line, member polygon and collection member a header declares
-//! before it checks that the bytes exist, and it recurses into nested
-//! GeometryCollections with no depth limit. A 9-byte value claiming four
-//! billion polygons asks the allocator for about 206 GB, and a point wrapped
-//! in a thousand one-member collections overflows a thread stack. Both abort
-//! the process.
+//! value to the `wkb` crate's reader (`wkb::reader::Wkb::try_new`). Before
+//! 0.9.3 that reader trusted the counts in the data: it reserved a `Vec` for
+//! every ring, member line, member polygon and collection member a header
+//! declared before it checked that the bytes existed, and it recursed into
+//! nested GeometryCollections with no depth limit. A 9-byte value claiming
+//! four billion polygons asked the allocator for about 206 GB, and a point
+//! wrapped in a thousand one-member collections overflowed a thread stack
+//! (#632). 0.9.3 bounds those reservations by the remaining bytes and stops at
+//! 128 levels, but a MultiPoint member whose SRID flag overruns the MultiPoint
+//! still panics it.
 //!
 //! [`check_wkb_value`] walks a value once, allocating nothing, and rejects it
 //! before the reader sees it when:
@@ -44,8 +46,13 @@
 //! `geoarrow.wkb` column, which is passed through to the output unchanged and
 //! read by the geoparquet encoder.
 //!
-//! This duplicates checks the `wkb` crate should make itself. Once a `wkb`
-//! release bounds its counts and its nesting, the walk can go.
+//! Since `wkb` 0.9.3 the count and depth checks are a second line of defence
+//! that also gives a precise error; the MultiPoint check is still the only
+//! guard against that panic. Finding a MultiPoint inside a GeometryCollection
+//! takes the whole walk, so the walk can go only once a `wkb` release fixes
+//! the MultiPoint case (#754). Keep [`MAX_NESTING_DEPTH`] at or below the
+//! reader's 128 whatever happens: the pipeline's own per-geometry recursion
+//! is tested to that cap, not the reader's.
 
 use std::fmt;
 
