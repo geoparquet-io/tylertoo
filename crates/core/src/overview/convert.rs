@@ -6956,8 +6956,17 @@ impl GroupInterner {
                     if a.is_null(i) {
                         out.push(Self::NULL_GROUP);
                     } else {
-                        let next = self.map.len() as u32;
-                        let id = *self.map.entry(a.value(i).to_string()).or_insert(next);
+                        // Look up first: only a value seen for the first
+                        // time allocates its key.
+                        let value = a.value(i);
+                        let id = match self.map.get(value) {
+                            Some(&id) => id,
+                            None => {
+                                let id = self.map.len() as u32;
+                                self.map.insert(value.to_string(), id);
+                                id
+                            }
+                        };
                         out.push(id);
                     }
                 }
