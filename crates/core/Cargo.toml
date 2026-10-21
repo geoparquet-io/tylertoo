@@ -69,7 +69,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # PMTiles tile ids: the Hilbert index at each zoom (the crate pmtiles-rs uses).
 fast_hilbert = "2.1"
 serde = { workspace = true }
-serde_json = "1"
+# 1.0.129: Value::sort_all_objects (overview/writer.rs).
+serde_json = "1.0.129"
 i_overlay = "9"
 tempfile = "3"
 object_store = { version = "0.14", features = ["aws", "gcp", "http"], optional = true }

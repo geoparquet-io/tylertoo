@@ -1285,7 +1285,7 @@ fn fold_geo_metadata(
 ///
 /// (`columns` itself is a `HashMap`, but `serde_json::Value`'s map type is a
 /// `BTreeMap` under this crate's default feature set — `to_value` already
-/// sorts column names by key. The explicit `sort_keys` below makes that
+/// sorts column names by key. The explicit `sort_all_objects` below makes that
 /// independent of the feature set: enabling `serde_json/preserve_order`
 /// anywhere in the dependency graph would silently switch `Value::Object` to
 /// an insertion-ordered map and put the `HashMap`'s order straight back into
@@ -1295,7 +1295,7 @@ pub(crate) fn geo_metadata_json_deterministic(
     geo_meta: &GeoParquetMetadata,
 ) -> Result<String, WriterError> {
     let mut value = serde_json::to_value(geo_meta)?;
-    sort_keys(&mut value);
+    value.sort_all_objects();
     if let Some(cols) = value.get_mut("columns").and_then(|c| c.as_object_mut()) {
         for col in cols.values_mut() {
             if let Some(types) = col.get_mut("geometry_types").and_then(|t| t.as_array_mut()) {
@@ -1304,31 +1304,6 @@ pub(crate) fn geo_metadata_json_deterministic(
         }
     }
     Ok(serde_json::to_string(&value)?)
-}
-
-/// Recursively sort every JSON object's keys, for [`geo_metadata_json_deterministic`].
-///
-/// A no-op under `serde_json`'s default `BTreeMap`-backed `Value::Object`
-/// (already sorted); it exists so the footer stays deterministic if the
-/// `preserve_order` feature is ever switched on somewhere in the graph.
-fn sort_keys(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
-                .into_iter()
-                .map(|(k, mut v)| {
-                    sort_keys(&mut v);
-                    (k, v)
-                })
-                .collect();
-            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-            for (k, v) in entries {
-                map.insert(k, v);
-            }
-        }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(sort_keys),
-        _ => {}
-    }
 }
 
 /// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
