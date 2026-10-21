@@ -388,6 +388,10 @@ pub fn tile_id(z: u8, x: u32, y: u32) -> u64 {
 /// `finalize` would happily produce an archive addressing one impossible tile.
 /// The `add_tile*` family already returns [`std::io::Result`], so the zoom is
 /// rejected there — before the id is computed, before any bytes are written.
+///
+/// So is a tile outside its zoom's `2^z x 2^z` grid: the Hilbert index sizes
+/// its curve from `x | y`, so such a tile gets the id of a tile at a deeper
+/// zoom and would overwrite that tile's directory entry.
 fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
     if z > MAX_TILE_ID_ZOOM {
         return Err(std::io::Error::new(
@@ -398,6 +402,12 @@ fn checked_tile_id(z: u8, x: u32, y: u32) -> std::io::Result<u64> {
                  writes at most z{}) (#371)",
                 crate::tile::MAX_ZOOM
             ),
+        ));
+    }
+    if u64::from(x | y) >= 1u64 << z {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("tile {z}/{x}/{y} is outside the zoom {z} grid (x and y must be < 2^{z})"),
         ));
     }
     Ok(tile_id(z, x, y))
@@ -3618,6 +3628,46 @@ mod tests {
             Header::from_bytes(&data[..127]).unwrap().max_zoom,
             MAX_TILE_ID_ZOOM
         );
+    }
+
+    /// A tile outside its zoom's `2^z x 2^z` grid has no tile id at that zoom.
+    /// `fast_hilbert` sizes the curve from `x | y`, so `tile_id(0, 1, 2)` is 5,
+    /// the id of (2, 0, 0): the writer would store the tile under another
+    /// tile's entry. Refuse it like a zoom past the address space.
+    #[test]
+    fn writers_reject_coordinates_outside_the_zoom() {
+        let tile = [0x1a, 0x00];
+        for (z, x, y) in [
+            (0u8, 1u32, 0u32),
+            (0, 0, 1),
+            (1, 2, 2),
+            (3, 5, 40),
+            (MAX_TILE_ID_ZOOM, 1 << 31, 0),
+            (MAX_TILE_ID_ZOOM, 0, u32::MAX),
+        ] {
+            let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+            streaming.set_layer_name("t");
+            let err = streaming
+                .add_tile(z, x, y, &tile)
+                .expect_err("a tile outside its zoom must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains(&format!("{z}/{x}/{y}")),
+                "error names the tile: {err}"
+            );
+            assert!(streaming
+                .add_tile_precompressed(z, x, y, 0, &tile, tile.len(), 0)
+                .is_err());
+        }
+
+        // The grid's far corner is still writable.
+        let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        streaming.set_layer_name("t");
+        streaming.add_tile(3, 7, 7, &tile).unwrap();
+        let max = u32::MAX >> (32 - u32::from(MAX_TILE_ID_ZOOM));
+        streaming
+            .add_tile(MAX_TILE_ID_ZOOM, max, max, &tile)
+            .unwrap();
     }
 
     #[test]
