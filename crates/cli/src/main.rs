@@ -26,7 +26,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use indicatif::HumanBytes;
+use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::assign::BudgetKinds;
@@ -1115,20 +1115,11 @@ impl ConvertTuningArgs {
         use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
         use tylertoo_core::overview::writer::RowGroupSizePolicy;
 
-        let profile = match self.profile.as_str() {
-            "auto" => MemoryProfile::Auto,
-            "speed" => MemoryProfile::Speed,
-            "bounded" => MemoryProfile::Bounded,
-            other => anyhow::bail!("invalid --profile '{other}' (auto|speed|bounded)"),
-        };
-
-        let row_group_size_policy = match self.row_group_size_policy.as_str() {
-            "constant" => RowGroupSizePolicy::Constant,
-            "zoom-scaled" => RowGroupSizePolicy::ZoomScaled,
-            other => {
-                anyhow::bail!("invalid --row-group-size-policy '{other}' (constant|zoom-scaled)")
-            }
-        };
+        let profile: MemoryProfile = self.profile.parse().map_err(anyhow::Error::msg)?;
+        let row_group_size_policy: RowGroupSizePolicy = self
+            .row_group_size_policy
+            .parse()
+            .map_err(anyhow::Error::msg)?;
 
         // `--verbatim` supplies DEFAULTS, it does not override: an explicitly
         // passed knob always wins, so `--verbatim --simplify-factor 0.5`
@@ -1551,29 +1542,23 @@ fn gen_reference_markdown() -> String {
 
 /// Insert an implicit `tiles` subcommand for the backward-compatible bare form.
 ///
-/// If the first token after the global flags is already a subcommand
-/// (`tiles`/`overview`/`validate`/`help`) or the invocation is a
-/// help/version query, the arguments are returned unchanged.
+/// If the first token after the global flags is already a subcommand (any
+/// of clap's, or `help`) or the invocation is a help/version query, the
+/// arguments are returned unchanged.
 fn rewrite_bare_args<I>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    // `gen-reference-docs` is listed unconditionally so the bare-form rewrite
-    // never prepends `tiles` to it. When the `gen-docs` feature is off, clap
-    // rejects it as unknown (correct); when on, it routes to the docs generator.
-    const SUBCOMMANDS: [&str; 11] = [
-        "tiles",
-        "overview",
-        "validate",
-        "export-pmtiles",
-        "decode",
-        "stats",
-        "pyramid",
-        "merge",
-        "shard-plan",
-        "gen-reference-docs",
-        "help",
-    ];
+    // The subcommands come from clap itself, so a new one cannot be missed.
+    // `help` is clap's built-in. `gen-reference-docs` is reserved even when
+    // the `gen-docs` feature compiles it out, so the bare-form rewrite never
+    // prepends `tiles` to it: clap then rejects it as unknown (correct).
+    let is_subcommand_name = |name: &str| {
+        matches!(name, "help" | "gen-reference-docs")
+            || Cli::command()
+                .get_subcommands()
+                .any(|c| c.get_name() == name)
+    };
     let argv: Vec<std::ffi::OsString> = args.into_iter().collect();
 
     // Nothing to rewrite for a bare `tylertoo` (clap prints help/usage).
@@ -1590,7 +1575,7 @@ where
         .skip(1)
         .find(|a| !matches!(a.to_string_lossy().as_ref(), "-q" | "--quiet"));
     let is_subcommand = first_after_globals
-        .map(|a| SUBCOMMANDS.contains(&a.to_string_lossy().as_ref()))
+        .map(|a| is_subcommand_name(a.to_string_lossy().as_ref()))
         .unwrap_or(false);
     let is_help_or_version = argv.iter().skip(1).any(|a| {
         matches!(
@@ -2804,11 +2789,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    let mode = match args.mode.as_str() {
-        "duplicating" => Mode::Duplicating,
-        "partitioning" => Mode::Partitioning,
-        other => anyhow::bail!("invalid --mode '{other}' (duplicating|partitioning)"),
-    };
+    let mode: Mode = args.mode.parse().map_err(anyhow::Error::msg)?;
 
     // #444: the plan is built with `auto`'s placeholder so every cheap check
     // runs first; the estimate (which reads the input) comes last.
@@ -3656,22 +3637,62 @@ fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
     }
 }
 
-/// Format a number with thousands separators
+/// Format a number with thousands separators. A `String`, not the
+/// `HumanCount` itself, so the `{:>10}`-style padding at call sites applies
+/// (`HumanCount`'s `Display` ignores width).
 fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
+    HumanCount(n).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every subcommand clap knows is left alone by the bare-form rewrite,
+    /// and the names it used to hard-code still are.
+    #[test]
+    fn bare_form_rewrite_leaves_every_subcommand_alone() {
+        let mut names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        names.extend(
+            [
+                "tiles",
+                "overview",
+                "validate",
+                "export-pmtiles",
+                "decode",
+                "stats",
+                "pyramid",
+                "merge",
+                "shard-plan",
+                "gen-reference-docs",
+                "help",
+            ]
+            .map(String::from),
+        );
+        for name in names {
+            let argv: Vec<std::ffi::OsString> = ["tylertoo", name.as_str(), "a.parquet"]
+                .map(Into::into)
+                .to_vec();
+            assert_eq!(rewrite_bare_args(argv.clone()), argv, "{name}");
+        }
+        let bare: Vec<std::ffi::OsString> = ["tylertoo", "in.parquet", "out.pmtiles"]
+            .map(Into::into)
+            .to_vec();
+        assert_eq!(rewrite_bare_args(bare)[1], "tiles");
+    }
+
+    #[test]
+    fn format_number_groups_thousands() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+        assert_eq!(format_number(u64::MAX), "18,446,744,073,709,551,615");
+        assert_eq!(format!("{:>8}", format_number(1_000)), "   1,000");
+    }
 
     /// clap's own consistency checks over the whole command tree (conflict
     /// targets that exist, unique short flags, ...), which otherwise run

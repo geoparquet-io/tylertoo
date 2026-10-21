@@ -467,6 +467,7 @@ class OverviewReport(TypedDict):
     wrapped_features: int
     duration_secs: float
     remote_fetch: RemoteFetch | None
+    effective_max_row_group_size: int | None
 ```
 
 * `skipped_empty_levels`: Planned levels with nothing visible.
@@ -476,6 +477,7 @@ class OverviewReport(TypedDict):
 * `unprojectable_features`: Features beyond ±85.05° latitude, which Web Mercator cannot tile.
 * `wrapped_features`: Features past ±180° longitude but within ±540°, drawn wrapped across the antimeridian. Expected for 0..360 data; otherwise the declared CRS may be wrong. Not a loss.
 * `crs_assumed_wgs84`: True when the input declared no CRS and lon/lat WGS84 was assumed. If the coordinates are not lon/lat degrees, the output is misplaced.
+* `effective_max_row_group_size`: The row-group cap actually used, when it had to be raised above `row_group_size` to keep the file under Parquet's row-group limit. None otherwise.
 
 ### `LevelReport`
 
@@ -485,7 +487,7 @@ Counts and sizes for one overview level.
 class LevelReport(TypedDict):
     level: int
     gsd: float
-    zoom: int
+    zoom: int | None
     feature_count: int
     vertex_count: int
     uncompressed_bytes: int
@@ -500,7 +502,7 @@ A planned level omitted because no features are visible.
 class SkippedLevel(TypedDict):
     planned_level: int
     gsd: float
-    zoom: int
+    zoom: int | None
 ```
 
 ### `OutOfRangeExemplar`

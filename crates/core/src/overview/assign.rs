@@ -184,6 +184,19 @@ pub enum SortDirection {
     Asc,
 }
 
+impl std::str::FromStr for SortDirection {
+    type Err = String;
+
+    /// Parse the CLI / Python spelling (desc|asc), case-sensitively.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "desc" => Ok(SortDirection::Desc),
+            "asc" => Ok(SortDirection::Asc),
+            other => Err(format!("invalid sort direction '{other}' (desc|asc)")),
+        }
+    }
+}
+
 /// A single input feature for level assignment.
 ///
 /// Deliberately geometry-free: the caller supplies only the bbox, the kind, and

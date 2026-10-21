@@ -147,19 +147,13 @@ const PLAN_HEADER_LEN: usize = 16;
 
 /// Read `r` to the end, returning the xxh3-64 of what it yielded.
 ///
-/// Streamed in fixed-size chunks rather than slurped: the artifact is
+/// Streamed through `io::copy` rather than slurped: the artifact is
 /// O(input rows), and a planet-scale plan must not be materialized twice
 /// just to be checksummed.
 fn hash_payload<R: Read>(mut r: R) -> std::io::Result<u64> {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = r.read(&mut buf)?;
-        if n == 0 {
-            return Ok(hasher.digest());
-        }
-        hasher.update(&buf[..n]);
-    }
+    std::io::copy(&mut r, &mut hasher)?;
+    Ok(hasher.digest())
 }
 
 /// A `Read + Seek` view of `inner` with its first `offset` bytes hidden.

@@ -39,7 +39,7 @@
 //! 370x faster than scanning column values.
 
 use crate::overview::level::Crs;
-use crate::tile::{lng_lat_to_tile, TileBounds, TileCoord};
+use crate::tile::{TileBounds, TileCoord};
 use crate::Error;
 use arrow_schema::{DataType, Schema};
 use parquet::basic::LogicalType;
@@ -410,7 +410,10 @@ pub fn find_bbox_column_indices(
 
 /// Extract a statistic value from column metadata.
 ///
-/// Handles both f32 and f64 physical types, converting to f64. A **NaN**
+/// Reads FLOAT and DOUBLE statistics through parquet's typed
+/// [`Statistics`](parquet::file::statistics::Statistics), converting to f64.
+/// Any other physical type is `None`: decoding raw stat bytes by width would
+/// read an INT64 column's 10 as about 5e-323, a bogus bound. A **NaN**
 /// statistic reads as *missing* (`None`, #428): it cannot bound anything, and
 /// a caller that treated one as a bound would prune row groups it must read
 /// (every comparison against a NaN is false). arrow-rs leaves NaN out of the
@@ -427,26 +430,11 @@ fn extract_stat_value(
     col_idx: usize,
     use_min: bool,
 ) -> Option<f64> {
-    let col_meta = row_group.column(col_idx);
-    let stats = col_meta.statistics()?;
+    use parquet::file::statistics::Statistics;
 
-    let bytes = if use_min {
-        stats.min_bytes_opt()?
-    } else {
-        stats.max_bytes_opt()?
-    };
-
-    let value = match bytes.len() {
-        4 => {
-            // FLOAT (f32)
-            let arr: [u8; 4] = bytes.try_into().ok()?;
-            f32::from_le_bytes(arr) as f64
-        }
-        8 => {
-            // DOUBLE (f64)
-            let arr: [u8; 8] = bytes.try_into().ok()?;
-            f64::from_le_bytes(arr)
-        }
+    let value = match row_group.column(col_idx).statistics()? {
+        Statistics::Float(s) => f64::from(*if use_min { s.min_opt() } else { s.max_opt() }?),
+        Statistics::Double(s) => *if use_min { s.min_opt() } else { s.max_opt() }?,
         _ => return None,
     };
     (!value.is_nan()).then_some(value)
@@ -868,55 +856,7 @@ fn parse_tile_coords(input: &str) -> Option<Result<TileBounds, Error>> {
         ))));
     }
 
-    Some(Ok(tile_to_bounds(z, x, y)))
-}
-
-/// Convert tile coordinates to WGS84 bounds using Web Mercator projection.
-pub fn tile_to_bounds(z: u8, x: u32, y: u32) -> TileBounds {
-    use std::f64::consts::PI;
-
-    let n = 2f64.powi(z as i32);
-
-    let lng_min = x as f64 / n * 360.0 - 180.0;
-    // In f64, so an out-of-range x or y from a direct caller can't overflow
-    // the `+ 1` (#681).
-    let lng_max = (f64::from(x) + 1.0) / n * 360.0 - 180.0;
-
-    // Note: y=0 is at the top (north), so lat_max uses y, lat_min uses y+1
-    let lat_max = (PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan().to_degrees();
-    let lat_min = (PI * (1.0 - 2.0 * (f64::from(y) + 1.0) / n))
-        .sinh()
-        .atan()
-        .to_degrees();
-
-    TileBounds {
-        lng_min,
-        lat_min,
-        lng_max,
-        lat_max,
-    }
-}
-
-/// Iterator over tiles covering a geographic bounding box at a given zoom level.
-///
-/// Used for coalescing density estimation: count tiles to estimate features-per-tile.
-///
-/// # Arguments
-///
-/// * `bounds` - Geographic bounding box (lng/lat, WGS84)
-/// * `zoom` - Target zoom level
-///
-/// # Returns
-///
-/// Iterator yielding `TileCoord` for each tile that intersects the bounding box.
-pub fn covering_tiles(bounds: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
-    // Convert corner coordinates to tile coordinates
-    let min_tile = lng_lat_to_tile(bounds.lng_min, bounds.lat_max, zoom); // NW corner
-    let max_tile = lng_lat_to_tile(bounds.lng_max, bounds.lat_min, zoom); // SE corner
-
-    // Generate all tiles in the bounding rectangle
-    (min_tile.x..=max_tile.x)
-        .flat_map(move |x| (min_tile.y..=max_tile.y).map(move |y| TileCoord::new(x, y, zoom)))
+    Some(Ok(TileCoord::new(x, y, z).bounds()))
 }
 
 /// Parse bbox in xmin,ymin,xmax,ymax format.
@@ -1184,7 +1124,7 @@ mod tests {
 
     #[test]
     fn test_tile_to_bounds_z0() {
-        let bounds = tile_to_bounds(0, 0, 0);
+        let bounds = TileCoord::new(0, 0, 0).bounds();
         assert!((bounds.lng_min - (-180.0)).abs() < 0.001);
         assert!((bounds.lng_max - 180.0).abs() < 0.001);
         // Web Mercator bounds at z0 are approximately [-85.05, 85.05]
@@ -1195,7 +1135,7 @@ mod tests {
     #[test]
     fn test_tile_to_bounds_sf() {
         // Tile containing San Francisco at z10
-        let bounds = tile_to_bounds(10, 163, 395);
+        let bounds = TileCoord::new(163, 395, 10).bounds();
 
         // SF is roughly at -122.4, 37.8
         assert!(bounds.lng_min < -122.0 && bounds.lng_min > -123.0);
@@ -1276,7 +1216,7 @@ mod tests {
     #[test]
     fn test_tile_to_bounds_does_not_overflow() {
         // A direct caller with an out-of-range tile gets bounds, not a panic.
-        let bounds = tile_to_bounds(0, u32::MAX, u32::MAX);
+        let bounds = TileCoord::new(u32::MAX, u32::MAX, 0).bounds();
         assert!(bounds.lng_max > bounds.lng_min);
     }
 
@@ -1340,67 +1280,6 @@ mod tests {
             "Extracted bounds for {}/{} row groups",
             with_bounds,
             bounds.len()
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Tile Coverage Tests (for coalescing density estimation)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_covering_tiles_single_tile() {
-        // Bounds that fit entirely within a single z10 tile
-        // San Francisco downtown area
-        let bounds = TileBounds::new(-122.42, 37.78, -122.40, 37.80);
-        let tiles: Vec<_> = covering_tiles(&bounds, 10).collect();
-
-        assert_eq!(tiles.len(), 1, "Expected single tile coverage");
-        assert_eq!(tiles[0].z, 10);
-    }
-
-    #[test]
-    fn test_covering_tiles_multiple_tiles() {
-        // Bounds spanning multiple tiles at z10
-        // Larger SF Bay area
-        let bounds = TileBounds::new(-122.5, 37.7, -122.3, 37.9);
-        let tiles: Vec<_> = covering_tiles(&bounds, 10).collect();
-
-        assert!(tiles.len() > 1, "Expected multiple tiles");
-        // All tiles should be at z10
-        assert!(tiles.iter().all(|t| t.z == 10));
-    }
-
-    #[test]
-    fn test_covering_tiles_world_at_z0() {
-        // World bounds at z0 = exactly one tile
-        let bounds = TileBounds::new(-180.0, -85.0, 180.0, 85.0);
-        let tiles: Vec<_> = covering_tiles(&bounds, 0).collect();
-
-        assert_eq!(tiles.len(), 1);
-        assert_eq!(tiles[0], TileCoord::new(0, 0, 0));
-    }
-
-    #[test]
-    fn test_covering_tiles_world_at_z1() {
-        // World bounds at z1 = four tiles (2x2)
-        let bounds = TileBounds::new(-180.0, -85.0, 180.0, 85.0);
-        let tiles: Vec<_> = covering_tiles(&bounds, 1).collect();
-
-        assert_eq!(tiles.len(), 4);
-    }
-
-    #[test]
-    fn test_covering_tiles_count_matches_expected() {
-        // A bbox covering roughly 2x3 tiles at z12
-        let bounds = TileBounds::new(-122.5, 37.7, -122.35, 37.85);
-        let tiles: Vec<_> = covering_tiles(&bounds, 12).collect();
-
-        // Calculate expected: tiles spanning this bbox
-        // We don't need exact count, just verify reasonable range
-        assert!(
-            tiles.len() >= 4 && tiles.len() <= 12,
-            "Expected 4-12 tiles, got {}",
-            tiles.len()
         );
     }
 
@@ -1472,6 +1351,75 @@ mod tests {
             None,
         );
         ParquetMetaData::new(file_meta, vec![rg])
+    }
+
+    /// A covering column with an integer physical type has 8-byte INT64 (or
+    /// 4-byte INT32) statistics. Decoded by width as f64 (or f32) bits, the
+    /// integer 10 reads as about 5e-323, a bogus bbox that prunes row groups it
+    /// must read. Statistics of any type other than FLOAT or DOUBLE mean
+    /// "read it".
+    #[test]
+    fn integer_covering_statistics_are_not_read_as_floats() {
+        use parquet::basic::Type as PhysicalType;
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        use std::sync::Arc;
+
+        for physical in [PhysicalType::INT64, PhysicalType::INT32] {
+            let fields = ["xmin", "ymin", "xmax", "ymax"]
+                .iter()
+                .map(|n| Arc::new(Type::primitive_type_builder(n, physical).build().unwrap()))
+                .collect();
+            let schema = Type::group_type_builder("schema")
+                .with_fields(fields)
+                .build()
+                .unwrap();
+            let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+            let stats = |min: i64, max: i64| match physical {
+                PhysicalType::INT64 => {
+                    Statistics::int64(Some(min), Some(max), None, Some(0), false)
+                }
+                _ => Statistics::int32(Some(min as i32), Some(max as i32), None, Some(0), false),
+            };
+            // Positive values: a negative INT64 read as f64 bits is a NaN, which
+            // the NaN guard already drops.
+            let columns = [(1, 10), (1, 10), (1, 10), (1, 10)]
+                .iter()
+                .enumerate()
+                .map(|(i, &(min, max))| {
+                    ColumnChunkMetaData::builder(descr.column(i))
+                        .set_statistics(stats(min, max))
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let rg = RowGroupMetaData::builder(descr.clone())
+                .set_num_rows(10)
+                .set_column_metadata(columns)
+                .build()
+                .unwrap();
+            let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"covering":{"bbox":{"xmin":["xmin"],"ymin":["ymin"],"xmax":["xmax"],"ymax":["ymax"]}}}}}"#;
+            let file_meta = FileMetaData::new(
+                2,
+                10,
+                None,
+                Some(vec![KeyValue::new("geo".to_string(), geo.to_string())]),
+                descr,
+                None,
+            );
+            let meta = ParquetMetaData::new(file_meta, vec![rg]);
+
+            let bounds = extract_row_group_bounds_from_metadata(&meta).unwrap();
+            assert_eq!(bounds.len(), 1);
+            assert!(
+                bounds[0].is_none(),
+                "{physical:?} statistics must not become a bbox: {:?}",
+                bounds[0]
+            );
+        }
     }
 
     /// A NaN in the stats bbox makes every AABB comparison false, which would

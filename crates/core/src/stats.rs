@@ -28,6 +28,7 @@ use std::collections::BinaryHeap;
 
 use crate::archive_index::ArchiveIndex;
 use crate::pmtiles_writer::tile_id_to_zxy;
+use crate::tile::hilbert_zoom_base;
 use crate::{Error, Result};
 
 /// One zoom level's tile-size distribution, in STORED (compressed) bytes per
@@ -73,13 +74,6 @@ pub struct LargestTile {
 pub struct StatsReport {
     pub per_zoom: Vec<ZoomStats>,
     pub largest: Vec<LargestTile>,
-}
-
-/// First PMTiles tile id at zoom `z`: `(4^z - 1) / 3`. Valid for `z <= 32`
-/// (the value at 32 is the one-past-the-end of z31's block).
-fn zoom_base(z: u8) -> u64 {
-    debug_assert!(z <= 32);
-    (((1u128 << (2 * u32::from(z))) - 1) / 3) as u64
 }
 
 /// Nearest-rank percentile over `(size, count)` pairs sorted ascending by
@@ -176,8 +170,8 @@ pub fn compute_stats(archive: &ArchiveIndex, largest_n: usize) -> Result<StatsRe
             by_zoom.resize(usize::from(z_last) + 1, Vec::new());
         }
         for z in z_first..=z_last {
-            let lo = first.max(zoom_base(z));
-            let hi = last.min(zoom_base(z + 1) - 1);
+            let lo = first.max(hilbert_zoom_base(z));
+            let hi = last.min(hilbert_zoom_base(z + 1) - 1);
             by_zoom[usize::from(z)].push((bytes, hi - lo + 1));
         }
 
@@ -264,10 +258,10 @@ mod tests {
     #[test]
     fn zoom_base_matches_tile_id() {
         for z in 0..=10u8 {
-            assert_eq!(zoom_base(z), tile_id(z, 0, 0), "z{z}");
+            assert_eq!(hilbert_zoom_base(z), tile_id(z, 0, 0), "z{z}");
         }
-        assert_eq!(zoom_base(1), 1);
-        assert_eq!(zoom_base(2), 5);
+        assert_eq!(hilbert_zoom_base(1), 1);
+        assert_eq!(hilbert_zoom_base(2), 5);
     }
 
     #[test]
@@ -424,7 +418,14 @@ mod tests {
             .iter()
             .map(|t| tile_id(t.z, t.x, t.y))
             .collect();
-        assert_eq!(ids, vec![zoom_base(2), zoom_base(2) + 1, zoom_base(2) + 2]);
+        assert_eq!(
+            ids,
+            vec![
+                hilbert_zoom_base(2),
+                hilbert_zoom_base(2) + 1,
+                hilbert_zoom_base(2) + 2
+            ]
+        );
     }
 
     /// Identical tile bodies: a run of consecutive identical tiles and a
@@ -439,7 +440,7 @@ mod tests {
         // first body at a later id (deduplicated, not a run).
         let order: Vec<(u32, u32)> = (0..16u64)
             .map(|d| {
-                let (_, x, y) = tile_id_to_zxy(zoom_base(2) + d).unwrap();
+                let (_, x, y) = tile_id_to_zxy(hilbert_zoom_base(2) + d).unwrap();
                 (x, y)
             })
             .collect();

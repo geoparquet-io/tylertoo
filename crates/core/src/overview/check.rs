@@ -926,17 +926,10 @@ fn find_level_column(metadata: &ParquetMetaData) -> Option<usize> {
     (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == LEVEL_COLUMN)
 }
 
-/// Parse a `MAJOR.MINOR.PATCH` semver and return MAJOR, or `None` if invalid.
+/// Parse a `MAJOR.MINOR.PATCH` semver and return MAJOR, or `None` if invalid
+/// (or if MAJOR does not fit a `u64`).
 fn parse_semver_major(v: &str) -> Option<u64> {
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return None;
-    }
-    parts[0].parse().ok()
+    super::level::semver_parts(v)?[0].parse().ok()
 }
 
 /// Fuzz hook (#633): decode `thrift` as a Parquet footer (the bytes before
@@ -1733,6 +1726,10 @@ mod tests {
         assert_eq!(parse_semver_major("1.2.3"), Some(1));
         assert_eq!(parse_semver_major("1.0"), None);
         assert_eq!(parse_semver_major("x.y.z"), None);
+        assert_eq!(parse_semver_major("1.2.3.4"), None);
+        assert_eq!(parse_semver_major("1..3"), None);
+        assert_eq!(parse_semver_major("1.2.3-rc1"), None);
+        assert_eq!(parse_semver_major("99999999999999999999.0.0"), None);
     }
 
     #[test]

@@ -52,8 +52,12 @@ arrow-array = { workspace = true }
 arrow-select = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-cast = { workspace = true }
+# --filter evaluation kernels (overview/filter.rs).
+arrow-ord = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-buffer = { workspace = true }
 geo = { workspace = true }
-geozero = { workspace = true }
+wkb = { workspace = true }
 prost = { workspace = true }
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -65,9 +69,15 @@ flate2 = "1"
 # Dependabot ignores newer majors; move them only with parquet (#649).
 brotli = "8"
 zstd = "0.13"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
+# PMTiles tile ids: the Hilbert index at each zoom (the crate pmtiles-rs uses).
+fast_hilbert = "2.1"
+# Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
+# already pulls in.
+rstar = "0.12"
 serde = { workspace = true }
-serde_json = "1"
+# 1.0.129: Value::sort_all_objects (overview/writer.rs).
+serde_json = "1.0.129"
 i_overlay = "9"
 tempfile = "3"
 object_store = { version = "0.14", features = ["aws", "gcp", "http"], optional = true }
@@ -110,14 +120,14 @@ libc = "0.2"
 prost-build = { workspace = true }
 
 [dev-dependencies]
-# Only for constructing i256 test values (Decimal256 coverage).
-arrow-buffer = { workspace = true }
 # CodSpeed's criterion shim (#614): identical API, so the benches still
 # `use criterion::…`. Under `cargo codspeed` it measures instruction counts;
 # under plain `cargo bench` it is ordinary criterion.
 criterion = { package = "codspeed-criterion-compat", version = "5", features = ["html_reports"] }
 serde_json = "1"
 proptest = { workspace = true }
+# Test and bench fixtures only: decoding WKB literals into geo types.
+geozero = { workspace = true }
 
 [[bench]]
 name = "clipping"

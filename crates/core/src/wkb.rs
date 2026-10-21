@@ -24,9 +24,13 @@
 //! assert!(matches!(restored, Geometry::Point(_)));
 //! ```
 
-use geo::Geometry;
-use geozero::wkb::Wkb;
-use geozero::{CoordDimensions, ToGeo, ToWkb};
+use geo::{Geometry, Point};
+use geo_traits::to_geo::ToGeoGeometry;
+use geo_traits::{GeometryTrait, GeometryType, PointTrait};
+use wkb::writer::{write_geometry, WriteOptions};
+use wkb::Endianness;
+
+use crate::wkb_column::check_wkb_value;
 
 /// Errors that can occur during WKB serialization/deserialization.
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +46,9 @@ pub type Result<T> = std::result::Result<T, WkbError>;
 
 /// Serialize a geometry to WKB bytes.
 ///
-/// Uses standard OGC WKB format with XY coordinates (no Z or M dimensions).
+/// Writes little-endian ISO WKB with XY coordinates (no Z or M dimensions)
+/// through the `wkb` crate, the same reader and writer geoarrow uses for
+/// GeoParquet columns.
 ///
 /// # Arguments
 /// * `geom` - The geometry to serialize
@@ -62,10 +68,36 @@ pub type Result<T> = std::result::Result<T, WkbError>;
 ///
 /// # Errors
 ///
-/// Returns `WkbError::EncodeError` if the geometry cannot be encoded.
+/// Returns `WkbError::EncodeError` if the geometry cannot be encoded,
+/// including a polygon with holes but an empty exterior: WKB has no way to
+/// say "no exterior ring", and the `wkb` writer would emit a ring count of
+/// zero followed by the holes, which no reader can parse back.
 pub fn geometry_to_wkb(geom: &Geometry) -> Result<Vec<u8>> {
-    geom.to_wkb(CoordDimensions::xy())
-        .map_err(|e| WkbError::EncodeError(e.to_string()))
+    if has_holes_without_exterior(geom) {
+        return Err(WkbError::EncodeError(
+            "a polygon with holes but an empty exterior ring has no WKB encoding".to_string(),
+        ));
+    }
+    let mut out = Vec::new();
+    write_geometry(
+        &mut out,
+        geom,
+        &WriteOptions {
+            endianness: Endianness::LittleEndian,
+        },
+    )
+    .map_err(|e| WkbError::EncodeError(e.to_string()))?;
+    Ok(out)
+}
+
+fn has_holes_without_exterior(geom: &Geometry) -> bool {
+    let polygon = |p: &geo::Polygon| p.exterior().0.is_empty() && !p.interiors().is_empty();
+    match geom {
+        Geometry::Polygon(p) => polygon(p),
+        Geometry::MultiPolygon(mp) => mp.0.iter().any(polygon),
+        Geometry::GeometryCollection(gc) => gc.0.iter().any(has_holes_without_exterior),
+        _ => false,
+    }
 }
 
 /// Deserialize WKB bytes back to a geometry.
@@ -90,188 +122,32 @@ pub fn geometry_to_wkb(geom: &Geometry) -> Result<Vec<u8>> {
 ///
 /// # Hostile input
 ///
-/// The bytes are walked once before geozero sees them, and rejected when any
-/// count in them declares more elements than the remaining bytes can hold.
-/// geozero reserves space for every declared element up front, so without
-/// this walk an 11-byte blob claiming three billion polygons asks the
-/// allocator for 160 GB and aborts the process. After the walk, geozero's
-/// allocations are bounded by a small multiple of `wkb.len()`.
-/// GeometryCollections nested more than 100 deep are rejected too, since both
-/// the walk and geozero recurse once per level.
+/// The bytes come from `--plan` files, which are user input. They pass
+/// `check_wkb_value` before the `wkb` reader sees them, the same walk every
+/// GeoParquet geometry column gets (see the `wkb_column` module): counts the
+/// remaining bytes cannot back, GeometryCollections nested more than 100
+/// deep, and the MultiPoint member that panics the reader are all rejected
+/// with an error. Both paths therefore accept exactly the same WKB.
 ///
 /// # Errors
 ///
-/// Returns `WkbError::DecodeError` if the bytes are not valid WKB or fail the
-/// hostile-input checks below.
+/// Returns `WkbError::DecodeError` if the bytes are not valid WKB, fail the
+/// hostile-input checks above, or hold an empty point inside another
+/// geometry, which `geo` cannot represent.
 pub fn wkb_to_geometry(wkb: &[u8]) -> Result<Geometry> {
-    check_wkb_bounds(wkb).map_err(WkbError::DecodeError)?;
-    Wkb(wkb)
-        .to_geo()
-        .map_err(|e| WkbError::DecodeError(e.to_string()))
-}
-
-/// Deepest GeometryCollection nesting [`wkb_to_geometry`] accepts. Real data
-/// nests one or two levels; the cap exists so a crafted blob cannot recurse
-/// the decoder into a stack overflow.
-const MAX_NESTING_DEPTH: usize = 100;
-
-/// Smallest encoding of any geometry the walk accepts: a 5-byte header plus a
-/// 4-byte count (an empty LineString, Polygon, Multi* or collection).
-const MIN_GEOMETRY_BYTES: u64 = 9;
-
-/// Smallest MultiPoint member: a 5-byte header plus an XY coordinate.
-const MIN_MEMBER_POINT_BYTES: u64 = 5 + 16;
-
-/// Walk OGC/ISO WKB exactly as geozero's `Wkb` reader does, allocating
-/// nothing, and fail on the first count the remaining bytes cannot back.
-///
-/// It mirrors geozero rather than the spec where the two differ, so that it
-/// accepts every blob geozero decodes: any non-zero byte-order byte means
-/// little-endian, the type code is `dims * 1000 + base`, and the members of a
-/// Multi* take their byte order and dimensions from their own header while
-/// their base type is not checked. Trailing bytes are ignored, as geozero
-/// ignores them. Curve, surface and triangle types are rejected: geozero
-/// cannot build a `geo::Geometry` from them, and the one case it tolerates
-/// (an empty one inside a collection) it silently drops.
-///
-/// Returns the number of bytes the geometry occupies, which is where geozero
-/// stops reading too.
-fn check_wkb_bounds(wkb: &[u8]) -> std::result::Result<usize, String> {
-    let mut cursor = Cursor { buf: wkb, pos: 0 };
-    cursor.geometry(0)?;
-    Ok(cursor.pos)
-}
-
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-/// A geometry header: byte order, base type, and bytes per coordinate.
-#[derive(Clone, Copy)]
-struct Header {
-    little_endian: bool,
-    base_type: u32,
-    coord_bytes: u64,
-}
-
-impl Cursor<'_> {
-    fn remaining(&self) -> u64 {
-        (self.buf.len() - self.pos) as u64
-    }
-
-    fn skip(&mut self, n: u64) -> std::result::Result<(), String> {
-        if n > self.remaining() {
-            return Err(format!(
-                "WKB truncated: needs {n} more bytes at offset {}, {} remain",
-                self.pos,
-                self.remaining()
-            ));
-        }
-        self.pos += n as usize;
-        Ok(())
-    }
-
-    fn u32(&mut self, little_endian: bool) -> std::result::Result<u32, String> {
-        let start = self.pos;
-        self.skip(4)?;
-        let bytes: [u8; 4] = self.buf[start..self.pos]
-            .try_into()
-            .expect("skip(4) advanced exactly four bytes");
-        Ok(if little_endian {
-            u32::from_le_bytes(bytes)
-        } else {
-            u32::from_be_bytes(bytes)
-        })
-    }
-
-    fn header(&mut self) -> std::result::Result<Header, String> {
-        let start = self.pos;
-        self.skip(1)?;
-        let little_endian = self.buf[start] != 0;
-        let type_id = self.u32(little_endian)?;
-        let dims = type_id / 1000;
-        let has_z = matches!(dims, 1 | 3);
-        let has_m = matches!(dims, 2 | 3);
-        Ok(Header {
-            little_endian,
-            base_type: type_id % 1000,
-            coord_bytes: 8 * (2 + u64::from(has_z) + u64::from(has_m)),
-        })
-    }
-
-    /// Read a count and check that `count` elements of at least
-    /// `min_element_bytes` each fit in what is left.
-    fn count(
-        &mut self,
-        header: Header,
-        min_element_bytes: u64,
-        what: &str,
-    ) -> std::result::Result<u32, String> {
-        let n = self.u32(header.little_endian)?;
-        let remaining = self.remaining();
-        if u64::from(n) * min_element_bytes > remaining {
-            return Err(format!(
-                "WKB declares {n} {what} but only {remaining} bytes remain \
-                 (each needs at least {min_element_bytes})"
-            ));
-        }
-        Ok(n)
-    }
-
-    fn points(&mut self, header: Header) -> std::result::Result<(), String> {
-        let n = self.count(header, header.coord_bytes, "points")?;
-        self.skip(u64::from(n) * header.coord_bytes)
-    }
-
-    fn rings(&mut self, header: Header) -> std::result::Result<(), String> {
-        for _ in 0..self.count(header, 4, "rings")? {
-            self.points(header)?;
-        }
-        Ok(())
-    }
-
-    fn geometry(&mut self, depth: usize) -> std::result::Result<(), String> {
-        let header = self.header()?;
-        match header.base_type {
-            1 => self.skip(header.coord_bytes),
-            2 => self.points(header),
-            3 => self.rings(header),
-            4 => {
-                for _ in 0..self.count(header, MIN_MEMBER_POINT_BYTES, "points")? {
-                    let member = self.header()?;
-                    self.skip(member.coord_bytes)?;
-                }
-                Ok(())
-            }
-            5 => {
-                for _ in 0..self.count(header, MIN_GEOMETRY_BYTES, "linestrings")? {
-                    let member = self.header()?;
-                    self.points(member)?;
-                }
-                Ok(())
-            }
-            6 => {
-                for _ in 0..self.count(header, MIN_GEOMETRY_BYTES, "polygons")? {
-                    let member = self.header()?;
-                    self.rings(member)?;
-                }
-                Ok(())
-            }
-            7 => {
-                if depth >= MAX_NESTING_DEPTH {
-                    return Err(format!(
-                        "WKB nests GeometryCollections deeper than {MAX_NESTING_DEPTH} levels"
-                    ));
-                }
-                for _ in 0..self.count(header, MIN_GEOMETRY_BYTES, "geometries")? {
-                    self.geometry(depth + 1)?;
-                }
-                Ok(())
-            }
-            other => Err(format!("unsupported WKB geometry type {other}")),
+    check_wkb_value(wkb).map_err(|e| WkbError::DecodeError(e.to_string()))?;
+    let value = wkb::reader::read_wkb(wkb).map_err(|e| WkbError::DecodeError(e.to_string()))?;
+    // An empty point (WKB writes it as NaN NaN) is a top-level
+    // `Point(NaN, NaN)`, as `geometry_to_wkb` wrote it; geo-traits' conversion
+    // has no value for it.
+    if let GeometryType::Point(p) = value.as_type() {
+        if p.coord().is_none() {
+            return Ok(Geometry::Point(Point::new(f64::NAN, f64::NAN)));
         }
     }
+    value.try_to_geometry().ok_or_else(|| {
+        WkbError::DecodeError("WKB holds an empty point inside another geometry".to_string())
+    })
 }
 
 #[cfg(test)]
@@ -499,13 +375,16 @@ mod tests {
     // ========================================================================
 
     /// The nightly fuzz run's crash input (#623): a MultiPolygon header that
-    /// declares 3,338,651,383 polygons in an 11-byte blob. geozero reserves
-    /// room for every declared polygon before reading one, so this asked the
-    /// allocator for 160 GB.
+    /// declares 3,338,651,383 polygons in an 11-byte blob. Its byte-order byte
+    /// is 10, which the `wkb` reader rejects outright. The same count behind a
+    /// plain MultiPolygon header is named by the count check.
     #[test]
     fn test_fuzz_623_huge_multipolygon_count_is_rejected() {
         let bytes = [10, 198, 255, 193, 255, 247, 198, 255, 198, 198, 255];
-        let err = wkb_to_geometry(&bytes).expect_err("an 11-byte blob holds no polygons");
+        let err = wkb_to_geometry(&bytes).expect_err("byte order 10 is not WKB");
+        assert!(err.to_string().contains("byte order 10"), "{err}");
+        let bytes = with_count(header(6), 3_338_651_383);
+        let err = wkb_to_geometry(&bytes).expect_err("a 9-byte blob holds no polygons");
         assert!(
             err.to_string().contains("declares 3338651383 polygons"),
             "the error must name the impossible count: {err}"
@@ -531,86 +410,38 @@ mod tests {
         v
     }
 
-    fn assert_count_rejected(bytes: &[u8], what: &str) {
-        let err = wkb_to_geometry(bytes).expect_err("the count cannot fit");
-        assert!(
-            err.to_string()
-                .contains(&format!("declares {} {what}", u32::MAX)),
-            "expected a {what} count error, got: {err}"
-        );
-    }
-
     /// Every count in the format is checked, not just the one the fuzzer hit.
-    /// Each blob declares `u32::MAX` elements, which would reserve tens of GB.
+    /// Each blob declares `u32::MAX` elements, which would once have reserved
+    /// tens of GB. Point counts are read lazily and fail as truncated; counts
+    /// the reader reserves for are named.
     #[test]
     fn test_every_count_site_rejects_an_impossible_count() {
-        assert_count_rejected(&with_count(header(2), u32::MAX), "points");
-        assert_count_rejected(&with_count(header(3), u32::MAX), "rings");
-        assert_count_rejected(&with_count(with_count(header(3), 1), u32::MAX), "points");
-        assert_count_rejected(&with_count(header(4), u32::MAX), "points");
-        assert_count_rejected(&with_count(header(5), u32::MAX), "linestrings");
-        let mut member_line = with_count(header(5), 1);
-        member_line.extend(with_count(header(2), u32::MAX));
-        assert_count_rejected(&member_line, "points");
+        let named = |bytes: &[u8], what: &str| {
+            let err = wkb_to_geometry(bytes).expect_err("the count cannot fit");
+            assert!(
+                err.to_string()
+                    .contains(&format!("declares {} {what}", u32::MAX)),
+                "expected a {what} count error, got: {err}"
+            );
+        };
+        named(&with_count(header(3), u32::MAX), "rings");
+        named(&with_count(header(5), u32::MAX), "linestrings");
+        named(&with_count(header(6), u32::MAX), "polygons");
+        named(&with_count(header(7), u32::MAX), "geometries");
         let mut member_polygon = with_count(header(6), 1);
         member_polygon.extend(with_count(header(3), u32::MAX));
-        assert_count_rejected(&member_polygon, "rings");
-        assert_count_rejected(&with_count(header(6), u32::MAX), "polygons");
-        assert_count_rejected(&with_count(header(7), u32::MAX), "geometries");
-    }
+        named(&member_polygon, "rings");
 
-    /// The walk must step over exactly the bytes each geometry occupies. A
-    /// walk that mis-sizes coordinates can still pass, because geozero then
-    /// fails on the same input, so the byte count is asserted directly.
-    #[test]
-    fn test_walk_consumes_exactly_the_geometry() {
-        let point_zm = coords(header(3001), &[1.0, 2.0, 3.0, 4.0]);
-        let point_z = coords(header(1001), &[1.0, 2.0, 3.0]);
-        let point_m = coords(header(2001), &[1.0, 2.0, 3.0]);
-        let line_zm = coords(with_count(header(3002), 2), &[0.0; 8]);
-        let mut multi_line = with_count(header(5), 2);
-        for _ in 0..2 {
-            multi_line.extend(coords(with_count(header(2), 2), &[0.0, 0.0, 1.0, 1.0]));
-        }
-        let mut multi_point_zm = with_count(header(4), 2);
-        for _ in 0..2 {
-            multi_point_zm.extend(coords(header(3001), &[1.0, 2.0, 3.0, 4.0]));
-        }
-        let round_trips: Vec<Vec<u8>> = [
-            Geometry::Point(point!(x: 1.0, y: 2.0)),
-            Geometry::Polygon(polygon![
-                (x: 0.0, y: 0.0), (x: 4.0, y: 0.0), (x: 4.0, y: 4.0), (x: 0.0, y: 0.0)
-            ]),
-        ]
-        .iter()
-        .map(|g| geometry_to_wkb(g).expect("encode"))
-        .collect();
+        let mut member_line = with_count(header(5), 1);
+        member_line.extend(with_count(header(2), u32::MAX));
         for bytes in [
-            point_zm,
-            point_z,
-            point_m,
-            line_zm,
-            multi_line,
-            multi_point_zm,
-        ]
-        .into_iter()
-        .chain(round_trips)
-        {
-            assert_eq!(
-                check_wkb_bounds(&bytes),
-                Ok(bytes.len()),
-                "the walk must end exactly at the end of {bytes:?}"
-            );
+            with_count(header(2), u32::MAX),
+            with_count(with_count(header(3), 1), u32::MAX),
+            with_count(header(4), u32::MAX),
+            member_line,
+        ] {
+            assert!(wkb_to_geometry(&bytes).is_err(), "{bytes:?}");
         }
-    }
-
-    /// A count only slightly too large is caught by the count check itself,
-    /// not left for the truncation check or for geozero.
-    #[test]
-    fn test_a_count_one_element_too_large_is_rejected_by_the_count_check() {
-        let line = coords(with_count(header(2), 3), &[0.0, 0.0, 1.0, 1.0]);
-        let err = check_wkb_bounds(&line).expect_err("three points need 48 bytes, 32 remain");
-        assert!(err.contains("declares 3 points"), "{err}");
     }
 
     /// A count that exactly fills the remaining bytes is valid.
@@ -626,15 +457,17 @@ mod tests {
         assert!(wkb_to_geometry(&short).is_err());
     }
 
-    /// Z, M and ZM coordinates are 24, 24 and 32 bytes. The walk must size
-    /// them as geozero does, or it would reject valid 3D input.
+    /// Z, M and ZM coordinates are 24, 24 and 32 bytes; they decode to XY.
     #[test]
     fn test_iso_z_m_and_zm_coordinates_are_sized_correctly() {
         for (type_id, n_values) in [(1001, 3), (2001, 3), (3001, 4)] {
-            let values: Vec<f64> = (0..n_values).map(f64::from).collect();
+            let values: Vec<f64> = (1..=n_values).map(f64::from).collect();
             let point = coords(header(type_id), &values);
             assert!(
-                matches!(wkb_to_geometry(&point), Ok(Geometry::Point(_))),
+                matches!(
+                    wkb_to_geometry(&point),
+                    Ok(Geometry::Point(p)) if (p.x(), p.y()) == (1.0, 2.0)
+                ),
                 "type {type_id}: a complete point must decode"
             );
             let truncated = &point[..point.len() - 1];
@@ -662,6 +495,49 @@ mod tests {
         }
     }
 
+    /// A NaN point (how the pipeline carries a missing point) round-trips as
+    /// `Point(NaN, NaN)`; the `wkb` reader alone would call it empty.
+    #[test]
+    fn test_nan_point_round_trips() {
+        let nan = Geometry::Point(Point::new(f64::NAN, f64::NAN));
+        match wkb_to_geometry(&geometry_to_wkb(&nan).unwrap()).unwrap() {
+            Geometry::Point(p) => assert!(p.x().is_nan() && p.y().is_nan()),
+            other => panic!("Expected Point, got {other:?}"),
+        }
+    }
+
+    /// WKB cannot hold holes without an exterior ring; refuse to write bytes
+    /// that would not read back.
+    #[test]
+    fn test_holes_without_exterior_fail_to_encode() {
+        let hole = LineString::from(vec![(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 1.0)]);
+        let polygon = Polygon::new(LineString::new(vec![]), vec![hole]);
+        for geom in [
+            Geometry::Polygon(polygon.clone()),
+            Geometry::MultiPolygon(MultiPolygon(vec![polygon])),
+        ] {
+            assert!(matches!(
+                geometry_to_wkb(&geom),
+                Err(WkbError::EncodeError(_))
+            ));
+        }
+    }
+
+    /// `--plan` WKB and GeoParquet WKB follow one set of rules: the base type
+    /// is `code & 7`, as the `wkb` reader reads it.
+    #[test]
+    fn test_plan_wkb_follows_the_column_rules() {
+        // 8 has no base type; 17 (Triangle) reads as a Point, as it does in a
+        // GeoParquet column.
+        assert!(wkb_to_geometry(&with_count(header(8), 0)).is_err());
+        let triangle_code = coords(header(17), &[1.0, 2.0]);
+        assert!(check_wkb_value(&triangle_code).is_ok());
+        assert!(matches!(
+            wkb_to_geometry(&triangle_code),
+            Ok(Geometry::Point(_))
+        ));
+    }
+
     /// Wrap `inner` in `levels` GeometryCollections of one member each.
     fn nest(inner: Vec<u8>, levels: usize) -> Vec<u8> {
         (0..levels).fold(inner, |acc, _| {
@@ -673,6 +549,7 @@ mod tests {
 
     #[test]
     fn test_collection_nesting_is_capped() {
+        use crate::wkb_column::MAX_NESTING_DEPTH;
         let point = coords(header(1), &[1.0, 2.0]);
         assert!(
             wkb_to_geometry(&nest(point.clone(), MAX_NESTING_DEPTH)).is_ok(),
@@ -681,21 +558,6 @@ mod tests {
         let err = wkb_to_geometry(&nest(point, MAX_NESTING_DEPTH + 1))
             .expect_err("one level past the cap");
         assert!(err.to_string().contains("deeper than"), "{err}");
-    }
-
-    #[test]
-    fn test_unsupported_types_are_rejected_by_name() {
-        // CircularString (8) and Triangle (17): geozero reads them but cannot
-        // build a geo::Geometry from them.
-        for type_id in [8, 17] {
-            let err = wkb_to_geometry(&with_count(header(type_id), 0))
-                .expect_err("not representable as geo::Geometry");
-            assert!(
-                err.to_string()
-                    .contains(&format!("unsupported WKB geometry type {type_id}")),
-                "{err}"
-            );
-        }
     }
 
     /// Mixed members of a collection, each with its own byte order, still
