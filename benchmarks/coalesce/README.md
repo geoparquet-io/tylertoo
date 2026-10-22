@@ -25,7 +25,7 @@ work whose inputs haven't changed:
 | `tile` | `tylertoo overview` then `export-pmtiles` for each dataset and setting, `repeats` times each, under GNU time with a wall and RSS cap (`run_matrix.run_cell`) | binary sha256, input, flags, repeats |
 | `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`, 2.79.0) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments |
 | `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s and the entry's config |
-| `report` | `report.json` and `report.md` in `<work>/runs/<binary>/`, copied to `<work>/` | — |
+| `report` | `report-<profile>.json` and `.md` in `<work>/runs/<binary>/`; the latest run's also as `<work>/report.json` and `report.md` | — |
 
 `--only tile,report` runs only the named steps. Any step you leave out must
 already be cached.

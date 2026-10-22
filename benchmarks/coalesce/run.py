@@ -24,8 +24,8 @@ The steps, each cached under --work so a rerun picks up where it stopped:
               profile). Cached per tippecanoe commit, input and arguments.
   score       render_maplibre.py per window, render_coverage.py and
               tile_metrics.py per check.
-  report      report.json and report.md, in <work>/runs/<binary>/ and
-              copied to <work>/.
+  report      report-<profile>.json and .md in <work>/runs/<binary>/, and
+              the latest as report.json and report.md in <work>/.
 
 `--only tile,report` runs just those steps; the others must be cached.
 """
@@ -780,9 +780,10 @@ def main() -> int:
     }
     baseline = json.loads(args.compare.read_text()) if args.compare else None
     md = render_markdown(report, baseline)
-    for d in (run_dir, work):
-        (d / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-        (d / "report.md").write_text(md)
+    # Per profile in the run's directory; the latest of any profile in --work.
+    for d, stem in ((run_dir, f"report-{plan['name']}"), (work, "report")):
+        (d / f"{stem}.json").write_text(json.dumps(report, indent=2) + "\n")
+        (d / f"{stem}.md").write_text(md)
     print(md)
     print(f"[run] done in {report['elapsed_s']:.0f} s: {work / 'report.md'}", flush=True)
     return 0
