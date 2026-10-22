@@ -441,7 +441,9 @@ def host_info() -> dict:
 
 def binary_info(binary: Path) -> dict:
     git = sh(["git", "rev-parse", "--short", "HEAD"], cwd=REPO)
-    if sh(["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPO):
+    # Dirty only if the source the binary is built from has changed.
+    if sh(["git", "status", "--porcelain", "--untracked-files=no", "--",
+           "crates", "Cargo.toml", "Cargo.lock"], cwd=REPO):
         git += "-dirty"
     return {"path": str(binary), "sha256": run_matrix.sha256(binary), "git": git,
             "version": sh([str(binary), "--version"]), "file": sh(["file", "-b", str(binary)]),
