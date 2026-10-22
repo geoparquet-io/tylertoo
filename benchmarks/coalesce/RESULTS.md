@@ -5,10 +5,11 @@ and merging oversized tiles) with the defaults before #745 for speed, memory use
 For the resulting decision, see
 [`corpus/SWEEPS.md` Decision 8](../../corpus/SWEEPS.md).
 
-This file records the #745 investigation. Its numbers come from builds made
+This file records the #745 investigation and measurements from builds made
 during that work. To rerun the measurements on the current binary, use
-`run.py` ([README.md](README.md)). The current numbers are in
-[`baseline/`](baseline/), and README.md lists where they differ from these.
+`run.py` as described in the [benchmark instructions](README.md). You can find
+the current numbers in the [baseline reports](baseline/). The `README.md`
+comparison describes how those numbers differ from these measurements.
 
 ## Setup
 
