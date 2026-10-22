@@ -39,6 +39,7 @@ tippecanoe runs as one stage: its wall time is under End to end and its peak RSS
 | --simplify-factor 0 | 17.20 s | 21.96 GiB | 122.03 s | 8.72 GiB | 139.23 s | 2.65× | 8,480 MB | 1,729 MB | 3,936,650 | 94 |
 | tippecanoe |  |  |  | 6.26 GiB | 1900.86 s | 36.21× |  | 884 MB |  |  |
 
+The tippecanoe time is seeded from the #745 run of 2026-10-20 (same tippecanoe commit, input and arguments; timing from its GNU time log).
 tippecanoe runs as one stage: its wall time is under End to end and its peak RSS under Export RSS.
 
 ## Rendered coverage (MapLibre)

@@ -128,9 +128,13 @@ Two marks flag cells to treat with care:
 ## Baselines
 
 `baseline/` contains a report for each profile and identifies the host:
-c7g.16xlarge, 64 Arm cores, a glibc build. Each timed run started with the
-load average below 6.4 (a tenth of the cores). To compare your change with
-the baseline, run:
+c7g.16xlarge, 64 Arm cores, a glibc build. The binary was built at `67a221e`,
+whose Rust code is the same as `main` at `fc64fe1`. The baselines predate the
+review fixes in the harness, so they don't carry † marks. Their times come
+from two load gates: Madagascar, and Moldova's before-#745 and defaults
+cells, started with the load average below 3. Moldova's `sf0.25` and `sf0`
+cells, and all of NZ, started below 6.4. The NZ tippecanoe time is seeded
+from the #745 run. To compare your change with the baseline, run:
 
 ```bash
 uv run benchmarks/coalesce/run.py --profile small --compare benchmarks/coalesce/baseline/small.json
@@ -140,7 +144,7 @@ When your PR intentionally changes generalization, replace the baseline in
 the same PR. Copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
 `baseline/<profile>.*`.
 
-## Findings (`baseline/`, `fc64fe1`)
+## Findings (`baseline/`)
 
 - **`--simplify-factor 0` slows the merge valve on dense fields
   ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)).** The
@@ -220,7 +224,7 @@ The `full` profile reproduces the NZ rows:
 The one exception is Madagascar's before-#745 MapLibre column. The
 `RESULTS.md` measurements use an archive built to `--max-zoom 10`; this
 benchmark builds every Madagascar archive to z12 (see
-[Findings](#findings-baseline-fc64fe1)). Other differences from the #745 runs:
+[Findings](#findings-baseline)). Other differences from the #745 runs:
 
 - Each dataset's archives are all built from its Hilbert-sorted input with
   one tool chain. #745 built some Madagascar archives from the unsorted
