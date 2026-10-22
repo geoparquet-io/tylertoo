@@ -115,16 +115,26 @@ Before writing any tile, the export reads the finest level once and works out,
 for every coarser tile, the area its child tiles cover. Each tile then draws
 that area under its own features.
 
-- Touching shapes in the fill are merged into one and simplified at one
-  ground pixel, so at coarse zooms the fill reads as dissolved shapes, not
-  individual polygons. Area lost to the
-  simplification comes back as small grid-aligned squares.
-- Each piece of the fill takes the id and attributes of the feature it sits
-  under, as a merged feature does, so a choropleth colors it like its
-  neighbors.
-- The fill counts toward the [size cap](#tile-size-cap): the size valve merges
-  or drops the tile's own features to make room for it.
-- It is skipped for sharded builds.
+- Touching shapes in the fill are merged into one and simplified at 4 tile
+  units (one GSD at the default `--gsd-base` and extent), so at coarse zooms
+  the fill reads as dissolved shapes, not individual polygons. Area lost to
+  the simplification comes back as small grid-aligned squares near where it
+  was lost.
+- Each piece of the fill takes the id and attributes of one feature it sits
+  under, as a merged feature does. In a dense coverage one dissolved piece
+  can span many features, so a style that colors by attribute draws that
+  piece in one feature's color, and a style that draws one class above
+  another can draw it over the other class.
+- The fill takes at most about half of the [size cap](#tile-size-cap),
+  dropping its smallest pieces first; the size valve merges or drops the
+  tile's own features to fit in the rest.
+- The fill is built from the finest level, so it also draws the area of
+  polygons that `--drop-polygons` or a dot-fill recipe removed from coarse
+  levels.
+- The export holds the finest level's geometry in memory while it builds
+  the fill, outside the RAM budget the export plans for: about 0.5 GB more
+  on 4.3M NZ parcels, growing with the input.
+- It is skipped with `--tile-range` or `--zoom-ceiling` (sharded builds).
 
 On the benchmark inputs, the fill adds about 10% to end-to-end time on NZ
 parcels and Madagascar admin-4 and 3–4% to the archive. On FTW Moldova, where

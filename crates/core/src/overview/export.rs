@@ -2650,7 +2650,10 @@ fn build_fills_if_asked(
         return Ok(None);
     }
     if options.tile_range.is_some() || options.zoom_ceiling.is_some() {
-        log::warn!("[export] --coverage-fill is ignored for a sharded job");
+        log::warn!(
+            "[export] --coverage-fill is ignored with --tile-range or --zoom-ceiling: \
+             the fill is built from the finest level, which those jobs leave out"
+        );
         return Ok(None);
     }
     coverage_fill::build_fill_map(
@@ -5814,8 +5817,11 @@ fn encode_members(
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
             let fill = fills
-                .and_then(|f| f.get(g[0].key))
-                .map(|polys| fill_features(polys, g, &tb, opts))
+                .and_then(|f| {
+                    let (feats, shed) = fill_features(f.get(g[0].key)?, g, &tb, opts);
+                    f.note_shed(shed);
+                    Some(feats)
+                })
                 .unwrap_or_default();
             let mvt = encode_tile(g, &tb, opts, &fill);
             if mvt.features == 0 {
@@ -5928,10 +5934,14 @@ fn fill_features(
     members: &[Member],
     tb: &TileBounds,
     opts: &ExportOptions,
-) -> Vec<FillFeature> {
+) -> (Vec<FillFeature>, usize) {
     if members.is_empty() || polys.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
+    let (kept, shed) = coverage_fill::within_budget(polys, fill_budget(opts));
+    let polys: Vec<coverage_fill::FillPolygon> =
+        kept.into_iter().map(|i| polys[i].clone()).collect();
+    let polys = polys.as_slice();
     let proj = crate::mvt::TileProjector::new(tb, opts.extent);
     let hosts: Vec<[f64; 4]> = members
         .iter()
@@ -5949,7 +5959,7 @@ fn fill_features(
     for (poly, host) in polys.iter().zip(coverage_fill::assign_hosts(polys, &hosts)) {
         groups.entry(host).or_default().push(poly);
     }
-    groups
+    let feats = groups
         .into_iter()
         .filter_map(|(host, group)| {
             let cmds = crate::mvt::encode_tile_unit_polygons(group);
@@ -5959,7 +5969,24 @@ fn fill_features(
                 cmds,
             })
         })
-        .collect()
+        .collect();
+    (feats, shed)
+}
+
+/// About how many bytes a tile's #750 fill may take: half its size limit,
+/// with a compressed limit read as about twice that many raw bytes.
+/// Unlimited without a limit.
+fn fill_budget(opts: &ExportOptions) -> usize {
+    let raw = opts.tile_size_limit.filter(|&l| l > 0);
+    let gz = opts
+        .compressed_tile_size_limit
+        .filter(|&l| l > 0)
+        .map(|l| l.saturating_mul(2));
+    match (raw, gz) {
+        (Some(a), Some(b)) => a.min(b) / 2,
+        (Some(a), None) | (None, Some(a)) => a / 2,
+        (None, None) => usize::MAX,
+    }
 }
 
 /// What [`build_mvt`] needs from a tile feature: a plain member, or a member
@@ -6096,10 +6123,14 @@ fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
 fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions, fill: &FillBytes) -> Result<f64, ExportError> {
     let share = |limit: usize, size: usize, fixed: usize| -> f64 {
         let (limit, size, fixed) = (limit as f64, size as f64, fixed as f64);
-        if size <= limit || fixed == 0.0 {
+        // A fill as big as the limit, or as the tile (gzip is not additive),
+        // leaves the members no share to fit: fall back to the whole tile's
+        // ratio rather than strip its own features to keep the fill. The
+        // fill's budget (`coverage_fill::within_budget`) keeps this rare.
+        if size <= limit || fixed == 0.0 || fixed >= limit || fixed >= size {
             return limit / size;
         }
-        ((limit - fixed) / (size - fixed)).max(0.0)
+        (limit - fixed) / (size - fixed)
     };
     let mut fit = f64::INFINITY;
     if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
@@ -9720,10 +9751,11 @@ mod tests {
         );
         // Under the limit the fit is the plain ratio either way.
         assert_eq!(tile_fit(&mut mvt(250), &opts, &fill).unwrap(), 2.0);
-        // A fill alone over the limit leaves the members nothing: fit 0, so
-        // the valve merges as far as it can rather than skipping the tile.
+        // A fill as big as the limit leaves the members no share: the fit
+        // falls back to the whole tile's ratio, so the valve shrinks the
+        // tile's own features no harder than it would without a fill.
         let big = FillBytes::known(600, 0);
-        assert_eq!(tile_fit(&mut mvt(1000), &opts, &big).unwrap(), 0.0);
+        assert_eq!(tile_fit(&mut mvt(1000), &opts, &big).unwrap(), 0.5);
     }
 
     /// #750: fill features are drawn but not counted as tile features, so the
@@ -9781,7 +9813,8 @@ mod tests {
             |x: i32, y: i32| vec![vec![(x, y), (x + 100, y), (x + 100, y + 100), (x, y + 100)]];
         // Two polygons in the west half, one in the east half.
         let polys = vec![square(100, 100), square(3000, 2000), square(300, 3000)];
-        let fill = fill_features(&polys, &members, &tb, &ExportOptions::default());
+        let (fill, shed) = fill_features(&polys, &members, &tb, &ExportOptions::default());
+        assert_eq!(shed, 0);
         let tagged: Vec<(Option<u64>, String)> = fill
             .iter()
             .map(|f| match &f.props[0].1 {

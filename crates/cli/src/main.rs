@@ -619,9 +619,11 @@ struct ExportPmtilesArgs {
 
     /// Fill the holes that dense small polygons (parcels, fields, small
     /// admin units) leave at coarse zooms: under each tile's features, also
-    /// draw the area its child tiles cover, carrying the attributes of the
-    /// feature it sits under. Adds about 10% to export time on dense
-    /// coverages; scattered sub-pixel polygons may be over-drawn.
+    /// draw the area its child tiles cover, with the attributes of one feature
+    /// it sits under. Adds about 10% to export time on dense coverages and
+    /// holds the finest level's geometry in memory; scattered sub-pixel
+    /// polygons may be over-drawn. Ignored with --tile-range or
+    /// --zoom-ceiling.
     #[arg(long)]
     coverage_fill: bool,
 
@@ -1405,9 +1407,11 @@ struct TilesArgs {
 
     /// Fill the holes that dense small polygons (parcels, fields, small
     /// admin units) leave at coarse zooms: under each tile's features, also
-    /// draw the area its child tiles cover, carrying the attributes of the
-    /// feature it sits under. Adds about 10% to export time on dense
-    /// coverages; scattered sub-pixel polygons may be over-drawn.
+    /// draw the area its child tiles cover, with the attributes of one feature
+    /// it sits under. Adds about 10% to export time on dense coverages and
+    /// holds the finest level's geometry in memory; scattered sub-pixel
+    /// polygons may be over-drawn. Ignored with --tile-range or
+    /// --zoom-ceiling.
     #[arg(long)]
     coverage_fill: bool,
 

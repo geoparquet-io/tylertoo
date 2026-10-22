@@ -20,15 +20,21 @@
 //!
 //! Area that the simplification loses — rings that collapse, and the convex
 //! corners Douglas–Peucker shaves off the rings it keeps — is not dropped:
-//! it goes to a placeholder accumulator ([`squares_for_collapsed`]) whose
-//! squares sit on a grid, so they never overlap. The fill keeps its area to
-//! within a square per tile at every zoom.
+//! it is credited where it was lost and goes to a placeholder accumulator
+//! ([`squares_for_collapsed`]) whose squares sit on a grid, so they never
+//! overlap. Each isolated group of credit loses less than one square.
 //!
 //! The export then draws each tile's fill under the tile's own features, one
 //! fill feature per feature the fill joins, with that feature's id and tags
-//! ([`assign_hosts`]), so an attribute-styled map colours it like its
-//! neighbours. The size valve fits the tile's own features into what the
-//! fill leaves of the limit (`export.rs`, `FillBytes`).
+//! ([`assign_hosts`]). A dissolved piece can span many features and carries
+//! one of them's attributes. The fill takes at most about half a tile's size
+//! limit, shedding its smallest pieces first ([`within_budget`]), and the
+//! size valve fits the tile's own features into what it leaves (`export.rs`,
+//! `FillBytes`).
+//!
+//! Memory: the finest level's geometry, simplified, is held until the fill
+//! is built, and every zoom's fill until the export ends. Neither is spilled
+//! or counted in the export's RAM budget.
 //!
 //! DIVERGENCE FROM TIPPECANOE: tippecanoe coalesces the raw geometry of the
 //! dropped features themselves, in every tile that is over its size limit
@@ -112,12 +118,15 @@ fn douglas_peucker(points: &[[f64; 2]], tol2: f64, keep: &mut [bool]) {
         let (mut best, mut at) = (-1.0, a);
         for (i, r) in points.iter().enumerate().take(b).skip(a + 1) {
             let (rx, ry) = (r[0] - p[0], r[1] - p[1]);
-            let d2 = if len2 == 0.0 {
-                rx * rx + ry * ry
+            // Distance to the segment, not its infinite line, so a vertex far
+            // past either end is kept (tippecanoe's `square_distance_from_line`).
+            let t = if len2 == 0.0 {
+                0.0
             } else {
-                let c = rx * dy - ry * dx;
-                c * c / len2
+                ((rx * dx + ry * dy) / len2).clamp(0.0, 1.0)
             };
+            let (ex, ey) = (rx - t * dx, ry - t * dy);
+            let d2 = ex * ex + ey * ey;
             if d2 > best {
                 best = d2;
                 at = i;
@@ -131,9 +140,10 @@ fn douglas_peucker(points: &[[f64; 2]], tol2: f64, keep: &mut [bool]) {
     }
 }
 
-/// One closed ring simplified at `tol2` (squared pixels); `None` once it no
-/// longer encloses any area.
-fn simplify_ring(r: &[[f64; 2]], tol2: f64) -> Option<Ring> {
+/// Which vertices of the closed ring `r` survive Douglas–Peucker at `tol2`
+/// (squared pixels), and the index of the vertex farthest from the first
+/// (the ring's long axis runs from vertex 0 to it). `None` under 3 points.
+fn simplify_mask(r: &[[f64; 2]], tol2: f64) -> Option<(Vec<bool>, usize)> {
     if r.len() < 3 {
         return None;
     }
@@ -148,32 +158,101 @@ fn simplify_ring(r: &[[f64; 2]], tol2: f64) -> Option<Ring> {
     keep[far] = true;
     douglas_peucker(&closed[..=far], tol2, &mut keep[..=far]);
     douglas_peucker(&closed[far..], tol2, &mut keep[far..]);
+    keep.truncate(r.len());
+    Some((keep, far))
+}
+
+/// The kept vertices of `r`, or `None` once they no longer enclose any area.
+fn kept_ring(r: &[[f64; 2]], keep: &[bool]) -> Option<Ring> {
     let out: Ring = r
         .iter()
-        .zip(&keep)
+        .zip(keep)
         .filter(|(_, k)| **k)
         .map(|(p, _)| *p)
         .collect();
     (out.len() >= 3 && ring_area2(&out) != 0.0).then_some(out)
 }
 
-/// Simplify every ring at `tol` pixels. Returns the simplified shapes and the
-/// rings that collapsed (an exterior collapsing takes its holes with it).
+/// One closed ring simplified at `tol2` (squared pixels); `None` once it no
+/// longer encloses any area.
+#[cfg(test)]
+fn simplify_ring(r: &[[f64; 2]], tol2: f64) -> Option<Ring> {
+    let (keep, _) = simplify_mask(r, tol2)?;
+    kept_ring(r, &keep)
+}
+
+/// Credit `area` along the segment `a`→`b`, in equal shares one `step`
+/// apart (at least one share), so the squares it buys land where the area
+/// was rather than at one point.
+fn credit_along(a: [f64; 2], b: [f64; 2], area: f64, step: f64, out: &mut Vec<Collapsed>) {
+    let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+    let n = ((len / step).ceil() as usize).max(1);
+    for i in 0..n {
+        let t = (i as f64 + 0.5) / n as f64;
+        out.push(Collapsed {
+            area: area / n as f64,
+            at: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+        });
+    }
+}
+
+/// The area Douglas–Peucker took from (positive) or added to (negative) the
+/// shape at each run of vertices it removed from `r`: the signed area
+/// between the run and the chord that replaced it, credited along the run.
+/// `sign` is `1.0` for an exterior and `-1.0` for a hole, whose lost area
+/// the shape gains. The credits sum to the change in the shape's area.
+fn credit_shaved(r: &[[f64; 2]], keep: &[bool], sign: f64, step: f64, out: &mut Vec<Collapsed>) {
+    let n = r.len();
+    let orient = ring_area2(r).signum();
+    let kept: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
+    if kept.len() < 2 {
+        return;
+    }
+    for (k, &a) in kept.iter().enumerate() {
+        let b = kept[(k + 1) % kept.len()];
+        let removed: Vec<usize> = if b > a {
+            (a + 1..b).collect()
+        } else {
+            (a + 1..n).chain(0..b).collect()
+        };
+        let (Some(&first), Some(&last)) = (removed.first(), removed.last()) else {
+            continue;
+        };
+        let mut run = Vec::with_capacity(removed.len() + 2);
+        run.push(r[a]);
+        run.extend(removed.iter().map(|&i| r[i]));
+        run.push(r[b]);
+        let area = sign * orient * ring_area2(&run) / 2.0;
+        if area != 0.0 {
+            credit_along(r[first], r[last], area, step, out);
+        }
+    }
+}
+
+/// Simplify every ring at `tol` pixels. Returns the simplified shapes and
+/// the area the simplification lost or gained, as credits placed where it
+/// happened: a collapsed shape's area along its long axis (an exterior
+/// collapsing takes its holes with it), and each kept ring's shaved runs
+/// along the run.
 pub(super) fn simplify_coverage(shapes: Vec<Shape>, tol: f64) -> (Vec<Shape>, Vec<Collapsed>) {
     let tol2 = tol * tol;
     let mut out = Vec::with_capacity(shapes.len());
     let mut collapsed = Vec::new();
     for shape in shapes {
-        let Some(exterior) = shape.first().and_then(|e| simplify_ring(e, tol2)) else {
-            if let Some(e) = shape.first().filter(|e| !e.is_empty()) {
-                let holes: f64 = shape[1..].iter().map(|h| ring_area2(h).abs()).sum();
-                let area = (ring_area2(e).abs() - holes).max(0.0) / 2.0;
-                if area > 0.0 {
-                    collapsed.push(Collapsed { area, at: e[0] });
-                }
+        let Some(e) = shape.first() else {
+            continue;
+        };
+        let Some((keep, far)) = simplify_mask(e, tol2) else {
+            continue; // under 3 points: no area
+        };
+        let Some(exterior) = kept_ring(e, &keep) else {
+            let area = net_area(&shape).max(0.0);
+            if area > 0.0 {
+                credit_along(e[0], e[far], area, tol, &mut collapsed);
             }
             continue;
         };
+        credit_shaved(e, &keep, 1.0, tol, &mut collapsed);
         // One winding for every exterior and the other for every hole: the
         // union's `NonZero` rule adds overlapping exteriors only when they
         // wind the same way, and source rings come in either.
@@ -183,24 +262,24 @@ pub(super) fn simplify_coverage(shapes: Vec<Shape>, tol: f64) -> (Vec<Shape>, Ve
             }
             r
         };
-        // A hole that collapses is filled in: a few pixels over-drawn.
         let mut kept = vec![orient(exterior, true)];
-        kept.extend(
-            shape[1..]
-                .iter()
-                .filter_map(|h| simplify_ring(h, tol2))
-                .map(|h| orient(h, false)),
-        );
-        // Douglas–Peucker shaves convex corners: on a blob a few tolerances
-        // across that is a third of its area, at every zoom. Credit the net
-        // change (negative where it filled a concavity) to the squares, so
-        // the fill keeps its area to within a square per tile.
-        let shaved = net_area(&shape) - net_area(&kept);
-        if shaved != 0.0 {
-            collapsed.push(Collapsed {
-                area: shaved,
-                at: kept[0][0],
-            });
+        for h in &shape[1..] {
+            let Some((hkeep, hfar)) = simplify_mask(h, tol2) else {
+                continue;
+            };
+            match kept_ring(h, &hkeep) {
+                Some(hole) => {
+                    credit_shaved(h, &hkeep, -1.0, tol, &mut collapsed);
+                    kept.push(orient(hole, false));
+                }
+                // A hole that collapses is filled in: the shape gains its area.
+                None => {
+                    let area = ring_area2(h).abs() / 2.0;
+                    if area > 0.0 {
+                        credit_along(h[0], h[hfar], -area, tol, &mut collapsed);
+                    }
+                }
+            }
         }
         out.push(kept);
     }
@@ -294,12 +373,22 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
     out
 }
 
-/// Placeholder squares for collapsed rings, by error diffusion on a `side`
-/// grid: each cell sums the area of the rings that collapsed in it; cells are
-/// visited in serpentine row order with a running total, and a cell draws a
-/// `side`-pixel square whenever the total reaches `side²`. The excess carries
-/// to the next cell, so a tile loses less than one square of area, however
-/// the rings are ordered.
+/// How far, in cells, a remainder under one square carries to the next cell
+/// that has credit; past that it is dropped.
+const MAX_CARRY_CELLS: i64 = 8;
+
+/// How far, in cells, a cell's excess looks for free cells to draw in.
+const MAX_SPILL_CELLS: i64 = 16;
+
+/// Placeholder squares for collapsed and shaved area, by error diffusion on
+/// a `side` grid. Each cell sums the credits that fall in it. Cells are
+/// visited row by row, alternating direction (rows with no credit are
+/// skipped), with a running total: a cell draws a `side`-pixel square each
+/// time the total reaches `side²`, in the cell itself if free, else in the
+/// nearest free cell. A remainder under one square carries to the next cell
+/// only within [`MAX_CARRY_CELLS`]; a deficit (filled concavities) is never
+/// carried, so it cannot cancel squares elsewhere. Each isolated group of
+/// credit loses less than one square of area.
 ///
 /// DIVERGENCE FROM TIPPECANOE: `reduce_tiny_poly` (clip.cpp) emits a square
 /// at the first vertex of the ring whose area crosses the running total, in
@@ -307,39 +396,93 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
 /// do (#750).
 pub(super) fn squares_for_collapsed(collapsed: &[Collapsed], side: f64) -> Vec<Shape> {
     let threshold = side * side;
-    let mut cells: std::collections::HashMap<(i64, i64), f64> = std::collections::HashMap::new();
-    // A ring on the tile's right or bottom edge falls in the last cell, so
+    // A credit on the tile's right or bottom edge falls in the last cell, so
     // no square is drawn past the edge.
     let last = (FILL_EXTENT / side).ceil() as i64 - 1;
+    // Keyed (row, column), so iteration runs row by row.
+    let mut cells: std::collections::BTreeMap<(i64, i64), f64> = std::collections::BTreeMap::new();
     for c in collapsed {
-        let cell = (
-            ((c.at[0] / side).floor() as i64).clamp(0, last),
-            ((c.at[1] / side).floor() as i64).clamp(0, last),
-        );
-        *cells.entry(cell).or_default() += c.area;
+        let x = ((c.at[0] / side).floor() as i64).clamp(0, last);
+        let y = ((c.at[1] / side).floor() as i64).clamp(0, last);
+        *cells.entry((y, x)).or_default() += c.area;
     }
-    let mut order: Vec<((i64, i64), f64)> = cells.into_iter().collect();
-    // Serpentine: rows top to bottom, alternate rows right to left, so the
-    // carry always moves to a neighbouring cell within a row.
-    order.sort_unstable_by_key(|&((x, y), _)| (y, if y % 2 == 0 { x } else { -x }));
-    let mut total = 0.0;
+    // Alternate the direction of each row that has credit, so the carry
+    // moves on to a nearby cell at the end of a row too.
+    let mut order: Vec<((i64, i64), f64)> = Vec::with_capacity(cells.len());
+    let mut row: Vec<((i64, i64), f64)> = Vec::new();
+    let mut rows = 0usize;
+    let mut flush = |row: &mut Vec<((i64, i64), f64)>, rows: &mut usize| {
+        if *rows % 2 == 1 {
+            row.reverse();
+        }
+        order.append(row);
+        *rows += 1;
+    };
+    for ((y, x), area) in cells {
+        if row.last().is_some_and(|&((_, ry), _)| ry != y) {
+            flush(&mut row, &mut rows);
+        }
+        row.push(((x, y), area));
+    }
+    flush(&mut row, &mut rows);
+
+    let mut occupied: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for ((cx, cy), area) in order {
+    let mut total = 0.0;
+    let mut prev: Option<(i64, i64)> = None;
+    for ((x, y), area) in order {
+        if prev.is_some_and(|(px, py)| (x - px).abs().max((y - py).abs()) > MAX_CARRY_CELLS) {
+            total = 0.0;
+        }
+        prev = Some((x, y));
         total += area;
+        if total <= 0.0 {
+            total = 0.0; // a deficit never travels
+            continue;
+        }
         // A hair under the threshold still counts: sums of exact areas can
         // land a rounding error short.
-        if total >= threshold * (1.0 - 1e-9) {
-            let (x, y) = (cx as f64 * side, cy as f64 * side);
+        while total >= threshold * (1.0 - 1e-9) {
+            let Some((sx, sy)) = nearest_free((x, y), &occupied, last) else {
+                total = 0.0; // nothing free nearby: the excess is dropped
+                break;
+            };
+            occupied.insert((sx, sy));
+            let (px, py) = (sx as f64 * side, sy as f64 * side);
             out.push(vec![vec![
-                [x, y],
-                [x + side, y],
-                [x + side, y + side],
-                [x, y + side],
+                [px, py],
+                [px + side, py],
+                [px + side, py + side],
+                [px, py + side],
             ]]);
             total -= threshold;
         }
     }
     out
+}
+
+/// The free cell nearest `c` within [`MAX_SPILL_CELLS`] and the tile's
+/// cells `0..=last`: `c` itself, then ring by ring, each ring in row order.
+fn nearest_free(
+    c: (i64, i64),
+    occupied: &std::collections::HashSet<(i64, i64)>,
+    last: i64,
+) -> Option<(i64, i64)> {
+    for r in 0..=MAX_SPILL_CELLS.min(last) {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let (x, y) = (c.0 + dx, c.1 + dy);
+                if (0..=last).contains(&x) && (0..=last).contains(&y) && !occupied.contains(&(x, y))
+                {
+                    return Some((x, y));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// One tile's fill from the shapes lifted into it: simplify, union where
@@ -387,6 +530,55 @@ pub(super) fn to_tile_polygons(fill: &[Shape], scale: f64) -> Vec<FillPolygon> {
             Some(poly)
         })
         .collect()
+}
+
+/// Rough MVT bytes a fill polygon encodes to: a command and a pair of small
+/// varints per vertex, a few bytes per ring. Only orders the budget.
+fn est_bytes(poly: &FillPolygon) -> usize {
+    poly.iter().map(|r| 3 * r.len() + 4).sum()
+}
+
+/// A fill polygon's area in tile units², exterior minus holes.
+fn poly_area(poly: &FillPolygon) -> f64 {
+    let ring = |r: &TileRing| {
+        let mut a = 0i64;
+        for k in 0..r.len() {
+            let (p, q) = (r[k], r[(k + 1) % r.len()]);
+            a += i64::from(p.0) * i64::from(q.1) - i64::from(q.0) * i64::from(p.1);
+        }
+        (a as f64 / 2.0).abs()
+    };
+    poly.first().map_or(0.0, ring) - poly.iter().skip(1).map(ring).sum::<f64>()
+}
+
+/// The fill polygons to draw within about `budget` bytes, largest first,
+/// returned in their original order, and how many were shed. The fill must
+/// not crowd out the tile's own features: past its budget the smallest
+/// pieces (placeholder squares first) go before the valve has to merge or
+/// drop real data.
+pub(super) fn within_budget(polys: &[FillPolygon], budget: usize) -> (Vec<usize>, usize) {
+    let total: usize = polys.iter().map(est_bytes).sum();
+    if total <= budget {
+        return ((0..polys.len()).collect(), 0);
+    }
+    let mut by_size: Vec<usize> = (0..polys.len()).collect();
+    by_size.sort_by(|&a, &b| {
+        poly_area(&polys[b])
+            .total_cmp(&poly_area(&polys[a]))
+            .then(a.cmp(&b))
+    });
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for i in by_size {
+        let b = est_bytes(&polys[i]);
+        if used + b <= budget {
+            used += b;
+            kept.push(i);
+        }
+    }
+    kept.sort_unstable();
+    let shed = polys.len() - kept.len();
+    (kept, shed)
 }
 
 /// For each fill polygon, the index of the feature box it joins: the
@@ -465,6 +657,7 @@ pub(super) fn assign_hosts(polys: &[FillPolygon], hosts: &[[f64; 4]]) -> Vec<usi
 pub(super) struct FillMap {
     tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
     used: std::sync::atomic::AtomicUsize,
+    shed: std::sync::atomic::AtomicUsize,
 }
 
 impl FillMap {
@@ -473,6 +666,11 @@ impl FillMap {
         let polys = self.tiles.get(&key)?;
         self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(polys)
+    }
+
+    /// Count fill polygons a tile shed to stay within its budget.
+    pub(super) fn note_shed(&self, n: usize) {
+        self.shed.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -483,10 +681,11 @@ impl Drop for FillMap {
         if self.tiles.is_empty() {
             return;
         }
-        // Encode retries (the size valve) count a tile more than once.
         let used = self.used.load(std::sync::atomic::Ordering::Relaxed);
+        let shed = self.shed.load(std::sync::atomic::Ordering::Relaxed);
         log::info!(
-            "[export] coverage fill: {} fill tiles built, {used} draws into tiles with features",
+            "[export] coverage fill: {} fill tiles built, {used} drawn into tiles with \
+             features, {shed} fill polygons shed to fit tile size limits",
             self.tiles.len(),
         );
     }
@@ -589,6 +788,7 @@ pub(super) fn build_fill_map(
     let mut map = FillMap {
         tiles: Default::default(),
         used: Default::default(),
+        shed: Default::default(),
     };
     if finest_zoom == 0 || min_zoom >= finest_zoom {
         return Ok(map);
@@ -615,8 +815,18 @@ pub(super) fn build_fill_map(
     super::scoped_pipe(
         super::WAVE_READ_IN_FLIGHT,
         |tx: &super::Sender<super::RecordBatch>| -> Result<(), super::ExportError> {
-            let batches =
-                reader.read_level_with_batch_size(level_idx, None, super::EXPORT_BATCH_SIZE)?;
+            // Only the geometry is needed: project the read to it, over the
+            // level's whole render set (its prefix in partitioning mode).
+            let batches = match super::geometry_index(reader.schema()) {
+                Some(root) => reader.read_row_groups_projected(
+                    reader.selected_row_groups(level_idx, None)?,
+                    super::EXPORT_BATCH_SIZE,
+                    &[root],
+                )?,
+                None => {
+                    reader.read_level_with_batch_size(level_idx, None, super::EXPORT_BATCH_SIZE)?
+                }
+            };
             for batch in batches {
                 let batch = batch
                     .map_err(|e| crate::Error::GeoParquetRead(format!("fill seed read: {e}")))?;
@@ -861,7 +1071,9 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].area, 4.0);
-        assert_eq!(collapsed[0].at, [10.0, 20.0]);
+        // Credited along the ring's long axis, (10, 20)–(12, 22): one share
+        // at its middle.
+        assert_eq!(collapsed[0].at, [11.0, 21.0]);
     }
 
     #[test]
@@ -935,6 +1147,119 @@ mod tests {
         ];
         let out = squares_for_collapsed(&collapsed, 4.0);
         assert_eq!(out, vec![square(0.0, 0.0, 4.0), square(4.0, 0.0, 4.0)]);
+    }
+
+    #[test]
+    fn a_cells_excess_spills_into_nearby_cells() {
+        // Ten squares' worth credited at one point inside the tile: all ten
+        // are drawn, in that cell (25, 25) and its nearest free neighbours.
+        let out = squares_for_collapsed(
+            &[Collapsed {
+                area: 160.0,
+                at: [101.0, 101.0],
+            }],
+            4.0,
+        );
+        assert_eq!(area(&out), 160.0);
+        for s in &out {
+            let (cx, cy) = (s[0][0][0] / 4.0, s[0][0][1] / 4.0);
+            assert!(
+                (cx - 25.0).abs() <= 2.0 && (cy - 25.0).abs() <= 2.0,
+                "square at cell ({cx}, {cy}) is not nearby"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_credit_does_not_suppress_a_distant_square() {
+        // A dent filled at (0, 0) must not cancel a collapsed parcel 200 px
+        // away: that cancellation is exactly a #750 hole.
+        let out = squares_for_collapsed(
+            &[
+                Collapsed {
+                    area: -50.0,
+                    at: [0.0, 0.0],
+                },
+                Collapsed {
+                    area: 16.0,
+                    at: [201.0, 1.0],
+                },
+            ],
+            4.0,
+        );
+        assert_eq!(out, vec![square(200.0, 0.0, 4.0)]);
+    }
+
+    #[test]
+    fn a_collapsed_strip_is_credited_along_its_length() {
+        let strip: Shape = vec![vec![[1.0, 1.0], [129.0, 1.0], [129.0, 2.0], [1.0, 2.0]]];
+        let (out, credit) = simplify_coverage(vec![strip], 4.0);
+        assert!(out.is_empty());
+        assert!((credit.iter().map(|c| c.area).sum::<f64>() - 128.0).abs() < 1e-9);
+        let xs: Vec<f64> = credit.iter().map(|c| c.at[0]).collect();
+        let (lo, hi) = xs
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(
+            lo < 10.0 && hi > 120.0,
+            "credit spans {lo}..{hi}, not the strip's length"
+        );
+    }
+
+    #[test]
+    fn a_shaved_bump_is_credited_where_it_was() {
+        // A 1000 px square with a 2 px bump at the middle of its bottom edge:
+        // the bump's area is credited next to the bump, not at a corner.
+        let s: Shape = vec![vec![
+            [0.0, 0.0],
+            [1000.0, 0.0],
+            [1000.0, 1000.0],
+            [510.0, 1000.0],
+            [500.0, 1002.0],
+            [490.0, 1000.0],
+            [0.0, 1000.0],
+        ]];
+        let (_, credit) = simplify_coverage(vec![s], 4.0);
+        assert!(!credit.is_empty());
+        for c in &credit {
+            assert!(
+                (c.at[0] - 500.0).abs() <= 20.0 && (c.at[1] - 1000.0).abs() <= 4.0,
+                "{c:?}"
+            );
+        }
+        assert!((credit.iter().map(|c| c.area).sum::<f64>() - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn douglas_peucker_measures_distance_to_the_segment() {
+        // (-60, -5) lies almost on the extension of the chord (100, 10)–(0, 0)
+        // but 60 px from the chord itself, so it must be kept.
+        let ring = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 10.0], [-60.0, -5.0]];
+        let out = simplify_ring(&ring, 16.0).expect("kept");
+        assert!(out.contains(&[-60.0, -5.0]), "{out:?}");
+    }
+
+    #[test]
+    fn a_fill_over_its_budget_sheds_its_smallest_pieces_first() {
+        // One large polygon and a hundred placeholder squares, with room for
+        // about ten pieces: the large one stays, the squares go first.
+        let big: FillPolygon = vec![vec![(0, 0), (1000, 0), (1000, 1000), (0, 1000)]];
+        let sq = |i: i32| -> FillPolygon {
+            vec![vec![
+                (i * 8, 2000),
+                (i * 8 + 4, 2000),
+                (i * 8 + 4, 2004),
+                (i * 8, 2004),
+            ]]
+        };
+        let mut polys: Vec<FillPolygon> = (0..100).map(sq).collect();
+        polys.insert(50, big);
+        let (kept, shed) = within_budget(&polys, 10 * est_bytes(&polys[0]));
+        assert_eq!(kept.len(), 10);
+        assert_eq!(shed, 91);
+        assert!(kept.contains(&50), "the large polygon is kept");
+        assert!(kept.windows(2).all(|w| w[0] < w[1]), "original order kept");
+        assert_eq!(within_budget(&polys, usize::MAX), ((0..101).collect(), 0));
     }
 
     #[test]
