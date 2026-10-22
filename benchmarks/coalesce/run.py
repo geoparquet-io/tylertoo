@@ -323,7 +323,10 @@ def render_markdown(report: dict, baseline: dict | None = None) -> str:
             b = base_get("cells", f"{ds}/{st}") or {}
             if c is None:
                 t = report.get("tippecanoe", {}).get(ds)
-                if st == "tippecanoe" and t:
+                if st == "tippecanoe" and t and t.get("status", "ok") != "ok":
+                    out.append(row([smeta["label"], f"failed: {t['status']} after "
+                                    f"{t['wall_s']:.0f} s ({t.get('error', '')})"] + [""] * 9))
+                elif st == "tippecanoe" and t:
                     bt = base_get("tippecanoe", ds) or {}
                     ratio = f"{t['wall_s'] / ref:.2f}×" if ref else ""
                     out.append(row([smeta["label"], "", "", "", gib(t["peak_rss_kib"]),
@@ -550,8 +553,12 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
         d = work / "tippecanoe" / f"{ds_name}-{key}"
         meta = d / "run.json"
         cached = read_cached(meta, key)
-        if cached and (d / "archive.pmtiles").exists():
-            print(f"[tippecanoe] {ds_name}: cached ({d})", flush=True)
+        # A failed run is a result too, and is not retried: delete the
+        # directory to try again.
+        if cached and (cached.get("status", "ok") != "ok"
+                       or (d / "archive.pmtiles").exists()):
+            print(f"[tippecanoe] {ds_name}: cached, {cached.get('status', 'ok')} ({d})",
+                  flush=True)
             refs[ds_name] = {**cached, "path": str(d / "archive.pmtiles")}
             continue
         if "tippecanoe" not in steps:
@@ -569,7 +576,22 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
         run = run_matrix.run_capped([lock["binary"], "-o", str(pm), "-f", *targs, str(fgb)],
                                     tcfg["wall_s"], tcfg["rss_gib"])
         if run["status"] != "ok":
-            raise SystemExit(f"tippecanoe {ds_name}: {run['status']}\n{run['stderr_tail']}")
+            tail = (run["stderr_tail"] or "").split("\tCommand being timed")[0].splitlines()
+            code = next((ln.rsplit(" ", 1)[1] for ln in tail
+                         if ln.startswith("Command exited with non-zero status")), None)
+            rec = {"key": key, "tippecanoe": lock, "args": targs,
+                   "status": f"exit {code}" if code else run["status"],
+                   "error": next((ln for ln in reversed(tail)
+                                  if ln.strip() and not ln.startswith("Command exited")), ""),
+                   "wall_s": run["wall_s"], "cpu_s": run["cpu_s"],
+                   "peak_rss_kib": run["peak_rss_kib"], "pmtiles_bytes": None}
+            meta.write_text(json.dumps(rec, indent=2))
+            pm.unlink(missing_ok=True)
+            fgb.unlink()
+            print(f"[tippecanoe] {ds_name}: {rec['status']} after {rec['wall_s']:.0f} s: "
+                  f"{rec['error']}", flush=True)
+            refs[ds_name] = {**rec, "path": str(pm)}
+            continue
         rec = {"key": key, "tippecanoe": lock, "args": targs, "wall_s": run["wall_s"],
                "cpu_s": run["cpu_s"], "peak_rss_kib": run["peak_rss_kib"],
                "pmtiles_bytes": pm.stat().st_size, "pmtiles_sha256": run_matrix.sha256(pm)}
@@ -758,7 +780,8 @@ def main() -> int:
         if c["status"] == "ok":
             archives[(ds_name, st_name)] = (run_dir / "tiles" / c["pmtiles"], c["pmtiles_sha256"])
     for ds_name, r in refs.items():
-        archives[(ds_name, "tippecanoe")] = (Path(r["path"]), r["pmtiles_sha256"])
+        if r.get("status", "ok") == "ok":
+            archives[(ds_name, "tippecanoe")] = (Path(r["path"]), r["pmtiles_sha256"])
     scores = score(cfg, plan, steps, inputs, js, run_dir, archives, args.jobs)
 
     report = {

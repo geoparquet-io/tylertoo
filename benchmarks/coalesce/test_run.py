@@ -317,3 +317,14 @@ def test_load_gate_scales_with_cores():
     assert run_matrix.default_load_max(64) == pytest.approx(6.4)
     assert run_matrix.default_load_max(8) == 3.0
     assert run_matrix.default_load_max(None) == 3.0
+
+
+def test_markdown_reports_a_failed_tippecanoe_run():
+    rep = _report()
+    rep["settings"]["tippecanoe"] = {"label": "tippecanoe", "external": True}
+    rep["tippecanoe"] = {"moldova": {"status": "exit 100", "wall_s": 2038.0,
+                                     "peak_rss_kib": 3585908, "pmtiles_bytes": None,
+                                     "error": "Can't increase feature gap threshold further"}}
+    md = run.render_markdown(rep)
+    assert "| tippecanoe | failed: exit 100 after 2038 s (Can't increase feature gap " \
+           "threshold further) |" in md
