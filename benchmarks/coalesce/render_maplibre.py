@@ -4,6 +4,8 @@
 #   "playwright==1.64.0", "pmtiles>=3.4", "shapely>=2.0", "geopandas>=1.0",
 #   "pyarrow>=17", "numpy>=1.26", "pillow>=10", "rasterio>=1.4",
 # ]
+# [tool.uv]
+# exclude-newer = "2026-10-22T00:00:00Z"
 # ///
 """
 render_maplibre.py — a window of several PMTiles archives drawn by MapLibre GL

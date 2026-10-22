@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def test_tippecanoe_args_are_per_dataset(cfg):
     nz = cfg["tippecanoe"]["datasets"]["nz"]["args"]
     md = cfg["tippecanoe"]["datasets"]["moldova"]["args"]
     assert "-z14" in nz and "-z12" in md
-    assert run.tippecanoe_key("s", "i", nz) != run.tippecanoe_key("s", "i", md)
+    assert run.tippecanoe_key("s", "i", nz, "g") != run.tippecanoe_key("s", "i", md, "g")
 
 
 def test_tippecanoe_on_unknown_dataset_is_an_error(cfg):
@@ -87,17 +88,18 @@ def test_window_on_unknown_dataset_is_an_error(cfg):
 
 
 def test_tippecanoe_key_is_stable_and_tracks_its_inputs():
-    a = run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "8"])
-    assert a == run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "8"])
-    assert a != run.tippecanoe_key("68ab8dd", "f" * 64, ["-z14", "-b", "8"])
-    assert a != run.tippecanoe_key("68ab8dc", "e" * 64, ["-z14", "-b", "8"])
-    assert a != run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "4"])
+    g = "geoparquet-io==1.7.0"
+    a = run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "8"], g)
+    assert a == run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "8"], g)
+    assert a != run.tippecanoe_key("68ab8dd", "f" * 64, ["-z14", "-b", "8"], g)
+    assert a != run.tippecanoe_key("68ab8dc", "e" * 64, ["-z14", "-b", "8"], g)
+    assert a != run.tippecanoe_key("68ab8dc", "f" * 64, ["-z14", "-b", "4"], g)
 
 
 def test_cell_key_changes_with_flags_and_repeats():
     base = dict(binary_sha="b" * 64, input_sha="i" * 64, convert=["--simplify-factor", "0"],
                 valve="merge", max_zoom=12, max_tile_size=512000,
-                max_compressed_tile_size=0, repeats=3)
+                max_compressed_tile_size=0, repeats=3, harness="h")
     k = run.cell_key(**base)
     assert k == run.cell_key(**base)
     assert k != run.cell_key(**{**base, "convert": ["--simplify-factor", "0.25"]})
@@ -282,6 +284,7 @@ def test_run_scorers_refuses_when_the_score_step_is_off(tmp_path):
         run.run_scorers([job], {"report"}, jobs=1)
 
 
+@pytest.mark.skipif(not Path("/usr/bin/time").exists(), reason="needs GNU time")
 def test_run_cell_starts_every_convert_repeat_without_the_previous_overview(tmp_path):
     # A stand-in binary: convert logs whether its output already exists, then
     # writes it; export writes the archive and a minimal report.
@@ -328,3 +331,173 @@ def test_markdown_reports_a_failed_tippecanoe_run():
     md = run.render_markdown(rep)
     assert "| tippecanoe | failed: exit 100 after 2038 s (Can't increase feature gap " \
            "threshold further) |" in md
+
+
+# --- review fixes: timing flags ----------------------------------------------
+
+
+def test_time_cell_flags_on_the_displayed_rounding():
+    assert run.time_cell(10.96, 10.0, 0.10) == "10.96 s (+10%)"
+    assert run.time_cell(11.04, 10.0, 0.10) == "11.04 s (+10%)"
+    assert run.time_cell(11.60, 10.0, 0.10) == "11.60 s (+16%) ▲"
+
+
+def test_time_cell_floor_widens_to_the_repeat_spread():
+    assert run.time_cell(9.0, 8.0, 0.10, spread=0.22) == "9.00 s (+12%)"
+    assert run.time_cell(10.0, 8.0, 0.10, spread=0.22) == "10.00 s (+25%) ▲"
+
+
+def test_time_cell_does_not_flag_seconds_across_hosts():
+    assert run.time_cell(16.0, 8.0, 0.10, flags=False) == "16.00 s (+100%)"
+
+
+def test_rel_spread():
+    assert run.rel_spread([125.5, 153.6, 131.1]) == pytest.approx((153.6 - 125.5) / 131.1)
+    assert run.rel_spread([1.0]) == 0.0
+    assert run.rel_spread([]) == 0.0
+
+
+def _cell(convert_s, export_s, walls=None, load=1.0):
+    walls = walls or [export_s]
+    return {"status": "ok",
+            "convert": {"median_s": convert_s, "peak_rss_kib": 1048576, "wall_s": [convert_s],
+                        "load_before_max": load},
+            "export": {"median_s": export_s, "peak_rss_kib": 1048576, "wall_s": walls,
+                       "load_before_max": load},
+            "total_s": round(convert_s + export_s, 3), "overview_bytes": 1, "pmtiles_bytes": 1,
+            "merged_features": 0, "oversized_tiles": 0, "repeats_identical": True}
+
+
+def test_markdown_flags_the_ratio_across_hosts_but_not_seconds():
+    cur, base = _report(), _report()
+    base["host"] = {"cpu": "other", "cores": 8, "mem_gib": 16.0}
+    cur["cells"]["moldova/default"] = _cell(4.0, 13.0)       # 17 s, 2.62x before-745
+    md = run.render_markdown(cur, base)
+    assert "different host" in md.lower()
+    assert "17.00 s (+100%) |" in md                        # seconds: shown, not flagged
+    assert "2.62× (+100%) ▲" in md                          # ratio: flagged
+
+
+def test_markdown_ignores_a_failed_baseline_cell():
+    cur, base = _report(), _report()
+    base["cells"]["moldova/default"] = {**base["cells"]["moldova/default"],
+                                        "status": "export TIMEOUT", "total_s": None}
+    md = run.render_markdown(cur, base)
+    assert "| Defaults | 2.00 s | 2.00 GiB | 6.50 s | 1.00 GiB | 8.50 s | 1.31× |" in md
+
+
+def test_markdown_ignores_a_failed_tippecanoe_baseline():
+    cur, base = _report(), _report()
+    for r in (cur, base):
+        r["settings"]["tippecanoe"] = {"label": "tippecanoe", "external": True}
+    cur["tippecanoe"] = {"moldova": {"wall_s": 100.0, "peak_rss_kib": 1048576,
+                                     "pmtiles_bytes": 10}}
+    base["tippecanoe"] = {"moldova": {"status": "TIMEOUT", "wall_s": 10800.0,
+                                      "peak_rss_kib": 1, "pmtiles_bytes": None}}
+    md = run.render_markdown(cur, base)
+    assert "100.00 s |" in md
+    assert "−99%" not in md
+
+
+def test_markdown_marks_loaded_seeded_and_unrepeatable_cells():
+    rep = _report()
+    rep["load_max"] = 6.4
+    rep["cells"]["moldova/default"] = {**_cell(2.0, 6.5, load=7.0), "repeats_identical": False}
+    rep["settings"]["tippecanoe"] = {"label": "tippecanoe", "external": True}
+    rep["tippecanoe"] = {"moldova": {"wall_s": 1900.0, "peak_rss_kib": 1048576,
+                                     "pmtiles_bytes": 10, "seeded_from": "the #745 run"}}
+    md = run.render_markdown(rep)
+    assert "| Defaults † ‡ |" in md
+    assert "† The load average was at or above 6.4" in md
+    assert "‡ Repeats wrote different bytes" in md
+    assert "seeded from the #745 run" in md
+
+
+def test_markdown_renders_coverage_and_metrics_sections():
+    rep = _report()
+    rep["coverage"] = {"mg-z8": {"label": "Madagascar z8", "zoom": 8, "tiles": {},
+                                 "settings": {"default": {"missing": 0.0023, "added": 0.00002,
+                                                          "features": 7782}}}}
+    rep["metrics"] = {"moldova": {"label": "FTW Moldova", "zooms": [6], "named": ["6/1/2"],
+                                  "settings": {"default": {
+                                      "zooms": {"6": {"median": 0.789, "min": 0.786,
+                                                      "edge_gap": 0.2, "excess_change": None}},
+                                      "named": {"6/1/2": 0.5}}}}}
+    md = run.render_markdown(rep)
+    assert "| Madagascar z8 | Defaults | 0.23% | 0.002% | 7,782 |" in md
+    assert "| Defaults | 78.9% (78.6%) | 50.0% | z6 0.20 |  |" in md
+
+
+# --- review fixes: caches and failures ---------------------------------------
+
+
+def test_cell_key_includes_the_harness():
+    base = dict(binary_sha="b", input_sha="i", convert=[], valve="merge", max_zoom=12,
+                max_tile_size=1, max_compressed_tile_size=0, repeats=3, harness="h1")
+    assert run.cell_key(**base) != run.cell_key(**{**base, "harness": "h2"})
+
+
+def test_tippecanoe_key_includes_the_gpio_pin():
+    assert run.tippecanoe_key("s", "i", ["-z12"], "geoparquet-io==1.7.0") != \
+        run.tippecanoe_key("s", "i", ["-z12"], "geoparquet-io==1.8.0")
+
+
+def test_tippecanoe_pin_comes_from_the_setup_script():
+    assert run.tippecanoe_pin() == "68ab8dcc229f95b8b25877697d5e8d66783af503"
+
+
+def test_tippecanoe_failure_from_gnu_time_stderr():
+    stderr = ("Can't increase feature gap threshold further\n"
+              "Command exited with non-zero status 100\n"
+              "\tCommand being timed: \"tippecanoe -o x\"\n\tUser time (seconds): 1.0\n")
+    assert run.tippecanoe_failure({"status": "FAILED", "stderr_tail": stderr}) == \
+        ("exit 100", "Can't increase feature gap threshold further")
+    assert run.tippecanoe_failure({"status": "TIMEOUT", "stderr_tail": ""}) == ("TIMEOUT", "")
+
+
+def test_cached_cell_rules(tmp_path):
+    pm = tmp_path / "c.merge.pmtiles"
+    pm.write_bytes(b"x" * 10)
+    st = pm.stat()
+    summary = tmp_path / "c.json"
+
+    def write(**kw):
+        summary.write_text(json.dumps({"key": "k", **kw}))
+
+    write(status="ok", pmtiles_bytes=10, pmtiles_mtime_ns=st.st_mtime_ns)
+    assert run.cached_cell(summary, "k", pm)
+    assert run.cached_cell(summary, "other", pm) is None
+    write(status="ok", pmtiles_bytes=11, pmtiles_mtime_ns=st.st_mtime_ns)
+    assert run.cached_cell(summary, "k", pm) is None          # archive changed
+    pm.unlink()
+    write(status="convert FAILED")
+    assert run.cached_cell(summary, "k", pm)                  # a failure is a result
+    write(status="export TIMEOUT")
+    assert run.cached_cell(summary, "k", pm) is None          # a cap is retried
+
+
+def test_window_missing_a_key_is_an_error(cfg):
+    bad = copy.deepcopy(cfg)
+    del bad["windows"][0]["report_zooms"]
+    with pytest.raises(run.ConfigError, match="report_zooms"):
+        run.validate_config(bad)
+
+
+def test_load_baseline_fails_early_and_tolerates_missing_sections(tmp_path):
+    with pytest.raises(SystemExit, match="--compare"):
+        run.load_baseline(tmp_path / "missing.json")
+    p = tmp_path / "b.json"
+    p.write_text("{}")
+    b = run.load_baseline(p)
+    assert b["binary"] == {} and b["host"] == {}
+    assert run.render_markdown(_report(), b)
+
+
+def test_verify_input_rejects_a_missing_or_changed_file(tmp_path):
+    f = tmp_path / "a.bin"
+    with pytest.raises(SystemExit, match="missing"):
+        run.verify_input(f, "0" * 64)
+    f.write_bytes(b"hello")
+    with pytest.raises(SystemExit, match="sha256"):
+        run.verify_input(f, "0" * 64)
+    run.verify_input(f, _sha(b"hello"))

@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -57,6 +58,13 @@ import run_matrix  # noqa: E402
 STEPS = ("fetch", "build", "tile", "tippecanoe", "score", "report")
 REFERENCE = "before-745"
 MINUS = "−"
+SETUP_TIPPECANOE = REPO / "benchmarks" / "e2e" / "setup_tippecanoe.sh"
+# A run stopped by a cap is retried, since the caps are not part of any key;
+# any other failure is a result and stays cached.
+CAPPED = ("TIMEOUT", "RSS_CAP")
+# Bump when what run_cell measures or summarize_cell records changes, so
+# cached cells are measured again.
+CELL_VERSION = 2
 
 
 class ConfigError(ValueError):
@@ -71,6 +79,14 @@ class FetchError(RuntimeError):
 
 DATASET_KEYS = ("label", "asset", "sha256", "max_zoom", "max_tile_size",
                 "max_compressed_tile_size", "wall_s", "rss_gib")
+
+
+ENTRY_KEYS = {
+    "windows": ("name", "label", "dataset", "zoom", "tile", "window", "draw_zooms",
+                "report_zooms"),
+    "coverage": ("name", "label", "dataset", "zoom", "center", "span"),
+    "metrics": ("name", "dataset", "zooms", "max_tiles"),
+}
 
 
 def load_config(path: Path) -> dict:
@@ -89,11 +105,14 @@ def validate_config(cfg: dict) -> None:
     for name, st in settings.items():
         if not st.get("external") and ("convert" not in st or "valve" not in st):
             raise ConfigError(f"setting {name!r}: needs 'convert' and 'valve'")
-    for section in ("windows", "coverage", "metrics"):
+    for section, keys in ENTRY_KEYS.items():
         for entry in cfg.get(section, []):
             if entry.get("dataset") not in datasets:
                 raise ConfigError(f"{section} {entry.get('name')!r}: unknown dataset "
                                   f"{entry.get('dataset')!r}")
+            for key in keys:
+                if key not in entry:
+                    raise ConfigError(f"{section} {entry.get('name')!r}: missing {key!r}")
     for ds in cfg.get("tippecanoe", {}).get("datasets", {}):
         if ds not in datasets:
             raise ConfigError(f"tippecanoe: unknown dataset {ds!r}")
@@ -136,14 +155,56 @@ def digest(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
 
-def tippecanoe_key(tippecanoe_sha: str, input_sha: str, args: list[str]) -> str:
-    return digest({"tippecanoe": tippecanoe_sha, "input": input_sha, "args": args})[:16]
+def tippecanoe_key(tippecanoe_sha: str, input_sha: str, args: list[str], gpio: str) -> str:
+    return digest({"tippecanoe": tippecanoe_sha, "input": input_sha, "args": args,
+                   "gpio": gpio})[:16]
 
 
 def cell_key(*, binary_sha: str, input_sha: str, convert: list[str], valve: str,
              max_zoom: int, max_tile_size: int, max_compressed_tile_size: int,
-             repeats: int) -> str:
+             repeats: int, harness: str) -> str:
     return digest(locals())[:16]
+
+
+def script_sha(name: str) -> str:
+    """A benchmark script's content hash, for the keys of what it produces."""
+    return run_matrix.sha256(HERE / name)
+
+
+def harness_sha() -> str:
+    return digest([CELL_VERSION, script_sha("run_matrix.py")])[:16]
+
+
+def tippecanoe_pin() -> str:
+    """The commit setup_tippecanoe.sh builds, read without building it."""
+    sha = os.environ.get("TIPPECANOE_SHA")
+    if sha:
+        return sha
+    m = re.search(r'DEFAULT_SHA="([0-9a-f]{40})"', SETUP_TIPPECANOE.read_text())
+    if not m:
+        raise SystemExit(f"{SETUP_TIPPECANOE}: no DEFAULT_SHA")
+    return m.group(1)
+
+
+def tippecanoe_failure(run: dict) -> tuple[str, str]:
+    """(status, message) for a failed tippecanoe run, from GNU time's stderr:
+    `exit N` and tippecanoe's last line before GNU time's report."""
+    if run["status"] in CAPPED:
+        return run["status"], ""
+    tail = (run.get("stderr_tail") or "").split("\tCommand being timed")[0].splitlines()
+    code = next((ln.rsplit(" ", 1)[1] for ln in tail
+                 if ln.startswith("Command exited with non-zero status")), None)
+    message = next((ln for ln in reversed(tail)
+                    if ln.strip() and not ln.startswith("Command exited")), "")
+    return (f"exit {code}" if code else run["status"]), message
+
+
+def verify_input(path: Path, sha: str) -> None:
+    """For steps run without fetch: the cached file must still be the pinned one."""
+    if not path.exists():
+        raise SystemExit(f"{path} is missing: run the fetch step")
+    if run_matrix.sha256(path) != sha:
+        raise SystemExit(f"{path}: sha256 differs from bench.toml: run the fetch step")
 
 
 def fetch(url: str, dest: Path, sha: str) -> Path:
@@ -179,10 +240,12 @@ def median(vals):
 
 def stage_summary(runs: list[dict]) -> dict:
     ok = [r for r in runs if r["status"] == "ok"]
+    loads = [r["load_before"] for r in runs if r.get("load_before") is not None]
     return {"wall_s": [r["wall_s"] for r in runs],
             "median_s": median([r["wall_s"] for r in ok]),
             "cpu_s": median([r.get("cpu_s") for r in ok]),
-            "peak_rss_kib": median([r["peak_rss_kib"] for r in ok])}
+            "peak_rss_kib": median([r["peak_rss_kib"] for r in ok]),
+            "load_before_max": max(loads) if loads else None}
 
 
 def summarize_cell(convert_runs: list[dict], exports: list[dict],
@@ -256,14 +319,53 @@ def pct_cell(v: float | None, base: float | None = None, floor_pp: float = 3.0,
     return text
 
 
-def time_cell(cur: float | None, base: float | None = None, floor: float = 0.10) -> str:
+def rel_spread(walls: list[float]) -> float:
+    """(max − min) / median of a cell's repeats: how far one run of it moves."""
+    walls = [w for w in walls if w is not None]
+    if len(walls) < 2:
+        return 0.0
+    return (max(walls) - min(walls)) / statistics.median(walls)
+
+
+def change_cell(text: str, cur: float, base: float | None, floor: float, spread: float,
+                flags: bool) -> str:
+    """text, with the relative change from base in whole percent, marked when
+    it is beyond the floor or the repeats' own spread, whichever is wider."""
+    if not base:
+        return text
+    d = round((cur / base - 1) * 100)
+    mark = flag([d], max(floor, spread) * 100) if flags else ""
+    return f"{text} ({signed(d, 0)}%){mark}"
+
+
+def time_cell(cur: float | None, base: float | None = None, floor: float = 0.10,
+              spread: float = 0.0, flags: bool = True) -> str:
     if cur is None:
         return ""
-    text = f"{cur:.2f} s"
-    if base:
-        d = (cur / base - 1) * 100
-        text += f" ({signed(d, 0)}%){flag([d], floor * 100)}"
-    return text
+    return change_cell(f"{cur:.2f} s", cur, base, floor, spread, flags)
+
+
+def ratio_cell(cur: float | None, base: float | None, floor: float, spread: float) -> str:
+    """The ratio to the reference setting, which carries across hosts, so its
+    change is always marked."""
+    if cur is None:
+        return ""
+    return change_cell(f"{cur:.2f}×", cur, base, floor, spread, True)
+
+
+def same_host(a: dict, b: dict) -> bool:
+    return all(a.get(k) == b.get(k) for k in ("cpu", "cores", "mem_gib"))
+
+
+def load_baseline(path: Path) -> dict:
+    """A previous report for --compare, read before any work is done."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"--compare {path}: {e}")
+    data.setdefault("binary", {})
+    data.setdefault("host", {})
+    return data
 
 
 def gib(kib) -> str:
@@ -296,10 +398,15 @@ def render_markdown(report: dict, baseline: dict | None = None) -> str:
                "regressions. At full detail, small fields show about 2.5% missing and 2.5% "
                "added area from tile-grid snapping alone. Timings depend on the host; "
                "compare ratios across hosts, not seconds.")
+    hosts_match = bool(baseline) and same_host(host, baseline.get("host", {}))
     if baseline:
-        out += ["", f"Compared with `{baseline['binary'].get('git')}` "
-                    f"({baseline.get('created', '')}, {baseline['host'].get('cpu')}): "
-                    "changes in parentheses, ▲/▼ beyond the noise floor."]
+        bbin, bhost = baseline.get("binary", {}), baseline.get("host", {})
+        out += ["", f"Compared with `{bbin.get('git')}` ({baseline.get('created', '')}, "
+                    f"{bhost.get('cpu')}): changes in parentheses, ▲/▼ beyond the noise floor "
+                    "or the repeats' own spread, whichever is wider."]
+        if not hosts_match:
+            out += ["", "**Different host:** time changes are shown but not marked. The "
+                        "ratio to the reference setting carries across hosts and is marked."]
 
     def base_get(*keys):
         node = baseline
@@ -309,6 +416,14 @@ def render_markdown(report: dict, baseline: dict | None = None) -> str:
             node = node[k]
         return node
 
+    def ok(node):
+        return node if node and node.get("status", "ok") == "ok" else {}
+
+    def spread_of(*cells):
+        return max([rel_spread((c.get(stage) or {}).get("wall_s") or [])
+                    for c in cells if c for stage in ("convert", "export")] or [0.0])
+
+    load_max = report.get("load_max")
     out += ["", "## Performance", "",
             "Median of the repeats per stage. End to end is convert plus export.", ""]
     for ds, dmeta in report["datasets"].items():
@@ -317,41 +432,66 @@ def render_markdown(report: dict, baseline: dict | None = None) -> str:
                      f"vs {settings.get(REFERENCE, {}).get('label', REFERENCE)}", "Overview",
                      "PMTiles", "Merged", "Oversized"]),
                 row(["---"] * 11)]
-        ref = report["cells"].get(f"{ds}/{REFERENCE}", {}).get("total_s")
+        ref_cell = report["cells"].get(f"{ds}/{REFERENCE}", {})
+        ref = ref_cell.get("total_s")
+        bref_cell = ok(base_get("cells", f"{ds}/{REFERENCE}"))
+        bref = bref_cell.get("total_s")
+        notes = set()
         for st, smeta in settings.items():
             c = report["cells"].get(f"{ds}/{st}")
-            b = base_get("cells", f"{ds}/{st}") or {}
+            b = ok(base_get("cells", f"{ds}/{st}"))
             if c is None:
                 t = report.get("tippecanoe", {}).get(ds)
                 if st == "tippecanoe" and t and t.get("status", "ok") != "ok":
                     out.append(row([smeta["label"], f"failed: {t['status']} after "
                                     f"{t['wall_s']:.0f} s ({t.get('error', '')})"] + [""] * 9))
                 elif st == "tippecanoe" and t:
-                    bt = base_get("tippecanoe", ds) or {}
-                    ratio = f"{t['wall_s'] / ref:.2f}×" if ref else ""
+                    bt = ok(base_get("tippecanoe", ds))
+                    ratio = t["wall_s"] / ref if ref else None
+                    bratio = bt["wall_s"] / bref if bt and bref else None
                     out.append(row([smeta["label"], "", "", "", gib(t["peak_rss_kib"]),
-                                    time_cell(t["wall_s"], bt.get("wall_s"), floor_t), ratio,
+                                    time_cell(t["wall_s"], bt.get("wall_s"), floor_t,
+                                              flags=hosts_match),
+                                    ratio_cell(ratio, bratio, floor_t, spread_of(ref_cell)),
                                     "", mb(t["pmtiles_bytes"]), "", ""]))
+                    if t.get("seeded_from"):
+                        notes.add(f"The tippecanoe time is seeded from {t['seeded_from']}.")
                 continue
             if c["status"] != "ok":
                 out.append(row([smeta["label"], c["status"]] + [""] * 9))
                 continue
-            ratio = f"{c['total_s'] / ref:.2f}×" if ref else ""
+            label = smeta["label"]
+            loads = [(c.get(stage) or {}).get("load_before_max") for stage in ("convert", "export")]
+            if load_max and any(v is not None and v >= load_max for v in loads):
+                label += " †"
+                notes.add(f"† The load average was at or above {load_max:g} when a run of "
+                          "this setting started (the gate waits at most 30 min), so its "
+                          "times may be high.")
+            if c.get("repeats_identical") is False:
+                label += " ‡"
+                notes.add("‡ Repeats wrote different bytes.")
+            sp = spread_of(c, b)
+            ratio = c["total_s"] / ref if ref else None
+            bratio = b["total_s"] / bref if b.get("total_s") and bref else None
             out.append(row([
-                smeta["label"],
+                label,
                 time_cell(c["convert"]["median_s"], (b.get("convert") or {}).get("median_s"),
-                          floor_t),
+                          floor_t, sp, hosts_match),
                 gib(c["convert"]["peak_rss_kib"]),
                 time_cell(c["export"]["median_s"], (b.get("export") or {}).get("median_s"),
-                          floor_t),
+                          floor_t, sp, hosts_match),
                 gib(c["export"]["peak_rss_kib"]),
-                time_cell(c["total_s"], b.get("total_s"), floor_t),
-                ratio, mb(c.get("overview_bytes")), mb(c.get("pmtiles_bytes")),
+                time_cell(c["total_s"], b.get("total_s"), floor_t, sp, hosts_match),
+                ratio_cell(ratio, bratio, floor_t,
+                           max(sp, spread_of(ref_cell, bref_cell))),
+                mb(c.get("overview_bytes")), mb(c.get("pmtiles_bytes")),
                 count(c.get("merged_features")), count(c.get("oversized_tiles")),
             ]))
         if "tippecanoe" in settings and ds in report.get("tippecanoe", {}):
-            out += ["", "tippecanoe runs as one stage: its wall time is under End to end and "
-                        "its peak RSS under Export RSS."]
+            notes.add("tippecanoe runs as one stage: its wall time is under End to end and "
+                      "its peak RSS under Export RSS.")
+        if notes:
+            out += [""] + [n for n in sorted(notes, key=lambda n: (n[0] in "†‡", n))]
         out.append("")
 
     if report.get("windows"):
@@ -439,13 +579,26 @@ def host_info() -> dict:
             "python": platform.python_version()}
 
 
-def binary_info(binary: Path) -> dict:
-    git = sh(["git", "rev-parse", "--short", "HEAD"], cwd=REPO)
-    # Dirty only if the source the binary is built from has changed.
-    if sh(["git", "status", "--porcelain", "--untracked-files=no", "--",
-           "crates", "Cargo.toml", "Cargo.lock"], cwd=REPO):
-        git += "-dirty"
-    return {"path": str(binary), "sha256": run_matrix.sha256(binary), "git": git,
+def binary_info(binary: Path, built: bool, work: Path) -> dict:
+    """The binary's sha256 and the commit it was built from. The commit is
+    known when this run built it, and remembered per binary under --work;
+    a binary passed with --bin and never built here is `unknown`."""
+    sha = run_matrix.sha256(binary)
+    known = work / "binaries" / f"{sha[:12]}.json"
+    if built:
+        git = sh(["git", "rev-parse", "--short", "HEAD"], cwd=REPO)
+        # Dirty only if the source the binary is built from has changed.
+        if sh(["git", "status", "--porcelain", "--untracked-files=no", "--",
+               "crates", "Cargo.toml", "Cargo.lock"], cwd=REPO):
+            git += "-dirty"
+        known.parent.mkdir(parents=True, exist_ok=True)
+        known.write_text(json.dumps({"sha256": sha, "git": git}))
+    else:
+        try:
+            git = json.loads(known.read_text())["git"]
+        except (OSError, json.JSONDecodeError, KeyError):
+            git = "unknown"
+    return {"path": str(binary), "sha256": sha, "git": git,
             "version": sh([str(binary), "--version"]), "file": sh(["file", "-b", str(binary)]),
             "rustc": sh(["rustc", "-V"])}
 
@@ -472,17 +625,19 @@ def preflight(plan: dict, steps: set, work: Path) -> None:
         raise SystemExit("preflight:\n  " + "\n  ".join(problems))
 
 
-def build_binary(args, steps: set) -> Path:
+def build_binary(args, steps: set) -> tuple[Path, bool]:
+    """The binary, and whether this run built it from the checkout."""
     if args.bin:
-        return args.bin.expanduser().resolve()
+        return args.bin.expanduser().resolve(), False
     binary = REPO / "target" / "release" / "tylertoo"
-    if "build" in steps:
+    built = "build" in steps
+    if built:
         print("[build] cargo build --release --bin tylertoo", flush=True)
         subprocess.run(["cargo", "build", "--release", "--bin", "tylertoo"], cwd=REPO,
                        check=True)
     if not binary.exists():
         raise SystemExit(f"{binary} is missing: run the build step or pass --bin")
-    return binary
+    return binary, built
 
 
 def read_cached(path: Path, key: str) -> dict | None:
@@ -493,10 +648,31 @@ def read_cached(path: Path, key: str) -> dict | None:
     return data if data.get("key") == key else None
 
 
+def cached_cell(summary_path: Path, key: str, pm: Path) -> dict | None:
+    """A cell's cached summary, if its key matches and it still stands: an ok
+    cell needs its archive, unchanged since it was measured; a failed cell is
+    a result unless a cap stopped it."""
+    cached = read_cached(summary_path, key)
+    if not cached:
+        return None
+    status = cached.get("status", "ok")
+    if status != "ok":
+        return None if any(cap in status for cap in CAPPED) else cached
+    try:
+        st = pm.stat()
+    except OSError:
+        return None
+    if (st.st_size, st.st_mtime_ns) != (cached.get("pmtiles_bytes"),
+                                        cached.get("pmtiles_mtime_ns")):
+        return None
+    return cached
+
+
 def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Path) -> dict:
     tiles = run_dir / "tiles"
     tiles.mkdir(parents=True, exist_ok=True)
     results = run_dir / "results.jsonl"
+    harness = harness_sha()
     cells = {}
     for ds_name in plan["datasets"]:
         ds = cfg["datasets"][ds_name]
@@ -508,11 +684,11 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
                            convert=st["convert"], valve=st["valve"], max_zoom=ds["max_zoom"],
                            max_tile_size=ds["max_tile_size"],
                            max_compressed_tile_size=ds["max_compressed_tile_size"],
-                           repeats=repeats)
+                           repeats=repeats, harness=harness)
             summary_path = tiles / f"{name}.json"
             pm = tiles / f"{name}.{st['valve']}.pmtiles"
-            cached = read_cached(summary_path, key)
-            if cached and pm.exists():
+            cached = cached_cell(summary_path, key, pm)
+            if cached:
                 cells[f"{ds_name}/{st_name}"] = cached
                 continue
             if "tile" not in steps:
@@ -533,7 +709,8 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
             summary = summarize_cell(conv["convert_runs"], records[1:],
                                      conv["convert_run"].get("overview_bytes"))
             summary.update(key=key, dataset=ds_name, setting=st_name, repeats=repeats,
-                           pmtiles=pm.name)
+                           pmtiles=pm.name,
+                           pmtiles_mtime_ns=pm.stat().st_mtime_ns if pm.exists() else None)
             summary_path.write_text(json.dumps(summary, indent=2))
             cells[f"{ds_name}/{st_name}"] = summary
     return cells
@@ -544,19 +721,17 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
     if not plan["tippecanoe"]:
         return refs
     tcfg = cfg["tippecanoe"]
-    setup = REPO / "benchmarks" / "e2e" / "setup_tippecanoe.sh"
-    # Builds once, verifies the pinned commit, and writes the lock file.
-    subprocess.run(["bash", str(setup)], check=True)
-    lock = json.loads((REPO / "benchmarks" / "e2e" / "tippecanoe.lock.json").read_text())
+    pin = tippecanoe_pin()
+    lock = None
     for ds_name in plan["tippecanoe"]:
         ds = cfg["datasets"][ds_name]
         targs = tcfg["datasets"][ds_name]["args"]
-        key = tippecanoe_key(lock["sha"], ds["sha256"], targs)
+        key = tippecanoe_key(pin, ds["sha256"], targs, tcfg["gpio"])
         d = work / "tippecanoe" / f"{ds_name}-{key}"
         meta = d / "run.json"
         cached = read_cached(meta, key)
         # A failed run is a result too, and is not retried: delete the
-        # directory to try again.
+        # directory to try again. A run stopped by a cap is not cached.
         if cached and (cached.get("status", "ok") != "ok"
                        or (d / "archive.pmtiles").exists()):
             print(f"[tippecanoe] {ds_name}: cached, {cached.get('status', 'ok')} ({d})",
@@ -565,38 +740,51 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
             continue
         if "tippecanoe" not in steps:
             raise SystemExit(f"tippecanoe {ds_name} is not cached: run the tippecanoe step")
+        if lock is None:
+            # Builds once, verifies the pinned commit, and writes the lock file.
+            subprocess.run(["bash", str(SETUP_TIPPECANOE)], check=True)
+            lock = json.loads((SETUP_TIPPECANOE.parent / "tippecanoe.lock.json").read_text())
+            if lock["sha"] != pin:
+                raise SystemExit(f"tippecanoe built {lock['sha']}, expected {pin}")
         d.mkdir(parents=True, exist_ok=True)
         fgb = d / "input.fgb"
         if not fgb.exists():
             tmp = d / "input.tmp.fgb"
             print(f"[tippecanoe] {ds_name}: gpio convert -> FlatGeobuf", flush=True)
-            subprocess.run(["uvx", "--from", tcfg["gpio"], "gpio", "convert", "flatgeobuf",
-                            str(inputs / ds["asset"]), str(tmp)], check=True)
-            tmp.replace(fgb)
+            try:
+                subprocess.run(["uvx", "--from", tcfg["gpio"], "gpio", "convert", "flatgeobuf",
+                                str(inputs / ds["asset"]), str(tmp)], check=True)
+                tmp.replace(fgb)
+            finally:
+                tmp.unlink(missing_ok=True)
         pm = d / "archive.pmtiles"
+        scratch = d / "tmp"
+        scratch.mkdir(exist_ok=True)
         print(f"[tippecanoe] {ds_name}: {' '.join(targs)} (this takes a while)", flush=True)
-        run = run_matrix.run_capped([lock["binary"], "-o", str(pm), "-f", *targs, str(fgb)],
-                                    tcfg["wall_s"], tcfg["rss_gib"])
+        subprocess.run(["sync"])
+        load_before, waited = run_matrix.wait_for_quiet()
+        # -t keeps tippecanoe's temporary files (GB on NZ) under --work, not /tmp.
+        run = run_matrix.run_capped(
+            [lock["binary"], "-o", str(pm), "-f", "-t", str(scratch), *targs, str(fgb)],
+            tcfg["wall_s"], tcfg["rss_gib"])
+        shutil.rmtree(scratch, ignore_errors=True)
+        lock_rec = {k: v for k, v in lock.items() if k != "binary"}
+        rec = {"key": key, "tippecanoe": lock_rec, "args": targs, "gpio": tcfg["gpio"],
+               "wall_s": run["wall_s"], "cpu_s": run["cpu_s"],
+               "peak_rss_kib": run["peak_rss_kib"], "load_before": load_before,
+               "load_wait_s": waited, "load_after": run_matrix.loadavg()}
         if run["status"] != "ok":
-            tail = (run["stderr_tail"] or "").split("\tCommand being timed")[0].splitlines()
-            code = next((ln.rsplit(" ", 1)[1] for ln in tail
-                         if ln.startswith("Command exited with non-zero status")), None)
-            rec = {"key": key, "tippecanoe": lock, "args": targs,
-                   "status": f"exit {code}" if code else run["status"],
-                   "error": next((ln for ln in reversed(tail)
-                                  if ln.strip() and not ln.startswith("Command exited")), ""),
-                   "wall_s": run["wall_s"], "cpu_s": run["cpu_s"],
-                   "peak_rss_kib": run["peak_rss_kib"], "pmtiles_bytes": None}
-            meta.write_text(json.dumps(rec, indent=2))
+            status, error = tippecanoe_failure(run)
+            rec.update(status=status, error=error, pmtiles_bytes=None)
             pm.unlink(missing_ok=True)
-            fgb.unlink()
-            print(f"[tippecanoe] {ds_name}: {rec['status']} after {rec['wall_s']:.0f} s: "
-                  f"{rec['error']}", flush=True)
+            if status not in CAPPED:
+                meta.write_text(json.dumps(rec, indent=2))
+                fgb.unlink()
+            print(f"[tippecanoe] {ds_name}: {status} after {rec['wall_s']:.0f} s: {error}",
+                  flush=True)
             refs[ds_name] = {**rec, "path": str(pm)}
             continue
-        rec = {"key": key, "tippecanoe": lock, "args": targs, "wall_s": run["wall_s"],
-               "cpu_s": run["cpu_s"], "peak_rss_kib": run["peak_rss_kib"],
-               "pmtiles_bytes": pm.stat().st_size, "pmtiles_sha256": run_matrix.sha256(pm)}
+        rec.update(pmtiles_bytes=pm.stat().st_size, pmtiles_sha256=run_matrix.sha256(pm))
         meta.write_text(json.dumps(rec, indent=2))
         # The archive is the cache; the FlatGeobuf is only its input.
         fgb.unlink()
@@ -660,18 +848,23 @@ def collect_scores(cfg, plan, inputs: Path, js: Path, run_dir: Path, archives: d
     def labels(ds):
         return [(s, archives[(ds, s)]) for s in plan["settings"] if (ds, s) in archives]
 
+    # Each key covers the entry, the input, the archives scored and the scorer
+    # script (whose header pins its dependencies). Window and coverage outputs
+    # sit in a directory per key, so profiles that score different archive
+    # sets of one window keep their own results.
     for w in plan["windows"]:
         ds = cfg["datasets"][w["dataset"]]
-        out = run_dir / "score" / "windows" / w["name"]
         lab = labels(w["dataset"])
+        key = digest([w, ds["sha256"], [(s, sha) for s, (_, sha) in lab], cfg["js"],
+                      script_sha("render_maplibre.py")])
+        out = run_dir / "score" / "windows" / f"{w['name']}-{key[:8]}"
         cmd = uv_script("render_maplibre.py", "--source", inputs / ds["asset"],
                         "--zoom", w["zoom"], "--tile", ",".join(map(str, w["tile"])),
                         "--window", ",".join(map(str, w["window"])),
                         "--draw-zoom", ",".join(map(str, w["draw_zooms"])),
                         "--js-dir", js, "--out", out,
                         *[a for s, (p, _) in lab for a in ("--label", f"{s}={p}")])
-        if not queue(out, digest([w, [(s, sha) for s, (_, sha) in lab], cfg["js"]]),
-                     f"window {w['name']}", cmd):
+        if not queue(out, key, f"window {w['name']}", cmd):
             continue
         images = json.loads((out / "maplibre.json").read_text())["images"]
         zooms = {}
@@ -684,14 +877,15 @@ def collect_scores(cfg, plan, inputs: Path, js: Path, run_dir: Path, archives: d
 
     for c in plan["coverage"]:
         ds = cfg["datasets"][c["dataset"]]
-        out = run_dir / "score" / "coverage" / c["name"]
         lab = labels(c["dataset"])
+        key = digest([c, ds["sha256"], [(s, sha) for s, (_, sha) in lab],
+                      script_sha("render_coverage.py")])
+        out = run_dir / "score" / "coverage" / f"{c['name']}-{key[:8]}"
         cmd = uv_script("render_coverage.py", "--source", inputs / ds["asset"],
                         "--zoom", c["zoom"], "--center", ",".join(map(str, c["center"])),
                         "--span", c["span"], "--out", out,
                         *[a for s, (p, _) in lab for a in ("--label", f"{s}={p}")])
-        if not queue(out, digest([c, [(s, sha) for s, (_, sha) in lab]]),
-                     f"coverage {c['name']}", cmd):
+        if not queue(out, key, f"coverage {c['name']}", cmd):
             continue
         data = json.loads((out / "coverage.json").read_text())
         res["coverage"][c["name"]] = {
@@ -716,7 +910,9 @@ def collect_scores(cfg, plan, inputs: Path, js: Path, run_dir: Path, archives: d
                 cmd += ["--color-attr", m["color_attr"]]
             if m.get("named"):
                 cmd += ["--named", ",".join(m["named"])]
-            if not queue(out, digest([m, sha]), f"metrics {m['name']} {s}", cmd):
+            key = digest([m, ds["sha256"], ds["max_tile_size"], ds["max_compressed_tile_size"],
+                          sha, script_sha("tile_metrics.py")])
+            if not queue(out, key, f"metrics {m['name']} {s}", cmd):
                 continue
             data = json.loads((out / "metrics.json").read_text())
             per[s] = {"zooms": {z: {"median": v["drawn_share"]["median"],
@@ -752,6 +948,7 @@ def main() -> int:
     if steps - set(STEPS):
         raise SystemExit(f"unknown steps: {', '.join(sorted(steps - set(STEPS)))}")
     run_matrix.LOAD_MAX = args.load_max
+    baseline = load_baseline(args.compare) if args.compare else None
     work = args.work.expanduser().resolve()
     preflight(plan, steps, work)
     t0 = time.monotonic()
@@ -762,15 +959,17 @@ def main() -> int:
         dest = inputs / ds["asset"]
         if "fetch" in steps:
             fetch(f"{cfg['release']}/{ds['asset']}", dest, ds["sha256"])
-        elif not dest.exists():
-            raise SystemExit(f"{dest} is missing: run the fetch step")
+        else:
+            verify_input(dest, ds["sha256"])
     for name, spec in cfg["js"].items():
-        fname = Path(spec["url"]).name
+        dest = js / Path(spec["url"]).name
         if "fetch" in steps:
-            fetch(spec["url"], js / fname, spec["sha256"])
+            fetch(spec["url"], dest, spec["sha256"])
+        elif plan["windows"]:
+            verify_input(dest, spec["sha256"])
 
-    binary = build_binary(args, steps)
-    binfo = binary_info(binary)
+    binary, built = build_binary(args, steps)
+    binfo = binary_info(binary, built, work)
     run_dir = work / "runs" / binfo["sha256"][:12]
     print(f"[run] {plan['name']} profile, tylertoo {binfo['git']} -> {run_dir}", flush=True)
 
@@ -790,7 +989,7 @@ def main() -> int:
         "schema": 1, "profile": plan["name"],
         "created": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "config_sha256": run_matrix.sha256(args.config),
-        "noise": cfg["noise"], "host": host_info(),
+        "noise": cfg["noise"], "load_max": run_matrix.LOAD_MAX, "host": host_info(),
         "binary": {k: v for k, v in binfo.items() if k != "path"},
         "datasets": {d: {k: cfg["datasets"][d].get(k)
                          for k in ("label", "asset", "sha256", "features", "max_zoom",
@@ -807,11 +1006,13 @@ def main() -> int:
         **scores,
         "elapsed_s": round(time.monotonic() - t0, 1),
     }
-    baseline = json.loads(args.compare.read_text()) if args.compare else None
-    md = render_markdown(report, baseline)
     # Per profile in the run's directory; the latest of any profile in --work.
-    for d, stem in ((run_dir, f"report-{plan['name']}"), (work, "report")):
+    # The JSON is written first, so a rendering failure loses nothing.
+    targets = ((run_dir, f"report-{plan['name']}"), (work, "report"))
+    for d, stem in targets:
         (d / f"{stem}.json").write_text(json.dumps(report, indent=2) + "\n")
+    md = render_markdown(report, baseline)
+    for d, stem in targets:
         (d / f"{stem}.md").write_text(md)
     print(md)
     print(f"[run] done in {report['elapsed_s']:.0f} s: {work / 'report.md'}", flush=True)

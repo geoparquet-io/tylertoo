@@ -4,6 +4,8 @@
 #   "pmtiles>=3.4", "mapbox-vector-tile>=2.1", "shapely>=2.0", "rasterio>=1.4",
 #   "geopandas>=1.0", "pyarrow>=17", "numpy>=1.26", "pillow>=10",
 # ]
+# [tool.uv]
+# exclude-newer = "2026-10-22T00:00:00Z"
 # ///
 """
 render_coverage.py — the source and several PMTiles archives, drawn over the

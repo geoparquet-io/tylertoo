@@ -22,19 +22,27 @@ it skips completed work if the inputs haven't changed:
 |---|---|---|
 | `fetch` | The profile's inputs from the [`bench-coalesce-v1`](https://github.com/geoparquet-io/tylertoo/releases/tag/bench-coalesce-v1) release, plus MapLibre GL JS 4.7.1 and pmtiles.js 3.2.1, each checked against its sha256 in `bench.toml` | file and sha256 |
 | `build` | `cargo build --release --bin tylertoo`; skipped with `--bin PATH` | cargo |
-| `tile` | `tylertoo overview` then `export-pmtiles` for each dataset and setting, `repeats` times each, under GNU time with a wall and RSS cap (`run_matrix.run_cell`) | binary sha256, input, flags, repeats |
-| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`, 2.79.0) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments |
-| `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s and the entry's config |
+| `tile` | `tylertoo overview` then `export-pmtiles` for each dataset and setting, `repeats` times each, under GNU time with a wall and RSS cap (`run_matrix.run_cell`) | binary sha256, `run_matrix.py`, input, flags, repeats |
+| `tippecanoe` | The pinned tippecanoe (`benchmarks/e2e/setup_tippecanoe.sh`, 2.79.0) on FlatGeobuf input, with #745's arguments | tippecanoe commit, input, arguments, gpio version |
+| `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s, input, scorer script, and the entry's config |
 | `report` | `report-<profile>.json` and `.md` in `<work>/runs/<binary>/`; the latest run's also as `<work>/report.json` and `report.md` | — |
 
-The benchmark records failed tippecanoe runs in `run.json`, caches them, and
-includes them in the report. To retry a failed run, delete
-`<work>/tippecanoe/<dataset>-<key>/`. tippecanoe's `-M` caps the compressed
-tile. On Moldova (500K), this cap is looser than tylertoo's 500K raw cap.
-tippecanoe has no raw cap.
+A failed run is a result: the benchmark caches it and shows it in the
+report, for tylertoo cells and tippecanoe alike. To retry a failed
+tippecanoe run, delete `<work>/tippecanoe/<dataset>-<key>/`. A run that a
+wall-time or memory cap stopped (`TIMEOUT`, `RSS_CAP`) isn't cached, so the
+next run tries it again.
+
+tippecanoe's `-M` caps the compressed tile. On Moldova (500K), this cap is
+looser than tylertoo's 500K raw cap. tippecanoe has no raw cap. tippecanoe
+writes its temporary files under `--work`, not `/tmp`.
 
 Use `--only tile,report` to run only the named steps. The cache must already
-contain the output of any step you omit.
+contain the output of any step you omit. Without the `fetch` step, the
+benchmark still checks each input against its sha256.
+
+The scorer scripts pin their Python dependencies with uv's `exclude-newer`,
+so a clean checkout resolves the same versions later.
 
 Each run waits until the 1-minute load average drops below the load limit,
 then records the load before and after. The limit is a tenth of the core
@@ -48,13 +56,15 @@ whether its repeats write identical bytes (`repeats_identical` in `report.json`)
 | `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 20 min: 8.5 min tiling, of which 6 min is the `sf0` export ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)), and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
 | `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ and Moldova | about 45 min of tylertoo tiling and scoring. The first run adds tippecanoe: about 32 min on NZ and 34 min on Moldova, where it fails. Both results are cached | about 20 GB at peak |
 
-You can run the `small` profile without keys. It needs network access only
-to the release and the CDN.
+You can run the `small` profile without keys. It needs network access to
+the release, the CDN, PyPI (through uv) and, for the `build` step,
+crates.io. The `full` profile also clones tippecanoe from GitHub.
 
 ## Setup
 
-- [uv](https://docs.astral.sh/uv/), Rust (for the `build` step), `curl`, and
-  GNU time at `/usr/bin/time` (`apt install time`). Timing and RSS come from
+- [uv](https://docs.astral.sh/uv/), Rust and `protoc` (for the `build` step;
+  `apt install protobuf-compiler`), `curl`, and GNU time at `/usr/bin/time`
+  (`apt install time`). Timing and RSS come from
   `/proc` and GNU time, so the benchmark runs on Linux only.
 - Headless Chromium for the MapLibre windows, installed once:
 
@@ -87,7 +97,7 @@ headless Chromium over a fixed window. The benchmark compares the rendering
 pixel by pixel with the source, rasterized by the same pixel-center rule.
 Each cell shows the share of source area the map leaves empty. Parentheses
 show the share the map fills outside the source when it is 0.5% or more.
-You can find the images in `<work>/runs/<binary>/score/windows/<window>/`:
+You can find the images in `<work>/runs/<binary>/score/windows/<window>-<key>/`:
 magenta marks missing area, orange marks added area.
 
 **Tile coverage and drawn share**: these checks rasterize decoded tiles at
@@ -98,8 +108,22 @@ settings, not as absolute values.
 **Noise floor**: at full detail, small fields show about 2.5% missing and 2.5%
 added area from tile-grid snapping alone. With `--compare`, each value shows
 its change from the baseline. The report marks a change with ▲ or ▼ only when
-it is beyond 3 percentage points (coverage) or 10% (median time), set in
-`bench.toml` under `[noise]`. Smaller changes are not regressions.
+it is beyond the noise floor in `bench.toml` under `[noise]`: 3 percentage
+points for coverage, and 10% for times. For times, the floor widens to the
+spread of the repeats when that is larger. For example, Moldova `sf0` exports
+vary by about 20% from run to run, so a 15% change there isn't marked.
+Smaller changes are not regressions.
+
+When the baseline comes from a different host, the report shows time changes
+but doesn't mark them. It marks changes to the ratio column instead, since
+the ratio carries across hosts.
+
+Two marks flag cells to treat with care:
+
+- † The load average was at or above the gate when a run of the cell started.
+  The gate waits at most 30 minutes, then runs anyway, so the times may be
+  high.
+- ‡ The cell's repeats wrote different bytes.
 
 ## Baselines
 

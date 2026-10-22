@@ -274,6 +274,8 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
     records = [{"kind": "convert", "convert_run": conv, "convert_runs": convert_runs}]
     record(records[-1])
     if conv["status"] != "ok":
+        if not keep:
+            ov.unlink(missing_ok=True)
         return records
     for valve in valves:
         pm = out / f"{name}.{valve}.pmtiles"
