@@ -797,7 +797,11 @@ def main() -> int:
         "settings": {s: {k: v for k, v in cfg["settings"][s].items()}
                      for s in plan["settings"]},
         "cells": cells,
-        "tippecanoe": {d: {k: v for k, v in r.items() if k != "path"} for d, r in refs.items()},
+        # Machine-local paths stay out, so a report can be committed as a baseline.
+        "tippecanoe": {d: {**{k: v for k, v in r.items() if k != "path"},
+                           "tippecanoe": {k: v for k, v in r["tippecanoe"].items()
+                                          if k != "binary"}}
+                       for d, r in refs.items()},
         **scores,
         "elapsed_s": round(time.monotonic() - t0, 1),
     }
