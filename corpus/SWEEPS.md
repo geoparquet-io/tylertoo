@@ -396,3 +396,36 @@ instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
 `0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
 file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
 Issue #450 tracks simplifying shared borders identically.
+
+## Decision 9: the coverage fill is opt-in (issue #750)
+
+After #745, placeholder squares stood in for polygons too small for a level,
+but they sat where those polygons were. In dense blocks they overlapped one
+another and left gaps: Auckland parcels missed 28% of their area at z8 and
+z10. `export-pmtiles --coverage-fill` draws, under each tile's features, the
+area its child tiles cover (`overview/export/coverage_fill.rs`).
+
+Measured with #760's harness (`benchmarks/coalesce/run.py`, a `fill`
+setting on the full profile's datasets), against the defaults:
+
+- Coverage: Auckland city z8/z10/z12 missing 28.5% / 28.2% / 3.2% → 0.0% /
+  0.2% / 0.1% (tippecanoe 5.7% / 0.0% / 0.6%); Upper North Island z3
+  13.3% → 0.6% (tippecanoe 12.1%); Madagascar z3 23.5% → 0.3%. Added
+  area stays under 1% on all three.
+- Cost, end to end: NZ 108.0 s → 117.8 s (+9%), Madagascar 2.82 s → 3.08 s
+  (+9%); archives +3% and +4%; export peak memory +8% and +15%.
+- FTW Moldova, whose fields are smaller than a pixel at coarse zooms: the
+  missing share halves (z3 15.8% → 7.6%), but added area grows (+51% →
+  +63%), the archive grows 20%, and the build takes 1.32× as long.
+  tippecanoe cannot tile this input (#760).
+
+Two fixes made the cost acceptable. The size valve fits a tile's own features
+into what the fill leaves of the cap (`FillBytes`): sized on the whole tile,
+it ran Moldova's z10 to 31 passes. And Douglas–Peucker's shrinkage of convex
+blobs, a third of their area a few pixels across, is credited back as squares;
+without that the fill lost 23% of its area by z5.
+
+The fill is opt-in because the Moldova result is worse on added area, and the
+overview cannot tell a dense coverage from scattered sub-pixel polygons.
+Making it the default needs that distinction, or a fix for the over-draw
+(#762).

@@ -42,6 +42,7 @@ Use these settings to balance coverage, build time, and file size:
 
 | Goal | Settings | Cost and effect |
 |---|---|---|
+| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. About 1.1× the build time and 3–4% larger archives on NZ parcels and Madagascar admin-4. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill---coverage-fill). |
 | Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
@@ -104,6 +105,32 @@ previous retained feature. First, sort the input spatially with
 `gpio sort hilbert` so consecutive features are near each other. On shuffled
 input, merged features can contain unrelated geometry, and color changes at
 tile edges become far more frequent.
+
+### Coverage fill: `--coverage-fill`
+
+Placeholder squares carry the right total area, but they sit where the small
+polygons were, so in a dense block they overlap one another and leave gaps
+between them (#750). `export-pmtiles --coverage-fill` closes those gaps.
+Before writing any tile, the export reads the finest level once and works out,
+for every coarser tile, the area its child tiles cover. Each tile then draws
+that area under its own features.
+
+- Touching shapes in the fill are merged into one and simplified at one
+  ground pixel, so at coarse zooms the fill reads as dissolved shapes, not
+  individual polygons. Area lost to the
+  simplification comes back as small grid-aligned squares.
+- Each piece of the fill takes the id and attributes of the feature it sits
+  under, as a merged feature does, so a choropleth colors it like its
+  neighbors.
+- The fill counts toward the [size cap](#tile-size-cap): the size valve merges
+  or drops the tile's own features to make room for it.
+- It is skipped for sharded builds.
+
+On the benchmark inputs, the fill adds about 10% to end-to-end time on NZ
+parcels and Madagascar admin-4 and 3–4% to the archive. On FTW Moldova, where
+fields are smaller than a pixel at coarse zooms, it halves the missing area
+but draws more area between fields, and the build takes about 1.3× as long
+(#762).
 
 ## The GSD ladder: `--gsd-base` and `--gsd`
 

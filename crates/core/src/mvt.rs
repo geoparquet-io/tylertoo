@@ -1276,6 +1276,39 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
     encode_tile_polygons(&resolve_part_overlaps(polys))
 }
 
+/// Encode polygons already in integer tile units (each one an exterior
+/// followed by its holes, rings open or closed) as one MultiPolygon command
+/// stream: clean, resolve overlapping parts and orient exactly as
+/// [`encode_multi_polygon`] does. Empty when nothing has area. The #750
+/// coverage fill is built in tile units, so it skips the projection.
+pub(crate) fn encode_tile_unit_polygons<'a>(
+    polygons: impl IntoIterator<Item = &'a Vec<Vec<(i32, i32)>>>,
+) -> Vec<u32> {
+    let close = |ring: &Vec<(i32, i32)>| -> Option<TileRing> {
+        let mut r: TileRing = Vec::with_capacity(ring.len() + 1);
+        for &q in ring {
+            if r.last() != Some(&q) {
+                r.push(q);
+            }
+        }
+        if r.first() != r.last() {
+            r.push(r[0]);
+        }
+        (r.len() >= 4).then_some(r)
+    };
+    let polys: Vec<Vec<TileRing>> = polygons
+        .into_iter()
+        .filter_map(|rings| {
+            let exterior = close(rings.first()?)?;
+            let mut rs = vec![exterior];
+            rs.extend(rings[1..].iter().filter_map(close));
+            Some(rs)
+        })
+        .flat_map(clean_tile_polygon)
+        .collect();
+    encode_tile_polygons(&resolve_part_overlaps(polys))
+}
+
 /// Encode a single-type `geo::Geometry` to MVT geometry commands and return the
 /// geometry type.
 ///

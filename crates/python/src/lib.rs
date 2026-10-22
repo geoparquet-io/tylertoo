@@ -222,6 +222,7 @@ fn convert(
         // #745: tippecanoe's `-M`; 0 sets no compressed limit.
         compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
         size_valve: parse_size_valve(size_valve)?,
+        coverage_fill: false,
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
@@ -791,6 +792,7 @@ fn export_pmtiles(
         // #745: tippecanoe's `-M`; 0 sets no compressed limit.
         compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
         size_valve: parse_size_valve(size_valve)?,
+        coverage_fill: false,
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,

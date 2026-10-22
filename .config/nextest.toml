@@ -75,6 +75,7 @@ not (
   | test(large_polygon_regression)
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
   | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
+  | (binary(coverage_fill) & test(=coverage_fill_closes_coarse_holes_without_overdrawing))
 )
 """
 
@@ -102,6 +103,7 @@ filter = """
   | test(large_polygon_regression)
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
   | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
+  | (binary(coverage_fill) & test(=coverage_fill_closes_coarse_holes_without_overdrawing))
 """
 slow-timeout = { period = "120s", terminate-after = 15 }
 
