@@ -217,6 +217,98 @@ def zoom_summary(report: dict) -> list[dict]:
     return [{k: z.get(k) for k in keep} for z in report.get("zooms", [])]
 
 
+def convert_argv(binary: str, src: Path, ov: Path, max_zoom: int, report: Path,
+                 flags: list[str]) -> list[str]:
+    return [binary, "overview", str(src), str(ov), "--min-zoom", "0",
+            "--max-zoom", str(max_zoom), "--force", "--report", str(report), *flags]
+
+
+def export_argv(binary: str, ov: Path, pm: Path, max_tile_size: str,
+                max_compressed_tile_size: str, valve: str, report: Path | None) -> list[str]:
+    argv = [binary, "export-pmtiles", str(ov), str(pm), "--force",
+            "--max-tile-size", str(max_tile_size),
+            "--max-compressed-tile-size", str(max_compressed_tile_size),
+            "--size-valve", valve]
+    return [*argv, "--report", str(report)] if report else argv
+
+
+def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[str],
+             valves: list[str], *, max_zoom: int, max_tile_size: str,
+             max_compressed_tile_size: str, wall_s: float, rss_gib: float,
+             repeats: int = 1, convert_repeats: int = 1, keep: bool = False,
+             determinism_check: bool = False, prep_s: float = 0.0,
+             record=lambda rec: None) -> list[dict]:
+    """Convert src once per convert repeat (the last overview is kept), then
+    export it `repeats` times per valve. Every run is passed to `record` and
+    returned: one `convert` record, then one `export` record per repeat. Files
+    are `<out>/<name>.*`; `prep_s` is the input's preparation time, added to
+    `total_with_prep_s`."""
+    ov = out / f"{name}.overview.parquet"
+    convert_runs = []
+    for _ in range(convert_repeats):
+        subprocess.run(["sync"])
+        load_before, waited = wait_for_quiet()
+        conv = run_capped(
+            convert_argv(binary, src, ov, max_zoom, out / f"{name}.convert.json", convert_flags),
+            wall_s, rss_gib,
+        )
+        conv.update(load_before=load_before, load_wait_s=waited, load_after=loadavg(),
+                    overview_bytes=ov.stat().st_size if ov.exists() else None)
+        print(f"[convert] {name}: {conv['status']} {conv['wall_s']}s "
+              f"{(conv['peak_rss_kib'] or 0) / 1048576:.2f} GiB", flush=True)
+        convert_runs.append(conv)
+        if conv["status"] != "ok":
+            break
+    conv = convert_runs[-1]
+    records = [{"kind": "convert", "convert_run": conv, "convert_runs": convert_runs}]
+    record(records[-1])
+    if conv["status"] != "ok":
+        return records
+    for valve in valves:
+        pm = out / f"{name}.{valve}.pmtiles"
+        for rep in range(repeats):
+            report = out / f"{name}.{valve}.report.json"
+            profile = out / f"{name}.{valve}.{rep}.profile.jsonl"
+            profile.unlink(missing_ok=True)
+            subprocess.run(["sync"])
+            load_before, waited = wait_for_quiet()
+            env = dict(os.environ, TYLERTOO_PROFILE_JSON=str(profile))
+            exp = run_capped(
+                export_argv(binary, ov, pm, max_tile_size, max_compressed_tile_size, valve,
+                            report),
+                wall_s, rss_gib, env=env,
+            )
+            exp.update(load_before=load_before, load_wait_s=waited, load_after=loadavg())
+            rec = {"kind": "export", "valve": valve, "repeat": rep, "convert_run": conv,
+                   "export_run": exp}
+            if exp["status"] == "ok":
+                rep_json = json.loads(report.read_text())
+                rec["pmtiles_bytes"] = pm.stat().st_size
+                rec["pmtiles_sha256"] = sha256(pm)
+                rec["zooms"] = zoom_summary(rep_json)
+                rec["merged_features"] = rep_json.get("merged_features")
+                rec["valve_dropped_features"] = rep_json.get("valve_dropped_features")
+                rec["oversized_tiles"] = rep_json.get("oversized_tiles")
+                rec["profile"] = last_json_line(profile)
+                rec["total_s"] = round(conv["wall_s"] + exp["wall_s"], 3)
+                rec["total_with_prep_s"] = round(rec["total_s"] + prep_s, 3)
+                if determinism_check and rep == 0:
+                    rec["determinism"] = determinism(
+                        binary, ov, pm, valve, max_tile_size, max_compressed_tile_size,
+                        wall_s, rss_gib, rec["pmtiles_sha256"])
+            print(f"[export] {name}/{valve}#{rep}: {exp['status']} "
+                  f"{exp['wall_s']}s {(exp['peak_rss_kib'] or 0) / 1048576:.2f} GiB "
+                  f"merged={rec.get('merged_features')} "
+                  f"dropped={rec.get('valve_dropped_features')}", flush=True)
+            records.append(rec)
+            record(rec)
+    # The PMTiles stay for tile_metrics.py; the overview, which can be many GB
+    # at scale, does not.
+    if not keep:
+        ov.unlink(missing_ok=True)
+    return records
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--stage", required=True, choices=sorted(STAGES))
@@ -270,75 +362,22 @@ def main() -> int:
                 continue
             prep_rec = prep.get(f"{ds}/{order}", {})
             for cv in stage["converts"]:
-                cell = f"{ds}/{order}/{cv}"
-                ov = out / f"{ds}.{order}.{cv}.overview.parquet"
-                load_before, waited = wait_for_quiet()
-                conv = run_capped(
-                    [binary, "overview", str(src), str(ov), "--min-zoom", "0",
-                     "--max-zoom", str(max_zoom), "--force",
-                     "--report", str(out / f"{ds}.{order}.{cv}.convert.json"),
-                     *CONVERTS[cv]],
-                    stage["wall_s"], stage["rss_gib"],
-                )
-                conv.update(load_before=load_before, load_wait_s=waited, load_after=loadavg(),
-                            overview_bytes=ov.stat().st_size if ov.exists() else None)
-                print(f"[convert] {cell}: {conv['status']} {conv['wall_s']}s "
-                      f"{(conv['peak_rss_kib'] or 0) / 1048576:.2f} GiB", flush=True)
-                if conv["status"] != "ok":
-                    record({"kind": "convert", "cell": cell, "dataset": ds, "order": order,
-                            "convert": cv, "prep": prep_rec, "convert_run": conv})
-                    continue
-                record({"kind": "convert", "cell": cell, "dataset": ds, "order": order,
-                        "convert": cv, "prep": prep_rec, "convert_run": conv})
-                for valve in stage["valves_for"][cv]:
-                    pm = out / f"{ds}.{order}.{cv}.{valve}.pmtiles"
-                    for rep in range(args.repeats):
-                        report = out / f"{ds}.{order}.{cv}.{valve}.report.json"
-                        profile = out / f"{ds}.{order}.{cv}.{valve}.{rep}.profile.jsonl"
-                        profile.unlink(missing_ok=True)
-                        subprocess.run(["sync"])
-                        load_before, waited = wait_for_quiet()
-                        env = dict(os.environ, TYLERTOO_PROFILE_JSON=str(profile))
-                        exp = run_capped(
-                            [binary, "export-pmtiles", str(ov), str(pm), "--force",
-                             "--max-tile-size", args.max_tile_size,
-                             "--max-compressed-tile-size", args.max_compressed_tile_size,
-                             "--size-valve", valve, "--report", str(report)],
-                            stage["wall_s"], stage["rss_gib"], env=env,
-                        )
-                        exp.update(load_before=load_before, load_wait_s=waited,
-                                   load_after=loadavg())
-                        rec = {"kind": "export", "cell": cell, "dataset": ds, "order": order,
-                               "convert": cv, "valve": valve, "repeat": rep,
-                               "prep": prep_rec, "convert_run": conv, "export_run": exp}
-                        if exp["status"] == "ok":
-                            rep_json = json.loads(report.read_text())
-                            rec["pmtiles_bytes"] = pm.stat().st_size
-                            rec["pmtiles_sha256"] = sha256(pm)
-                            rec["zooms"] = zoom_summary(rep_json)
-                            rec["merged_features"] = rep_json.get("merged_features")
-                            rec["valve_dropped_features"] = rep_json.get("valve_dropped_features")
-                            rec["oversized_tiles"] = rep_json.get("oversized_tiles")
-                            rec["profile"] = last_json_line(profile)
-                            prep_s = prep_rec.get("wall_s") or 0.0
-                            rec["total_s"] = round(conv["wall_s"] + exp["wall_s"], 3)
-                            rec["total_with_prep_s"] = round(rec["total_s"] + prep_s, 3)
-                            if stage.get("determinism") and rep == 0:
-                                rec["determinism"] = determinism(binary, ov, pm, valve, args,
-                                                                 stage, rec["pmtiles_sha256"])
-                        print(f"[export] {cell}/{valve}#{rep}: {exp['status']} "
-                              f"{exp['wall_s']}s {(exp['peak_rss_kib'] or 0) / 1048576:.2f} GiB "
-                              f"merged={rec.get('merged_features')} "
-                              f"dropped={rec.get('valve_dropped_features')}", flush=True)
-                        record(rec)
-                # The PMTiles stay for tile_metrics.py; the overview, which
-                # can be many GB at scale, does not.
-                if not args.keep:
-                    ov.unlink(missing_ok=True)
+                base = {"cell": f"{ds}/{order}/{cv}", "dataset": ds, "order": order,
+                        "convert": cv, "prep": prep_rec}
+                run_cell(binary, src, out, f"{ds}.{order}.{cv}", CONVERTS[cv],
+                         stage["valves_for"][cv], max_zoom=max_zoom,
+                         max_tile_size=args.max_tile_size,
+                         max_compressed_tile_size=args.max_compressed_tile_size,
+                         wall_s=stage["wall_s"], rss_gib=stage["rss_gib"],
+                         repeats=args.repeats, keep=args.keep,
+                         determinism_check=stage.get("determinism", False),
+                         prep_s=prep_rec.get("wall_s") or 0.0,
+                         record=lambda rec, base=base: record({**base, **rec}))
     return 0
 
 
-def determinism(binary: str, ov: Path, pm: Path, valve: str, args, stage: dict,
+def determinism(binary: str, ov: Path, pm: Path, valve: str, max_tile_size: str,
+                max_compressed_tile_size: str, wall_s: float, rss_gib: float,
                 first: str) -> dict:
     """Re-export twice more (same threads, then one thread) and compare."""
     res = {}
@@ -348,16 +387,12 @@ def determinism(binary: str, ov: Path, pm: Path, valve: str, args, stage: dict,
         if threads:
             env["RAYON_NUM_THREADS"] = threads
         run = run_capped(
-            [binary, "export-pmtiles", str(ov), str(other), "--force",
-             "--max-tile-size", args.max_tile_size,
-             "--max-compressed-tile-size", args.max_compressed_tile_size,
-             "--size-valve", valve],
-            stage["wall_s"] * 4, stage["rss_gib"], env=env,
+            export_argv(binary, ov, other, max_tile_size, max_compressed_tile_size, valve, None),
+            wall_s * 4, rss_gib, env=env,
         )
         res[label] = run["status"] == "ok" and sha256(other) == first
         other.unlink(missing_ok=True)
     return res
-
 
 if __name__ == "__main__":
     sys.exit(main())
