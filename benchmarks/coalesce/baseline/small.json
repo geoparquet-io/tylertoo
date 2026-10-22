@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "profile": "small",
-  "created": "2026-10-22 12:38 UTC",
-  "config_sha256": "7f07a3167b14ebbd145255390ca1907c910e1a03814f8e37e4a2eda2753479da",
+  "created": "2026-10-22 14:21 UTC",
+  "config_sha256": "c9727f2c88f29657c2a23392968ef5854e22982e99055a052c0ea7fc28d879a0",
   "noise": {
     "coverage_pp": 3.0,
     "time_ratio": 0.1
@@ -17,7 +17,7 @@
   },
   "binary": {
     "sha256": "7d6f50e90893795325832ea6c3a1089aa59f8060b86ba00bf454d9d0526c6520",
-    "git": "67bc3de",
+    "git": "67a221e",
     "version": "tylertoo 0.8.0",
     "file": "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=774047c10ec7e679354994128c7f713cc4c0ee41, for GNU/Linux 3.7.0, stripped",
     "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)"
@@ -81,25 +81,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          0.68,
-          0.71,
-          0.68
+          0.67,
+          0.66,
+          0.69
         ],
-        "median_s": 0.68,
-        "cpu_s": 3.1,
-        "peak_rss_kib": 318332
+        "median_s": 0.67,
+        "cpu_s": 3.13,
+        "peak_rss_kib": 317004
       },
       "export": {
         "wall_s": [
-          0.5,
+          0.51,
           0.52,
-          0.52
+          0.51
         ],
-        "median_s": 0.52,
-        "cpu_s": 4.17,
-        "peak_rss_kib": 261136
+        "median_s": 0.51,
+        "cpu_s": 4.14,
+        "peak_rss_kib": 262760
       },
-      "total_s": 1.2,
+      "total_s": 1.18,
       "overview_bytes": 30221929,
       "pmtiles_bytes": 18717926,
       "pmtiles_sha256": "5ae6094316c1b8c28dca00bdfa1f873b296bdba1cccfd3bfa4f1bef88c61db99",
@@ -227,25 +227,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
+          0.88,
           0.86,
-          0.96,
-          0.88
+          0.87
         ],
-        "median_s": 0.88,
-        "cpu_s": 2.78,
-        "peak_rss_kib": 440348
+        "median_s": 0.87,
+        "cpu_s": 2.77,
+        "peak_rss_kib": 444588
       },
       "export": {
         "wall_s": [
-          2.05,
-          2.02,
-          2.0
+          1.94,
+          1.9,
+          2.09
         ],
-        "median_s": 2.02,
-        "cpu_s": 11.66,
-        "peak_rss_kib": 415968
+        "median_s": 1.94,
+        "cpu_s": 11.43,
+        "peak_rss_kib": 427764
       },
-      "total_s": 2.9,
+      "total_s": 2.81,
       "overview_bytes": 47756458,
       "pmtiles_bytes": 25469267,
       "pmtiles_sha256": "0066cf72072434129e2b42f2b0423232f329249ac7a09877e8e467d8f2fc7171",
@@ -382,25 +382,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.01,
-          1.11,
-          1.04
+          1.05,
+          1.02,
+          1.02
         ],
-        "median_s": 1.04,
-        "cpu_s": 4.25,
-        "peak_rss_kib": 490960
+        "median_s": 1.02,
+        "cpu_s": 4.3,
+        "peak_rss_kib": 486260
       },
       "export": {
         "wall_s": [
-          2.08,
-          2.02,
-          2.04
+          2.15,
+          2.17,
+          2.1
         ],
-        "median_s": 2.04,
-        "cpu_s": 12.67,
-        "peak_rss_kib": 451340
+        "median_s": 2.15,
+        "cpu_s": 12.89,
+        "peak_rss_kib": 451704
       },
-      "total_s": 3.08,
+      "total_s": 3.17,
       "overview_bytes": 61003226,
       "pmtiles_bytes": 27635062,
       "pmtiles_sha256": "5d3d4549b59127c71be0633fabcd8db22c0a3aabddd72b7b1df7895c18b053ff",
@@ -537,25 +537,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.65,
-          2.05,
-          2.05
+          1.71,
+          1.7,
+          1.7
         ],
-        "median_s": 2.05,
-        "cpu_s": 3.23,
-        "peak_rss_kib": 808652
+        "median_s": 1.7,
+        "cpu_s": 3.29,
+        "peak_rss_kib": 815944
       },
       "export": {
         "wall_s": [
-          2.44,
-          2.34,
-          2.27
+          2.42,
+          2.53,
+          2.34
         ],
-        "median_s": 2.34,
-        "cpu_s": 19.17,
-        "peak_rss_kib": 781680
+        "median_s": 2.42,
+        "cpu_s": 19.59,
+        "peak_rss_kib": 825864
       },
-      "total_s": 4.39,
+      "total_s": 4.12,
       "overview_bytes": 187051542,
       "pmtiles_bytes": 31132892,
       "pmtiles_sha256": "ca9651ea7981ab6d7cb473c781d05a88aad942e7431b46c5d2cb34fa07f9c598",
@@ -692,25 +692,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.62,
-          1.85,
-          1.82
+          1.66,
+          1.65,
+          1.65
         ],
-        "median_s": 1.82,
-        "cpu_s": 21.3,
-        "peak_rss_kib": 2428104
+        "median_s": 1.65,
+        "cpu_s": 21.39,
+        "peak_rss_kib": 2478180
       },
       "export": {
         "wall_s": [
-          4.44,
-          4.32,
-          4.58
+          4.57,
+          4.54,
+          4.77
         ],
-        "median_s": 4.44,
-        "cpu_s": 60.79,
-        "peak_rss_kib": 1688796
+        "median_s": 4.57,
+        "cpu_s": 60.77,
+        "peak_rss_kib": 1651368
       },
-      "total_s": 6.26,
+      "total_s": 6.22,
       "overview_bytes": 172763950,
       "pmtiles_bytes": 77502351,
       "pmtiles_sha256": "b0bc39cf642bdc9e20d31a3f905b1c63cdf395879744709b27fc6e280527e7d8",
@@ -820,25 +820,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          1.98,
-          2.71,
-          2.71
+          1.96,
+          1.95,
+          1.99
         ],
-        "median_s": 2.71,
-        "cpu_s": 24.46,
-        "peak_rss_kib": 2597656
+        "median_s": 1.96,
+        "cpu_s": 24.23,
+        "peak_rss_kib": 2619392
       },
       "export": {
         "wall_s": [
-          6.69,
-          6.72,
-          6.84
+          6.96,
+          7.08,
+          7.34
         ],
-        "median_s": 6.72,
-        "cpu_s": 101.29,
-        "peak_rss_kib": 1870788
+        "median_s": 7.08,
+        "cpu_s": 101.6,
+        "peak_rss_kib": 1904704
       },
-      "total_s": 9.43,
+      "total_s": 9.04,
       "overview_bytes": 228467685,
       "pmtiles_bytes": 85365292,
       "pmtiles_sha256": "8bf0fe294a1cdf44433a154b043fe1ba4911643f0a92651ac4b042bd56dd949c",
@@ -976,24 +976,24 @@
       "convert": {
         "wall_s": [
           3.34,
-          4.74,
-          4.75
+          3.37,
+          3.3
         ],
-        "median_s": 4.74,
-        "cpu_s": 86.21,
-        "peak_rss_kib": 3321760
+        "median_s": 3.34,
+        "cpu_s": 86.11,
+        "peak_rss_kib": 3351220
       },
       "export": {
         "wall_s": [
-          13.63,
-          19.44,
-          15.0
+          17.63,
+          17.4,
+          15.66
         ],
-        "median_s": 15.0,
-        "cpu_s": 249.85,
-        "peak_rss_kib": 2524548
+        "median_s": 17.4,
+        "cpu_s": 250.68,
+        "peak_rss_kib": 2474016
       },
-      "total_s": 19.74,
+      "total_s": 20.74,
       "overview_bytes": 315033588,
       "pmtiles_bytes": 95386258,
       "pmtiles_sha256": "1075b07e85a803877cf83299a5bb262b9cd0495489c38c70d44c68da702fd17e",
@@ -1130,25 +1130,25 @@
       "status": "ok",
       "convert": {
         "wall_s": [
-          3.49,
-          7.28,
-          7.27
+          3.47,
+          3.45,
+          3.42
         ],
-        "median_s": 7.27,
-        "cpu_s": 32.13,
-        "peak_rss_kib": 5222372
+        "median_s": 3.45,
+        "cpu_s": 31.98,
+        "peak_rss_kib": 5291776
       },
       "export": {
         "wall_s": [
-          117.58,
-          122.29,
-          107.7
+          125.54,
+          153.6,
+          131.09
         ],
-        "median_s": 117.58,
-        "cpu_s": 1436.68,
-        "peak_rss_kib": 8115272
+        "median_s": 131.09,
+        "cpu_s": 1439.15,
+        "peak_rss_kib": 8089724
       },
-      "total_s": 124.85,
+      "total_s": 134.54,
       "overview_bytes": 629706810,
       "pmtiles_bytes": 88934412,
       "pmtiles_sha256": "1ddb5ccc40c78c40f501b48f359470f8766109c8fd066ef50e76682ebd4a9c18",

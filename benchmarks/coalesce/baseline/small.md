@@ -1,6 +1,6 @@
 # Coalesce benchmark: small profile
 
-tylertoo `67bc3de` · Neoverse-V1, 64 cores, 123.5 GiB RAM · 2026-10-22 12:38 UTC
+tylertoo `67a221e` · Neoverse-V1, 64 cores, 123.5 GiB RAM · 2026-10-22 14:21 UTC
 
 **Noise floor.** Coverage differences under 3 percentage points (missing or added share) and timing differences under 10% are not regressions. At full detail, small fields show about 2.5% missing and 2.5% added area from tile-grid snapping alone. Timings depend on the host; compare ratios across hosts, not seconds.
 
@@ -12,19 +12,19 @@ Median of the repeats per stage. End to end is convert plus export.
 
 | Setting | Convert | Convert RSS | Export | Export RSS | End to end | vs Before #745 | Overview | PMTiles | Merged | Oversized |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Before #745 | 0.68 s | 0.30 GiB | 0.52 s | 0.25 GiB | 1.20 s | 1.00× | 30 MB | 19 MB | 0 | 0 |
-| Defaults | 0.88 s | 0.42 GiB | 2.02 s | 0.40 GiB | 2.90 s | 2.42× | 48 MB | 25 MB | 47,441 | 12 |
-| --simplify-factor 0.25 | 1.04 s | 0.47 GiB | 2.04 s | 0.43 GiB | 3.08 s | 2.57× | 61 MB | 28 MB | 51,381 | 13 |
-| --simplify-factor 0 | 2.05 s | 0.77 GiB | 2.34 s | 0.75 GiB | 4.39 s | 3.66× | 187 MB | 31 MB | 61,933 | 17 |
+| Before #745 | 0.67 s | 0.30 GiB | 0.51 s | 0.25 GiB | 1.18 s | 1.00× | 30 MB | 19 MB | 0 | 0 |
+| Defaults | 0.87 s | 0.42 GiB | 1.94 s | 0.41 GiB | 2.81 s | 2.38× | 48 MB | 25 MB | 47,441 | 12 |
+| --simplify-factor 0.25 | 1.02 s | 0.46 GiB | 2.15 s | 0.43 GiB | 3.17 s | 2.69× | 61 MB | 28 MB | 51,381 | 13 |
+| --simplify-factor 0 | 1.70 s | 0.78 GiB | 2.42 s | 0.79 GiB | 4.12 s | 3.49× | 187 MB | 31 MB | 61,933 | 17 |
 
 ### FTW Moldova (631,910 features)
 
 | Setting | Convert | Convert RSS | Export | Export RSS | End to end | vs Before #745 | Overview | PMTiles | Merged | Oversized |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Before #745 | 1.82 s | 2.32 GiB | 4.44 s | 1.61 GiB | 6.26 s | 1.00× | 173 MB | 78 MB | 0 | 49 |
-| Defaults | 2.71 s | 2.48 GiB | 6.72 s | 1.78 GiB | 9.43 s | 1.51× | 228 MB | 85 MB | 901,431 | 83 |
-| --simplify-factor 0.25 | 4.74 s | 3.17 GiB | 15.00 s | 2.41 GiB | 19.74 s | 3.15× | 315 MB | 95 MB | 1,348,169 | 160 |
-| --simplify-factor 0 | 7.27 s | 4.98 GiB | 117.58 s | 7.74 GiB | 124.85 s | 19.94× | 630 MB | 89 MB | 1,594,540 | 217 |
+| Before #745 | 1.65 s | 2.36 GiB | 4.57 s | 1.57 GiB | 6.22 s | 1.00× | 173 MB | 78 MB | 0 | 49 |
+| Defaults | 1.96 s | 2.50 GiB | 7.08 s | 1.82 GiB | 9.04 s | 1.45× | 228 MB | 85 MB | 901,431 | 83 |
+| --simplify-factor 0.25 | 3.34 s | 3.20 GiB | 17.40 s | 2.36 GiB | 20.74 s | 3.33× | 315 MB | 95 MB | 1,348,169 | 160 |
+| --simplify-factor 0 | 3.45 s | 5.05 GiB | 131.09 s | 7.71 GiB | 134.54 s | 21.63× | 630 MB | 89 MB | 1,594,540 | 217 |
 
 ## Rendered coverage (MapLibre)
 

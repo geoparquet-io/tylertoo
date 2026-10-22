@@ -27,6 +27,12 @@ work whose inputs haven't changed:
 | `score` | `render_maplibre.py` for each window, `render_coverage.py` and `tile_metrics.py` for each check | archive sha256s and the entry's config |
 | `report` | `report-<profile>.json` and `.md` in `<work>/runs/<binary>/`; the latest run's also as `<work>/report.json` and `report.md` | — |
 
+A tippecanoe run that fails is also a result. It is cached in its
+`run.json` and shown in the report, not retried; delete
+`<work>/tippecanoe/<dataset>-<key>/` to run it again. tippecanoe's `-M` caps
+the compressed tile, so on Moldova (500K) its cap is looser than tylertoo's
+500K raw cap. tippecanoe has no raw cap.
+
 `--only tile,report` runs only the named steps. Any step you leave out must
 already be cached.
 
@@ -40,7 +46,7 @@ wrote identical bytes (`repeats_identical` in `report.json`).
 | Profile | Datasets | Settings | Time | Disk |
 |---|---|---|---|---|
 | `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 20 min: 8.5 min tiling, of which 6 min is the `sf0` export ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)), and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
-| `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ | about 1 h 30 min on the first run, of which tippecanoe takes about 30 min; reruns use the cached tippecanoe archive | about 30 GB |
+| `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ and Moldova | about 45 min of tylertoo tiling and scoring. The first run adds tippecanoe: about 32 min on NZ and 34 min on Moldova, where it fails. Both results are cached | about 20 GB at peak |
 
 The `small` profile needs no keys and no network access beyond the release
 and the CDN.
@@ -112,33 +118,47 @@ PR: copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
 
 - **`--simplify-factor 0` makes the merge valve very slow on dense fields
   ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)).** The
-  Moldova export takes 117.6 s and 7.7 GiB, against 6.7 s and 1.8 GiB with the
+  Moldova export takes 131 s and 7.7 GiB, against 7.1 s and 1.8 GiB with the
   defaults. Nearly all of it is MVT encoding at z6–z11:
   - tiles there need 13–24 merge passes;
-  - each pass re-encodes full-resolution geometry;
-  - encode CPU totals 3,111 s, against 60 s with the defaults.
+  - each pass re-encodes full-resolution geometry from scratch;
+  - encode CPU totals about 3,000 s, against about 50 s with the defaults.
 
-  NZ Parcels did not show this in #745, because it was measured with a 2 MB
-  gzip cap instead of the 500K raw cap.
-- **Cost of the shipped defaults** relative to before #745, end to end:
-  1.51× on Moldova and 2.42× on Madagascar. The Madagascar times are only a
-  few seconds, so its ratio carries more noise. `--simplify-factor 0.25`
-  costs 3.15× on Moldova.
-- **Coverage gained, Moldova whole country, missing area at z5:**
-  - before #745: 71.6%;
-  - defaults: 22.3%;
-  - `--simplify-factor 0.25`: 13.5%;
-  - `--simplify-factor 0`: 12.3%.
+  NZ uses a 2 MB gzip cap, so fewer of its tiles go over, and there factor 0
+  costs 1.3× the defaults (139 s against 108 s).
+- **tippecanoe can't tile FTW Moldova.** With `-z12 -M 500000
+  --coalesce-densest-as-needed`, it stops after 34 min with `Can't increase
+  feature gap threshold further` (exit 100). tylertoo finishes the same file
+  in 9 s with the defaults, and in 2¼ min at factor 0. On NZ, tippecanoe
+  takes 31 min 41 s, against 108 s for the tylertoo defaults (17.5×).
+- **tylertoo's default cap is stricter than tippecanoe's
+  ([#761](https://github.com/geoparquet-io/tylertoo/issues/761)).**
+  tippecanoe's `-M` caps the gzip-compressed tile; tylertoo's 500K default
+  caps the raw tile. On Moldova that makes ours about 1.75× stricter.
+- **Cost of the shipped defaults** against before #745, end to end:
 
-  The added area (25% at z5, 51% at z3) is the placeholder squares spreading
-  into gaps between fields
+  | Dataset | Defaults | `--simplify-factor 0.25` |
+  |---|---|---|
+  | Moldova | 1.45× | 3.33× |
+  | NZ | 2.06× | 2.20× |
+  | Madagascar | 2.38× | |
+
+  Madagascar's times are around a second, so its ratio is noisy.
+- **Coverage gained** (missing area, before #745 → defaults → `sf0.25` →
+  `sf0`):
+  - Moldova whole country at z5: 71.6% → 22.3% → 13.5% → 12.3%.
+  - Auckland city at z10: 91.6% → 28.2% → 17.0% → 16.1%; tippecanoe is at
+    0.0%.
+
+  The added area on Moldova (25% at z5) comes from placeholder squares
+  spreading into the gaps between fields
   ([#750](https://github.com/geoparquet-io/tylertoo/issues/750)).
 - **Before #745, coverage depended on the maximum zoom.** Madagascar's
   before-#745 archive misses 65.3% of the z4 window at z6 when built to z12,
-  and 43.6% when built to z10, which is the `RESULTS.md` figure. With the
-  defaults, the maximum zoom makes no difference to coverage at these zooms.
-- **Repeats wrote identical bytes in every cell.** Re-scoring the same
-  archives reproduced every MapLibre and tile-check value exactly.
+  but 43.6% when built to z10 (the `RESULTS.md` figure). With the defaults,
+  the maximum zoom makes no difference to coverage at these zooms.
+- **Determinism.** Every cell's repeats wrote identical bytes. Re-scoring the
+  same archives reproduced every MapLibre and tile-check value exactly.
 
 ## Relation to `RESULTS.md`
 
@@ -158,6 +178,18 @@ floor:
   - before #745: 0.56/0.90/0.97 (0.70);
   - defaults: 0.79/0.94/0.98 (0.83);
   - the z8 seam excess is 0.39, as in the merge-threshold section.
+
+The full profile reproduces the NZ rows:
+
+- MapLibre, Auckland city and Upper North Island: every value within 0.6
+  points, and the before-#745 and tippecanoe columns are identical.
+- palmerj's three z12 tiles:
+  - before #745: 67.2/76.4/68.7%;
+  - defaults: 97.3/97.9/97.6%, the "thinning off" row;
+  - tippecanoe: 99.5/99.6/99.6%.
+- Timings. Before #745 takes 52 s (57 s in `RESULTS.md`) and the defaults
+  take 108 s (106 s). `--simplify-factor 0.25` is faster than in `RESULTS.md`
+  (116 s against 156 s), and factor 0 is slower (139 s against 120 s).
 
 The one exception is Madagascar's before-#745 MapLibre column. `RESULTS.md`
 built that archive to `--max-zoom 10`; this benchmark builds every Madagascar

@@ -1,0 +1,2909 @@
+{
+  "schema": 1,
+  "profile": "full",
+  "created": "2026-10-22 14:21 UTC",
+  "config_sha256": "c9727f2c88f29657c2a23392968ef5854e22982e99055a052c0ea7fc28d879a0",
+  "noise": {
+    "coverage_pp": 3.0,
+    "time_ratio": 0.1
+  },
+  "host": {
+    "cpu": "Neoverse-V1",
+    "arch": "aarch64",
+    "cores": 64,
+    "mem_gib": 123.5,
+    "kernel": "7.0.0-1014-aws",
+    "python": "3.12.3"
+  },
+  "binary": {
+    "sha256": "7d6f50e90893795325832ea6c3a1089aa59f8060b86ba00bf454d9d0526c6520",
+    "git": "67a221e",
+    "version": "tylertoo 0.8.0",
+    "file": "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=774047c10ec7e679354994128c7f713cc4c0ee41, for GNU/Linux 3.7.0, stripped",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)"
+  },
+  "datasets": {
+    "madagascar": {
+      "label": "Madagascar adm4",
+      "asset": "madagascar-adm4-hilbert.parquet",
+      "sha256": "6f666e18e06a87eeb219dfd6c1ef407fb9bce0e72c4cd7736fdd1c245c72f0b9",
+      "features": 17465,
+      "max_zoom": 12,
+      "max_tile_size": 512000,
+      "max_compressed_tile_size": 0
+    },
+    "moldova": {
+      "label": "FTW Moldova",
+      "asset": "moldova-hilbert.parquet",
+      "sha256": "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5",
+      "features": 631910,
+      "max_zoom": 12,
+      "max_tile_size": 512000,
+      "max_compressed_tile_size": 0
+    },
+    "nz": {
+      "label": "NZ Parcels",
+      "asset": "nz-parcels-hilbert.parquet",
+      "sha256": "3a8336ce71d623c44eee44e1226ce87052e13950d2918f4e91a9b75e80bb7998",
+      "features": 4343547,
+      "max_zoom": 14,
+      "max_tile_size": 0,
+      "max_compressed_tile_size": 2000000
+    }
+  },
+  "settings": {
+    "before-745": {
+      "label": "Before #745",
+      "convert": [
+        "--drop-polygons",
+        "--drop-lines",
+        "--polygon-thinning",
+        "1",
+        "--no-collapse"
+      ],
+      "valve": "drop"
+    },
+    "default": {
+      "label": "Defaults",
+      "convert": [],
+      "valve": "merge"
+    },
+    "sf0.25": {
+      "label": "--simplify-factor 0.25",
+      "convert": [
+        "--simplify-factor",
+        "0.25"
+      ],
+      "valve": "merge"
+    },
+    "sf0": {
+      "label": "--simplify-factor 0",
+      "convert": [
+        "--simplify-factor",
+        "0"
+      ],
+      "valve": "merge"
+    },
+    "tippecanoe": {
+      "label": "tippecanoe",
+      "external": true
+    }
+  },
+  "cells": {
+    "madagascar/before-745": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          0.67,
+          0.66,
+          0.69
+        ],
+        "median_s": 0.67,
+        "cpu_s": 3.13,
+        "peak_rss_kib": 317004
+      },
+      "export": {
+        "wall_s": [
+          0.51,
+          0.52,
+          0.51
+        ],
+        "median_s": 0.51,
+        "cpu_s": 4.14,
+        "peak_rss_kib": 262760
+      },
+      "total_s": 1.18,
+      "overview_bytes": 30221929,
+      "pmtiles_bytes": 18717926,
+      "pmtiles_sha256": "5ae6094316c1b8c28dca00bdfa1f873b296bdba1cccfd3bfa4f1bef88c61db99",
+      "merged_features": 0,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 0,
+      "zooms": [
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 238,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 2,
+          "tile_feature_count": 426,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 509,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 4,
+          "tile_feature_count": 676,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 6,
+          "tile_count": 7,
+          "tile_feature_count": 1045,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 7,
+          "tile_count": 16,
+          "tile_feature_count": 1808,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 8,
+          "tile_count": 44,
+          "tile_feature_count": 3152,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 9,
+          "tile_count": 147,
+          "tile_feature_count": 5737,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 10,
+          "tile_count": 515,
+          "tile_feature_count": 10871,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 11,
+          "tile_count": 1933,
+          "tile_feature_count": 23175,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 12,
+          "tile_count": 7440,
+          "tile_feature_count": 53782,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "03760106eefef719",
+      "dataset": "madagascar",
+      "setting": "before-745",
+      "repeats": 3,
+      "pmtiles": "madagascar.before-745.drop.pmtiles"
+    },
+    "madagascar/default": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          0.88,
+          0.86,
+          0.87
+        ],
+        "median_s": 0.87,
+        "cpu_s": 2.77,
+        "peak_rss_kib": 444588
+      },
+      "export": {
+        "wall_s": [
+          1.94,
+          1.9,
+          2.09
+        ],
+        "median_s": 1.94,
+        "cpu_s": 11.43,
+        "peak_rss_kib": 427764
+      },
+      "total_s": 2.81,
+      "overview_bytes": 47756458,
+      "pmtiles_bytes": 25469267,
+      "pmtiles_sha256": "0066cf72072434129e2b42f2b0423232f329249ac7a09877e8e467d8f2fc7171",
+      "merged_features": 47441,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 12,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 410,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 1537,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 2073,
+          "oversized_tiles": 1,
+          "merged_features": 2484,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 3,
+          "tile_count": 2,
+          "tile_feature_count": 4306,
+          "oversized_tiles": 2,
+          "merged_features": 8531,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 7632,
+          "oversized_tiles": 2,
+          "merged_features": 11372,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 5,
+          "tile_count": 4,
+          "tile_feature_count": 6583,
+          "oversized_tiles": 2,
+          "merged_features": 12396,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 7,
+          "tile_feature_count": 8828,
+          "oversized_tiles": 3,
+          "merged_features": 10004,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 7,
+          "tile_count": 16,
+          "tile_feature_count": 18072,
+          "oversized_tiles": 2,
+          "merged_features": 2654,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 8,
+          "tile_count": 44,
+          "tile_feature_count": 21185,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 9,
+          "tile_count": 149,
+          "tile_feature_count": 23270,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 10,
+          "tile_count": 524,
+          "tile_feature_count": 26830,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 11,
+          "tile_count": 1944,
+          "tile_feature_count": 34896,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 12,
+          "tile_count": 7440,
+          "tile_feature_count": 53782,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "8b56844603fd4709",
+      "dataset": "madagascar",
+      "setting": "default",
+      "repeats": 3,
+      "pmtiles": "madagascar.default.merge.pmtiles"
+    },
+    "madagascar/sf0.25": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          1.05,
+          1.02,
+          1.02
+        ],
+        "median_s": 1.02,
+        "cpu_s": 4.3,
+        "peak_rss_kib": 486260
+      },
+      "export": {
+        "wall_s": [
+          2.15,
+          2.17,
+          2.1
+        ],
+        "median_s": 2.15,
+        "cpu_s": 12.89,
+        "peak_rss_kib": 451704
+      },
+      "total_s": 3.17,
+      "overview_bytes": 61003226,
+      "pmtiles_bytes": 27635062,
+      "pmtiles_sha256": "5d3d4549b59127c71be0633fabcd8db22c0a3aabddd72b7b1df7895c18b053ff",
+      "merged_features": 51381,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 13,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 410,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 1571,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 2062,
+          "oversized_tiles": 1,
+          "merged_features": 2686,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 3,
+          "tile_count": 2,
+          "tile_feature_count": 4223,
+          "oversized_tiles": 2,
+          "merged_features": 9142,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 7103,
+          "oversized_tiles": 2,
+          "merged_features": 12369,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 5,
+          "tile_count": 4,
+          "tile_feature_count": 6333,
+          "oversized_tiles": 2,
+          "merged_features": 12767,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 7,
+          "tile_feature_count": 7966,
+          "oversized_tiles": 3,
+          "merged_features": 10919,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 7,
+          "tile_count": 16,
+          "tile_feature_count": 17238,
+          "oversized_tiles": 3,
+          "merged_features": 3498,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 8,
+          "tile_count": 44,
+          "tile_feature_count": 21192,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 9,
+          "tile_count": 149,
+          "tile_feature_count": 23270,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 10,
+          "tile_count": 524,
+          "tile_feature_count": 26831,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 11,
+          "tile_count": 1944,
+          "tile_feature_count": 34899,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 12,
+          "tile_count": 7440,
+          "tile_feature_count": 53782,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "d666527e3c9d68c4",
+      "dataset": "madagascar",
+      "setting": "sf0.25",
+      "repeats": 3,
+      "pmtiles": "madagascar.sf0.25.merge.pmtiles"
+    },
+    "madagascar/sf0": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          1.71,
+          1.7,
+          1.7
+        ],
+        "median_s": 1.7,
+        "cpu_s": 3.29,
+        "peak_rss_kib": 815944
+      },
+      "export": {
+        "wall_s": [
+          2.42,
+          2.53,
+          2.34
+        ],
+        "median_s": 2.42,
+        "cpu_s": 19.59,
+        "peak_rss_kib": 825864
+      },
+      "total_s": 4.12,
+      "overview_bytes": 187051542,
+      "pmtiles_bytes": 31132892,
+      "pmtiles_sha256": "ca9651ea7981ab6d7cb473c781d05a88aad942e7431b46c5d2cb34fa07f9c598",
+      "merged_features": 61933,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 17,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 410,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 1573,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 1943,
+          "oversized_tiles": 1,
+          "merged_features": 2806,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 3,
+          "tile_count": 2,
+          "tile_feature_count": 3226,
+          "oversized_tiles": 2,
+          "merged_features": 10142,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 6339,
+          "oversized_tiles": 2,
+          "merged_features": 13136,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 5,
+          "tile_count": 4,
+          "tile_feature_count": 5336,
+          "oversized_tiles": 2,
+          "merged_features": 13766,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 7,
+          "tile_feature_count": 5495,
+          "oversized_tiles": 3,
+          "merged_features": 13391,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 7,
+          "tile_count": 16,
+          "tile_feature_count": 13311,
+          "oversized_tiles": 5,
+          "merged_features": 7427,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 8,
+          "tile_count": 44,
+          "tile_feature_count": 19928,
+          "oversized_tiles": 2,
+          "merged_features": 1265,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 9,
+          "tile_count": 149,
+          "tile_feature_count": 23270,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 10,
+          "tile_count": 524,
+          "tile_feature_count": 26831,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 11,
+          "tile_count": 1944,
+          "tile_feature_count": 34899,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 12,
+          "tile_count": 7440,
+          "tile_feature_count": 53782,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "c9dff60a97f0a603",
+      "dataset": "madagascar",
+      "setting": "sf0",
+      "repeats": 3,
+      "pmtiles": "madagascar.sf0.merge.pmtiles"
+    },
+    "moldova/before-745": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          1.66,
+          1.65,
+          1.65
+        ],
+        "median_s": 1.65,
+        "cpu_s": 21.39,
+        "peak_rss_kib": 2478180
+      },
+      "export": {
+        "wall_s": [
+          4.57,
+          4.54,
+          4.77
+        ],
+        "median_s": 4.57,
+        "cpu_s": 60.77,
+        "peak_rss_kib": 1651368
+      },
+      "total_s": 6.22,
+      "overview_bytes": 172763950,
+      "pmtiles_bytes": 77502351,
+      "pmtiles_sha256": "b0bc39cf642bdc9e20d31a3f905b1c63cdf395879744709b27fc6e280527e7d8",
+      "merged_features": 0,
+      "valve_dropped_features": 157515,
+      "oversized_tiles": 49,
+      "zooms": [
+        {
+          "zoom": 3,
+          "tile_count": 1,
+          "tile_feature_count": 3,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 1,
+          "tile_feature_count": 184,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 1,
+          "tile_feature_count": 3070,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 6,
+          "tile_count": 2,
+          "tile_feature_count": 13752,
+          "oversized_tiles": 1,
+          "merged_features": 0,
+          "valve_dropped_features": 4154,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 7,
+          "tile_count": 4,
+          "tile_feature_count": 22465,
+          "oversized_tiles": 3,
+          "merged_features": 0,
+          "valve_dropped_features": 16916,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 8,
+          "tile_count": 11,
+          "tile_feature_count": 38533,
+          "oversized_tiles": 4,
+          "merged_features": 0,
+          "valve_dropped_features": 32408,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 9,
+          "tile_count": 28,
+          "tile_feature_count": 92204,
+          "oversized_tiles": 9,
+          "merged_features": 0,
+          "valve_dropped_features": 32075,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 10,
+          "tile_count": 78,
+          "tile_feature_count": 201481,
+          "oversized_tiles": 7,
+          "merged_features": 0,
+          "valve_dropped_features": 28149,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 11,
+          "tile_count": 255,
+          "tile_feature_count": 409709,
+          "oversized_tiles": 10,
+          "merged_features": 0,
+          "valve_dropped_features": 15311,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 12,
+          "tile_count": 905,
+          "tile_feature_count": 736246,
+          "oversized_tiles": 15,
+          "merged_features": 0,
+          "valve_dropped_features": 28502,
+          "max_valve_passes": 8
+        }
+      ],
+      "repeats_identical": true,
+      "key": "d21a7658c7f88f98",
+      "dataset": "moldova",
+      "setting": "before-745",
+      "repeats": 3,
+      "pmtiles": "moldova.before-745.drop.pmtiles"
+    },
+    "moldova/default": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          1.96,
+          1.95,
+          1.99
+        ],
+        "median_s": 1.96,
+        "cpu_s": 24.23,
+        "peak_rss_kib": 2619392
+      },
+      "export": {
+        "wall_s": [
+          6.96,
+          7.08,
+          7.34
+        ],
+        "median_s": 7.08,
+        "cpu_s": 101.6,
+        "peak_rss_kib": 1904704
+      },
+      "total_s": 9.04,
+      "overview_bytes": 228467685,
+      "pmtiles_bytes": 85365292,
+      "pmtiles_sha256": "8bf0fe294a1cdf44433a154b043fe1ba4911643f0a92651ac4b042bd56dd949c",
+      "merged_features": 901431,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 83,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 161,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 647,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 1,
+          "tile_feature_count": 2554,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 1,
+          "tile_feature_count": 6221,
+          "oversized_tiles": 1,
+          "merged_features": 3082,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 5,
+          "tile_count": 1,
+          "tile_feature_count": 4812,
+          "oversized_tiles": 1,
+          "merged_features": 22087,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 2,
+          "tile_feature_count": 9107,
+          "oversized_tiles": 2,
+          "merged_features": 53865,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 7,
+          "tile_count": 4,
+          "tile_feature_count": 14679,
+          "oversized_tiles": 3,
+          "merged_features": 93774,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 8,
+          "tile_count": 11,
+          "tile_feature_count": 30818,
+          "oversized_tiles": 5,
+          "merged_features": 146444,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 9
+        },
+        {
+          "zoom": 9,
+          "tile_count": 28,
+          "tile_feature_count": 79910,
+          "oversized_tiles": 11,
+          "merged_features": 215750,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 28
+        },
+        {
+          "zoom": 10,
+          "tile_count": 78,
+          "tile_feature_count": 257731,
+          "oversized_tiles": 27,
+          "merged_features": 209853,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 5
+        },
+        {
+          "zoom": 11,
+          "tile_count": 255,
+          "tile_feature_count": 527335,
+          "oversized_tiles": 18,
+          "merged_features": 117915,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 12,
+          "tile_count": 905,
+          "tile_feature_count": 726082,
+          "oversized_tiles": 15,
+          "merged_features": 38661,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        }
+      ],
+      "repeats_identical": true,
+      "key": "4425813de8c8da03",
+      "dataset": "moldova",
+      "setting": "default",
+      "repeats": 3,
+      "pmtiles": "moldova.default.merge.pmtiles"
+    },
+    "moldova/sf0.25": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          3.34,
+          3.37,
+          3.3
+        ],
+        "median_s": 3.34,
+        "cpu_s": 86.11,
+        "peak_rss_kib": 3351220
+      },
+      "export": {
+        "wall_s": [
+          17.63,
+          17.4,
+          15.66
+        ],
+        "median_s": 17.4,
+        "cpu_s": 250.68,
+        "peak_rss_kib": 2474016
+      },
+      "total_s": 20.74,
+      "overview_bytes": 315033588,
+      "pmtiles_bytes": 95386258,
+      "pmtiles_sha256": "1075b07e85a803877cf83299a5bb262b9cd0495489c38c70d44c68da702fd17e",
+      "merged_features": 1348169,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 160,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 161,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 647,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 1,
+          "tile_feature_count": 2584,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 1,
+          "tile_feature_count": 5998,
+          "oversized_tiles": 1,
+          "merged_features": 3750,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 5,
+          "tile_count": 1,
+          "tile_feature_count": 4117,
+          "oversized_tiles": 1,
+          "merged_features": 24694,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 2,
+          "tile_feature_count": 5823,
+          "oversized_tiles": 2,
+          "merged_features": 60723,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 5
+        },
+        {
+          "zoom": 7,
+          "tile_count": 4,
+          "tile_feature_count": 8961,
+          "oversized_tiles": 3,
+          "merged_features": 104230,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 6
+        },
+        {
+          "zoom": 8,
+          "tile_count": 11,
+          "tile_feature_count": 21915,
+          "oversized_tiles": 6,
+          "merged_features": 162346,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 18
+        },
+        {
+          "zoom": 9,
+          "tile_count": 28,
+          "tile_feature_count": 40287,
+          "oversized_tiles": 15,
+          "merged_features": 266262,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 20
+        },
+        {
+          "zoom": 10,
+          "tile_count": 78,
+          "tile_feature_count": 100148,
+          "oversized_tiles": 42,
+          "merged_features": 379895,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 24
+        },
+        {
+          "zoom": 11,
+          "tile_count": 255,
+          "tile_feature_count": 337907,
+          "oversized_tiles": 75,
+          "merged_features": 307608,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 17
+        },
+        {
+          "zoom": 12,
+          "tile_count": 905,
+          "tile_feature_count": 726082,
+          "oversized_tiles": 15,
+          "merged_features": 38661,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        }
+      ],
+      "repeats_identical": true,
+      "key": "de8c43b2c72c9711",
+      "dataset": "moldova",
+      "setting": "sf0.25",
+      "repeats": 3,
+      "pmtiles": "moldova.sf0.25.merge.pmtiles"
+    },
+    "moldova/sf0": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          3.47,
+          3.45,
+          3.42
+        ],
+        "median_s": 3.45,
+        "cpu_s": 31.98,
+        "peak_rss_kib": 5291776
+      },
+      "export": {
+        "wall_s": [
+          125.54,
+          153.6,
+          131.09
+        ],
+        "median_s": 131.09,
+        "cpu_s": 1439.15,
+        "peak_rss_kib": 8089724
+      },
+      "total_s": 134.54,
+      "overview_bytes": 629706810,
+      "pmtiles_bytes": 88934412,
+      "pmtiles_sha256": "1ddb5ccc40c78c40f501b48f359470f8766109c8fd066ef50e76682ebd4a9c18",
+      "merged_features": 1594540,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 217,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 40,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 1,
+          "tile_feature_count": 161,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 1,
+          "tile_feature_count": 647,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 1,
+          "tile_feature_count": 2585,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 1,
+          "tile_feature_count": 5188,
+          "oversized_tiles": 1,
+          "merged_features": 4562,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 5,
+          "tile_count": 1,
+          "tile_feature_count": 1690,
+          "oversized_tiles": 1,
+          "merged_features": 27125,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 6,
+          "tile_count": 2,
+          "tile_feature_count": 182,
+          "oversized_tiles": 2,
+          "merged_features": 66383,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 13
+        },
+        {
+          "zoom": 7,
+          "tile_count": 4,
+          "tile_feature_count": 3303,
+          "oversized_tiles": 4,
+          "merged_features": 109917,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 10
+        },
+        {
+          "zoom": 8,
+          "tile_count": 11,
+          "tile_feature_count": 3979,
+          "oversized_tiles": 7,
+          "merged_features": 180314,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 19
+        },
+        {
+          "zoom": 9,
+          "tile_count": 28,
+          "tile_feature_count": 5802,
+          "oversized_tiles": 18,
+          "merged_features": 300766,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 14
+        },
+        {
+          "zoom": 10,
+          "tile_count": 78,
+          "tile_feature_count": 9935,
+          "oversized_tiles": 55,
+          "merged_features": 470144,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 20
+        },
+        {
+          "zoom": 11,
+          "tile_count": 255,
+          "tile_feature_count": 248887,
+          "oversized_tiles": 114,
+          "merged_features": 396668,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 24
+        },
+        {
+          "zoom": 12,
+          "tile_count": 905,
+          "tile_feature_count": 726082,
+          "oversized_tiles": 15,
+          "merged_features": 38661,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        }
+      ],
+      "repeats_identical": true,
+      "key": "c66065165629e775",
+      "dataset": "moldova",
+      "setting": "sf0",
+      "repeats": 3,
+      "pmtiles": "moldova.sf0.merge.pmtiles"
+    },
+    "nz/before-745": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          7.96,
+          7.87
+        ],
+        "median_s": 7.915,
+        "cpu_s": 142.37,
+        "peak_rss_kib": 6393572.0
+      },
+      "export": {
+        "wall_s": [
+          44.53,
+          44.62
+        ],
+        "median_s": 44.575,
+        "cpu_s": 436.63,
+        "peak_rss_kib": 3921346.0
+      },
+      "total_s": 52.49,
+      "overview_bytes": 2016583607,
+      "pmtiles_bytes": 991919668,
+      "pmtiles_sha256": "41c626727d9843163623054e3d283f81d166f27e13cfa52f1a17338736c5035e",
+      "merged_features": 0,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 0,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 9,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 2,
+          "tile_feature_count": 179,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 2,
+          "tile_feature_count": 427,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 4,
+          "tile_feature_count": 1500,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 5013,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 7,
+          "tile_feature_count": 22371,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 6,
+          "tile_count": 15,
+          "tile_feature_count": 60239,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 7,
+          "tile_count": 31,
+          "tile_feature_count": 119041,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 8,
+          "tile_count": 78,
+          "tile_feature_count": 232918,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 9,
+          "tile_count": 210,
+          "tile_feature_count": 410702,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 10,
+          "tile_count": 657,
+          "tile_feature_count": 701052,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 11,
+          "tile_count": 2297,
+          "tile_feature_count": 1182205,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 12,
+          "tile_count": 8612,
+          "tile_feature_count": 2007937,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 13,
+          "tile_count": 33257,
+          "tile_feature_count": 3428299,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 14,
+          "tile_count": 130718,
+          "tile_feature_count": 6011278,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "198cf7ba0a723402",
+      "dataset": "nz",
+      "setting": "before-745",
+      "repeats": 2,
+      "pmtiles": "nz.before-745.drop.pmtiles"
+    },
+    "nz/default": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          11.28,
+          11.27
+        ],
+        "median_s": 11.274999999999999,
+        "cpu_s": 182.88,
+        "peak_rss_kib": 9730280.0
+      },
+      "export": {
+        "wall_s": [
+          98.64,
+          95.54
+        ],
+        "median_s": 97.09,
+        "cpu_s": 912.575,
+        "peak_rss_kib": 6766222.0
+      },
+      "total_s": 108.365,
+      "overview_bytes": 2902838023,
+      "pmtiles_bytes": 1424600700,
+      "pmtiles_sha256": "98d3811285d45f43301c9432f02e2082cb2068e9eb0c6fe32e75367c7c2a4be1",
+      "merged_features": 2487951,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 55,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 465,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 2,
+          "tile_feature_count": 2205,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 2,
+          "tile_feature_count": 5518,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 4,
+          "tile_feature_count": 21212,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 62417,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 7,
+          "tile_feature_count": 78247,
+          "oversized_tiles": 2,
+          "merged_features": 94969,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 6,
+          "tile_count": 16,
+          "tile_feature_count": 203302,
+          "oversized_tiles": 2,
+          "merged_features": 194323,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 7,
+          "tile_count": 31,
+          "tile_feature_count": 359134,
+          "oversized_tiles": 7,
+          "merged_features": 299843,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 8,
+          "tile_count": 78,
+          "tile_feature_count": 803755,
+          "oversized_tiles": 8,
+          "merged_features": 277957,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 9,
+          "tile_count": 210,
+          "tile_feature_count": 1399336,
+          "oversized_tiles": 8,
+          "merged_features": 311731,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 10,
+          "tile_count": 657,
+          "tile_feature_count": 2504155,
+          "oversized_tiles": 9,
+          "merged_features": 541464,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 11,
+          "tile_count": 2297,
+          "tile_feature_count": 3474162,
+          "oversized_tiles": 12,
+          "merged_features": 619938,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 12,
+          "tile_count": 8612,
+          "tile_feature_count": 4386634,
+          "oversized_tiles": 7,
+          "merged_features": 147726,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 2
+        },
+        {
+          "zoom": 13,
+          "tile_count": 33257,
+          "tile_feature_count": 5104419,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 14,
+          "tile_count": 130718,
+          "tile_feature_count": 6011278,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "152590f01474eda0",
+      "dataset": "nz",
+      "setting": "default",
+      "repeats": 2,
+      "pmtiles": "nz.default.merge.pmtiles"
+    },
+    "nz/sf0.25": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          13.38,
+          13.19
+        ],
+        "median_s": 13.285,
+        "cpu_s": 253.31,
+        "peak_rss_kib": 11084306.0
+      },
+      "export": {
+        "wall_s": [
+          101.79,
+          102.69
+        ],
+        "median_s": 102.24000000000001,
+        "cpu_s": 1009.8499999999999,
+        "peak_rss_kib": 7054620.0
+      },
+      "total_s": 115.525,
+      "overview_bytes": 3411072096,
+      "pmtiles_bytes": 1523601392,
+      "pmtiles_sha256": "b0d55c5f25e1cc9a2f28645eb88db8181cde2a8fd0908704a4cffd30cd647d19",
+      "merged_features": 3121286,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 68,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 469,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 2,
+          "tile_feature_count": 2263,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 2,
+          "tile_feature_count": 5603,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 4,
+          "tile_feature_count": 21178,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 62335,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 7,
+          "tile_feature_count": 68426,
+          "oversized_tiles": 2,
+          "merged_features": 113604,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 16,
+          "tile_feature_count": 197120,
+          "oversized_tiles": 3,
+          "merged_features": 239945,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 7,
+          "tile_count": 31,
+          "tile_feature_count": 351944,
+          "oversized_tiles": 7,
+          "merged_features": 376114,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 8,
+          "tile_count": 78,
+          "tile_feature_count": 753425,
+          "oversized_tiles": 13,
+          "merged_features": 418945,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 9,
+          "tile_count": 210,
+          "tile_feature_count": 1415189,
+          "oversized_tiles": 12,
+          "merged_features": 421674,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 10,
+          "tile_count": 657,
+          "tile_feature_count": 2614438,
+          "oversized_tiles": 9,
+          "merged_features": 652193,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 11,
+          "tile_count": 2297,
+          "tile_feature_count": 3525598,
+          "oversized_tiles": 13,
+          "merged_features": 696426,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 12,
+          "tile_count": 8613,
+          "tile_feature_count": 4443082,
+          "oversized_tiles": 9,
+          "merged_features": 202385,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 13,
+          "tile_count": 33257,
+          "tile_feature_count": 5147835,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 14,
+          "tile_count": 130718,
+          "tile_feature_count": 6011278,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "669c3c0e23e40f15",
+      "dataset": "nz",
+      "setting": "sf0.25",
+      "repeats": 2,
+      "pmtiles": "nz.sf0.25.merge.pmtiles"
+    },
+    "nz/sf0": {
+      "status": "ok",
+      "convert": {
+        "wall_s": [
+          17.72,
+          16.69
+        ],
+        "median_s": 17.205,
+        "cpu_s": 225.235,
+        "peak_rss_kib": 23029032.0
+      },
+      "export": {
+        "wall_s": [
+          120.59,
+          123.46
+        ],
+        "median_s": 122.025,
+        "cpu_s": 1496.63,
+        "peak_rss_kib": 9141278.0
+      },
+      "total_s": 139.23,
+      "overview_bytes": 8479730923,
+      "pmtiles_bytes": 1729476241,
+      "pmtiles_sha256": "8979404fd1e2388ee0134dfd0130dea4975982dc85478c8ebfb4867a6b327336",
+      "merged_features": 3936650,
+      "valve_dropped_features": 0,
+      "oversized_tiles": 94,
+      "zooms": [
+        {
+          "zoom": 0,
+          "tile_count": 1,
+          "tile_feature_count": 469,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 1,
+          "tile_count": 2,
+          "tile_feature_count": 2267,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 2,
+          "tile_count": 2,
+          "tile_feature_count": 5625,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 3,
+          "tile_count": 4,
+          "tile_feature_count": 21609,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 4,
+          "tile_count": 4,
+          "tile_feature_count": 66087,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 5,
+          "tile_count": 7,
+          "tile_feature_count": 57431,
+          "oversized_tiles": 2,
+          "merged_features": 138762,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 6,
+          "tile_count": 16,
+          "tile_feature_count": 170782,
+          "oversized_tiles": 4,
+          "merged_features": 286587,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 7,
+          "tile_count": 31,
+          "tile_feature_count": 266456,
+          "oversized_tiles": 9,
+          "merged_features": 481463,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 8,
+          "tile_count": 78,
+          "tile_feature_count": 618210,
+          "oversized_tiles": 17,
+          "merged_features": 578750,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 9,
+          "tile_count": 210,
+          "tile_feature_count": 1303470,
+          "oversized_tiles": 17,
+          "merged_features": 558329,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 10,
+          "tile_count": 657,
+          "tile_feature_count": 2507628,
+          "oversized_tiles": 17,
+          "merged_features": 783959,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 11,
+          "tile_count": 2297,
+          "tile_feature_count": 3429478,
+          "oversized_tiles": 16,
+          "merged_features": 812801,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 4
+        },
+        {
+          "zoom": 12,
+          "tile_count": 8613,
+          "tile_feature_count": 4363131,
+          "oversized_tiles": 12,
+          "merged_features": 295999,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 3
+        },
+        {
+          "zoom": 13,
+          "tile_count": 33257,
+          "tile_feature_count": 5169935,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        },
+        {
+          "zoom": 14,
+          "tile_count": 130718,
+          "tile_feature_count": 6011278,
+          "oversized_tiles": 0,
+          "merged_features": 0,
+          "valve_dropped_features": 0,
+          "max_valve_passes": 1
+        }
+      ],
+      "repeats_identical": true,
+      "key": "0217c21bee498a91",
+      "dataset": "nz",
+      "setting": "sf0",
+      "repeats": 2,
+      "pmtiles": "nz.sf0.merge.pmtiles"
+    }
+  },
+  "tippecanoe": {
+    "nz": {
+      "key": "f16d5233ae318393",
+      "tippecanoe": {
+        "tag": "2.79.0",
+        "sha": "68ab8dcc229f95b8b25877697d5e8d66783af503",
+        "repo": "https://github.com/felt/tippecanoe.git",
+        "version_string": "tippecanoe v2.79.0 BUILD_INFO",
+        "built_at": "2026-10-22T12:37:32Z"
+      },
+      "args": [
+        "-Z0",
+        "-z14",
+        "-b",
+        "8",
+        "-l",
+        "parcels",
+        "-M",
+        "2000000",
+        "--coalesce-densest-as-needed",
+        "--quiet"
+      ],
+      "wall_s": 1900.86,
+      "cpu_s": 5188.76,
+      "peak_rss_kib": 6560396,
+      "pmtiles_bytes": 884046286,
+      "pmtiles_sha256": "febadaa78eb82acbd320e3f539de11c861f3b961712e96eca640c2e5a779f5e8",
+      "seeded_from": "the #745 run of 2026-10-20 (same tippecanoe commit, input and arguments; timing from its GNU time log)"
+    },
+    "moldova": {
+      "key": "25914bcf0f64c2e8",
+      "tippecanoe": {
+        "tag": "2.79.0",
+        "sha": "68ab8dcc229f95b8b25877697d5e8d66783af503",
+        "repo": "https://github.com/felt/tippecanoe.git",
+        "version_string": "tippecanoe v2.79.0 BUILD_INFO",
+        "built_at": "2026-10-22T13:34:15Z"
+      },
+      "args": [
+        "-Z0",
+        "-z12",
+        "-b",
+        "8",
+        "-l",
+        "fields",
+        "-M",
+        "500000",
+        "--coalesce-densest-as-needed",
+        "--quiet"
+      ],
+      "status": "exit 100",
+      "error": "Can't increase feature gap threshold further",
+      "wall_s": 2038.01,
+      "cpu_s": 3274.83,
+      "peak_rss_kib": 3585908,
+      "pmtiles_bytes": null
+    }
+  },
+  "windows": {
+    "auckland-city": {
+      "label": "Auckland city, 2.4 km",
+      "dataset": "nz",
+      "report_zooms": [
+        8,
+        10,
+        12
+      ],
+      "zooms": {
+        "8": {
+          "before-745": {
+            "missing": 1.0,
+            "added": 0.0
+          },
+          "default": {
+            "missing": 0.2854512532552083,
+            "added": 0.0
+          },
+          "sf0.25": {
+            "missing": 0.2811923556857639,
+            "added": 0.0
+          },
+          "sf0": {
+            "missing": 0.270111083984375,
+            "added": 0.0
+          },
+          "tippecanoe": {
+            "missing": 0.05744594997829861,
+            "added": 0.0
+          }
+        },
+        "10": {
+          "before-745": {
+            "missing": 0.9160580105251737,
+            "added": 0.0
+          },
+          "default": {
+            "missing": 0.2823723687065972,
+            "added": 0.0
+          },
+          "sf0.25": {
+            "missing": 0.17017957899305555,
+            "added": 0.0
+          },
+          "sf0": {
+            "missing": 0.1605801052517361,
+            "added": 0.0
+          },
+          "tippecanoe": {
+            "missing": 0.0,
+            "added": 0.0
+          }
+        },
+        "12": {
+          "before-745": {
+            "missing": 0.5768178304036459,
+            "added": 0.0
+          },
+          "default": {
+            "missing": 0.031760321723090276,
+            "added": 0.0
+          },
+          "sf0.25": {
+            "missing": 0.008516099717881944,
+            "added": 0.0
+          },
+          "sf0": {
+            "missing": 0.00020345052083333334,
+            "added": 0.0
+          },
+          "tippecanoe": {
+            "missing": 0.005632188585069444,
+            "added": 0.0
+          }
+        }
+      }
+    },
+    "upper-north-island": {
+      "label": "Upper North Island, z5 tile 31/19",
+      "dataset": "nz",
+      "report_zooms": [
+        3,
+        5,
+        7
+      ],
+      "zooms": {
+        "3": {
+          "before-745": {
+            "missing": 0.5640191339035191,
+            "added": 0.0036847976741827522
+          },
+          "default": {
+            "missing": 0.13299922247388526,
+            "added": 0.0036932490449950984
+          },
+          "sf0.25": {
+            "missing": 0.10405327744160103,
+            "added": 0.0016142118251580406
+          },
+          "sf0": {
+            "missing": 0.09913457962881579,
+            "added": 0.001386024813224705
+          },
+          "tippecanoe": {
+            "missing": 0.12084615124573206,
+            "added": 0.0015804063419086575
+          }
+        },
+        "4": {
+          "before-745": {
+            "missing": 0.4750261992495183,
+            "added": 0.0018423988370913761
+          },
+          "default": {
+            "missing": 0.10954666846962577,
+            "added": 0.001850850207903722
+          },
+          "sf0.25": {
+            "missing": 0.08385450120009466,
+            "added": 0.0006169500693012406
+          },
+          "sf0": {
+            "missing": 0.07600317771542545,
+            "added": 0.0008789425644839593
+          },
+          "tippecanoe": {
+            "missing": 0.01657313816301004,
+            "added": 0.0006845610358000067
+          }
+        },
+        "5": {
+          "before-745": {
+            "missing": 0.34921909333693923,
+            "added": 0.0009211994185456881
+          },
+          "default": {
+            "missing": 0.10243906561644299,
+            "added": 0.0009296507893580339
+          },
+          "sf0.25": {
+            "missing": 0.05877083262905243,
+            "added": 0.0003634089449308678
+          },
+          "sf0": {
+            "missing": 0.04658395591764984,
+            "added": 0.0003972144281802508
+          },
+          "tippecanoe": {
+            "missing": 0.0039805956526148545,
+            "added": 0.00027889523680741014
+          }
+        },
+        "6": {
+          "before-745": {
+            "missing": 0.24431302264332133,
+            "added": 0.00048015441005186616
+          },
+          "default": {
+            "missing": 0.08679385212194972,
+            "added": 0.00048015441005186616
+          },
+          "sf0.25": {
+            "missing": 0.032160837465355196,
+            "added": 0.0001758981502170203
+          },
+          "sf0": {
+            "missing": 0.01964354477558724,
+            "added": 0.0002519622151757318
+          },
+          "tippecanoe": {
+            "missing": 0.004321389690466796,
+            "added": 0.00019491416645669814
+          }
+        },
+        "7": {
+          "before-745": {
+            "missing": 0.16075530988123407,
+            "added": 0.0002816723971747189
+          },
+          "default": {
+            "missing": 0.05076639850345197,
+            "added": 0.0002816723971747189
+          },
+          "sf0.25": {
+            "missing": 0.01582000539574972,
+            "added": 0.0001402419530236997
+          },
+          "sf0": {
+            "missing": 0.007397168776436499,
+            "added": 0.0001497498820422556
+          },
+          "tippecanoe": {
+            "missing": 0.0021785042363766235,
+            "added": 0.00013548798851442174
+          }
+        }
+      }
+    },
+    "moldova-country": {
+      "label": "Moldova, whole country",
+      "dataset": "moldova",
+      "report_zooms": [
+        3,
+        5,
+        7
+      ],
+      "zooms": {
+        "3": {
+          "before-745": {
+            "missing": 0.9976092971776425,
+            "added": 0.0004095185390149419
+          },
+          "default": {
+            "missing": 0.15753182069728833,
+            "added": 0.5143552850027671
+          },
+          "sf0.25": {
+            "missing": 0.15572772551189817,
+            "added": 0.5136801328168235
+          },
+          "sf0": {
+            "missing": 0.15413392363032652,
+            "added": 0.5134587714443829
+          }
+        },
+        "4": {
+          "before-745": {
+            "missing": 0.9455893746541228,
+            "added": 0.0076037631433314885
+          },
+          "default": {
+            "missing": 0.17053680132816823,
+            "added": 0.40318760376314333
+          },
+          "sf0.25": {
+            "missing": 0.1484781405644715,
+            "added": 0.39799667957941337
+          },
+          "sf0": {
+            "missing": 0.14162700608743775,
+            "added": 0.3976092971776425
+          }
+        },
+        "5": {
+          "before-745": {
+            "missing": 0.7164028776978417,
+            "added": 0.02935251798561151
+          },
+          "default": {
+            "missing": 0.22272274488101826,
+            "added": 0.25028223574986164
+          },
+          "sf0.25": {
+            "missing": 0.13451023796347536,
+            "added": 0.23733259546209187
+          },
+          "sf0": {
+            "missing": 0.12345323741007194,
+            "added": 0.23598229109020477
+          }
+        },
+        "6": {
+          "before-745": {
+            "missing": 0.4452573325954621,
+            "added": 0.042888765910348646
+          },
+          "default": {
+            "missing": 0.19771997786386275,
+            "added": 0.1440398450470393
+          },
+          "sf0.25": {
+            "missing": 0.09206419479800775,
+            "added": 0.12842280022136138
+          },
+          "sf0": {
+            "missing": 0.07946873270614278,
+            "added": 0.12855561704482568
+          }
+        },
+        "7": {
+          "before-745": {
+            "missing": 0.2978028555835285,
+            "added": 0.042305593211387126
+          },
+          "default": {
+            "missing": 0.12446963961902079,
+            "added": 0.09278885935106776
+          },
+          "sf0.25": {
+            "missing": 0.05957641590817063,
+            "added": 0.07582612982165807
+          },
+          "sf0": {
+            "missing": 0.053617013784968574,
+            "added": 0.08027147409376595
+          }
+        }
+      }
+    },
+    "moldova-fields": {
+      "label": "Moldova fields, z10 tile 592/359",
+      "dataset": "moldova",
+      "report_zooms": [
+        8,
+        10,
+        12
+      ],
+      "zooms": {
+        "8": {
+          "before-745": {
+            "missing": 0.8216113381849599,
+            "added": 0.02063602831223208
+          },
+          "default": {
+            "missing": 0.311708703020636,
+            "added": 0.31755723922506895
+          },
+          "sf0.25": {
+            "missing": 0.2208237796165221,
+            "added": 0.3021965241085967
+          },
+          "sf0": {
+            "missing": 0.2122005117469179,
+            "added": 0.3045309540424683
+          }
+        },
+        "10": {
+          "before-745": {
+            "missing": 0.31462466354301666,
+            "added": 0.044836008374040476
+          },
+          "default": {
+            "missing": 0.16883494500382148,
+            "added": 0.09984049446715183
+          },
+          "sf0.25": {
+            "missing": 0.07555743860698501,
+            "added": 0.09160768284983219
+          },
+          "sf0": {
+            "missing": 0.0692187551922374,
+            "added": 0.07389592263981656
+          }
+        },
+        "12": {
+          "before-745": {
+            "missing": 0.025047628409468576,
+            "added": 0.025482954412473727
+          },
+          "default": {
+            "missing": 0.024560812234064963,
+            "added": 0.02557189198298016
+          },
+          "sf0.25": {
+            "missing": 0.024560812234064963,
+            "added": 0.02557189198298016
+          },
+          "sf0": {
+            "missing": 0.024560812234064963,
+            "added": 0.02557189198298016
+          }
+        }
+      }
+    },
+    "madagascar": {
+      "label": "Madagascar adm4, z4 tile 10/8",
+      "dataset": "madagascar",
+      "report_zooms": [
+        3,
+        4,
+        6
+      ],
+      "zooms": {
+        "3": {
+          "before-745": {
+            "missing": 0.8265272786671023,
+            "added": 0.00025130047998391674
+          },
+          "default": {
+            "missing": 0.2349408187369638,
+            "added": 0.004850099263689594
+          },
+          "sf0.25": {
+            "missing": 0.07991355263488553,
+            "added": 0.0023622245118488177
+          },
+          "sf0": {
+            "missing": 0.052371020028648255,
+            "added": 0.0021360540798632927
+          }
+        },
+        "4": {
+          "before-745": {
+            "missing": 0.7917221621893298,
+            "added": 0.00027643052798230846
+          },
+          "default": {
+            "missing": 0.14412082527077627,
+            "added": 0.002563264895835951
+          },
+          "sf0.25": {
+            "missing": 0.028095393662201894,
+            "added": 0.0011308521599276255
+          },
+          "sf0": {
+            "missing": 0.008443696127459604,
+            "added": 0.0008292915839469253
+          }
+        },
+        "5": {
+          "before-745": {
+            "missing": 0.7270285552728301,
+            "added": 0.00022618037885213457
+          },
+          "default": {
+            "missing": 0.059640938648572235,
+            "added": 0.0013853548204693243
+          },
+          "sf0.25": {
+            "missing": 0.00942889454339836,
+            "added": 0.0007492225049476958
+          },
+          "sf0": {
+            "missing": 0.001583262651964942,
+            "added": 0.0006219960418433701
+          }
+        },
+        "6": {
+          "before-745": {
+            "missing": 0.6529093273770816,
+            "added": 0.00015903757527778564
+          },
+          "default": {
+            "missing": 0.02083392236138992,
+            "added": 0.0008729395798580678
+          },
+          "sf0.25": {
+            "missing": 0.0029510305634878,
+            "added": 0.0003958268540247109
+          },
+          "sf0": {
+            "missing": 0.0004311685374197744,
+            "added": 0.00027919929882100147
+          }
+        }
+      }
+    }
+  },
+  "coverage": {
+    "madagascar-z8": {
+      "label": "Madagascar, z8, 3\u00d73 tiles around the densest",
+      "zoom": 8,
+      "tiles": {
+        "x": [
+          160,
+          162
+        ],
+        "y": [
+          140,
+          142
+        ]
+      },
+      "settings": {
+        "before-745": {
+          "missing": 0.4859126426542663,
+          "added": 3.534874184990571e-06,
+          "features": 1028
+        },
+        "default": {
+          "missing": 0.0022817612864114135,
+          "added": 2.1209245109943423e-05,
+          "features": 7782
+        },
+        "sf0.25": {
+          "missing": 0.0003252084250191325,
+          "added": 3.534874184990571e-06,
+          "features": 7783
+        },
+        "sf0": {
+          "missing": 1.590693383245757e-05,
+          "added": 0.0,
+          "features": 6518
+        }
+      }
+    },
+    "madagascar-z6": {
+      "label": "Madagascar, z6, 3\u00d73 tiles (the whole island)",
+      "zoom": 6,
+      "tiles": {
+        "x": [
+          39,
+          41
+        ],
+        "y": [
+          34,
+          36
+        ]
+      },
+      "settings": {
+        "before-745": {
+          "missing": 0.6514385119764485,
+          "added": 0.00018734109460725277,
+          "features": 1045
+        },
+        "default": {
+          "missing": 0.01941210580311343,
+          "added": 0.0008028904054596548,
+          "features": 8828
+        },
+        "sf0.25": {
+          "missing": 0.0028458004371292207,
+          "added": 0.0003033141531736473,
+          "features": 7966
+        },
+        "sf0": {
+          "missing": 0.0004014452027298274,
+          "added": 0.0004282082162451492,
+          "features": 5495
+        }
+      }
+    }
+  },
+  "metrics": {
+    "moldova": {
+      "label": "FTW Moldova",
+      "dataset": "moldova",
+      "zooms": [
+        6,
+        8,
+        10,
+        12
+      ],
+      "named": [],
+      "settings": {
+        "before-745": {
+          "zooms": {
+            "6": {
+              "median": 0.5623398843507539,
+              "min": 0.5394524959742351,
+              "edge_gap": 0.42962962962962964,
+              "excess_change": null
+            },
+            "8": {
+              "median": 0.8960741396741783,
+              "min": 0.6999732477260567,
+              "edge_gap": 0.18059450364554122,
+              "excess_change": 0.0035714285714285587
+            },
+            "10": {
+              "median": 0.9722267337989281,
+              "min": 0.6964929531301213,
+              "edge_gap": 0.034220532319391636,
+              "excess_change": 0.009285355643078863
+            },
+            "12": {
+              "median": 0.9945573003791681,
+              "min": 0.923591625296784,
+              "edge_gap": 0.00832813231393353,
+              "excess_change": 0.014278925979946983
+            }
+          },
+          "named": {},
+          "sizes": {
+            "tiles": 1286,
+            "max_raw": 519098,
+            "max_gz": 315009,
+            "over_raw": 10,
+            "over_gz": 0
+          }
+        },
+        "default": {
+          "zooms": {
+            "6": {
+              "median": 0.7891276899429074,
+              "min": 0.7859848484848485,
+              "edge_gap": 0.2,
+              "excess_change": null
+            },
+            "8": {
+              "median": 0.935761834543943,
+              "min": 0.9202782236490101,
+              "edge_gap": 0.06561974200785194,
+              "excess_change": 0.3866666666666667
+            },
+            "10": {
+              "median": 0.9773081201334817,
+              "min": 0.8321861684693543,
+              "edge_gap": 0.02586268742377502,
+              "excess_change": -0.004946885337225204
+            },
+            "12": {
+              "median": 0.9945573003791681,
+              "min": 0.9626474442988204,
+              "edge_gap": 0.006943360898736152,
+              "excess_change": -0.015113530568733866
+            }
+          },
+          "named": {},
+          "sizes": {
+            "tiles": 1289,
+            "max_raw": 534017,
+            "max_gz": 305208,
+            "over_raw": 1,
+            "over_gz": 0
+          }
+        },
+        "sf0.25": {
+          "zooms": {
+            "6": {
+              "median": 0.8962450592885376,
+              "min": 0.8939393939393939,
+              "edge_gap": 0.14814814814814814,
+              "excess_change": null
+            },
+            "8": {
+              "median": 0.970128159830405,
+              "min": 0.9596683530073075,
+              "edge_gap": 0.03309029725182277,
+              "excess_change": 0.7122200050588797
+            },
+            "10": {
+              "median": 0.9891825582692093,
+              "min": 0.9219927892494264,
+              "edge_gap": 0.01226773800129134,
+              "excess_change": 0.13150608611067952
+            },
+            "12": {
+              "median": 0.9945573003791681,
+              "min": 0.9626474442988204,
+              "edge_gap": 0.006943360898736152,
+              "excess_change": -0.015113530568733866
+            }
+          },
+          "named": {},
+          "sizes": {
+            "tiles": 1289,
+            "max_raw": 779036,
+            "max_gz": 408784,
+            "over_raw": 7,
+            "over_gz": 0
+          }
+        },
+        "sf0": {
+          "zooms": {
+            "6": {
+              "median": 0.9177920509442248,
+              "min": 0.9128787878787878,
+              "edge_gap": 0.0962962962962963,
+              "excess_change": null
+            },
+            "8": {
+              "median": 0.9654483200135928,
+              "min": 0.9577009555930298,
+              "edge_gap": 0.039820527201346045,
+              "excess_change": 0.8356714746756241
+            },
+            "10": {
+              "median": 0.9864335242689177,
+              "min": 0.9101933792199279,
+              "edge_gap": 0.016321113422770643,
+              "excess_change": 0.9124117620082094
+            },
+            "12": {
+              "median": 0.9945573003791681,
+              "min": 0.9626474442988204,
+              "edge_gap": 0.006943360898736152,
+              "excess_change": -0.015113530568733866
+            }
+          },
+          "named": {},
+          "sizes": {
+            "tiles": 1289,
+            "max_raw": 2707584,
+            "max_gz": 671193,
+            "over_raw": 67,
+            "over_gz": 0
+          }
+        }
+      }
+    },
+    "nz": {
+      "label": "NZ Parcels",
+      "dataset": "nz",
+      "zooms": [
+        10,
+        12,
+        14
+      ],
+      "named": [
+        "12/4035/2500",
+        "12/4036/2499",
+        "12/4036/2500"
+      ],
+      "settings": {
+        "before-745": {
+          "zooms": {
+            "10": {
+              "median": 0.98577880859375,
+              "min": 0.75439453125,
+              "edge_gap": 0.05851128366901238,
+              "excess_change": -0.03608533246201853
+            },
+            "12": {
+              "median": 0.994598388671875,
+              "min": 0.66241455078125,
+              "edge_gap": 0.09413376636557394,
+              "excess_change": -0.01069944465546993
+            },
+            "14": {
+              "median": 1.0,
+              "min": 0.9998432479034407,
+              "edge_gap": 0.0,
+              "excess_change": 0.007519531249999989
+            }
+          },
+          "named": {
+            "12/4035/2500": 0.6719970703125,
+            "12/4036/2499": 0.76373291015625,
+            "12/4036/2500": 0.68731689453125
+          },
+          "sizes": {
+            "tiles": 175895,
+            "max_raw": 3037269,
+            "max_gz": 1355682,
+            "over_raw": 0,
+            "over_gz": 0
+          }
+        },
+        "default": {
+          "zooms": {
+            "10": {
+              "median": 0.994964599609375,
+              "min": 0.93804931640625,
+              "edge_gap": 0.01707646264890558,
+              "excess_change": -0.017505582137161108
+            },
+            "12": {
+              "median": 0.998931884765625,
+              "min": 0.97052001953125,
+              "edge_gap": 0.009431614572964363,
+              "excess_change": -0.031241632565697425
+            },
+            "14": {
+              "median": 1.0,
+              "min": 0.9998432479034407,
+              "edge_gap": 0.0,
+              "excess_change": 0.007519531249999989
+            }
+          },
+          "named": {
+            "12/4035/2500": 0.9727783203125,
+            "12/4036/2499": 0.97906494140625,
+            "12/4036/2500": 0.97625732421875
+          },
+          "sizes": {
+            "tiles": 175896,
+            "max_raw": 4821660,
+            "max_gz": 1987208,
+            "over_raw": 0,
+            "over_gz": 0
+          }
+        },
+        "sf0.25": {
+          "zooms": {
+            "10": {
+              "median": 0.9990032398850521,
+              "min": 0.97308349609375,
+              "edge_gap": 0.00689513526201514,
+              "excess_change": -0.017692203260209455
+            },
+            "12": {
+              "median": 0.999725341796875,
+              "min": 0.99365234375,
+              "edge_gap": 0.0020406131793748758,
+              "excess_change": -0.032754572064542964
+            },
+            "14": {
+              "median": 1.0,
+              "min": 0.9998432479034407,
+              "edge_gap": 0.0,
+              "excess_change": 0.007519531249999989
+            }
+          },
+          "named": {
+            "12/4035/2500": 0.99365234375,
+            "12/4036/2499": 0.99591064453125,
+            "12/4036/2500": 0.9947509765625
+          },
+          "sizes": {
+            "tiles": 175897,
+            "max_raw": 4547476,
+            "max_gz": 1992458,
+            "over_raw": 0,
+            "over_gz": 0
+          }
+        },
+        "sf0": {
+          "zooms": {
+            "10": {
+              "median": 0.9997060893281426,
+              "min": 0.978759765625,
+              "edge_gap": 0.005164016196232616,
+              "excess_change": -0.017558066206015494
+            },
+            "12": {
+              "median": 1.0,
+              "min": 0.999755859375,
+              "edge_gap": 0.0,
+              "excess_change": -0.03073248042077545
+            },
+            "14": {
+              "median": 1.0,
+              "min": 0.9998432479034407,
+              "edge_gap": 0.0,
+              "excess_change": 0.007519531249999989
+            }
+          },
+          "named": {
+            "12/4035/2500": 0.9998779296875,
+            "12/4036/2499": 0.99993896484375,
+            "12/4036/2500": 0.99993896484375
+          },
+          "sizes": {
+            "tiles": 175897,
+            "max_raw": 4918298,
+            "max_gz": 1999191,
+            "over_raw": 0,
+            "over_gz": 0
+          }
+        },
+        "tippecanoe": {
+          "zooms": {
+            "10": {
+              "median": 1.0,
+              "min": 0.9962756052141527,
+              "edge_gap": 0.00025292976983390945,
+              "excess_change": 0.5011520997460571
+            },
+            "12": {
+              "median": 0.99981689453125,
+              "min": 0.9949951171875,
+              "edge_gap": 0.0013020833333333333,
+              "excess_change": 0.06406247793786898
+            },
+            "14": {
+              "median": 0.999969482421875,
+              "min": 0.99786376953125,
+              "edge_gap": 0.00044308782985427335,
+              "excess_change": -0.010390015676421754
+            }
+          },
+          "named": {
+            "12/4035/2500": 0.9949951171875,
+            "12/4036/2499": 0.99639892578125,
+            "12/4036/2500": 0.9962158203125
+          },
+          "sizes": {
+            "tiles": 175850,
+            "max_raw": 5531259,
+            "max_gz": 1884391,
+            "over_raw": 0,
+            "over_gz": 0
+          }
+        }
+      }
+    }
+  },
+  "elapsed_s": 0.1
+}
