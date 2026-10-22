@@ -1,0 +1,237 @@
+# The coalesce benchmark (#755): inputs, settings, windows and profiles for
+# run.py. Everything a run depends on is pinned here, so two runs of the same
+# profile on the same binary compare like for like.
+#
+# Inputs are assets on the `bench-coalesce-v1` release (see README.md for how
+# they were made and their licences). A new input, or a changed one, gets a
+# new release tag; an asset under an existing tag never changes.
+
+release = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1"
+
+# Differences under these are not regressions.
+[noise]
+# Missing or added share of the source area, in percentage points. At full
+# detail, small fields show about 2.5% missing and 2.5% added area from
+# tile-grid snapping alone (#745 RESULTS.md, "Rendered coverage").
+coverage_pp = 3.0
+# Relative change of a median wall time.
+time_ratio = 0.10
+
+# MapLibre and its PMTiles protocol, served to headless Chromium from a local
+# copy so a CDN change cannot move the numbers.
+[js.maplibre]
+url = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"
+sha256 = "be9633c4d870e26fb37f1cfe5c5a77181667114003ea16207ac7850d8da8add1"
+
+[js.pmtiles]
+url = "https://unpkg.com/pmtiles@3.2.1/dist/pmtiles.js"
+sha256 = "367c19f8936d1d6c1b1820b0dee053f793fc29277655c3e471f5ed4d37b5f045"
+
+# ---------------------------------------------------------------------------
+# Datasets. `asset` is the Hilbert-sorted input every run reads; `raw` is the
+# file as delivered, kept on the release for provenance and for
+# prepare_data.py's row-order runs. Caps are export-pmtiles' tile size caps
+# in bytes (0 = none). `wall_s` and `rss_gib` cap each run (run_matrix.py).
+
+[datasets.madagascar]
+label = "Madagascar adm4"
+asset = "madagascar-adm4-hilbert.parquet"
+sha256 = "6f666e18e06a87eeb219dfd6c1ef407fb9bce0e72c4cd7736fdd1c245c72f0b9"
+bytes = 17899512
+features = 17465
+max_zoom = 12
+max_tile_size = 512000
+max_compressed_tile_size = 0
+wall_s = 300
+rss_gib = 16
+
+[datasets.moldova]
+label = "FTW Moldova"
+asset = "moldova-hilbert.parquet"
+sha256 = "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5"
+bytes = 105052005
+raw = "moldova.parquet"
+raw_sha256 = "f5343419fd6b2f8054136eb6ccd6a65d66d1c7d01446c8ea04e809e96fe97afd"
+features = 631910
+max_zoom = 12
+max_tile_size = 512000
+max_compressed_tile_size = 0
+wall_s = 600
+rss_gib = 24
+
+[datasets.nz]
+label = "NZ Parcels"
+asset = "nz-parcels-hilbert.parquet"
+sha256 = "3a8336ce71d623c44eee44e1226ce87052e13950d2918f4e91a9b75e80bb7998"
+bytes = 1001727145
+raw = "nz-parcels.parquet"
+raw_sha256 = "20046c0d35a5b7d30b6e6f5919ee85b6b7d1426c34cda2be58365f68c12ddf49"
+features = 4343547
+max_zoom = 14
+# Parcels are dense: #745 measured NZ with a 2 MB gzip cap instead of the
+# raw cap.
+max_tile_size = 0
+max_compressed_tile_size = 2000000
+wall_s = 2700
+rss_gib = 96
+# Each NZ cell takes minutes; two repeats agreed within 1% in #745.
+repeats = 2
+
+# ---------------------------------------------------------------------------
+# Settings: the table columns. `convert` is passed to `tylertoo overview`,
+# `valve` to `export-pmtiles --size-valve`.
+
+[settings.before-745]
+label = "Before #745"
+convert = ["--drop-polygons", "--drop-lines", "--polygon-thinning", "1", "--no-collapse"]
+valve = "drop"
+
+[settings.default]
+label = "Defaults"
+convert = []
+valve = "merge"
+
+[settings."sf0.25"]
+label = "--simplify-factor 0.25"
+convert = ["--simplify-factor", "0.25"]
+valve = "merge"
+
+[settings.sf0]
+label = "--simplify-factor 0"
+convert = ["--simplify-factor", "0"]
+valve = "merge"
+
+[settings.tippecanoe]
+label = "tippecanoe"
+external = true
+
+# The tippecanoe reference: built by benchmarks/e2e/setup_tippecanoe.sh at its
+# pinned tag, fed FlatGeobuf (gpio), with arguments per dataset. Each archive
+# is cached under <work>/tippecanoe/<dataset>-<key>/ and rebuilt only when the
+# tippecanoe commit, the input or the arguments change.
+[tippecanoe]
+gpio = "geoparquet-io==1.7.0"
+wall_s = 10800
+rss_gib = 48
+
+# The #745 arguments: the 2 MB cap matches tylertoo's gzip cap for NZ.
+[tippecanoe.datasets.nz]
+args = ["-Z0", "-z14", "-b", "8", "-l", "parcels", "-M", "2000000",
+        "--coalesce-densest-as-needed", "--quiet"]
+
+# DIVERGENCE FROM TYLERTOO'S CAP: tippecanoe's -M limits the compressed tile,
+# so its 500K default is looser than tylertoo's 500K raw cap (512000 bytes)
+# that Moldova is tiled with. There is no tippecanoe flag for a raw cap.
+[tippecanoe.datasets.moldova]
+args = ["-Z0", "-z12", "-b", "8", "-l", "fields", "-M", "500000",
+        "--coalesce-densest-as-needed", "--quiet"]
+
+# ---------------------------------------------------------------------------
+# MapLibre windows (render_maplibre.py): `tile` at `zoom`, `window` as
+# fx,fy,size fractions of it, drawn at `draw_zooms`; `report_zooms` are the
+# ones the summary table shows (every drawn zoom is in report.json).
+
+[[windows]]
+name = "auckland-city"
+label = "Auckland city, 2.4 km"
+dataset = "nz"
+zoom = 12
+tile = [4036, 2500]
+window = [0.17, 0.0, 0.25]
+draw_zooms = [8, 10, 12]
+report_zooms = [8, 10, 12]
+
+[[windows]]
+name = "upper-north-island"
+label = "Upper North Island, z5 tile 31/19"
+dataset = "nz"
+zoom = 5
+tile = [31, 19]
+window = [0.0, 0.0, 1.0]
+draw_zooms = [3, 4, 5, 6, 7]
+report_zooms = [3, 5, 7]
+
+[[windows]]
+name = "moldova-country"
+label = "Moldova, whole country"
+dataset = "moldova"
+zoom = 5
+tile = [18, 11]
+window = [0.33, 0.04, 0.42]
+draw_zooms = [3, 4, 5, 6, 7]
+report_zooms = [3, 5, 7]
+
+[[windows]]
+name = "moldova-fields"
+label = "Moldova fields, z10 tile 592/359"
+dataset = "moldova"
+zoom = 10
+tile = [592, 359]
+window = [0.25, 0.25, 0.5]
+draw_zooms = [8, 10, 12]
+report_zooms = [8, 10, 12]
+
+[[windows]]
+name = "madagascar"
+label = "Madagascar adm4, z4 tile 10/8"
+dataset = "madagascar"
+zoom = 4
+tile = [10, 8]
+window = [0.0, 0.0, 1.0]
+draw_zooms = [3, 4, 5, 6]
+report_zooms = [3, 4, 6]
+
+# ---------------------------------------------------------------------------
+# Tile-level checks. `coverage` is render_coverage.py: `span`×`span` tiles
+# around `center` at `zoom`, missing and added share and features in view.
+# `metrics` is tile_metrics.py: drawn share per sampled tile, seam holes and
+# seam colour changes.
+
+[[coverage]]
+name = "madagascar-z8"
+label = "Madagascar, z8, 3×3 tiles around the densest"
+dataset = "madagascar"
+zoom = 8
+center = [161, 141]
+span = 3
+
+[[coverage]]
+name = "madagascar-z6"
+label = "Madagascar, z6, 3×3 tiles (the whole island)"
+dataset = "madagascar"
+zoom = 6
+center = [40, 35]
+span = 3
+
+[[metrics]]
+name = "moldova"
+dataset = "moldova"
+zooms = [6, 8, 10, 12]
+color_attr = "id"
+max_tiles = 120
+
+[[metrics]]
+name = "nz"
+dataset = "nz"
+zooms = [10, 12, 14]
+color_attr = "parcel_intent"
+max_tiles = 40
+# palmerj's three Auckland tiles (#246).
+named = ["12/4035/2500", "12/4036/2499", "12/4036/2500"]
+
+# ---------------------------------------------------------------------------
+# Profiles. Windows, coverage and metrics entries run when their dataset is
+# in the profile; tippecanoe runs for the datasets [tippecanoe.datasets] lists
+# when the profile names it among its settings. `disk_gb` is checked before a run.
+
+[profiles.small]
+datasets = ["madagascar", "moldova"]
+settings = ["before-745", "default", "sf0.25", "sf0"]
+repeats = 3
+disk_gb = 5
+
+[profiles.full]
+datasets = ["madagascar", "moldova", "nz"]
+settings = ["before-745", "default", "sf0.25", "sf0", "tippecanoe"]
+repeats = 3
+disk_gb = 30

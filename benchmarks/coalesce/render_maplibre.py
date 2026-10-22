@@ -4,6 +4,8 @@
 #   "playwright==1.64.0", "pmtiles>=3.4", "shapely>=2.0", "geopandas>=1.0",
 #   "pyarrow>=17", "numpy>=1.26", "pillow>=10", "rasterio>=1.4",
 # ]
+# [tool.uv]
+# exclude-newer = "2026-10-22T00:00:00Z"
 # ///
 """
 render_maplibre.py — a window of several PMTiles archives drawn by MapLibre GL
@@ -27,6 +29,10 @@ of `--tile` at `--zoom`. For each `--draw-zoom` the camera is set so MapLibre
 draws that zoom's tiles: at that zoom when the window is at least `--px`
 pixels wide there, otherwise overzoomed from it (the source's `maxzoom` is
 pinned to it).
+
+MapLibre and pmtiles.js load from unpkg unless `--js-dir` names a directory
+holding `maplibre-gl.js` and `pmtiles.js` (run.py fetches pinned copies
+there), which are served to the page locally.
 """
 
 from __future__ import annotations
@@ -84,6 +90,7 @@ def main() -> int:
     ap.add_argument("--label", action="append", required=True, help="name=archive.pmtiles")
     ap.add_argument("--px", type=int, default=768)
     ap.add_argument("--prefix", default="")
+    ap.add_argument("--js-dir", type=Path, help="local maplibre-gl.js and pmtiles.js")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
@@ -143,6 +150,21 @@ def main() -> int:
                         "ground_m": side}, "source_polygons": len(sub), "images": {}}
     zooms = [int(v) for v in args.draw_zoom.split(",")] if args.draw_zoom else [args.zoom]
 
+    scripts = {"maplibre": MAPLIBRE, "pmtiles": PMTILES}
+    local_js = {}
+    if args.js_dir:
+        for key, fname in (("maplibre", "maplibre-gl.js"), ("pmtiles", "pmtiles.js")):
+            scripts[key] = f"http://local/{fname}"
+            local_js[scripts[key]] = (args.js_dir / fname).read_bytes()
+
+    def serve_js(body: bytes):
+        # Playwright passes (route, request) to a handler that takes two
+        # arguments, so bind the body here rather than as a default.
+        def handler(route):
+            route.fulfill(status=200, body=body,
+                          headers={"Content-Type": "application/javascript"})
+        return handler
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader"])
         for dz in zooms:
@@ -181,8 +203,9 @@ def main() -> int:
 
                     cfg = {"layers": layer_ids, "mask": mask_mode, "center": [lng, lat],
                            "zoom": cam_zoom, "maxzoom": dz}
-                    html = PAGE % {"maplibre": MAPLIBRE, "pmtiles": PMTILES, "px": n,
-                                   "cfg": json.dumps(cfg)}
+                    html = PAGE % {**scripts, "px": n, "cfg": json.dumps(cfg)}
+                    for url, body in local_js.items():
+                        page.route(url, serve_js(body))
                     page.route("http://local/archive.pmtiles", serve)
                     page.route("http://local/index.html",
                                lambda route: route.fulfill(status=200, body=html,
