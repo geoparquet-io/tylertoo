@@ -311,3 +311,9 @@ fi
     assert log.read_text().split() == ["missing", "missing", "missing"]
     assert [r["status"] for r in recs[0]["convert_runs"]] == ["ok"] * 3
     assert recs[1]["export_run"]["status"] == "ok"
+
+
+def test_load_gate_scales_with_cores():
+    assert run_matrix.default_load_max(64) == pytest.approx(6.4)
+    assert run_matrix.default_load_max(8) == 3.0
+    assert run_matrix.default_load_max(None) == 3.0

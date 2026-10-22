@@ -30,7 +30,8 @@ work whose inputs haven't changed:
 `--only tile,report` runs only the named steps. Any step you leave out must
 already be cached.
 
-Each run waits until the 1-minute load average drops below 3 (`--load-max`)
+Each run waits until the 1-minute load average drops below a tenth of the
+core count, and at least 3 (`--load-max`; 6.4 on 64 cores),
 and records the load before and after. Every cell records whether its repeats
 wrote identical bytes (`repeats_identical` in `report.json`).
 
@@ -97,7 +98,7 @@ it is beyond 3 percentage points (coverage) or 10% (median time), set in
 
 `baseline/` holds a report for each profile, with the host it was made on:
 c7g.16xlarge, 64 Arm cores, a glibc build. Each timed run started with the
-load average below 3. To compare a change against it:
+load average below 6.4 (a tenth of the cores). To compare a change against it:
 
 ```bash
 uv run benchmarks/coalesce/run.py --profile small --compare benchmarks/coalesce/baseline/small.json

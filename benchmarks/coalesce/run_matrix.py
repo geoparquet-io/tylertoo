@@ -25,7 +25,8 @@ What it records, per run, so a slowdown can be traced to its source:
     sort ran outside the timer.
 
 Convert runs once per (dataset, order, convert variant); every valve exports
-that overview. Runs wait for the 1-minute load average to drop below 3 (other
+that overview. Runs wait for the 1-minute load average to drop below a tenth
+of the core count, and at least 3 (other
 sessions share this box) and log it after.
 
     python3 benchmarks/coalesce/run_matrix.py --stage G0 \\
@@ -105,7 +106,13 @@ STAGES = {
             "rss_gib": 96, "max_zoom": 14},
 }
 
-LOAD_MAX = 3.0
+def default_load_max(cores: int | None) -> float:
+    """A tenth of the cores, at least 3: one compile on a big host does not
+    hold every run, while a competing benchmark still does."""
+    return max(3.0, 0.1 * (cores or 0))
+
+
+LOAD_MAX = default_load_max(os.cpu_count())
 LOAD_WAIT_S = 1800
 
 
