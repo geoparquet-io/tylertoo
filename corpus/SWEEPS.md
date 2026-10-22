@@ -409,23 +409,28 @@ Measured with #760's harness (`benchmarks/coalesce/run.py`, a `fill`
 setting on the full profile's datasets), against the defaults:
 
 - Coverage: Auckland city z8/z10/z12 missing 28.5% / 28.2% / 3.2% → 0.0% /
-  0.2% / 0.1% (tippecanoe 5.7% / 0.0% / 0.6%); Upper North Island z3
-  13.3% → 0.6% (tippecanoe 12.1%); Madagascar z3 23.5% → 0.3%. Added
-  area stays under 1% on all three.
-- Cost, end to end: NZ 108.0 s → 117.8 s (+9%), Madagascar 2.82 s → 3.08 s
-  (+9%); archives +3% and +4%; export peak memory +8% and +15%.
+  0.1% / 0.1% (tippecanoe 5.7% / 0.0% / 0.6%); Upper North Island z3
+  13.3% → 0.5% (tippecanoe 12.1%); Madagascar z3 23.5% → 0.2%. Added
+  area stays at 1% or under on all three.
+- Cost, end to end: NZ 107.0 s → 125.5 s (+17%), Madagascar 2.89 s →
+  3.06 s (+6%); archives +4% on both; export peak memory +26% (6.4 →
+  8.0 GiB) and +20%.
 - FTW Moldova, whose fields are smaller than a pixel at coarse zooms: the
-  missing share halves (z3 15.8% → 7.6%), but added area grows (+51% →
-  +63%), the archive grows 20%, and the build takes 1.32× as long.
-  tippecanoe cannot tile this input (#760).
+  missing share halves (z3 15.8% → 7.7%), but added area grows (+51% →
+  +61%), the archive grows 19%, and the build takes 2.2× as long
+  (8.70 s → 19.47 s). tippecanoe cannot tile this input (#760).
 
-Two fixes made the cost acceptable. The size valve fits a tile's own features
-into what the fill leaves of the cap (`FillBytes`): sized on the whole tile,
-it ran Moldova's z10 to 31 passes. And Douglas–Peucker's shrinkage of convex
-blobs, a third of their area a few pixels across, is credited back as squares;
-without that the fill lost 23% of its area by z5.
+Three fixes shaped the cost and the coverage. The size valve fits a tile's own
+features into what the fill leaves of the cap (`FillBytes`): sized on the
+whole tile, it ran Moldova's z10 to 31 passes. Douglas–Peucker's shrinkage of
+convex blobs, a third of their area a few pixels across, is credited back as
+squares; without that the fill lost 23% of its area by z5. And the credit is
+placed where the area was lost, and a cell's excess spills into nearby cells,
+so the fill keeps its area within about 2% from z11 to z3 on Moldova.
 
-The fill is opt-in because the Moldova result is worse on added area, and the
-overview cannot tell a dense coverage from scattered sub-pixel polygons.
-Making it the default needs that distinction, or a fix for the over-draw
-(#762).
+That last fix doubled the vertices the fill carries up the zooms on Moldova
+(7.4M → 14.4M) and took its export from 10.0 s to 17.4 s, against 6.7 s
+without the fill. The fill stays opt-in, and the PR is not merged, until that
+cost comes down. The Moldova over-draw (#762) and the overview's inability to
+tell a dense coverage from scattered sub-pixel polygons keep it opt-in after
+that.

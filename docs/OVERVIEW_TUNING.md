@@ -42,7 +42,7 @@ Use these settings to balance coverage, build time, and file size:
 
 | Goal | Settings | Cost and effect |
 |---|---|---|
-| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. About 1.1× the build time and 3–4% larger archives on NZ parcels and Madagascar admin-4. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill---coverage-fill). |
+| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.06–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill---coverage-fill). |
 | Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
@@ -132,14 +132,14 @@ that area under its own features.
   polygons that `--drop-polygons` or a dot-fill recipe removed from coarse
   levels.
 - The export holds the finest level's geometry in memory while it builds
-  the fill, outside the RAM budget the export plans for: about 0.5 GB more
-  on 4.3M NZ parcels, growing with the input.
+  the fill, outside the RAM budget the export plans for: about 1.7 GB more
+  on 4.3M NZ parcels, growing with the input (#764).
 - It is skipped with `--tile-range` or `--zoom-ceiling` (sharded builds).
 
-On the benchmark inputs, the fill adds about 10% to end-to-end time on NZ
-parcels and Madagascar admin-4 and 3–4% to the archive. On FTW Moldova, where
+On the benchmark inputs, the fill adds 17% to end-to-end time on NZ parcels
+and 6% on Madagascar admin-4, and 4% to the archive. On FTW Moldova, where
 fields are smaller than a pixel at coarse zooms, it halves the missing area
-but draws more area between fields, and the build takes about 1.3× as long
+but draws more area between fields, and the build takes 2.2× as long
 (#762).
 
 ## The GSD ladder: `--gsd-base` and `--gsd`
