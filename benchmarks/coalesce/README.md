@@ -38,7 +38,7 @@ wrote identical bytes (`repeats_identical` in `report.json`).
 
 | Profile | Datasets | Settings | Time | Disk |
 |---|---|---|---|---|
-| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 10 min | about 5 GB |
+| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 20 min: 8.5 min tiling, of which 6 min is the `sf0` export ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)), and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
 | `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ | about 1 h 30 min on the first run, of which tippecanoe takes about 30 min; reruns use the cached tippecanoe archive | about 30 GB |
 
 The `small` profile needs no keys and no network access beyond the release
@@ -95,33 +95,81 @@ it is beyond 3 percentage points (coverage) or 10% (median time), set in
 
 ## Baselines
 
-`baseline/` holds a report from each profile, made on the host it names
-(c7g.16xlarge, 64 Arm cores, glibc build). To make a change against it:
+`baseline/` holds a report for each profile, with the host it was made on:
+c7g.16xlarge, 64 Arm cores, a glibc build. Each timed run started with the
+load average below 3. To compare a change against it:
 
 ```bash
 uv run benchmarks/coalesce/run.py --profile small --compare benchmarks/coalesce/baseline/small.json
 ```
 
-When generalization changes on purpose, replace the baseline in the same PR,
-copying `<work>/report.json` and `report.md` to `baseline/<profile>.*`.
+When a PR changes generalization on purpose, replace the baseline in the same
+PR: copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
+`baseline/<profile>.*`.
+
+## Findings (`baseline/`, `fc64fe1`)
+
+- **`--simplify-factor 0` makes the merge valve very slow on dense fields
+  ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)).** The
+  Moldova export takes 117.6 s and 7.7 GiB, against 6.7 s and 1.8 GiB with the
+  defaults. Nearly all of it is MVT encoding at z6–z11:
+  - tiles there need 13–24 merge passes;
+  - each pass re-encodes full-resolution geometry;
+  - encode CPU totals 3,111 s, against 60 s with the defaults.
+
+  NZ Parcels did not show this in #745, because it was measured with a 2 MB
+  gzip cap instead of the 500K raw cap.
+- **Cost of the shipped defaults** relative to before #745, end to end:
+  1.51× on Moldova and 2.42× on Madagascar. The Madagascar times are only a
+  few seconds, so its ratio carries more noise. `--simplify-factor 0.25`
+  costs 3.15× on Moldova.
+- **Coverage gained, Moldova whole country, missing area at z5:**
+  - before #745: 71.6%;
+  - defaults: 22.3%;
+  - `--simplify-factor 0.25`: 13.5%;
+  - `--simplify-factor 0`: 12.3%.
+
+  The added area (25% at z5, 51% at z3) is the placeholder squares spreading
+  into gaps between fields
+  ([#750](https://github.com/geoparquet-io/tylertoo/issues/750)).
+- **Before #745, coverage depended on the maximum zoom.** Madagascar's
+  before-#745 archive misses 65.3% of the z4 window at z6 when built to z12,
+  and 43.6% when built to z10, which is the `RESULTS.md` figure. With the
+  defaults, the maximum zoom makes no difference to coverage at these zooms.
+- **Repeats wrote identical bytes in every cell.** Re-scoring the same
+  archives reproduced every MapLibre and tile-check value exactly.
 
 ## Relation to `RESULTS.md`
 
-`RESULTS.md` records #745 as investigated. Its numbers come from builds made
-during that work, some of which predate later changes on the branch (the merge
-threshold, `f323c9f`; the one-GSD placeholder square). `run.py` measures the
-current binary on the same inputs, windows and settings. Where its numbers
-differ from `RESULTS.md`, `baseline/` is the reference. Three things differ
-from the #745 runs:
+`RESULTS.md` records #745 as it was investigated. Its numbers come from builds
+made during that work, some of which predate later changes on the branch: the
+merge threshold (`f323c9f`) and the one-GSD placeholder square. `run.py`
+measures the current binary on the same inputs, windows and settings. The
+small profile reproduces the Madagascar and Moldova rows within the noise
+floor:
 
-- Every archive of a dataset is built from that dataset's Hilbert-sorted input
-  with one tool chain. #745 built some of its Madagascar archives from the
-  unsorted fixture with `tylertoo tiles`, and its Auckland-city archives from
-  a subset of NZ.
-- The `tippecanoe` column is for NZ only, as in #745.
+- MapLibre Moldova window: every value matches within 0.6 percentage points.
+- MapLibre Madagascar window: the defaults and both simplify factors match
+  within 0.2 points.
+- The Madagascar z8 and z6 tile checks match exactly: 48.59% → 0.23%, and
+  1,028 → 7,782 features.
+- Moldova drawn share (z6/z8/z10 median, worst z10):
+  - before #745: 0.56/0.90/0.97 (0.70);
+  - defaults: 0.79/0.94/0.98 (0.83);
+  - the z8 seam excess is 0.39, as in the merge-threshold section.
+
+The one exception is Madagascar's before-#745 MapLibre column. `RESULTS.md`
+built that archive to `--max-zoom 10`; this benchmark builds every Madagascar
+archive to z12 (see Findings above). Other differences from the #745 runs:
+
+- Each dataset's archives are all built from its Hilbert-sorted input with
+  one tool chain. #745 built some Madagascar archives from the unsorted
+  fixture with `tylertoo tiles`, and its Auckland-city archives from a subset
+  of NZ.
+- The `tippecanoe` column covers NZ only, as in #745.
 - Not covered here: the Mato Grosso scaling ladder, the row-order runs and the
-  simplify sweep. They still run by hand with `run_matrix.py --stage L|G2`
-  and `sweep_simplify.py`.
+  simplify sweep. Run those by hand with `run_matrix.py --stage L|G2` and
+  `sweep_simplify.py`.
 
 ## Inputs
 

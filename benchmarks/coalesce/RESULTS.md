@@ -5,6 +5,11 @@ and merging oversized tiles) with the defaults before #745 for speed, memory use
 For the resulting decision, see
 [`corpus/SWEEPS.md` Decision 8](../../corpus/SWEEPS.md).
 
+This file records the #745 investigation. Its numbers come from builds made
+during that work. To rerun the measurements on the current binary, use
+`run.py` ([README.md](README.md)). The current numbers are in
+[`baseline/`](baseline/), and README.md lists where they differ from these.
+
 ## Setup
 
 - Host: AWS c7g.16xlarge (64 Arm cores, 123 GB RAM), shared with other
