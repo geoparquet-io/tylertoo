@@ -2634,10 +2634,6 @@ fn export_level(
     ))
 }
 
-/// Export every level, one [`plan_level_groups`] group at a time. Each level
-/// is followed by a throttled salvage checkpoint (#229) once its tiles are
-/// written, inside a group too (#647).
-#[allow(clippy::too_many_arguments)]
 /// The #750 coverage fill for this export, when [`ExportOptions::coverage_fill`]
 /// asks for it: built from the finest of `levels` for every coarser zoom,
 /// before any level is written. Not for a sharded job, whose finest level
@@ -2670,6 +2666,10 @@ fn build_fills_if_asked(
     .map(Some)
 }
 
+/// Export every level, one [`plan_level_groups`] group at a time. Each level
+/// is followed by a throttled salvage checkpoint (#229) once its tiles are
+/// written, inside a group too (#647).
+#[allow(clippy::too_many_arguments)]
 fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
     mut store: Option<&mut MemberStore>,
@@ -5910,8 +5910,6 @@ struct ValveTally {
     mingap: u64,
 }
 
-/// What [`build_mvt`] needs from a tile feature: a plain member, or a member
-/// with others merged into it (#745).
 /// One #750 coverage-fill feature of a tile: the fill polygons that joined
 /// one of the tile's features, drawn with that feature's id and tags.
 /// Built once per tile, before the size valve, so the valve's merges and
@@ -5964,6 +5962,8 @@ fn fill_features(
         .collect()
 }
 
+/// What [`build_mvt`] needs from a tile feature: a plain member, or a member
+/// with others merged into it (#745).
 trait TileFeature: Sync {
     fn geometry(&self) -> &Geometry<f64>;
     fn properties(&self) -> &SharedProps;
@@ -6016,7 +6016,7 @@ fn encode_tile(
     // A fill alone over the limit makes `tile_fit` report 0: the valve then
     // merges (or drops) the tile's own features as far as it can in a few
     // passes, and the tile is written as small as it gets.
-    let fb = FillBytes::measure(fill, tb, opts);
+    let fb = FillBytes::new(fill, tb);
     if opts.size_valve == SizeValve::Merge && !is_point_like(members) {
         return merge_to_fit(members, tb, opts, fill, &fb);
     }
@@ -6026,28 +6026,47 @@ fn encode_tile(
 /// The bytes a tile's #750 fill features take, raw and (when a compressed
 /// limit is set) gzipped on their own. The size valve can only shrink the
 /// tile's own features, so it fits their share of the limit, not the whole
-/// tile's ([`tile_fit`]). Zero without a fill.
-#[derive(Default)]
-struct FillBytes {
-    raw: usize,
-    gz: usize,
+/// tile's ([`tile_fit`]). Measured once, and only for a tile over a limit;
+/// zero without a fill.
+struct FillBytes<'a> {
+    fill: &'a [FillFeature],
+    tb: Option<&'a TileBounds>,
+    /// `(raw, gzipped)`, filled on first use.
+    sizes: std::cell::OnceCell<(usize, usize)>,
 }
 
-impl FillBytes {
-    fn measure(fill: &[FillFeature], tb: &TileBounds, opts: &ExportOptions) -> Self {
-        if fill.is_empty() {
-            return Self::default();
-        }
-        let data = build_mvt::<Member>(&[], tb, opts, fill).data;
-        let gz = if opts.compressed_tile_size_limit.is_some_and(|l| l > 0) {
-            compression::compress(&data, Compression::Gzip).map_or(data.len(), |g| g.len())
-        } else {
-            0
-        };
+impl<'a> FillBytes<'a> {
+    fn new(fill: &'a [FillFeature], tb: &'a TileBounds) -> Self {
         Self {
-            raw: data.len(),
-            gz,
+            fill,
+            tb: Some(tb),
+            sizes: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Known sizes, for tests.
+    #[cfg(test)]
+    fn known(raw: usize, gz: usize) -> Self {
+        Self {
+            fill: &[],
+            tb: None,
+            sizes: std::cell::OnceCell::from((raw, gz)),
+        }
+    }
+
+    fn sizes(&self, opts: &ExportOptions) -> (usize, usize) {
+        *self.sizes.get_or_init(|| match self.tb {
+            Some(tb) if !self.fill.is_empty() => {
+                let data = build_mvt::<Member>(&[], tb, opts, self.fill).data;
+                let gz = if opts.compressed_tile_size_limit.is_some_and(|l| l > 0) {
+                    compression::compress(&data, Compression::Gzip).map_or(data.len(), |g| g.len())
+                } else {
+                    0
+                };
+                (data.len(), gz)
+            }
+            _ => (0, 0),
+        })
     }
 }
 
@@ -6084,11 +6103,18 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions, fill: &FillBytes) -> Result
     };
     let mut fit = f64::INFINITY;
     if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
-        fit = fit.min(share(limit, mvt.data.len(), fill.raw));
+        let size = mvt.data.len();
+        let fixed = if size > limit { fill.sizes(opts).0 } else { 0 };
+        fit = fit.min(share(limit, size, fixed));
     }
     if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
         let gz = compression::compress(&mvt.data, Compression::Gzip)?;
-        fit = fit.min(share(limit, gz.len(), fill.gz));
+        let fixed = if gz.len() > limit {
+            fill.sizes(opts).1
+        } else {
+            0
+        };
+        fit = fit.min(share(limit, gz.len(), fixed));
         mvt.gzip = Some(gz);
     }
     Ok(fit)
@@ -6389,7 +6415,9 @@ fn build_mvt<M: TileFeature>(
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     }
-    let features = layer.feature_count();
+    // The fill is drawn but is not the data's own features: the report,
+    // the tilestats and the empty-tile check count members only (#750).
+    let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
     let mut tb_builder = TileBuilder::new();
@@ -9682,8 +9710,8 @@ mod tests {
             oversized: false,
             valve: ValveTally::default(),
         };
-        let none = FillBytes::default();
-        let fill = FillBytes { raw: 100, gz: 0 };
+        let none = FillBytes::known(0, 0);
+        let fill = FillBytes::known(100, 0);
         assert_eq!(tile_fit(&mut mvt(1000), &opts, &none).unwrap(), 0.5);
         // 900 bytes of members must become 400: a share of 4/9.
         assert_eq!(
@@ -9694,8 +9722,29 @@ mod tests {
         assert_eq!(tile_fit(&mut mvt(250), &opts, &fill).unwrap(), 2.0);
         // A fill alone over the limit leaves the members nothing: fit 0, so
         // the valve merges as far as it can rather than skipping the tile.
-        let big = FillBytes { raw: 600, gz: 0 };
+        let big = FillBytes::known(600, 0);
         assert_eq!(tile_fit(&mut mvt(1000), &opts, &big).unwrap(), 0.0);
+    }
+
+    /// #750: fill features are drawn but not counted as tile features, so the
+    /// report and tilestats count the data's own features, and a tile whose
+    /// features all failed to encode is not written for its fill alone.
+    #[test]
+    fn fill_features_do_not_count_as_tile_features() {
+        let tb = TileCoord::new(512, 300, 10).bounds();
+        let fill = [FillFeature {
+            id: Some(7),
+            props: Arc::new(Vec::new()),
+            cmds: crate::mvt::encode_tile_unit_polygons(&[vec![vec![
+                (0, 0),
+                (100, 0),
+                (100, 100),
+                (0, 100),
+            ]]]),
+        }];
+        let mvt = build_mvt::<Member>(&[], &tb, &ExportOptions::default(), &fill);
+        assert_eq!(mvt.features, 0);
+        assert!(!mvt.data.is_empty(), "the fill is still encoded");
     }
 
     /// #750: each fill polygon is drawn with the id and tags of the feature

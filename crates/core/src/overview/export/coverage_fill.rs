@@ -308,10 +308,13 @@ pub(super) fn union_touching(shapes: Vec<Shape>) -> Vec<Shape> {
 pub(super) fn squares_for_collapsed(collapsed: &[Collapsed], side: f64) -> Vec<Shape> {
     let threshold = side * side;
     let mut cells: std::collections::HashMap<(i64, i64), f64> = std::collections::HashMap::new();
+    // A ring on the tile's right or bottom edge falls in the last cell, so
+    // no square is drawn past the edge.
+    let last = (FILL_EXTENT / side).ceil() as i64 - 1;
     for c in collapsed {
         let cell = (
-            (c.at[0] / side).floor() as i64,
-            (c.at[1] / side).floor() as i64,
+            ((c.at[0] / side).floor() as i64).clamp(0, last),
+            ((c.at[1] / side).floor() as i64).clamp(0, last),
         );
         *cells.entry(cell).or_default() += c.area;
     }
@@ -598,6 +601,13 @@ pub(super) fn build_fill_map(
     type Bucket = (Vec<Shape>, Vec<Collapsed>);
     let mut buckets: BTreeMap<u64, Bucket> = BTreeMap::new();
     let mut features = 0usize;
+    // Clip to the exact tile, with no buffer: a polygon in the buffer band
+    // would land in both neighbours, and its collapsed area would be
+    // credited twice.
+    let seed_opts = super::ExportOptions {
+        tile_buffer: 0,
+        ..opts.clone()
+    };
     // The read runs on its own thread, one batch ahead of the parallel
     // per-feature work, as the export's own band reads do (#535).
     let buckets_ref = &mut buckets;
@@ -623,7 +633,7 @@ pub(super) fn build_fill_map(
                     geometry,
                     crs,
                     seed_zoom,
-                    opts,
+                    &seed_opts,
                     timers,
                     buckets_ref,
                     features_ref,
@@ -925,6 +935,30 @@ mod tests {
         ];
         let out = squares_for_collapsed(&collapsed, 4.0);
         assert_eq!(out, vec![square(0.0, 0.0, 4.0), square(4.0, 0.0, 4.0)]);
+    }
+
+    #[test]
+    fn squares_stay_inside_the_tile() {
+        // A ring that collapsed on the tile's right or bottom edge must not
+        // draw its square past the edge, where the next tile draws too.
+        let collapsed = vec![
+            Collapsed {
+                area: 16.0,
+                at: [FILL_EXTENT, 100.0],
+            },
+            Collapsed {
+                area: 16.0,
+                at: [100.0, FILL_EXTENT],
+            },
+        ];
+        for s in squares_for_collapsed(&collapsed, 4.0) {
+            for p in &s[0] {
+                assert!(
+                    (0.0..=FILL_EXTENT).contains(&p[0]) && (0.0..=FILL_EXTENT).contains(&p[1]),
+                    "{s:?}"
+                );
+            }
+        }
     }
 
     #[test]
