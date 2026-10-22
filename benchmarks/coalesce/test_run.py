@@ -243,3 +243,26 @@ def test_export_argv_matches_the_stages_path():
     assert argv == ["/bin/tt", "export-pmtiles", "ov.parquet", "o.pmtiles", "--force",
                     "--max-tile-size", "500K", "--max-compressed-tile-size", "0",
                     "--size-valve", "merge", "--report", "r.json"]
+
+
+# --- scorers ----------------------------------------------------------------
+
+
+def test_run_scorers_records_done_and_logs(tmp_path):
+    ok = (tmp_path / "ok", "k1", "ok job", [sys.executable, "-c", "print('hi')"])
+    run.run_scorers([ok], {"score"}, jobs=2)
+    assert run.read_cached(tmp_path / "ok" / "done.json", "k1")
+    assert (tmp_path / "ok" / "score.log").read_text().strip() == "hi"
+
+
+def test_run_scorers_stops_on_a_failure_without_marking_it_done(tmp_path):
+    bad = (tmp_path / "bad", "k2", "bad job", [sys.executable, "-c", "raise SystemExit(3)"])
+    with pytest.raises(SystemExit, match="bad job: exit 3"):
+        run.run_scorers([bad], {"score"}, jobs=2)
+    assert not (tmp_path / "bad" / "done.json").exists()
+
+
+def test_run_scorers_refuses_when_the_score_step_is_off(tmp_path):
+    job = (tmp_path / "x", "k", "window x", [sys.executable, "-c", "pass"])
+    with pytest.raises(SystemExit, match="window x is not scored"):
+        run.run_scorers([job], {"report"}, jobs=1)

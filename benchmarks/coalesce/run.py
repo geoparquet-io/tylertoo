@@ -44,6 +44,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -559,7 +560,7 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
         if not fgb.exists():
             tmp = d / "input.tmp.fgb"
             print(f"[tippecanoe] {ds_name}: gpio convert -> FlatGeobuf", flush=True)
-            subprocess.run(["uvx", "--from", tcfg["gpio"], "gpio", "convert",
+            subprocess.run(["uvx", "--from", tcfg["gpio"], "gpio", "convert", "flatgeobuf",
                             str(inputs / ds["asset"]), str(tmp)], check=True)
             tmp.replace(fgb)
         pm = d / "archive.pmtiles"
@@ -583,20 +584,53 @@ def uv_script(script: str, *argv) -> list[str]:
     return ["uv", "run", "-q", str(HERE / script), *map(str, argv)]
 
 
-def scored(out: Path, key: str, steps: set, what: str, cmd: list[str]) -> None:
-    """Run cmd unless out/done.json already holds key."""
-    if read_cached(out / "done.json", key):
-        return
+def run_scorers(pending: list[tuple], steps: set, jobs: int) -> None:
+    """Run each (out, key, what, cmd), `jobs` at a time; each writes its
+    output to out/score.log and, when it succeeds, out/done.json."""
     if "score" not in steps:
-        raise SystemExit(f"{what} is not scored: run the score step")
-    out.mkdir(parents=True, exist_ok=True)
-    print(f"[score] {what}", flush=True)
-    subprocess.run(cmd, check=True)
-    (out / "done.json").write_text(json.dumps({"key": key}))
+        raise SystemExit(f"{pending[0][2]} is not scored: run the score step")
+
+    def one(job):
+        out, key, what, cmd = job
+        out.mkdir(parents=True, exist_ok=True)
+        print(f"[score] {what}", flush=True)
+        t0 = time.monotonic()
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        log = out / "score.log"
+        log.write_text(r.stdout + r.stderr)
+        if r.returncode != 0:
+            raise SystemExit(f"{what}: exit {r.returncode}, see {log}\n{r.stderr[-2000:]}")
+        (out / "done.json").write_text(json.dumps({"key": key}))
+        print(f"[score] {what}: {time.monotonic() - t0:.0f} s", flush=True)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        list(pool.map(one, pending))
 
 
-def score(cfg, plan, steps, inputs: Path, js: Path, run_dir: Path, archives: dict) -> dict:
-    """archives: (dataset, setting) -> (path, sha256)."""
+def score(cfg, plan, steps, inputs: Path, js: Path, run_dir: Path, archives: dict,
+          jobs: int = 4) -> dict:
+    """archives: (dataset, setting) -> (path, sha256). The scorers that are
+    not cached run in parallel, then every result is read."""
+    pending: list[tuple] = []
+
+    def queue(out: Path, key: str, what: str, cmd: list[str]) -> bool:
+        if read_cached(out / "done.json", key):
+            return True
+        pending.append((out, key, what, cmd))
+        return False
+
+    res = collect_scores(cfg, plan, inputs, js, run_dir, archives, queue)
+    if pending:
+        run_scorers(pending, steps, jobs)
+        pending.clear()
+        res = collect_scores(cfg, plan, inputs, js, run_dir, archives, queue)
+    return res
+
+
+def collect_scores(cfg, plan, inputs: Path, js: Path, run_dir: Path, archives: dict,
+                   queue) -> dict:
+    """Each scorer's command, passed to `queue`; the results of those it
+    reports cached."""
     res = {"windows": {}, "coverage": {}, "metrics": {}}
 
     def labels(ds):
@@ -612,8 +646,9 @@ def score(cfg, plan, steps, inputs: Path, js: Path, run_dir: Path, archives: dic
                         "--draw-zoom", ",".join(map(str, w["draw_zooms"])),
                         "--js-dir", js, "--out", out,
                         *[a for s, (p, _) in lab for a in ("--label", f"{s}={p}")])
-        scored(out, digest([w, [(s, sha) for s, (_, sha) in lab], cfg["js"]]), steps,
-               f"window {w['name']}", cmd)
+        if not queue(out, digest([w, [(s, sha) for s, (_, sha) in lab], cfg["js"]]),
+                     f"window {w['name']}", cmd):
+            continue
         images = json.loads((out / "maplibre.json").read_text())["images"]
         zooms = {}
         for dz in w["draw_zooms"]:
@@ -631,8 +666,9 @@ def score(cfg, plan, steps, inputs: Path, js: Path, run_dir: Path, archives: dic
                         "--zoom", c["zoom"], "--center", ",".join(map(str, c["center"])),
                         "--span", c["span"], "--out", out,
                         *[a for s, (p, _) in lab for a in ("--label", f"{s}={p}")])
-        scored(out, digest([c, [(s, sha) for s, (_, sha) in lab]]), steps,
-               f"coverage {c['name']}", cmd)
+        if not queue(out, digest([c, [(s, sha) for s, (_, sha) in lab]]),
+                     f"coverage {c['name']}", cmd):
+            continue
         data = json.loads((out / "coverage.json").read_text())
         res["coverage"][c["name"]] = {
             "label": c["label"], "zoom": c["zoom"], "tiles": data["tiles"],
@@ -656,7 +692,8 @@ def score(cfg, plan, steps, inputs: Path, js: Path, run_dir: Path, archives: dic
                 cmd += ["--color-attr", m["color_attr"]]
             if m.get("named"):
                 cmd += ["--named", ",".join(m["named"])]
-            scored(out, digest([m, sha]), steps, f"metrics {m['name']} {s}", cmd)
+            if not queue(out, digest([m, sha]), f"metrics {m['name']} {s}", cmd):
+                continue
             data = json.loads((out / "metrics.json").read_text())
             per[s] = {"zooms": {z: {"median": v["drawn_share"]["median"],
                                     "min": v["drawn_share"]["min"],
@@ -680,6 +717,7 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, help="override every dataset's repeats")
     ap.add_argument("--compare", type=Path, help="a previous report.json to compare against")
     ap.add_argument("--only", help=f"comma list of steps ({','.join(STEPS)})")
+    ap.add_argument("--jobs", type=int, default=4, help="scorers run in parallel")
     ap.add_argument("--load-max", type=float, default=run_matrix.LOAD_MAX,
                     help="wait for the 1-minute load average to drop below this before each run")
     args = ap.parse_args()
@@ -721,7 +759,7 @@ def main() -> int:
             archives[(ds_name, st_name)] = (run_dir / "tiles" / c["pmtiles"], c["pmtiles_sha256"])
     for ds_name, r in refs.items():
         archives[(ds_name, "tippecanoe")] = (Path(r["path"]), r["pmtiles_sha256"])
-    scores = score(cfg, plan, steps, inputs, js, run_dir, archives)
+    scores = score(cfg, plan, steps, inputs, js, run_dir, archives, args.jobs)
 
     report = {
         "schema": 1, "profile": plan["name"],

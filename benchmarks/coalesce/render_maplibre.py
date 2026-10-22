@@ -155,6 +155,14 @@ def main() -> int:
             scripts[key] = f"http://local/{fname}"
             local_js[scripts[key]] = (args.js_dir / fname).read_bytes()
 
+    def serve_js(body: bytes):
+        # Playwright passes (route, request) to a handler that takes two
+        # arguments, so bind the body here rather than as a default.
+        def handler(route):
+            route.fulfill(status=200, body=body,
+                          headers={"Content-Type": "application/javascript"})
+        return handler
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(args=["--use-angle=swiftshader", "--enable-unsafe-swiftshader"])
         for dz in zooms:
@@ -195,9 +203,7 @@ def main() -> int:
                            "zoom": cam_zoom, "maxzoom": dz}
                     html = PAGE % {**scripts, "px": n, "cfg": json.dumps(cfg)}
                     for url, body in local_js.items():
-                        page.route(url, lambda route, body=body: route.fulfill(
-                            status=200, body=body,
-                            headers={"Content-Type": "application/javascript"}))
+                        page.route(url, serve_js(body))
                     page.route("http://local/archive.pmtiles", serve)
                     page.route("http://local/index.html",
                                lambda route: route.fulfill(status=200, body=html,
