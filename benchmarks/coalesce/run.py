@@ -94,7 +94,7 @@ def validate_config(cfg: dict) -> None:
             if entry.get("dataset") not in datasets:
                 raise ConfigError(f"{section} {entry.get('name')!r}: unknown dataset "
                                   f"{entry.get('dataset')!r}")
-    for ds in cfg.get("tippecanoe", {}).get("datasets", []):
+    for ds in cfg.get("tippecanoe", {}).get("datasets", {}):
         if ds not in datasets:
             raise ConfigError(f"tippecanoe: unknown dataset {ds!r}")
     for pname, prof in cfg.get("profiles", {}).items():
@@ -118,7 +118,7 @@ def profile_plan(cfg: dict, name: str) -> dict:
     def in_profile(section):
         return [e for e in cfg.get(section, []) if e["dataset"] in datasets]
 
-    tippecanoe = ([d for d in cfg.get("tippecanoe", {}).get("datasets", []) if d in datasets]
+    tippecanoe = ([d for d in cfg.get("tippecanoe", {}).get("datasets", {}) if d in datasets]
                   if "tippecanoe" in settings else [])
     return {
         "name": name, "datasets": datasets, "settings": settings,
@@ -545,7 +545,8 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
     lock = json.loads((REPO / "benchmarks" / "e2e" / "tippecanoe.lock.json").read_text())
     for ds_name in plan["tippecanoe"]:
         ds = cfg["datasets"][ds_name]
-        key = tippecanoe_key(lock["sha"], ds["sha256"], tcfg["args"])
+        targs = tcfg["datasets"][ds_name]["args"]
+        key = tippecanoe_key(lock["sha"], ds["sha256"], targs)
         d = work / "tippecanoe" / f"{ds_name}-{key}"
         meta = d / "run.json"
         cached = read_cached(meta, key)
@@ -564,13 +565,12 @@ def tippecanoe_refs(cfg, plan, steps, inputs: Path, work: Path) -> dict:
                             str(inputs / ds["asset"]), str(tmp)], check=True)
             tmp.replace(fgb)
         pm = d / "archive.pmtiles"
-        print(f"[tippecanoe] {ds_name}: {' '.join(tcfg['args'])} (this takes a while)",
-              flush=True)
-        run = run_matrix.run_capped([lock["binary"], "-o", str(pm), "-f", *tcfg["args"],
-                                     str(fgb)], tcfg["wall_s"], tcfg["rss_gib"])
+        print(f"[tippecanoe] {ds_name}: {' '.join(targs)} (this takes a while)", flush=True)
+        run = run_matrix.run_capped([lock["binary"], "-o", str(pm), "-f", *targs, str(fgb)],
+                                    tcfg["wall_s"], tcfg["rss_gib"])
         if run["status"] != "ok":
             raise SystemExit(f"tippecanoe {ds_name}: {run['status']}\n{run['stderr_tail']}")
-        rec = {"key": key, "tippecanoe": lock, "args": tcfg["args"], "wall_s": run["wall_s"],
+        rec = {"key": key, "tippecanoe": lock, "args": targs, "wall_s": run["wall_s"],
                "cpu_s": run["cpu_s"], "peak_rss_kib": run["peak_rss_kib"],
                "pmtiles_bytes": pm.stat().st_size, "pmtiles_sha256": run_matrix.sha256(pm)}
         meta.write_text(json.dumps(rec, indent=2))

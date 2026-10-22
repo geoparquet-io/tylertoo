@@ -106,16 +106,25 @@ label = "tippecanoe"
 external = true
 
 # The tippecanoe reference: built by benchmarks/e2e/setup_tippecanoe.sh at its
-# pinned tag, fed FlatGeobuf (gpio), with the #745 arguments. The archive is
-# cached under <work>/tippecanoe/<key>/ and rebuilt only when the tippecanoe
-# commit, the input or the arguments change.
+# pinned tag, fed FlatGeobuf (gpio), with arguments per dataset. Each archive
+# is cached under <work>/tippecanoe/<dataset>-<key>/ and rebuilt only when the
+# tippecanoe commit, the input or the arguments change.
 [tippecanoe]
-datasets = ["nz"]
 gpio = "geoparquet-io==1.7.0"
-args = ["-Z0", "-z14", "-b", "8", "-l", "parcels", "-M", "2000000",
-        "--coalesce-densest-as-needed", "--quiet"]
 wall_s = 10800
 rss_gib = 48
+
+# The #745 arguments: the 2 MB cap matches tylertoo's gzip cap for NZ.
+[tippecanoe.datasets.nz]
+args = ["-Z0", "-z14", "-b", "8", "-l", "parcels", "-M", "2000000",
+        "--coalesce-densest-as-needed", "--quiet"]
+
+# DIVERGENCE FROM TYLERTOO'S CAP: tippecanoe's -M limits the compressed tile,
+# so its 500K default is looser than tylertoo's 500K raw cap (512000 bytes)
+# that Moldova is tiled with. There is no tippecanoe flag for a raw cap.
+[tippecanoe.datasets.moldova]
+args = ["-Z0", "-z12", "-b", "8", "-l", "fields", "-M", "500000",
+        "--coalesce-densest-as-needed", "--quiet"]
 
 # ---------------------------------------------------------------------------
 # MapLibre windows (render_maplibre.py): `tile` at `zoom`, `window` as
@@ -212,8 +221,8 @@ named = ["12/4035/2500", "12/4036/2499", "12/4036/2500"]
 
 # ---------------------------------------------------------------------------
 # Profiles. Windows, coverage and metrics entries run when their dataset is
-# in the profile; tippecanoe runs for the datasets [tippecanoe] lists when the
-# profile names it among its settings. `disk_gb` is checked before a run.
+# in the profile; tippecanoe runs for the datasets [tippecanoe.datasets] lists
+# when the profile names it among its settings. `disk_gb` is checked before a run.
 
 [profiles.small]
 datasets = ["madagascar", "moldova"]

@@ -39,7 +39,7 @@ def test_small_profile_has_no_nz_and_no_tippecanoe(cfg):
 def test_full_profile_adds_nz_and_tippecanoe(cfg):
     plan = run.profile_plan(cfg, "full")
     assert "nz" in plan["datasets"]
-    assert plan["tippecanoe"] == ["nz"]
+    assert plan["tippecanoe"] == ["nz", "moldova"]
     assert {w["name"] for w in plan["windows"]} >= {"auckland-city", "upper-north-island"}
 
 
@@ -59,6 +59,20 @@ def test_unknown_setting_in_profile_is_an_error(cfg):
     bad = copy.deepcopy(cfg)
     bad["profiles"]["small"]["settings"].append("sf9")
     with pytest.raises(run.ConfigError, match="sf9"):
+        run.validate_config(bad)
+
+
+def test_tippecanoe_args_are_per_dataset(cfg):
+    nz = cfg["tippecanoe"]["datasets"]["nz"]["args"]
+    md = cfg["tippecanoe"]["datasets"]["moldova"]["args"]
+    assert "-z14" in nz and "-z12" in md
+    assert run.tippecanoe_key("s", "i", nz) != run.tippecanoe_key("s", "i", md)
+
+
+def test_tippecanoe_on_unknown_dataset_is_an_error(cfg):
+    bad = copy.deepcopy(cfg)
+    bad["tippecanoe"]["datasets"]["atlantis"] = {"args": []}
+    with pytest.raises(run.ConfigError, match="atlantis"):
         run.validate_config(bad)
 
 
@@ -266,3 +280,34 @@ def test_run_scorers_refuses_when_the_score_step_is_off(tmp_path):
     job = (tmp_path / "x", "k", "window x", [sys.executable, "-c", "pass"])
     with pytest.raises(SystemExit, match="window x is not scored"):
         run.run_scorers([job], {"report"}, jobs=1)
+
+
+def test_run_cell_starts_every_convert_repeat_without_the_previous_overview(tmp_path):
+    # A stand-in binary: convert logs whether its output already exists, then
+    # writes it; export writes the archive and a minimal report.
+    log = tmp_path / "seen.log"
+    fake = tmp_path / "fake-tylertoo"
+    fake.write_text(f"""#!/bin/sh
+if [ "$1" = overview ]; then
+  if [ -e "$3" ]; then echo exists >> {log}; else echo missing >> {log}; fi
+  echo ov > "$3"
+else
+  echo pm > "$3"
+  for last; do :; done
+  echo '{{"zooms": []}}' > "$last"
+fi
+""")
+    fake.chmod(0o755)
+    src = tmp_path / "in.parquet"
+    src.write_text("x")
+    old = run_matrix.LOAD_MAX
+    run_matrix.LOAD_MAX = 1e9
+    try:
+        recs = run_matrix.run_cell(str(fake), src, tmp_path, "c", [], ["merge"], max_zoom=1,
+                                   max_tile_size="0", max_compressed_tile_size="0",
+                                   wall_s=60, rss_gib=4, repeats=1, convert_repeats=3)
+    finally:
+        run_matrix.LOAD_MAX = old
+    assert log.read_text().split() == ["missing", "missing", "missing"]
+    assert [r["status"] for r in recs[0]["convert_runs"]] == ["ok"] * 3
+    assert recs[1]["export_run"]["status"] == "ok"

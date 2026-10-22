@@ -246,6 +246,10 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
     ov = out / f"{name}.overview.parquet"
     convert_runs = []
     for _ in range(convert_repeats):
+        # Every repeat starts from the same state: overwriting the previous
+        # repeat's overview with --force costs up to 3x the wall time at the
+        # same CPU time (NZ: 8 s against 24 s).
+        ov.unlink(missing_ok=True)
         subprocess.run(["sync"])
         load_before, waited = wait_for_quiet()
         conv = run_capped(
