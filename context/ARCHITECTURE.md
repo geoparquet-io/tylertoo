@@ -873,9 +873,8 @@ What makes it a gate is where it runs. It is in the slow set in
 (`ci.yml`; the `rest` shard is every slow binary the two named shards do not
 take). Slow Tests gates merges through `CI passed`, the one CI check `main`'s
 branch protection **requires**; ubuntu runs on every PR, macOS on every push
-to `main`. The `Convert regression guard` job in
-`bench.yml` is *not* a required check, so it does not gate merges and the
-golden does not run there. If the golden ever leaves the nextest slow set, or
+to `main`. The structural convert guard now runs in `e2e.yml` (`Archive
+e2e`), a required check of its own; the golden does not run there. If the golden ever leaves the nextest slow set, or
 Slow Tests drops out of `CI passed`'s `needs`, or `CI passed` stops being
 required, the guard silently stops gating.
 
@@ -884,7 +883,7 @@ Why the pre-existing guard did not do this, though it ran (green) on #539:
 per-level feature/vertex counts. Clipping happens in export, which that guard
 never runs, and counts are blind to coordinates that move without appearing or
 disappearing — the exact shape of an overlay-engine change. The two guards run
-in different places (structural in `bench.yml`, golden in Slow Tests); neither
+in different places (structural in `e2e.yml`, golden in Slow Tests); neither
 replaces the other (the structural one is cheap, covers three geometry classes,
 and catches pass-1 regressions the golden's single fixture does not).
 

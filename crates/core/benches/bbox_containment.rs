@@ -7,6 +7,7 @@
 // Run with: cargo bench --package tylertoo-core -- bbox_containment
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiPolygon, Polygon};
@@ -387,8 +388,19 @@ fn bench_optimization_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// 30 samples over 2 s instead of criterion's 100 over 5 s. The regression
+// gate's A/A runs (#678) put the noise between runs, with intervals under 3
+// points wide, so the extra samples bought nothing and cost ~8 min a run.
+fn config() -> Criterion {
+    Criterion::default()
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(2))
+}
+
 criterion_group!(
-    benches,
+    name = benches;
+    config = config();
+    targets =
     bench_small_features_high_zoom,
     bench_small_features_boundary_crossing,
     bench_large_features_low_zoom,

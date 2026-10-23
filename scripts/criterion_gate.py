@@ -28,12 +28,13 @@ compared nothing is a broken run, not a pass.
 
 Shared-runner timing is noisy (see ci_guard.py for why *that* guard stays
 structural), so this only ever compares two runs from one runner. It runs
-from .github/workflows/bench-regression.yml on each PR that touches benched
-code, on a PR carrying the `benchmark` label, and on dispatch; see
-DEVELOPMENT.md's "Criterion regression gate".
+from .github/workflows/bench-regression.yml on a PR carrying the `benchmark`
+label, weekly on main, and on dispatch; see DEVELOPMENT.md's "Criterion
+regression gate".
 
 Usage:
   criterion_gate.py --check --criterion-dir target/criterion-compare --baseline base
+  criterion_gate.py --check ... --markdown report.md   # also write a Markdown table
   criterion_gate.py --check ... --warn 10 --fail 10 \
       --noisy 'sutherland_hodgman/*' --noisy-fail 50
 
@@ -122,6 +123,11 @@ def main() -> int:
         help="bench name glob gated at --noisy-fail instead of --fail (repeatable)",
     )
     ap.add_argument("--noisy-fail", type=float, default=50.0, help="--fail for benches matching --noisy")
+    ap.add_argument(
+        "--markdown",
+        metavar="PATH",
+        help="also write the verdict and the per-bench table as Markdown (job summary, weekly issue)",
+    )
     args = ap.parse_args()
 
     if not args.check:
@@ -130,6 +136,8 @@ def main() -> int:
 
     compared = 0
     new_benches, not_run, unreadable, warnings, failures = [], [], [], [], []
+    # (bench, base ns, new ns, "+1.2%", "[+0.1, +2.3]%", verdict) for --markdown.
+    rows = []
     print(f"{'bench':<52} {'base (ns)':>13} {'new (ns)':>13} {'change':>8}  {'95% CI':>17}")
     print("-" * 110)
     for name, leaf in find_benches(args.criterion_dir, args.baseline):
@@ -140,15 +148,18 @@ def main() -> int:
         if has_new and not has_base:
             new_benches.append(name)
             print(f"{name:<52} {'-':>13} {'':>13} {'':>8}  new (no baseline)")
+            rows.append((name, "-", "", "", "", "new (no baseline)"))
             continue
         if has_base and not has_new:
             not_run.append(name)
             print(f"{name:<52} {'':>13} {'-':>13} {'':>8}  not run at head")
+            rows.append((name, "", "-", "", "", "not run at head"))
             continue
         base_ns, new_ns, change = mean_point(base_est), mean_point(new_est), mean_change(change_est)
         if base_ns is None or new_ns is None or change is None:
             unreadable.append(name)
             print(f"{name:<52} {'?':>13} {'?':>13} {'?':>8}  unreadable estimates")
+            rows.append((name, "?", "?", "?", "", "unreadable estimates"))
             continue
         compared += 1
         pct, lo, hi = change
@@ -165,6 +176,7 @@ def main() -> int:
             flag = (flag + " (noisy)").strip()
         ci = f"[{lo:+.1f}, {hi:+.1f}]%"
         print(f"{name:<52} {base_ns:>13.0f} {new_ns:>13.0f} {pct:>+7.1f}%  {ci:>17} {flag}")
+        rows.append((name, f"{base_ns:.0f}", f"{new_ns:.0f}", f"{pct:+.1f}%", ci, flag or "ok"))
 
     print()
     if new_benches:
@@ -188,16 +200,41 @@ def main() -> int:
             print(f"  - {name}: {pct:+.1f}% (CI lower bound {lo:+.1f}% >= +{fail_at}%)")
         status = 1
     if compared == 0:
-        print(
+        verdict = (
             f"FAIL: no bench under {args.criterion_dir} has both a '{args.baseline}/' and a fresh "
             "'new/' result, so nothing was compared. The base run or the head run did not "
             "produce results (missing fixtures, wrong --criterion-dir, or wrong --baseline)."
         )
-        return 1
-    if status == 0:
+        print(verdict)
+        status = 1
+    elif status == 0:
         noisy_note = f", +{args.noisy_fail}% for --noisy benches" if args.noisy else ""
-        print(f"OK: {compared} bench(es) compared; none regressed past +{args.fail}%{noisy_note} (CI lower bound).")
+        verdict = f"OK: {compared} bench(es) compared; none regressed past +{args.fail}%{noisy_note} (CI lower bound)."
+        print(verdict)
+    else:
+        verdict = (
+            f"FAIL: {len(failures)} regressed past the fail threshold, "
+            f"{len(unreadable)} had unreadable estimates ({compared} compared)."
+        )
+    if args.markdown:
+        write_markdown(args.markdown, verdict, warnings, rows)
     return status
+
+
+def write_markdown(path: str, verdict: str, warnings: list, rows: list) -> None:
+    """The verdict, the warnings, and every bench as one GitHub Markdown table."""
+    lines = [f"**{verdict}**", ""]
+    if warnings:
+        lines.append(f"{len(warnings)} bench(es) with a point estimate past the warn threshold:")
+        lines += [f"- `{name}`: {pct:+.1f}% (CI lower bound {lo:+.1f}%)" for name, pct, lo in warnings]
+        lines.append("")
+    lines += [
+        "| bench | base (ns) | head (ns) | change | 95% CI | verdict |",
+        "|---|--:|--:|--:|--:|---|",
+    ]
+    lines += [f"| `{name}` | {base} | {new} | {pct} | {ci} | {flag} |" for name, base, new, pct, ci, flag in rows]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

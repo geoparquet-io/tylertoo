@@ -51,7 +51,8 @@
 #                   platform-sensitive code, before merging.
 # A job skipped on purpose reports "skipped", which `CI passed` accepts.
 #
-# Benchmarks run in bench.yml (push to main / manual); mutation testing runs
+# Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
+# weekly); mutation testing runs
 # in mutation-tests.yml (weekly); the tippecanoe parity gate (#420) runs in
 # tippecanoe-compare.yml (PRs, push to main, weekly).
 #

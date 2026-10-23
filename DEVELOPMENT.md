@@ -214,7 +214,7 @@ open target/criterion/report/index.html
 ```
 
 `scripts/criterion_compare.sh --list` prints the gated set. Run the
-whole set, as the Benchmark workflow does on each push to `main`:
+whole set:
 
 ```bash
 for b in $(scripts/criterion_compare.sh --list); do
@@ -254,10 +254,11 @@ only what it can move:
   the benches whose code they touch, and only those build and run.
   CodSpeed reports the rest as "skipped", with their baseline numbers.
   A PR that touches only code no bench covers passes without building.
-- A change to `Cargo.lock`, a manifest, the crate root, the bench
-  harness, or the workflow runs every bench.
-- Every push to `main` runs every bench, so each bench keeps a current
-  baseline.
+- A change to a manifest, the bench harness, or the workflow runs every
+  bench. A `Cargo.lock`-only PR doesn't start the workflow.
+- A push to `main` that touches the same paths, or `Cargo.lock`, runs
+  every bench. Those runs are the baselines; CodSpeed compares a PR
+  against the newest `main` commit that has one.
 
 The map in `scripts/codspeed_benches.sh` is kept by hand: each bench's
 entry modules and their direct dependencies. A change that moves a bench
@@ -297,19 +298,24 @@ runner, base revision first and head second, and gates the difference.
 A baseline from another VM would mostly measure the VM. Two runs on one
 machine, minutes apart, give a comparison that shared runners support.
 
-The gate runs in these cases, never on a schedule:
+The gate runs in these cases:
 
-- On each PR that changes `crates/core/`, `Cargo.toml`, `Cargo.lock`, or
-  the gate's own workflow and scripts. No label is needed. The
-  workflow's `changes` job holds the path list.
-- On any other PR with the **`benchmark` label**. Adding the label
-  starts it, and later pushes rerun it while the label stays.
+- On a PR with the **`benchmark` label**. Adding the label starts it,
+  and later pushes rerun it while the label stays. Add it to a PR that
+  changes threading, I/O, or memory behaviour, which CodSpeed's
+  instruction counts can't see. The base is the merge-base with the
+  PR's base branch.
+- Every Monday on `main`, against the last `main` commit at least seven
+  days old. The table goes to the pinned "Weekly benchmark comparison"
+  issue as one comment a week. A week with no new commits skips.
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
   on another branch against its merge-base with `origin/main`.
 
-On a PR the base is the merge-base with the PR's base branch. A run
-takes 41 to 48 minutes of runner time.
+It used to run on every PR that touched `crates/core/`. In 62 runs it
+caught one real change and failed seven times on noise (#759), at about
+45 minutes a run. Pass `--markdown <path>` to `criterion_gate.py` to
+get the table the workflow posts.
 
 `scripts/criterion_compare.sh <base-rev>` does the two runs, the base
 in a temporary git worktree. It writes to `target/criterion-compare/`,

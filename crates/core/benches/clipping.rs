@@ -9,6 +9,7 @@
 mod fixtures;
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::{Coord, Geometry, LineString, Point, Polygon};
@@ -274,8 +275,19 @@ fn bench_export_clip_mix(c: &mut Criterion) {
     group.finish();
 }
 
+// 30 samples over 2 s instead of criterion's 100 over 5 s. The regression
+// gate's A/A runs (#678) put the noise between runs, with intervals under 3
+// points wide, so the extra samples bought nothing and cost ~8 min a run.
+fn config() -> Criterion {
+    Criterion::default()
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(2))
+}
+
 criterion_group!(
-    benches,
+    name = benches;
+    config = config();
+    targets =
     bench_sutherland_hodgman,
     bench_ioverlay,
     bench_wide_polygon,
