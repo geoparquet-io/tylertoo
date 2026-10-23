@@ -331,12 +331,12 @@ It requires `--mode duplicating`. Partitioning writes each feature at exactly
 one level. With thinning off, every feature would land in the coarsest level
 and every finer level would be empty, so tylertoo rejects the combination.
 
-On `tiles`, `--verbatim` also disables the per-tile size cap. An explicit
-`--max-tile-size` restores it.
+On `tiles`, `--verbatim` also disables the per-tile size caps. An explicit
+`--max-tile-size` or `--max-compressed-tile-size` restores that cap.
 
 For two-step builds, `tylertoo export-pmtiles` still applies its default
-500K cap after `tylertoo overview --verbatim`. Pass `--tile-size-limit 0`
-(alias `--max-tile-size 0`) to export every feature.
+caps (500K compressed, 2M raw) after `tylertoo overview --verbatim`. Pass
+`--max-compressed-tile-size 0 --tile-size-limit 0` to export every feature.
 
 ### `0` is the off switch
 
@@ -522,17 +522,19 @@ tylertoo overview buildings.parquet buildings_overview.parquet \
   --min-zoom 0 --max-zoom 14 \
   --polygon-visibility 0 --collapse
 
-# One-shot PMTiles build; 500K is the default cap (0 disables it).
+# One-shot PMTiles build; the default caps are 500K compressed and 2M raw
+# (0 disables either).
 tylertoo tiles buildings.parquet buildings.pmtiles \
   --min-zoom 0 --max-zoom 14 \
-  --polygon-visibility 0 --collapse --max-tile-size 500K \
+  --polygon-visibility 0 --collapse --max-compressed-tile-size 500K \
   --profile bounded
 ```
 
 For country-scale builds:
 
 - Keep the tile cap. Uncapped dot tiles can reach several MB (Germany z6:
-  12 MB). The cap thins dots with a spatially even stride to about 500 KB.
+  12 MB). The cap thins dots with a spatially even stride to about 500 KB
+  compressed.
 - Use `--profile auto` to spill when needed, or `bounded` to force spilling.
   Coarse levels buffer more rows; forcing `speed` raised Germany's peak
   resident set size from 15 to 29 GB.
@@ -1307,12 +1309,14 @@ precision. Other positive values are accepted with a warning.
 
 ### Tile size cap
 
-`export-pmtiles --tile-size-limit`, also spelled
-`--max-tile-size` as on `tiles`, caps each tile's encoded MVT size. The
-default of 500K matches tippecanoe, and `0` disables the cap.
-`--max-compressed-tile-size` caps the gzip-compressed size instead, like
-tippecanoe's `-M`; it is off by default, and when both caps are set a tile
-must fit both.
+`--max-compressed-tile-size` caps each tile's gzip-compressed size, like
+tippecanoe's `-M`, at 500K by default. `export-pmtiles --tile-size-limit`,
+also spelled `--max-tile-size` as on `tiles`, caps the raw encoded MVT at
+2M by default: a backstop, since clients decode the raw tile and
+full-resolution polygons can compress 4:1. A tile must fit both caps, and
+`0` disables either. Until #761 the only default was a 500K raw cap, about
+twice as strict as tippecanoe's: on dense fields it merged nearly twice as
+many features (FTW Moldova: 901k against 490k) for no coverage gain.
 
 A tile over a cap is reduced for that tile only, and measured again until it
 fits. `--size-valve` chooses how:
@@ -1320,6 +1324,9 @@ fits. `--size-valve` chooses how:
 - `merge` (the default) merges the densest lines and polygons into the
   feature kept just before them, raising the merge threshold until the tile
   fits. See [what merging does to attributes](#what-merging-does-to-attributes).
+  A tile that shrinks too slowly to fit within a few more passes, which
+  happens when the merged features do not touch, merges everything it can
+  in one step instead.
   If the tile still exceeds the cap after all possible merges, unmerged
   features are dropped, keeping the largest. Merged features are retained. A
   tile that is still over after that is written as it is, with a warning.

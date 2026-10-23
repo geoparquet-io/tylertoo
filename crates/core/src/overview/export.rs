@@ -199,14 +199,25 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
     f64::from(opts.tile_buffer) / NOMINAL_TILE_PIXELS
 }
 
-/// Default per-tile MVT size cap, in bytes.
+/// Default per-tile cap on the raw (uncompressed) MVT, in bytes: 2 MiB.
 ///
-/// 500 KiB matches what `500K` parses to and tippecanoe's on-by-default 500K
-/// bar (issue #280). A tile whose
-/// encoded MVT exceeds this trips the size valve (see
-/// [`ExportOptions::tile_size_limit`] and [`ExportOptions::size_valve`]). Set `tile_size_limit` to `None` (CLI:
-/// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
-pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
+/// A backstop behind [`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`], which does the
+/// work: clients decode and render the raw tile, and full-resolution
+/// polygons can compress 4:1, so the compressed cap alone would admit tiles
+/// of 2 MB and more. Up to #761 this was the only cap, at 500 KiB, which was
+/// about twice as strict as tippecanoe's. A tile over either cap trips the
+/// size valve (see [`ExportOptions::tile_size_limit`] and
+/// [`ExportOptions::size_valve`]). Set `tile_size_limit` to `None` (CLI:
+/// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable it.
+pub const DEFAULT_TILE_SIZE_LIMIT: usize = 2048 * 1024;
+
+/// Default per-tile cap on the gzip-compressed tile, in bytes: 500 KiB.
+///
+/// tippecanoe's `-M` default (#761). It is what `500K` parses to, slightly
+/// above tippecanoe's 500,000. Set `compressed_tile_size_limit` to `None`
+/// (CLI: `--max-compressed-tile-size 0`; Python:
+/// `max_compressed_tile_size=0`) to disable it.
+pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 
 /// How the export brings a tile that is over its size limit back under it
 /// (#745).
@@ -283,13 +294,14 @@ pub struct ExportOptions {
     /// re-encoded once. When `None` (or `Some(0)`), no size limit is enforced
     /// and `oversized_tiles` is always 0.
     ///
-    /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (500 KiB — tippecanoe
-    /// parity, issue #280).
+    /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (2 MiB, a backstop
+    /// behind the compressed limit; #761).
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
-    /// [`Self::tile_size_limit`]; a tile must satisfy both. `None` (the
-    /// default) or `Some(0)` sets no compressed limit.
+    /// [`Self::tile_size_limit`]; a tile must satisfy both. Defaults to
+    /// `Some(`[`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`]`)` (500 KiB, #761);
+    /// `None` or `Some(0)` sets no compressed limit.
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
@@ -439,7 +451,7 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
-            compressed_tile_size_limit: None,
+            compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
@@ -12227,15 +12239,19 @@ mod tests {
         );
     }
 
-    /// #280: the per-tile cap is on by default at 500 KiB (== what `500K`
-    /// parses to; tippecanoe parity), not disabled.
+    /// #280, #761: the per-tile caps are on by default: tippecanoe's 500 KiB
+    /// (== what `500K` parses to) on the gzip-compressed tile, and a 2 MiB
+    /// backstop on the raw one.
     #[test]
-    fn default_export_caps_tiles_at_500_kib() {
-        assert_eq!(DEFAULT_TILE_SIZE_LIMIT, 500 * 1024);
+    fn default_export_caps_tiles_at_500_kib_compressed_and_2_mib_raw() {
+        assert_eq!(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT, 500 * 1024);
+        assert_eq!(DEFAULT_TILE_SIZE_LIMIT, 2048 * 1024);
+        let opts = ExportOptions::default();
         assert_eq!(
-            ExportOptions::default().tile_size_limit,
-            Some(DEFAULT_TILE_SIZE_LIMIT)
+            opts.compressed_tile_size_limit,
+            Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT)
         );
+        assert_eq!(opts.tile_size_limit, Some(DEFAULT_TILE_SIZE_LIMIT));
     }
 
     /// Build a bare point [`Member`] at `(x, y)` for the drop-valve unit tests.

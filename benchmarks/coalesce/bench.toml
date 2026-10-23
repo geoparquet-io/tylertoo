@@ -40,8 +40,8 @@ sha256 = "6f666e18e06a87eeb219dfd6c1ef407fb9bce0e72c4cd7736fdd1c245c72f0b9"
 bytes = 17899512
 features = 17465
 max_zoom = 12
-max_tile_size = 512000
-max_compressed_tile_size = 0
+max_tile_size = 2097152
+max_compressed_tile_size = 512000
 wall_s = 300
 rss_gib = 16
 
@@ -54,8 +54,8 @@ raw = "moldova.parquet"
 raw_sha256 = "f5343419fd6b2f8054136eb6ccd6a65d66d1c7d01446c8ea04e809e96fe97afd"
 features = 631910
 max_zoom = 12
-max_tile_size = 512000
-max_compressed_tile_size = 0
+max_tile_size = 2097152
+max_compressed_tile_size = 512000
 wall_s = 600
 rss_gib = 24
 
@@ -68,8 +68,9 @@ raw = "nz-parcels.parquet"
 raw_sha256 = "20046c0d35a5b7d30b6e6f5919ee85b6b7d1426c34cda2be58365f68c12ddf49"
 features = 4343547
 max_zoom = 14
-# Parcels are dense: #745 measured NZ with a 2 MB gzip cap instead of the
-# raw cap.
+# Parcels are dense: #745 measured NZ with a 2 MB gzip cap and no raw cap,
+# kept here rather than the defaults (500K gzip, 2M raw), which merge 3.4x
+# as many features on NZ.
 max_tile_size = 0
 max_compressed_tile_size = 2000000
 wall_s = 2700
@@ -79,7 +80,8 @@ repeats = 2
 
 # ---------------------------------------------------------------------------
 # Settings: the table columns. `convert` is passed to `tylertoo overview`,
-# `valve` to `export-pmtiles --size-valve`.
+# `valve` to `export-pmtiles --size-valve`. A setting's `max_tile_size` and
+# `max_compressed_tile_size` replace the dataset's caps (#761).
 
 [settings.before-745]
 label = "Before #745"
@@ -101,6 +103,14 @@ label = "--simplify-factor 0"
 convert = ["--simplify-factor", "0"]
 valve = "merge"
 
+# The default caps before #761: 500K on the raw tile, no compressed cap.
+[settings.raw500k]
+label = "500K raw cap (before #761)"
+convert = []
+valve = "merge"
+max_tile_size = 512000
+max_compressed_tile_size = 0
+
 [settings.tippecanoe]
 label = "tippecanoe"
 external = true
@@ -119,9 +129,9 @@ rss_gib = 48
 args = ["-Z0", "-z14", "-b", "8", "-l", "parcels", "-M", "2000000",
         "--coalesce-densest-as-needed", "--quiet"]
 
-# DIVERGENCE FROM TYLERTOO'S CAP: tippecanoe's -M limits the compressed tile,
-# so its 500K default is looser than tylertoo's 500K raw cap (512000 bytes)
-# that Moldova is tiled with. There is no tippecanoe flag for a raw cap.
+# tippecanoe's -M limits the compressed tile, as tylertoo's default does
+# since #761 (512000 bytes against 500000). tylertoo also caps the raw tile
+# at 2M; there is no tippecanoe flag for a raw cap.
 [tippecanoe.datasets.moldova]
 args = ["-Z0", "-z12", "-b", "8", "-l", "fields", "-M", "500000",
         "--coalesce-densest-as-needed", "--quiet"]
@@ -226,12 +236,12 @@ named = ["12/4035/2500", "12/4036/2499", "12/4036/2500"]
 
 [profiles.small]
 datasets = ["madagascar", "moldova"]
-settings = ["before-745", "default", "sf0.25", "sf0"]
+settings = ["before-745", "raw500k", "default", "sf0.25", "sf0"]
 repeats = 3
 disk_gb = 5
 
 [profiles.full]
 datasets = ["madagascar", "moldova", "nz"]
-settings = ["before-745", "default", "sf0.25", "sf0", "tippecanoe"]
+settings = ["before-745", "raw500k", "default", "sf0.25", "sf0", "tippecanoe"]
 repeats = 3
 disk_gb = 30

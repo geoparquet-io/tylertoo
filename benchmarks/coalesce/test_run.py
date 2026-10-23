@@ -44,6 +44,27 @@ def test_full_profile_adds_nz_and_tippecanoe(cfg):
     assert {w["name"] for w in plan["windows"]} >= {"auckland-city", "upper-north-island"}
 
 
+def test_the_defaults_column_uses_the_default_caps(cfg):
+    # #761: tylertoo's defaults, 500K gzip-compressed and a 2M raw backstop.
+    for ds in ("madagascar", "moldova"):
+        assert run.cell_caps(cfg, ds, "default") == (2097152, 512000)
+
+
+def test_a_setting_can_override_the_dataset_caps(cfg):
+    assert run.cell_caps(cfg, "moldova", "raw500k") == (512000, 0)
+    # tippecanoe has its own args; the dataset's caps stand for it.
+    ds = cfg["datasets"]["moldova"]
+    assert run.cell_caps(cfg, "moldova", "tippecanoe") == (
+        ds["max_tile_size"], ds["max_compressed_tile_size"])
+
+
+def test_a_cap_override_must_be_a_byte_count(cfg):
+    bad = copy.deepcopy(cfg)
+    bad["settings"]["raw500k"]["max_tile_size"] = "500K"
+    with pytest.raises(run.ConfigError):
+        run.validate_config(bad)
+
+
 def test_every_dataset_pins_a_sha256(cfg):
     for name, ds in cfg["datasets"].items():
         assert len(ds["sha256"]) == 64, name
