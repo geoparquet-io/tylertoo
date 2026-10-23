@@ -6011,6 +6011,22 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
             feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
         }
     };
+    // #758: from the second pass on, every member's polygons are projected,
+    // quantized and cleaned once, and which of their parts interact is known,
+    // so a pass only unions. A tile that fits at once never builds this.
+    let mut quantized: Option<crate::mvt::QuantizedPolygons> = None;
+    let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32| {
+        if pass == 1 {
+            return build_mvt(feats, tb, opts);
+        }
+        let q = quantized.get_or_insert_with(|| {
+            crate::mvt::QuantizedPolygons::new(ordered.iter().map(|m| &m.geom), tb, opts.extent)
+        });
+        build_mvt_with(feats, opts, |m| {
+            q.encode(&m.members)
+                .unwrap_or_else(|| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
+        })
+    };
     let mut gaps: Option<Vec<u64>> = None;
     let mut mingap = 0u64;
     let mut keep_fraction = 1.0_f64;
@@ -6021,7 +6037,7 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         let absorbed: usize = merged.iter().map(|m| m.absorbed).sum();
         let mut feats: Vec<&coalesce_valve::Merged<'_>> = merged.iter().collect();
         draw_order(&mut feats);
-        let mut mvt = build_mvt(&feats, tb, opts);
+        let mut mvt = build(&feats, passes);
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
         let tally = ValveTally {
             merged: absorbed,
@@ -6060,9 +6076,9 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
                 kept = whole.clone();
                 kept.extend(select_kept_members(&single, keep));
                 draw_order(&mut kept);
-                out = build_mvt(&kept, tb, opts);
-                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 passes += 1;
+                out = build(&kept, passes);
+                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 if fit >= 1.0 || keep == 0 {
                     break;
                 }
@@ -6182,22 +6198,31 @@ fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
 /// key/value tables and the bytes identical to the serial loop. A smaller
 /// tile encodes and interns each member in turn, with no buffer.
 fn build_mvt<M: TileFeature>(members: &[M], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    build_mvt_with(members, opts, |m| {
+        EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent)
+    })
+}
+
+/// [`build_mvt`] with each feature's geometry encoded by `encode`, which must
+/// return what [`EncodedFeatureGeometry::encode`] would (#758: the merge
+/// valve's cached encode).
+fn build_mvt_with<M: TileFeature>(
+    members: &[M],
+    opts: &ExportOptions,
+    encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
+) -> TileMvt {
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
     let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     if encode_in_parallel(members) {
-        let encoded: Vec<EncodedFeatureGeometry> = members
-            .par_iter()
-            .map(|m| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
-            .collect();
+        let encoded: Vec<EncodedFeatureGeometry> = members.par_iter().map(&encode).collect();
         for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     } else {
         for (i, m) in members.iter().enumerate() {
-            let geom = EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent);
-            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            layer.add_encoded_feature(id_of(i, m), encode(m), m.properties());
         }
     }
     let features = layer.feature_count();
