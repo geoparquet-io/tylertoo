@@ -445,13 +445,16 @@ setting on the full profile's datasets), against the defaults:
   0.1% / 0.1% (tippecanoe 5.7% / 0.0% / 0.6%); Upper North Island z3
   13.3% → 0.5% (tippecanoe 12.1%); Madagascar z3 23.5% → 0.2%. Added
   area stays at 1% or under on all three.
-- Cost, end to end: NZ 107.0 s → 125.5 s (+17%), Madagascar 2.89 s →
-  3.06 s (+6%); archives +4% on both; export peak memory +26% (6.4 →
-  8.0 GiB) and +20%.
+- Cost, end to end: NZ 107.0 s → 125.5 s (+17%); archives +4%; export
+  peak memory +26% (6.4 → 8.0 GiB). Under #761's default caps (NZ's
+  benchmark cap did not change), Madagascar export 1.99 s → 2.28 s
+  (+10% end to end), export memory 0.44 → 0.76 GiB.
 - FTW Moldova, whose fields are smaller than a pixel at coarse zooms: the
   missing share halves (z3 15.8% → 7.7%), but added area grows (+51% →
-  +61%), the archive grows 19%, and the build takes 2.2× as long
-  (8.70 s → 19.47 s). tippecanoe cannot tile this input (#760).
+  +61%) and the archive grows 19%. Under #761's caps the export takes
+  6.5 s → 11.2 s (1.55× end to end), export memory 1.8 → 2.4 GiB; under
+  the old 500K raw cap it took 2.2× as long. tippecanoe cannot tile this
+  input (#760).
 
 What shaped the cost and the coverage:
 
