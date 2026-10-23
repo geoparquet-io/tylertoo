@@ -781,12 +781,16 @@ Every PR gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
 check "Mutation score (diff-scoped)"). It runs
 `cargo mutants --package tylertoo-core --in-diff` on the PR's diff
 against `origin/main`, so it tests only the mutants inside changed core
-lines. A typical PR yields a few dozen mutants and takes ten to twenty
-minutes, most of it the cold baseline build.
+lines. The mutants are split across up to four runners, about twelve
+each, so a diff of up to ~50 mutants finishes in about 15 minutes. One
+runner used to take 40 minutes for 65 mutants and time out past ~130.
+A bigger diff gets a random sample instead: each runner takes its share
+from across the whole diff in shuffled order and stops after 20 minutes,
+and the summary says how many of the planned mutants ran.
 
 The score and the missed mutants (`file:line`) go to the job summary. A
 same-repo PR with missed mutants also gets one sticky comment, updated
-on every push. A PR that touches no Rust under `crates/core/` skips the
+on every push. Missed mutants from a sampled run are posted too. A PR that touches no Rust under `crates/core/` skips the
 run, and a diff with no mutation site reports "no mutants in this diff".
 
 `scripts/mutants-diff.sh` is the local twin. It also covers uncommitted
