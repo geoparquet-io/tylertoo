@@ -1213,8 +1213,9 @@ fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
 /// feature is a MultiPolygon of its members' polygons, and encoding it
 /// quantizes and cleans each polygon on its own, then unions the parts that
 /// interact. Neither the cleaned parts nor whether two parts interact depend
-/// on the grouping, so this computes both once per tile; each pass only
-/// unions. A component of interacting parts unions to the same pieces
+/// on the grouping, so this quantizes once per tile and tests a pair of
+/// parts at most once, when a pass first puts both in one feature; each pass
+/// then only unions. A component of interacting parts unions to the same pieces
 /// whichever pass asks, so a component the previous pass already unioned is
 /// not unioned again. [`Self::encode`] returns exactly what
 /// [`EncodedFeatureGeometry::encode`] returns for the merged geometry.
@@ -1223,8 +1224,13 @@ pub(crate) struct QuantizedPolygons {
     features: Vec<Option<QuantizedFeature>>,
     /// Every feature's cleaned parts, feature by feature.
     parts: Vec<Vec<TileRing>>,
-    /// Per part, the parts it interacts with ([`parts_interact`]).
-    interacts: Vec<Vec<u32>>,
+    /// Per part, the parts with its merge key whose boxes meet its own, each
+    /// with its pair's slot in [`Self::interacts`].
+    candidates: Vec<Vec<(u32, u32)>>,
+    /// Per candidate pair, whether its parts interact ([`parts_interact`]):
+    /// 0 not tested yet, 1 no, 2 yes. Only pairs a pass puts in one feature
+    /// are ever tested.
+    interacts: Vec<std::sync::atomic::AtomicU8>,
     /// Unioned components, keyed by their parts' indices in [`Self::parts`]:
     /// those this pass used, and the previous pass's. Two generations, so
     /// a component no pass asks for again is dropped.
@@ -1295,30 +1301,44 @@ impl QuantizedPolygons {
                 }
             }));
         }
-        // The box-meeting pairs that share a key, then the exact test on each
-        // in parallel.
+        // The box-meeting pairs that share a key; the exact test waits until
+        // a pass puts both parts in one feature.
         let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-        let mut candidates: Vec<(u32, u32)> = Vec::new();
+        let mut candidates = vec![Vec::new(); parts.len()];
+        let mut slots = 0u32;
         any_box_pair(&boxes, |i, j| {
             if keys[i] == keys[j] {
-                candidates.push((i as u32, j as u32));
+                candidates[i].push((j as u32, slots));
+                candidates[j].push((i as u32, slots));
+                slots += 1;
             }
             false
         });
-        let hits: Vec<(u32, u32)> = candidates
-            .into_par_iter()
-            .filter(|&(i, j)| parts_interact(&parts[i as usize], &parts[j as usize]))
-            .collect();
-        let mut interacts = vec![Vec::new(); parts.len()];
-        for (i, j) in hits {
-            interacts[i as usize].push(j);
-            interacts[j as usize].push(i);
-        }
         Self {
             features,
             parts,
-            interacts,
+            candidates,
+            interacts: (0..slots)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             unions: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Do parts `a` and `b`, a candidate pair in `slot`, interact? Tested
+    /// once and remembered. Any thread may test a pair no thread has
+    /// recorded yet; the answer is the same either way, so none waits.
+    fn interact(&self, a: usize, b: usize, slot: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = &self.interacts[slot as usize];
+        match state.load(Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let hit = parts_interact(&self.parts[a], &self.parts[b]);
+                state.store(if hit { 2 } else { 1 }, Relaxed);
+                hit
+            }
         }
     }
 
@@ -1401,17 +1421,27 @@ impl QuantizedPolygons {
     fn pairs_within(&self, globals: &[usize]) -> Vec<(usize, usize)> {
         let local: HashMap<usize, usize> =
             globals.iter().enumerate().map(|(i, &g)| (g, i)).collect();
-        let mut pairs = Vec::new();
+        // The candidates inside the group, then the test on each: in
+        // parallel for a large group, which can hold most of the tile.
+        let mut todo: Vec<(usize, usize, usize, usize, u32)> = Vec::new();
         for (&g, &i) in &local {
-            for &h in &self.interacts[g] {
+            for &(h, slot) in &self.candidates[g] {
                 if let Some(&j) = local.get(&(h as usize)) {
                     if i < j {
-                        pairs.push((i, j));
+                        todo.push((i, j, g, h as usize, slot));
                     }
                 }
             }
         }
-        pairs
+        let hit = |&(i, j, g, h, slot): &(usize, usize, usize, usize, u32)| {
+            self.interact(g, h, slot).then_some((i, j))
+        };
+        if todo.len() >= 256 {
+            use rayon::prelude::*;
+            todo.par_iter().filter_map(hit).collect()
+        } else {
+            todo.iter().filter_map(hit).collect()
+        }
     }
 }
 

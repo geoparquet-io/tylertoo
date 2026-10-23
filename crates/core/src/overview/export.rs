@@ -6040,9 +6040,12 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         }
     };
     // #758: from the second pass on, every member's polygons are projected,
-    // quantized and cleaned once, and which of their parts interact is known,
-    // so a pass only unions, and only the components that changed since the
-    // pass before. A tile that fits at once never builds this.
+    // quantized and cleaned once, so a pass only unions, and only the
+    // components that changed since the pass before. A tile that fits at
+    // once never builds this. Whether two parts interact is tested only when
+    // a pass puts both in one feature: on NZ Parcels under a 2 MB gzip cap,
+    // where most oversized tiles fit on their second pass, testing every
+    // touching pair up front cost 15% of the export.
     let mut quantized: Option<crate::mvt::QuantizedPolygons> = None;
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32| {
         if pass == 1 {
