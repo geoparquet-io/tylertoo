@@ -199,14 +199,25 @@ fn buffer_fraction(opts: &ExportOptions) -> f64 {
     f64::from(opts.tile_buffer) / NOMINAL_TILE_PIXELS
 }
 
-/// Default per-tile MVT size cap, in bytes.
+/// Default per-tile cap on the raw (uncompressed) MVT, in bytes: 2 MiB.
 ///
-/// 500 KiB matches what `500K` parses to and tippecanoe's on-by-default 500K
-/// bar (issue #280). A tile whose
-/// encoded MVT exceeds this trips the size valve (see
-/// [`ExportOptions::tile_size_limit`] and [`ExportOptions::size_valve`]). Set `tile_size_limit` to `None` (CLI:
-/// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable the cap.
-pub const DEFAULT_TILE_SIZE_LIMIT: usize = 500 * 1024;
+/// A backstop behind [`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`], which does the
+/// work: clients decode and render the raw tile, and full-resolution
+/// polygons can compress 4:1, so the compressed cap alone would admit tiles
+/// of 2 MB and more. Up to #761 this was the only cap, at 500 KiB, which was
+/// about twice as strict as tippecanoe's. A tile over either cap trips the
+/// size valve (see [`ExportOptions::tile_size_limit`] and
+/// [`ExportOptions::size_valve`]). Set `tile_size_limit` to `None` (CLI:
+/// `--max-tile-size 0`; Python: `tile_size_limit=0`) to disable it.
+pub const DEFAULT_TILE_SIZE_LIMIT: usize = 2048 * 1024;
+
+/// Default per-tile cap on the gzip-compressed tile, in bytes: 500 KiB.
+///
+/// tippecanoe's `-M` default (#761). It is what `500K` parses to, slightly
+/// above tippecanoe's 500,000. Set `compressed_tile_size_limit` to `None`
+/// (CLI: `--max-compressed-tile-size 0`; Python:
+/// `max_compressed_tile_size=0`) to disable it.
+pub const DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize = 500 * 1024;
 
 /// How the export brings a tile that is over its size limit back under it
 /// (#745).
@@ -275,21 +286,20 @@ pub struct ExportOptions {
     /// not a power of two is accepted with a warning, since the MVT spec only
     /// recommends one (#433).
     pub extent: u32,
-    /// Per-tile MVT size limit in **bytes**. When `Some(limit)` with
-    /// `limit > 0`, a tile whose encoded size exceeds the limit triggers the
-    /// single, non-iterative safety valve: `select_kept_members` chooses which
-    /// features survive (largest-first for sized geometries, uniform spatial
-    /// stride for point-dominated tiles — see that function) and the tile is
-    /// re-encoded once. When `None` (or `Some(0)`), no size limit is enforced
-    /// and `oversized_tiles` is always 0.
+    /// Per-tile limit on the **raw** MVT size, in bytes. When `Some(limit)`
+    /// with `limit > 0`, a tile whose encoded size exceeds it goes through the
+    /// size valve ([`Self::size_valve`]). `None` (or `Some(0)`) sets no raw
+    /// limit; only with [`Self::compressed_tile_size_limit`] also off is no
+    /// size limit enforced and `oversized_tiles` always 0.
     ///
-    /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (500 KiB — tippecanoe
-    /// parity, issue #280).
+    /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (2 MiB, a backstop
+    /// behind the compressed limit; #761).
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
-    /// [`Self::tile_size_limit`]; a tile must satisfy both. `None` (the
-    /// default) or `Some(0)` sets no compressed limit.
+    /// [`Self::tile_size_limit`]; a tile must satisfy both. Defaults to
+    /// `Some(`[`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`]`)` (500 KiB, #761);
+    /// `None` or `Some(0)` sets no compressed limit.
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
@@ -439,7 +449,7 @@ impl Default for ExportOptions {
             tile_buffer: DEFAULT_TILE_BUFFER_PX,
             extent: DEFAULT_EXTENT,
             tile_size_limit: Some(DEFAULT_TILE_SIZE_LIMIT),
-            compressed_tile_size_limit: None,
+            compressed_tile_size_limit: Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
             size_valve: SizeValve::Merge,
             simple_clip_fastpath: true,
             partition_wave: PARTITION_WAVE_AUTO,
@@ -5987,9 +5997,26 @@ fn drop_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Til
     }
 }
 
+/// How many more passes a stalling tile may need, at the rate its last pass
+/// shrank it, before the merge valve stops raising the threshold step by
+/// step and merges everything (#758).
+const MAX_PROJECTED_PASSES: f64 = 4.0;
+
+/// Has the merge valve stalled? From the fit before and after a pass: the
+/// tile did not shrink, or shrinking at that rate it would need more than
+/// [`MAX_PROJECTED_PASSES`] further passes to fit. Merging features that do
+/// not touch saves only their tags, so on detailed, scattered polygons each
+/// pass shrinks the tile by a few percent.
+fn stalled(prev_fit: f64, fit: f64) -> bool {
+    let rate = fit / prev_fit;
+    rate <= 1.0 || (1.0 / fit).ln() / rate.ln() > MAX_PROJECTED_PASSES
+}
+
 /// The merge valve (#745): merge members whose gap is below the threshold
 /// into the member kept before them, re-encode, and raise the threshold
-/// until the tile fits. See [`coalesce_valve`].
+/// until the tile fits. See [`coalesce_valve`]. A tile that stops shrinking
+/// ([`stalled`]) for two passes in a row merges everything it can at once
+/// (#758).
 ///
 /// A tile under its limit is encoded exactly as [`drop_to_fit`] would. When
 /// the threshold cannot rise any further and the tile is still over, the
@@ -6011,9 +6038,45 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
             feats.sort_by(|a, b| compare_by_feature_order(a.target, b.target, name, *descending));
         }
     };
+    // #758: from the second pass on, every member's polygons are projected,
+    // quantized and cleaned once, so a pass only unions, and only the
+    // components that changed since the pass before. A tile that fits at
+    // once never builds this. Whether two parts interact is tested only when
+    // a pass puts both in one feature: on NZ Parcels under a 2 MB gzip cap,
+    // where most oversized tiles fit on their second pass, testing every
+    // touching pair up front cost 15% of the export.
+    // Built once, on the first pass that merges; `Some(None)` when the tile
+    // has too many touching parts to cache, and is encoded plainly.
+    let mut quantized: Option<Option<crate::mvt::QuantizedPolygons>> = None;
+    let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32| {
+        // Pass 1 merges nothing, and a pass that still merges nothing (a
+        // tile with no mergeable gaps, on its way to the drop fallback) has
+        // nothing to reuse.
+        if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
+            return build_mvt(feats, tb, opts);
+        }
+        let cached = quantized.get_or_insert_with(|| {
+            crate::mvt::QuantizedPolygons::new(
+                ordered.iter().map(|m| (&m.geom, u64::from(m.band))),
+                tb,
+                opts.extent,
+            )
+        });
+        let Some(q) = cached.as_mut() else {
+            return build_mvt(feats, tb, opts);
+        };
+        q.next_pass();
+        let q = &*q;
+        build_mvt_with(feats, opts, |m| {
+            q.encode(&m.members)
+                .unwrap_or_else(|| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
+        })
+    };
     let mut gaps: Option<Vec<u64>> = None;
     let mut mingap = 0u64;
     let mut keep_fraction = 1.0_f64;
+    let mut prev_fit: Option<f64> = None;
+    let mut stalls = 0u32;
     let mut passes = 0u32;
     loop {
         passes += 1;
@@ -6021,7 +6084,7 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         let absorbed: usize = merged.iter().map(|m| m.absorbed).sum();
         let mut feats: Vec<&coalesce_valve::Merged<'_>> = merged.iter().collect();
         draw_order(&mut feats);
-        let mut mvt = build_mvt(&feats, tb, opts);
+        let mut mvt = build(&feats, passes);
         let fit = tile_fit(&mut mvt, opts).unwrap_or(f64::INFINITY);
         let tally = ValveTally {
             merged: absorbed,
@@ -6039,6 +6102,22 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
         keep_fraction = (keep_fraction * fit * 0.8).min(0.8);
+        // #758: a tile that shrinks too slowly to fit within a few more
+        // passes, twice in a row, merges everything it can in one step. One
+        // slow pass is not enough: gzip barely rewards a pass that merges
+        // only a few features, so a tile just over a compressed cap can look
+        // stalled once and still fit a pass later.
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe keeps raising the threshold
+        // one quantile at a time until it fits or runs out of gaps.
+        stalls = if prev_fit.is_some_and(|p| stalled(p, fit)) {
+            stalls + 1
+        } else {
+            0
+        };
+        if stalls >= 2 {
+            keep_fraction = 0.0;
+        }
+        prev_fit = Some(fit);
         let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
         if let Some(next) = coalesce_valve::next_mingap(g, keep_fraction, mingap) {
             mingap = next;
@@ -6060,9 +6139,9 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
                 kept = whole.clone();
                 kept.extend(select_kept_members(&single, keep));
                 draw_order(&mut kept);
-                out = build_mvt(&kept, tb, opts);
-                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 passes += 1;
+                out = build(&kept, passes);
+                fit = tile_fit(&mut out, opts).unwrap_or(f64::INFINITY);
                 if fit >= 1.0 || keep == 0 {
                     break;
                 }
@@ -6182,22 +6261,31 @@ fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
 /// key/value tables and the bytes identical to the serial loop. A smaller
 /// tile encodes and interns each member in turn, with no buffer.
 fn build_mvt<M: TileFeature>(members: &[M], tb: &TileBounds, opts: &ExportOptions) -> TileMvt {
+    build_mvt_with(members, opts, |m| {
+        EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent)
+    })
+}
+
+/// [`build_mvt`] with each feature's geometry encoded by `encode`, which must
+/// return what [`EncodedFeatureGeometry::encode`] would (#758: the merge
+/// valve's cached encode).
+fn build_mvt_with<M: TileFeature>(
+    members: &[M],
+    opts: &ExportOptions,
+    encode: impl Fn(&M) -> EncodedFeatureGeometry + Sync,
+) -> TileMvt {
     // #443: a resolved `--feature-id` always wins; the no-flag default
     // (`m.id` is `None`) keeps the pre-#443 tile-local member index.
     let id_of = |i: usize, m: &M| Some(m.feature_id().unwrap_or(i as u64));
     let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
     if encode_in_parallel(members) {
-        let encoded: Vec<EncodedFeatureGeometry> = members
-            .par_iter()
-            .map(|m| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
-            .collect();
+        let encoded: Vec<EncodedFeatureGeometry> = members.par_iter().map(&encode).collect();
         for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     } else {
         for (i, m) in members.iter().enumerate() {
-            let geom = EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent);
-            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            layer.add_encoded_feature(id_of(i, m), encode(m), m.properties());
         }
     }
     let features = layer.feature_count();
@@ -11888,6 +11976,7 @@ mod tests {
             10,
             &ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..Default::default()
             },
         )
@@ -11934,6 +12023,28 @@ mod tests {
                 vertices < full_vertices / 2,
                 "{valve:?}: shared edges should dissolve ({vertices} vs {full_vertices})"
             );
+            // A coverage shrinks steadily as it merges, so the valve raises
+            // the threshold step by step and never jumps to merging all of
+            // it into one feature (#758).
+            assert!(features > 1, "{valve:?}: merged everything: {tally:?}");
+        }
+    }
+
+    /// #758: a pass that did not shrink the tile, or shrank it too slowly
+    /// to fit within [`MAX_PROJECTED_PASSES`] more, is a stall; a steady
+    /// shrink is not.
+    #[test]
+    fn stalled_tells_a_slow_shrink_from_a_steady_one() {
+        for (prev, fit, want) in [
+            (0.5, 0.5, true),   // no shrink
+            (0.5, 0.45, true),  // grew
+            (0.5, 0.52, true),  // ~17 more passes at this rate
+            (0.9, 0.91, true),  // ~9 more
+            (0.5, 0.7, false),  // ~1 more
+            (0.9, 0.98, false), // well under 1 more
+            (0.3, 0.6, false),  // ~0.7 more
+        ] {
+            assert_eq!(stalled(prev, fit), want, "{prev} -> {fit}");
         }
     }
 
@@ -11971,6 +12082,7 @@ mod tests {
             10,
             &ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..Default::default()
             },
         )
@@ -11991,6 +12103,61 @@ mod tests {
         assert!(
             (area - full_area).abs() <= 1e-6 * full_area,
             "merged features were dropped: drew {area} of {full_area}"
+        );
+    }
+
+    /// #758: merging features that do not touch saves only their tags, so
+    /// on a tile of detailed, disjoint polygons each pass barely shrinks the
+    /// tile. Once a pass shows the tile cannot fit within a few more at that
+    /// rate, the valve merges everything it can in one step instead of
+    /// raising the threshold pass after pass (it took 13 passes, each
+    /// re-encoding the whole tile, on an FTW Moldova z6 tile that never fit).
+    #[test]
+    fn a_stalled_merge_jumps_to_merging_everything() {
+        let feats: Vec<Feature> = (0..200)
+            .map(|i| {
+                let (cx, cy) = (0.1 + (i % 20) as f64 * 0.01, 0.1 + (i / 20) as f64 * 0.01);
+                let ring: Vec<(f64, f64)> = (0..=240)
+                    .map(|k| {
+                        let a = std::f64::consts::TAU * f64::from(k % 240) / 240.0;
+                        (cx + 0.003 * a.cos(), cy + 0.003 * a.sin())
+                    })
+                    .collect();
+                Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![])),
+                    props: vec![("n".to_string(), PropertyValue::Int(i))],
+                }
+            })
+            .collect();
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (full_bytes, full_area, _, _) = tile_area_stats(&full[0]);
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(full_bytes / 2),
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        // Two passes that barely shrink it, then one that merges everything.
+        assert!(v.passes <= 4, "the valve should stop inching: {v:?}");
+        assert_eq!((features, v.merged), (1, 199), "everything merges: {v:?}");
+        assert!(
+            (area - full_area).abs() <= 1e-6 * full_area,
+            "drew {area} of {full_area}"
         );
     }
 
@@ -12090,10 +12257,11 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let feats = read_level_features(&reader, 1, Crs::Epsg4326).unwrap();
 
-        // No limit (explicit `None`, since the default is now 500 KiB): no
-        // oversized tiles.
+        // No limit (both caps off explicitly, since both are on by default):
+        // no oversized tiles.
         let no_limit = ExportOptions {
             tile_size_limit: None,
+            compressed_tile_size_limit: None,
             ..Default::default()
         };
         let none = encode_level_tiles(&feats, 6, &no_limit).unwrap();
@@ -12117,15 +12285,19 @@ mod tests {
         );
     }
 
-    /// #280: the per-tile cap is on by default at 500 KiB (== what `500K`
-    /// parses to; tippecanoe parity), not disabled.
+    /// #280, #761: the per-tile caps are on by default: tippecanoe's 500 KiB
+    /// (== what `500K` parses to) on the gzip-compressed tile, and a 2 MiB
+    /// backstop on the raw one.
     #[test]
-    fn default_export_caps_tiles_at_500_kib() {
-        assert_eq!(DEFAULT_TILE_SIZE_LIMIT, 500 * 1024);
+    fn default_export_caps_tiles_at_500_kib_compressed_and_2_mib_raw() {
+        assert_eq!(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT, 500 * 1024);
+        assert_eq!(DEFAULT_TILE_SIZE_LIMIT, 2048 * 1024);
+        let opts = ExportOptions::default();
         assert_eq!(
-            ExportOptions::default().tile_size_limit,
-            Some(DEFAULT_TILE_SIZE_LIMIT)
+            opts.compressed_tile_size_limit,
+            Some(DEFAULT_COMPRESSED_TILE_SIZE_LIMIT)
         );
+        assert_eq!(opts.tile_size_limit, Some(DEFAULT_TILE_SIZE_LIMIT));
     }
 
     /// Build a bare point [`Member`] at `(x, y)` for the drop-valve unit tests.

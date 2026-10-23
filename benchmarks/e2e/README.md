@@ -127,7 +127,7 @@ harness passes exactly this and records the full argv of both tools in
 | zoom range | `--min-zoom 0 --max-zoom 14` | `-Z 0 -z 14` | **matched** |
 | layer name | `--layer-name <id>` | `-l <id>` | **matched** |
 | tile buffer | `--tile-buffer 8` | `-b 8` (tippecanoe default is 5) | **matched**, by moving tippecanoe to tylertoo's value |
-| per-tile byte cap | `--max-tile-size 500000` (tylertoo's own default `500K` is 512,000 bytes) | `--maximum-tile-bytes 500000` (tippecanoe's default) | **matched**, by passing tippecanoe's 500,000 explicitly to both |
+| per-tile byte cap | `--max-compressed-tile-size 500000 --max-tile-size 0` (tylertoo's own defaults: `500K` = 512,000 bytes compressed, 2M raw) | `--maximum-tile-bytes 500000` (tippecanoe's default, on the compressed tile) | **matched**: the same compressed cap on both, and no raw cap, as tippecanoe has none |
 | oversize-tile valve | single non-iterative drop pass (always on) | `--drop-fraction-as-needed` | **approximated** — see asymmetries |
 | drop rate | `--drop-rate 1.65` | *not passed* (tippecanoe default 2.5) | **not matched on purpose** — see asymmetries |
 | gamma | `--drop-gamma 1.5` | *not passed* (tippecanoe default 0) | **not matched on purpose** |

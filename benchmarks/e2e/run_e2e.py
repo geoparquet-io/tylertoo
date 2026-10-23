@@ -179,9 +179,12 @@ def corpus_datasets() -> dict:
 #
 # These are tylertoo's `tiles` defaults, mapped onto the nearest tippecanoe
 # flag, and passed EXPLICITLY on both sides so neither tool's default decides.
-# The per-tile cap looks matched but is not: tylertoo's default `500K` is
-# 500 * 1024 = 512,000 bytes, tippecanoe's default --maximum-tile-bytes is
-# 500,000, so the harness passes 500000 to both. Where tylertoo's default
+# The per-tile cap: tippecanoe's --maximum-tile-bytes caps the
+# gzip-compressed tile at 500,000 by default. tylertoo's default (#761) caps
+# the compressed tile at `500K` = 512,000 bytes and the raw tile at 2M, so
+# the harness passes `--max-compressed-tile-size 500000 --max-tile-size 0`
+# to tylertoo: the same compressed cap, and no raw cap, as tippecanoe has
+# none. Where tylertoo's default
 # differs from tippecanoe's
 # (buffer 8 vs 5) the tippecanoe side is moved to tylertoo's value rather than
 # the reverse, because the buffer changes output *size*, and letting
@@ -204,8 +207,9 @@ def corpus_datasets() -> dict:
 DEFAULT_MIN_ZOOM = 0
 DEFAULT_MAX_ZOOM = 14
 TILE_BUFFER = 8            # tylertoo default; tippecanoe default is 5
-# tippecanoe's default cap. NOT tylertoo's default (its `500K` is 512,000
-# bytes), so the harness passes 500000 to both tools explicitly.
+# tippecanoe's default cap on the compressed tile. NOT tylertoo's default
+# (its `500K` is 512,000 bytes), so the harness passes 500000 to both tools
+# explicitly.
 MAX_TILE_BYTES = 500_000
 
 # The pinned baseline, exactly as `tippecanoe --version` prints it. Enforced on
@@ -395,9 +399,9 @@ def geojsonseq_argv(src: Path, dst: Path) -> list[str] | None:
 #
 # `--verbatim` switches the whole thinning/visibility ladder off, and
 # `--simplify-factor` is then set back explicitly (verbatim would otherwise
-# disable simplification too, and tippecanoe does simplify). `--max-tile-size`
-# likewise has to be restated because verbatim disables the cap (so the size
-# valve still fires: 10 madagascar tiles hit it). The result is near-parity
+# disable simplification too, and tippecanoe does simplify). The tile cap
+# likewise has to be restated because verbatim disables the caps (so the size
+# valve still fires). The result is near-parity
 # with tippecanoe, not identity: tile counts within 2 per zoom, features
 # within 0.4% at z8 and ~5% at z4.
 QUALITY_MATCHED_FLAGS = ["--verbatim", "--simplify-factor", "1.0"]
@@ -410,7 +414,8 @@ def tylertoo_argv(binary, src, dst, layer, zmin, zmax, report, extra=()):
         "--max-zoom", str(zmax),
         "--layer-name", layer,
         "--tile-buffer", str(TILE_BUFFER),
-        "--max-tile-size", str(MAX_TILE_BYTES),
+        "--max-compressed-tile-size", str(MAX_TILE_BYTES),
+        "--max-tile-size", "0",
         "--report", str(report),
         "--force",
         *extra,

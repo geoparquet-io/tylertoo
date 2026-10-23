@@ -254,7 +254,8 @@ class TestConvertIntegration:
 
     @pytest.mark.parametrize("off_value", [0, None])
     def test_convert_tile_size_limit_off_switch(self, off_value):
-        """tile_size_limit=0 (or None) disables the default 500 KiB cap (#280)."""
+        """tile_size_limit=0 (or None) disables the raw cap (#280), and
+        max_compressed_tile_size=0 the compressed one (#761)."""
         input_file = REALDATA_DIR / "open-buildings.parquet"
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -266,6 +267,7 @@ class TestConvertIntegration:
                 min_zoom=0,
                 max_zoom=6,
                 tile_size_limit=off_value,
+                max_compressed_tile_size=0,
             )
 
             assert output.exists()

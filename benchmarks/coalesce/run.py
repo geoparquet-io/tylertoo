@@ -105,6 +105,20 @@ def validate_config(cfg: dict) -> None:
     for name, st in settings.items():
         if not st.get("external") and ("convert" not in st or "valve" not in st):
             raise ConfigError(f"setting {name!r}: needs 'convert' and 'valve'")
+        for key in CAP_KEYS:
+            if key not in st:
+                continue
+            if st.get("external"):
+                raise ConfigError(f"setting {name!r}: {key!r} has no effect on an external "
+                                  "setting; set its caps in its own args")
+            # A byte count for every dataset, or a table of them by dataset.
+            values = st[key] if isinstance(st[key], dict) else {None: st[key]}
+            for ds_name, value in values.items():
+                if ds_name is not None and ds_name not in datasets:
+                    raise ConfigError(f"setting {name!r}: {key!r} names unknown dataset "
+                                      f"{ds_name!r}")
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ConfigError(f"setting {name!r}: {key!r} must be a byte count")
     for section, keys in ENTRY_KEYS.items():
         for entry in cfg.get(section, []):
             if entry.get("dataset") not in datasets:
@@ -123,6 +137,21 @@ def validate_config(cfg: dict) -> None:
         for st in prof.get("settings", []):
             if st not in settings:
                 raise ConfigError(f"profile {pname!r}: unknown setting {st!r}")
+
+
+CAP_KEYS = ("max_tile_size", "max_compressed_tile_size")
+
+
+def cell_caps(cfg: dict, ds_name: str, st_name: str) -> tuple[int, int]:
+    """The (raw, gzip) tile caps a cell exports with: the setting's, where it
+    sets them for every dataset or for this one (#761), else the dataset's."""
+    ds, st = cfg["datasets"][ds_name], cfg["settings"].get(st_name, {})
+
+    def cap(key):
+        value = st.get(key, ds[key])
+        return value.get(ds_name, ds[key]) if isinstance(value, dict) else value
+
+    return cap(CAP_KEYS[0]), cap(CAP_KEYS[1])
 
 
 def profile_plan(cfg: dict, name: str) -> dict:
@@ -680,10 +709,10 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
         for st_name in plan["internal"]:
             st = cfg["settings"][st_name]
             name = f"{ds_name}.{st_name}"
+            raw_cap, gz_cap = cell_caps(cfg, ds_name, st_name)
             key = cell_key(binary_sha=binfo["sha256"], input_sha=ds["sha256"],
                            convert=st["convert"], valve=st["valve"], max_zoom=ds["max_zoom"],
-                           max_tile_size=ds["max_tile_size"],
-                           max_compressed_tile_size=ds["max_compressed_tile_size"],
+                           max_tile_size=raw_cap, max_compressed_tile_size=gz_cap,
                            repeats=repeats, harness=harness)
             summary_path = tiles / f"{name}.json"
             pm = tiles / f"{name}.{st['valve']}.pmtiles"
@@ -701,8 +730,8 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
 
             records = run_matrix.run_cell(
                 str(binary), inputs / ds["asset"], tiles, name, st["convert"], [st["valve"]],
-                max_zoom=ds["max_zoom"], max_tile_size=str(ds["max_tile_size"]),
-                max_compressed_tile_size=str(ds["max_compressed_tile_size"]),
+                max_zoom=ds["max_zoom"], max_tile_size=str(raw_cap),
+                max_compressed_tile_size=str(gz_cap),
                 wall_s=ds["wall_s"], rss_gib=ds["rss_gib"], repeats=repeats,
                 convert_repeats=repeats, record=record)
             conv = records[0]
@@ -900,17 +929,18 @@ def collect_scores(cfg, plan, inputs: Path, js: Path, run_dir: Path, archives: d
         per = {}
         for s, (p, sha) in labels(m["dataset"]):
             out = out_dir / s
+            raw_cap, gz_cap = cell_caps(cfg, m["dataset"], s)
             cmd = uv_script("tile_metrics.py", p, "--source", inputs / ds["asset"],
                             "--zooms", ",".join(map(str, m["zooms"])),
                             "--max-tiles", m["max_tiles"],
-                            "--raw-limit", ds["max_tile_size"],
-                            "--gz-limit", ds["max_compressed_tile_size"],
+                            "--raw-limit", raw_cap,
+                            "--gz-limit", gz_cap,
                             "--json", out / "metrics.json")
             if m.get("color_attr"):
                 cmd += ["--color-attr", m["color_attr"]]
             if m.get("named"):
                 cmd += ["--named", ",".join(m["named"])]
-            key = digest([m, ds["sha256"], ds["max_tile_size"], ds["max_compressed_tile_size"],
+            key = digest([m, ds["sha256"], raw_cap, gz_cap,
                           sha, script_sha("tile_metrics.py")])
             if not queue(out, key, f"metrics {m['name']} {s}", cmd):
                 continue

@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::assign::BudgetKinds;
 use tylertoo_core::overview::auto_zoom::MaxZoom;
-use tylertoo_core::overview::export::{FeatureOrder, SizeValve};
+use tylertoo_core::overview::export::{
+    FeatureOrder, SizeValve, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT, DEFAULT_TILE_SIZE_LIMIT,
+};
 use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
@@ -107,22 +109,23 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
     })
 }
 
-/// Map a per-tile size-cap CLI value to [`ExportOptions::tile_size_limit`]:
-/// `0` (the off switch, e.g. `--max-tile-size 0`) becomes `None` (cap disabled);
-/// any positive byte count becomes `Some(n)`. The default `500K` therefore caps;
-/// `0` opts out. See issue #280.
-/// Default per-tile MVT size cap (tippecanoe parity, #280).
-const DEFAULT_MAX_TILE_SIZE: usize = 500 * 1024;
-
-/// Resolve the `tiles` per-tile size cap.
+/// Resolve one of the `tiles` per-tile size caps (raw or gzip-compressed).
 ///
-/// An explicit `--max-tile-size` always wins. Otherwise `--verbatim` means no
-/// cap — a valve that sheds features to fit a byte budget is not verbatim
-/// either — and the default is [`DEFAULT_MAX_TILE_SIZE`].
-fn resolve_tiles_size_limit(explicit: Option<usize>, verbatim: bool) -> Option<usize> {
-    size_limit_opt(explicit.unwrap_or(if verbatim { 0 } else { DEFAULT_MAX_TILE_SIZE }))
+/// An explicit value always wins. Otherwise `--verbatim` means no cap — a
+/// valve that sheds features to fit a byte budget is not verbatim either —
+/// and the cap is `default` ([`DEFAULT_TILE_SIZE_LIMIT`] or
+/// [`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`]).
+fn resolve_tiles_size_limit(
+    explicit: Option<usize>,
+    verbatim: bool,
+    default: usize,
+) -> Option<usize> {
+    size_limit_opt(explicit.unwrap_or(if verbatim { 0 } else { default }))
 }
 
+/// Map a per-tile size-cap CLI value to an [`ExportOptions`] limit: `0` (the
+/// off switch, e.g. `--max-tile-size 0`) becomes `None` (cap disabled); any
+/// positive byte count becomes `Some(n)`. See issues #280 and #761.
 fn size_limit_opt(n: usize) -> Option<usize> {
     (n > 0).then_some(n)
 }
@@ -597,16 +600,15 @@ struct ExportPmtilesArgs {
     #[arg(long, default_value = "8")]
     tile_buffer: u32,
 
-    /// Per-tile MVT size cap, such as `500K`, `1M`, or a byte count, or 0 for
-    /// no cap. A tile over the cap is merged or thinned until it fits; see
-    /// `--size-valve`.
-    #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "500K", value_parser = parse_size_bytes)]
+    /// Per-tile cap on the raw MVT size, such as `2M` or a byte count, or 0
+    /// for no cap: a backstop behind `--max-compressed-tile-size`. A tile
+    /// over a cap is merged or thinned until it fits; see `--size-valve`.
+    #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "2M", value_parser = parse_size_bytes)]
     tile_size_limit: usize,
 
     /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
-    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
-    /// both caps.
-    #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size_bytes)]
+    /// `-M`, such as `500K`, or 0 for no cap. A tile must fit both caps.
+    #[arg(long, value_name = "SIZE", default_value = "500K", value_parser = parse_size_bytes)]
     max_compressed_tile_size: usize,
 
     /// How to reduce a tile that exceeds its cap: `merge` merges the
@@ -1375,15 +1377,16 @@ struct TilesArgs {
     #[command(flatten)]
     publication: TilesetMetadataArgs,
 
-    /// Per-tile MVT size cap, such as `500K` or `1M`, or 0 for no cap
-    /// (default 500K, or no cap with `--verbatim`). A tile over the cap is
-    /// merged or thinned until it fits; see `--size-valve`.
+    /// Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap
+    /// (default 2M, or no cap with `--verbatim`): a backstop behind
+    /// `--max-compressed-tile-size`. A tile over a cap is merged or thinned
+    /// until it fits; see `--size-valve`.
     #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
     max_tile_size: Option<usize>,
 
     /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
-    /// `-M`, such as `500K`, or 0 for no cap (the default). A tile must fit
-    /// both caps.
+    /// `-M`, such as `500K`, or 0 for no cap (default 500K, or no cap with
+    /// `--verbatim`). A tile must fit both caps.
     #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
     max_compressed_tile_size: Option<usize>,
 
@@ -2388,8 +2391,16 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         shard: shard.as_ref().map(ShardJob::as_tiles_shard),
         tile_range: manual_range,
         tile_buffer: args.tile_buffer,
-        tile_size_limit: resolve_tiles_size_limit(args.max_tile_size, args.tuning.verbatim),
-        compressed_tile_size_limit: args.max_compressed_tile_size.and_then(size_limit_opt),
+        tile_size_limit: resolve_tiles_size_limit(
+            args.max_tile_size,
+            args.tuning.verbatim,
+            DEFAULT_TILE_SIZE_LIMIT,
+        ),
+        compressed_tile_size_limit: resolve_tiles_size_limit(
+            args.max_compressed_tile_size,
+            args.tuning.verbatim,
+            DEFAULT_COMPRESSED_TILE_SIZE_LIMIT,
+        ),
         size_valve: args.size_valve,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
@@ -3212,6 +3223,9 @@ fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions
         convert,
         export: ExportOptions {
             tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
+            // A band keeps every feature unless a cap is asked for; the
+            // compressed default (#761) is not one.
+            compressed_tile_size_limit: None,
             feature_order: args.feature_order.clone(),
             ..ExportOptions::default()
         },
@@ -4013,8 +4027,10 @@ mod tests {
         );
         let opts = pyramid_options(&parse_pyramid(&["--feature-order", "level:desc"]));
         assert_eq!(opts.export.feature_order, column("level", true));
-        // The rest of the export options are untouched by the new knob.
+        // The rest of the export options are untouched by the new knob, and
+        // a band keeps every feature: neither cap is on (#761).
         assert_eq!(opts.export.tile_size_limit, None);
+        assert_eq!(opts.export.compressed_tile_size_limit, None);
         assert_eq!(
             pyramid_options(&parse_pyramid(&["--feature-order", "level"]))
                 .export
@@ -4392,11 +4408,21 @@ mod tests {
     }
 
     #[test]
-    fn tile_size_cap_defaults_to_500k_and_zero_disables() {
-        // #280: the per-tile cap is on by default at 500K on both commands.
+    fn tile_size_caps_default_to_500k_gzip_and_2m_raw_and_zero_disables() {
+        // #761: tippecanoe's `-M` caps the gzip-compressed tile at 500K; a 2M
+        // cap on the raw tile backs it up. Both commands, both caps.
         assert_eq!(parse_tiles(&[]).max_tile_size, None);
-        assert_eq!(resolve_tiles_size_limit(None, false), Some(500 * 1024));
-        assert_eq!(parse_export(&[]).tile_size_limit, 500 * 1024);
+        assert_eq!(parse_tiles(&[]).max_compressed_tile_size, None);
+        assert_eq!(
+            resolve_tiles_size_limit(None, false, DEFAULT_TILE_SIZE_LIMIT),
+            Some(2048 * 1024)
+        );
+        assert_eq!(
+            resolve_tiles_size_limit(None, false, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
+            Some(500 * 1024)
+        );
+        assert_eq!(parse_export(&[]).tile_size_limit, 2048 * 1024);
+        assert_eq!(parse_export(&[]).max_compressed_tile_size, 500 * 1024);
 
         // `0` is the off switch: the CLI value maps to `None` (cap disabled).
         assert_eq!(
@@ -4413,13 +4439,18 @@ mod tests {
     /// a cap with verbatim generalization can say so.
     #[test]
     fn verbatim_disables_the_tile_size_cap_unless_asked_otherwise() {
-        assert_eq!(resolve_tiles_size_limit(None, true), None);
-        assert_eq!(
-            resolve_tiles_size_limit(None, false),
-            Some(DEFAULT_MAX_TILE_SIZE)
-        );
-        assert_eq!(resolve_tiles_size_limit(Some(1024), true), Some(1024));
-        assert_eq!(resolve_tiles_size_limit(Some(0), false), None);
+        for default in [DEFAULT_TILE_SIZE_LIMIT, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT] {
+            assert_eq!(resolve_tiles_size_limit(None, true, default), None);
+            assert_eq!(
+                resolve_tiles_size_limit(None, false, default),
+                Some(default)
+            );
+            assert_eq!(
+                resolve_tiles_size_limit(Some(1024), true, default),
+                Some(1024)
+            );
+            assert_eq!(resolve_tiles_size_limit(Some(0), false, default), None);
+        }
     }
 
     /// The flag reaches both commands that build a conversion, and switches

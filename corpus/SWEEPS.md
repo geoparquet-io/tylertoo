@@ -396,3 +396,36 @@ instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
 `0.25` (about tippecanoe's coverage) and `0` (no slivers, a larger overview
 file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
 Issue #450 tracks simplifying shared borders identically.
+
+## Decision 9: cap the compressed tile at 500K, with a 2M raw backstop (issue #761)
+
+tippecanoe's `-M 500000` limits the gzip-compressed tile. tylertoo's default
+limited the raw MVT to 500K, about twice as strict on dense polygons, which
+compress roughly 2:1 (4:1 at `--simplify-factor 0`). The defaults are now
+`--max-compressed-tile-size 500K` and `--max-tile-size 2M`. The raw cap is a
+backstop for clients, which decode the raw tile; tippecanoe has none.
+
+Measured with the coalesce benchmark (`benchmarks/coalesce/`, one repeat per
+cell, the binary of PR #770), against the committed `baseline/full.json`:
+
+| Input | Cap | Export | Merged features | Oversized tiles | PMTiles |
+|---|---|---|---|---|---|
+| Madagascar adm4 | 500K raw (before) | 2.07 s | 47,441 | 12 | 25.5 MB |
+| | 500K gzip | 1.93 s | 2,943 | 1 | 27.0 MB |
+| | 500K gzip + 2M raw | 1.97 s | 6,058 | 2 | 26.9 MB |
+| FTW Moldova | 500K raw (before) | 6.83 s | 901,431 | 83 | 85 MB |
+| | 500K gzip, with or without 2M raw | 6.44–6.57 s | 489,695 | 27 | 96 MB |
+| NZ Parcels | 2 MB gzip (its benchmark cap) | 97.1 s | 2,487,951 | 55 | 1,425 MB |
+| | 500K gzip, with or without 2M raw | 99.5 s | 8,392,039 | 382 | 1,198 MB |
+
+- The raw backstop changed no byte on Moldova or NZ, and 3,115 merges on
+  Madagascar.
+- Coverage held within the noise floor everywhere. The rendered windows on
+  Moldova are unchanged, and NZ Auckland z10 misses 27.3% of its area
+  against 28.2%. Drawn share per tile on Moldova z6 is 78.6% against 78.9%,
+  and on NZ z10 99.5% for both. Moldova's z8 seam colour changes fall
+  from 0.39 to 0.00, since fewer features take on a neighbour's attributes.
+- Archives grow 6–12% on Madagascar and Moldova: tiles keep more of their own
+  features. Caps are flags, so a smaller archive is one setting away.
+- NZ's benchmark keeps its 2 MB gzip cap; under the new default it would
+  merge 3.4× as many features.

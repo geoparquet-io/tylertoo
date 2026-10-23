@@ -33,9 +33,11 @@ tippecanoe run, delete `<work>/tippecanoe/<dataset>-<key>/`. A run that a
 wall-time or memory cap stopped (`TIMEOUT`, `RSS_CAP`) isn't cached, so the
 next run tries it again.
 
-tippecanoe's `-M` caps the compressed tile. On Moldova (500K), this cap is
-looser than tylertoo's 500K raw cap. tippecanoe has no raw cap. tippecanoe
-writes its temporary files under `--work`, not `/tmp`.
+tippecanoe's `-M` caps the compressed tile, as tylertoo's default does since
+[#761](https://github.com/geoparquet-io/tylertoo/issues/761) (500,000 bytes
+against tylertoo's 512,000). tylertoo also caps the raw tile at 2M;
+tippecanoe has no raw cap. tippecanoe writes its temporary files under
+`--work`, not `/tmp`.
 
 Use `--only tile,report` to run only the named steps. The cache must already
 contain the output of any step you omit. Without the `fetch` step, the
@@ -53,8 +55,8 @@ whether its repeats write identical bytes (`repeats_identical` in `report.json`)
 
 | Profile | Datasets | Settings | Time | Disk |
 |---|---|---|---|---|
-| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 20 min: 8.5 min tiling, of which 6 min is the `sf0` export ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)), and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
-| `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ and Moldova | about 45 min of tylertoo tiling and scoring. The first run adds tippecanoe: about 32 min on NZ and 34 min on Moldova, where it fails. Both results are cached | about 20 GB at peak |
+| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, 500K raw cap (before #761), defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 13 min: 3½ min tiling and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
+| `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ and Moldova | about 50 min of tylertoo tiling and scoring. The first run adds tippecanoe: about 32 min on NZ and 34 min on Moldova, where it fails. Both results are cached | about 20 GB at peak |
 
 You can run the `small` profile without keys. It needs network access to
 the release, the CDN, PyPI (through uv) and, for the `build` step,
@@ -128,13 +130,11 @@ Two marks flag cells to treat with care:
 ## Baselines
 
 `baseline/` contains a report for each profile and identifies the host:
-c7g.16xlarge, 64 Arm cores, a glibc build. The binary was built at `67a221e`,
-whose Rust code is the same as `main` at `fc64fe1`. The baselines predate the
-review fixes in the harness, so they don't carry † marks. Their times come
-from two load gates: Madagascar, and Moldova's before-#745 and defaults
-cells, started with the load average below 3. Moldova's `sf0.25` and `sf0`
-cells, and all of NZ, started below 6.4. The NZ tippecanoe time is seeded
-from the #745 run. To compare your change with the baseline, run:
+c7g.16xlarge, 64 Arm cores, a glibc build. The binary was built at `635322c`
+(PR #770: the merge valve's caches and stall rule, #758, and the default
+caps, #761). Every run started with the load average below the gate, so no
+cell carries a † mark. The NZ tippecanoe time is seeded from the #745 run.
+To compare your change with the baseline, run:
 
 ```bash
 uv run benchmarks/coalesce/run.py --profile small --compare benchmarks/coalesce/baseline/small.json
@@ -146,32 +146,34 @@ the same PR. Copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
 
 ## Findings (`baseline/`)
 
-- **`--simplify-factor 0` slows the merge valve on dense fields
-  ([#758](https://github.com/geoparquet-io/tylertoo/issues/758)).** The
-  Moldova export takes 131 s and 7.7 GiB, against 7.1 s and 1.8 GiB with the
-  defaults. MVT encoding at z6–z11 accounts for nearly all the export time:
-  - tiles at these zooms need 13–24 merge passes;
-  - each pass re-encodes full-resolution geometry from scratch;
-  - encode CPU totals about 3,000 s, against about 50 s with the defaults.
-
-  NZ uses a 2 MB gzip cap, so fewer tiles exceed the cap. Factor 0 takes
-  1.3× as long as the defaults (139 s against 108 s).
+- **`--simplify-factor 0` no longer stalls the merge valve on dense fields
+  ([#758](https://github.com/geoparquet-io/tylertoo/issues/758), fixed in
+  #770).** The Moldova export took 131 s and 7.7 GiB, against 7.1 s and 1.8
+  GiB with the defaults: each merge pass re-encoded full-resolution geometry
+  from scratch, 13–24 passes per tile at z6–z11. With each member quantized
+  once per tile, unions reused across passes, and a tile that stops shrinking
+  merged in one step, it takes 15.2 s and 5.5 GiB, against 6.7 s and 1.9
+  GiB. `--simplify-factor 0.25` went from 17.4 s to 7.8 s. NZ, with its
+  2 MB gzip cap, has few tiles over and did not move (124 s against 99 s
+  for the defaults).
 - **tippecanoe can't tile FTW Moldova.** With `-z12 -M 500000
   --coalesce-densest-as-needed`, it stops after 34 min with `Can't increase
   feature gap threshold further` (exit 100). tylertoo finishes the same file
-  in 9 s with the defaults, and in 2¼ min at factor 0. On NZ, tippecanoe
-  takes 31 min 41 s, against 108 s for the tylertoo defaults (17.5×).
-- **tylertoo's default cap is stricter than tippecanoe's
-  ([#761](https://github.com/geoparquet-io/tylertoo/issues/761)).**
-  tippecanoe's `-M` caps the gzip-compressed tile; tylertoo's 500K default
-  caps the raw tile. On Moldova, this makes tylertoo's cap about 1.75× stricter.
+  in 9 s with the defaults, and in 19 s at factor 0. On NZ, tippecanoe
+  takes 31 min 41 s, against 110 s for the tylertoo defaults (17.3×).
+- **tylertoo's default cap was stricter than tippecanoe's
+  ([#761](https://github.com/geoparquet-io/tylertoo/issues/761), fixed in
+  #770).** tippecanoe's `-M` caps the gzip-compressed tile; tylertoo's 500K
+  default capped the raw tile, about 1.75× stricter on Moldova. The defaults
+  are now 500K compressed and 2M raw; the "500K raw (before #761)" column
+  keeps the old cap.
 - **End-to-end cost of the shipped defaults** compared with before #745:
 
   | Dataset | Defaults | `--simplify-factor 0.25` |
   |---|---|---|
-  | Moldova | 1.45× | 3.33× |
-  | NZ | 2.06× | 2.20× |
-  | Madagascar | 2.38× | |
+  | Moldova | 1.38× | 1.77× |
+  | NZ | 2.07× | 2.22× |
+  | Madagascar | 2.43× | |
 
   Madagascar's times are around a second, so its ratio varies with noise.
 - **Coverage improvement** (missing area, before #745 → defaults → `sf0.25` →
