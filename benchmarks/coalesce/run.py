@@ -106,7 +106,12 @@ def validate_config(cfg: dict) -> None:
         if not st.get("external") and ("convert" not in st or "valve" not in st):
             raise ConfigError(f"setting {name!r}: needs 'convert' and 'valve'")
         for key in CAP_KEYS:
-            if key in st and (not isinstance(st[key], int) or st[key] < 0):
+            if key not in st:
+                continue
+            if st.get("external"):
+                raise ConfigError(f"setting {name!r}: {key!r} has no effect on an external "
+                                  "setting; set its caps in its own args")
+            if isinstance(st[key], bool) or not isinstance(st[key], int) or st[key] < 0:
                 raise ConfigError(f"setting {name!r}: {key!r} must be a byte count")
     for section, keys in ENTRY_KEYS.items():
         for entry in cfg.get(section, []):

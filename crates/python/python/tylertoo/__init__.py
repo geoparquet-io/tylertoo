@@ -503,9 +503,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         layer_name: MVT layer name.
         tile_buffer: Tile edge buffer in pixels, at most 256.
         extent: Tile resolution in MVT units.
-        tile_size_limit: Maximum raw (uncompressed) tile size in bytes, a
-            backstop behind `max_compressed_tile_size` (default 2 MiB), or
-            `0` or `None` for no limit.
+        tile_size_limit: Maximum raw (uncompressed) tile size in
+            bytes, a backstop behind `max_compressed_tile_size`
+            (default 2 MiB), or `0` or `None` for no limit.
         simple_clip_fastpath: Use faster clipping for simple polygons.
             `False` gives byte-stable output.
         partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves)
@@ -534,9 +534,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             neighbor, which keeps its own attributes; `"drop"` removes
             features, leaving holes. Point tiles use feature dropping in
             both modes.
-        max_compressed_tile_size: Maximum gzip-compressed tile size in
-            bytes, like tippecanoe's `-M` (default 500 KiB), or `0` for no
-            limit.
+        max_compressed_tile_size: Maximum gzip-compressed tile size
+            in bytes, like tippecanoe's `-M` (default 500 KiB), or `0`
+            for no limit.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.

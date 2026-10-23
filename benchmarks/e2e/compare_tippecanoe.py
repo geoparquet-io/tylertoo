@@ -57,7 +57,8 @@ self-contained; README.md "Settings parity" has the reasoning)
   --min-zoom Z --max-zoom Z               -Z Z -z Z
   --layer-name L                          -l L
   --tile-buffer 8                         -b 8        (tippecanoe default 5)
-  --max-tile-size 500000                  --maximum-tile-bytes 500000
+  --max-compressed-tile-size 500000       --maximum-tile-bytes 500000
+  --max-tile-size 0                       (no raw cap)
   (single-pass size valve, always on)     --drop-fraction-as-needed
   --verbatim --simplify-factor 1.0        (defaults: tippecanoe does not
                                            thin lines/polygons by rate)

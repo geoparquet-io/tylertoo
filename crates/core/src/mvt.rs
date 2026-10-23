@@ -1103,41 +1103,31 @@ fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
     if parts.len() < 2 {
         return parts;
     }
-    let pairs = interacting_pairs(&parts);
-    union_interacting(parts, &pairs)
+    union_interacting_with(parts, interacting_pairs, union_group)
 }
 
-/// Every pair of parts that interact ([`parts_interact`]); box-meeting
-/// pairs are the only candidates.
-fn interacting_pairs(parts: &[Vec<TileRing>]) -> Vec<(usize, usize)> {
+/// Feed `join` every pair of `parts` that interact ([`parts_interact`]), as
+/// they are found; box-meeting pairs are the only candidates.
+fn interacting_pairs(parts: &[Vec<TileRing>], join: &mut dyn FnMut(usize, usize)) {
     let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
-    let mut pairs = Vec::new();
     any_box_pair(&boxes, |i, j| {
         if parts_interact(&parts[i], &parts[j]) {
-            pairs.push((i, j));
+            join(i, j);
         }
         false
     });
-    pairs
 }
 
-/// [`resolve_part_overlaps`] once the interacting pairs are known: union
-/// each connected component of two or more parts, pass the rest through.
-/// The output depends only on which pairs interact, not on their order.
-fn union_interacting(parts: Vec<Vec<TileRing>>, pairs: &[(usize, usize)]) -> Vec<Vec<TileRing>> {
-    union_interacting_with(parts, pairs, union_group)
-}
-
-/// [`union_interacting`] with each component of two or more parts (indices
-/// into `parts`, ascending) turned into output pieces by `union`.
+/// [`resolve_part_overlaps`] with the interacting pairs fed by `pairs`, and
+/// each connected component of two or more parts (indices into `parts`,
+/// ascending) turned into output pieces by `union`; the rest pass through.
+/// The output depends only on which pairs interact, not on their order, and
+/// the pairs are joined as they come rather than stored.
 fn union_interacting_with(
     parts: Vec<Vec<TileRing>>,
-    pairs: &[(usize, usize)],
+    pairs: impl FnOnce(&[Vec<TileRing>], &mut dyn FnMut(usize, usize)),
     mut union: impl FnMut(&[usize], &[Vec<TileRing>]) -> Vec<Vec<TileRing>>,
 ) -> Vec<Vec<TileRing>> {
-    if pairs.is_empty() {
-        return parts;
-    }
     // Union-find over the parts.
     let mut root: Vec<usize> = (0..parts.len()).collect();
     fn find(root: &mut [usize], mut i: usize) -> usize {
@@ -1147,9 +1137,14 @@ fn union_interacting_with(
         }
         i
     }
-    for &(i, j) in pairs {
+    let mut joined = false;
+    pairs(&parts, &mut |i, j| {
         let (ri, rj) = (find(&mut root, i), find(&mut root, j));
         root[ri] = rj;
+        joined = true;
+    });
+    if !joined {
+        return parts;
     }
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
     for i in 0..parts.len() {
@@ -1219,11 +1214,20 @@ fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
 /// whichever pass asks, so a component the previous pass already unioned is
 /// not unioned again. [`Self::encode`] returns exactly what
 /// [`EncodedFeatureGeometry::encode`] returns for the merged geometry.
+/// How many touching pairs of parts, on average per part, a tile may have
+/// for [`QuantizedPolygons::new`] to cache it. A coverage has about six
+/// (each field touches its neighbours); heavily overlapping polygons can
+/// have thousands, and storing their pairs would cost more than re-encoding.
+const MAX_CANDIDATES_PER_PART: u32 = 64;
+
 pub(crate) struct QuantizedPolygons {
     /// Per feature, `None` when it is not polygonal.
     features: Vec<Option<QuantizedFeature>>,
     /// Every feature's cleaned parts, feature by feature.
     parts: Vec<Vec<TileRing>>,
+    /// Per part, its feature's merge key: parts with different keys are
+    /// never grouped, so they are never tested against each other.
+    keys: Vec<u64>,
     /// Per part, the parts with its merge key whose boxes meet its own, each
     /// with its pair's slot in [`Self::interacts`].
     candidates: Vec<Vec<(u32, u32)>>,
@@ -1258,11 +1262,17 @@ impl QuantizedPolygons {
     /// Quantize `features`, each a geometry and its merge key: features with
     /// different keys are never grouped, so their parts' interactions are
     /// not looked for.
+    ///
+    /// `None` when the tile has more touching pairs of parts than
+    /// [`MAX_CANDIDATES_PER_PART`] per part allows, as heavily overlapping
+    /// polygons can (scene footprints, buffers): their pairs grow with the
+    /// square of the part count, and the caller encodes such a tile without
+    /// the cache.
     pub(crate) fn new<'a>(
         features: impl IntoIterator<Item = (&'a Geometry, u64)>,
         bounds: &TileBounds,
         extent: u32,
-    ) -> Self {
+    ) -> Option<Self> {
         use rayon::prelude::*;
         let proj = TileProjector::new(bounds, extent);
         let (geometries, feature_keys): (Vec<&Geometry>, Vec<u64>) = features.into_iter().unzip();
@@ -1303,26 +1313,32 @@ impl QuantizedPolygons {
         }
         // The box-meeting pairs that share a key; the exact test waits until
         // a pass puts both parts in one feature.
+        let n = u32::try_from(parts.len()).ok()?;
+        let max_slots = MAX_CANDIDATES_PER_PART.saturating_mul(n.max(64));
         let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
         let mut candidates = vec![Vec::new(); parts.len()];
         let mut slots = 0u32;
-        any_box_pair(&boxes, |i, j| {
+        let too_many = any_box_pair(&boxes, |i, j| {
             if keys[i] == keys[j] {
                 candidates[i].push((j as u32, slots));
                 candidates[j].push((i as u32, slots));
                 slots += 1;
             }
-            false
+            slots > max_slots
         });
-        Self {
+        if too_many {
+            return None;
+        }
+        Some(Self {
             features,
             parts,
+            keys,
             candidates,
             interacts: (0..slots)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             unions: std::sync::Mutex::default(),
-        }
+        })
     }
 
     /// Do parts `a` and `b`, a candidate pair in `slot`, interact? Tested
@@ -1364,25 +1380,32 @@ impl QuantizedPolygons {
         parts: &[Vec<TileRing>],
         globals: &[usize],
     ) -> Vec<Vec<TileRing>> {
+        // Part indices fit in u32: `new` declines a tile with more parts.
         let key: Vec<u32> = group.iter().map(|&k| globals[k] as u32).collect();
-        {
+        // The lock is held only to look up and insert; the pieces, which can
+        // be most of a tile, are copied outside it.
+        let found = {
             let mut cache = self.unions.lock().expect("union cache");
             let found = match cache.current.get(&key) {
                 Some(u) => Some(std::sync::Arc::clone(u)),
                 None => cache.previous.get(&key).cloned(),
             };
-            if let Some(u) = found {
+            if let Some(u) = &found {
                 cache.hits += 1;
-                cache.current.insert(key, std::sync::Arc::clone(&u));
-                return u.as_ref().clone();
+                cache.current.insert(key.clone(), std::sync::Arc::clone(u));
             }
+            found
+        };
+        if let Some(u) = found {
+            return u.as_ref().clone();
         }
-        let pieces = union_group(group, parts);
-        let mut cache = self.unions.lock().expect("union cache");
-        cache
+        let pieces = std::sync::Arc::new(union_group(group, parts));
+        self.unions
+            .lock()
+            .expect("union cache")
             .current
-            .insert(key, std::sync::Arc::new(pieces.clone()));
-        pieces
+            .insert(key, std::sync::Arc::clone(&pieces));
+        pieces.as_ref().clone()
     }
 
     /// The encoded geometry of `group` (feature indices, the kept feature
@@ -1396,13 +1419,23 @@ impl QuantizedPolygons {
             .map(|&i| self.features[i].as_ref())
             .collect::<Option<_>>()?;
         let globals: Vec<usize> = feats.iter().flat_map(|f| f.parts.clone()).collect();
+        // Parts with different keys are never tested against each other, so
+        // a group that mixed keys would leave their overlaps unresolved.
+        debug_assert!(
+            globals
+                .windows(2)
+                .all(|w| self.keys[w[0]] == self.keys[w[1]]),
+            "a merged group spans merge keys"
+        );
         let polys: Vec<Vec<TileRing>> = globals.iter().map(|&g| self.parts[g].clone()).collect();
         let resolve = !matches!(feats[..], [only] if !only.multi);
         let polys = if resolve {
             let pairs = self.pairs_within(&globals);
-            union_interacting_with(polys, &pairs, |group, parts| {
-                self.union_cached(group, parts, &globals)
-            })
+            union_interacting_with(
+                polys,
+                |_, join| pairs.iter().for_each(|&(i, j)| join(i, j)),
+                |group, parts| self.union_cached(group, parts, &globals),
+            )
         } else {
             polys
         };
@@ -2202,7 +2235,8 @@ mod tests {
         geoms.push(Polygon::new(LineString::new(vec![]), vec![]).into()); // 18: empty
         geoms.push(line_string![(x: 0.1, y: 0.9), (x: 0.9, y: 0.9)].into()); // 19
 
-        let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096);
+        let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096)
+            .expect("a few overlaps");
         assert!(q.encode(&[19]).is_none(), "a line is not cached");
         assert!(q.encode(&[0, 19]).is_none(), "nor a group holding one");
         let polygonal: Vec<usize> = (0..19).collect();
@@ -2234,6 +2268,58 @@ mod tests {
             q.next_pass();
         }
         assert!(q.union_hits() > 0, "later passes reuse unions");
+    }
+
+    /// #758: a tile of heavily overlapping polygons has touching pairs in
+    /// the square of its part count; caching them would cost more than it
+    /// saves, so the cache declines the tile.
+    #[test]
+    fn quantized_polygons_decline_a_tile_of_overlapping_parts() {
+        let stacked: Vec<Geometry> = (0..300)
+            .map(|i| square(0.2 + 1e-4 * f64::from(i), 0.2, 0.3).into())
+            .collect();
+        assert!(
+            QuantizedPolygons::new(stacked.iter().map(|g| (g, 0)), &test_bounds(), 4096).is_none()
+        );
+        // A coverage of the same size is cached.
+        let grid: Vec<Geometry> = (0..300)
+            .map(|i| square(0.01 * f64::from(i % 20), 0.01 * f64::from(i / 20), 0.01).into())
+            .collect();
+        assert!(
+            QuantizedPolygons::new(grid.iter().map(|g| (g, 0)), &test_bounds(), 4096).is_some()
+        );
+    }
+
+    /// Features merge only within their merge key (band), so pairs across
+    /// keys are never tested; each group with one key still encodes exactly.
+    #[test]
+    fn quantized_polygons_keep_merge_keys_apart() {
+        let geoms: Vec<Geometry> = (0..6)
+            .map(|i| square(0.1 + 0.08 * f64::from(i), 0.1, 0.1).into())
+            .collect();
+        let q = QuantizedPolygons::new(
+            geoms.iter().enumerate().map(|(i, g)| (g, (i % 2) as u64)),
+            &test_bounds(),
+            4096,
+        )
+        .expect("a few overlaps");
+        for g in [vec![0, 2, 4], vec![1, 3, 5], vec![2, 4]] {
+            assert_eq!(q.encode(&g).unwrap(), merged_reference(&geoms, &g), "{g:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "spans merge keys")]
+    fn quantized_polygons_refuse_a_group_across_merge_keys() {
+        let geoms: Vec<Geometry> = vec![square(0.1, 0.1, 0.2).into(), square(0.2, 0.1, 0.2).into()];
+        let q = QuantizedPolygons::new(
+            geoms.iter().enumerate().map(|(i, g)| (g, i as u64)),
+            &test_bounds(),
+            4096,
+        )
+        .expect("two parts");
+        let _ = q.encode(&[0, 1]);
     }
 
     fn test_bounds() -> TileBounds {

@@ -1324,9 +1324,9 @@ fits. `--size-valve` chooses how:
 - `merge` (the default) merges the densest lines and polygons into the
   feature kept just before them, raising the merge threshold until the tile
   fits. See [what merging does to attributes](#what-merging-does-to-attributes).
-  A tile that shrinks too slowly to fit within a few more passes, which
-  happens when the merged features do not touch, merges everything it can
-  in one step instead.
+  A tile that twice in a row shrinks too slowly to fit within a few more
+  passes, which happens when the merged features do not touch, merges
+  everything it can in one step instead.
   If the tile still exceeds the cap after all possible merges, unmerged
   features are dropped, keeping the largest. Merged features are retained. A
   tile that is still over after that is written as it is, with a warning.

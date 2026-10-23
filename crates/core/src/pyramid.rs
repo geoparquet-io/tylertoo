@@ -1480,9 +1480,10 @@ impl Default for PyramidOptions {
             convert: ConvertOptions::default().verbatim(),
             // Every feature of an aggregate band must be drawn, so the default
             // per-tile size valve — which sheds features to fit a byte budget
-            // — is off, matching `tiles --verbatim`.
+            // — is off on both caps, matching `tiles --verbatim` (#761).
             export: ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..ExportOptions::default()
             },
             work_dir: None,
@@ -2576,6 +2577,11 @@ mod tests {
             PyramidOptions::default().export.tile_size_limit,
             None,
             "a size valve that sheds features is not verbatim either"
+        );
+        assert_eq!(
+            PyramidOptions::default().export.compressed_tile_size_limit,
+            None,
+            "nor is one on the compressed tile (#761 made it a default)"
         );
     }
 

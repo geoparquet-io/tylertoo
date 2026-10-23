@@ -59,10 +59,23 @@ def test_a_setting_can_override_the_dataset_caps(cfg):
 
 
 def test_a_cap_override_must_be_a_byte_count(cfg):
+    for value in ("500K", True, -1):
+        bad = copy.deepcopy(cfg)
+        bad["settings"]["raw500k"]["max_tile_size"] = value
+        with pytest.raises(run.ConfigError):
+            run.validate_config(bad)
+
+
+def test_an_external_setting_takes_no_caps(cfg):
     bad = copy.deepcopy(cfg)
-    bad["settings"]["raw500k"]["max_tile_size"] = "500K"
+    bad["settings"]["tippecanoe"]["max_tile_size"] = 512000
     with pytest.raises(run.ConfigError):
         run.validate_config(bad)
+
+
+def test_before_745_keeps_the_caps_of_its_time(cfg):
+    for ds in ("madagascar", "moldova"):
+        assert run.cell_caps(cfg, ds, "before-745") == (512000, 0)
 
 
 def test_every_dataset_pins_a_sha256(cfg):

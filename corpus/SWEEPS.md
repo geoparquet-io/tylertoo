@@ -406,7 +406,7 @@ compress roughly 2:1 (4:1 at `--simplify-factor 0`). The defaults are now
 backstop for clients, which decode the raw tile; tippecanoe has none.
 
 Measured with the coalesce benchmark (`benchmarks/coalesce/`, one repeat per
-cell, the binary of PR #758), against the committed `baseline/full.json`:
+cell, the binary of PR #770), against the committed `baseline/full.json`:
 
 | Input | Cap | Export | Merged features | Oversized tiles | PMTiles |
 |---|---|---|---|---|---|

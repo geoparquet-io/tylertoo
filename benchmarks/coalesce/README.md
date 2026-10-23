@@ -33,9 +33,11 @@ tippecanoe run, delete `<work>/tippecanoe/<dataset>-<key>/`. A run that a
 wall-time or memory cap stopped (`TIMEOUT`, `RSS_CAP`) isn't cached, so the
 next run tries it again.
 
-tippecanoe's `-M` caps the compressed tile. On Moldova (500K), this cap is
-looser than tylertoo's 500K raw cap. tippecanoe has no raw cap. tippecanoe
-writes its temporary files under `--work`, not `/tmp`.
+tippecanoe's `-M` caps the compressed tile, as tylertoo's default does since
+[#761](https://github.com/geoparquet-io/tylertoo/issues/761) (500,000 bytes
+against tylertoo's 512,000). tylertoo also caps the raw tile at 2M;
+tippecanoe has no raw cap. tippecanoe writes its temporary files under
+`--work`, not `/tmp`.
 
 Use `--only tile,report` to run only the named steps. The cache must already
 contain the output of any step you omit. Without the `fetch` step, the
@@ -161,10 +163,12 @@ the same PR. Copy `<work>/runs/<binary>/report-<profile>.json` and `.md` to
   feature gap threshold further` (exit 100). tylertoo finishes the same file
   in 9 s with the defaults, and in 2¼ min at factor 0. On NZ, tippecanoe
   takes 31 min 41 s, against 108 s for the tylertoo defaults (17.5×).
-- **tylertoo's default cap is stricter than tippecanoe's
-  ([#761](https://github.com/geoparquet-io/tylertoo/issues/761)).**
-  tippecanoe's `-M` caps the gzip-compressed tile; tylertoo's 500K default
-  caps the raw tile. On Moldova, this makes tylertoo's cap about 1.75× stricter.
+- **tylertoo's default cap was stricter than tippecanoe's
+  ([#761](https://github.com/geoparquet-io/tylertoo/issues/761), fixed in
+  #770).** tippecanoe's `-M` caps the gzip-compressed tile; tylertoo's 500K
+  default capped the raw tile, about 1.75× stricter on Moldova. The defaults
+  are now 500K compressed and 2M raw; the "500K raw (before #761)" column
+  keeps the old cap.
 - **End-to-end cost of the shipped defaults** compared with before #745:
 
   | Dataset | Defaults | `--simplify-factor 0.25` |

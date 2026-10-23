@@ -16,7 +16,7 @@ def convert(
     min_zoom: int = 0,
     max_zoom: int | Literal["auto"] = 14,
     layer_name: str | None = None,
-    tile_size_limit: int | None = 512000,
+    tile_size_limit: int | None = 2097152,
     simple_clip_fastpath: bool = True,
     feature_order: str = "input",
     spill_dir: str | Path | None = None,
@@ -25,7 +25,7 @@ def convert(
     exclude_properties: list[str] | None = None,
     exclude_all_properties: bool = False,
     size_valve: str = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512000,
 ) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
@@ -90,7 +90,7 @@ def export_pmtiles(
     layer_name: str = "overview",
     tile_buffer: int = 8,
     extent: int = 4096,
-    tile_size_limit: int | None = 512000,
+    tile_size_limit: int | None = 2097152,
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
     feature_order: str = "input",
@@ -104,7 +104,7 @@ def export_pmtiles(
     description: str | None = None,
     attribution: str | None = None,
     size_valve: str = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512000,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
 def decode(

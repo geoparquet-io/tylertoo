@@ -87,6 +87,9 @@ repeats = 2
 label = "Before #745"
 convert = ["--drop-polygons", "--drop-lines", "--polygon-thinning", "1", "--no-collapse"]
 valve = "drop"
+# The caps of that time, so the column stays the pre-#745 reference.
+max_tile_size = 512000
+max_compressed_tile_size = 0
 
 [settings.default]
 label = "Defaults"

@@ -3223,6 +3223,9 @@ fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions
         convert,
         export: ExportOptions {
             tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
+            // A band keeps every feature unless a cap is asked for; the
+            // compressed default (#761) is not one.
+            compressed_tile_size_limit: None,
             feature_order: args.feature_order.clone(),
             ..ExportOptions::default()
         },
@@ -4024,8 +4027,10 @@ mod tests {
         );
         let opts = pyramid_options(&parse_pyramid(&["--feature-order", "level:desc"]));
         assert_eq!(opts.export.feature_order, column("level", true));
-        // The rest of the export options are untouched by the new knob.
+        // The rest of the export options are untouched by the new knob, and
+        // a band keeps every feature: neither cap is on (#761).
         assert_eq!(opts.export.tile_size_limit, None);
+        assert_eq!(opts.export.compressed_tile_size_limit, None);
         assert_eq!(
             pyramid_options(&parse_pyramid(&["--feature-order", "level"]))
                 .export

@@ -286,13 +286,11 @@ pub struct ExportOptions {
     /// not a power of two is accepted with a warning, since the MVT spec only
     /// recommends one (#433).
     pub extent: u32,
-    /// Per-tile MVT size limit in **bytes**. When `Some(limit)` with
-    /// `limit > 0`, a tile whose encoded size exceeds the limit triggers the
-    /// single, non-iterative safety valve: `select_kept_members` chooses which
-    /// features survive (largest-first for sized geometries, uniform spatial
-    /// stride for point-dominated tiles — see that function) and the tile is
-    /// re-encoded once. When `None` (or `Some(0)`), no size limit is enforced
-    /// and `oversized_tiles` is always 0.
+    /// Per-tile limit on the **raw** MVT size, in bytes. When `Some(limit)`
+    /// with `limit > 0`, a tile whose encoded size exceeds it goes through the
+    /// size valve ([`Self::size_valve`]). `None` (or `Some(0)`) sets no raw
+    /// limit; only with [`Self::compressed_tile_size_limit`] also off is no
+    /// size limit enforced and `oversized_tiles` always 0.
     ///
     /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (2 MiB, a backstop
     /// behind the compressed limit; #761).
@@ -6017,7 +6015,8 @@ fn stalled(prev_fit: f64, fit: f64) -> bool {
 /// The merge valve (#745): merge members whose gap is below the threshold
 /// into the member kept before them, re-encode, and raise the threshold
 /// until the tile fits. See [`coalesce_valve`]. A tile that stops shrinking
-/// ([`stalled`]) merges everything it can at once (#758).
+/// ([`stalled`]) for two passes in a row merges everything it can at once
+/// (#758).
 ///
 /// A tile under its limit is encoded exactly as [`drop_to_fit`] would. When
 /// the threshold cannot rise any further and the tile is still over, the
@@ -6046,18 +6045,26 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
     // a pass puts both in one feature: on NZ Parcels under a 2 MB gzip cap,
     // where most oversized tiles fit on their second pass, testing every
     // touching pair up front cost 15% of the export.
-    let mut quantized: Option<crate::mvt::QuantizedPolygons> = None;
+    // Built once, on the first pass that merges; `Some(None)` when the tile
+    // has too many touching parts to cache, and is encoded plainly.
+    let mut quantized: Option<Option<crate::mvt::QuantizedPolygons>> = None;
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32| {
-        if pass == 1 {
+        // Pass 1 merges nothing, and a pass that still merges nothing (a
+        // tile with no mergeable gaps, on its way to the drop fallback) has
+        // nothing to reuse.
+        if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
             return build_mvt(feats, tb, opts);
         }
-        let q = quantized.get_or_insert_with(|| {
+        let cached = quantized.get_or_insert_with(|| {
             crate::mvt::QuantizedPolygons::new(
                 ordered.iter().map(|m| (&m.geom, u64::from(m.band))),
                 tb,
                 opts.extent,
             )
         });
+        let Some(q) = cached.as_mut() else {
+            return build_mvt(feats, tb, opts);
+        };
         q.next_pass();
         let q = &*q;
         build_mvt_with(feats, opts, |m| {
@@ -6069,6 +6076,7 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
     let mut mingap = 0u64;
     let mut keep_fraction = 1.0_f64;
     let mut prev_fit: Option<f64> = None;
+    let mut stalls = 0u32;
     let mut passes = 0u32;
     loop {
         passes += 1;
@@ -6095,10 +6103,18 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         // that would fit, with a 20% margin, never keeping more than 80%.
         keep_fraction = (keep_fraction * fit * 0.8).min(0.8);
         // #758: a tile that shrinks too slowly to fit within a few more
-        // passes at this rate merges everything it can in one step.
+        // passes, twice in a row, merges everything it can in one step. One
+        // slow pass is not enough: gzip barely rewards a pass that merges
+        // only a few features, so a tile just over a compressed cap can look
+        // stalled once and still fit a pass later.
         // DIVERGENCE FROM TIPPECANOE: tippecanoe keeps raising the threshold
         // one quantile at a time until it fits or runs out of gaps.
-        if prev_fit.is_some_and(|p| stalled(p, fit)) {
+        stalls = if prev_fit.is_some_and(|p| stalled(p, fit)) {
+            stalls + 1
+        } else {
+            0
+        };
+        if stalls >= 2 {
             keep_fraction = 0.0;
         }
         prev_fit = Some(fit);
@@ -11960,6 +11976,7 @@ mod tests {
             10,
             &ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..Default::default()
             },
         )
@@ -12006,6 +12023,28 @@ mod tests {
                 vertices < full_vertices / 2,
                 "{valve:?}: shared edges should dissolve ({vertices} vs {full_vertices})"
             );
+            // A coverage shrinks steadily as it merges, so the valve raises
+            // the threshold step by step and never jumps to merging all of
+            // it into one feature (#758).
+            assert!(features > 1, "{valve:?}: merged everything: {tally:?}");
+        }
+    }
+
+    /// #758: a pass that did not shrink the tile, or shrank it too slowly
+    /// to fit within [`MAX_PROJECTED_PASSES`] more, is a stall; a steady
+    /// shrink is not.
+    #[test]
+    fn stalled_tells_a_slow_shrink_from_a_steady_one() {
+        for (prev, fit, want) in [
+            (0.5, 0.5, true),   // no shrink
+            (0.5, 0.45, true),  // grew
+            (0.5, 0.52, true),  // ~17 more passes at this rate
+            (0.9, 0.91, true),  // ~9 more
+            (0.5, 0.7, false),  // ~1 more
+            (0.9, 0.98, false), // well under 1 more
+            (0.3, 0.6, false),  // ~0.7 more
+        ] {
+            assert_eq!(stalled(prev, fit), want, "{prev} -> {fit}");
         }
     }
 
@@ -12043,6 +12082,7 @@ mod tests {
             10,
             &ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..Default::default()
             },
         )
@@ -12094,6 +12134,7 @@ mod tests {
             10,
             &ExportOptions {
                 tile_size_limit: None,
+                compressed_tile_size_limit: None,
                 ..Default::default()
             },
         )
@@ -12111,7 +12152,8 @@ mod tests {
         .unwrap();
         let (_, area, _, features) = tile_area_stats(&tiles[0]);
         let v = tiles[0].valve;
-        assert!(v.passes <= 3, "the valve should stop inching: {v:?}");
+        // Two passes that barely shrink it, then one that merges everything.
+        assert!(v.passes <= 4, "the valve should stop inching: {v:?}");
         assert_eq!((features, v.merged), (1, 199), "everything merges: {v:?}");
         assert!(
             (area - full_area).abs() <= 1e-6 * full_area,
@@ -12215,10 +12257,11 @@ mod tests {
         let reader = OverviewReader::open(tmp.path()).unwrap();
         let feats = read_level_features(&reader, 1, Crs::Epsg4326).unwrap();
 
-        // No limit (explicit `None`, since the default is now 500 KiB): no
-        // oversized tiles.
+        // No limit (both caps off explicitly, since both are on by default):
+        // no oversized tiles.
         let no_limit = ExportOptions {
             tile_size_limit: None,
+            compressed_tile_size_limit: None,
             ..Default::default()
         };
         let none = encode_level_tiles(&feats, 6, &no_limit).unwrap();
