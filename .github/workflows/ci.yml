@@ -39,12 +39,13 @@
 #   pull_request    Test on ubuntu + macos stable; Slow Tests on ubuntu.
 #                   A PR that touches only docs (scripts/ci/docs_only.sh)
 #                   runs just Plan, Lint, Docs and the gate.
-#   merge_group     the merge queue: the same set as pull_request, on the
-#                   queue's commit (the PR on top of main and anything
-#                   queued ahead of it).
 #   push to main    everything: adds the beta Test lanes and the macOS Slow
 #                   Tests, so a macOS-only or beta break shows up on the
-#                   merge that caused it.
+#                   merge that caused it. This is also the backstop for two
+#                   PRs that pass apart and break together: there is no
+#                   merge queue (it re-ran every green PR for ~24 min, #756),
+#                   and the required checks are not strict, so a PR merges
+#                   without being rebased onto the latest main.
 #   workflow_dispatch  everything, on any branch. Run it on a PR that
 #                   changes pipeline internals, sharding, determinism or
 #                   platform-sensitive code, before merging.
@@ -71,8 +72,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The merge queue: required checks must report on the queue's commit too.
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -112,12 +111,12 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
+          if [ "$EVENT" = pull_request ] \
             && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
             code=false
           fi
 
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; then
+          if [ "$EVENT" = pull_request ]; then
             test_matrix='{"os":["ubuntu-latest","macos-latest"],"rust":["stable"]}'
             slow_os='["ubuntu-latest"]'
           else

@@ -39,8 +39,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The merge queue: required checks must report on the queue's commit too.
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -78,7 +76,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
+          if [ "$EVENT" = pull_request ] \
             && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
             code=false
           fi
