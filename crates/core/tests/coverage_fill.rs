@@ -300,8 +300,9 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
          valve passes {passes} for {tiles} tiles (fill off: {})",
         sum(&off, |z| z.valve_passes)
     );
+    eprintln!("{counts}");
     // Measured when the bounds were set: vertices 133,900, shed 9,850,
-    // passes 109 for 72 tiles (79 with the fill off; fitting the fill into
+    // passes 110 for 72 tiles (79 with the fill off; fitting the fill into
     // the room left counts its encodes). About 25% headroom.
     assert!(polygons > 0, "the fill drew nothing: {counts}");
     assert!(

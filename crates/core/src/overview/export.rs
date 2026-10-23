@@ -6167,7 +6167,9 @@ fn with_fill<M: TileFeature>(
     let mut by_area: Vec<usize> = (0..fill.len()).collect();
     by_area.sort_by(|&a, &b| fill[b].area.total_cmp(&fill[a].area).then(a.cmp(&b)));
     let mut keep = fill.len();
+    let mut tried = 0;
     for pass in 1..=MAX_FILL_PASSES {
+        tried = pass;
         let mut kept: Vec<usize> = by_area[..keep].to_vec();
         kept.sort_unstable();
         let subset: Vec<&FillFeature> = kept.iter().map(|&i| &fill[i]).collect();
@@ -6208,6 +6210,8 @@ fn with_fill<M: TileFeature>(
             break;
         }
     }
+    // None of the fill fit: the tile goes without, but its encodes count.
+    fitted.valve.passes += tried;
     no_fill(tally, fitted)
 }
 
@@ -9940,6 +9944,31 @@ mod tests {
             );
             assert!(tally.shed > 0 && tally.polygons > 0, "{valve:?}: {tally:?}");
         }
+    }
+
+    /// #750: a tile with no room for any of its fill is written without it,
+    /// and the encodes spent trying still count as valve passes, so the
+    /// work ratchets see them.
+    #[test]
+    fn fill_that_never_fits_still_counts_its_encodes() {
+        let (tb, members, fill) = crowded_tile();
+        let bare = encode_tile(
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &[],
+            &mut FillTally::default(),
+        );
+        let opts = ExportOptions {
+            tile_size_limit: Some(bare.data.len()),
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        let mut tally = FillTally::default();
+        let mvt = encode_tile(&members, &tb, &opts, &fill, &mut tally);
+        assert_eq!(mvt.data, bare.data, "the tile goes without its fill");
+        assert_eq!(tally.polygons, 0);
+        assert!(mvt.valve.passes > 1, "{:?}", mvt.valve);
     }
 
     /// #750: on a tile over its limit without the fill, the valve decides
