@@ -71,6 +71,7 @@ additional_cargo_args = [
   "--test", "overview_hostile",
   "--test", "overview_property_tests",
   "--test", "pmtiles_clustered",
+  "--test", "rayon_pool_reentry",
   "--test", "webmercator_roundtrip",
   "--test", "wrapped_log",
 ]

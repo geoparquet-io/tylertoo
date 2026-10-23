@@ -39,8 +39,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The merge queue: required checks must report on the queue's commit too.
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -55,10 +53,11 @@ env:
   GO_PMTILES_VERSION: "1.31.2"
 
 jobs:
-  # Docs-only PRs skip this workflow's job: nothing it builds or reads can
-  # change (scripts/ci/docs_only.sh holds the rule; ci.yml's plan job uses
-  # the same one). A job skipped by `if:` reports "skipped" under its own
-  # name, which satisfies the required check.
+  # Docs-only and Python-only PRs skip this workflow's job: nothing it
+  # builds or reads can change (scripts/ci/python_only.sh holds the rule,
+  # docs included; ci.yml's plan job uses the same one). A job skipped by
+  # `if:` reports "skipped" under its own name, which satisfies the
+  # required check.
   changes:
     name: Changes
     runs-on: ubuntu-latest
@@ -72,14 +71,14 @@ jobs:
           # HEAD^1 (the base tip) for the docs-only diff below.
           fetch-depth: 2
 
-      - name: Code or docs only?
+      - name: Rust code, or only docs and Python?
         id: changes
         env:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
-            && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
+          if [ "$EVENT" = pull_request ] \
+            && git diff --name-only HEAD^1 HEAD | scripts/ci/python_only.sh; then
             code=false
           fi
           echo "code=$code" | tee -a "$GITHUB_OUTPUT"

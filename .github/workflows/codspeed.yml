@@ -12,20 +12,22 @@
 #                 scripts/codspeed_benches.sh. CodSpeed reports the others
 #                 as "skipped" with their baseline numbers (partial runs).
 #                 A PR touching no benched code skips every step and passes.
-#   push (main)   every bench, on every push: these runs are the baselines,
-#                 and a bench skipped here would compare PRs against stale
-#                 numbers.
+#   push (main)   every bench, on pushes that touch the same paths plus
+#                 Cargo.lock: these runs are the baselines. A push that
+#                 touches none of them can't move a bench, and CodSpeed
+#                 compares PRs against the newest main commit with a run.
 #
 # The benches build against `codspeed-criterion-compat` (renamed to
 # `criterion` in crates/core/Cargo.toml), so their code is unchanged and plain
-# `cargo bench` still runs ordinary criterion locally and in bench.yml.
+# `cargo bench` still runs ordinary criterion locally and in
+# bench-regression.yml.
 #
 # Bench set: scripts/criterion_compare.sh --list, the same gated set as the
 # regression job (`assign_scaling` is a wall-clock harness, not criterion).
 #
-# bench-regression.yml stays as the wall-clock cross-check behind the
-# `benchmark` label: instruction counts miss effects such as memory-bandwidth
-# or thread-scaling changes that only show up in time.
+# bench-regression.yml is the wall-clock cross-check, behind the `benchmark`
+# label and weekly on main: instruction counts miss effects such as
+# memory-bandwidth or thread-scaling changes that only show up in time.
 #
 # Auth: OIDC (`id-token: write`), no token secret; this needs the CodSpeed
 # GitHub app installed on the repo. See DEVELOPMENT.md, "CodSpeed".
@@ -35,6 +37,20 @@ name: CodSpeed
 on:
   pull_request:
     # Keep in step with GLOBAL and the bench map in scripts/codspeed_benches.sh.
+    # No Cargo.lock: a lockfile-only PR (Dependabot, an advisory bump) is
+    # measured by the run on main after it merges (#759).
+    paths:
+      - "crates/core/**"
+      - "Cargo.toml"
+      - ".github/workflows/codspeed.yml"
+      - "scripts/criterion_compare.sh"
+      - "scripts/codspeed_benches.sh"
+  # Main runs every bench, but only when benched code changed: CodSpeed
+  # compares a PR against the newest base commit that has a run, so a push
+  # that touches none of this needs no new baseline. Cargo.lock is here,
+  # unlike on PRs, so a dependency bump still gets measured.
+  push:
+    branches: [main]
     paths:
       - "crates/core/**"
       - "Cargo.toml"
@@ -42,17 +58,17 @@ on:
       - ".github/workflows/codspeed.yml"
       - "scripts/criterion_compare.sh"
       - "scripts/codspeed_benches.sh"
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
 
+# PRs cancel superseded runs. Main never does: each main run is the baseline
+# for the PRs after it, and cancelling one left merges unmeasured.
 concurrency:
   group: codspeed-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -115,7 +131,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       # Own key: cargo-codspeed builds into target/codspeed with its own
-      # instrumentation cfg, so sharing bench.yml's entry would only thrash it.
+      # instrumentation cfg, so sharing another bench job's entry would only
+      # thrash it. .crates.toml/.crates2.json are cargo's record of the
+      # installed cargo-codspeed; without them the next step can't tell the
+      # cached binary is the pinned version.
       - name: Cache cargo
         if: steps.select.outputs.benches != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -124,6 +143,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/cargo-codspeed
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             target
           key: ${{ runner.os }}-cargo-codspeed-${{ hashFiles('**/Cargo.lock') }}
 
@@ -131,7 +152,9 @@ jobs:
       - name: Install cargo-codspeed
         if: steps.select.outputs.benches != ''
         run: |
-          if [ "$(cargo codspeed --version 2>/dev/null)" != "cargo-codspeed 5.0.3" ]; then
+          installed=$(cargo codspeed --version 2>&1 || true)
+          echo "Found: ${installed:-nothing}"
+          if [ "$installed" != "cargo-codspeed 5.0.3" ]; then
             cargo install cargo-codspeed --version 5.0.3 --locked --force
           fi
 

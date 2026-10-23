@@ -125,8 +125,23 @@ full set on a branch before merging, start the CI workflow by hand
 that call for `full` locally.
 
 A pull request that changes only docs skips the Rust and Python jobs;
-`scripts/ci/docs_only.sh` decides. Branch protection requires one CI
-check, `CI passed`, which fails when any other CI job fails.
+`scripts/ci/docs_only.sh` decides. One that changes only docs and the
+Python side (`crates/python/` outside its Rust `src/`, and `examples/`)
+runs the Python jobs and Docs but skips the Rust jobs, Archive e2e and
+tippecanoe parity; `scripts/ci/python_only.sh` decides.
+
+Branch protection requires three checks: `CI passed` (fails when any
+other CI job fails), `Archive e2e (independent readers)` and
+`tippecanoe parity`. The checks are not strict, so a green PR merges
+without first being brought up to date with `main`, and there is no
+merge queue: the push to `main` runs the full set and catches two PRs
+that pass apart and break together.
+
+The Python jobs and Docs build the extension and the CLI with the `ci`
+Cargo profile: release settings without fat LTO, so the link isn't one
+long serial step. Wheels, release binaries, Archive e2e and tippecanoe
+parity keep `release`. Build caches are saved from `main` only; PRs
+restore them.
 
 To reproduce one shard, take its filter from the Slow Tests job in
 `.github/workflows/ci.yml`:
@@ -201,6 +216,7 @@ panics instead, so a gated run can't compare nothing.
 | `clipping` | Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile |
 | `bbox_containment` | Bounding-box containment fast paths |
 | `tile_compress_dedup` | Per-tile gzip and the XXH3 tile-content dedup cache |
+| `pipeline` | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end |
 
 Run one:
 
@@ -210,7 +226,7 @@ open target/criterion/report/index.html
 ```
 
 `scripts/criterion_compare.sh --list` prints the gated set. Run the
-whole set, as the Benchmark workflow does on each push to `main`:
+whole set:
 
 ```bash
 for b in $(scripts/criterion_compare.sh --list); do
@@ -250,10 +266,11 @@ only what it can move:
   the benches whose code they touch, and only those build and run.
   CodSpeed reports the rest as "skipped", with their baseline numbers.
   A PR that touches only code no bench covers passes without building.
-- A change to `Cargo.lock`, a manifest, the crate root, the bench
-  harness, or the workflow runs every bench.
-- Every push to `main` runs every bench, so each bench keeps a current
-  baseline.
+- A change to a manifest, the bench harness, or the workflow runs every
+  bench. A `Cargo.lock`-only PR doesn't start the workflow.
+- A push to `main` that touches the same paths, or `Cargo.lock`, runs
+  every bench. Those runs are the baselines; CodSpeed compares a PR
+  against the newest `main` commit that has one.
 
 The map in `scripts/codspeed_benches.sh` is kept by hand: each bench's
 entry modules and their direct dependencies. A change that moves a bench
@@ -293,19 +310,24 @@ runner, base revision first and head second, and gates the difference.
 A baseline from another VM would mostly measure the VM. Two runs on one
 machine, minutes apart, give a comparison that shared runners support.
 
-The gate runs in these cases, never on a schedule:
+The gate runs in these cases:
 
-- On each PR that changes `crates/core/`, `Cargo.toml`, `Cargo.lock`, or
-  the gate's own workflow and scripts. No label is needed. The
-  workflow's `changes` job holds the path list.
-- On any other PR with the **`benchmark` label**. Adding the label
-  starts it, and later pushes rerun it while the label stays.
+- On a PR with the **`benchmark` label**. Adding the label starts it,
+  and later pushes rerun it while the label stays. Add it to a PR that
+  changes threading, I/O, or memory behaviour, which CodSpeed's
+  instruction counts can't see. The base is the merge-base with the
+  PR's base branch.
+- Every Monday on `main`, against the last `main` commit at least seven
+  days old. The table goes to the pinned "Weekly benchmark comparison"
+  issue as one comment a week. A week with no new commits skips.
 - On `workflow_dispatch`, with an optional `base` input. Without one, a
   run on `main` compares against the newest `v*` release tag, and a run
   on another branch against its merge-base with `origin/main`.
 
-On a PR the base is the merge-base with the PR's base branch. A run
-takes 41 to 48 minutes of runner time.
+It used to run on every PR that touched `crates/core/`. In 62 runs it
+caught one real change and failed seven times on noise (#759), at about
+45 minutes a run. Pass `--markdown <path>` to `criterion_gate.py` to
+get the table the workflow posts.
 
 `scripts/criterion_compare.sh <base-rev>` does the two runs, the base
 in a temporary git worktree. It writes to `target/criterion-compare/`,
@@ -760,12 +782,16 @@ Every PR gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
 check "Mutation score (diff-scoped)"). It runs
 `cargo mutants --package tylertoo-core --in-diff` on the PR's diff
 against `origin/main`, so it tests only the mutants inside changed core
-lines. A typical PR yields a few dozen mutants and takes ten to twenty
-minutes, most of it the cold baseline build.
+lines. The mutants are split across up to four runners, about twelve
+each, so a diff of up to ~50 mutants finishes in about 15 minutes. One
+runner used to take 40 minutes for 65 mutants and time out past ~130.
+A bigger diff gets a random sample instead: each runner takes its share
+from across the whole diff in shuffled order and stops after 20 minutes,
+and the summary says how many of the planned mutants ran.
 
 The score and the missed mutants (`file:line`) go to the job summary. A
 same-repo PR with missed mutants also gets one sticky comment, updated
-on every push. A PR that touches no Rust under `crates/core/` skips the
+on every push. Missed mutants from a sampled run are posted too. A PR that touches no Rust under `crates/core/` skips the
 run, and a diff with no mutation site reports "no mutants in this diff".
 
 `scripts/mutants-diff.sh` is the local twin. It also covers uncommitted

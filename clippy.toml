@@ -19,6 +19,7 @@ too-many-lines-threshold = 200
 # written as prose. ".." keeps clippy's built-in list (GitHub, JavaScript, ...).
 doc-valid-idents = [
     "..",
+    "CodSpeed",
     "DuckDB",
     "ETag",
     "GeoArrow",

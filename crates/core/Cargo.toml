@@ -158,6 +158,10 @@ name = "tile_compress_dedup"
 harness = false
 
 [[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
 name = "assign_scaling"
 harness = false
 

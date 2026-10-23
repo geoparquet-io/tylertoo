@@ -22,7 +22,7 @@
 #      artifact, and on a scheduled/manual failure opens (or updates) an
 #      issue labelled `tippecanoe-parity` so a drift has an owner.
 #
-# Runs on every PR, in the merge queue, and on push to main (the push is
+# Runs on every PR and on push to main (the push is
 # what makes the tippecanoe and cargo caches available to PR runs — caches
 # made on a PR branch are private to it), weekly against main so an
 # upstream-independent drift (a runner image change, a dependency bump that
@@ -45,8 +45,6 @@ on:
   # Every PR, whatever its base: a stacked PR changes what lands on main
   # just as much as one opened against it, and the gate is cheap enough.
   pull_request:
-  # The merge queue: required checks must report on the queue's commit too.
-  merge_group:
   schedule:
     # Every Monday at 07:00 UTC (an hour after the security audit).
     - cron: '0 7 * * 1'
@@ -63,10 +61,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Docs-only PRs skip this workflow's job: nothing it builds or reads can
-  # change (scripts/ci/docs_only.sh holds the rule; ci.yml's plan job uses
-  # the same one). A job skipped by `if:` reports "skipped" under its own
-  # name, which satisfies the required check.
+  # Docs-only and Python-only PRs skip this workflow's job: nothing it
+  # builds or reads can change (scripts/ci/python_only.sh holds the rule,
+  # docs included; ci.yml's plan job uses the same one). A job skipped by
+  # `if:` reports "skipped" under its own name, which satisfies the
+  # required check.
   changes:
     name: Changes
     runs-on: ubuntu-latest
@@ -80,14 +79,14 @@ jobs:
           # HEAD^1 (the base tip) for the docs-only diff below.
           fetch-depth: 2
 
-      - name: Code or docs only?
+      - name: Rust code, or only docs and Python?
         id: changes
         env:
           EVENT: ${{ github.event_name }}
         run: |
           code=true
-          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
-            && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
+          if [ "$EVENT" = pull_request ] \
+            && git diff --name-only HEAD^1 HEAD | scripts/ci/python_only.sh; then
             code=false
           fi
           echo "code=$code" | tee -a "$GITHUB_OUTPUT"
@@ -183,12 +182,11 @@ jobs:
           if-no-files-found: ignore
 
       - name: Open or update the parity issue
-        # Not on PR or merge-queue runs: their failure is the PR's red
-        # check, and an issue per red PR would be noise.
+        # Not on PR runs: their failure is the PR's red check, and an issue
+        # per red PR would be noise.
         if: >-
           steps.compare.outcome == 'failure'
           && github.event_name != 'pull_request'
-          && github.event_name != 'merge_group'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

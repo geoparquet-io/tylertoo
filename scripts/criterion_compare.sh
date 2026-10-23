@@ -28,7 +28,7 @@
 # maps source paths to these names for CodSpeed's per-PR selection.
 set -euo pipefail
 
-BENCHES="${CRITERION_BENCHES:-clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup}"
+BENCHES="${CRITERION_BENCHES:-clipping bbox_containment pass1_decode assign simplify_cascade mvt_encode tile_compress_dedup pipeline}"
 
 if [ $# -lt 1 ]; then
   sed -n '2,25p' "$0"

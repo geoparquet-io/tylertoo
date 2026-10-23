@@ -9,29 +9,34 @@
 #
 # Base revision:
 #   pull_request        merge-base of the PR head and its base branch.
+#   schedule            the last main commit at least 7 days old: a
+#                       week-over-week comparison, both sides on one VM. A
+#                       week with no new commits skips the run.
 #   workflow_dispatch   the `base` input if given; otherwise, on main, the
 #                       latest v* release tag before HEAD ("what changed since
 #                       the last release"); on any other branch, its merge-base
 #                       with origin/main.
 #
-# Triggers (#678):
-#   pull_request        every PR that changes what the benches measure: the
-#                       paths in BENCHED below (crates/core, the build, this
-#                       gate's own workflow and scripts). The `changes` job
-#                       decides; a PR touching none of them skips the gate.
-#                       The `benchmark` label still starts it on any PR
-#                       (applying the label starts it; later pushes re-run it
-#                       while the label stays).
+# Triggers (#759):
+#   pull_request        only with the `benchmark` label. Applying the label
+#                       starts it; later pushes re-run it while the label
+#                       stays. It used to run on every crates/core PR (#678):
+#                       ~45 min a push, one real catch in 62 runs and seven
+#                       false reds, and never a required check. CodSpeed
+#                       (codspeed.yml) is the per-PR signal; label a PR that
+#                       changes threading, I/O or memory behaviour, which
+#                       instruction counts can't see.
+#   schedule            Mondays, on main. The table goes to the pinned
+#                       "Weekly benchmark comparison" issue, one comment a
+#                       week, so the history stays readable in one place.
+#                       This replaced bench.yml's per-push criterion run, whose
+#                       numbers compared different VMs and which nothing read.
 #   workflow_dispatch   manual, with the optional `base` input.
-# The paths are checked in a job rather than with an `on.pull_request.paths`
-# filter: that filter applies to `labeled` events too, so the label could
-# never start the gate on a PR outside the paths. There is no schedule:
-# main-vs-main on a timer compares a revision against itself and only
-# measures noise. Kept in its own workflow so label events don't re-run
-# bench.yml's convert-guard.
+# The label is checked in the job's `if:` rather than with `on.pull_request`
+# filters, which can't select on labels.
 #
 # Cost: one run is 41-48 min of ubuntu-latest (#432, and the #678 A/A runs;
-# almost all of it the two bench passes), on PRs that touch BENCHED only.
+# almost all of it the two bench passes), before the sample cuts in #759.
 #
 # Gate: see the "Check for regressions" step for the thresholds and the
 # noise data behind them, and DEVELOPMENT.md, "Criterion regression gate".
@@ -41,6 +46,9 @@ name: Bench regression
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # Mondays at 04:00 UTC, before the 07:00 parity run.
+    - cron: '0 4 * * 1'
   workflow_dispatch:
     inputs:
       base:
@@ -66,58 +74,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  changes:
-    name: Benched paths changed?
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    outputs:
-      benched: ${{ steps.diff.outputs.benched }}
-    steps:
-      # Depth 2: on a PR, HEAD is GitHub's merge commit and HEAD^1 the base
-      # branch tip, so `git diff HEAD^1 HEAD` is exactly the PR's change.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-
-      - name: Diff against the base branch
-        id: diff
-        run: |
-          # BENCHED: what the benches measure, or how they are run and gated.
-          # Wider than codspeed.yml's per-bench selection on purpose: any
-          # crates/core change runs every bench, so a regression that reaches
-          # a bench through some distant module is still caught on the PR.
-          BENCHED='^(crates/core/.*|Cargo\.toml|Cargo\.lock|\.github/workflows/bench-regression\.yml|scripts/criterion_compare\.sh|scripts/criterion_gate\.py)$'
-          changed=$(git diff --name-only HEAD^1 HEAD)
-          echo "Changed files:"
-          sed 's/^/  /' <<<"$changed"
-          if grep -qE "$BENCHED" <<<"$changed"; then
-            echo "benched=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "No benched path changed; the gate skips unless the PR has the benchmark label."
-            echo "benched=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  criterion-regression:
-    name: Criterion regression gate
-    needs: changes
-    runs-on: ubuntu-latest
-    # Dispatch: always. PR: when it changes a benched path or carries the
-    # `benchmark` label. A `labeled` event runs it only when that label is
-    # `benchmark` (any other label changes nothing worth re-benching).
-    # `!cancelled()` because a dispatch skips `changes`, and a skipped need
-    # would otherwise skip this job too.
+  # Resolves the base revision (see the header) in a small job, so a week
+  # with no new commits on main skips the bench job instead of failing it.
+  base:
+    name: Resolve base revision
+    # PR: only with the `benchmark` label. A `labeled` event runs it only
+    # when that label is `benchmark` (any other label changes nothing worth
+    # re-benching).
     if: >-
-      !cancelled() &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'benchmark') ||
-       (github.event.action != 'labeled' &&
-        (needs.changes.outputs.benched == 'true' ||
-         contains(github.event.pull_request.labels.*.name, 'benchmark'))))
-    timeout-minutes: 90
-    env:
-      TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
-      CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'benchmark') ||
+      (github.event.action != 'labeled' &&
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.base.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,6 +108,12 @@ jobs:
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base=$(git merge-base "$PR_BASE_SHA" HEAD)
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            base=$(git rev-list -1 --before='7 days ago' HEAD)
+            if [ -z "$base" ] || [ "$base" = "$(git rev-parse HEAD)" ]; then
+              echo "::notice::no commits on main in the last 7 days; nothing to compare"
+              exit 0
+            fi
           elif [ -n "$INPUT_BASE" ]; then
             base=$(git rev-parse --verify "${INPUT_BASE}^{commit}")
           elif [ "$REF_NAME" = "main" ]; then
@@ -150,6 +128,22 @@ jobs:
           fi
           echo "Comparing base $base -> head $(git rev-parse HEAD)"
           echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+  criterion-regression:
+    name: Criterion regression gate
+    needs: base
+    if: needs.base.outputs.sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TYLERTOO_BENCH_REQUIRE_FIXTURES: "1"
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion-compare
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Cache test fixtures
         id: fixture-cache
@@ -175,10 +169,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      # Own key: this job builds two revisions into one target dir, so it must
-      # not share (or overwrite) bench.yml's cache entry. Criterion output goes
-      # to CRITERION_HOME, which criterion_compare.sh wipes before running, so
-      # a restored target/ can't leak old results into the comparison.
+      # Own key: this job builds two revisions into one target dir. The weekly
+      # run saves it from main, where label runs on PRs can restore it.
+      # Criterion output goes to CRITERION_HOME, which criterion_compare.sh
+      # wipes before running, so a restored target/ can't leak old results
+      # into the comparison.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -187,10 +182,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-bench-regression-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-regression-
 
       - name: Run benches at base, then head
         env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_SHA: ${{ needs.base.outputs.sha }}
         run: |
           rm -rf target/criterion target/criterion-compare
           scripts/criterion_compare.sh "$BASE_SHA"
@@ -220,7 +216,19 @@ jobs:
           python3 scripts/criterion_gate.py --check
           --criterion-dir "$CRITERION_HOME" --baseline base --warn 10 --fail 10
           --noisy 'sutherland_hodgman/*' --noisy 'wide_polygon_clip/sutherland_hodgman/*'
-          --noisy-fail 50
+          --noisy-fail 50 --markdown "$CRITERION_HOME/report.md"
+
+      - name: Job summary
+        if: always()
+        env:
+          BASE_SHA: ${{ needs.base.outputs.sha }}
+        run: |
+          [ -f "$CRITERION_HOME/report.md" ] || exit 0
+          {
+            echo "## Criterion: \`${BASE_SHA:0:10}\` → \`$(git rev-parse --short=10 HEAD)\`"
+            echo
+            cat "$CRITERION_HOME/report.md"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload comparison report
         if: always()
@@ -228,3 +236,78 @@ jobs:
         with:
           name: criterion-regression-report
           path: target/criterion-compare/
+
+  # Weekly run: one comment with the table on the pinned tracking issue, so
+  # the history is in one place and nobody has to open job summaries.
+  # Posted whether or not the gate failed; a failure is the interesting week.
+  report:
+    name: Post the weekly table
+    needs: [base, criterion-regression]
+    if: >-
+      always() && github.event_name == 'schedule'
+      && (needs.criterion-regression.result == 'success'
+          || needs.criterion-regression.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # No artifact when the bench job failed before writing any results
+      # (fixture download, protoc, the build): carry on, so the comment
+      # below still posts that week's failed run and its link.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: criterion-regression-report
+          path: report
+
+      - name: Comment on the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_SHA: ${{ needs.base.outputs.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          RESULT: ${{ needs.criterion-regression.result }}
+        run: |
+          TITLE="Weekly benchmark comparison"
+          BODY="Each Monday, bench-regression.yml runs the criterion benches at
+          last week's main and at today's on one runner, and comments the table
+          here. Numbers within a table are comparable; numbers across weeks are
+          from different runners and are not.
+
+          To dig into a week: \`scripts/criterion_compare.sh <base>\` locally
+          (DEVELOPMENT.md, \"Criterion regression gate\").
+
+          ---
+          _Managed by .github/workflows/bench-regression.yml; it comments,
+          never edits this text._"
+
+          if [ -f report/report.md ]; then
+            TABLE=$(cat report/report.md)
+          else
+            TABLE="_No table: the run failed before the gate step._"
+          fi
+          COMMENT="### \`${BASE_SHA:0:10}\` → \`${HEAD_SHA:0:10}\` (gate: $RESULT)
+
+          $TABLE
+
+          Run: $RUN_URL"
+
+          # Match on the exact title, not the label: `benchmark` also labels
+          # PRs and other issues.
+          EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" \
+            --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          if [ -z "$EXISTING" ]; then
+            NEW_URL=$(gh issue create --title "$TITLE" --label benchmark --body "$BODY")
+            EXISTING=${NEW_URL##*/}
+            # Pin it so it stays visible (best effort; needs no extra scope).
+            ISSUE_ID=$(gh api "repos/$GH_REPO/issues/$EXISTING" --jq .node_id)
+            # shellcheck disable=SC2016  # $id is a GraphQL variable, not shell
+            gh api graphql -f query='
+              mutation($id: ID!) { pinIssue(input: {issueId: $id}) { issue { number } } }' \
+              -f id="$ISSUE_ID" || true
+          fi
+          gh issue comment "$EXISTING" --body "$COMMENT"

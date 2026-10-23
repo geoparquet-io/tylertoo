@@ -38,19 +38,31 @@
 # spent most of its hour queued, so PRs run a smaller set:
 #   pull_request    Test on ubuntu + macos stable; Slow Tests on ubuntu.
 #                   A PR that touches only docs (scripts/ci/docs_only.sh)
-#                   runs just Plan, Lint, Docs and the gate.
-#   merge_group     the merge queue: the same set as pull_request, on the
-#                   queue's commit (the PR on top of main and anything
-#                   queued ahead of it).
+#                   runs just Plan, Lint, Docs and the gate. One that
+#                   touches only docs and the Python side
+#                   (scripts/ci/python_only.sh: crates/python outside its
+#                   Rust, examples/) also runs the Python jobs, and skips
+#                   Check, Test, Slow Tests, Coverage and Lint's Rust steps.
 #   push to main    everything: adds the beta Test lanes and the macOS Slow
 #                   Tests, so a macOS-only or beta break shows up on the
-#                   merge that caused it.
+#                   merge that caused it. This is also the backstop for two
+#                   PRs that pass apart and break together: there is no
+#                   merge queue (it re-ran every green PR for ~24 min, #756),
+#                   and the required checks are not strict, so a PR merges
+#                   without being rebased onto the latest main.
 #   workflow_dispatch  everything, on any branch. Run it on a PR that
 #                   changes pipeline internals, sharding, determinism or
 #                   platform-sensitive code, before merging.
 # A job skipped on purpose reports "skipped", which `CI passed` accepts.
 #
-# Benchmarks run in bench.yml (push to main / manual); mutation testing runs
+# CACHES. Each job restores its target/ cache (exact key, else the newest
+# entry by prefix, so a Cargo.lock bump starts warm), and only main saves:
+# PR refs writing ~1 GB entries pushed the repo past its 10 GB cache cap
+# and evicted main's, which PRs restore from (#756). The beta lanes run
+# only on main against a moving toolchain, so they don't cache target/.
+#
+# Benchmarks run in codspeed.yml (per PR) and bench-regression.yml (label,
+# weekly); mutation testing runs
 # in mutation-tests.yml (weekly); the tippecanoe parity gate (#420) runs in
 # tippecanoe-compare.yml (PRs, push to main, weekly).
 #
@@ -71,8 +83,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The merge queue: required checks must report on the queue's commit too.
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -97,6 +107,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.plan.outputs.code }}
+      rust: ${{ steps.plan.outputs.rust }}
       test_matrix: ${{ steps.plan.outputs.test_matrix }}
       slow_matrix: ${{ steps.plan.outputs.slow_matrix }}
     steps:
@@ -111,13 +122,22 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
+          # code: anything beyond docs (runs the Python jobs).
+          # rust: anything beyond docs and the Python side (runs the Rust
+          # jobs too). See scripts/ci/{docs,python}_only.sh.
           code=true
-          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; } \
-            && git diff --name-only HEAD^1 HEAD | scripts/ci/docs_only.sh; then
-            code=false
+          rust=true
+          if [ "$EVENT" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            if scripts/ci/docs_only.sh <<<"$changed"; then
+              code=false
+            fi
+            if scripts/ci/python_only.sh <<<"$changed"; then
+              rust=false
+            fi
           fi
 
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = merge_group ]; then
+          if [ "$EVENT" = pull_request ]; then
             test_matrix='{"os":["ubuntu-latest","macos-latest"],"rust":["stable"]}'
             slow_os='["ubuntu-latest"]'
           else
@@ -128,6 +148,7 @@ jobs:
 
           {
             echo "code=$code"
+            echo "rust=$rust"
             echo "test_matrix=$test_matrix"
             echo "slow_matrix=$slow_matrix"
           } | tee -a "$GITHUB_OUTPUT"
@@ -136,8 +157,9 @@ jobs:
   check:
     name: Check
     needs: plan
-    if: needs.plan.outputs.code == 'true'
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,7 +213,8 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
@@ -250,14 +273,23 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked --lib --all-features
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo build cache
+        if: always() && github.ref == 'refs/heads/main' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
   # Full test suite
   # The matrix comes from the plan job: ubuntu + macos stable on PRs, plus
   # beta on main (see "WHAT RUNS WHEN" in the header).
   test:
     name: Test
     needs: plan
-    if: needs.plan.outputs.code == 'true'
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix: ${{ fromJSON(needs.plan.outputs.test_matrix) }}
     steps:
@@ -298,10 +330,13 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: matrix.rust == 'stable'
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -369,6 +404,14 @@ jobs:
         if: runner.os == 'Linux' && matrix.rust == 'stable'
         run: scripts/mutants-test-binaries.sh --check
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo build cache
+        if: always() && github.ref == 'refs/heads/main' && matrix.rust == 'stable' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
   # Slow Tests: the slow set, split three ways per OS.
   #
   # What runs: the slow end-to-end tests that the `quick` nextest profile
@@ -399,8 +442,9 @@ jobs:
   slow-tests:
     name: Slow Tests (${{ matrix.os }}, ${{ matrix.shard }})
     needs: plan
-    if: needs.plan.outputs.code == 'true'
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.slow_matrix) }}
@@ -444,7 +488,8 @@ jobs:
       - name: Cache cargo build
         # Same key as the Test (<os>, stable) lane: same build, so this job
         # starts from a warm target/ and compiles almost nothing.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-stable-cargo-build-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
@@ -480,6 +525,14 @@ jobs:
           cargo nextest run --locked --all-features \
             --ignore-default-filter -E "not default() & ($shard)"
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo build cache
+        if: always() && github.ref == 'refs/heads/main' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+
   # Python bindings: strict lint/type/dead-code/complexity/security gates.
   # Everything runs through uv against the committed uv.lock.
   python-quality:
@@ -487,6 +540,10 @@ jobs:
     needs: plan
     if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # maturin builds the extension with [profile.ci] (Cargo.toml).
+      MATURIN_PEP517_ARGS: --profile ci
     defaults:
       run:
         working-directory: crates/python
@@ -506,12 +563,15 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo (pyo3 build)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -585,6 +645,17 @@ jobs:
           uv export --no-emit-project --format requirements-txt -o /tmp/requirements.txt
           uv run pip-audit -r /tmp/requirements.txt --disable-pip
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo cache (pyo3 build)
+        if: always() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # The binding's pytest suite on the other two wheel platforms (#678).
   # Release builds macOS and Windows wheels but only import-checks them;
   # this runs the Python API on both before merge. Python Quality keeps the
@@ -594,6 +665,10 @@ jobs:
     needs: plan
     if: needs.plan.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      # maturin builds the extension with [profile.ci] (Cargo.toml).
+      MATURIN_PEP517_ARGS: --profile ci
     strategy:
       fail-fast: false
       matrix:
@@ -623,12 +698,15 @@ jobs:
         uses: ./.github/actions/install-protoc-windows
 
       - name: Cache cargo (pyo3 build)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -659,6 +737,17 @@ jobs:
       - name: pytest
         run: uv run --no-sync pytest tests/ -v
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo cache (pyo3 build)
+        if: always() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # Docs: the reference pages, the rustdoc, and every example the site shows.
   #
   # - The CLI and Python reference pages are generated from the clap help
@@ -667,7 +756,7 @@ jobs:
   #   under docs/reference/, and must match a fresh regeneration.
   # - rustdoc builds with -D warnings, so docs.rs never shows a broken link.
   # - crates/python/tests/docs runs both tutorials (examples/*) and the
-  #   README quickstart against the release CLI, checks every command the
+  #   README quickstart against the CLI ([profile.ci]), checks every command the
   #   guides show against `--help`, and builds the site with
   #   `zensical build --strict`. See tests/docs/conftest.py for the policy.
   docs:
@@ -677,6 +766,9 @@ jobs:
     env:
       # The docs dependency group (zensical, gpio) needs Python >= 3.11.
       UV_PYTHON: "3.12"
+      # The extension and the CLI build with [profile.ci] (Cargo.toml).
+      MATURIN_PEP517_ARGS: --profile ci
+      TYLERTOO_BIN: ${{ github.workspace }}/target/ci/tylertoo
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -693,13 +785,15 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-docs-
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -749,19 +843,31 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps -p tylertoo-core --features remote
 
-      - name: Build release CLI
-        run: cargo build --locked --release -p tylertoo
+      - name: Build the CLI
+        run: cargo build --locked --profile ci -p tylertoo
 
       - name: Test documentation examples and site build
         working-directory: crates/python
         run: uv run --no-sync pytest -m docs tests/docs -v
 
+      # Main only; see CACHES in the header.
+      - name: Save cargo cache
+        if: always() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # Coverage reporting
   coverage:
     name: Coverage
     needs: plan
-    if: needs.plan.outputs.code == 'true'
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -803,7 +909,8 @@ jobs:
       - name: Cache cargo build
         # Own key: llvm-cov builds into target/llvm-cov-target with
         # instrumentation flags, so the Test job's cache does not help.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: build-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           key: ${{ runner.os }}-llvm-cov-target-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
@@ -875,6 +982,14 @@ jobs:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+
+      # Main only; see CACHES in the header.
+      - name: Save cargo build cache
+        if: always() && github.ref == 'refs/heads/main' && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
 
   # Lint: the small checks on one runner. Each used to be its own job, and
@@ -1012,7 +1127,7 @@ jobs:
       # the manifest and this check follows.
       - name: Read MSRV from Cargo.toml
         id: msrv
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         run: |
           version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ -z "$version" ]; then
@@ -1023,14 +1138,14 @@ jobs:
           echo "Declared MSRV: $version"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }} (MSRV)
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Install Rust nightly (Public API)
         # cargo-public-api reads rustdoc JSON, which is nightly-only.
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.NIGHTLY }}
@@ -1042,7 +1157,7 @@ jobs:
           toolchain: stable
 
       - name: Install protoc
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
@@ -1107,7 +1222,7 @@ jobs:
       # --all-features so the optional `remote` stack (object_store, aws-*) is
       # covered too; that is where the MSRV floor actually comes from.
       - name: Check on the declared MSRV
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         env:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: cargo "+$MSRV" check --locked --workspace --all-targets --all-features
@@ -1130,11 +1245,11 @@ jobs:
       # changed", not "rustc changed". Bump it deliberately, regenerating
       # the baseline in the same commit.
       - name: Install cargo-public-api
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         run: cargo install cargo-public-api --locked
 
       - name: Diff the public API against the baseline
-        if: ${{ !cancelled() && needs.plan.outputs.code == 'true' }}
+        if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
         working-directory: crates/core
         run: |
           cargo "+$NIGHTLY" public-api --simplified > api-current.txt

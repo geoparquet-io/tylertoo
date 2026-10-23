@@ -8,7 +8,7 @@
 # benches from `scripts/criterion_compare.sh --list` whose code they touch,
 # space-separated, or nothing. codspeed.yml runs only those on a PR; CodSpeed
 # reports the rest as "skipped" with their baseline numbers (partial runs).
-# Pushes to main always run --all, so every bench keeps a fresh baseline.
+# Pushes to main that touch benched code run --all (codspeed.yml).
 #
 # The map below is hand-kept: each bench's entry modules plus their
 # top-level `use crate::` dependencies. The static import graph is no help
@@ -28,8 +28,11 @@ if [ "${1:-}" = "--all" ]; then
 fi
 
 # Changes that can move every bench: the build, the bench harness, the
-# generated MVT protobuf, the crate root, and this selection itself.
-GLOBAL='^(Cargo\.toml|Cargo\.lock|crates/core/Cargo\.toml|crates/core/build\.rs|crates/core/proto/.*|crates/core/src/lib\.rs|crates/core/src/overview/mod\.rs|crates/core/benches/support/.*|\.github/workflows/codspeed\.yml|scripts/criterion_compare\.sh|scripts/codspeed_benches\.sh)$'
+# generated MVT protobuf, and this selection itself. Not Cargo.lock, the
+# crate root or overview/mod.rs (#759): those ran all 51 benches for
+# dependency bumps and one-line `pub mod` edits, 15 min each, and reported
+# no change on every one but #743. The run on main measures them instead.
+GLOBAL='^(Cargo\.toml|crates/core/Cargo\.toml|crates/core/build\.rs|crates/core/proto/.*|crates/core/benches/support/.*|\.github/workflows/codspeed\.yml|scripts/criterion_compare\.sh|scripts/codspeed_benches\.sh)$'
 
 S=crates/core/src
 CLIP="$S/(clip|ioverlay_clip|sutherland_hodgman|tile|world_coord)\.rs"
@@ -43,6 +46,10 @@ declare -A PATHS=(
   [simplify_cascade]="$S/overview/(simplify|level)\.rs|$MVT|$DECODE"
   [mvt_encode]="$MVT"
   [tile_compress_dedup]="$S/(compression|dedup)\.rs|$MVT"
+  # convert + export end to end: any library source can move it, and it is
+  # what measures the modules no kernel bench covers (pass-1 scan, decode,
+  # staging, pyramid merge, export scan; #759).
+  [pipeline]="$S/.*"
 )
 
 changed=$(cat)
