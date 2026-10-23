@@ -81,15 +81,17 @@ repeats = 2
 # ---------------------------------------------------------------------------
 # Settings: the table columns. `convert` is passed to `tylertoo overview`,
 # `valve` to `export-pmtiles --size-valve`. A setting's `max_tile_size` and
-# `max_compressed_tile_size` replace the dataset's caps (#761).
+# `max_compressed_tile_size` replace the dataset's caps (#761): one byte count
+# for every dataset, or a table of them by dataset.
 
 [settings.before-745]
 label = "Before #745"
 convert = ["--drop-polygons", "--drop-lines", "--polygon-thinning", "1", "--no-collapse"]
 valve = "drop"
-# The caps of that time, so the column stays the pre-#745 reference.
-max_tile_size = 512000
-max_compressed_tile_size = 0
+# The caps of that time, so the column stays the pre-#745 reference: the
+# 500K raw default then; NZ always ran at its own cap.
+max_tile_size = { madagascar = 512000, moldova = 512000 }
+max_compressed_tile_size = { madagascar = 0, moldova = 0 }
 
 [settings.default]
 label = "Defaults"

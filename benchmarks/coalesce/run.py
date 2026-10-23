@@ -111,8 +111,14 @@ def validate_config(cfg: dict) -> None:
             if st.get("external"):
                 raise ConfigError(f"setting {name!r}: {key!r} has no effect on an external "
                                   "setting; set its caps in its own args")
-            if isinstance(st[key], bool) or not isinstance(st[key], int) or st[key] < 0:
-                raise ConfigError(f"setting {name!r}: {key!r} must be a byte count")
+            # A byte count for every dataset, or a table of them by dataset.
+            values = st[key] if isinstance(st[key], dict) else {None: st[key]}
+            for ds_name, value in values.items():
+                if ds_name is not None and ds_name not in datasets:
+                    raise ConfigError(f"setting {name!r}: {key!r} names unknown dataset "
+                                      f"{ds_name!r}")
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ConfigError(f"setting {name!r}: {key!r} must be a byte count")
     for section, keys in ENTRY_KEYS.items():
         for entry in cfg.get(section, []):
             if entry.get("dataset") not in datasets:
@@ -138,10 +144,14 @@ CAP_KEYS = ("max_tile_size", "max_compressed_tile_size")
 
 def cell_caps(cfg: dict, ds_name: str, st_name: str) -> tuple[int, int]:
     """The (raw, gzip) tile caps a cell exports with: the setting's, where it
-    sets them (#761), else the dataset's."""
+    sets them for every dataset or for this one (#761), else the dataset's."""
     ds, st = cfg["datasets"][ds_name], cfg["settings"].get(st_name, {})
-    raw, gz = (st.get(k, ds[k]) for k in CAP_KEYS)
-    return raw, gz
+
+    def cap(key):
+        value = st.get(key, ds[key])
+        return value.get(ds_name, ds[key]) if isinstance(value, dict) else value
+
+    return cap(CAP_KEYS[0]), cap(CAP_KEYS[1])
 
 
 def profile_plan(cfg: dict, name: str) -> dict:

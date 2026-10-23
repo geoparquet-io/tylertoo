@@ -76,6 +76,23 @@ def test_an_external_setting_takes_no_caps(cfg):
 def test_before_745_keeps_the_caps_of_its_time(cfg):
     for ds in ("madagascar", "moldova"):
         assert run.cell_caps(cfg, ds, "before-745") == (512000, 0)
+    # NZ always ran at its own cap, so its reference keeps it.
+    nz = cfg["datasets"]["nz"]
+    assert run.cell_caps(cfg, "nz", "before-745") == (
+        nz["max_tile_size"], nz["max_compressed_tile_size"])
+
+
+def test_a_cap_override_can_name_its_datasets(cfg):
+    good = copy.deepcopy(cfg)
+    good["settings"]["raw500k"]["max_tile_size"] = {"moldova": 1000}
+    run.validate_config(good)
+    assert run.cell_caps(good, "moldova", "raw500k")[0] == 1000
+    assert run.cell_caps(good, "nz", "raw500k")[0] == good["datasets"]["nz"]["max_tile_size"]
+    for bad_value in ({"moldova": "1K"}, {"nowhere": 1000}):
+        bad = copy.deepcopy(cfg)
+        bad["settings"]["raw500k"]["max_tile_size"] = bad_value
+        with pytest.raises(run.ConfigError):
+            run.validate_config(bad)
 
 
 def test_every_dataset_pins_a_sha256(cfg):
