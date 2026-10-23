@@ -1125,6 +1125,16 @@ fn interacting_pairs(parts: &[Vec<TileRing>]) -> Vec<(usize, usize)> {
 /// each connected component of two or more parts, pass the rest through.
 /// The output depends only on which pairs interact, not on their order.
 fn union_interacting(parts: Vec<Vec<TileRing>>, pairs: &[(usize, usize)]) -> Vec<Vec<TileRing>> {
+    union_interacting_with(parts, pairs, union_group)
+}
+
+/// [`union_interacting`] with each component of two or more parts (indices
+/// into `parts`, ascending) turned into output pieces by `union`.
+fn union_interacting_with(
+    parts: Vec<Vec<TileRing>>,
+    pairs: &[(usize, usize)],
+    mut union: impl FnMut(&[usize], &[Vec<TileRing>]) -> Vec<Vec<TileRing>>,
+) -> Vec<Vec<TileRing>> {
     if pairs.is_empty() {
         return parts;
     }
@@ -1158,29 +1168,38 @@ fn union_interacting(parts: Vec<Vec<TileRing>>, pairs: &[(usize, usize)]) -> Vec
             done[i] = true;
             continue;
         }
-        let polys: Vec<Polygon<f64>> = group
-            .iter()
-            .map(|&k| {
-                let mut p = parts[k].clone();
-                orient_tile_polygon(&mut p);
-                tile_rings_to_polygon(&p)
-            })
-            .collect();
-        match crate::ioverlay_clip::union_polygons_ioverlay(&polys) {
-            Some(unioned) => {
-                for rs in requantized_parts(unioned) {
-                    for piece in regroup_pinched(rs) {
-                        clean_into(piece, 1, &mut out);
-                    }
-                }
-            }
-            // The overlay could not trace the group: emit the parts as they
-            // are rather than drop them.
-            None => out.extend(group.iter().map(|&k| parts[k].clone())),
-        }
+        out.extend(union(group, &parts));
         for &k in group {
             done[k] = true;
         }
+    }
+    out
+}
+
+/// One component of interacting parts, oriented consistently, unioned under
+/// `NonZero`, then snapped and cleaned again. Depends only on the parts, in
+/// order.
+fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
+    let polys: Vec<Polygon<f64>> = group
+        .iter()
+        .map(|&k| {
+            let mut p = parts[k].clone();
+            orient_tile_polygon(&mut p);
+            tile_rings_to_polygon(&p)
+        })
+        .collect();
+    let mut out = Vec::new();
+    match crate::ioverlay_clip::union_polygons_ioverlay(&polys) {
+        Some(unioned) => {
+            for rs in requantized_parts(unioned) {
+                for piece in regroup_pinched(rs) {
+                    clean_into(piece, 1, &mut out);
+                }
+            }
+        }
+        // The overlay could not trace the group: emit the parts as they
+        // are rather than drop them.
+        None => out.extend(group.iter().map(|&k| parts[k].clone())),
     }
     out
 }
@@ -1195,8 +1214,10 @@ fn union_interacting(parts: Vec<Vec<TileRing>>, pairs: &[(usize, usize)]) -> Vec
 /// quantizes and cleans each polygon on its own, then unions the parts that
 /// interact. Neither the cleaned parts nor whether two parts interact depend
 /// on the grouping, so this computes both once per tile; each pass only
-/// unions. [`Self::encode`] returns exactly what [`EncodedFeatureGeometry::encode`]
-/// returns for the merged geometry.
+/// unions. A component of interacting parts unions to the same pieces
+/// whichever pass asks, so a component the previous pass already unioned is
+/// not unioned again. [`Self::encode`] returns exactly what
+/// [`EncodedFeatureGeometry::encode`] returns for the merged geometry.
 pub(crate) struct QuantizedPolygons {
     /// Per feature, `None` when it is not polygonal.
     features: Vec<Option<QuantizedFeature>>,
@@ -1204,6 +1225,17 @@ pub(crate) struct QuantizedPolygons {
     parts: Vec<Vec<TileRing>>,
     /// Per part, the parts it interacts with ([`parts_interact`]).
     interacts: Vec<Vec<u32>>,
+    /// Unioned components, keyed by their parts' indices in [`Self::parts`]:
+    /// those this pass used, and the previous pass's. Two generations, so
+    /// a component no pass asks for again is dropped.
+    unions: std::sync::Mutex<UnionCache>,
+}
+
+#[derive(Default)]
+struct UnionCache {
+    current: HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<TileRing>>>>,
+    previous: HashMap<Vec<u32>, std::sync::Arc<Vec<Vec<TileRing>>>>,
+    hits: usize,
 }
 
 struct QuantizedFeature {
@@ -1278,7 +1310,51 @@ impl QuantizedPolygons {
             features,
             parts,
             interacts,
+            unions: std::sync::Mutex::default(),
         }
+    }
+
+    /// Start a new pass: unions the last pass used stay available, older
+    /// ones are dropped.
+    pub(crate) fn next_pass(&mut self) {
+        let cache = self.unions.get_mut().expect("union cache");
+        cache.previous = std::mem::take(&mut cache.current);
+    }
+
+    /// Components served from the cache so far.
+    #[cfg(test)]
+    fn union_hits(&self) -> usize {
+        self.unions.lock().expect("union cache").hits
+    }
+
+    /// [`union_group`] of a component, from the cache when this pass or the
+    /// last one unioned the same parts. `globals` maps the feature's local
+    /// part numbers to [`Self::parts`].
+    fn union_cached(
+        &self,
+        group: &[usize],
+        parts: &[Vec<TileRing>],
+        globals: &[usize],
+    ) -> Vec<Vec<TileRing>> {
+        let key: Vec<u32> = group.iter().map(|&k| globals[k] as u32).collect();
+        {
+            let mut cache = self.unions.lock().expect("union cache");
+            let found = match cache.current.get(&key) {
+                Some(u) => Some(std::sync::Arc::clone(u)),
+                None => cache.previous.get(&key).cloned(),
+            };
+            if let Some(u) = found {
+                cache.hits += 1;
+                cache.current.insert(key, std::sync::Arc::clone(&u));
+                return u.as_ref().clone();
+            }
+        }
+        let pieces = union_group(group, parts);
+        let mut cache = self.unions.lock().expect("union cache");
+        cache
+            .current
+            .insert(key, std::sync::Arc::new(pieces.clone()));
+        pieces
     }
 
     /// The encoded geometry of `group` (feature indices, the kept feature
@@ -1291,18 +1367,16 @@ impl QuantizedPolygons {
             .iter()
             .map(|&i| self.features[i].as_ref())
             .collect::<Option<_>>()?;
-        let polys: Vec<Vec<TileRing>> = feats
-            .iter()
-            .flat_map(|f| self.parts[f.parts.clone()].iter().cloned())
-            .collect();
-        let polys = if let [only] = feats[..] {
-            if only.multi {
-                union_interacting(polys, &self.pairs_within(&feats))
-            } else {
-                polys
-            }
+        let globals: Vec<usize> = feats.iter().flat_map(|f| f.parts.clone()).collect();
+        let polys: Vec<Vec<TileRing>> = globals.iter().map(|&g| self.parts[g].clone()).collect();
+        let resolve = !matches!(feats[..], [only] if !only.multi);
+        let polys = if resolve {
+            let pairs = self.pairs_within(&globals);
+            union_interacting_with(polys, &pairs, |group, parts| {
+                self.union_cached(group, parts, &globals)
+            })
         } else {
-            union_interacting(polys, &self.pairs_within(&feats))
+            polys
         };
         let commands = encode_tile_polygons(&polys);
         Some(if !commands.is_empty() {
@@ -1314,16 +1388,11 @@ impl QuantizedPolygons {
         })
     }
 
-    /// The interacting pairs among `feats`' parts, numbered as they are
-    /// concatenated.
-    fn pairs_within(&self, feats: &[&QuantizedFeature]) -> Vec<(usize, usize)> {
-        let mut local: HashMap<usize, usize> = HashMap::new();
-        for f in feats {
-            for g in f.parts.clone() {
-                let n = local.len();
-                local.insert(g, n);
-            }
-        }
+    /// The interacting pairs among the parts `globals`, numbered by their
+    /// position in it.
+    fn pairs_within(&self, globals: &[usize]) -> Vec<(usize, usize)> {
+        let local: HashMap<usize, usize> =
+            globals.iter().enumerate().map(|(i, &g)| (g, i)).collect();
         let mut pairs = Vec::new();
         for (&g, &i) in &local {
             for &h in &self.interacts[g] {
@@ -2095,7 +2164,7 @@ mod tests {
         geoms.push(Polygon::new(LineString::new(vec![]), vec![]).into()); // 18: empty
         geoms.push(line_string![(x: 0.1, y: 0.9), (x: 0.9, y: 0.9)].into()); // 19
 
-        let q = QuantizedPolygons::new(&geoms, &test_bounds(), 4096);
+        let mut q = QuantizedPolygons::new(&geoms, &test_bounds(), 4096);
         assert!(q.encode(&[19]).is_none(), "a line is not cached");
         assert!(q.encode(&[0, 19]).is_none(), "nor a group holding one");
         let polygonal: Vec<usize> = (0..19).collect();
@@ -2114,13 +2183,19 @@ mod tests {
             vec![17, 0],
             vec![5, 13, 9, 14, 15, 16, 11],
         ]);
-        for g in &groups {
-            assert_eq!(
-                q.encode(g).expect("polygonal"),
-                merged_reference(&geoms, g),
-                "group {g:?}"
-            );
+        // Three passes, as the valve runs them: the second reuses the first's
+        // unions, the third finds them carried over from the second.
+        for pass in 0..3 {
+            for g in &groups {
+                assert_eq!(
+                    q.encode(g).expect("polygonal"),
+                    merged_reference(&geoms, g),
+                    "pass {pass}, group {g:?}"
+                );
+            }
+            q.next_pass();
         }
+        assert!(q.union_hits() > 0, "later passes reuse unions");
     }
 
     fn test_bounds() -> TileBounds {

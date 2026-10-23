@@ -6013,7 +6013,8 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
     };
     // #758: from the second pass on, every member's polygons are projected,
     // quantized and cleaned once, and which of their parts interact is known,
-    // so a pass only unions. A tile that fits at once never builds this.
+    // so a pass only unions, and only the components that changed since the
+    // pass before. A tile that fits at once never builds this.
     let mut quantized: Option<crate::mvt::QuantizedPolygons> = None;
     let mut build = |feats: &[&coalesce_valve::Merged<'_>], pass: u32| {
         if pass == 1 {
@@ -6022,6 +6023,8 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         let q = quantized.get_or_insert_with(|| {
             crate::mvt::QuantizedPolygons::new(ordered.iter().map(|m| &m.geom), tb, opts.extent)
         });
+        q.next_pass();
+        let q = &*q;
         build_mvt_with(feats, opts, |m| {
             q.encode(&m.members)
                 .unwrap_or_else(|| EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent))
