@@ -498,45 +498,49 @@ fn requantize_ring(ring: &LineString<f64>) -> Option<TileRing> {
 /// that snapped shut, or a spike that folded back). Each loop between two
 /// visits of the same vertex becomes its own closed ring; zero-area loops
 /// (spikes) are dropped. The returned rings visit no vertex twice.
+///
+/// One pass, `O(n)`: walk the ring keeping the path so far with every
+/// closed loop cut out, and each path vertex's index. A vertex already on
+/// the path closes the loop from its earlier visit, which is cut out and
+/// emitted, leaving the vertex once. Until #759 this re-sorted the
+/// remaining ring after every split, `O(pinches × n log n)`: a coastline
+/// snapped to a coarse tile has pinches by the thousand, and one 316k-vertex
+/// Antarctica tile took ~7 s. The output is identical (rings, vertices and
+/// order; `split_pinches_matches_the_resorting_reference`).
 fn split_pinches(mut ring: TileRing) -> Vec<TileRing> {
     ring.pop(); // work on the open ring
     let mut out = Vec::new();
-    let mut stack = vec![ring];
-    while let Some(mut cur) = stack.pop() {
-        // Find the first repeated vertex: sort (index, vertex) by vertex and
-        // look for an equal neighbour. No hashing, and n is small.
-        let mut order: Vec<usize> = (0..cur.len()).collect();
-        order.sort_unstable_by_key(|&i| cur[i]);
-        let mut pinch: Option<(usize, usize)> = None;
-        for w in order.windows(2) {
-            if cur[w[0]] == cur[w[1]] {
-                let (i, j) = (w[0].min(w[1]), w[0].max(w[1]));
-                // Take the earliest second visit so loops nest predictably.
-                if pinch.is_none_or(|(_, pj)| j < pj) {
-                    pinch = Some((i, j));
-                }
+    let mut path: Vec<(i32, i32)> = Vec::with_capacity(ring.len());
+    let mut at: HashMap<(i32, i32), usize> = HashMap::with_capacity(ring.len());
+    for v in ring {
+        if let Some(&i) = at.get(&v) {
+            // `path[i..]` plus the return to `v` is a loop entered at `v`.
+            let mut piece = Vec::with_capacity(path.len() - i);
+            piece.push(v);
+            for u in path.drain(i + 1..) {
+                at.remove(&u);
+                piece.push(u);
             }
-        }
-        match pinch {
-            None => {
-                if cur.len() >= 3 {
-                    let first = cur[0];
-                    cur.push(first);
-                    if ring_area2(&cur) != 0 {
-                        out.push(cur);
-                    }
-                }
-            }
-            Some((i, j)) => {
-                // `cur[i..j]` is the loop entered at the pinch vertex; removing
-                // it leaves the vertex once, at index i, in the remainder.
-                let sub: Vec<(i32, i32)> = cur.drain(i..j).collect();
-                stack.push(cur);
-                stack.push(sub);
-            }
+            push_closed_loop(&mut out, piece);
+        } else {
+            at.insert(v, path.len());
+            path.push(v);
         }
     }
+    push_closed_loop(&mut out, path);
     out
+}
+
+/// Close an open loop from [`split_pinches`] and keep it if it is a ring
+/// with area (a two-vertex spike or a zero-area fold is dropped).
+fn push_closed_loop(out: &mut Vec<TileRing>, mut open: Vec<(i32, i32)>) {
+    if open.len() >= 3 {
+        let first = open[0];
+        open.push(first);
+        if ring_area2(&open) != 0 {
+            out.push(open);
+        }
+    }
 }
 
 /// Insert every vertex that lies strictly inside a non-adjacent edge into
@@ -3152,6 +3156,93 @@ mod tests {
         assert!(
             touched > 20 && swept > 10,
             "too few noded rings to be meaningful: {touched} ({swept} past the sweep threshold)"
+        );
+    }
+
+    /// The pre-#759 [`split_pinches`]: re-sort the remaining ring after every
+    /// split, `O(pinches × n log n)`. Kept as the oracle the single pass is
+    /// tested against, with one fix: ties are broken by index. The original
+    /// sorted by vertex alone with `sort_unstable`, so for a vertex visited
+    /// three or more times the adjacent pairs it compared were arbitrary and
+    /// it could miss the earliest second visit its own comment promises.
+    ///
+    /// Split a closed ring at every vertex it visits twice (a "pinch": a neck
+    /// that snapped shut, or a spike that folded back). Each loop between two
+    /// visits of the same vertex becomes its own closed ring; zero-area loops
+    /// (spikes) are dropped. The returned rings visit no vertex twice.
+    fn split_pinches_reference(mut ring: TileRing) -> Vec<TileRing> {
+        ring.pop(); // work on the open ring
+        let mut out = Vec::new();
+        let mut stack = vec![ring];
+        while let Some(mut cur) = stack.pop() {
+            // Find the first repeated vertex: sort (index, vertex) by vertex and
+            // look for an equal neighbour. No hashing, and n is small.
+            let mut order: Vec<usize> = (0..cur.len()).collect();
+            order.sort_unstable_by_key(|&i| (cur[i], i));
+            let mut pinch: Option<(usize, usize)> = None;
+            for w in order.windows(2) {
+                if cur[w[0]] == cur[w[1]] {
+                    let (i, j) = (w[0].min(w[1]), w[0].max(w[1]));
+                    // Take the earliest second visit so loops nest predictably.
+                    if pinch.is_none_or(|(_, pj)| j < pj) {
+                        pinch = Some((i, j));
+                    }
+                }
+            }
+            match pinch {
+                None => {
+                    if cur.len() >= 3 {
+                        let first = cur[0];
+                        cur.push(first);
+                        if ring_area2(&cur) != 0 {
+                            out.push(cur);
+                        }
+                    }
+                }
+                Some((i, j)) => {
+                    // `cur[i..j]` is the loop entered at the pinch vertex; removing
+                    // it leaves the vertex once, at index i, in the remainder.
+                    let sub: Vec<(i32, i32)> = cur.drain(i..j).collect();
+                    stack.push(cur);
+                    stack.push(sub);
+                }
+            }
+        }
+        out
+    }
+
+    /// The single-pass [`split_pinches`] returns exactly what the re-sorting
+    /// reference does: the same rings, vertices and order. Rings on tiny
+    /// grids revisit vertices constantly, including three and more times,
+    /// which is where the original's arbitrary tie order parted ways.
+    #[test]
+    fn split_pinches_matches_the_resorting_reference() {
+        let mut seed = 0x5eed_0f9a_u64;
+        let mut pinched = 0usize;
+        for case in 0..2000 {
+            let grid = [3u32, 5, 8, 16][case % 4];
+            let n = 3 + (case / 4) % 120;
+            let mut pts: Vec<(i32, i32)> = Vec::new();
+            while pts.len() < n {
+                let p = (
+                    (lcg(&mut seed) % grid) as i32,
+                    (lcg(&mut seed) % grid) as i32,
+                );
+                if pts.last() != Some(&p) {
+                    pts.push(p);
+                }
+            }
+            if pts.first() == pts.last() {
+                continue;
+            }
+            let ring = closed(&pts);
+            let expected = split_pinches_reference(ring.clone());
+            pinched += usize::from(expected.len() > 1);
+            assert_eq!(split_pinches(ring.clone()), expected, "ring={ring:?}");
+        }
+        assert!(
+            pinched > 500,
+            "too few pinched rings to be meaningful: {pinched}"
         );
     }
 

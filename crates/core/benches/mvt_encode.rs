@@ -83,18 +83,14 @@ fn bench_encode_polygon(c: &mut Criterion) {
         });
     }
 
-    // Not under CodSpeed: one call takes ~7 s natively and ~20 min in
-    // simulation (Valgrind), over 90% of the whole CodSpeed job (#614). The
-    // regression gate still times it, at criterion's minimum of 10 samples:
-    // at the group's 30 it took ~9 of the gate's ~45 min (#759).
-    if cfg!(codspeed) {
-        eprintln!("mvt_encode: antarctica_316k_over_cap skipped under CodSpeed");
-    } else if let Some(poly) = load_antarctica_polygon() {
+    // One call took ~7 s until #759 (split_pinches re-sorted the ring after
+    // every pinch), so this ran at 10 samples and was skipped under
+    // CodSpeed. It is ~0.15 s now and runs everywhere.
+    if let Some(poly) = load_antarctica_polygon() {
         let verts = poly.exterior().0.len() as u64;
         group.throughput(Throughput::Elements(verts));
-        group.sample_size(10);
-        // Named for what it measures: the over-cap early-out in `node_ring`
-        // (the noding sweep itself is covered by the synthetic sizes above).
+        // Named for the over-cap early-out in `node_ring` (the noding sweep
+        // itself is covered by the synthetic sizes above).
         group.bench_function("antarctica_316k_over_cap", |b| {
             b.iter(|| black_box(encode_polygon(black_box(&poly), black_box(&bounds), 4096)));
         });
