@@ -14,9 +14,10 @@
 //! Everything runs on one rayon thread: the global pool is built with one
 //! thread (as `RAYON_NUM_THREADS=1` does for the CLI), and `read_workers` /
 //! `in_flight_batches` are 1, which the docs on [`ConvertOptions`]
-//! guarantee produce byte-identical output. Not a `pool.install` of a
-//! private pool: convert then runs *on* the pool's only worker and
-//! deadlocks waiting for work queued behind itself. That keeps
+//! guarantee produce byte-identical output. The global pool rather than a
+//! `pool.install` keeps the caller off the pool, as in the CLI. (An early
+//! version of this bench used `install` and found that convert deadlocked
+//! there; `tests/rayon_pool_reentry.rs` pins the fix.) That keeps
 //! CodSpeed's instruction counts deterministic and free of thread wake-ups
 //! (the syscall-dominated warning `assign` gets), and the wall-clock gate
 //! comparable run to run. Thread scaling is `assign_scaling`'s job.

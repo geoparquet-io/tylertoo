@@ -58,11 +58,12 @@ use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver, RecvError, RecvTimeoutError};
 use parquet::arrow::arrow_writer::{
     compute_leaves, ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory,
 };
@@ -868,8 +869,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             // A disconnect means the task's sender was dropped without
             // sending — it never ran (pool shutdown). A panic inside the task
             // arrives as an ordinary `Err` on the channel instead (#426).
-            let (encoded, geo_meta) = rx
-                .recv()
+            let (encoded, geo_meta) = recv_in_pool(&rx)
                 .map_err(|_| {
                     WriterError::GeoParquet(format!("{WKB_TASK} did not report a result"))
                 })?
@@ -940,7 +940,7 @@ impl<W: Write + Send> OverviewWriter<W> {
         let outcome: Result<(), WriterError> = (|| {
             // As in `drain_wkb_encoded`: a disconnect means the task never
             // ran; a panic inside it arrives as an `Err` on the channel (#426).
-            let chunks = rx.recv().map_err(|_| {
+            let chunks = recv_in_pool(&rx).map_err(|_| {
                 WriterError::Parquet(ParquetError::General(format!(
                     "{ROW_GROUP_TASK} did not report a result"
                 )))
@@ -1097,6 +1097,36 @@ fn poisoned_writer_error() -> WriterError {
          no further writes are accepted"
             .to_string(),
     ))
+}
+
+/// Wait for a task this writer handed to rayon, without starving it.
+///
+/// Off the pool (the CLI's main thread) this is a plain blocking `recv`.
+/// On a pool worker, which is where the writer runs when a library caller
+/// converts inside `pool.install` or a rayon-parallel loop, a blocking
+/// `recv` parks the worker the spawned task may be queued behind: with one
+/// thread nothing ever ran it (`tests/rayon_pool_reentry.rs`). So the
+/// worker runs queued pool work while it waits, and naps briefly only when
+/// the pool has none (the task is running on another worker).
+fn recv_in_pool<T>(rx: &Receiver<T>) -> Result<T, RecvError> {
+    if rayon::current_thread_index().is_none() {
+        return rx.recv();
+    }
+    loop {
+        match rx.recv_timeout(Duration::ZERO) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Disconnected) => return Err(RecvError),
+            Err(RecvTimeoutError::Timeout) => {
+                if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                    match rx.recv_timeout(Duration::from_millis(1)) {
+                        Ok(value) => return Ok(value),
+                        Err(RecvTimeoutError::Disconnected) => return Err(RecvError),
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Run one detached encode task's body, turning a panic into an error string
