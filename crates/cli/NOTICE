@@ -78,6 +78,14 @@ tests/fixtures/realdata/tielt-winge-adm4.wkb
   (Madagascar BNGRC). The .wkb file is one Belgian feature from the
   FieldMaps ADM4 layer.
 
+tests/fixtures/realdata/ftw-moldova-z10.parquet
+  Field boundaries from Fields of The World (https://source.coop/ftw/global-data),
+  global field-boundary predictions by the Taylor Geospatial Institute and
+  the Microsoft AI for Good Research Lab. Creative Commons Attribution 4.0
+  International (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/).
+  Changes: the fields of one z10 tile (10/593/357) of the Moldova extract,
+  geometry and bbox columns only.
+
 tests/fixtures/golden/open-buildings.pmtiles
 tests/fixtures/golden/fieldmaps-boundaries.pmtiles
 tests/fixtures/golden/decoded/

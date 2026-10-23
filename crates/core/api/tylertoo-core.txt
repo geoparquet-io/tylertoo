@@ -1849,6 +1849,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::SizeValve
 pub struct tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::overview::export::ExportOptions::compressed_tile_size_limit: core::option::Option<usize>
+pub tylertoo_core::overview::export::ExportOptions::coverage_fill: bool
 pub tylertoo_core::overview::export::ExportOptions::extent: u32
 pub tylertoo_core::overview::export::ExportOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
@@ -1932,6 +1933,9 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::S
 pub struct tylertoo_core::overview::export::ZoomReport
 pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_polygons: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_shed: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_vertices: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::max_valve_passes: u32
@@ -1940,6 +1944,7 @@ pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_count: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::valve_dropped_features: usize
+pub tylertoo_core::overview::export::ZoomReport::valve_passes: u64
 pub tylertoo_core::overview::export::ZoomReport::zoom: u8
 impl core::clone::Clone for tylertoo_core::overview::export::ZoomReport
 pub fn tylertoo_core::overview::export::ZoomReport::clone(&self) -> tylertoo_core::overview::export::ZoomReport
@@ -2959,6 +2964,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::In
 pub struct tylertoo_core::overview::tiles::TilesOptions
 pub tylertoo_core::overview::tiles::TilesOptions::compressed_tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
+pub tylertoo_core::overview::tiles::TilesOptions::coverage_fill: bool
 pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
 pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>

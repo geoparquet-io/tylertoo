@@ -105,6 +105,9 @@ def validate_config(cfg: dict) -> None:
     for name, st in settings.items():
         if not st.get("external") and ("convert" not in st or "valve" not in st):
             raise ConfigError(f"setting {name!r}: needs 'convert' and 'valve'")
+        export = st.get("export", [])
+        if not isinstance(export, list) or not all(isinstance(f, str) for f in export):
+            raise ConfigError(f"setting {name!r}: 'export' must be a list of flags")
         for key in CAP_KEYS:
             if key not in st:
                 continue
@@ -156,7 +159,8 @@ def cell_caps(cfg: dict, ds_name: str, st_name: str) -> tuple[int, int]:
 
 def profile_plan(cfg: dict, name: str) -> dict:
     """What a profile runs: its datasets and settings, and the windows,
-    checks and tippecanoe references whose dataset is among them."""
+    checks and tippecanoe references whose dataset is among them (no windows
+    or checks with `score = false`)."""
     if name not in cfg["profiles"]:
         raise ConfigError(f"unknown profile {name!r} (have {', '.join(cfg['profiles'])})")
     prof = cfg["profiles"][name]
@@ -164,6 +168,9 @@ def profile_plan(cfg: dict, name: str) -> dict:
     settings = list(prof["settings"])
 
     def in_profile(section):
+        # `score = false`: tile and time only, nothing to score.
+        if not prof.get("score", True):
+            return []
         return [e for e in cfg.get(section, []) if e["dataset"] in datasets]
 
     tippecanoe = ([d for d in cfg.get("tippecanoe", {}).get("datasets", {}) if d in datasets]
@@ -190,7 +197,7 @@ def tippecanoe_key(tippecanoe_sha: str, input_sha: str, args: list[str], gpio: s
 
 
 def cell_key(*, binary_sha: str, input_sha: str, convert: list[str], valve: str,
-             max_zoom: int, max_tile_size: int, max_compressed_tile_size: int,
+             export: list[str], max_zoom: int, max_tile_size: int, max_compressed_tile_size: int,
              repeats: int, harness: str) -> str:
     return digest(locals())[:16]
 
@@ -413,6 +420,47 @@ def row(cells) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
+WORK = ("tile_count", "valve_passes", "fill_polygons", "fill_vertices", "fill_shed")
+
+
+def work_counts(cell: dict | None) -> dict | None:
+    """A cell's export work summed over its zooms, or None when its report
+    predates the counters."""
+    zooms = (cell or {}).get("zooms") or []
+    if not zooms or any(z.get("valve_passes") is None for z in zooms):
+        return None
+    return {k: sum(z.get(k) or 0 for z in zooms) for k in WORK}
+
+
+def work_section(report: dict, base_get) -> list[str]:
+    """The export's work counters per cell (#750). They are exact for a given
+    binary and input, so any change from the baseline shows."""
+    rows = []
+    for ds, dmeta in report["datasets"].items():
+        for st, smeta in report["settings"].items():
+            w = work_counts(report["cells"].get(f"{ds}/{st}"))
+            if w is None:
+                continue
+            b = work_counts(base_get("cells", f"{ds}/{st}"))
+
+            def cell(k, w=w, b=b):
+                v = count(w[k])
+                if b is not None and b[k] != w[k]:
+                    d = w[k] - b[k]
+                    v += f" ({'+' if d > 0 else MINUS}{count(abs(d))})"
+                return v
+            rows.append(row([dmeta["label"], smeta["label"]] + [cell(k) for k in WORK]))
+    if not rows:
+        return []
+    return ["## Work", "",
+            "Summed over the zooms of the last export: exact for a binary and input, so "
+            "compare these before timings. Valve passes count every encode, one per tile "
+            "that fits at once; fill columns are the #750 coverage fill.", "",
+            row(["Dataset", "Setting", "Tiles", "Valve passes", "Fill polygons",
+                 "Fill vertices", "Fill shed"]),
+            row(["---"] * 7), *rows, ""]
+
+
 def render_markdown(report: dict, baseline: dict | None = None) -> str:
     noise = report["noise"]
     floor_pp, floor_t = noise["coverage_pp"], noise["time_ratio"]
@@ -522,6 +570,8 @@ def render_markdown(report: dict, baseline: dict | None = None) -> str:
         if notes:
             out += [""] + [n for n in sorted(notes, key=lambda n: (n[0] in "†‡", n))]
         out.append("")
+
+    out += work_section(report, base_get)
 
     if report.get("windows"):
         names = list(settings)
@@ -711,7 +761,8 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
             name = f"{ds_name}.{st_name}"
             raw_cap, gz_cap = cell_caps(cfg, ds_name, st_name)
             key = cell_key(binary_sha=binfo["sha256"], input_sha=ds["sha256"],
-                           convert=st["convert"], valve=st["valve"], max_zoom=ds["max_zoom"],
+                           convert=st["convert"], valve=st["valve"],
+                           export=st.get("export", []), max_zoom=ds["max_zoom"],
                            max_tile_size=raw_cap, max_compressed_tile_size=gz_cap,
                            repeats=repeats, harness=harness)
             summary_path = tiles / f"{name}.json"
@@ -733,7 +784,7 @@ def tile_cells(cfg, plan, args, steps, binary, binfo, inputs: Path, run_dir: Pat
                 max_zoom=ds["max_zoom"], max_tile_size=str(raw_cap),
                 max_compressed_tile_size=str(gz_cap),
                 wall_s=ds["wall_s"], rss_gib=ds["rss_gib"], repeats=repeats,
-                convert_repeats=repeats, record=record)
+                convert_repeats=repeats, export_flags=st.get("export", []), record=record)
             conv = records[0]
             summary = summarize_cell(conv["convert_runs"], records[1:],
                                      conv["convert_run"].get("overview_bytes"))

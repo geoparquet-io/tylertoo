@@ -429,3 +429,57 @@ cell, the binary of PR #770), against the committed `baseline/full.json`:
   features. Caps are flags, so a smaller archive is one setting away.
 - NZ's benchmark keeps its 2 MB gzip cap; under the new default it would
   merge 3.4× as many features.
+
+## Decision 10: the coverage fill is opt-in (issue #750)
+
+After #745, placeholder squares stood in for polygons too small for a level,
+but they sat where those polygons were. In dense blocks they overlapped one
+another and left gaps: Auckland parcels missed 28% of their area at z8 and
+z10. `export-pmtiles --coverage-fill` draws, under each tile's features, the
+area its child tiles cover (`overview/export/coverage_fill.rs`).
+
+Measured with #760's harness (`benchmarks/coalesce/run.py`, a `fill`
+setting on the full profile's datasets), against the defaults:
+
+- Coverage: Auckland city z8/z10/z12 missing 28.5% / 28.2% / 3.2% → 0.0% /
+  0.1% / 0.1% (tippecanoe 5.7% / 0.0% / 0.6%); Upper North Island z3
+  13.3% → 0.5% (tippecanoe 12.1%); Madagascar z3 23.5% → 0.2%. Added
+  area stays at 1% or under on all three.
+- Cost, end to end: NZ 107.0 s → 125.5 s (+17%); archives +4%; export
+  peak memory +26% (6.4 → 8.0 GiB). Under #761's default caps (NZ's
+  benchmark cap did not change), Madagascar export 1.99 s → 2.28 s
+  (+10% end to end), export memory 0.44 → 0.76 GiB.
+- FTW Moldova, whose fields are smaller than a pixel at coarse zooms: the
+  missing share halves (z3 15.8% → 7.7%), but added area grows (+51% →
+  +61%) and the archive grows 19%. Under #761's caps the export takes
+  6.5 s → 11.2 s (1.55× end to end), export memory 1.8 → 2.4 GiB; under
+  the old 500K raw cap it took 2.2× as long. tippecanoe cannot tile this
+  input (#760).
+
+What shaped the cost and the coverage:
+
+- The fill takes only the room the tile's own features leave. The size
+  valve fits them first, exactly as without a fill, and the fill sheds its
+  smallest features until the tile fits, so it never makes the valve merge
+  or drop a real feature. An earlier version sized the valve on the
+  features' share of the cap left after the fill; on attribute-heavy tiles
+  that merged real features to make room. So the fill needs headroom:
+  Madagascar admin-4 at z4 misses 0.01% of the area z8 draws (tile by tile)
+  under a 500K compressed cap, and 8.6% under a 500K raw cap, where the
+  coarse tiles are nearly full (12.8% without the fill).
+- Douglas–Peucker's shrinkage of convex blobs, a third of their area a few
+  pixels across, is credited back as squares; without that the fill lost
+  23% of its area by z5. The credit lands where the area was lost: a shaved
+  run's area along the run, as trapezoids against the chord that replaced
+  it. A cell's excess spills into nearby cells, so the fill keeps its area
+  within about 2% from z11 to z3 on Moldova.
+- Squares that touch are dissolved with each other and with the shapes they
+  touch, and the fill takes at most a quarter of the cap. Before that the
+  fill carried 14.4M vertices up the zooms on Moldova and the export took
+  18.1 s against 6.7 s without the fill; after, 9.2M and 15.8 s. Most of the
+  rest was the merge valve grinding on tiles that could not fit, fixed in
+  #758.
+
+The fill stays opt-in. The Moldova over-draw (#762) and the overview's
+inability to tell a dense coverage from scattered sub-pixel polygons keep it
+so.

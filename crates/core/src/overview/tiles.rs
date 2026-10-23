@@ -200,6 +200,9 @@ pub struct TilesOptions {
     /// How an oversized tile is brought under its limit
     /// ([`ExportOptions::size_valve`], #745).
     pub size_valve: SizeValve,
+    /// Draw the coverage fill under coarse tiles
+    /// ([`ExportOptions::coverage_fill`], #750).
+    pub coverage_fill: bool,
     /// See [`ExportOptions::simple_clip_fastpath`].
     pub simple_clip_fastpath: bool,
     /// See [`ExportOptions::partition_wave`].
@@ -227,6 +230,7 @@ impl Default for TilesOptions {
             tile_size_limit: export.tile_size_limit,
             compressed_tile_size_limit: export.compressed_tile_size_limit,
             size_valve: export.size_valve,
+            coverage_fill: export.coverage_fill,
             simple_clip_fastpath: export.simple_clip_fastpath,
             partition_wave: export.partition_wave,
             feature_order: FeatureOrder::default(),
@@ -731,6 +735,7 @@ pub fn convert_to_pmtiles_observed(
         tile_size_limit: options.tile_size_limit,
         compressed_tile_size_limit: options.compressed_tile_size_limit,
         size_valve: options.size_valve,
+        coverage_fill: options.coverage_fill,
         simple_clip_fastpath: options.simple_clip_fastpath,
         partition_wave: options.partition_wave,
         feature_order: options.feature_order.clone(),

@@ -9,6 +9,7 @@ numbers.
 
 ```bash
 uv run benchmarks/coalesce/run.py --profile small
+uv run benchmarks/coalesce/run.py --profile smoke
 uv run benchmarks/coalesce/run.py --profile small --compare benchmarks/coalesce/baseline/small.json
 ```
 
@@ -55,7 +56,8 @@ whether its repeats write identical bytes (`repeats_identical` in `report.json`)
 
 | Profile | Datasets | Settings | Time | Disk |
 |---|---|---|---|---|
-| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, 500K raw cap (before #761), defaults, `--simplify-factor 0.25`, `--simplify-factor 0` | about 13 min: 3½ min tiling and about 9 min scoring. The first run adds about 2 min of environment setup | about 3 GB |
+| `smoke` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | defaults, `--coverage-fill` | about 2 min of tiling; nothing is scored (`score = false`). The report's Work table sums each export's counters (valve passes, fill polygons and vertices), which are exact: compare them before the timings | about 1 GB |
+| `small` | Madagascar adm4 (17k polygons), FTW Moldova (632k) | before #745, 500K raw cap (before #761), defaults, `--simplify-factor 0.25`, `--simplify-factor 0`, `--coverage-fill` | about 13 min: 3½ min tiling and about 9 min scoring, and the `--coverage-fill` cells add about 1 min of tiling and their scoring. The first run adds about 2 min of environment setup | about 3 GB |
 | `full` | Adds NZ Parcels (4.3M) | Adds tippecanoe on NZ and Moldova | about 50 min of tylertoo tiling and scoring. The first run adds tippecanoe: about 32 min on NZ and 34 min on Moldova, where it fails. Both results are cached | about 20 GB at peak |
 
 You can run the `small` profile without keys. It needs network access to

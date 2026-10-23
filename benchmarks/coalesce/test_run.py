@@ -44,6 +44,27 @@ def test_full_profile_adds_nz_and_tippecanoe(cfg):
     assert {w["name"] for w in plan["windows"]} >= {"auckland-city", "upper-north-island"}
 
 
+def test_smoke_profile_compares_the_fill_on_two_inputs(cfg):
+    plan = run.profile_plan(cfg, "smoke")
+    assert plan["datasets"] == ["madagascar", "moldova"]
+    assert plan["internal"] == ["default", "fill"]
+    assert cfg["settings"]["fill"]["export"] == ["--coverage-fill"]
+    # Work counters and timing only: nothing to score.
+    assert plan["windows"] == plan["coverage"] == plan["metrics"] == []
+
+
+def test_fill_runs_in_small_and_full(cfg):
+    for profile in ("small", "full"):
+        assert "fill" in run.profile_plan(cfg, profile)["settings"]
+
+
+def test_export_flags_must_be_a_list(cfg):
+    bad = copy.deepcopy(cfg)
+    bad["settings"]["fill"]["export"] = "--coverage-fill"
+    with pytest.raises(run.ConfigError):
+        run.validate_config(bad)
+
+
 def test_the_defaults_column_uses_the_default_caps(cfg):
     # #761: tylertoo's defaults, 500K gzip-compressed and a 2M raw backstop.
     for ds in ("madagascar", "moldova"):
@@ -149,11 +170,12 @@ def test_tippecanoe_key_is_stable_and_tracks_its_inputs():
 
 def test_cell_key_changes_with_flags_and_repeats():
     base = dict(binary_sha="b" * 64, input_sha="i" * 64, convert=["--simplify-factor", "0"],
-                valve="merge", max_zoom=12, max_tile_size=512000,
+                valve="merge", export=[], max_zoom=12, max_tile_size=512000,
                 max_compressed_tile_size=0, repeats=3, harness="h")
     k = run.cell_key(**base)
     assert k == run.cell_key(**base)
     assert k != run.cell_key(**{**base, "convert": ["--simplify-factor", "0.25"]})
+    assert k != run.cell_key(**{**base, "export": ["--coverage-fill"]})
     assert k != run.cell_key(**{**base, "repeats": 1})
     assert k != run.cell_key(**{**base, "binary_sha": "c" * 64})
 
@@ -285,6 +307,29 @@ def test_markdown_has_performance_and_coverage_rows():
     assert "noise floor" in md.lower()
 
 
+def _zooms(passes, fill_vertices):
+    return [{"zoom": z, "tile_count": 2, "valve_passes": passes, "fill_polygons": 10,
+             "fill_vertices": fill_vertices, "fill_shed": 1} for z in (0, 1)]
+
+
+def test_markdown_has_a_work_table_from_the_report_counters():
+    rep = _report()
+    assert "## Work" not in run.render_markdown(rep)  # reports without counters
+    rep["cells"]["moldova/default"]["zooms"] = _zooms(3, 500)
+    md = run.render_markdown(rep)
+    assert "## Work" in md
+    assert "| FTW Moldova | Defaults | 4 | 6 | 20 | 1,000 | 2 |" in md
+
+
+def test_markdown_work_shows_any_change_from_the_baseline():
+    cur, base = _report(), _report()
+    cur["cells"]["moldova/default"]["zooms"] = _zooms(4, 500)
+    base["cells"]["moldova/default"]["zooms"] = _zooms(3, 500)
+    md = run.render_markdown(cur, base)
+    # Counts are exact: every change shows, with no noise floor.
+    assert "| FTW Moldova | Defaults | 4 | 8 (+2) | 20 | 1,000 | 2 |" in md
+
+
 def test_markdown_against_a_baseline_flags_only_beyond_the_floor():
     cur, base = _report(), _report()
     cur["windows"]["moldova-country"]["zooms"]["3"]["default"]["missing"] = 0.20
@@ -310,6 +355,13 @@ def test_export_argv_matches_the_stages_path():
     assert argv == ["/bin/tt", "export-pmtiles", "ov.parquet", "o.pmtiles", "--force",
                     "--max-tile-size", "500K", "--max-compressed-tile-size", "0",
                     "--size-valve", "merge", "--report", "r.json"]
+
+
+def test_export_argv_appends_a_settings_export_flags():
+    argv = run_matrix.export_argv("/bin/tt", Path("ov.parquet"), Path("o.pmtiles"), "500K", "0",
+                                  "merge", None, ["--coverage-fill"])
+    assert argv[-1] == "--coverage-fill"
+    assert "--report" not in argv
 
 
 # --- scorers ----------------------------------------------------------------
@@ -483,7 +535,7 @@ def test_markdown_renders_coverage_and_metrics_sections():
 
 
 def test_cell_key_includes_the_harness():
-    base = dict(binary_sha="b", input_sha="i", convert=[], valve="merge", max_zoom=12,
+    base = dict(binary_sha="b", input_sha="i", convert=[], valve="merge", export=[], max_zoom=12,
                 max_tile_size=1, max_compressed_tile_size=0, repeats=3, harness="h1")
     assert run.cell_key(**base) != run.cell_key(**{**base, "harness": "h2"})
 

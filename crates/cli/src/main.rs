@@ -619,6 +619,16 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
+    /// Fill the holes that dense small polygons (parcels, fields, small
+    /// admin units) leave at coarse zooms: under each tile's features, also
+    /// draw the area its child tiles cover, with the attributes of one feature
+    /// it sits under, in the room the tile's own features leave. Adds 10–17%
+    /// to build time on dense coverages, about 1.5x on scattered sub-pixel
+    /// fields (which it may also over-draw), and holds the finest level's
+    /// geometry in memory. Ignored with --tile-range or --zoom-ceiling.
+    #[arg(long)]
+    coverage_fill: bool,
+
     /// Write the JSON export report, with per-zoom tile and feature counts,
     /// to this path.
     #[arg(long, value_name = "PATH")]
@@ -1398,6 +1408,16 @@ struct TilesArgs {
     #[arg(long, value_name = "merge|drop", default_value = "merge")]
     size_valve: SizeValve,
 
+    /// Fill the holes that dense small polygons (parcels, fields, small
+    /// admin units) leave at coarse zooms: under each tile's features, also
+    /// draw the area its child tiles cover, with the attributes of one feature
+    /// it sits under, in the room the tile's own features leave. Adds 10–17%
+    /// to build time on dense coverages, about 1.5x on scattered sub-pixel
+    /// fields (which it may also over-draw), and holds the finest level's
+    /// geometry in memory. Ignored with --tile-range or --zoom-ceiling.
+    #[arg(long)]
+    coverage_fill: bool,
+
     /// Clip all polygons with the full overlay for byte-stable tiles. The
     /// simple-ring fast path renders identically but can change a ring's
     /// starting vertex.
@@ -2122,6 +2142,7 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
             "--size-valve",
             args.size_valve != ExportOptions::default().size_valve,
         ),
+        ("--coverage-fill", args.coverage_fill),
         ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
         (
             "--tile-buffer",
@@ -2402,6 +2423,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             DEFAULT_COMPRESSED_TILE_SIZE_LIMIT,
         ),
         size_valve: args.size_valve,
+        coverage_fill: args.coverage_fill,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),
@@ -3036,6 +3058,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         tile_size_limit: size_limit_opt(args.tile_size_limit),
         compressed_tile_size_limit: size_limit_opt(args.max_compressed_tile_size),
         size_valve: args.size_valve,
+        coverage_fill: args.coverage_fill,
         simple_clip_fastpath: !args.no_simple_clip_fastpath,
         partition_wave: args.partition_wave,
         feature_order: args.feature_order.clone(),

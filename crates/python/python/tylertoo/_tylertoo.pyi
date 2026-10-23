@@ -26,6 +26,7 @@ def convert(
     exclude_all_properties: bool = False,
     size_valve: str = "merge",
     max_compressed_tile_size: int = 512000,
+    coverage_fill: bool = False,
 ) -> dict[str, Any]: ...
 def overview(
     input: str | list[str],
@@ -105,6 +106,7 @@ def export_pmtiles(
     attribution: str | None = None,
     size_valve: str = "merge",
     max_compressed_tile_size: int = 512000,
+    coverage_fill: bool = False,
 ) -> dict[str, Any]: ...
 def validate(file: str) -> dict[str, Any]: ...
 def decode(

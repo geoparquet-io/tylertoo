@@ -148,8 +148,8 @@ fn resolve_max_zoom_py(
 /// never drift from `tylertoo tiles`.
 #[pyfunction]
 #[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false, size_valve="merge", max_compressed_tile_size=512000),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False, size_valve='merge', max_compressed_tile_size=512000)"
+    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false, size_valve="merge", max_compressed_tile_size=512000, coverage_fill=false),
+    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False, size_valve='merge', max_compressed_tile_size=512000, coverage_fill=False)"
 )]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn convert(
@@ -168,6 +168,7 @@ fn convert(
     exclude_all_properties: bool,
     size_valve: &str,
     max_compressed_tile_size: usize,
+    coverage_fill: bool,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let input_path = Path::new(input).to_path_buf();
@@ -222,6 +223,7 @@ fn convert(
         // #745: tippecanoe's `-M`; 0 sets no compressed limit.
         compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
         size_valve: parse_size_valve(size_valve)?,
+        coverage_fill,
         simple_clip_fastpath,
         // Convenience wrapper: use the core auto default (core-sized wave).
         partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
@@ -752,7 +754,7 @@ fn overview(
 /// The documented, typed Python API is `python/tylertoo/__init__.py`; it
 /// passes every argument here by keyword.
 #[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=2097152, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None, size_valve="merge", max_compressed_tile_size=512000))]
+#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=2097152, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None, size_valve="merge", max_compressed_tile_size=512000, coverage_fill=false))]
 #[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
 fn export_pmtiles(
     py: Python<'_>,
@@ -776,6 +778,7 @@ fn export_pmtiles(
     attribution: Option<String>,
     size_valve: &str,
     max_compressed_tile_size: usize,
+    coverage_fill: bool,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let mut metadata = tylertoo_core::TilesetMetadata::new();
@@ -791,6 +794,7 @@ fn export_pmtiles(
         // #745: tippecanoe's `-M`; 0 sets no compressed limit.
         compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
         size_valve: parse_size_valve(size_valve)?,
+        coverage_fill,
         simple_clip_fastpath,
         partition_wave,
         feature_order: parse_feature_order(feature_order)?,
