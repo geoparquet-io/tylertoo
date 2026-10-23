@@ -219,7 +219,7 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
 
 Largest 10 tile(s):
 z    x    y    bytes
-6   40   35  179,805
+6   40   35  179,809
 ...
 ```
 
