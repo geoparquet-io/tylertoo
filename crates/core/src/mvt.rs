@@ -1249,14 +1249,17 @@ struct QuantizedFeature {
 }
 
 impl QuantizedPolygons {
+    /// Quantize `features`, each a geometry and its merge key: features with
+    /// different keys are never grouped, so their parts' interactions are
+    /// not looked for.
     pub(crate) fn new<'a>(
-        geometries: impl IntoIterator<Item = &'a Geometry>,
+        features: impl IntoIterator<Item = (&'a Geometry, u64)>,
         bounds: &TileBounds,
         extent: u32,
     ) -> Self {
         use rayon::prelude::*;
         let proj = TileProjector::new(bounds, extent);
-        let geometries: Vec<&Geometry> = geometries.into_iter().collect();
+        let (geometries, feature_keys): (Vec<&Geometry>, Vec<u64>) = features.into_iter().unzip();
         // Per feature: its cleaned parts, `multi` and `has_coords`.
         type Quantized = (Vec<Vec<TileRing>>, bool, bool);
         let quantized: Vec<Option<Quantized>> = geometries
@@ -1279,9 +1282,11 @@ impl QuantizedPolygons {
             .collect();
         let mut features = Vec::with_capacity(quantized.len());
         let mut parts = Vec::new();
-        for q in quantized {
+        let mut keys = Vec::new();
+        for (q, &key) in quantized.into_iter().zip(&feature_keys) {
             features.push(q.map(|(p, multi, has_coords)| {
                 let start = parts.len();
+                keys.extend(std::iter::repeat_n(key, p.len()));
                 parts.extend(p);
                 QuantizedFeature {
                     parts: start..parts.len(),
@@ -1290,11 +1295,14 @@ impl QuantizedPolygons {
                 }
             }));
         }
-        // The box-meeting pairs, then the exact test on each in parallel.
+        // The box-meeting pairs that share a key, then the exact test on each
+        // in parallel.
         let boxes: Vec<_> = parts.iter().map(|p| ring_box(&p[0])).collect();
         let mut candidates: Vec<(u32, u32)> = Vec::new();
         any_box_pair(&boxes, |i, j| {
-            candidates.push((i as u32, j as u32));
+            if keys[i] == keys[j] {
+                candidates.push((i as u32, j as u32));
+            }
             false
         });
         let hits: Vec<(u32, u32)> = candidates
@@ -2164,7 +2172,7 @@ mod tests {
         geoms.push(Polygon::new(LineString::new(vec![]), vec![]).into()); // 18: empty
         geoms.push(line_string![(x: 0.1, y: 0.9), (x: 0.9, y: 0.9)].into()); // 19
 
-        let mut q = QuantizedPolygons::new(&geoms, &test_bounds(), 4096);
+        let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096);
         assert!(q.encode(&[19]).is_none(), "a line is not cached");
         assert!(q.encode(&[0, 19]).is_none(), "nor a group holding one");
         let polygonal: Vec<usize> = (0..19).collect();

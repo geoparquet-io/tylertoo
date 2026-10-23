@@ -5987,9 +5987,25 @@ fn drop_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Til
     }
 }
 
+/// How many more passes a stalling tile may need, at the rate its last pass
+/// shrank it, before the merge valve stops raising the threshold step by
+/// step and merges everything (#758).
+const MAX_PROJECTED_PASSES: f64 = 4.0;
+
+/// Has the merge valve stalled? From the fit before and after a pass: the
+/// tile did not shrink, or shrinking at that rate it would need more than
+/// [`MAX_PROJECTED_PASSES`] further passes to fit. Merging features that do
+/// not touch saves only their tags, so on detailed, scattered polygons each
+/// pass shrinks the tile by a few percent.
+fn stalled(prev_fit: f64, fit: f64) -> bool {
+    let rate = fit / prev_fit;
+    rate <= 1.0 || (1.0 / fit).ln() / rate.ln() > MAX_PROJECTED_PASSES
+}
+
 /// The merge valve (#745): merge members whose gap is below the threshold
 /// into the member kept before them, re-encode, and raise the threshold
-/// until the tile fits. See [`coalesce_valve`].
+/// until the tile fits. See [`coalesce_valve`]. A tile that stops shrinking
+/// ([`stalled`]) merges everything it can at once (#758).
 ///
 /// A tile under its limit is encoded exactly as [`drop_to_fit`] would. When
 /// the threshold cannot rise any further and the tile is still over, the
@@ -6021,7 +6037,11 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
             return build_mvt(feats, tb, opts);
         }
         let q = quantized.get_or_insert_with(|| {
-            crate::mvt::QuantizedPolygons::new(ordered.iter().map(|m| &m.geom), tb, opts.extent)
+            crate::mvt::QuantizedPolygons::new(
+                ordered.iter().map(|m| (&m.geom, u64::from(m.band))),
+                tb,
+                opts.extent,
+            )
         });
         q.next_pass();
         let q = &*q;
@@ -6033,6 +6053,7 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
     let mut gaps: Option<Vec<u64>> = None;
     let mut mingap = 0u64;
     let mut keep_fraction = 1.0_f64;
+    let mut prev_fit: Option<f64> = None;
     let mut passes = 0u32;
     loop {
         passes += 1;
@@ -6058,6 +6079,14 @@ fn merge_to_fit(members: &[Member], tb: &TileBounds, opts: &ExportOptions) -> Ti
         // tippecanoe's `mingap_fraction`: aim for the share of features
         // that would fit, with a 20% margin, never keeping more than 80%.
         keep_fraction = (keep_fraction * fit * 0.8).min(0.8);
+        // #758: a tile that shrinks too slowly to fit within a few more
+        // passes at this rate merges everything it can in one step.
+        // DIVERGENCE FROM TIPPECANOE: tippecanoe keeps raising the threshold
+        // one quantile at a time until it fits or runs out of gaps.
+        if prev_fit.is_some_and(|p| stalled(p, fit)) {
+            keep_fraction = 0.0;
+        }
+        prev_fit = Some(fit);
         let g = gaps.get_or_insert_with(|| coalesce_valve::mergeable_gaps(&ordered));
         if let Some(next) = coalesce_valve::next_mingap(g, keep_fraction, mingap) {
             mingap = next;
@@ -12019,6 +12048,59 @@ mod tests {
         assert!(
             (area - full_area).abs() <= 1e-6 * full_area,
             "merged features were dropped: drew {area} of {full_area}"
+        );
+    }
+
+    /// #758: merging features that do not touch saves only their tags, so
+    /// on a tile of detailed, disjoint polygons each pass barely shrinks the
+    /// tile. Once a pass shows the tile cannot fit within a few more at that
+    /// rate, the valve merges everything it can in one step instead of
+    /// raising the threshold pass after pass (it took 13 passes, each
+    /// re-encoding the whole tile, on an FTW Moldova z6 tile that never fit).
+    #[test]
+    fn a_stalled_merge_jumps_to_merging_everything() {
+        let feats: Vec<Feature> = (0..200)
+            .map(|i| {
+                let (cx, cy) = (0.1 + (i % 20) as f64 * 0.01, 0.1 + (i / 20) as f64 * 0.01);
+                let ring: Vec<(f64, f64)> = (0..=240)
+                    .map(|k| {
+                        let a = std::f64::consts::TAU * f64::from(k % 240) / 240.0;
+                        (cx + 0.003 * a.cos(), cy + 0.003 * a.sin())
+                    })
+                    .collect();
+                Feature {
+                    geom: Geometry::Polygon(geo::Polygon::new(LineString::from(ring), vec![])),
+                    props: vec![("n".to_string(), PropertyValue::Int(i))],
+                }
+            })
+            .collect();
+        let full = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (full_bytes, full_area, _, _) = tile_area_stats(&full[0]);
+        let tiles = encode_level_tiles(
+            &feats,
+            10,
+            &ExportOptions {
+                tile_size_limit: Some(full_bytes / 2),
+                size_valve: SizeValve::Merge,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, area, _, features) = tile_area_stats(&tiles[0]);
+        let v = tiles[0].valve;
+        assert!(v.passes <= 3, "the valve should stop inching: {v:?}");
+        assert_eq!((features, v.merged), (1, 199), "everything merges: {v:?}");
+        assert!(
+            (area - full_area).abs() <= 1e-6 * full_area,
+            "drew {area} of {full_area}"
         );
     }
 
