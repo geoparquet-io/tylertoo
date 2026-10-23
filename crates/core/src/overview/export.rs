@@ -561,6 +561,10 @@ pub struct ZoomReport {
     /// The most encodes any tile at this zoom took (#745); 1 when every tile
     /// fit at once, whichever the valve, and 0 for a zoom with no tiles.
     pub max_valve_passes: u32,
+    /// Encodes all tiles at this zoom took, summed (#750): the tile count
+    /// when every tile fit at once. What the size valve costs, where
+    /// `max_valve_passes` shows only its worst tile.
+    pub valve_passes: u64,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -2984,6 +2988,8 @@ struct LevelTally {
     /// The size valve's per-tile tallies, summed (#745): `merged` and
     /// `dropped` add up; `passes` and `mingap` are the largest seen.
     valve: ValveTally,
+    /// Every tile's `valve.passes`, summed (#750).
+    valve_passes: u64,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
@@ -3002,6 +3008,7 @@ fn write_encoded_tiles(
         tally.valve.merged += t.valve.merged;
         tally.valve.dropped += t.valve.dropped;
         tally.valve.passes = tally.valve.passes.max(t.valve.passes);
+        tally.valve_passes += u64::from(t.valve.passes);
         tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
         if t.feature_count == 0 {
             // #431: an all-dropped tile is a tally carrier, not a tile.
@@ -3094,6 +3101,7 @@ fn finish_level(
         merged_features: tally.valve.merged,
         valve_dropped_features: tally.valve.dropped,
         max_valve_passes: tally.valve.passes,
+        valve_passes: tally.valve_passes,
     }
 }
 
@@ -5818,7 +5826,10 @@ fn encode_members(
             let tb = TileCoord::new(x, y, zoom).bounds();
             let fill = fills
                 .and_then(|f| {
-                    let (feats, shed) = fill_features(f.get(g[0].key)?, g, &tb, opts);
+                    let polys = f.get(g[0].key)?;
+                    let (feats, shed) = ExportTimers::time(&timers.fill_encode, || {
+                        fill_features(polys, g, &tb, opts)
+                    });
                     f.note_shed(shed);
                     Some(feats)
                 })
@@ -5973,9 +5984,12 @@ fn fill_features(
     (feats, shed)
 }
 
-/// About how many bytes a tile's #750 fill may take: half its size limit,
-/// with a compressed limit read as about twice that many raw bytes.
-/// Unlimited without a limit.
+/// About how many bytes a tile's #750 fill may take: a quarter of its size
+/// limit, with a compressed limit read as about twice that many raw bytes.
+/// Unlimited without a limit. At half the limit the size valve ran up to
+/// ten passes per dense tile squeezing the tile's own features into the
+/// rest, each pass re-encoding the whole tile; at a quarter, coverage on FTW
+/// Moldova was the same and the export 27% faster.
 fn fill_budget(opts: &ExportOptions) -> usize {
     let raw = opts.tile_size_limit.filter(|&l| l > 0);
     let gz = opts
@@ -5983,8 +5997,8 @@ fn fill_budget(opts: &ExportOptions) -> usize {
         .filter(|&l| l > 0)
         .map(|l| l.saturating_mul(2));
     match (raw, gz) {
-        (Some(a), Some(b)) => a.min(b) / 2,
-        (Some(a), None) | (None, Some(a)) => a / 2,
+        (Some(a), Some(b)) => a.min(b) / 4,
+        (Some(a), None) | (None, Some(a)) => a / 4,
         (None, None) => usize::MAX,
     }
 }
@@ -9758,6 +9772,31 @@ mod tests {
         assert_eq!(tile_fit(&mut mvt(1000), &opts, &big).unwrap(), 0.5);
     }
 
+    /// #750: the fill may take a quarter of a tile's size limit (a compressed
+    /// limit read as twice that many raw bytes), so the size valve does not
+    /// have to squeeze the tile's own features into half of it.
+    #[test]
+    fn the_fill_budget_is_a_quarter_of_the_limit() {
+        let raw = ExportOptions {
+            tile_size_limit: Some(1000),
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_budget(&raw), 250);
+        let gz = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: Some(1000),
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_budget(&gz), 500);
+        let none = ExportOptions {
+            tile_size_limit: None,
+            compressed_tile_size_limit: None,
+            ..ExportOptions::default()
+        };
+        assert_eq!(fill_budget(&none), usize::MAX);
+    }
+
     /// #750: fill features are drawn but not counted as tile features, so the
     /// report and tilestats count the data's own features, and a tile whose
     /// features all failed to encode is not written for its fill alone.
@@ -13394,6 +13433,22 @@ mod tests {
                 "{valve:?}: the valve must merge here"
             );
             assert_eq!(r_one.valve_dropped_features, 0, "{valve:?}");
+            // Every tile takes at least one encode; the valve's tiles more.
+            for z in &r_one.zooms {
+                assert!(
+                    z.valve_passes >= z.tile_count as u64
+                        && z.valve_passes >= u64::from(z.max_valve_passes),
+                    "{valve:?}: {z:?}"
+                );
+            }
+            assert!(
+                r_one
+                    .zooms
+                    .iter()
+                    .any(|z| z.valve_passes > z.tile_count as u64),
+                "{valve:?}: {:?}",
+                r_one.zooms
+            );
             assert_eq!(
                 std::fs::read(t_many.path()).unwrap(),
                 std::fs::read(t_one.path()).unwrap(),

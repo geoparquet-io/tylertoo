@@ -145,6 +145,7 @@ class ZoomReport(TypedDict):
     merged_features: int
     valve_dropped_features: int
     max_valve_passes: int
+    valve_passes: int
 
 
 class SkippedPropertyColumn(TypedDict):

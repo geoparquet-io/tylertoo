@@ -1941,6 +1941,7 @@ pub tylertoo_core::overview::export::ZoomReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_count: usize
 pub tylertoo_core::overview::export::ZoomReport::tile_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::valve_dropped_features: usize
+pub tylertoo_core::overview::export::ZoomReport::valve_passes: u64
 pub tylertoo_core::overview::export::ZoomReport::zoom: u8
 impl core::clone::Clone for tylertoo_core::overview::export::ZoomReport
 pub fn tylertoo_core::overview::export::ZoomReport::clone(&self) -> tylertoo_core::overview::export::ZoomReport

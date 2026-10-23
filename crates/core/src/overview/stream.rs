@@ -3656,6 +3656,22 @@ pub(super) struct ExportTimers {
     /// The level scan's per-batch tile sizing (`size_bboxes`, #730): a wall
     /// window on the consumer thread, like `scan_decode`.
     pub(super) scan_size: AtomicU64,
+    /// #750 coverage fill, seed: decoding, clipping, projecting and
+    /// simplifying the finest level, a wall window per batch on the
+    /// consumer thread (its decode is not charged to `decode`).
+    pub(super) fill_seed: AtomicU64,
+    /// #750 coverage fill, pyramid: Douglas–Peucker with area credit,
+    /// summed per tile across threads.
+    pub(super) fill_simplify: AtomicU64,
+    /// #750 coverage fill, pyramid: `union_touching` (both passes), summed
+    /// per tile.
+    pub(super) fill_union: AtomicU64,
+    /// #750 coverage fill, pyramid: the placeholder-square accumulator,
+    /// summed per tile.
+    pub(super) fill_squares: AtomicU64,
+    /// #750 coverage fill, encode: a tile's host assignment, budget and
+    /// fill-feature encoding, summed per tile (part of `encode`'s window).
+    pub(super) fill_encode: AtomicU64,
 }
 
 /// [`ExportTimers`] snapshotted in seconds for [`write_export_profile_json`].
@@ -3672,6 +3688,11 @@ pub(super) struct ExportStageSecs {
     pub(super) scan_read: f64,
     pub(super) scan_decode: f64,
     pub(super) scan_size: f64,
+    pub(super) fill_seed: f64,
+    pub(super) fill_simplify: f64,
+    pub(super) fill_union: f64,
+    pub(super) fill_squares: f64,
+    pub(super) fill_encode: f64,
 }
 
 impl ExportTimers {
@@ -3707,6 +3728,11 @@ impl ExportTimers {
             scan_read: nanos_secs(&self.scan_read),
             scan_decode: nanos_secs(&self.scan_decode),
             scan_size: nanos_secs(&self.scan_size),
+            fill_seed: nanos_secs(&self.fill_seed),
+            fill_simplify: nanos_secs(&self.fill_simplify),
+            fill_union: nanos_secs(&self.fill_union),
+            fill_squares: nanos_secs(&self.fill_squares),
+            fill_encode: nanos_secs(&self.fill_encode),
         }
     }
 }
@@ -3862,6 +3888,11 @@ pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
                 "scan_read": stage.scan_read,
                 "scan_decode": stage.scan_decode,
                 "scan_size": stage.scan_size,
+                "fill_seed": stage.fill_seed,
+                "fill_simplify": stage.fill_simplify,
+                "fill_union": stage.fill_union,
+                "fill_squares": stage.fill_squares,
+                "fill_encode": stage.fill_encode,
             },
             "per_zoom": per_zoom_json,
             "waves_total": inputs.waves_total,

@@ -220,7 +220,7 @@ def last_json_line(path: Path) -> dict | None:
 
 def zoom_summary(report: dict) -> list[dict]:
     keep = ("zoom", "tile_count", "tile_feature_count", "oversized_tiles", "merged_features",
-            "valve_dropped_features", "max_valve_passes")
+            "valve_dropped_features", "max_valve_passes", "valve_passes")
     return [{k: z.get(k) for k in keep} for z in report.get("zooms", [])]
 
 

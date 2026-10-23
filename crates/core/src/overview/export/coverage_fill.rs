@@ -487,18 +487,49 @@ fn nearest_free(
 
 /// One tile's fill from the shapes lifted into it: simplify, union where
 /// shapes touch, simplify the union, and return collapsed area as squares.
+#[cfg(test)]
 pub(super) fn fill_for_tile(lifted: Vec<Shape>) -> Vec<Shape> {
-    let (shapes, collapsed) = simplify_coverage(lifted, FILL_SIMPLIFY_PX);
-    fill_from(shapes, collapsed)
+    fill_for_tile_timed(lifted, &super::ExportTimers::default())
+}
+
+/// [`fill_for_tile`], charging its stages to the export's fill timers.
+fn fill_for_tile_timed(lifted: Vec<Shape>, timers: &super::ExportTimers) -> Vec<Shape> {
+    let (shapes, collapsed) = super::ExportTimers::time(&timers.fill_simplify, || {
+        simplify_coverage(lifted, FILL_SIMPLIFY_PX)
+    });
+    fill_from_timed(shapes, collapsed, timers)
 }
 
 /// The tail of [`fill_for_tile`] for shapes already simplified at this
 /// tile's scale, with the area that collapsed (or was shaved) on the way.
-fn fill_from(shapes: Vec<Shape>, mut collapsed: Vec<Collapsed>) -> Vec<Shape> {
-    let (mut fill, more) = simplify_coverage(union_touching(shapes), FILL_SIMPLIFY_PX);
+#[cfg(test)]
+fn fill_from(shapes: Vec<Shape>, collapsed: Vec<Collapsed>) -> Vec<Shape> {
+    fill_from_timed(shapes, collapsed, &super::ExportTimers::default())
+}
+
+/// [`fill_from`], charging its stages to the export's fill timers.
+fn fill_from_timed(
+    shapes: Vec<Shape>,
+    mut collapsed: Vec<Collapsed>,
+    timers: &super::ExportTimers,
+) -> Vec<Shape> {
+    use super::ExportTimers as T;
+    let united = T::time(&timers.fill_union, || union_touching(shapes));
+    let (mut fill, more) = T::time(&timers.fill_simplify, || {
+        simplify_coverage(united, FILL_SIMPLIFY_PX)
+    });
     collapsed.extend(more);
-    fill.extend(squares_for_collapsed(&collapsed, FILL_SIMPLIFY_PX));
-    fill
+    fill.extend(T::time(&timers.fill_squares, || {
+        squares_for_collapsed(&collapsed, FILL_SIMPLIFY_PX)
+    }));
+    // Squares sit on a grid, so a block of them touch: dissolve them with
+    // each other and with the shapes they touch. A block of squares is then
+    // one shape, not a 4-vertex ring per cell, which cuts the vertices the
+    // fill carries on scattered sub-pixel fields by a third (FTW Moldova).
+    // Rectangles from the grid alone are cheaper to build but leave the
+    // squares beside the shapes, and the larger fill sent the size valve to
+    // 15 passes per tile.
+    T::time(&timers.fill_union, || union_touching(fill))
 }
 
 /// An open ring in integer tile units at the export extent.
@@ -532,10 +563,32 @@ pub(super) fn to_tile_polygons(fill: &[Shape], scale: f64) -> Vec<FillPolygon> {
         .collect()
 }
 
-/// Rough MVT bytes a fill polygon encodes to: a command and a pair of small
-/// varints per vertex, a few bytes per ring. Only orders the budget.
+/// The MVT command bytes a fill polygon encodes to: per ring a `MoveTo`, a
+/// `LineTo` and a `ClosePath` command, and each vertex's zigzag-encoded delta
+/// from the one before as varints (the first from the ring's own start, an
+/// estimate of the cursor). Dissolved shapes have long edges, so counting
+/// vertices alone would let them overrun the budget.
 fn est_bytes(poly: &FillPolygon) -> usize {
-    poly.iter().map(|r| 3 * r.len() + 4).sum()
+    let varint = |d: i32| -> usize {
+        let z = ((d << 1) ^ (d >> 31)) as u32;
+        match z {
+            0..=0x7f => 1,
+            0x80..=0x3fff => 2,
+            0x4000..=0x1f_ffff => 3,
+            _ => 4,
+        }
+    };
+    poly.iter()
+        .map(|r| {
+            let mut prev = r.first().copied().unwrap_or((0, 0));
+            let mut bytes = 3 + 2; // commands, and the first point's deltas
+            for &p in r.iter().skip(1) {
+                bytes += varint(p.0 - prev.0) + varint(p.1 - prev.1);
+                prev = p;
+            }
+            bytes
+        })
+        .sum()
 }
 
 /// A fill polygon's area in tile units², exterior minus holes.
@@ -726,9 +779,18 @@ fn seed_batch(
 ) -> Result<(), super::ExportError> {
     use rayon::prelude::*;
     type Bucket = (Vec<Shape>, Vec<Collapsed>);
+    // The whole batch is the fill's seed time; its decode is not the
+    // export's own `decode` stage.
+    let _seed = super::ExportTimers::scope(&timers.fill_seed);
     let schema = batch.schema();
     let geom_idx = super::batch_geometry_index(batch, geometry)?;
-    let geoms = super::decode_batch_geometries(batch, &schema, geom_idx, crs, timers)?;
+    let geoms = super::decode_batch_geometries(
+        batch,
+        &schema,
+        geom_idx,
+        crs,
+        &super::ExportTimers::default(),
+    )?;
     *features += geoms.len();
     let pieces: Vec<Vec<(u64, Bucket)>> = geoms
         .par_iter()
@@ -860,16 +922,17 @@ pub(super) fn build_fill_map(
     let mut vertices = 0usize;
     let mut zoom = seed_zoom;
     loop {
+        let t_zoom = std::time::Instant::now();
         let fills: Vec<(u64, Vec<Shape>)> = std::mem::take(&mut buckets)
             .into_iter()
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|(key, (shapes, collapsed))| {
                 let fill = if zoom == seed_zoom {
-                    fill_from(shapes, collapsed)
+                    fill_from_timed(shapes, collapsed, timers)
                 } else {
                     debug_assert!(collapsed.is_empty());
-                    fill_for_tile(shapes)
+                    fill_for_tile_timed(shapes, timers)
                 };
                 (key, fill)
             })
@@ -895,8 +958,9 @@ pub(super) fn build_fill_map(
                 .sum::<f64>()
                 * k;
             log::debug!(
-                "[export] coverage fill z{zoom}: {} tiles, area {area:.0} seed px²",
-                fills.len()
+                "[export] coverage fill z{zoom}: {} tiles, area {area:.0} seed px², {:.3}s",
+                fills.len(),
+                t_zoom.elapsed().as_secs_f64()
             );
         }
         if zoom == min_zoom {
@@ -1254,12 +1318,39 @@ mod tests {
         };
         let mut polys: Vec<FillPolygon> = (0..100).map(sq).collect();
         polys.insert(50, big);
-        let (kept, shed) = within_budget(&polys, 10 * est_bytes(&polys[0]));
+        // Room for the large polygon and nine squares.
+        let budget = est_bytes(&polys[50]) + 9 * est_bytes(&polys[0]);
+        let (kept, shed) = within_budget(&polys, budget);
         assert_eq!(kept.len(), 10);
         assert_eq!(shed, 91);
         assert!(kept.contains(&50), "the large polygon is kept");
         assert!(kept.windows(2).all(|w| w[0] < w[1]), "original order kept");
         assert_eq!(within_budget(&polys, usize::MAX), ((0..101).collect(), 0));
+    }
+
+    #[test]
+    fn adjacent_squares_are_dissolved_into_one_shape() {
+        // Three squares' worth credited in a row of cells: drawn as one
+        // 12×4 rectangle, not three 4-vertex rings.
+        let collapsed: Vec<Collapsed> = [1.0, 5.0, 9.0]
+            .iter()
+            .map(|&x| Collapsed {
+                area: 16.0,
+                at: [x, 1.0],
+            })
+            .collect();
+        let fill = fill_from(Vec::new(), collapsed);
+        assert_eq!(fill.len(), 1, "{fill:?}");
+        assert_eq!(fill[0][0].len(), 4, "{fill:?}");
+        assert_eq!(area(&fill), 48.0);
+    }
+
+    #[test]
+    fn the_byte_estimate_charges_long_edges_more() {
+        // Same vertex count; the large square's deltas take more varint bytes.
+        let small: FillPolygon = vec![vec![(0, 0), (4, 0), (4, 4), (0, 4)]];
+        let large: FillPolygon = vec![vec![(0, 0), (4000, 0), (4000, 4000), (0, 4000)]];
+        assert!(est_bytes(&large) > est_bytes(&small));
     }
 
     #[test]
