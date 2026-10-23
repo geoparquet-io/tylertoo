@@ -216,6 +216,7 @@ panics instead, so a gated run can't compare nothing.
 | `clipping` | Sutherland-Hodgman against `i_overlay`, plus `export_clip_mix`, the point, line, and polygon mix that export clips per tile |
 | `bbox_containment` | Bounding-box containment fast paths |
 | `tile_compress_dedup` | Per-tile gzip and the XXH3 tile-content dedup cache |
+| `pipeline` | `convert_to_overviews` then `export_pmtiles` on two small real fixtures, single-threaded: the production path end to end |
 
 Run one:
 

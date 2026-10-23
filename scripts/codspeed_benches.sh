@@ -46,6 +46,10 @@ declare -A PATHS=(
   [simplify_cascade]="$S/overview/(simplify|level)\.rs|$MVT|$DECODE"
   [mvt_encode]="$MVT"
   [tile_compress_dedup]="$S/(compression|dedup)\.rs|$MVT"
+  # convert + export end to end: any library source can move it, and it is
+  # what measures the modules no kernel bench covers (pass-1 scan, decode,
+  # staging, pyramid merge, export scan; #759).
+  [pipeline]="$S/.*"
 )
 
 changed=$(cat)
