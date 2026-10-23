@@ -27,10 +27,11 @@
 //! The export then draws each tile's fill under the tile's own features, one
 //! fill feature per feature the fill joins, with that feature's id and tags
 //! ([`assign_hosts`]). A dissolved piece can span many features and carries
-//! one of them's attributes. The fill takes at most about half a tile's size
-//! limit, shedding its smallest pieces first ([`within_budget`]), and the
-//! size valve fits the tile's own features into what it leaves (`export.rs`,
-//! `FillBytes`).
+//! one of them's attributes. The size valve fits the tile's own features
+//! first, exactly as without a fill; the fill then takes only the room they
+//! leave, at most about a quarter of the size limit, shedding its smallest
+//! pieces first ([`within_budget`]; `export.rs`, `with_fill`). It never makes
+//! the valve merge or drop a real feature.
 //!
 //! Memory: the finest level's geometry, simplified, is held until the fill
 //! is built, and every zoom's fill until the export ends. Neither is spilled
@@ -215,16 +216,52 @@ fn credit_shaved(r: &[[f64; 2]], keep: &[bool], sign: f64, step: f64, out: &mut 
         } else {
             (a + 1..n).chain(0..b).collect()
         };
-        let (Some(&first), Some(&last)) = (removed.first(), removed.last()) else {
+        if removed.is_empty() {
             continue;
-        };
+        }
         let mut run = Vec::with_capacity(removed.len() + 2);
         run.push(r[a]);
         run.extend(removed.iter().map(|&i| r[i]));
         run.push(r[b]);
         let area = sign * orient * ring_area2(&run) / 2.0;
         if area != 0.0 {
-            credit_along(r[first], r[last], area, step, out);
+            credit_run(&run, area, step, out);
+        }
+    }
+}
+
+/// Credit `area`, the area between a removed `run` and its chord (the run's
+/// first and last points), along the run: each segment gets the trapezoid
+/// between it and its projection on the chord, so the pieces sum to the
+/// run's area and land where it was. Every removed vertex lies within the
+/// simplification tolerance of the chord, so each share stays small: a
+/// lone vertex's area spreads along both its edges, not as a block of
+/// squares at the vertex.
+fn credit_run(run: &[[f64; 2]], area: f64, step: f64, out: &mut Vec<Collapsed>) {
+    let (a, b) = (run[0], run[run.len() - 1]);
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    // In the chord's frame: distance along it, and height off it.
+    let frame = |p: [f64; 2]| {
+        let (px, py) = (p[0] - a[0], p[1] - a[1]);
+        ((px * dx + py * dy) / len, (dx * py - dy * px) / len)
+    };
+    let pieces: Vec<f64> = run
+        .windows(2)
+        .map(|w| {
+            let ((x0, h0), (x1, h1)) = (frame(w[0]), frame(w[1]));
+            (x1 - x0) * (h0 + h1) / 2.0
+        })
+        .collect();
+    let total: f64 = pieces.iter().sum();
+    if len == 0.0 || total.abs() < 1e-12 {
+        // A closed or degenerate run: along the run's whole span instead.
+        credit_along(run[1], run[run.len() - 2], area, step, out);
+        return;
+    }
+    for (w, piece) in run.windows(2).zip(&pieces) {
+        if *piece != 0.0 {
+            credit_along(w[0], w[1], area * piece / total, step, out);
         }
     }
 }
@@ -306,8 +343,11 @@ fn bbox(shape: &Shape) -> [f64; 4] {
     b
 }
 
-/// The union of `shapes` clipped to the tile, in one `i_overlay` pass:
-/// `NonZero` makes overlapping parts add, as in `mvt.rs`.
+/// The union of `shapes` clipped to the tile, in one `i_overlay` pass.
+/// Every input is oriented (exteriors positive, holes negative), so the
+/// `Positive` rule keeps what any exterior covers less its holes. Unlike
+/// `NonZero` (as in `mvt.rs`), it does not fill the part of a hole that
+/// simplification pushed outside its exterior.
 fn union_clip(shapes: &[Shape]) -> Vec<Shape> {
     use i_overlay::core::fill_rule::FillRule;
     use i_overlay::core::overlay_rule::OverlayRule;
@@ -316,7 +356,7 @@ fn union_clip(shapes: &[Shape]) -> Vec<Shape> {
     let e = FILL_EXTENT;
     let tile: Shape = vec![vec![[0.0, 0.0], [e, 0.0], [e, e], [0.0, e]]];
     FloatOverlay::with_subj_and_clip_custom(shapes, &[tile], Default::default(), Default::default())
-        .overlay(OverlayRule::Intersect, FillRule::NonZero)
+        .overlay(OverlayRule::Intersect, FillRule::Positive)
 }
 
 /// Union shapes whose bounding boxes meet and clip them to the tile; a lone
@@ -564,10 +604,13 @@ pub(super) fn to_tile_polygons(fill: &[Shape], scale: f64) -> Vec<FillPolygon> {
 }
 
 /// The MVT command bytes a fill polygon encodes to: per ring a `MoveTo`, a
-/// `LineTo` and a `ClosePath` command, and each vertex's zigzag-encoded delta
-/// from the one before as varints (the first from the ring's own start, an
-/// estimate of the cursor). Dissolved shapes have long edges, so counting
-/// vertices alone would let them overrun the budget.
+/// `LineTo` with its vertex count and a `ClosePath` command, and each
+/// vertex's zigzag-encoded delta from the one before as varints. The first
+/// point's delta runs from wherever the last ring ended, unknown here, so it
+/// is counted at the most a tile coordinate takes. Dissolved shapes have long
+/// edges, so counting vertices alone would let them overrun the budget. The
+/// feature's tags are not counted: they are its host's, which the tile
+/// already carries.
 fn est_bytes(poly: &FillPolygon) -> usize {
     let varint = |d: i32| -> usize {
         let z = ((d << 1) ^ (d >> 31)) as u32;
@@ -581,7 +624,9 @@ fn est_bytes(poly: &FillPolygon) -> usize {
     poly.iter()
         .map(|r| {
             let mut prev = r.first().copied().unwrap_or((0, 0));
-            let mut bytes = 3 + 2; // commands, and the first point's deltas
+            // MoveTo, LineTo and its count, ClosePath; the first point.
+            let count = if r.len() > 15 { 2 } else { 1 };
+            let mut bytes = 3 + count + 2 * 3;
             for &p in r.iter().skip(1) {
                 bytes += varint(p.0 - prev.0) + varint(p.1 - prev.1);
                 prev = p;
@@ -592,7 +637,7 @@ fn est_bytes(poly: &FillPolygon) -> usize {
 }
 
 /// A fill polygon's area in tile units², exterior minus holes.
-fn poly_area(poly: &FillPolygon) -> f64 {
+pub(super) fn poly_area(poly: &FillPolygon) -> f64 {
     let ring = |r: &TileRing| {
         let mut a = 0i64;
         for k in 0..r.len() {
@@ -614,12 +659,9 @@ pub(super) fn within_budget(polys: &[FillPolygon], budget: usize) -> (Vec<usize>
     if total <= budget {
         return ((0..polys.len()).collect(), 0);
     }
+    let areas: Vec<f64> = polys.iter().map(poly_area).collect();
     let mut by_size: Vec<usize> = (0..polys.len()).collect();
-    by_size.sort_by(|&a, &b| {
-        poly_area(&polys[b])
-            .total_cmp(&poly_area(&polys[a]))
-            .then(a.cmp(&b))
-    });
+    by_size.sort_by(|&a, &b| areas[b].total_cmp(&areas[a]).then(a.cmp(&b)));
     let mut used = 0;
     let mut kept = Vec::new();
     for i in by_size {
@@ -1103,7 +1145,7 @@ mod tests {
         // The bump dents the shape (y grows downward); filling the dent
         // adds 50 px², which comes back as a negative credit.
         let credited: f64 = credit.iter().map(|c| c.area).sum();
-        assert_eq!(credited, -50.0);
+        assert!((credited + 50.0).abs() < 1e-9, "{credited}");
     }
 
     #[test]
@@ -1164,6 +1206,32 @@ mod tests {
     fn union_passes_a_lone_interior_shape_through() {
         let lone = square(100.0, 100.0, 10.0);
         assert_eq!(union_touching(vec![lone.clone()]), vec![lone]);
+    }
+
+    /// Simplification can push a hole near the boundary partly outside its
+    /// exterior. Under `NonZero` that part (winding -1) was filled, drawing
+    /// fill outside the coverage; a hole only ever removes area.
+    #[test]
+    fn union_does_not_fill_a_hole_pushed_outside_its_exterior() {
+        let mut frame = square(100.0, 100.0, 100.0);
+        // Exterior positive, hole negative: the hole pokes 20 px out of the
+        // bottom edge.
+        frame.push(vec![
+            [140.0, 150.0],
+            [140.0, 220.0],
+            [160.0, 220.0],
+            [160.0, 150.0],
+        ]);
+        assert!(ring_area2(&frame[0]) > 0.0 && ring_area2(&frame[1]) < 0.0);
+        let neighbour = square(500.0, 500.0, 10.0);
+        let out = union_clip(&[frame, neighbour.clone(), square(195.0, 100.0, 10.0)]);
+        let area: f64 = out.iter().map(|s| net_area(s)).sum();
+        // 100×100, less the hole's 20×50 inside it, plus the overlapping
+        // 10×10 square's 5×10 outside, plus the neighbour.
+        assert!(
+            (area - (10_000.0 - 1_000.0 + 50.0 + 100.0)).abs() < 1e-6,
+            "{area}"
+        );
     }
 
     #[test]
@@ -1292,6 +1360,27 @@ mod tests {
             );
         }
         assert!((credit.iter().map(|c| c.area).sum::<f64>() - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_single_shaved_vertex_is_credited_along_its_edges() {
+        // One vertex 3 px out of a 1000 px edge: 1500 px² shaved off. It is
+        // credited in small shares along the edges it sat on, not as one
+        // lump at the vertex (which drew a 40 px block of squares).
+        let s: Shape = vec![vec![
+            [0.0, 0.0],
+            [1000.0, 0.0],
+            [1000.0, 1000.0],
+            [500.0, 1003.0],
+            [0.0, 1000.0],
+        ]];
+        let (_, credit) = simplify_coverage(vec![s], 4.0);
+        assert!((credit.iter().map(|c| c.area).sum::<f64>() - 1500.0).abs() < 1e-6);
+        assert!(credit.len() > 100, "{} shares", credit.len());
+        for c in &credit {
+            assert!(c.area.abs() <= 2.0 * 16.0, "{c:?}");
+            assert!((c.at[1] - 1000.0).abs() <= 4.0, "{c:?}");
+        }
     }
 
     #[test]

@@ -196,6 +196,7 @@ export_pmtiles(
     attribution: str | None = None,
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int = 0,
+    coverage_fill: bool = False,
 ) -> ExportReport
 ```
 
@@ -223,6 +224,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
 * `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`, or `0` for no limit.
+* `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 
 ### Returns
 
@@ -398,6 +400,7 @@ convert(
     exclude_all_properties: bool = False,
     size_valve: Literal['merge', 'drop'] = "merge",
     max_compressed_tile_size: int = 0,
+    coverage_fill: bool = False,
 ) -> ConvertReport
 ```
 
@@ -421,6 +424,7 @@ Use `overview()` followed by `export_pmtiles()` for all options, including the `
 * `exclude_all_properties`: See `overview()`.
 * `size_valve`: See `export_pmtiles()`.
 * `max_compressed_tile_size`: See `export_pmtiles()`.
+* `coverage_fill`: See `export_pmtiles()`.
 
 ### Returns
 

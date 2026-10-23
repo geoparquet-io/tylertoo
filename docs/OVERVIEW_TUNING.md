@@ -42,7 +42,7 @@ Use these settings to balance coverage, build time, and file size:
 
 | Goal | Settings | Cost and effect |
 |---|---|---|
-| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.06–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill---coverage-fill). |
+| No holes where small polygons are dense (parcels, small admin units) | `export-pmtiles --coverage-fill` | Each tile also draws, under its own features, the area its child tiles cover, so placeholder squares no longer leave gaps between them: Auckland parcels at z8 go from 28.5% of the area missing to none. 1.06–1.17× the build time and 4% larger archives on Madagascar admin-4 and NZ parcels. On scattered polygons smaller than a pixel (FTW fields) it also draws area between them. See [coverage fill](#coverage-fill-coverage-fill). |
 | Fewer slivers between neighbors | `--simplify-factor 0.25` | About tippecanoe's coverage on dense parcels. See [coverage and simplification](#coverage-and-simplification). |
 | No slivers at all | `--simplify-factor 0`, plus `--profile bounded` when memory is tight | Neighbors meet without gaps. The overview file grows about 2.7×, and dense small polygons build up to 10× slower. |
 | Smaller, faster builds (the output before #745) | `--drop-polygons --drop-lines --no-collapse`, plus `--size-valve drop` | Fastest. A polygon coverage shows holes at coarse and middle zooms. |
@@ -125,12 +125,17 @@ that area under its own features.
   can span many features, so a style that colors by attribute draws that
   piece in one feature's color, and a style that draws one class above
   another can draw it over the other class.
-- The fill takes at most about half of the [size cap](#tile-size-cap),
-  dropping its smallest pieces first; the size valve merges or drops the
-  tile's own features to fit in the rest.
-- The fill is built from the finest level, so it also draws the area of
-  polygons that `--drop-polygons` or a dot-fill recipe removed from coarse
-  levels.
+- The fill only takes the room the tile's own features leave under the
+  [size cap](#tile-size-cap), and at most about a quarter of it, dropping its
+  smallest pieces first. It never makes the size valve merge or drop a real
+  feature. So the fill needs headroom: under tippecanoe's 500K compressed
+  cap, Madagascar admin-4 at z4 misses 0.01% of the area z8 draws, tile by
+  tile; under a 500K raw cap the z4 tiles are nearly full, and it misses
+  8.6% (12.8% without the fill).
+- The fill is built from the finest level, so in tiles that have features
+  of their own it also draws the area of polygons that `--drop-polygons` or
+  a dot-fill recipe removed from coarse levels. A tile left with no
+  features at all is not written, fill or not (#766).
 - The export holds the finest level's geometry in memory while it builds
   the fill, outside the RAM budget the export plans for: about 1.7 GB more
   on 4.3M NZ parcels, growing with the input (#764).
@@ -139,8 +144,8 @@ that area under its own features.
 On the benchmark inputs, the fill adds 17% to end-to-end time on NZ parcels
 and 6% on Madagascar admin-4, and 4% to the archive. On FTW Moldova, where
 fields are smaller than a pixel at coarse zooms, it halves the missing area
-but draws more area between fields, and the build takes 2.2× as long
-(#762).
+but draws more area between fields, and the export takes about 2.4× as
+long (#762).
 
 ## The GSD ladder: `--gsd-base` and `--gsd`
 

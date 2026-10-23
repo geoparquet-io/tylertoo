@@ -165,13 +165,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # Keyed on the fixtures' LFS pointer files (checkout fetches no LFS),
-      # so adding or changing a fixture downloads the release again.
+      # Only the release's Parquet fixtures are cached, keyed on their
+      # pointer files (the checkout fetches no large files): adding or
+      # changing one downloads the release again, and the fixtures tracked
+      # as plain files (.wkb, the README) always come from the checkout.
       - name: Cache test fixtures
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -304,7 +306,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -460,7 +462,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -590,7 +592,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -722,7 +724,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -809,7 +811,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
@@ -880,7 +882,7 @@ jobs:
         id: fixture-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: tests/fixtures/realdata
+          path: tests/fixtures/realdata/*.parquet
           key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures

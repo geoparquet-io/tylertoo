@@ -938,3 +938,19 @@ class TestPublicationMetadata:
     def test_deprecated_convert_signature_is_unchanged(self):
         params = inspect.signature(tylertoo.convert).parameters
         assert not set(self.KEYS) & params.keys()
+
+
+@needs_buildings
+def test_export_pmtiles_coverage_fill_reaches_the_export():
+    """`coverage_fill=True` draws a fill under coarse tiles (#750); off by
+    default, the report counts none."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ov = Path(tmpdir) / "overview.parquet"
+        tylertoo.overview(str(BUILDINGS), str(ov), min_zoom=0, max_zoom=12)
+        off = tylertoo.export_pmtiles(str(ov), str(Path(tmpdir) / "off.pmtiles"))
+        on = tylertoo.export_pmtiles(
+            str(ov), str(Path(tmpdir) / "on.pmtiles"), coverage_fill=True
+        )
+        assert sum(z["fill_polygons"] for z in off["zooms"]) == 0
+        assert sum(z["fill_polygons"] for z in on["zooms"]) > 0
+        assert on["zooms"][-1]["fill_polygons"] == 0

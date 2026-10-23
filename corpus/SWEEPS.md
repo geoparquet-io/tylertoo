@@ -397,7 +397,7 @@ instead (`docs/OVERVIEW_TUNING.md` § Coverage and simplification), with
 file) as recipes, alongside the pre-#745 settings for smaller, faster builds.
 Issue #450 tracks simplifying shared borders identically.
 
-## Decision 9: the coverage fill is opt-in (issue #750)
+## Decision 10: the coverage fill is opt-in (issue #750)
 
 After #745, placeholder squares stood in for polygons too small for a level,
 but they sat where those polygons were. In dense blocks they overlapped one
@@ -420,17 +420,30 @@ setting on the full profile's datasets), against the defaults:
   +61%), the archive grows 19%, and the build takes 2.2× as long
   (8.70 s → 19.47 s). tippecanoe cannot tile this input (#760).
 
-Three fixes shaped the cost and the coverage. The size valve fits a tile's own
-features into what the fill leaves of the cap (`FillBytes`): sized on the
-whole tile, it ran Moldova's z10 to 31 passes. Douglas–Peucker's shrinkage of
-convex blobs, a third of their area a few pixels across, is credited back as
-squares; without that the fill lost 23% of its area by z5. And the credit is
-placed where the area was lost, and a cell's excess spills into nearby cells,
-so the fill keeps its area within about 2% from z11 to z3 on Moldova.
+What shaped the cost and the coverage:
 
-That last fix doubled the vertices the fill carries up the zooms on Moldova
-(7.4M → 14.4M) and took its export from 10.0 s to 17.4 s, against 6.7 s
-without the fill. The fill stays opt-in, and the PR is not merged, until that
-cost comes down. The Moldova over-draw (#762) and the overview's inability to
-tell a dense coverage from scattered sub-pixel polygons keep it opt-in after
-that.
+- The fill takes only the room the tile's own features leave. The size
+  valve fits them first, exactly as without a fill, and the fill sheds its
+  smallest features until the tile fits, so it never makes the valve merge
+  or drop a real feature. An earlier version sized the valve on the
+  features' share of the cap left after the fill; on attribute-heavy tiles
+  that merged real features to make room. So the fill needs headroom:
+  Madagascar admin-4 at z4 misses 0.01% of the area z8 draws (tile by tile)
+  under a 500K compressed cap, and 8.6% under a 500K raw cap, where the
+  coarse tiles are nearly full (12.8% without the fill).
+- Douglas–Peucker's shrinkage of convex blobs, a third of their area a few
+  pixels across, is credited back as squares; without that the fill lost
+  23% of its area by z5. The credit lands where the area was lost: a shaved
+  run's area along the run, as trapezoids against the chord that replaced
+  it. A cell's excess spills into nearby cells, so the fill keeps its area
+  within about 2% from z11 to z3 on Moldova.
+- Squares that touch are dissolved with each other and with the shapes they
+  touch, and the fill takes at most a quarter of the cap. Before that the
+  fill carried 14.4M vertices up the zooms on Moldova and the export took
+  18.1 s against 6.7 s without the fill; after, 9.2M and 15.8 s. Most of the
+  rest was the merge valve grinding on tiles that could not fit, fixed in
+  #758.
+
+The fill stays opt-in. The Moldova over-draw (#762) and the overview's
+inability to tell a dense coverage from scattered sub-pixel polygons keep it
+so.

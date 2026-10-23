@@ -72,6 +72,73 @@ fn tile_polygons(raw: &[u8]) -> Vec<Polygon<f64>> {
     out
 }
 
+/// Each tile an archive draws at `zoom`: the union of its polygons clipped
+/// to the tile, in tile units, keyed by (x, y).
+fn drawn_tiles(
+    archive: &Path,
+    zoom: u8,
+) -> std::collections::HashMap<(u32, u32), geo::MultiPolygon<f64>> {
+    let index = ArchiveIndex::open(archive).expect("open archive");
+    let tile_box = Rect::new(
+        Coord { x: 0.0, y: 0.0 },
+        Coord {
+            x: EXTENT,
+            y: EXTENT,
+        },
+    )
+    .to_polygon();
+    let mut out = std::collections::HashMap::new();
+    for t in index.tiles() {
+        let t = t.expect("tile entry");
+        if t.z != zoom {
+            continue;
+        }
+        let bytes = index.read_range(t.range.clone()).expect("read tile");
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut raw)
+            .expect("gunzip");
+        let union = geo::unary_union(&tile_polygons(&raw));
+        out.insert((t.x, t.y), union.intersection(&tile_box));
+    }
+    out
+}
+
+/// Where a coarse zoom draws against a fine one, tile by tile: each fine
+/// tile's square of the coarse tile above it is compared with what the fine
+/// tile draws. Returns the area the coarse zoom misses and the area it adds,
+/// each as a share of the fine zoom's total, so a hole in one place cannot
+/// be offset by over-draw in another.
+fn local_coverage(archive: &Path, coarse: u8, fine: u8) -> (f64, f64) {
+    let coarse_tiles = drawn_tiles(archive, coarse);
+    let fine_tiles = drawn_tiles(archive, fine);
+    let n = 1u32 << (fine - coarse);
+    let side = EXTENT / f64::from(n);
+    let (mut fine_total, mut missing, mut added) = (0.0, 0.0, 0.0);
+    for (&(cx, cy), drawn) in &coarse_tiles {
+        for (dx, dy) in (0..n).flat_map(|dx| (0..n).map(move |dy| (dx, dy))) {
+            let (x0, y0) = (f64::from(dx) * side, f64::from(dy) * side);
+            let square = Rect::new(
+                Coord { x: x0, y: y0 },
+                Coord {
+                    x: x0 + side,
+                    y: y0 + side,
+                },
+            )
+            .to_polygon();
+            // In fine tile units² (the square is one fine tile).
+            let a_coarse = drawn.intersection(&square).unsigned_area() * f64::from(n * n);
+            let a_fine = fine_tiles
+                .get(&(cx * n + dx, cy * n + dy))
+                .map_or(0.0, |m| m.unsigned_area());
+            fine_total += a_fine;
+            missing += (a_fine - a_coarse).max(0.0);
+            added += (a_coarse - a_fine).max(0.0);
+        }
+    }
+    (missing / fine_total, added / fine_total)
+}
+
 /// The area an archive draws at `zoom`, as a share of the world: per tile,
 /// the union of its polygons clipped to the tile, so overlaps and the tile
 /// buffer count once.
@@ -128,8 +195,13 @@ fn coverage_fill_closes_coarse_holes_without_overdrawing() {
 
     let export = |name: &str, fill: bool, threads: usize| {
         let archive = dir.path().join(name);
+        // tippecanoe's cap on the compressed tile, with a 2M raw backstop
+        // (#761): the fill takes only the room the tile's own features
+        // leave, and a 500K raw cap leaves z4 almost none.
         let opts = ExportOptions {
             coverage_fill: fill,
+            tile_size_limit: Some(2048 * 1024),
+            compressed_tile_size_limit: Some(500 * 1024),
             ..ExportOptions::default()
         };
         rayon::ThreadPoolBuilder::new()
@@ -152,18 +224,21 @@ fn coverage_fill_closes_coarse_holes_without_overdrawing() {
     // z8 draws every polygon: the reference for the island's area.
     let island = drawn_area(&today, 8);
     let today_z4 = drawn_area(&today, 4) / island;
-    let fill_z4 = drawn_area(&fill, 4) / island;
     assert!(
         today_z4 < 0.95,
         "the defaults should still show the #750 holes at z4: {today_z4:.4}"
     );
+    // Where z4 draws, not only how much: per z8 tile, against z8.
+    let (missing, added) = local_coverage(&fill, 4, 8);
+    let (today_missing, _) = local_coverage(&today, 4, 8);
+    eprintln!("z4 against z8: missing {missing:.4}, added {added:.4} (defaults: missing {today_missing:.4})");
     assert!(
-        fill_z4 > 0.99,
-        "the fill must close them: z4 draws {fill_z4:.4} of the island"
+        missing < 0.02,
+        "the fill must close the holes: z4 misses {missing:.4} of z8's area (defaults {today_missing:.4})"
     );
     assert!(
-        fill_z4 < 1.03,
-        "and must not draw past the coverage: {fill_z4:.4}"
+        added < 0.03,
+        "and must not draw past the coverage: z4 adds {added:.4}"
     );
 }
 
@@ -225,18 +300,39 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
          valve passes {passes} for {tiles} tiles (fill off: {})",
         sum(&off, |z| z.valve_passes)
     );
-    // Measured when the bounds were set: vertices 161,048, shed 6,182,
-    // passes 84 for 72 tiles (79 with the fill off). About 25% headroom.
+    // Measured when the bounds were set: vertices 133,900, shed 9,850,
+    // passes 109 for 72 tiles (79 with the fill off; fitting the fill into
+    // the room left counts its encodes). About 25% headroom.
     assert!(polygons > 0, "the fill drew nothing: {counts}");
     assert!(
-        vertices <= 200_000,
+        vertices <= 170_000,
         "fill vertices over the ratchet: {counts}"
     );
-    assert!(shed <= 8_000, "fill shed over the ratchet: {counts}");
-    assert!(passes <= 105, "valve passes over the ratchet: {counts}");
+    assert!(shed <= 12_500, "fill shed over the ratchet: {counts}");
+    assert!(passes <= 136, "valve passes over the ratchet: {counts}");
     assert_eq!(
         on.zooms.last().map(|z| z.fill_polygons),
         Some(0),
         "the finest zoom draws every feature and needs no fill: {counts}"
     );
+    // The fill takes only the room the tile's own features leave: every
+    // zoom keeps exactly the features, merges and drops it has without it.
+    for (a, b) in off.zooms.iter().zip(&on.zooms) {
+        assert_eq!(
+            (
+                a.tile_count,
+                a.tile_feature_count,
+                a.merged_features,
+                a.valve_dropped_features
+            ),
+            (
+                b.tile_count,
+                b.tile_feature_count,
+                b.merged_features,
+                b.valve_dropped_features
+            ),
+            "z{}: the fill changed the tile's own features",
+            a.zoom
+        );
+    }
 }

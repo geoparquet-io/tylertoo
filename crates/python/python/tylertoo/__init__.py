@@ -498,6 +498,7 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     attribution: str | None = None,
     size_valve: Literal["merge", "drop"] = "merge",
     max_compressed_tile_size: int = 0,
+    coverage_fill: bool = False,
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
 
@@ -539,6 +540,10 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             both modes.
         max_compressed_tile_size: Maximum gzip-compressed tile size in
             bytes, like tippecanoe's `-M`, or `0` for no limit.
+        coverage_fill: Experimental: under each tile's features, draw
+            the area its child tiles cover, so a polygon coverage shows
+            no holes at coarse zooms. Holds the finest level's geometry
+            in memory. See `docs/OVERVIEW_TUNING.md`.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.
@@ -721,6 +726,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     exclude_all_properties: bool = False,
     size_valve: Literal["merge", "drop"] = "merge",
     max_compressed_tile_size: int = 0,
+    coverage_fill: bool = False,
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).
 
@@ -750,6 +756,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         exclude_all_properties: See `overview()`.
         size_valve: See `export_pmtiles()`.
         max_compressed_tile_size: See `export_pmtiles()`.
+        coverage_fill: See `export_pmtiles()`.
 
     Returns:
         Both halves' reports, keyed `"convert"` and `"export"` like the

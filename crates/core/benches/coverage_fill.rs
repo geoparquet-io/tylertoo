@@ -45,8 +45,17 @@ fn write_prefix(out: &Path) -> Option<()> {
     Some(())
 }
 
+/// Whether `path` is a real Parquet file: not missing, and not the pointer
+/// file a checkout without large-file support leaves in its place.
+fn is_parquet(path: &str) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok_and(|()| &magic == b"PAR1")
+}
+
 fn bench_coverage_fill(c: &mut Criterion) {
-    if !Path::new(FIXTURE).exists() {
+    if !is_parquet(FIXTURE) {
         fixtures::missing("coverage_fill", FIXTURE);
         return;
     }

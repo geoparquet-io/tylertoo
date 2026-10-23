@@ -1933,6 +1933,9 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::S
 pub struct tylertoo_core::overview::export::ZoomReport
 pub tylertoo_core::overview::export::ZoomReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ZoomReport::encode_quantized_features: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_polygons: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_shed: usize
+pub tylertoo_core::overview::export::ZoomReport::fill_vertices: usize
 pub tylertoo_core::overview::export::ZoomReport::level: usize
 pub tylertoo_core::overview::export::ZoomReport::level_feature_count: usize
 pub tylertoo_core::overview::export::ZoomReport::max_valve_passes: u32
