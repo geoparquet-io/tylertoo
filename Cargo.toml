@@ -177,6 +177,18 @@ overflow-checks = false
 [profile.bench]
 inherits = "release"
 
+# CI builds that only need release *behaviour*, not release *speed*: the
+# Python extension in Python Quality / Python Tests and the CLI the Docs
+# job runs the tutorials with (#756). Fat LTO with one codegen unit made
+# each of those a long serial link, most of the Windows Python Tests'
+# ~15 min. overflow-checks and strip stay as in release. Wheels, release
+# binaries, the e2e signature guard and the tippecanoe parity gate keep
+# `release`; Rust has no fast-math, so the output is the same either way.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # Release code generation with symbols, for sampling profilers (#614):
 # `cargo build --profile profiling`, then samply/perf/cargo-flamegraph on
 # target/profiling/tylertoo. The release binary stays stripped; without this,

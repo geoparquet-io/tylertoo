@@ -125,12 +125,23 @@ full set on a branch before merging, start the CI workflow by hand
 that call for `full` locally.
 
 A pull request that changes only docs skips the Rust and Python jobs;
-`scripts/ci/docs_only.sh` decides. Branch protection requires three
-checks: `CI passed` (fails when any other CI job fails), `Archive e2e
-(independent readers)` and `tippecanoe parity`. The checks are not strict,
-so a green PR merges without first being brought up to date with `main`, and
-there is no merge queue: the push to `main` runs the full set and catches
-two PRs that pass apart and break together.
+`scripts/ci/docs_only.sh` decides. One that changes only docs and the
+Python side (`crates/python/` outside its Rust `src/`, and `examples/`)
+runs the Python jobs and Docs but skips the Rust jobs, Archive e2e and
+tippecanoe parity; `scripts/ci/python_only.sh` decides.
+
+Branch protection requires three checks: `CI passed` (fails when any
+other CI job fails), `Archive e2e (independent readers)` and
+`tippecanoe parity`. The checks are not strict, so a green PR merges
+without first being brought up to date with `main`, and there is no
+merge queue: the push to `main` runs the full set and catches two PRs
+that pass apart and break together.
+
+The Python jobs and Docs build the extension and the CLI with the `ci`
+Cargo profile: release settings without fat LTO, so the link isn't one
+long serial step. Wheels, release binaries, Archive e2e and tippecanoe
+parity keep `release`. Build caches are saved from `main` only; PRs
+restore them.
 
 To reproduce one shard, take its filter from the Slow Tests job in
 `.github/workflows/ci.yml`:
