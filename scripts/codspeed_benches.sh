@@ -50,6 +50,7 @@ declare -A PATHS=(
   # what measures the modules no kernel bench covers (pass-1 scan, decode,
   # staging, pyramid merge, export scan; #759).
   [pipeline]="$S/.*"
+  [coverage_fill]="$S/overview/(export|export/.*|stream)\.rs|$MVT"
 )
 
 changed=$(cat)

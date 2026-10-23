@@ -220,7 +220,8 @@ def last_json_line(path: Path) -> dict | None:
 
 def zoom_summary(report: dict) -> list[dict]:
     keep = ("zoom", "tile_count", "tile_feature_count", "oversized_tiles", "merged_features",
-            "valve_dropped_features", "max_valve_passes", "valve_passes")
+            "valve_dropped_features", "max_valve_passes", "valve_passes",
+            "fill_polygons", "fill_vertices", "fill_shed")
     return [{k: z.get(k) for k in keep} for z in report.get("zooms", [])]
 
 
@@ -231,11 +232,12 @@ def convert_argv(binary: str, src: Path, ov: Path, max_zoom: int, report: Path,
 
 
 def export_argv(binary: str, ov: Path, pm: Path, max_tile_size: str,
-                max_compressed_tile_size: str, valve: str, report: Path | None) -> list[str]:
+                max_compressed_tile_size: str, valve: str, report: Path | None,
+                extra: list[str] | tuple[str, ...] = ()) -> list[str]:
     argv = [binary, "export-pmtiles", str(ov), str(pm), "--force",
             "--max-tile-size", str(max_tile_size),
             "--max-compressed-tile-size", str(max_compressed_tile_size),
-            "--size-valve", valve]
+            "--size-valve", valve, *extra]
     return [*argv, "--report", str(report)] if report else argv
 
 
@@ -244,12 +246,13 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
              max_compressed_tile_size: str, wall_s: float, rss_gib: float,
              repeats: int = 1, convert_repeats: int = 1, keep: bool = False,
              determinism_check: bool = False, prep_s: float = 0.0,
+             export_flags: list[str] | tuple[str, ...] = (),
              record=lambda rec: None) -> list[dict]:
     """Convert src once per convert repeat (the last overview is kept), then
     export it `repeats` times per valve. Every run is passed to `record` and
     returned: one `convert` record, then one `export` record per repeat. Files
     are `<out>/<name>.*`; `prep_s` is the input's preparation time, added to
-    `total_with_prep_s`."""
+    `total_with_prep_s`; `export_flags` go to every export."""
     ov = out / f"{name}.overview.parquet"
     convert_runs = []
     for _ in range(convert_repeats):
@@ -288,7 +291,7 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
             env = dict(os.environ, TYLERTOO_PROFILE_JSON=str(profile))
             exp = run_capped(
                 export_argv(binary, ov, pm, max_tile_size, max_compressed_tile_size, valve,
-                            report),
+                            report, export_flags),
                 wall_s, rss_gib, env=env,
             )
             exp.update(load_before=load_before, load_wait_s=waited, load_after=loadavg())
@@ -308,7 +311,7 @@ def run_cell(binary: str, src: Path, out: Path, name: str, convert_flags: list[s
                 if determinism_check and rep == 0:
                     rec["determinism"] = determinism(
                         binary, ov, pm, valve, max_tile_size, max_compressed_tile_size,
-                        wall_s, rss_gib, rec["pmtiles_sha256"])
+                        wall_s, rss_gib, rec["pmtiles_sha256"], export_flags)
             print(f"[export] {name}/{valve}#{rep}: {exp['status']} "
                   f"{exp['wall_s']}s {(exp['peak_rss_kib'] or 0) / 1048576:.2f} GiB "
                   f"merged={rec.get('merged_features')} "
@@ -391,7 +394,7 @@ def main() -> int:
 
 def determinism(binary: str, ov: Path, pm: Path, valve: str, max_tile_size: str,
                 max_compressed_tile_size: str, wall_s: float, rss_gib: float,
-                first: str) -> dict:
+                first: str, export_flags: list[str] | tuple[str, ...] = ()) -> dict:
     """Re-export twice more (same threads, then one thread) and compare."""
     res = {}
     for label, threads in (("again", None), ("one_thread", "1")):
@@ -400,7 +403,8 @@ def determinism(binary: str, ov: Path, pm: Path, valve: str, max_tile_size: str,
         if threads:
             env["RAYON_NUM_THREADS"] = threads
         run = run_capped(
-            export_argv(binary, ov, other, max_tile_size, max_compressed_tile_size, valve, None),
+            export_argv(binary, ov, other, max_tile_size, max_compressed_tile_size, valve, None,
+                        export_flags),
             wall_s * 4, rss_gib, env=env,
         )
         res[label] = run["status"] == "ok" and sha256(other) == first

@@ -10,12 +10,14 @@ Production data samples for testing tylertoo tiling performance.
 | `fieldmaps-madagascar-adm4.parquet` | 17,465 | 28MB | [FieldMaps](https://fieldmaps.io) | **Parallelization benchmarks** |
 | `fieldmaps-boundaries.parquet` | 3 | 2.2MB | FieldMaps | Large polygon tests |
 | `road-detections.parquet` | ~1,000 | 90KB | Road detection ML | LineString tests |
+| `ftw-moldova-z10.parquet` | 10,931 | 1.9MB | [Fields of The World](https://source.coop/ftw/global-data) | Coverage-fill work ratchets (#750) |
 
 ## Attribution
 
 - **FieldMaps data** courtesy of Maxym Malynowsky ([fieldmaps.io](https://fieldmaps.io)) — edge-matched humanitarian admin boundaries
 - **Open buildings**: Andorra subset of [VIDA's Google-Microsoft-OSM Open Buildings](https://source.coop/vida/google-microsoft-osm-open-buildings), ODbL 1.0 (Microsoft and OpenStreetMap footprints)
 - **Road detections**: derived from ML model outputs
+- **FTW Moldova**: field boundaries from [Fields of The World](https://source.coop/ftw/global-data) (Taylor Geospatial Institute and Microsoft AI for Good Research Lab), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The fields of z10 tile 10/593/357 of the `bench-coalesce-v1` Moldova input, cut with `uvx --from geoparquet-io==1.7.0 gpio extract --bbox 28.476562,47.517201,28.828125,47.754098`, then reduced to the geometry and bbox columns.
 
 The repository-root `NOTICE` file lists the verified licenses.
 

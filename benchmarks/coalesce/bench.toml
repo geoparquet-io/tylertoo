@@ -79,7 +79,8 @@ repeats = 2
 
 # ---------------------------------------------------------------------------
 # Settings: the table columns. `convert` is passed to `tylertoo overview`,
-# `valve` to `export-pmtiles --size-valve`.
+# `valve` to `export-pmtiles --size-valve`, and the optional `export` list
+# to `export-pmtiles` as well.
 
 [settings.before-745]
 label = "Before #745"
@@ -100,6 +101,13 @@ valve = "merge"
 label = "--simplify-factor 0"
 convert = ["--simplify-factor", "0"]
 valve = "merge"
+
+# #750: the defaults plus the export-side coverage fill.
+[settings.fill]
+label = "--coverage-fill"
+convert = []
+valve = "merge"
+export = ["--coverage-fill"]
 
 [settings.tippecanoe]
 label = "tippecanoe"
@@ -224,14 +232,24 @@ named = ["12/4035/2500", "12/4036/2499", "12/4036/2500"]
 # in the profile; tippecanoe runs for the datasets [tippecanoe.datasets] lists
 # when the profile names it among its settings. `disk_gb` is checked before a run.
 
+# A change's cost on the two small inputs, with and without the coverage
+# fill. Nothing is scored; each export's report carries the work counters
+# (valve passes, fill vertices per zoom).
+[profiles.smoke]
+datasets = ["madagascar", "moldova"]
+settings = ["default", "fill"]
+score = false
+repeats = 3
+disk_gb = 1
+
 [profiles.small]
 datasets = ["madagascar", "moldova"]
-settings = ["before-745", "default", "sf0.25", "sf0"]
+settings = ["before-745", "default", "sf0.25", "sf0", "fill"]
 repeats = 3
 disk_gb = 5
 
 [profiles.full]
 datasets = ["madagascar", "moldova", "nz"]
-settings = ["before-745", "default", "sf0.25", "sf0", "tippecanoe"]
+settings = ["before-745", "default", "sf0.25", "sf0", "fill", "tippecanoe"]
 repeats = 3
 disk_gb = 30

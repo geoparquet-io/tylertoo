@@ -147,7 +147,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tests/fixtures/realdata
-          key: fixtures-v1-${{ runner.os }}
+          key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
 
       - name: Download test fixtures
         if: steps.fixture-cache.outputs.cache-hit != 'true'

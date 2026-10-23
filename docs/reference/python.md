@@ -577,6 +577,9 @@ class ZoomReport(TypedDict):
     valve_dropped_features: int
     max_valve_passes: int
     valve_passes: int
+    fill_polygons: int
+    fill_vertices: int
+    fill_shed: int
 ```
 
 ### `SkippedPropertyColumn`

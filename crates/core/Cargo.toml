@@ -169,6 +169,10 @@ harness = false
 name = "hostile_geometry"
 harness = false
 
+[[bench]]
+name = "coverage_fill"
+harness = false
+
 [lints]
 workspace = true
 

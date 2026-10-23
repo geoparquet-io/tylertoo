@@ -565,6 +565,14 @@ pub struct ZoomReport {
     /// when every tile fit at once. What the size valve costs, where
     /// `max_valve_passes` shows only its worst tile.
     pub valve_passes: u64,
+    /// #750 coverage-fill polygons drawn into this zoom's tiles; 0 without
+    /// [`ExportOptions::coverage_fill`] and at the finest zoom.
+    pub fill_polygons: usize,
+    /// Vertices of those fill polygons: the fill's share of the encode work.
+    pub fill_vertices: usize,
+    /// Fill polygons left out to stay within the fill's share of a tile's
+    /// size limit, smallest first.
+    pub fill_shed: usize,
 }
 
 /// Result of an export, `Serialize` for the `--report` JSON.
@@ -1004,6 +1012,8 @@ struct EncodedTile {
     oversized: bool,
     /// What the size valve did to the tile (#745).
     valve: ValveTally,
+    /// The tile's coverage fill (#750).
+    fill: FillTally,
 }
 
 /// Resolve the Web Mercator zoom for overview level `level_idx`.
@@ -2990,6 +3000,8 @@ struct LevelTally {
     valve: ValveTally,
     /// Every tile's `valve.passes`, summed (#750).
     valve_passes: u64,
+    /// Every tile's coverage fill, summed (#750).
+    fill: FillTally,
 }
 
 /// Append one wave's encoded tiles to the writer in order, and add them to
@@ -3009,6 +3021,9 @@ fn write_encoded_tiles(
         tally.valve.dropped += t.valve.dropped;
         tally.valve.passes = tally.valve.passes.max(t.valve.passes);
         tally.valve_passes += u64::from(t.valve.passes);
+        tally.fill.polygons += t.fill.polygons;
+        tally.fill.vertices += t.fill.vertices;
+        tally.fill.shed += t.fill.shed;
         tally.valve.mingap = tally.valve.mingap.max(t.valve.mingap);
         if t.feature_count == 0 {
             // #431: an all-dropped tile is a tally carrier, not a tile.
@@ -3102,6 +3117,9 @@ fn finish_level(
         valve_dropped_features: tally.valve.dropped,
         max_valve_passes: tally.valve.passes,
         valve_passes: tally.valve_passes,
+        fill_polygons: tally.fill.polygons,
+        fill_vertices: tally.fill.vertices,
+        fill_shed: tally.fill.shed,
     }
 }
 
@@ -5824,14 +5842,14 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let fill = fills
+            let (fill, fill_tally) = fills
                 .and_then(|f| {
                     let polys = f.get(g[0].key)?;
-                    let (feats, shed) = ExportTimers::time(&timers.fill_encode, || {
+                    let (feats, tally) = ExportTimers::time(&timers.fill_encode, || {
                         fill_features(polys, g, &tb, opts)
                     });
-                    f.note_shed(shed);
-                    Some(feats)
+                    f.note_shed(tally.shed);
+                    Some((feats, tally))
                 })
                 .unwrap_or_default();
             let mvt = encode_tile(g, &tb, opts, &fill);
@@ -5850,6 +5868,7 @@ fn encode_members(
                     encode_quantized: mvt.quantized,
                     oversized: mvt.oversized,
                     valve: mvt.valve,
+                    fill: fill_tally,
                 }));
             }
             let hash = TileHasher::hash(&mvt.data);
@@ -5872,6 +5891,7 @@ fn encode_members(
                 encode_quantized: mvt.quantized,
                 oversized: mvt.oversized,
                 valve: mvt.valve,
+                fill: fill_tally,
             }))
         })
         .collect()
@@ -5937,6 +5957,17 @@ struct FillFeature {
     cmds: Vec<u32>,
 }
 
+/// What a tile's coverage fill drew (#750), for the report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FillTally {
+    /// Fill polygons drawn.
+    polygons: usize,
+    /// Their vertices, holes included.
+    vertices: usize,
+    /// Fill polygons left out to stay within [`fill_budget`].
+    shed: usize,
+}
+
 /// A tile's fill features: every fill polygon joins the member whose tile-unit
 /// bbox holds it ([`coverage_fill::assign_hosts`]), and each host's polygons
 /// are encoded once as one MultiPolygon.
@@ -5945,14 +5976,19 @@ fn fill_features(
     members: &[Member],
     tb: &TileBounds,
     opts: &ExportOptions,
-) -> (Vec<FillFeature>, usize) {
+) -> (Vec<FillFeature>, FillTally) {
     if members.is_empty() || polys.is_empty() {
-        return (Vec::new(), 0);
+        return (Vec::new(), FillTally::default());
     }
     let (kept, shed) = coverage_fill::within_budget(polys, fill_budget(opts));
     let polys: Vec<coverage_fill::FillPolygon> =
         kept.into_iter().map(|i| polys[i].clone()).collect();
     let polys = polys.as_slice();
+    let tally = FillTally {
+        polygons: polys.len(),
+        vertices: polys.iter().flatten().map(Vec::len).sum(),
+        shed,
+    };
     let proj = crate::mvt::TileProjector::new(tb, opts.extent);
     let hosts: Vec<[f64; 4]> = members
         .iter()
@@ -5981,7 +6017,7 @@ fn fill_features(
             })
         })
         .collect();
-    (feats, shed)
+    (feats, tally)
 }
 
 /// About how many bytes a tile's #750 fill may take: a quarter of its size
@@ -9852,8 +9888,15 @@ mod tests {
             |x: i32, y: i32| vec![vec![(x, y), (x + 100, y), (x + 100, y + 100), (x, y + 100)]];
         // Two polygons in the west half, one in the east half.
         let polys = vec![square(100, 100), square(3000, 2000), square(300, 3000)];
-        let (fill, shed) = fill_features(&polys, &members, &tb, &ExportOptions::default());
-        assert_eq!(shed, 0);
+        let (fill, tally) = fill_features(&polys, &members, &tb, &ExportOptions::default());
+        assert_eq!(
+            tally,
+            FillTally {
+                polygons: 3,
+                vertices: 12,
+                shed: 0
+            }
+        );
         let tagged: Vec<(Option<u64>, String)> = fill
             .iter()
             .map(|f| match &f.props[0].1 {
