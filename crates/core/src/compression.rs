@@ -99,9 +99,11 @@ pub const MAX_INTERNAL_BYTES: u64 = 16 * 1024 * 1024;
 /// Ceiling for decompressing one tile body (#417), and the default ceiling
 /// [`decompress`] applies.
 ///
-/// Our exporter caps encoded tiles at `DEFAULT_TILE_SIZE_LIMIT` (500 KiB —
-/// tippecanoe's default bar). A foreign archive may have been written with
-/// that cap disabled, so 64 MiB still leaves ~100x headroom over that bar.
+/// Our exporter caps the compressed tile at `DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`
+/// (500 KiB, tippecanoe's default bar) and the raw tile at
+/// `DEFAULT_TILE_SIZE_LIMIT` (2 MiB). A foreign archive may have been written
+/// with those caps disabled, so 64 MiB still leaves 32x headroom over the raw
+/// one.
 ///
 /// It is deliberately far below "as much as a tile could conceivably be":
 /// the decompressed bytes are not the peak. `prost` decodes the tile into

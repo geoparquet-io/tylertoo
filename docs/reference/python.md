@@ -181,7 +181,7 @@ export_pmtiles(
     layer_name: str = "overview",
     tile_buffer: int = 8,
     extent: int = 4096,
-    tile_size_limit: int | None = 512_000,
+    tile_size_limit: int | None = 2_097_152,
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
     feature_order: Literal['input'] | str = "input",
@@ -195,7 +195,7 @@ export_pmtiles(
     description: str | None = None,
     attribution: str | None = None,
     size_valve: Literal['merge', 'drop'] = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512_000,
     coverage_fill: bool = False,
 ) -> ExportReport
 ```
@@ -209,7 +209,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `layer_name`: MVT layer name.
 * `tile_buffer`: Tile edge buffer in pixels, at most 256.
 * `extent`: Tile resolution in MVT units.
-* `tile_size_limit`: Maximum tile size in bytes, or `0` or `None` for no limit.
+* `tile_size_limit`: Maximum raw (uncompressed) tile size in bytes, a backstop behind `max_compressed_tile_size` (default 2 MiB), or `0` or `None` for no limit.
 * `simple_clip_fastpath`: Use faster clipping for simple polygons. `False` gives byte-stable output.
 * `partition_wave`: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves) at once, or `0` to size from CPUs and RAM.
 * `feature_order`: Paint order within a tile: `"input"`, or a property name with an optional `:asc` or `:desc`.
@@ -223,7 +223,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.
 * `size_valve`: How to reduce a tile that exceeds its limit: `"merge"` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `"drop"` removes features, leaving holes. Point tiles use feature dropping in both modes.
-* `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M`, or `0` for no limit.
+* `max_compressed_tile_size`: Maximum gzip-compressed tile size in bytes, like tippecanoe's `-M` (default 500 KiB), or `0` for no limit.
 * `coverage_fill`: Experimental: under each tile's features, draw the area its child tiles cover, so a polygon coverage shows no holes at coarse zooms. Holds the finest level's geometry in memory. See `docs/OVERVIEW_TUNING.md`.
 
 ### Returns
@@ -390,7 +390,7 @@ convert(
     min_zoom: int = 0,
     max_zoom: int | Literal['auto'] = 14,
     layer_name: str | None = None,
-    tile_size_limit: int | None = 512_000,
+    tile_size_limit: int | None = 2_097_152,
     simple_clip_fastpath: bool = True,
     feature_order: Literal['input'] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
@@ -399,7 +399,7 @@ convert(
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
     size_valve: Literal['merge', 'drop'] = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512_000,
     coverage_fill: bool = False,
 ) -> ConvertReport
 ```

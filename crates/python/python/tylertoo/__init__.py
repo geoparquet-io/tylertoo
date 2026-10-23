@@ -483,7 +483,7 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     layer_name: str = "overview",
     tile_buffer: int = 8,
     extent: int = 4096,
-    tile_size_limit: int | None = 512000,
+    tile_size_limit: int | None = 2097152,
     simple_clip_fastpath: bool = True,
     partition_wave: int = 0,
     feature_order: Literal["input"] | str = "input",
@@ -497,7 +497,7 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     description: str | None = None,
     attribution: str | None = None,
     size_valve: Literal["merge", "drop"] = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512000,
     coverage_fill: bool = False,
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
@@ -508,8 +508,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         layer_name: MVT layer name.
         tile_buffer: Tile edge buffer in pixels, at most 256.
         extent: Tile resolution in MVT units.
-        tile_size_limit: Maximum tile size in bytes, or `0` or `None`
-            for no limit.
+        tile_size_limit: Maximum raw (uncompressed) tile size in
+            bytes, a backstop behind `max_compressed_tile_size`
+            (default 2 MiB), or `0` or `None` for no limit.
         simple_clip_fastpath: Use faster clipping for simple polygons.
             `False` gives byte-stable output.
         partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves)
@@ -538,8 +539,9 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             neighbor, which keeps its own attributes; `"drop"` removes
             features, leaving holes. Point tiles use feature dropping in
             both modes.
-        max_compressed_tile_size: Maximum gzip-compressed tile size in
-            bytes, like tippecanoe's `-M`, or `0` for no limit.
+        max_compressed_tile_size: Maximum gzip-compressed tile size
+            in bytes, like tippecanoe's `-M` (default 500 KiB), or `0`
+            for no limit.
         coverage_fill: Experimental: under each tile's features, draw
             the area its child tiles cover, so a polygon coverage shows
             no holes at coarse zooms. Holds the finest level's geometry
@@ -716,7 +718,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     min_zoom: int = 0,
     max_zoom: int | Literal["auto"] = 14,
     layer_name: str | None = None,
-    tile_size_limit: int | None = 512000,
+    tile_size_limit: int | None = 2097152,
     simple_clip_fastpath: bool = True,
     feature_order: Literal["input"] | str = "input",
     spill_dir: str | os.PathLike[str] | None = None,
@@ -725,7 +727,7 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
     exclude_properties: Sequence[str] | None = None,
     exclude_all_properties: bool = False,
     size_valve: Literal["merge", "drop"] = "merge",
-    max_compressed_tile_size: int = 0,
+    max_compressed_tile_size: int = 512000,
     coverage_fill: bool = False,
 ) -> ConvertReport:
     """Convert GeoParquet to PMTiles in one call (deprecated).

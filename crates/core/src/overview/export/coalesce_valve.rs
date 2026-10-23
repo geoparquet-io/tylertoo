@@ -199,6 +199,10 @@ pub(super) struct Merged<'a> {
     pub(super) geom: Cow<'a, Geometry<f64>>,
     /// How many members were merged into this one.
     pub(super) absorbed: usize,
+    /// The members `geom` is made of, as indices into the `ordered` slice
+    /// given to [`coalesce_members`]: the kept member, then each merged one
+    /// in the order its parts are appended (#758).
+    pub(super) members: Vec<usize>,
 }
 
 impl Merged<'_> {
@@ -214,22 +218,22 @@ impl Merged<'_> {
 /// keeps that order. A member with nothing of its kind and band before it is
 /// kept. With `mingap == 0` nothing merges.
 pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<Merged<'a>> {
-    // (kept member, members merged into it)
-    let mut kept: Vec<(&'a Member, Vec<&'a Member>)> = Vec::with_capacity(ordered.len());
+    // (kept member, members merged into it), as indices into `ordered`
+    let mut kept: Vec<(usize, Vec<usize>)> = Vec::with_capacity(ordered.len());
     // The index in `kept` of the last kept member per (band, kind). Bands
     // are few, so a linear scan beats a map.
     let mut last: Vec<(u16, MergeKind, usize)> = Vec::new();
-    for &m in ordered {
+    for (i, &m) in ordered.iter().enumerate() {
         let kind = merge_kind(&m.geom);
         if let Some(kind) = kind {
             if m.gap < mingap {
                 if let Some(&(_, _, t)) = last.iter().find(|(b, k, _)| *b == m.band && *k == kind) {
-                    kept[t].1.push(m);
+                    kept[t].1.push(i);
                     continue;
                 }
             }
         }
-        kept.push((m, Vec::new()));
+        kept.push((i, Vec::new()));
         if let Some(kind) = kind {
             let idx = kept.len() - 1;
             match last.iter_mut().find(|(b, k, _)| *b == m.band && *k == kind) {
@@ -239,17 +243,23 @@ pub(super) fn coalesce_members<'a>(ordered: &[&'a Member], mingap: u64) -> Vec<M
         }
     }
     kept.into_iter()
-        .map(|(target, absorbed)| {
+        .map(|(t, absorbed)| {
+            let target = ordered[t];
             let n = absorbed.len();
             let geom = if absorbed.is_empty() {
                 Cow::Borrowed(&target.geom)
             } else {
-                Cow::Owned(concat_geometry(&target.geom, &absorbed))
+                let parts: Vec<&Member> = absorbed.iter().map(|&i| ordered[i]).collect();
+                Cow::Owned(concat_geometry(&target.geom, &parts))
             };
+            let mut members = Vec::with_capacity(n + 1);
+            members.push(t);
+            members.extend(absorbed);
             Merged {
                 target,
                 geom,
                 absorbed: n,
+                members,
             }
         })
         .collect()
@@ -542,6 +552,10 @@ mod tests {
         let seqs: Vec<(u64, usize)> = out.iter().map(|m| (m.target.seq, m.absorbed)).collect();
         assert_eq!(seqs, [(0, 1), (1, 1), (2, 0)]);
         assert!(matches!(&*out[1].geom, Geometry::MultiLineString(ml) if ml.0.len() == 2));
+        // Each feature names its members by their index in `ordered`, kept
+        // member first, in the order their parts are appended (#758).
+        let members: Vec<&[usize]> = out.iter().map(|m| m.members.as_slice()).collect();
+        assert_eq!(members, [&[0, 3][..], &[1, 4], &[2]]);
     }
 
     #[test]

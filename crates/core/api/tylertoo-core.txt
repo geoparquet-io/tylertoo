@@ -1962,6 +1962,7 @@ impl core::marker::Unpin for tylertoo_core::overview::export::ZoomReport
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ZoomReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ZoomReport
+pub const tylertoo_core::overview::export::DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: usize
 pub const tylertoo_core::overview::export::DEFAULT_TILE_SIZE_LIMIT: usize
 pub const tylertoo_core::overview::export::MAX_TILE_BUFFER_PX: u32
 pub const tylertoo_core::overview::export::PARTITION_WAVE_AUTO: usize
