@@ -253,7 +253,11 @@ jobs:
       contents: read
       issues: write
     steps:
+      # No artifact when the bench job failed before writing any results
+      # (fixture download, protoc, the build): carry on, so the comment
+      # below still posts that week's failed run and its link.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
         with:
           name: criterion-regression-report
           path: report
