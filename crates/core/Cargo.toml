@@ -74,7 +74,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3", "std"] }
 fast_hilbert = "2.1"
 # Orphan-cell nearest lookup (overview/cluster.rs); 0.12 is the version geo
 # already pulls in.
-rstar = "0.12"
+rstar = "0.13"
 serde = { workspace = true }
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
 serde_json = "1.0.129"
@@ -93,7 +93,7 @@ aws-credential-types = { version = "1", optional = true }
 # run and the pin is no longer load-bearing for that reason -- the lock holds
 # 1.6.3 on its own. Keep it only until the upstream fix lands.
 # TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
-aws-smithy-types = { version = "=1.8.1", optional = true }
+aws-smithy-types = { version = "=1.9.0", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
