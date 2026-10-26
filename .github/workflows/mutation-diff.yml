@@ -127,7 +127,7 @@ jobs:
         # Pinned to the release the weekly job currently resolves (its
         # install-action line floats), so the two runs agree on the
         # mutation catalogue; bump both together, and the shard job below.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-mutants@27.1.0
 
@@ -250,7 +250,7 @@ jobs:
         # cargo-mutants: same pin as the plan job. nextest:
         # .cargo/mutants.toml sets test_tool = "nextest" so the quick tier
         # from .config/nextest.toml applies to every mutant.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest
 
