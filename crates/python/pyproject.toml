@@ -47,7 +47,7 @@ dev = [
     "mypy>=1.14",
     # Type checker for the package and its extension stub (CI: Python
     # Quality). Exact pin: ty is pre-1.0 and its rules still move.
-    "ty==0.0.89",
+    "ty==0.0.91",
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
