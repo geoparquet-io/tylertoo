@@ -84,6 +84,11 @@ thread_local! {
 /// targets install theirs before the first input, this one wraps it, and a
 /// panic inside the boundary then unwinds to the boundary as it does in a
 /// normal build. A panic anywhere else still reaches libFuzzer and aborts.
+///
+/// Our own reader code (the remote chunk cache, its spill, `InputReader`)
+/// runs inside the boundary too, so a caught panic may be a tylertoo bug.
+/// With `RUST_BACKTRACE` set, the hook still prints the panic and its
+/// backtrace to stderr, as the default hook would.
 fn install_quiet_hook() {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
@@ -95,6 +100,13 @@ fn install_quiet_hook() {
                     .map(|l| format!(" (at {}:{})", short_path(l.file()), l.line()))
                     .unwrap_or_default();
                 let message = format!("{}{at}", panic_message(info.payload()));
+                // `capture` honours RUST_BACKTRACE / RUST_LIB_BACKTRACE.
+                let backtrace = std::backtrace::Backtrace::capture();
+                if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                    eprintln!(
+                        "tylertoo: caught a panic inside the input boundary: {message}\n{backtrace}"
+                    );
+                }
                 CAUGHT.with(|c| *c.borrow_mut() = Some(message));
             } else {
                 previous(info);
@@ -141,9 +153,15 @@ fn short_path(file: &str) -> &str {
 /// `done`), so a broken invariant can never be observed afterwards. That is
 /// the property `UnwindSafe` approximates; the assertion states it.
 ///
-/// The one shared state a decode can reach is a remote input's chunk cache,
-/// whose mutexes are held only inside our own `get_bytes`, never across an
-/// upstream decode, so a decoder panic cannot poison them.
+/// The one shared state a decode can reach is a remote input's chunk cache
+/// and its spill, shared by every reader of that input. Their mutexes are
+/// held only inside our own `get_bytes`, never across an upstream decode,
+/// so an upstream panic cannot poison them. A panic from our own code while
+/// one is held could, so every lock on them recovers a poisoned guard
+/// (`PoisonError::into_inner`) instead of panicking. Each critical section
+/// inserts, evicts or reads whole entries, so a panic in one leaves at worst
+/// a stale byte total, never an entry that reads back wrong, and another
+/// reader sharing the cache carries on.
 ///
 /// # Errors
 ///
@@ -157,6 +175,7 @@ pub(crate) fn guard<T>(what: &'static str, f: impl FnOnce() -> T) -> Result<T, I
         let message = CAUGHT
             .with(|c| c.borrow_mut().take())
             .unwrap_or_else(|| panic_message(payload.as_ref()));
+        log::debug!("caught a panic while decoding the {what}: {message}");
         InputError::DecoderPanic { what, message }
     })
 }
@@ -216,6 +235,17 @@ enum SkimStop {
     Confused,
 }
 
+/// The fewest bytes one collection element of compact type `ty` takes on
+/// the wire: a double is 8, everything else (a varint, a length-prefixed
+/// binary, a nested collection's header, a struct's stop byte) at least 1.
+fn min_wire_bytes(ty: u8) -> u64 {
+    if ty == 7 {
+        8
+    } else {
+        1
+    }
+}
+
 /// A forward-only reader of thrift compact-protocol bytes that skips values
 /// without allocating, checking every declared count against what remains.
 struct Skim<'a> {
@@ -272,14 +302,17 @@ impl Skim<'_> {
             15 => self.varint()?,
             n => u64::from(n),
         };
-        self.check_count(size, "list")?;
+        self.check_count(size, min_wire_bytes(ty), "list")?;
         Ok((ty, size as usize))
     }
 
-    fn check_count(&self, size: u64, what: &str) -> Result<(), SkimStop> {
-        if size > self.remaining() as u64 {
+    /// Refuse `size` elements of at least `each` bytes apiece when fewer
+    /// bytes than that remain.
+    fn check_count(&self, size: u64, each: u64, what: &str) -> Result<(), SkimStop> {
+        if size.saturating_mul(each) > self.remaining() as u64 {
             return Err(SkimStop::Hostile(format!(
-                "a {what} in the footer declares {size} elements, but only {} bytes follow it",
+                "a {what} in the footer declares {size} elements of at least {each} byte(s), \
+                 but only {} bytes follow it",
                 self.remaining()
             )));
         }
@@ -331,7 +364,7 @@ impl Skim<'_> {
     /// and that many pairs.
     fn skip_map(&mut self, depth: u32) -> Result<(), SkimStop> {
         let size = self.varint()?;
-        self.check_count(size, "map")?;
+        self.check_count(size, 2, "map")?;
         let kv = if size == 0 { 0 } else { self.byte()? };
         (0..size).try_for_each(|_| {
             self.skip_elements(kv >> 4, 1, depth)?;
@@ -404,6 +437,14 @@ impl Skim<'_> {
 /// element's child count against the elements that follow, and the nesting
 /// depth. Bytes it cannot make sense of are left to parquet-rs, which
 /// reports its own error: the pre-check only ever refuses a count.
+///
+/// Each declared count is floored at its element type's smallest wire size
+/// ([`min_wire_bytes`]), not its decoded size. A struct element can be one
+/// byte on the wire (its stop byte) yet decode into a struct of a few
+/// hundred bytes, so a footer of F bytes can still make parquet-rs reserve
+/// about F × `size_of::<T>()`. That is linear in a footer the file actually
+/// holds, so on the order of 100 MB for a 1 MB footer. It is not the
+/// unbounded, footer-independent reservation of #690.
 ///
 /// # Errors
 ///
@@ -1202,6 +1243,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("panicked"), "overview reader: {err}");
+        // `validate` must not pass a file export refuses: the schema decode
+        // is one of its checks.
+        let report = crate::overview::check::validate_file(&path).unwrap();
+        let failed = report
+            .checks
+            .iter()
+            .find(|c| c.name == "arrow_schema_decodes" && !c.passed)
+            .unwrap_or_else(|| panic!("validate passed #683's file: {:?}", report.checks));
+        assert!(failed.message.contains("panicked"), "{}", failed.message);
     }
 
     /// #687: a crafted data page panicked parquet-rs's definition-level
@@ -1236,6 +1286,33 @@ mod tests {
         assert!(err.contains("children"), "{err}");
         let err = read_all(&path).unwrap_err();
         assert!(err.contains("children"), "{err}");
+    }
+
+    /// A caught panic names where it happened and does not claim the input
+    /// was malformed: our own reader code runs inside the boundary too.
+    #[test]
+    fn a_caught_panic_names_its_location_not_a_cause() {
+        let err = super::guard("test value", || panic!("boom"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("panicked while decoding the test value: boom (at "),
+            "{err}"
+        );
+        assert!(err.contains("untrusted.rs:"), "{err}");
+        assert!(!err.contains("malformed"), "{err}");
+    }
+
+    /// A list's declared size is floored at its element type's wire size:
+    /// ten doubles need 80 bytes, so 16 remaining bytes refuse it.
+    #[test]
+    fn a_list_of_doubles_needs_eight_bytes_each() {
+        // Field 1, type list; list of 10 doubles; 15 bytes; struct stop.
+        let mut footer = vec![0x19, 0xA7];
+        footer.extend_from_slice(&[0u8; 15]);
+        footer.push(0);
+        let err = super::precheck_footer(&footer).unwrap_err().to_string();
+        assert!(err.contains("10 elements of at least 8 byte"), "{err}");
     }
 
     /// The `plan_file` fuzz target's first find once re-enabled: an IPC

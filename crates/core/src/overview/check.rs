@@ -121,6 +121,17 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
     let file = File::open(path)?;
     let metadata = crate::untrusted::read_parquet_metadata(&file)?;
     let mut report = validate_metadata(&metadata);
+    // Every reader decodes the footer's ARROW:schema before a row, so a file
+    // whose schema cannot be decoded (#683) is one `export` refuses; it must
+    // not validate. Reported only on failure, so a valid file's checklist is
+    // unchanged.
+    if let Err(e) = crate::untrusted::reader_metadata(std::sync::Arc::clone(&metadata)) {
+        report.fail(
+            "arrow_schema_decodes",
+            format!("the footer's ARROW:schema cannot be decoded: {e}"),
+        );
+        return Ok(report);
+    }
     check_cluster_sum_invariant(path, &metadata, &mut report);
     Ok(report)
 }

@@ -144,6 +144,21 @@ fn parquet_footer_seeds() {
         &["seed-issue-690-num-children.thrift"],
         tylertoo_core::overview::check::fuzz_parquet_footer,
     );
+    // Not just "no crash": with overcommit, parquet-rs's 12 GB reservation
+    // succeeds and the decode fails later on its own, so only the error's
+    // kind proves the pre-check refused the footer first.
+    let (_, bytes) = seeds("parquet_footer")
+        .into_iter()
+        .find(|(n, _)| n == "seed-issue-690-num-children.thrift")
+        .unwrap();
+    let err = tylertoo_core::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_core::untrusted::input_error(&err),
+            Some(tylertoo_core::input::InputError::HostileFooter(_))
+        ),
+        "#690's seed must be refused by the footer pre-check: {err:?}"
+    );
 }
 
 #[test]

@@ -180,14 +180,16 @@ pub enum InputError {
         /// The glob crate's error message.
         message: String,
     },
-    /// An upstream decoder (parquet-rs, arrow-ipc) panicked on malformed
-    /// input (#683, #684, #687). [`crate::untrusted`] catches the panic at
-    /// its boundary; the input is refused and the process carries on.
-    #[error("the {what} decoder panicked on malformed input: {message}")]
+    /// Something panicked inside [`crate::untrusted`]'s boundary while
+    /// decoding: usually an upstream decoder (parquet-rs, arrow-ipc) on
+    /// malformed input (#683, #684, #687). Our own reader code also runs
+    /// inside it, so the message and location say which. The input is
+    /// refused and the process carries on.
+    #[error("panicked while decoding the {what}: {message}")]
     DecoderPanic {
         /// What was being decoded (`parquet footer`, `parquet page`, ...).
         what: &'static str,
-        /// The upstream panic message and location.
+        /// The panic message and its `file:line` location.
         message: String,
     },
     /// A Parquet footer declares a count no honest footer could hold, and
@@ -686,7 +688,11 @@ pub(crate) mod remote {
         })?;
         let key = url[..url::Position::BeforePath].to_ascii_lowercase();
         let stores = STORES.get_or_init(Default::default);
-        if let Some(store) = stores.lock().expect("store cache lock").get(&key) {
+        if let Some(store) = stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Ok((Arc::clone(store), location));
         }
         let overrides = effective_client_overrides();
@@ -728,7 +734,7 @@ pub(crate) mod remote {
         // last insert wins.
         stores
             .lock()
-            .expect("store cache lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, Arc::clone(&store));
         Ok((store, location))
     }
@@ -921,7 +927,10 @@ pub(crate) mod remote {
                 .max()
                 .unwrap_or(0);
             {
-                let mut cache = self.cache.lock().expect("chunk cache lock");
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cache.cap = self.cap_base.max(max_row_group);
             }
             Ok(crate::untrusted::open_parquet_with_metadata(
@@ -946,7 +955,10 @@ pub(crate) mod remote {
         ///
         /// [`InputSource::set_spill_dir`]: super::InputSource::set_spill_dir
         pub(crate) fn set_spill_dir(&self, dir: Option<&Path>) {
-            self.spill.lock().expect("spill lock").dir = dir.map(Path::to_path_buf);
+            self.spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dir = dir.map(Path::to_path_buf);
         }
 
         /// Parse (and cache) the footer, returning the shared metadata.
@@ -1116,14 +1128,16 @@ pub(crate) mod remote {
                     shared
                         .ranges
                         .lock()
-                        .expect("ranges lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(rg.span.clone());
                     // Slice into per-column-chunk spill entries. Guard the
                     // slice bounds: a well-behaved store returns exactly the
                     // requested span, but a short read must fall back to the
                     // reader's network path (skip spilling), never panic.
                     let base = rg.span.start;
-                    let mut spill = spill.lock().expect("spill lock");
+                    let mut spill = spill
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for (chunk_start, len) in rg.chunks {
                         // Checked (#430): a wrapped `off + len` would pass the
                         // bound and panic inside `slice`.
@@ -1154,7 +1168,11 @@ pub(crate) mod remote {
 
         /// The byte ranges fetched so far, in request order.
         pub fn fetched_ranges(&self) -> Vec<Range<u64>> {
-            self.shared.ranges.lock().expect("ranges lock").clone()
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// Drop the in-memory (L1) chunk cache. The disk spill (L2) and the
@@ -1163,7 +1181,10 @@ pub(crate) mod remote {
         /// on part transitions so resident memory stays O(one part's row
         /// group) instead of O(parts × cap) (v0.7 multi-partition input).
         pub fn release_read_cache(&self) {
-            let mut cache = self.cache.lock().expect("chunk cache lock");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.entries.clear();
             cache.order.clear();
             cache.total = 0;
@@ -1940,7 +1961,11 @@ pub(crate) mod remote {
             self.shared
                 .bytes
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            self.shared.ranges.lock().expect("ranges lock").push(range);
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(range);
             Ok(bytes)
         }
 
@@ -1960,14 +1985,22 @@ pub(crate) mod remote {
         fn chunk_data(&self, chunk: &Range<u64>) -> Result<Bytes, ParquetError> {
             // L1: in-memory cache (hot, one row group's working set).
             {
-                let cache = self.cache.lock().expect("chunk cache lock");
+                let cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some((_, data)) = cache.entries.get(&chunk.start) {
                     return Ok(data.clone());
                 }
             }
             // L2: local disk spill. A hit avoids re-fetching over the network on
             // a later pass; re-warm L1 so same-pass touches stay in memory.
-            if let Some(data) = self.spill.lock().expect("spill lock").get(chunk.start) {
+            if let Some(data) = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(chunk.start)
+            {
                 self.cache_insert(chunk, &data);
                 return Ok(data);
             }
@@ -1981,7 +2014,7 @@ pub(crate) mod remote {
             }
             self.spill
                 .lock()
-                .expect("spill lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .put(chunk.start, &data);
             self.cache_insert(chunk, &data);
             Ok(data)
@@ -1991,7 +2024,10 @@ pub(crate) mod remote {
         /// order until the working-set budget (`cap`, sized to the largest row
         /// group in [`RemoteSource::open_builder`]) is respected.
         fn cache_insert(&self, chunk: &Range<u64>, data: &Bytes) {
-            let mut cache = self.cache.lock().expect("chunk cache lock");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !cache.entries.contains_key(&chunk.start) {
                 cache.total += data.len() as u64;
                 cache
