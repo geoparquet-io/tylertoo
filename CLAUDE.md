@@ -6,6 +6,28 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
+## Fix at the Owner
+
+Most bugs here are a concept implemented in several places with a fix that reached one of them (#779): 15 of 23 fix PRs to `convert.rs` also had to edit `stream.rs`; the 2 GiB reader fix reached 2 of 4 paths (#577 → #606/#607); the geometry column had 4 resolvers (#518 → #676). So, before fixing anything:
+
+1. **Find every place the concept lives.** `git grep` the function, constant, error variant, or option name across `crates/core` (both engines: `overview/convert.rs` and `overview/stream.rs`), `crates/cli`, `crates/python` (`src/lib.rs`, `__init__.py`, `.pyi`), and pyramid.
+2. **More than one site? Consolidate in this PR.** Move the logic into one owner in `crates/core` and route every site through it. Never patch one site and file a follow-up for the siblings.
+3. **Name the owner and the sites in the PR body** (the template's "Concept owner / sites" section).
+
+Owners (landing in #779; use them, never add a sibling):
+
+| Concept | Owner |
+|---|---|
+| Opening untrusted Parquet/IPC input (batch-size cap, footer pre-check, panic → error) | `untrusted::{open_parquet, open_ipc}` (landing in #779) |
+| Options and their validation, before any I/O, for tiles/overview/export/pyramid, CLI and Python | `TilesConfig { convert, export }` and its `validate()` (landing in #779) |
+| Warnings, drop counters, and report lines | the typed `Diagnostic` channel in `diagnostics.rs`; one `Display` each (landing in #779) |
+| Geometry column, CRS, version, renames, property columns of an input | `ResolvedSchema` / `InputDescriptor`, computed once per input part (landing in #779) |
+| Pass-1 scan, assign, carriers, writer options, report, memory budget | the shared pipeline stages (`Pass1Ctx`, `MemoryBudget`) both engines call (landing in #779) |
+
+The gates that enforce this: `ci/ratchets.toml` pins the counts that may only go down (parquet-open sites, `"geometry"` literals, CLI `bail!`s, `too_many_arguments`, …); `clippy.toml`'s `disallowed-methods` names the calls only an owner may make; `scripts/ci/mirrored_hunks.py` fails a PR that adds near-identical blocks to two files (`Mirrored-ok: #NNN` trailer to exempt); the CLI ↔ Python ↔ core parity tests (`crates/python/tests/test_parity.py`) fail a flag or default that exists on one surface only. `ci/README.md` lists every gate and its canary.
+
+Baselines (tippecanoe bands, `ci_baseline.json`, golden digests and archives) change only with a `Baseline-change: #NNN <measured evidence>` commit trailer, and a `fix` PR fails the Mutation gate on an unannotated missed mutant on its changed lines.
+
 ## Agent-wide rules
 
 `AGENTS.md` holds the rules every coding agent follows, including how to
@@ -181,6 +203,7 @@ feat(cli): add --report flag to export-pmtiles
 | `examples/` | The two tutorials (Madagascar local, Brazil remote and sharded) as runnable scripts; `crates/python/tests/docs` runs them and checks the site shows them verbatim |
 | `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup, running CI gates locally |
 | `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
+| `ci/README.md` | Every CI gate: what it asserts, required or not, its canary, the local command |
 | `context/archive/` | Frozen historical docs (plans, session artifacts, legacy-pipeline notes) |
 
 ## Setup
