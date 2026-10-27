@@ -205,7 +205,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-shear
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-shear
 
@@ -224,7 +224,7 @@ jobs:
       # The structural-gate scripts in scripts/ci are stdlib-only Python;
       # uv supplies the interpreter (and pytest for their own tests).
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: false
 
@@ -392,7 +392,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
 
@@ -558,7 +558,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
 
@@ -635,7 +635,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -770,7 +770,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -857,7 +857,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-docs-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -985,7 +985,7 @@ jobs:
       - name: Install cargo-llvm-cov and cargo-nextest
         # Prebuilt binaries via install-action; compiling them from source
         # costs minutes on every run.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -1133,7 +1133,7 @@ jobs:
 
       - name: Install uv
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       # CI Lint: zizmor (GitHub Actions security linter) on these workflows.
       - name: zizmor
@@ -1240,7 +1240,7 @@ jobs:
       # catches new advisories between PRs.
       - name: Install cargo-audit and cargo-deny
         if: ${{ !cancelled() }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit,cargo-deny
 
@@ -1345,7 +1345,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Test the gate scripts
         run: uv run --no-project --with pytest==8.3.4 --with pyyaml==6.0.2 pytest -q scripts/ci/tests
