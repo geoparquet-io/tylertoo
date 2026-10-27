@@ -2,8 +2,8 @@
 #
 # Read by crates/cli/tests/parity/in_crate.rs, which is compiled into the
 # binary's unit tests. Every entry has a reason and an issue number. The
-# number of entries per table and kind is pinned in PINNED there, so adding
-# or dropping one shows up in review.
+# number of entries is pinned in ci/ratchets.toml ([cli_parity_exemptions],
+# [parity_xfails]), so adding or dropping one shows up in review.
 #
 # `xfail = true` marks known drift, not an allowed difference. The test
 # passes while the drift is there, and fails once it is gone and the entry

@@ -18,8 +18,9 @@ The gates:
 An allowed difference is an entry in ``parity_exemptions.toml`` with a
 reason and an issue number. A known, unfixed difference is an entry with
 ``xfail = true``, which runs as a strict xfail: when the drift is fixed the
-test XPASSes, fails, and the entry has to go. ``PINNED`` holds the number of
-entries in each table.
+test XPASSes, fails, and the entry has to go. The number of entries is
+pinned in ``ci/ratchets.toml`` (``[python_parity_exemptions]``,
+``[parity_xfails]``), checked by ``crates/core/tests/architecture.rs``.
 """
 
 from __future__ import annotations
@@ -86,15 +87,8 @@ NEGATED = {
 # clap's `auto` is the Python 0 sentinel for these.
 AUTO_IS_ZERO = {"partition-wave", "in-flight-batches", "read-workers"}
 
-# Entries per ledger table and kind; see the module docstring.
-PINNED = {
-    ("flag", "exempt"): 17,
-    ("flag", "xfail"): 0,
-    ("kwarg", "exempt"): 4,
-    ("kwarg", "xfail"): 0,
-    ("default", "exempt"): 0,
-    ("default", "xfail"): 0,
-}
+# The ledger's tables; its size is pinned in ci/ratchets.toml.
+TABLES = {"flag", "kwarg", "default"}
 
 
 class Arg(NamedTuple):
@@ -354,7 +348,7 @@ def test_defaults_match_the_core_defaults(name: str) -> None:
 # --- the ledger ------------------------------------------------------------------
 
 
-def test_ledger_is_well_formed_and_pinned() -> None:
+def test_ledger_is_well_formed() -> None:
     seen = set()
     for e in ENTRIES:
         assert e.reason.strip(), f"{e} has no reason"
@@ -363,12 +357,8 @@ def test_ledger_is_well_formed_and_pinned() -> None:
         key = (e.table, e.command, e.name)
         assert key not in seen, f"{e} is listed twice"
         seen.add(key)
-    counts: dict[tuple[str, str], int] = {}
-    for e in ENTRIES:
-        kind = "xfail" if e.xfail else "exempt"
-        counts[(e.table, kind)] = counts.get((e.table, kind), 0) + 1
-    assert {k: counts.get(k, 0) for k in PINNED} == PINNED
-    assert set(counts) <= set(PINNED), f"unpinned tables: {set(counts) - set(PINNED)}"
+    unknown = {e.table for e in ENTRIES} - TABLES
+    assert not unknown, f"unknown tables: {unknown}"
 
 
 def test_exempt_entries_are_not_stale() -> None:

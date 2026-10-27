@@ -1,7 +1,8 @@
 # Surface-parity exemption ledger for the Python API (#779, track G2).
 #
 # Read by tests/test_parity.py. Every entry has a reason and an issue
-# number; PINNED there holds the number of entries per table and kind.
+# number; ci/ratchets.toml ([python_parity_exemptions], [parity_xfails])
+# pins the number of entries.
 #
 # `xfail = true` marks known drift: the pair runs as a strict xfail, so it
 # fails once the drift is fixed and the entry is still here. #779's F3

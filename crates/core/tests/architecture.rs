@@ -799,6 +799,55 @@ fn cargo_deny_skips(inv: &Inventory) -> Vec<String> {
     deny_skip_entries(&inv.root)
 }
 
+/// The exemption ledgers whose size is pinned here, so each count lives in
+/// `ci/ratchets.toml` and nowhere else. Each ledger's own checker
+/// (`crates/cli/tests/parity/in_crate.rs`,
+/// `crates/python/tests/test_parity.py`,
+/// `scripts/verify_archive.py --check-exemptions`) validates its entries.
+const PARITY_LEDGERS: [&str; 2] = [
+    "crates/cli/tests/parity_exemptions.toml",
+    "crates/python/tests/parity_exemptions.toml",
+];
+const INVARIANT_LEDGER: &str = "benchmarks/e2e/invariant_exemptions.toml";
+
+/// Lines of `ledger` (relative to `root`) that `keep` selects, as sites.
+fn ledger_lines(root: &Path, ledger: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    let text = fs::read_to_string(root.join(ledger)).unwrap();
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| keep(line.trim()))
+        .map(|(n, line)| format!("{ledger}:{}: {}", n + 1, line.trim()))
+        .collect()
+}
+
+/// Entries (`[[table]]` headers) of one ledger.
+fn ledger_entries(root: &Path, ledger: &str) -> Vec<String> {
+    ledger_lines(root, ledger, |t| t.starts_with("[["))
+}
+
+fn cli_parity_exemptions(inv: &Inventory) -> Vec<String> {
+    ledger_entries(&inv.root, PARITY_LEDGERS[0])
+}
+
+fn python_parity_exemptions(inv: &Inventory) -> Vec<String> {
+    ledger_entries(&inv.root, PARITY_LEDGERS[1])
+}
+
+fn parity_xfails(inv: &Inventory) -> Vec<String> {
+    PARITY_LEDGERS
+        .iter()
+        .flat_map(|ledger| {
+            ledger_lines(&inv.root, ledger, |t| {
+                t.replace(' ', "").starts_with("xfail=true")
+            })
+        })
+        .collect()
+}
+
+fn invariant_exemptions(inv: &Inventory) -> Vec<String> {
+    ledger_entries(&inv.root, INVARIANT_LEDGER)
+}
+
 /// Lint groups whose `allow` also silences `clippy::disallowed_methods`
 /// (a `clippy::style` lint), and with it every owner ban in clippy.toml,
 /// without an allow that `disallowed_method_allows` counts. Allowing
@@ -864,6 +913,10 @@ const METRICS: &[(&str, Metric)] = &[
     ("disallowed_method_allows", disallowed_method_allows),
     ("cargo_deny_skips", cargo_deny_skips),
     ("blanket_clippy_allows", blanket_clippy_allows),
+    ("cli_parity_exemptions", cli_parity_exemptions),
+    ("python_parity_exemptions", python_parity_exemptions),
+    ("parity_xfails", parity_xfails),
+    ("invariant_exemptions", invariant_exemptions),
 ];
 
 // ---------------------------------------------------------------------------

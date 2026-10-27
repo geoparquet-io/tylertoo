@@ -35,16 +35,10 @@ const DUMPED: [&str; 5] = ["tiles", "overview", "export-pmtiles", "pyramid", "de
 /// The subcommands gated for parsed-but-unused flags.
 const BUILT: [&str; 4] = ["tiles", "overview", "export-pmtiles", "pyramid"];
 
-/// Entries per exemption table and kind. A new entry, or one removed, needs
-/// this pin changed in the same PR, so a reviewer sees every exemption.
-const PINNED: &[(&str, &str, usize)] = &[
-    ("parsed_unused", "exempt", 15),
-    ("parsed_unused", "xfail", 0),
-    ("defaults", "exempt", 0),
-    ("defaults", "xfail", 0),
-    ("pyramid_vs_tiles", "exempt", 59),
-    ("pyramid_vs_tiles", "xfail", 0),
-];
+/// The ledger's tables. Its size is pinned in `ci/ratchets.toml`
+/// (`[cli_parity_exemptions]`, `[parity_xfails]`), checked by
+/// `crates/core/tests/architecture.rs`: one place for the count.
+const TABLES: [&str; 3] = ["parsed_unused", "defaults", "pyramid_vs_tiles"];
 
 const SNAPSHOT: &str = "tests/parity/clap_surface.json";
 const EXEMPTIONS: &str = "tests/parity_exemptions.toml";
@@ -223,7 +217,7 @@ fn lookup<'a>(entries: &'a [Entry], command: &str, name: &str) -> Option<&'a Ent
 /// the pins: an exemption cannot be added, or quietly left behind, without
 /// a reviewer seeing the pin change.
 #[test]
-fn exemption_ledger_is_well_formed_and_pinned() {
+fn exemption_ledger_is_well_formed() {
     let entries = ledger();
     let mut seen = BTreeSet::new();
     for e in &entries {
@@ -235,26 +229,13 @@ fn exemption_ledger_is_well_formed_and_pinned() {
             e.cite()
         );
     }
-    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
     for e in &entries {
-        *counts
-            .entry((e.table.clone(), e.kind().to_string()))
-            .or_default() += 1;
-    }
-    for &(table, kind, pinned) in PINNED {
-        let n = counts
-            .remove(&(table.to_string(), kind.to_string()))
-            .unwrap_or(0);
-        assert_eq!(
-            n, pinned,
-            "[[{table}]] has {n} {kind} entries but the pin says {pinned}: update PINNED \
-             in tests/parity/in_crate.rs with the ledger"
+        assert!(
+            TABLES.contains(&e.table.as_str()),
+            "{} is in an unknown table",
+            e.cite()
         );
     }
-    assert!(
-        counts.is_empty(),
-        "tables or kinds missing from PINNED: {counts:?}"
-    );
 }
 
 // --- the builders ------------------------------------------------------------

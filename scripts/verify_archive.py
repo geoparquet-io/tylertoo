@@ -62,7 +62,8 @@ invariant, issue}, in benchmarks/e2e/invariant_exemptions.toml (pass
 --exemptions with --fixture/--settings). Exemptions are strict: an exempted
 invariant that PASSES is a failure too ("XPASS: remove the row"), so a fix
 cannot land without its exemption coming off. `--check-exemptions` validates
-the file itself and pins its row count (EXPECTED_EXEMPTION_ROWS below).
+the file itself and its row count, pinned by [invariant_exemptions] in
+ci/ratchets.toml.
 
 Usage:
   uv run scripts/verify_archive.py out.pmtiles --layer overview
@@ -149,10 +150,18 @@ INVARIANTS = (
 # Invariants with a per-zoom verdict; the rest are archive-wide (zoom "*").
 PER_ZOOM_INVARIANTS = frozenset({"tile_size", "polygon_valid", "monotone"})
 
-# The pinned size of benchmarks/e2e/invariant_exemptions.toml. A row added
-# without raising this, or removed without lowering it, fails
-# `--check-exemptions` (run by e2e.yml): the list can only change on purpose.
-EXPECTED_EXEMPTION_ROWS = 6
+# The pinned size of benchmarks/e2e/invariant_exemptions.toml lives in
+# ci/ratchets.toml ([invariant_exemptions], also checked by
+# crates/core/tests/architecture.rs). A row added without raising it, or
+# removed without lowering it, fails `--check-exemptions` (run by e2e.yml):
+# the list can only change on purpose.
+RATCHETS = Path(__file__).resolve().parents[1] / "ci" / "ratchets.toml"
+
+
+def expected_exemption_rows() -> int:
+    """The [invariant_exemptions] pin in ci/ratchets.toml."""
+    return int(tomllib.loads(RATCHETS.read_text())["invariant_exemptions"]["pin"])
+
 
 # Placeholder-square decay (#749). Under the dither, a square standing in for
 # a polygon of area A at a level of side s survives with probability A / s^2,
@@ -761,7 +770,7 @@ def load_exemptions(path: Path) -> list[dict]:
 def check_exemption_rows(rows: list[dict], path: Path) -> list[str]:
     """Structural problems with the exemption file: every row names a
     fixture, settings, zoom ("*" or an int), a known invariant and an issue;
-    no duplicate rows; the count equals EXPECTED_EXEMPTION_ROWS."""
+    no duplicate rows; the count equals the ci/ratchets.toml pin."""
     problems = []
     seen = set()
     for i, r in enumerate(rows):
@@ -782,11 +791,12 @@ def check_exemption_rows(rows: list[dict], path: Path) -> list[str]:
         if key in seen:
             problems.append(f"{where}: duplicate of an earlier row {key}")
         seen.add(key)
-    if len(rows) != EXPECTED_EXEMPTION_ROWS:
+    expected = expected_exemption_rows()
+    if len(rows) != expected:
         problems.append(
-            f"{path}: {len(rows)} exemption row(s), but EXPECTED_EXEMPTION_ROWS in "
-            f"scripts/verify_archive.py pins {EXPECTED_EXEMPTION_ROWS}. Change both "
-            "together, in the PR that adds or removes the row"
+            f"{path}: {len(rows)} exemption row(s), but [invariant_exemptions] in "
+            f"ci/ratchets.toml pins {expected}. Change both together, in the PR "
+            "that adds or removes the row"
         )
     return problems
 

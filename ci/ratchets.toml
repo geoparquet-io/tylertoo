@@ -196,3 +196,39 @@ target = 0
 owner = "one staged pipeline both engines call (#779 F1)"
 catches = "the twin engines: 15 of 23 convert.rs fix PRs also edited stream.rs; #507/8576c61, #407/ab5214d (in_memory_carriers vs streaming_carriers)"
 scope = "similarity-rs pairs >= 0.80 with one side in overview/convert.rs and the other in overview/stream.rs, both minus test items, concatenated into one file since similarity-rs never compares across files"
+
+# #779 integration: the exemption ledgers' sizes, moved here from the
+# pins each ledger's checker held (PINNED in crates/cli/tests/parity/
+# in_crate.rs and crates/python/tests/test_parity.py, and
+# EXPECTED_EXEMPTION_ROWS in scripts/verify_archive.py), so each count
+# lives in one place. The ledgers stay where they are and their checkers
+# still validate every entry; scripts/verify_archive.py --check-exemptions
+# reads [invariant_exemptions]'s pin from here. An entry added is a raise:
+# say why in the comment above the table, in the PR that adds it.
+[cli_parity_exemptions]
+pin = 74
+target = 0
+owner = "the CLI surface and core TilesConfig (#779 G2/F3): each entry goes when its flag reaches core or gains its counterpart"
+catches = "#374/#600: a flag parsed and never threaded into the core options; pyramid flags drifting from tiles'"
+scope = "[[table]] entries in crates/cli/tests/parity_exemptions.toml ([[parsed_unused]], [[defaults]], [[pyramid_vs_tiles]])"
+
+[python_parity_exemptions]
+pin = 21
+target = 0
+owner = "the Python surface, built from core's knobs (#779 G2/F3): each entry goes when the flag gains its keyword"
+catches = "#443/#709: a CLI flag with no Python keyword argument, or a keyword whose default drifted from the flag's"
+scope = "[[table]] entries in crates/python/tests/parity_exemptions.toml ([[flag]], [[kwarg]], [[default]])"
+
+[parity_xfails]
+pin = 0
+target = 0
+owner = "#779 F3: known surface drift is fixed, not recorded"
+catches = "a parity difference parked as a strict xfail instead of fixed"
+scope = "`xfail = true` lines in crates/cli/tests/parity_exemptions.toml and crates/python/tests/parity_exemptions.toml"
+
+[invariant_exemptions]
+pin = 6
+target = 0
+owner = "the fix each row's issue tracks: decay #749 (3 rows), monotone #768 (2), feature_accounting #707 (1)"
+catches = "a strict-matrix invariant failure exempted without anyone seeing the list grow; an exempted invariant that passes is an XPASS in verify_archive.py"
+scope = "[[exemption]] rows in benchmarks/e2e/invariant_exemptions.toml"

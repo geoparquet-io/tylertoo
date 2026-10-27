@@ -21,9 +21,10 @@
 #
 # Rows are strict: an exempted invariant that passes fails the run as XPASS,
 # so the PR that fixes the issue must delete its rows. The row count is
-# pinned by EXPECTED_EXEMPTION_ROWS in scripts/verify_archive.py, checked by
+# pinned by [invariant_exemptions] in ci/ratchets.toml, checked by
+# crates/core/tests/architecture.rs and by
 # `uv run scripts/verify_archive.py --check-exemptions <this file>`: the list
-# only changes on purpose, in both places at once.
+# only changes on purpose, with the pin.
 
 [[exemption]]
 fixture = "open-buildings"
