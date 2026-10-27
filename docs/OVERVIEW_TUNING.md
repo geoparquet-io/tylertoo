@@ -139,7 +139,13 @@ that area under its own features.
 - The export holds the finest level's geometry in memory while it builds
   the fill, outside the RAM budget the export plans for: about 1.7 GB more
   on 4.3M NZ parcels, growing with the input (#764).
-- It is skipped with `--tile-range` or `--zoom-ceiling` (sharded builds).
+- In a sharded build the coarse job (`tiles --shard coarse`, or
+  `export-pmtiles --zoom-ceiling`) builds the fill from the finest level and
+  draws it at the zooms it owns, the same fill a single-job build draws
+  there; to do that, `tiles --shard coarse --coverage-fill` builds every
+  level of its intermediate instead of stopping at the pivot. Data shards
+  (`--tile-range`) own the zooms from the pivot down, where the fill matters
+  least, and skip it (#771).
 
 On the benchmark inputs, the fill adds 17% to end-to-end time on NZ parcels
 and 10% on Madagascar admin-4, and 4% to the archive. On FTW Moldova, where
@@ -305,11 +311,14 @@ shares no zoom with its archive is always an error.
 
 ### Export settings and disk use
 
-`--max-tile-size` is unset by default for pyramid bands, preserving every
-cell. When set,
-the cap applies to each band's tiles before tylertoo combines them.
-`--feature-order` applies to every GeoParquet band alike, as `--generalize`
-does. A band that lacks the column exports in input order with a warning
+`pyramid` takes the export flags `tiles` and `export-pmtiles` take
+(`--max-tile-size`, `--max-compressed-tile-size`, `--size-valve`,
+`--tile-buffer`, `--feature-order`, `--feature-id`, the property selection,
+and the rest), and applies them to every GeoParquet band alike, as
+`--generalize` does. Both size caps are off by default for pyramid bands,
+preserving every cell. When set, a cap applies to each band's tiles before
+tylertoo combines them. Every GeoParquet band needs the `--feature-id`
+column. A band that lacks the column exports in input order with a warning
 naming its layer. An archive band keeps the order it had. tylertoo writes
 bands coarsest first, whatever order you list them in.
 
