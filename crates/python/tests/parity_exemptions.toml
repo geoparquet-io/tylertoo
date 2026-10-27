@@ -89,428 +89,37 @@ reason = "Shorthand for --min-zoom Z --max-zoom Z, which decode() takes."
 issue = 779
 
 
-# --- [[flag]]: drift (strict xfail) ---------------------------------------
-
-[[flag]]
-command = "tiles"
-flag = "feature-id"
-reason = "convert() has no feature_id; #443 asks for it on every surface."
-issue = 443
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "keep-overview"
-reason = "convert() cannot keep its intermediate overview, and puts it where #709 describes."
-issue = 709
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "gsd"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "bbox"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "name"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "description"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "attribution"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "tile-buffer"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "partition-wave"
-reason = "convert() lacks a keyword tiles has: F3 builds Python from the same config."
-issue = 779
-xfail = true
+# --- [[flag]]: CLI-only (sharded builds, pyramid report) -------------------
 
 [[flag]]
 command = "tiles"
 flag = "files-from"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
+reason = "convert() takes one input path; overview() takes a list of files."
 issue = 779
-xfail = true
 
 [[flag]]
 command = "tiles"
 flag = "shard"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
-issue = 779
-xfail = true
+reason = "Sharded builds stay a CLI and Rust-API feature: a fleet shares one shard plan and convert plan across jobs, which a one-call convert() has no use for."
+issue = 498
 
 [[flag]]
 command = "tiles"
 flag = "shard-plan"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "tile-range"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
-issue = 779
-xfail = true
+reason = "Sharded builds stay a CLI and Rust-API feature: a fleet shares one shard plan and convert plan across jobs, which a one-call convert() has no use for."
+issue = 498
 
 [[flag]]
 command = "tiles"
 flag = "plan-only"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
-issue = 779
-xfail = true
+reason = "Sharded builds stay a CLI and Rust-API feature: a fleet shares one shard plan and convert plan across jobs, which a one-call convert() has no use for. --plan-only is the coarse job's plan writer."
+issue = 560
 
 [[flag]]
-command = "tiles"
-flag = "save-plan"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
+command = "pyramid"
+flag = "report"
+reason = "Python returns the report as a dict instead of writing it to a path."
 issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "plan"
-reason = "convert() cannot take part in a sharded build or reuse a plan: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "verbatim"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "sort-key"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "magnitude-ladder"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "ladder-step"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "entry-zoom"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "class-rank"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-auto-rank"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "filter"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "gsd-base"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "simplify-factor"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "collapse"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "collapse-square"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-collapse"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "representation"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-cascade"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "point-thinning"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "line-thinning"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "polygon-thinning"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "line-visibility"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "polygon-visibility"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "drop-rate"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "drop-gamma"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-density-drop"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "drop-lines"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "drop-polygons"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "cluster"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "accumulate-attribute"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-coalesce-lines"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "coalesce-junction-angle"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "coalesce-snap"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "coalesce-max-level-rows"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "row-group-size"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "row-group-size-policy"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "full-column-stats"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "no-streaming"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "read-batch-size"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "profile"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "in-flight-batches"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "tiles"
-flag = "read-workers"
-reason = "convert() takes none of the convert tuning flags tiles shares with overview: F3 builds Python from the same config."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "overview"
-flag = "row-group-size-policy"
-reason = "overview() lacks a keyword the overview command has."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "overview"
-flag = "save-plan"
-reason = "overview() lacks a keyword the overview command has."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "overview"
-flag = "plan"
-reason = "overview() lacks a keyword the overview command has."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "export-pmtiles"
-flag = "tile-range"
-reason = "export_pmtiles() cannot export one shard of a sharded build."
-issue = 779
-xfail = true
-
-[[flag]]
-command = "export-pmtiles"
-flag = "zoom-ceiling"
-reason = "export_pmtiles() cannot export one shard of a sharded build."
-issue = 779
-xfail = true
-
 
 # --- [[kwarg]] ---------------------------------------------------------------
 
@@ -527,32 +136,13 @@ reason = "Python takes the --class-rank spec pre-parsed: class_rank_column, clas
 issue = 779
 
 [[kwarg]]
-command = "overview"
-kwarg = "sort_direction"
-reason = "The CLI always ranks descending; only Python can pick ascending."
+command = "tiles"
+kwarg = "class_rank_column"
+reason = "Python takes the --class-rank spec pre-parsed: class_rank_column, class_ranks and class_rank_unknown."
 issue = 779
-xfail = true
 
 [[kwarg]]
-command = "export-pmtiles"
-kwarg = "extent"
-reason = "The CLI always writes extent 4096; only Python can change it."
-issue = 779
-xfail = true
-
-
-# --- [[default]] -------------------------------------------------------------
-
-[[default]]
 command = "tiles"
-flag = "max-tile-size"
-reason = "tiles leaves the cap unset so --verbatim can lift it; convert() fixes 2097152. Equal today, but wrong once convert() gains verbatim."
+kwarg = "class_rank_unknown"
+reason = "Python takes the --class-rank spec pre-parsed: class_rank_column, class_ranks and class_rank_unknown."
 issue = 779
-xfail = true
-
-[[default]]
-command = "tiles"
-flag = "max-compressed-tile-size"
-reason = "tiles leaves the cap unset so --verbatim can lift it; convert() fixes 512000. Equal today, but wrong once convert() gains verbatim."
-issue = 779
-xfail = true

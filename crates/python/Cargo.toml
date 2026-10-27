@@ -27,6 +27,7 @@ pyo3 = { workspace = true, features = ["abi3-py39"] }
 pyo3-log = { workspace = true }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"
+serde = { workspace = true }
 
 [lints]
 workspace = true

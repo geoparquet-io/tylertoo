@@ -73,6 +73,7 @@ RENAMES: dict[str, dict[str, str]] = {
         "no-simple-clip-fastpath": "simple_clip_fastpath",
     },
     "overview": {"gsd": "gsds"},
+    "tiles": {"gsd": "gsds"},
     "pyramid": {"band": "bands"},
 }
 NEGATED = {
@@ -87,12 +88,12 @@ AUTO_IS_ZERO = {"partition-wave", "in-flight-batches", "read-workers"}
 
 # Entries per ledger table and kind; see the module docstring.
 PINNED = {
-    ("flag", "exempt"): 12,
-    ("flag", "xfail"): 60,
-    ("kwarg", "exempt"): 2,
-    ("kwarg", "xfail"): 2,
+    ("flag", "exempt"): 17,
+    ("flag", "xfail"): 0,
+    ("kwarg", "exempt"): 4,
+    ("kwarg", "xfail"): 0,
     ("default", "exempt"): 0,
-    ("default", "xfail"): 2,
+    ("default", "xfail"): 0,
 }
 
 
@@ -309,29 +310,45 @@ def _init_signature(name: str) -> dict[str, object]:
 STUB_FUNCTIONS = sorted(_stub_signatures())
 
 
+def _stub_defaults_agree(stub: dict[str, object], public: dict[str, object]) -> bool:
+    """The stub names the public keywords, and any default it states agrees.
+
+    Since #779 F3 the extension takes every keyword through ``**kwargs``
+    and requires each, so the stub states no default (``...``): there is
+    no third copy to drift. A stub default, if one comes back, must equal
+    the public one.
+    """
+    return set(stub) == set(public) and all(
+        v is ... or v == public[k] for k, v in stub.items()
+    )
+
+
 @pytest.mark.parametrize("name", STUB_FUNCTIONS)
 def test_stub_matches_the_public_signature(name: str) -> None:
     # `__init__.py` passes every argument to the extension by keyword, and
-    # stubtest only checks the stub against the extension. A default changed
-    # in one of the three and not the others (#699) shows up here.
-    assert _stub_signatures()[name] == _init_signature(name)
+    # stubtest only checks the stub against the extension. A keyword or a
+    # default changed in one of the three and not the others (#699) shows
+    # up here.
+    if name.startswith("_"):
+        return
+    assert _stub_defaults_agree(_stub_signatures()[name], _init_signature(name))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AttributeError,
-    reason="#779 F3: core defaults not exposed",
-)
 @pytest.mark.parametrize("name", STUB_FUNCTIONS)
 def test_defaults_match_the_core_defaults(name: str) -> None:
     # `tylertoo._defaults()` is built from the core `Default` impls (#779
     # F3): {function name: {keyword: default}}. Every keyword it names has
-    # that default in `__init__.py` and in the stub.
-    core: dict[str, dict[str, object]] = tylertoo._defaults()  # type: ignore[attr-defined]
+    # that default in `__init__.py`, and the stub states it or none.
+    core: dict[str, dict[str, object]] = tylertoo._defaults()
     stub, public = _stub_signatures()[name], _init_signature(name)
     for kwarg, value in core.get(name, {}).items():
         assert public.get(kwarg) == value, f"{name}({kwarg}=...) in __init__.py"
-        assert stub.get(kwarg) == value, f"{name}({kwarg}=...) in the stub"
+        assert stub.get(kwarg) in (value, ...), f"{name}({kwarg}=...) in the stub"
+    # Every public default comes from it: no keyword of a mirrored function
+    # has a default `_defaults()` does not name.
+    if name in core:
+        missing = {k for k, v in public.items() if v is not ... and k not in core[name]}
+        assert not missing, f"{name}: defaults not built from core: {missing}"
 
 
 # --- the ledger ------------------------------------------------------------------

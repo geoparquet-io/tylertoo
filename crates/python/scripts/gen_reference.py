@@ -65,6 +65,9 @@ TYPE_ORDER = [
     "ConvertReport",
 ]
 
+# Exception classes, after the report types.
+EXCEPTION_ORDER = ["ConfigError"]
+
 # Integer defaults at least this large print with `_` separators.
 GROUP = 10_000
 
@@ -209,6 +212,22 @@ def _render_type(name: str) -> str:
     return "\n".join(lines)
 
 
+def _render_exception(name: str) -> str:
+    """Render one exception class: its base and its docstring.
+
+    Args:
+        name: The exception's public name.
+
+    Returns:
+        The exception's Markdown section.
+    """
+    cls = getattr(tylertoo, name)
+    base = cls.__mro__[1].__name__
+    lines = [f"### `{name}`", "", "```python", f"class {name}({base})", "```", ""]
+    lines += [_flat(inspect.getdoc(cls)), ""]
+    return "\n".join(lines)
+
+
 def main() -> None:
     """Print the reference page, after checking that it covers the API.
 
@@ -217,7 +236,7 @@ def main() -> None:
             name is not public.
     """
     public = set(tylertoo.__all__)
-    listed = FUNCTION_ORDER + TYPE_ORDER
+    listed = FUNCTION_ORDER + TYPE_ORDER + EXCEPTION_ORDER
     if missing := [n for n in listed if n not in public]:
         raise SystemExit(f"Listed but not public: {missing}")
     if uncovered := sorted(public - set(listed)):
@@ -227,6 +246,8 @@ def main() -> None:
     parts += [_render_function(name) for name in FUNCTION_ORDER]
     parts += ["## Report types", ""]
     parts += [_render_type(name) for name in TYPE_ORDER]
+    parts += ["## Errors", ""]
+    parts += [_render_exception(name) for name in EXCEPTION_ORDER]
     sys.stdout.write("\n".join(parts).rstrip() + "\n")
 
 
