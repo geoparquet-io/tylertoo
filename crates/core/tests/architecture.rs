@@ -890,10 +890,10 @@ fn ratchets_match_their_pins() {
         if count > pin {
             let _ = writeln!(
                 failures,
-                "[{name}] is {count}, above its pin {pin}. {} Route the new code through \
-                 the owner ({}) instead of adding a bypass. Sites:\n    {}",
-                entry.get("catches").map_or("", String::as_str),
+                "[{name}] is {count}, above its pin {pin}. Route the new code through \
+                 the owner ({}) instead of adding a bypass. Guards: {}. Sites:\n    {}",
                 entry.get("owner").map_or("?", String::as_str),
+                entry.get("catches").map_or("", String::as_str),
                 sites.join("\n    ")
             );
         } else if count < pin {

@@ -1,0 +1,20 @@
+Gate: structural ratchets (crates/core/tests/architecture.rs, cli_bail_calls)
+Expect-fail: cargo test --locked -p tylertoo-core --test architecture ratchets_match_their_pins
+Catches: #458/#709/b8fa58a: validation added in the CLI instead of core's config validate()
+
+diff --git a/crates/cli/src/g1_canary.rs b/crates/cli/src/g1_canary.rs
+new file mode 100644
+index 0000000..b6e8240
+--- /dev/null
++++ b/crates/cli/src/g1_canary.rs
+@@ -0,0 +1,10 @@
++//! G1 canary (#779): a CLI-side validation `bail!` instead of a check in
++//! core's config validation. The architecture test's `cli_bail_calls`
++//! ratchet must count it and fail above its pin.
++
++pub fn check_tile_buffer(tile_buffer: u32) -> anyhow::Result<()> {
++    if tile_buffer > 512 {
++        anyhow::bail!("--tile-buffer must be at most 512");
++    }
++    Ok(())
++}

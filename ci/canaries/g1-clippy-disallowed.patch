@@ -1,0 +1,19 @@
+Gate: clippy disallowed-methods (clippy.toml)
+Expect-fail: cargo clippy --locked -p tylertoo-core --example g1_canary --all-features -- -D warnings
+Catches: #577 -> #606/#607: a parquet reader built outside untrusted::open_parquet skips the batch-size cap
+
+diff --git a/crates/core/examples/g1_canary.rs b/crates/core/examples/g1_canary.rs
+new file mode 100644
+index 0000000..6cfe8c9
+--- /dev/null
++++ b/crates/core/examples/g1_canary.rs
+@@ -0,0 +1,9 @@
++//! G1 canary (#779): opens a parquet file without the `untrusted::open_parquet`
++//! owner. The disallowed-methods list in clippy.toml must reject it.
++
++fn main() {
++    let file = std::fs::File::open("input.parquet").expect("open");
++    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
++        .expect("footer");
++    println!("{} row groups", builder.metadata().num_row_groups());
++}
