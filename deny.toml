@@ -9,12 +9,46 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# Empty, and worth keeping that way. Every exception this list used to carry
-# was resolved by the dependency bumps rather than waived: arrow 59 dropped
-# `paste`, indicatif 0.18 dropped `number_prefix`, and object_store 0.14
-# reached quick-xml 0.41 and dropped rustls-pemfile. cargo-deny warns on an
-# ignore that matches nothing, so a stale entry here is not silent.
-ignore = []
+# Keep this list as short as possible. Earlier exceptions were all resolved by
+# dependency bumps rather than waived: arrow 59 dropped `paste`, indicatif 0.18
+# dropped `number_prefix`, and object_store 0.14 reached quick-xml 0.41 and
+# dropped rustls-pemfile. cargo-deny warns on an ignore that matches nothing,
+# so a stale entry here is not silent.
+#
+# zstd 0.13.3 / zstd-safe 7.3.0 (2026-10-27). The fixes ship only in zstd
+# 0.14.3 / zstd-safe 8.2.0, and parquet 59 requires `zstd = "^0.13"`. Only
+# parquet 60 moves to 0.14, and the arrow stack stays on 59 until geoarrow and
+# geoparquet support arrow 60 (see the workspace Cargo.toml).
+# RUSTSEC-2026-0410 (zstd-sys wasm allocator shim) is fixed by zstd-sys 2.1.2,
+# a semver-compatible lockfile bump, so it is not waived. The only zstd callers
+# in the tree are parquet's `ZSTDCodec`, which uses `zstd::bulk::{Compressor,
+# Decompressor}` (one-shot compress2/decompress per page), and
+# tylertoo-core's `compression.rs`, which uses `zstd::encode_all` and
+# `zstd::stream::read::Decoder::new`.
+# Expires: drop these entries when the arrow/parquet 60 bump lands, and
+# re-check them by 2027-01-31 either way. Neither cargo-deny nor cargo-audit
+# has an expiry field, so this date is a review date, not an enforced one.
+# Mirrored in .cargo/audit.toml, because cargo-audit does not read this file.
+ignore = [
+    # Stream `with_context` constructors reuse a context without resetting
+    # it. Nothing in the tree calls `with_context`. Parquet's bulk API and
+    # our `encode_all` / `read::Decoder::new` each start on a fresh or
+    # session-reset context.
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 pinned by parquet 59; no caller uses the affected with_context constructors" },
+    # `Seekable::decompress`. The `seekable` feature is off: zstd's enabled
+    # features are arrays, legacy, std and zdict_builder, so the type is not
+    # compiled.
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 pinned via parquet 59; seekable feature not enabled" },
+    # A failed legacy-frame `DCtx::decompress_stream` extends a `Vec<u8>`
+    # destination over uninitialized memory. Legacy decoding is on by
+    # default, and we decode untrusted tiles and GeoParquet pages. The
+    # affected path is `zstd::stream::write::Decoder`, or `decompress_stream`
+    # into a Vec, and nothing here uses it. Our reader is
+    # `stream::read::Decoder`, which writes into a `&mut [u8]` slice and
+    # returns the error. Parquet uses the bulk API. The advisory lists both
+    # as not affected.
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 pinned via parquet 59; only read::Decoder and bulk APIs are used, which the advisory lists as unaffected" },
+]
 
 [licenses]
 version = 2
