@@ -1485,7 +1485,9 @@ pub struct BandMergeOptions {
 }
 
 /// How the one-shot pyramid tiles each GeoParquet band.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct PyramidOptions {
     /// Convert knobs applied to every source band, with the band's own zoom
     /// range substituted for [`ConvertOptions::levels`].
@@ -1495,13 +1497,17 @@ pub struct PyramidOptions {
     /// the whole premise of banding — so generalizing it would re-introduce
     /// the problem the pyramid exists to avoid. Callers that want the ladder
     /// inside a band pass a non-verbatim config.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().convert))]
     pub convert: ConvertOptions,
     /// Export knobs applied to every source band, with the band's own layer
     /// name substituted for [`ExportOptions::layer_name`].
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().export))]
     pub export: ExportOptions,
     /// Directory for the per-band intermediates (one overview GeoParquet and
     /// one PMTiles archive per source band, all removed on the way out).
     /// `None` uses the system temp directory.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "DIR"))]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for temporary per-band files, deleted after the build. Defaults to the system temp directory", long_help = None))]
     pub work_dir: Option<PathBuf>,
     /// Allow a pre-tiled band's declared zoom range to overshoot what its
     /// archive actually holds (#495). Off by default: an overshooting band
@@ -1511,6 +1517,8 @@ pub struct PyramidOptions {
     /// error unless this is set. Has no effect on a *disjoint* range (the
     /// band and archive share no zoom at all), which is always an error —
     /// see [`crate::pyramid::merge_bands_with_options`].
+    #[cfg_attr(feature = "cli", arg(long))]
+    #[cfg_attr(feature = "cli", arg(help = "Accept a pre-tiled band with fewer zooms than declared. Missing zooms render empty; use only for a sparse pyramid", long_help = None))]
     pub allow_missing_zooms: bool,
     /// The final archive's `name`, `description` and `attribution`, each
     /// overriding what the pre-tiled band archives carry for that field
@@ -1522,6 +1530,7 @@ pub struct PyramidOptions {
     /// ([`ConfigError::OptionIgnored`](crate::overview::config::ConfigError::OptionIgnored)),
     /// so a GeoParquet band's intermediate archive carries none and passes
     /// none on.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
 
@@ -1588,7 +1597,16 @@ impl PyramidOptions {
     /// # Errors
     ///
     /// [`Error::Config`], or [`Error::InvalidConfig`] for a convert knob.
-    pub fn validate(&self) -> Result<(), Error> {
+    /// Validate these options and return the immutable engine configuration.
+    pub fn validate(&self) -> Result<crate::overview::config::ValidatedConfig<'_, Self>, Error> {
+        crate::overview::config::validate_pyramid(self)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        crate::overview::config::check_work_dir(self.work_dir.as_deref())?;
+        self.metadata
+            .check_size()
+            .map_err(crate::overview::config::ConfigError::MetadataTooLarge)?;
         self.convert
             .validate()
             .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
@@ -1625,9 +1643,17 @@ pub fn build_pyramid(
     output: &Path,
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
-    // #779: the options every band runs with, before any band is read.
-    opts.validate()?;
+    let config = opts.validate()?;
+    build_pyramid_validated(bands, output, &config)
+}
+
+fn build_pyramid_validated(
+    bands: &[Band],
+    output: &Path,
+    config: &crate::overview::config::ValidatedConfig<'_, PyramidOptions>,
+) -> Result<PyramidReport, Error> {
     let diagnostics = crate::diagnostics::Diagnostics::default();
+    let opts = config.options();
     // Validates every band up front, including (#482) that none names a
     // remote `.pmtiles` archive — pure string work, so it is cheap to run for
     // every band before any band is tiled, rather than interleaved with

@@ -29,7 +29,7 @@ class TestDecodeApi:
 
     def test_zooms_are_keyword_only(self) -> None:
         with pytest.raises(TypeError):
-            tylertoo.decode(str(ROADS_PMTILES), "/tmp/x.parquet", 5)  # type: ignore[misc]
+            tylertoo.decode(str(ROADS_PMTILES), "/tmp/x.parquet", 5)  # type: ignore[misc, arg-type]
 
     def test_missing_input_raises_runtime_error(self) -> None:
         with (

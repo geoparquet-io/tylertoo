@@ -2349,9 +2349,10 @@ fn run_front_half(
 /// normalized and validated the options and checked that `save_plan` is set.
 pub(crate) fn write_plan_streaming(
     source: &ConvertSource,
-    options: &ConvertOptions,
+    config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanReport, ConvertError> {
+    let options = config.options();
     let start = Instant::now();
     // Boundary sampling only: a plan-only run writes no profile JSON dump,
     // so the #571 background sampler would have no reader.
@@ -2837,10 +2838,11 @@ fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerRep
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,
-    options: &ConvertOptions,
+    config: &super::config::ValidatedConfig<'_, ConvertOptions>,
     strategy: Pass2Strategy,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
+    let options = config.options();
     let start = Instant::now();
     // #295/#571 peak-RSS tracking: boundary samples + a continuous
     // background sampler when profiling is on (see `RssTracker`/`RssSampler`).

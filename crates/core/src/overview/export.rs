@@ -278,20 +278,30 @@ impl std::str::FromStr for SizeValve {
 use crate::tile::WEBMERC_HALF_M;
 
 /// Options controlling a PMTiles export.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("export_only").multiple(true))))]
 pub struct ExportOptions {
     /// MVT layer name written into every tile and the archive metadata.
+    #[cfg_attr(feature = "cli", arg(long, default_value_t = Self::default().layer_name))]
+    #[cfg_attr(feature = "cli", arg(help = "MVT layer name written into every tile", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub layer_name: String,
     /// Per-tile edge buffer in **tile pixels**. Converted to coordinate units
     /// per tile (`buffer_deg = tile_width * buffer_px / 256`) and applied as
     /// the clip margin, so features spanning a seam render continuously.
     /// At most [`MAX_TILE_BUFFER_PX`] (one tile width); wider is
     /// [`ConfigError::TileBufferTooWide`] (#433).
+    #[cfg_attr(feature = "cli", arg(long, default_value_t = ExportOptions::default().tile_buffer))]
+    #[cfg_attr(feature = "cli", arg(help = "Edge buffer around each tile, in tile pixels, so features continue across tile seams. At most 256 (one tile width)", long_help = None))]
     pub tile_buffer: u32,
     /// MVT tile extent (integer tile-local resolution). Default 4096. Must be
     /// positive ([`ConfigError::InvalidExtent`] otherwise); a value that is
     /// not a power of two is accepted with a warning, since the MVT spec only
     /// recommends one (#433).
+    #[cfg_attr(feature = "cli", arg(long, default_value_t = ExportOptions::default().extent))]
+    #[cfg_attr(feature = "cli", arg(help = "MVT tile extent: the tile-local coordinate resolution. A power of two is recommended", long_help = None))]
     pub extent: u32,
     /// Per-tile limit on the **raw** MVT size, in bytes. When `Some(limit)`
     /// with `limit > 0`, a tile whose encoded size exceeds it goes through the
@@ -301,15 +311,36 @@ pub struct ExportOptions {
     ///
     /// Defaults to `Some(`[`DEFAULT_TILE_SIZE_LIMIT`]`)` (2 MiB, a backstop
     /// behind the compressed limit; #761).
+    #[cfg_attr(feature = "cli", arg(long = "max-tile-size", id = "tile_size_limit",
+        value_name = "SIZE|auto",
+        visible_alias = "tile-size-limit",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_size_auto
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is merged or thinned until it fits; see `--size-valve`", long_help = None))]
     pub tile_size_limit: Option<usize>,
     /// Per-tile limit on the **gzip-compressed** tile size, in bytes:
     /// tippecanoe's `-M` / `--maximum-tile-bytes` (#745). Checked alongside
     /// [`Self::tile_size_limit`]; a tile must satisfy both. Defaults to
     /// `Some(`[`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`]`)` (500 KiB, #761);
     /// `None` or `Some(0)` sets no compressed limit.
+    #[serde(rename = "max_compressed_tile_size")]
+    #[cfg_attr(feature = "cli", arg(long = "max-compressed-tile-size", id = "max_compressed_tile_size",
+        value_name = "SIZE|auto",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_size_auto
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Per-tile cap on the gzip-compressed tile size, like tippecanoe's `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps", long_help = None))]
     pub compressed_tile_size_limit: Option<usize>,
     /// How a tile over a size limit is brought back under it (#745). Default
     /// [`SizeValve::Merge`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "merge|drop",
+        default_value_t = ExportOptions::default().size_valve
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "How to reduce a tile that exceeds its cap: `merge` merges the densest lines and polygons into a neighbor, which keeps its own attributes; `drop` removes features, leaving holes while preserving each retained feature's attributes. Point tiles use feature dropping in both modes", long_help = None))]
     pub size_valve: SizeValve,
     /// Experimental (#750): draw, under each tile's own features below the
     /// finest zoom, the area its child tiles cover, built from the finest
@@ -317,6 +348,8 @@ pub struct ExportOptions {
     /// `false`. A coarse job ([`Self::zoom_ceiling`]) builds it from the
     /// file's finest level (#771); a data shard ([`Self::tile_range`]) does
     /// not build it.
+    #[cfg_attr(feature = "cli", arg(long))]
+    #[cfg_attr(feature = "cli", arg(help = "Fill the holes that dense small polygons (parcels, fields, small admin units) leave at coarse zooms: under each tile's features, also draw the area its child tiles cover, with the attributes of one feature it sits under, in the room the tile's own features leave. Adds 10–17% to build time on dense coverages, about 1.5x on scattered sub-pixel fields (which it may also over-draw), and holds the finest level's geometry in memory. A sharded build's coarse job draws it; data shards (`--tile-range`) do not", long_help = None))]
     pub coverage_fill: bool,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
@@ -328,6 +361,8 @@ pub struct ExportOptions {
     /// render-equivalent to the fallback but stored rotated to a different start
     /// vertex, so disable it (`--no-simple-clip-fastpath`) only when byte-stable
     /// tile output is required.
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().simple_clip_fastpath, action = clap::ArgAction::SetFalse, long = "no-simple-clip-fastpath"))]
+    #[cfg_attr(feature = "cli", arg(help = "Clip all polygons with the full overlay for byte-stable tiles. The simple-ring fast path renders identically but can change a ring's starting vertex", long_help = None))]
     pub simple_clip_fastpath: bool,
     /// Number of partitions processed per band read (the export concurrency
     /// knob). Default [`PARTITION_WAVE_AUTO`], which [`resolve_partition_wave`]
@@ -341,9 +376,18 @@ pub struct ExportOptions {
     /// partitions resident) and read a wider combined-bbox band per wave.
     /// Output is byte-identical for every value — the wave is a scheduling
     /// concern only.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "N|auto", default_value = "auto", value_parser = super::config::cli::parse_partition_wave))]
+    #[cfg_attr(feature = "cli", arg(help = "Partitions to export at once, or `auto` to size the wave to the cores and free memory. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>", long_help = None))]
     pub partition_wave: usize,
     /// Within-tile feature order (#361). Defaults to [`FeatureOrder::Input`],
     /// the order tylertoo has always emitted.
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "input|COLUMN[:asc|:desc]",
+        default_value_t = ExportOptions::default().feature_order
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Feature order within each tile: `input` preserves source row order; `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this order unless the style overrides it. A `pyramid` band without that column keeps input order with a warning", long_help = None))]
     pub feature_order: FeatureOrder,
     /// Minimum zoom the archive declares in its metadata, even when the
     /// overview file's coarsest levels are missing (#380).
@@ -360,11 +404,16 @@ pub struct ExportOptions {
     /// than the coarsest level present — that would misdescribe real tiles —
     /// and is rejected if it is. The one-shot `tiles` command passes its
     /// `--min-zoom` here; `export-pmtiles --min-zoom` sets it directly.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "ZOOM"))]
+    #[cfg_attr(feature = "cli", arg(help = "Minimum zoom in archive metadata, including empty coarse overview levels. Defaults to the coarsest level's zoom", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub min_zoom: Option<u8>,
     /// Which properties the tiles carry (#386): tippecanoe's `-x` / `-y` /
     /// `-X`, matched against the property names as the tiles would publish
     /// them. The overview file is untouched. Default: keep everything the
     /// file exports.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().properties))]
     pub properties: PropertySelection,
     /// Emit only the tiles inside this pivot-zoom range — one shard of a
     /// sharded build (#498).
@@ -390,6 +439,10 @@ pub struct ExportOptions {
     /// costs roughly its share of the export, not the whole of it.
     ///
     /// Default `None` (emit everything).
+    #[serde(with = "super::config::tile_range")]
+    #[cfg_attr(feature = "cli", arg(value_parser = crate::shard::TileRange::parse, long, value_name = "LO..HI"))]
+    #[cfg_attr(feature = "cli", arg(help = "Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at one zoom, plus their descendants. Ranges that partition a zoom give disjoint archives, which `tylertoo merge` can join", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub tile_range: Option<crate::shard::TileRange>,
     /// Emit only the tiles at or below this zoom — the coarse half of a
     /// sharded build (#498).
@@ -401,6 +454,9 @@ pub struct ExportOptions {
     /// than on `--max-zoom`.
     ///
     /// Default `None` (no ceiling).
+    #[cfg_attr(feature = "cli", arg(long, value_name = "ZOOM"))]
+    #[cfg_attr(feature = "cli", arg(help = "Emit only the tiles at or below this zoom, the coarse half of a sharded build. A partial overview kept from `tiles --shard coarse` needs a ceiling at or below its own", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub zoom_ceiling: Option<u8>,
     /// Carry a property column through as the MVT feature `id` on every tile
     /// the feature appears in, at every zoom (#443; tippecanoe's
@@ -436,6 +492,8 @@ pub struct ExportOptions {
     /// always had (unique only within a single tile/zoom pair -- see
     /// `build_mvt`). Whether that no-flag default should instead omit the
     /// id entirely is an open question (#443) this option does not decide.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "COLUMN"))]
+    #[cfg_attr(feature = "cli", arg(help = "Use this integer column as the MVT feature id for `setFeatureState` across tiles and zooms. Every row must contain 0 to 2^64-1. Defaults to tile-local ids", long_help = None))]
     pub feature_id: Option<String>,
     /// Directory for the export's member spill file (#427) -- the on-disk
     /// backing the partitioning single-read pass 2 (#235) falls back to when
@@ -447,12 +505,20 @@ pub struct ExportOptions {
     ///
     /// The PMTiles archive itself is never spilled here: it is assembled in
     /// place at `<output>.partial` beside the output (#459).
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub spill_dir: Option<PathBuf>,
     /// Top-level `name`, `description` and `attribution` written to the
     /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
     ///
     /// Unset fields are left out rather than derived from a filename, and
     /// nothing here changes the tiles. Default: none set.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().metadata))]
     pub metadata: TilesetMetadata,
 }
 
@@ -514,7 +580,23 @@ impl ExportOptions {
     /// [`MAX_TILE_BUFFER_PX`], [`ConfigError::SpillDirNotDirectory`] for a
     /// missing spill directory, or [`ConfigError::MetadataTooLarge`] if
     /// `metadata` is too large for an archive's metadata.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    /// Validate these options and return the immutable engine configuration.
+    pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConfigError> {
+        super::config::validate_export(self)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), ConfigError> {
+        for (option, zoom) in [
+            ("--min-zoom / min_zoom", self.min_zoom),
+            ("--zoom-ceiling / zoom_ceiling", self.zoom_ceiling),
+        ] {
+            if let Some(zoom) = zoom.filter(|zoom| *zoom > crate::tile::MAX_ZOOM) {
+                return Err(ConfigError::InvalidSpec {
+                    option,
+                    message: format!("{option} {zoom} must not exceed {}", crate::tile::MAX_ZOOM),
+                });
+            }
+        }
         if self.extent == 0 {
             return Err(ConfigError::InvalidExtent {
                 extent: self.extent,
@@ -1857,16 +1939,26 @@ fn export_pmtiles_run(
     partition_target: usize,
     knobs: &Pass2Knobs,
 ) -> Result<Pass2Run, ExportError> {
+    let validated = options.validate()?;
+    export_pmtiles_validated(input_path, output_path, &validated, partition_target, knobs)
+}
+
+fn export_pmtiles_validated(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    config: &super::config::ValidatedConfig<'_, ExportOptions>,
+    partition_target: usize,
+    knobs: &Pass2Knobs,
+) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
-
+    let options = config.options();
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
     // for the standalone `export-pmtiles` path (which never runs convert's
     // own preflight); redundant but harmless in the `tiles` path.
     preflight_profile_json_path();
     // #433: the knobs that need no file (`extent`, `tile_buffer`) are checked
     // before any I/O, so a bad value fails here rather than after the open.
-    options.validate()?;
     // #452: and the output, before the input is opened.
     crate::atomic_output::check_writable(output_path.as_ref())?;
     let start = Instant::now();
@@ -14834,17 +14926,9 @@ mod tests {
             ..ExportOptions::default()
         };
         let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExportError::DeclaredMinZoomAboveCeiling {
-                    declared: 33,
-                    ceiling: 30
-                }
-            ),
-            "got: {err}"
-        );
+        assert!(err.is_config(), "got: {err}");
         let msg = err.to_string();
+        assert!(msg.contains("33"), "error names the value: {msg}");
         assert!(msg.contains("--min-zoom"), "error names the flag: {msg}");
         assert!(msg.contains("30"), "error names the limit: {msg}");
     }

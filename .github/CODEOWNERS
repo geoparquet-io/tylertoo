@@ -7,8 +7,6 @@
 /crates/*/api/ @nlebovits
 /crates/io/api/ @nlebovits
 /benchmarks/e2e/invariant_exemptions.toml @nlebovits
-/crates/cli/tests/parity_exemptions.toml @nlebovits
-/crates/python/tests/parity_exemptions.toml @nlebovits
 /codecov.yml @nlebovits
 /.config/nextest.toml @nlebovits
 /ci/ @nlebovits

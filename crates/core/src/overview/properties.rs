@@ -27,16 +27,41 @@ use thiserror::Error;
 
 /// Include/exclude choice over property columns. Names are exact
 /// (parquet column names are case-sensitive).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct PropertySelection {
     /// When `Some`, only these properties are kept (`-y`), and `exclude` /
     /// `exclude_all` are ignored, as in tippecanoe. An empty list keeps
     /// none — the same as [`Self::exclude_all`].
+    #[serde(rename = "include_properties")]
+    #[cfg_attr(feature = "cli", arg(action = clap::ArgAction::Append, long = "include-property", id = "include_properties", value_name = "NAME"))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep only these properties in the tiles (repeatable). The input keeps every column, and the `--feature-order` column must stay", long_help = None))]
     pub include: Option<Vec<String>>,
     /// Properties dropped (`-x`). Ignored when `include` is given.
+    #[serde(
+        rename = "exclude_properties",
+        serialize_with = "serialize_exclude",
+        deserialize_with = "deserialize_exclude"
+    )]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "exclude-property",
+            id = "exclude_properties",
+            value_name = "NAME"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Drop these properties from the tiles (repeatable). `--include-property` overrides it", long_help = None))]
     pub exclude: Vec<String>,
     /// Keep no properties at all (`-X`): geometry-only output. Ignored when
     /// `include` is given.
+    #[serde(rename = "exclude_all_properties")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "exclude-all-properties", id = "exclude_all_properties")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Drop every property, writing geometry-only tiles. `--include-property` overrides it", long_help = None))]
     pub exclude_all: bool,
 }
 
@@ -67,6 +92,25 @@ pub enum PropertySelectionError {
          drop the knob"
     )]
     RequiredByKnob { name: String, knob: String },
+}
+
+fn serialize_exclude<S: serde::Serializer>(
+    names: &[String],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    if names.is_empty() {
+        serializer.serialize_none()
+    } else {
+        names.serialize(serializer)
+    }
+}
+
+fn deserialize_exclude<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    use serde::Deserialize;
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl PropertySelection {

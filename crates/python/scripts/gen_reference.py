@@ -1,8 +1,8 @@
 r"""Generate the Python API reference page (Markdown) on stdout.
 
-The source of truth is `python/tylertoo/__init__.py`: its type
-annotations, defaults, and Google-style docstrings. The script imports
-the built package and renders each public function, then each report
+The native functions provide generated defaults and Google-style
+docstrings; their checked stubs provide type annotations. The script
+imports the built package and renders each public function and report
 type. The committed copy is `docs/reference/python.md`; CI fails when it
 drifts, so never edit it by hand.
 
@@ -15,8 +15,10 @@ Regenerate:
 
 from __future__ import annotations
 
+import ast
 import inspect
 import sys
+from pathlib import Path
 from typing import Any
 
 from docstring_parser import parse
@@ -111,6 +113,31 @@ def _default(value: Any) -> str:
     return repr(value)
 
 
+def _annotations(name: str) -> dict[str, str]:
+    """Read annotations from the checked native API stub.
+
+    Args:
+        name: Public function name.
+
+    Returns:
+        Parameter and return annotations as source text.
+    """
+    source = Path(tylertoo.__file__).with_name("_tylertoo.pyi").read_text()
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    notes = {
+        arg.arg: ast.unparse(arg.annotation)
+        for arg in [*function.args.args, *function.args.kwonlyargs]
+        if arg.annotation is not None
+    }
+    if function.returns is not None:
+        notes["return"] = ast.unparse(function.returns)
+    return notes
+
+
 def _signature(name: str, func: Any) -> str:
     """Render a function signature from its annotations' source text.
 
@@ -121,10 +148,18 @@ def _signature(name: str, func: Any) -> str:
     Returns:
         The signature, one parameter per line.
     """
-    notes = func.__annotations__
+    notes = _annotations(name)
     lines = [f"{name}("]
     keyword_only_started = False
-    for param in inspect.signature(func).parameters.values():
+    parameters = inspect.signature(func).parameters
+    order = [
+        entry.arg_name
+        for entry in parse(inspect.getdoc(func) or "").params
+        if entry.arg_name in parameters
+    ]
+    order.extend(name for name in parameters if name not in order)
+    for parameter_name in order:
+        param = parameters[parameter_name]
         if param.kind is param.KEYWORD_ONLY and not keyword_only_started:
             lines.append("    *,")
             keyword_only_started = True
@@ -175,7 +210,7 @@ def _render_function(name: str) -> str:
             lines += [f"* `{param.arg_name}`: {_flat(param.description)}"]
         lines.append("")
     if doc.returns and doc.returns.description:
-        returned = _link_type(func.__annotations__["return"])
+        returned = _link_type(_annotations(name)["return"])
         lines += ["### Returns", ""]
         lines += [f"{returned}: {_flat(doc.returns.description)}", ""]
     if doc.raises:

@@ -29,14 +29,22 @@ use crate::compression::MAX_INTERNAL_BYTES;
 /// assert_eq!(meta.name.as_deref(), Some("Park Tiles"));
 /// assert_eq!(meta.description, None);
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default)]
 #[non_exhaustive]
 pub struct TilesetMetadata {
     /// Human-readable tileset name.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "TEXT"))]
+    #[cfg_attr(feature = "cli", arg(help = "Human-readable name stored in the archive metadata", long_help = None))]
     pub name: Option<String>,
     /// Tileset description.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "TEXT"))]
+    #[cfg_attr(feature = "cli", arg(help = "Description stored in the archive metadata", long_help = None))]
     pub description: Option<String>,
     /// Attribution text or HTML.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "TEXT"))]
+    #[cfg_attr(feature = "cli", arg(help = "Attribution text or HTML stored in the archive metadata", long_help = None))]
     pub attribution: Option<String>,
 }
 

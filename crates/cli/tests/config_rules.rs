@@ -90,6 +90,9 @@ fn tiles_surfaces_every_core_rule() {
             &["--spill-dir", "/nonexistent/tylertoo-779"][..],
             "not an existing directory",
         ),
+        (&["--point-thinning", "NaN"][..], "point-thinning"),
+        (&["--simplify-factor", "NaN"][..], "simplify-factor"),
+        (&["--drop-gamma", "NaN"][..], "drop-gamma"),
         // #428 (b8fa58a): a NaN class rank.
         (&["--class-rank", "c:a=nan"][..], "finite"),
         // Q1: formerly a `bail!` "(also enforced in core)".

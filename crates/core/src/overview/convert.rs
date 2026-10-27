@@ -93,7 +93,7 @@ use super::writer::{
 };
 
 /// How the caller specifies the overview levels.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LevelPlan {
     /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
@@ -226,7 +226,7 @@ impl LevelPlan {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => {
                 if min_zoom > max_zoom {
                     return Err(ConvertError::InvalidLevels(format!(
-                        "min_zoom {min_zoom} must be <= max_zoom {max_zoom}"
+                        "--min-zoom {min_zoom} (min_zoom) must be <= --max-zoom {max_zoom} (max_zoom)"
                     )));
                 }
                 check_len(*max_zoom as usize - *min_zoom as usize + 1)?;
@@ -273,7 +273,7 @@ impl LevelPlan {
 /// every named rank — **loses to all named classes but still beats a
 /// null/missing value** (nulls encode as `None`, which loses to any `Some` in
 /// the priority order).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassRanking {
     /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
     pub column: String,
@@ -408,13 +408,22 @@ pub(super) const KNOWN_ROAD_CLASSES: &[&str] = &[
 pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 
 /// Options for [`convert_to_overviews`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("overview_only").multiple(true))))]
 pub struct ConvertOptions {
     /// Level materialization mode. Default [`Mode::Duplicating`].
+    #[cfg_attr(feature = "cli", arg(long, default_value = Self::default().mode.as_str(), value_parser = super::config::cli::spelled::<Mode>(&["duplicating", "partitioning"])))]
+    #[cfg_attr(feature = "cli", arg(help = "Level layout: `duplicating` writes each level in full, and `partitioning` writes each feature once, at its coarsest level", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "overview_only"))]
     pub mode: Mode,
     /// How levels are specified (zoom range or explicit GSDs).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().levels))]
     pub levels: LevelPlan,
     /// Thinning / visibility / sort configuration for level assignment.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub assign: AssignConfig,
     /// Attribute-driven entry zoom (#364): a magnitude ladder that decides how
     /// early each feature may appear, overriding the visibility gate and
@@ -425,6 +434,7 @@ pub struct ConvertOptions {
     /// backwards. [`sort_key`](Self::sort_key) cannot fix that on its own — it
     /// chooses between features competing for a cell, and the gate has already
     /// dropped the small ones on size.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().entry_zoom))]
     pub entry_zoom: Option<EntryZoomSpec>,
     /// Optional column name whose (numeric) value is used as the cell-winner
     /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
@@ -433,14 +443,24 @@ pub struct ConvertOptions {
     /// spells nodata — is a *missing* key: the feature still appears, it just
     /// loses any cell it contests to a feature that has a key
     /// (`extract_sort_keys`).
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "COL", help_heading = "Ranking")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Numeric column used to choose each thinning cell's winning feature. Conflicts with `--class-rank`", long_help = None))]
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().class_ranking))]
     pub class_ranking: Option<ClassRanking>,
     /// Disable tier-3 auto-detection of well-known schemas (Overture roads /
     /// places confidence). No effect when `sort_key` or `class_ranking` is set.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Ranking"))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off automatic ranking for known schemas (Overture roads `class`/`road_class`, Overture places `confidence`)", long_help = None))]
     pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub simplify: SimplifyOptions,
     /// Zoom-band representation selector (#317 / #279): per-zoom-band
     /// [`Representation`] overrides — e.g. `0-7:point, 8-14:geom` renders
@@ -458,29 +478,60 @@ pub struct ConvertOptions {
     /// point-thinning grid; within a `square` band they bypass the gate but
     /// keep the polygon grid. Lines and genuine points are unaffected by
     /// every band kind. Default empty (all levels `geom`).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().representation))]
     pub representation: Vec<RepresentationBand>,
     /// Per-level density budget applied after cell-winner thinning (Q2). Default
     /// enabled; disable via `--no-density-drop` to reproduce pre-Q2 behavior.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub density: DensityBudgetConfig,
     /// GSD tile-band base for zoom→GSD derivation (spec §5.2 / Q6; the cogp-rs
     /// `base` knob). Default [`GSD_TILE_BASE`] (1024). Larger ⇒ smaller GSDs
     /// (finer detail / less thinning); smaller ⇒ larger GSDs (coarser / more
     /// thinning). No effect on an explicit [`LevelPlan::Gsds`] plan.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "F",
+        default_value_t = ConvertOptions::default().gsd_base,
+        help_heading = "Generalization"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`", long_help = None))]
     pub gsd_base: f64,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
+    #[serde(rename = "cogp_compat")]
+    #[cfg_attr(feature = "cli", arg(id = "cogp_compat", long = "cogp-compat"))]
+    #[cfg_attr(feature = "cli", arg(help = "Write the third-party `cogp` footer key for readers of that overview format. Partitioning mode only", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "overview_only"))]
     pub cogp_compat_key: bool,
     /// Maximum row-group size in rows for the output writer.
+    #[serde(rename = "row_group_size")]
+    #[cfg_attr(feature = "cli", arg(long = "row-group-size", id = "row_group_size",
+        default_value_t = ConvertOptions::default().max_row_group_size,
+        help_heading = "Output layout"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Maximum rows per output row group at each level. The cap increases if a level would exceed Parquet's row-group limit", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(value_name = "ROW_GROUP_SIZE"))]
     pub max_row_group_size: usize,
     /// How the per-level row-group cap is derived from `max_row_group_size`
     /// (#202). Default [`RowGroupSizePolicy::Constant`]; `ZoomScaled` doubles
     /// the cap per zoom step below the finest level (fewer requests on coarse
     /// bands that wide viewports read mostly whole anyway).
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ConvertOptions::default().row_group_size_policy.as_str(),
+        value_parser = super::config::cli::spelled::<RowGroupSizePolicy>(&["constant", "zoom-scaled"]),
+        help_heading = "Output layout"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "How the row-group cap varies by level: `constant`, or `zoom-scaled`, which doubles it per zoom step coarser than the finest level", long_help = None))]
     pub row_group_size_policy: RowGroupSizePolicy,
     /// Keep full Parquet statistics on every column (including high-cardinality
     /// string/binary property columns and the WKB geometry column). Default
     /// `false`: those stats are suppressed to keep the footer small (H1); the
     /// bbox covering and `level` column always keep their pruning stats. Set
     /// `true` for clients that push property predicates to the remote file.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Output layout"))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep Parquet min/max stats on every column, even large string and geometry columns. Use it when remote clients filter on property columns", long_help = None))]
     pub full_column_stats: bool,
     /// Use the two-pass bounded-memory streaming pipeline (H3). Default `true`.
     ///
@@ -490,16 +541,33 @@ pub struct ConvertOptions {
     /// `O(read batch + winner tables)` instead of `O(dataset)`. Set `false`
     /// to use the original in-memory pipeline (kept for comparison; produces
     /// equivalent output).
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().streaming, action = clap::ArgAction::SetFalse, long = "no-streaming", help_heading = "Memory & performance"))]
+    #[cfg_attr(feature = "cli", arg(help = "Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
     pub streaming: bool,
     /// Rows per Arrow read batch in the streaming pipeline (both passes).
     /// Default [`DEFAULT_READ_BATCH_SIZE`]. Larger batches amortize per-batch
     /// overhead at the cost of proportionally more peak memory; smaller
     /// batches bound memory tighter. No effect when `streaming` is `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = ConvertOptions::default().read_batch_size,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
     pub read_batch_size: usize,
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
     /// size at convert entry. Changes speed and peak memory only — output is
     /// byte-identical across profiles. No effect when `streaming` is `false`.
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ConvertOptions::default().profile.as_str(),
+        value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -514,6 +582,14 @@ pub struct ConvertOptions {
     /// window's output batches). 1 or 2 processes one batch at a time. Output
     /// is byte-identical for every value. No effect when `streaming` is
     /// `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_in_flight_batches,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub in_flight_batches: usize,
     /// Number of concurrent reader threads pass 2 (#494) and pass 1 (#717)
     /// each split the input across. Default [`READ_WORKERS_AUTO`], which
@@ -525,6 +601,14 @@ pub struct ConvertOptions {
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
     /// for remote inputs (see `super::pipeline`) and when `streaming` is
     /// `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_read_workers,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -532,11 +616,16 @@ pub struct ConvertOptions {
     /// INT64 NOT NULL column (1 at the canonical level) and the winner keeps
     /// its own geometry and attributes (see [`super::cluster`]). Lines and
     /// polygons are unaffected. Default `false`.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Clustering"))]
+    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only", long_help = None))]
     pub cluster: bool,
     /// Numeric per-cluster attribute aggregation (Q6): for each spec, the
     /// winner's value of the column becomes the aggregate over itself + the
     /// absorbed features at that level. Requires [`cluster`](Self::cluster).
     /// Empty by default.
+    #[serde(rename = "accumulate_attributes", with = "super::config::accumulation")]
+    #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", help_heading = "Clustering", value_parser = parse_accumulate))]
+    #[cfg_attr(feature = "cli", arg(help = "Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`", long_help = None))]
     pub accumulate: Vec<AccumulateSpec>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by
@@ -554,11 +643,20 @@ pub struct ConvertOptions {
     /// this option is treated as INERT for partitioning conversions — the
     /// output has no `coalesced_count` column and no coalescing provenance.
     /// (The CLI additionally rejects an *explicit* request.)
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().coalesce_lines, action = clap::ArgAction::SetFalse, long = "no-coalesce-lines", help_heading = "Line coalescing"))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels", long_help = None))]
     pub coalesce_lines: bool,
     /// Endpoint snap tolerance for coalescing, in GSD multiples (default
     /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
     /// chain ends within `factor × gsd` of each other are joined. `<= 0`
     /// disables the snap pass (exact coordinate matching only).
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "F",
+        default_value_t = ConvertOptions::default().coalesce_snap,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Join line ends within this many GSDs of each other when coalescing. Set 0 to join only ends that match exactly", long_help = None))]
     pub coalesce_snap: f64,
     /// Per-level candidate ceiling for coalescing (default
     /// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`]): chaining holds the level's
@@ -575,6 +673,13 @@ pub struct ConvertOptions {
     /// such inputs anyway, at a proportional memory cost. Exceeding either skips coalescing. Both are pure
     /// functions of the input, so the verdict is identical across engines,
     /// machines and read-batch sizes.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = ConvertOptions::default().coalesce_max_level_rows,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Skip coalescing above this candidate-line count to bound memory. Long lines reach a corresponding geometry-size limit first", long_help = None))]
     pub coalesce_max_level_rows: usize,
     /// Junction continuation threshold for coalescing, in degrees (default
     /// [`DEFAULT_JUNCTION_ANGLE_DEG`] = `0` = OFF, per maintainer render
@@ -583,6 +688,13 @@ pub struct ConvertOptions {
     /// lines that continue each other within this deviation from straight
     /// merge best-pair-first, so arterials chain THROUGH same-class
     /// crossings (fewer, longer strokes at the cost of over-merging).
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "DEG",
+        default_value_t = ConvertOptions::default().coalesce_junction_angle,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Continue a line through a junction when the straightest pair turns by at most this many degrees. Set 0 to stop chains at every junction", long_help = None))]
     pub coalesce_junction_angle: f64,
     /// Regional extract (#102): `[xmin, ymin, xmax, ymax]` in EPSG:4326
     /// lon/lat degrees. When set, the conversion behaves as if the input
@@ -598,6 +710,8 @@ pub struct ConvertOptions {
     /// read and only the exact per-feature filter applies, so the output is
     /// identical either way. Default `None` (full-extent conversion,
     /// byte-identical output to a build without this option).
+    #[cfg_attr(feature = "cli", arg(value_parser = super::config::cli::parse_bbox, long, value_name = "XMIN,YMIN,XMAX,YMAX"))]
+    #[cfg_attr(feature = "cli", arg(help = "Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box", long_help = None))]
     pub bbox: Option<[f64; 4]>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
@@ -610,6 +724,16 @@ pub struct ConvertOptions {
     /// input those byte ranges are never fetched); row groups without usable
     /// statistics degrade gracefully to the exact per-row evaluation. See
     /// [`super::filter`] for the grammar. Default `None` (no filtering).
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long,
+            value_name = "EXPR",
+            visible_alias = "where",
+            help_heading = "Filtering"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>", long_help = None))]
     pub filter: Option<String>,
     /// Which property columns the output carries (#386): tippecanoe's
     /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
@@ -619,6 +743,8 @@ pub struct ConvertOptions {
     /// column another knob reads (`sort_key`, `class_ranking`, `entry_zoom`,
     /// `accumulate`, `filter`) must stay included; excluding it is rejected.
     /// Default: keep everything.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub properties: PropertySelection,
     /// Directory for the remote-input disk spill (#219 / #272). A remote
     /// convert stages every fetched column chunk in an anonymous temp file
@@ -627,6 +753,11 @@ pub struct ConvertOptions {
     /// under the process temp dir (`$TMPDIR`); set this to use a roomier
     /// or faster volume instead. The directory must exist (validated up
     /// front). Local inputs never spill, so this has no effect on them.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
     pub spill_dir: Option<PathBuf>,
     /// Write the **convert plan artifact** to this path once pass 1 and the
     /// level assignment are done, then carry on with the conversion.
@@ -644,6 +775,11 @@ pub struct ConvertOptions {
     /// column), so a sharded build MUST consume one plan rather than
     /// recompute the assignment per shard. Mutually exclusive with
     /// [`plan`](Self::plan). Streaming pipeline only. Default `None`.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Save the convert plan to PATH and continue converting. Reuse it with `--plan`; sharded builds share one plan", long_help = None))]
     pub save_plan: Option<PathBuf>,
     /// Load a previously saved convert plan from this path instead of running
     /// pass 1 and the level assignment.
@@ -657,6 +793,11 @@ pub struct ConvertOptions {
     /// one plan can be replayed across them. Mutually exclusive with
     /// [`save_plan`](Self::save_plan). Streaming pipeline only. Default
     /// `None`.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Reuse a convert plan, skipping the first pass and level assignment. Its fingerprint must match this run's version, flags, and inputs", long_help = None))]
     pub plan: Option<PathBuf>,
     /// Convert one shard of a sharded build (#498): read only the row groups
     /// whose bbox reaches this tile range, and re-address the `--plan`
@@ -678,6 +819,8 @@ pub struct ConvertOptions {
     /// same thinning options as the plan and only narrows which row groups it
     /// reads, which the fingerprint check accepts as a subset relation rather
     /// than an equality (see `plan_state::SelectionRule`). Default `None`.
+    #[serde(with = "super::config::tile_range")]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TileRange>,
     /// [`crate::shard::ShardPlan::cut_digest_hex`] of the shard plan this run
     /// was given, binding the whole fleet to **one cut** (#498).
@@ -695,6 +838,8 @@ pub struct ConvertOptions {
     /// shards alike. `None` for an unsharded run, which is itself part of the
     /// binding: a plan saved without a shard plan cannot be consumed by a
     /// shard, and vice versa. Default `None`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().shard_plan_digest))]
     pub shard_plan_digest: Option<String>,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
@@ -740,6 +885,7 @@ pub struct ConvertOptions {
     /// [`export_pmtiles`]: super::export::export_pmtiles
     ///
     /// [`ExportOptions::zoom_ceiling`]: super::export::ExportOptions::zoom_ceiling
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().zoom_ceiling))]
     pub zoom_ceiling: Option<u8>,
 }
 
@@ -868,8 +1014,34 @@ impl ConvertOptions {
     ///
     /// The first rule broken. [`ConvertError::is_config`] is true for every
     /// error this returns.
-    pub fn validate(&self) -> Result<(), ConvertError> {
-        validate_options(self)
+    /// Validate these options and return the immutable engine configuration.
+    pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
+        super::config::validate_convert(self)
+    }
+
+    pub(super) fn check_finite_numbers(&self) -> Result<(), ConvertError> {
+        for (name, value) in [
+            ("gsd-base", self.gsd_base),
+            ("point-thinning", self.assign.point_thinning),
+            ("line-thinning", self.assign.line_thinning),
+            ("polygon-thinning", self.assign.polygon_thinning),
+            ("line-visibility", self.assign.line_visibility),
+            ("polygon-visibility", self.assign.polygon_visibility),
+            ("simplify-factor", self.simplify.factor),
+            ("drop-rate", self.density.drop_rate),
+            ("drop-gamma", self.density.gamma),
+            ("coalesce-snap", self.coalesce_snap),
+            ("coalesce-junction-angle", self.coalesce_junction_angle),
+        ] {
+            super::config::finite_number(name, value).map_err(ConvertError::InvalidConfig)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check(&self) -> Result<(), ConvertError> {
+        validate_options(self)?;
+        self.levels.resolve(self.gsd_base)?;
+        Ok(())
     }
 
     /// Turn off the whole generalization ladder: tile this input **exactly as
@@ -954,7 +1126,7 @@ impl ConvertOptions {
         if overrides.coalesce_lines == Some(true) && matches!(self.mode, Mode::Partitioning) {
             return Err(super::config::ConfigError::CoalescePartitioningUnsupported.into());
         }
-        let defaults = AssignConfig::default();
+        let defaults = Self::default();
         let tuned = |explicit: Option<f64>, default: f64| {
             explicit.unwrap_or(if verbatim { 0.0 } else { default })
         };
@@ -963,20 +1135,25 @@ impl ConvertOptions {
         let point_default = if self.cluster {
             super::assign::CLUSTER_POINT_THINNING_DEFAULT
         } else {
-            defaults.point_thinning
+            defaults.assign.point_thinning
         };
         self.assign.point_thinning = tuned(overrides.point_thinning, point_default);
-        self.assign.line_thinning = tuned(overrides.line_thinning, defaults.line_thinning);
-        self.assign.polygon_thinning = tuned(overrides.polygon_thinning, defaults.polygon_thinning);
-        self.assign.line_visibility = tuned(overrides.line_visibility, defaults.line_visibility);
-        self.assign.polygon_visibility =
-            tuned(overrides.polygon_visibility, defaults.polygon_visibility);
-        self.simplify.factor = tuned(
-            overrides.simplify_factor,
-            super::simplify::DEFAULT_SIMPLIFY_FACTOR,
+        self.assign.line_thinning = tuned(overrides.line_thinning, defaults.assign.line_thinning);
+        self.assign.polygon_thinning =
+            tuned(overrides.polygon_thinning, defaults.assign.polygon_thinning);
+        self.assign.line_visibility =
+            tuned(overrides.line_visibility, defaults.assign.line_visibility);
+        self.assign.polygon_visibility = tuned(
+            overrides.polygon_visibility,
+            defaults.assign.polygon_visibility,
         );
-        self.density.enabled = overrides.density_drop.unwrap_or(!verbatim);
-        self.coalesce_lines = overrides.coalesce_lines.unwrap_or(!verbatim);
+        self.simplify.factor = tuned(overrides.simplify_factor, defaults.simplify.factor);
+        self.density.enabled = overrides
+            .density_drop
+            .unwrap_or(!verbatim && defaults.density.enabled);
+        self.coalesce_lines = overrides
+            .coalesce_lines
+            .unwrap_or(!verbatim && defaults.coalesce_lines);
 
         // Logged because "no features were dropped" is a surprising thing to
         // infer from a quiet run — and the message has to tell the truth about
@@ -1037,7 +1214,8 @@ impl ConvertOptions {
 ///
 /// One field per CLI flag (`--point-thinning`, …, `--no-density-drop`,
 /// `--no-coalesce-lines`) and per Python keyword argument.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GeneralizationOverrides {
     /// Point grid cell size in GSDs.
     pub point_thinning: Option<f64>,
@@ -1972,8 +2150,9 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// feature — so nonsensical values are rejected up front with a clear error
 /// instead of producing an "everything at the canonical level" file.
 pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
+    options.check_finite_numbers()?;
     let positive = |name: &str, v: f64| {
-        if !v.is_finite() || v <= 0.0 {
+        if v <= 0.0 {
             return Err(ConvertError::InvalidConfig(format!(
                 "{name} = {v} must be a finite value > 0"
             )));
@@ -1981,7 +2160,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         Ok(())
     };
     let non_negative = |name: &str, v: f64| {
-        if !v.is_finite() || v < 0.0 {
+        if v < 0.0 {
             return Err(ConvertError::InvalidConfig(format!(
                 "{name} = {v} must be a finite value >= 0"
             )));
@@ -2027,18 +2206,6 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
-    // Negative snap / junction-angle values are documented OFF switches; only
-    // NaN is meaningless.
-    if options.coalesce_snap.is_nan() {
-        return Err(ConvertError::InvalidConfig(
-            "coalesce-snap must not be NaN (use <= 0 to disable snapping)".to_string(),
-        ));
-    }
-    if options.coalesce_junction_angle.is_nan() {
-        return Err(ConvertError::InvalidConfig(
-            "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
-        ));
-    }
     if let Some(bb) = options.bbox {
         if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
             return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
@@ -2317,7 +2484,7 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
 
 /// One zoom band of the representation selector (#317 / #279): levels whose
 /// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepresentationBand {
     /// Coarsest zoom of the band (inclusive).
     pub min_zoom: u8,
@@ -2659,7 +2826,7 @@ pub fn write_convert_plan_sources(
     }
     // `--save-plan` already requires the streaming pipeline (validated above),
     // which is where the separable pass-1 + assignment stage lives.
-    super::stream::write_plan_streaming(source, options, diagnostics)
+    super::stream::write_plan_streaming(source, &options.validate()?, diagnostics)
 }
 
 /// Convert a GeoParquet input into a multi-resolution overview file.
@@ -4141,21 +4308,32 @@ fn warn_profile_json_not_streaming() {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "#779: F1 merges the engine report and writer stages next"
-)]
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
+    options.validate()?;
+    let adjusted = normalize_convert_options(source, options)?;
+    let options = adjusted.as_ref().unwrap_or(options);
+    let validated = options.validate()?;
+    convert_to_overviews_validated(source, output_path, &validated, strategy)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "#779: F1 merges the engine report and writer stages next"
+)]
+fn convert_to_overviews_validated(
+    source: &ConvertSource,
+    output_path: &Path,
+    config: &super::config::ValidatedConfig<'_, ConvertOptions>,
+    strategy: super::stream::Pass2Strategy,
+) -> Result<ConvertReport, ConvertError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     source.record_diagnostics(diagnostics);
-
-    let adjusted = normalize_convert_options(source, options)?;
-    let options: &ConvertOptions = adjusted.as_ref().unwrap_or(options);
+    let options = config.options();
     // #452: the output is created after pass 1; a missing or read-only
     // directory must not cost the whole scan first. After the option checks
     // above (which read at most a footer, for a property selection), so a
@@ -4169,7 +4347,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         return super::stream::convert_streaming_strategy(
             source,
             output_path,
-            options,
+            config,
             strategy,
             diagnostics,
         );

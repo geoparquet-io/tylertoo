@@ -25,7 +25,7 @@ name = "tylertoo"
 path = "src/main.rs"
 
 [dependencies]
-tylertoo-core = { workspace = true, features = ["remote"] }
+tylertoo-core = { workspace = true, features = ["remote", "cli"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
@@ -65,9 +65,7 @@ arrow-schema = { workspace = true }
 tylertoo-io = { workspace = true, features = ["test-support"] }
 # Snapshot tests of the CLI's stdout/stderr/exit code (tests/cmd, #613).
 trycmd = "1.2.1"
-# Reads the surface-parity exemption ledger (tests/parity_exemptions.toml,
-# #779). Already in the lockfile through trycmd.
-toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+
 
 [lints]
 workspace = true

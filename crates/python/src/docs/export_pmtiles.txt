@@ -1,0 +1,74 @@
+Export an overview file to a PMTiles archive, one zoom per level.
+
+Args:
+    input: Overview file from `overview()`.
+    output: PMTiles archive to write.
+    layer_name: MVT layer name.
+    tile_buffer: Tile edge buffer in pixels, at most 256.
+    extent: Tile resolution in MVT units.
+    tile_size_limit: Maximum raw (uncompressed) tile size in
+        bytes, a backstop behind `max_compressed_tile_size`;
+        `"auto"` is 2 MiB, and `0` or `None` is no limit.
+    simple_clip_fastpath: Use faster clipping for simple polygons.
+        `False` gives byte-stable output.
+    partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves)
+        at once, or `0` to size from CPUs and RAM.
+    feature_order: Paint order within a tile: `"input"`, or a
+        property name with an optional `:asc` or `:desc`.
+    min_zoom: Coarsest zoom to declare when the coarsest levels are
+        empty.
+    include_properties: Keep only these properties in the tiles.
+        The overview file keeps every column, and the
+        `feature_order` column must stay. `[]` keeps none.
+    exclude_properties: Drop these properties from the tiles.
+        `include_properties` overrides it.
+    exclude_all_properties: Drop every property, writing
+        geometry-only tiles. `include_properties` overrides it.
+    feature_id: Integer column to use as the MVT feature ID.
+    spill_dir: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
+        used when memory runs short.
+    name: Human-readable tileset name, stored in the metadata.
+    description: Description of the tileset, stored in the metadata.
+    attribution: Attribution text or HTML stored in the archive
+        metadata; MapLibre shows it in its attribution control.
+        Each value is stored as given, and `""` is kept as `""`.
+    size_valve: How to reduce a tile that exceeds its limit:
+        `"merge"` merges the densest lines and polygons into a
+        neighbor, which keeps its own attributes; `"drop"` removes
+        features, leaving holes. Point tiles use feature dropping in
+        both modes.
+    max_compressed_tile_size: Maximum gzip-compressed tile size
+        in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and
+        `0` or `None` is no limit.
+    coverage_fill: Experimental: under each tile's features, draw
+        the area its child tiles cover, so a polygon coverage shows
+        no holes at coarse zooms. Holds the finest level's geometry
+        in memory. See `docs/OVERVIEW_TUNING.md`.
+    tile_range: Export only the tiles in this tile-id range,
+        `"LO..HI"`: one shard of a sharded build.
+    zoom_ceiling: Export only the tiles at or below this zoom: the
+        coarse job of a sharded build.
+
+Returns:
+    Tile counts for each zoom written, with encoding diagnostics.
+
+Raises:
+    ConfigError: An option out of range or refused, such as
+        `tile_buffer` past 256, `extent=0`, a missing `spill_dir`,
+        or metadata too large for the 16 MiB archive metadata.
+    ValueError: A property selection the overview file cannot
+        satisfy.
+    RuntimeError: Not an overview file, or reading or writing
+        failed.
+
+Example:
+    >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
+    >>> report["max_zoom"]
+    10
+    >>> credited = export_pmtiles(
+    ...     "overview.parquet",
+    ...     "credited.pmtiles",
+    ...     attribution="© Example contributors",
+    ... )
+    >>> credited["zooms"] == report["zooms"]
+    True

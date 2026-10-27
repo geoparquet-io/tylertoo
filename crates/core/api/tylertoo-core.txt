@@ -1021,6 +1021,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::Representation
 pub fn tylertoo_core::overview::simplify::Representation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::Representation
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::Representation
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::Representation
 impl core::marker::Send for tylertoo_core::overview::simplify::Representation
 impl core::marker::Sync for tylertoo_core::overview::simplify::Representation
@@ -1068,6 +1072,10 @@ pub fn tylertoo_core::overview::assign::AssignConfig::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::assign::AssignConfig
 pub fn tylertoo_core::overview::assign::AssignConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::AssignConfig
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::AssignConfig
+pub fn tylertoo_core::overview::assign::AssignConfig::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::AssignConfig where tylertoo_core::overview::assign::AssignConfig: core::default::Default
+pub fn tylertoo_core::overview::assign::AssignConfig::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::AssignConfig
 impl core::marker::Send for tylertoo_core::overview::assign::AssignConfig
 impl core::marker::Sync for tylertoo_core::overview::assign::AssignConfig
@@ -1136,6 +1144,10 @@ impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::Budg
 impl core::str::traits::FromStr for tylertoo_core::overview::assign::BudgetKinds
 pub type tylertoo_core::overview::assign::BudgetKinds::Err = alloc::string::String
 pub fn tylertoo_core::overview::assign::BudgetKinds::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::BudgetKinds where tylertoo_core::overview::assign::BudgetKinds: core::default::Default
+pub fn tylertoo_core::overview::assign::BudgetKinds::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::BudgetKinds
 impl core::marker::Send for tylertoo_core::overview::assign::BudgetKinds
 impl core::marker::Sync for tylertoo_core::overview::assign::BudgetKinds
@@ -1155,6 +1167,10 @@ pub fn tylertoo_core::overview::assign::DensityBudgetConfig::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::assign::DensityBudgetConfig
 pub fn tylertoo_core::overview::assign::DensityBudgetConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::DensityBudgetConfig
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::DensityBudgetConfig
+pub fn tylertoo_core::overview::assign::DensityBudgetConfig::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::DensityBudgetConfig where tylertoo_core::overview::assign::DensityBudgetConfig: core::default::Default
+pub fn tylertoo_core::overview::assign::DensityBudgetConfig::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::DensityBudgetConfig
 impl core::marker::Send for tylertoo_core::overview::assign::DensityBudgetConfig
 impl core::marker::Sync for tylertoo_core::overview::assign::DensityBudgetConfig
@@ -1471,6 +1487,43 @@ pub const tylertoo_core::overview::coalesce::DEFAULT_JUNCTION_ANGLE_DEG: f64
 pub const tylertoo_core::overview::coalesce::DEFAULT_SNAP_GSD_FACTOR: f64
 pub fn tylertoo_core::overview::coalesce::coalesce_level_lines(&[tylertoo_core::overview::coalesce::CoalesceInput<'_>], f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::coalesce::CoalesceParams) -> alloc::vec::Vec<tylertoo_core::overview::coalesce::CoalescedLine>
 pub mod tylertoo_core::overview::config
+pub mod tylertoo_core::overview::config::keywords
+pub struct tylertoo_core::overview::config::keywords::ConvertSyntax
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::class_rank: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::collapse: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::collapse_square: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::entry_zoom: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::explicit_coalesce_lines: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::ladder_step: u8
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::magnitude_ladder: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::no_collapse: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::representation: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::verbatim: bool
+impl core::clone::Clone for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::clone(&self) -> tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::default::Default for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Send for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Sync for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Unpin for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub const tylertoo_core::overview::config::keywords::CONVERT_POSITIONAL: &[&str]
+pub fn tylertoo_core::overview::config::keywords::command_defaults(&str) -> serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub fn tylertoo_core::overview::config::keywords::convert(serde_json::map::Map<alloc::string::String, serde_json::value::Value>, tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertOptions, tylertoo_core::overview::convert::ConvertError>
+pub fn tylertoo_core::overview::config::keywords::defaults<T: serde_core::ser::Serialize>(T) -> serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub fn tylertoo_core::overview::config::keywords::deserialize_value<'de>(&str, impl serde_core::de::Deserializer<'de>) -> core::result::Result<serde_json::value::Value, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::export(serde_json::map::Map<alloc::string::String, serde_json::value::Value>, tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportOptions, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::max_zoom(&mut serde_json::map::Map<alloc::string::String, serde_json::value::Value>, &str) -> core::result::Result<tylertoo_core::overview::auto_zoom::MaxZoom, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::pyramid(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::pyramid::PyramidOptions, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::tiles(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::overview::tiles::TilesOptions, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::config::keywords::validate_rank_syntax<'de>(impl serde_core::de::Deserializer<'de>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
 #[non_exhaustive] pub enum tylertoo_core::overview::config::ConfigError
 pub tylertoo_core::overview::config::ConfigError::ClassRankIncomplete
 pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite
@@ -1570,9 +1623,52 @@ impl core::marker::Unpin for tylertoo_core::overview::config::OutputKind
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::OutputKind
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::OutputKind
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::OutputKind
+pub enum tylertoo_core::overview::config::SizeCap
+pub tylertoo_core::overview::config::SizeCap::Auto
+pub tylertoo_core::overview::config::SizeCap::Bytes(usize)
+impl tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::or(self, core::option::Option<usize>) -> core::option::Option<usize>
+impl core::clone::Clone for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::clone(&self) -> tylertoo_core::overview::config::SizeCap
+impl core::cmp::Eq for tylertoo_core::overview::config::SizeCap
+impl core::cmp::PartialEq for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::eq(&self, &tylertoo_core::overview::config::SizeCap) -> bool
+impl core::default::Default for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::default() -> tylertoo_core::overview::config::SizeCap
+impl core::fmt::Debug for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::config::SizeCap
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::config::SizeCap
+impl serde_core::ser::Serialize for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for tylertoo_core::overview::config::SizeCap
+impl core::marker::Send for tylertoo_core::overview::config::SizeCap
+impl core::marker::Sync for tylertoo_core::overview::config::SizeCap
+impl core::marker::Unpin for tylertoo_core::overview::config::SizeCap
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::SizeCap
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::SizeCap
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::SizeCap
+pub struct tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T> tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::options(&self) -> &'a T
+impl<'a, T: core::clone::Clone> core::clone::Clone for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::clone(&self) -> tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T: core::fmt::Debug> core::fmt::Debug for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a, T: core::marker::Copy> core::marker::Copy for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T> core::marker::Freeze for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Freeze
+impl<'a, T> core::marker::Send for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Send
+impl<'a, T> core::marker::Sync for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Sync
+impl<'a, T> core::marker::Unpin for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Unpin
+impl<'a, T> core::marker::UnsafeUnpin for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::UnsafeUnpin
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::RefUnwindSafe
+impl<'a, T> core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::UnwindSafe
 pub const tylertoo_core::overview::config::DEFAULT_LADDER_STEP: u8
 pub fn tylertoo_core::overview::config::check_output(&std::path::Path, tylertoo_core::overview::config::OutputKind, bool) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::check_spill_dir(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::check_work_dir(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::class_ranking(core::option::Option<&str>, core::option::Option<alloc::string::String>, core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, f64>>, core::option::Option<f64>) -> core::result::Result<core::option::Option<tylertoo_core::overview::convert::ClassRanking>, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::collapse_mode(bool, bool, bool) -> core::result::Result<tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::entry_zoom(core::option::Option<&str>, u8, core::option::Option<&str>) -> core::result::Result<core::option::Option<tylertoo_core::overview::ladder::EntryZoomSpec>, tylertoo_core::overview::config::ConfigError>
@@ -1692,6 +1788,10 @@ pub fn tylertoo_core::overview::convert::LevelPlan::eq(&self, &tylertoo_core::ov
 impl core::fmt::Debug for tylertoo_core::overview::convert::LevelPlan
 pub fn tylertoo_core::overview::convert::LevelPlan::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::LevelPlan
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::LevelPlan
+pub fn tylertoo_core::overview::convert::LevelPlan::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::LevelPlan
+pub fn tylertoo_core::overview::convert::LevelPlan::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::LevelPlan
 impl core::marker::Send for tylertoo_core::overview::convert::LevelPlan
 impl core::marker::Sync for tylertoo_core::overview::convert::LevelPlan
@@ -1712,6 +1812,10 @@ pub fn tylertoo_core::overview::convert::ClassRanking::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::ClassRanking::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::ClassRanking
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::ClassRanking::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::ClassRanking::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::ClassRanking
 impl core::marker::Send for tylertoo_core::overview::convert::ClassRanking
 impl core::marker::Sync for tylertoo_core::overview::convert::ClassRanking
@@ -1757,7 +1861,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::streaming: bool
 pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
-pub fn tylertoo_core::overview::convert::ConvertOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::convert::ConvertError>
+pub fn tylertoo_core::overview::convert::ConvertOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
 pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertOptions
@@ -1766,6 +1870,10 @@ impl core::default::Default for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::ConvertOptions
+pub fn tylertoo_core::overview::convert::ConvertOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::ConvertOptions where tylertoo_core::overview::convert::ConvertOptions: core::default::Default
+pub fn tylertoo_core::overview::convert::ConvertOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::ConvertOptions
 impl core::marker::Send for tylertoo_core::overview::convert::ConvertOptions
 impl core::marker::Sync for tylertoo_core::overview::convert::ConvertOptions
@@ -1830,6 +1938,10 @@ impl core::fmt::Debug for tylertoo_core::overview::convert::GeneralizationOverri
 pub fn tylertoo_core::overview::convert::GeneralizationOverrides::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::GeneralizationOverrides
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::GeneralizationOverrides where tylertoo_core::overview::convert::GeneralizationOverrides: core::default::Default
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::Send for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::Sync for tylertoo_core::overview::convert::GeneralizationOverrides
@@ -1953,6 +2065,10 @@ impl core::fmt::Debug for tylertoo_core::overview::convert::RepresentationBand
 pub fn tylertoo_core::overview::convert::RepresentationBand::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::RepresentationBand
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::RepresentationBand
+pub fn tylertoo_core::overview::convert::RepresentationBand::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::RepresentationBand
+pub fn tylertoo_core::overview::convert::RepresentationBand::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::Send for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::Sync for tylertoo_core::overview::convert::RepresentationBand
@@ -2220,7 +2336,7 @@ pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Op
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::export::ExportOptions
-pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::export::ExportOptions::verbatim(self) -> Self
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
@@ -2228,6 +2344,10 @@ impl core::default::Default for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::export::ExportOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::export::ExportOptions where tylertoo_core::overview::export::ExportOptions: core::default::Default
+pub fn tylertoo_core::overview::export::ExportOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::export::ExportOptions
 impl core::marker::Send for tylertoo_core::overview::export::ExportOptions
 impl core::marker::Sync for tylertoo_core::overview::export::ExportOptions
@@ -2453,139 +2573,6 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::filter::BoundFilter
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::filter::BoundFilter
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::filter::BoundFilter
 pub fn tylertoo_core::overview::filter::parse_filter(&str) -> core::result::Result<tylertoo_core::overview::filter::FilterExpr, tylertoo_core::overview::filter::FilterError>
-pub mod tylertoo_core::overview::knobs
-pub enum tylertoo_core::overview::knobs::SizeCap
-pub tylertoo_core::overview::knobs::SizeCap::Auto
-pub tylertoo_core::overview::knobs::SizeCap::Bytes(usize)
-impl tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::or(self, core::option::Option<usize>) -> core::option::Option<usize>
-impl core::clone::Clone for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::clone(&self) -> tylertoo_core::overview::knobs::SizeCap
-impl core::cmp::Eq for tylertoo_core::overview::knobs::SizeCap
-impl core::cmp::PartialEq for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::eq(&self, &tylertoo_core::overview::knobs::SizeCap) -> bool
-impl core::default::Default for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::default() -> tylertoo_core::overview::knobs::SizeCap
-impl core::fmt::Debug for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Copy for tylertoo_core::overview::knobs::SizeCap
-impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::SizeCap
-impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
-impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::SizeCap
-pub fn tylertoo_core::overview::knobs::SizeCap::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
-impl core::marker::Freeze for tylertoo_core::overview::knobs::SizeCap
-impl core::marker::Send for tylertoo_core::overview::knobs::SizeCap
-impl core::marker::Sync for tylertoo_core::overview::knobs::SizeCap
-impl core::marker::Unpin for tylertoo_core::overview::knobs::SizeCap
-impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::SizeCap
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::SizeCap
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::SizeCap
-pub struct tylertoo_core::overview::knobs::ConvertKnobs
-pub tylertoo_core::overview::knobs::ConvertKnobs::accumulate_attributes: alloc::vec::Vec<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::cascade: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank_column: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank_unknown: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::class_ranks: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, f64>>
-pub tylertoo_core::overview::knobs::ConvertKnobs::cluster: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_junction_angle: f64
-pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_lines: core::option::Option<bool>
-pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_max_level_rows: usize
-pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_snap: f64
-pub tylertoo_core::overview::knobs::ConvertKnobs::collapse: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::collapse_square: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::density_drop: core::option::Option<bool>
-pub tylertoo_core::overview::knobs::ConvertKnobs::drop_gamma: f64
-pub tylertoo_core::overview::knobs::ConvertKnobs::drop_lines: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::drop_polygons: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::drop_rate: f64
-pub tylertoo_core::overview::knobs::ConvertKnobs::entry_zoom: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::exclude_all_properties: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::exclude_properties: core::option::Option<alloc::vec::Vec<alloc::string::String>>
-pub tylertoo_core::overview::knobs::ConvertKnobs::filter: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::full_column_stats: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::gsd_base: f64
-pub tylertoo_core::overview::knobs::ConvertKnobs::in_flight_batches: usize
-pub tylertoo_core::overview::knobs::ConvertKnobs::include_properties: core::option::Option<alloc::vec::Vec<alloc::string::String>>
-pub tylertoo_core::overview::knobs::ConvertKnobs::ladder_step: u8
-pub tylertoo_core::overview::knobs::ConvertKnobs::line_thinning: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::line_visibility: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::magnitude_ladder: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::no_auto_rank: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::no_collapse: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::plan: core::option::Option<std::path::PathBuf>
-pub tylertoo_core::overview::knobs::ConvertKnobs::point_thinning: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::polygon_thinning: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::polygon_visibility: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::profile: tylertoo_core::overview::level::MemoryProfile
-pub tylertoo_core::overview::knobs::ConvertKnobs::read_batch_size: usize
-pub tylertoo_core::overview::knobs::ConvertKnobs::read_workers: usize
-pub tylertoo_core::overview::knobs::ConvertKnobs::representation: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::row_group_size: usize
-pub tylertoo_core::overview::knobs::ConvertKnobs::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
-pub tylertoo_core::overview::knobs::ConvertKnobs::save_plan: core::option::Option<std::path::PathBuf>
-pub tylertoo_core::overview::knobs::ConvertKnobs::simplify_factor: core::option::Option<f64>
-pub tylertoo_core::overview::knobs::ConvertKnobs::sort_direction: tylertoo_core::overview::assign::SortDirection
-pub tylertoo_core::overview::knobs::ConvertKnobs::sort_key: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ConvertKnobs::spill_dir: core::option::Option<std::path::PathBuf>
-pub tylertoo_core::overview::knobs::ConvertKnobs::streaming: bool
-pub tylertoo_core::overview::knobs::ConvertKnobs::verbatim: bool
-impl tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::convert_options(self, tylertoo_core::overview::level::Mode, tylertoo_core::overview::convert::LevelPlan, core::option::Option<[f64; 4]>, bool) -> core::result::Result<tylertoo_core::overview::convert::ConvertOptions, tylertoo_core::overview::convert::ConvertError>
-impl core::clone::Clone for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::clone(&self) -> tylertoo_core::overview::knobs::ConvertKnobs
-impl core::cmp::PartialEq for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::eq(&self, &tylertoo_core::overview::knobs::ConvertKnobs) -> bool
-impl core::default::Default for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::default() -> Self
-impl core::fmt::Debug for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::ConvertKnobs
-impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::ConvertKnobs
-pub fn tylertoo_core::overview::knobs::ConvertKnobs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
-impl core::marker::Freeze for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::marker::Send for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::marker::Sync for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::marker::Unpin for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::ConvertKnobs
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::ConvertKnobs
-pub struct tylertoo_core::overview::knobs::ExportKnobs
-pub tylertoo_core::overview::knobs::ExportKnobs::coverage_fill: bool
-pub tylertoo_core::overview::knobs::ExportKnobs::extent: u32
-pub tylertoo_core::overview::knobs::ExportKnobs::feature_id: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::knobs::ExportKnobs::feature_order: tylertoo_core::overview::export::FeatureOrder
-pub tylertoo_core::overview::knobs::ExportKnobs::max_compressed_tile_size: tylertoo_core::overview::knobs::SizeCap
-pub tylertoo_core::overview::knobs::ExportKnobs::partition_wave: usize
-pub tylertoo_core::overview::knobs::ExportKnobs::simple_clip_fastpath: bool
-pub tylertoo_core::overview::knobs::ExportKnobs::size_valve: tylertoo_core::overview::export::SizeValve
-pub tylertoo_core::overview::knobs::ExportKnobs::tile_buffer: u32
-pub tylertoo_core::overview::knobs::ExportKnobs::tile_size_limit: tylertoo_core::overview::knobs::SizeCap
-impl tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::apply(self, tylertoo_core::overview::export::ExportOptions) -> tylertoo_core::overview::export::ExportOptions
-impl core::clone::Clone for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::clone(&self) -> tylertoo_core::overview::knobs::ExportKnobs
-impl core::cmp::PartialEq for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::eq(&self, &tylertoo_core::overview::knobs::ExportKnobs) -> bool
-impl core::default::Default for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::default() -> Self
-impl core::fmt::Debug for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::ExportKnobs
-impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
-impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::ExportKnobs
-pub fn tylertoo_core::overview::knobs::ExportKnobs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
-impl core::marker::Freeze for tylertoo_core::overview::knobs::ExportKnobs
-impl core::marker::Send for tylertoo_core::overview::knobs::ExportKnobs
-impl core::marker::Sync for tylertoo_core::overview::knobs::ExportKnobs
-impl core::marker::Unpin for tylertoo_core::overview::knobs::ExportKnobs
-impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::ExportKnobs
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::ExportKnobs
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::ExportKnobs
 pub mod tylertoo_core::overview::ladder
 pub enum tylertoo_core::overview::ladder::EntryZoomKind
 pub tylertoo_core::overview::ladder::EntryZoomKind::DenseRank
@@ -2598,6 +2585,10 @@ pub fn tylertoo_core::overview::ladder::EntryZoomKind::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::ladder::EntryZoomKind
 pub fn tylertoo_core::overview::ladder::EntryZoomKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::ladder::EntryZoomKind
+impl serde_core::ser::Serialize for tylertoo_core::overview::ladder::EntryZoomKind
+pub fn tylertoo_core::overview::ladder::EntryZoomKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::ladder::EntryZoomKind
+pub fn tylertoo_core::overview::ladder::EntryZoomKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::ladder::EntryZoomKind
 impl core::marker::Send for tylertoo_core::overview::ladder::EntryZoomKind
 impl core::marker::Sync for tylertoo_core::overview::ladder::EntryZoomKind
@@ -2661,6 +2652,10 @@ pub fn tylertoo_core::overview::ladder::EntryZoomSpec::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::ladder::EntryZoomSpec
 pub fn tylertoo_core::overview::ladder::EntryZoomSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::ladder::EntryZoomSpec
+impl serde_core::ser::Serialize for tylertoo_core::overview::ladder::EntryZoomSpec
+pub fn tylertoo_core::overview::ladder::EntryZoomSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::ladder::EntryZoomSpec
+pub fn tylertoo_core::overview::ladder::EntryZoomSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::ladder::EntryZoomSpec
 impl core::marker::Send for tylertoo_core::overview::ladder::EntryZoomSpec
 impl core::marker::Sync for tylertoo_core::overview::ladder::EntryZoomSpec
@@ -3136,6 +3131,10 @@ pub fn tylertoo_core::overview::properties::PropertySelection::default() -> tyle
 impl core::fmt::Debug for tylertoo_core::overview::properties::PropertySelection
 pub fn tylertoo_core::overview::properties::PropertySelection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::properties::PropertySelection
+impl serde_core::ser::Serialize for tylertoo_core::overview::properties::PropertySelection
+pub fn tylertoo_core::overview::properties::PropertySelection::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::properties::PropertySelection where tylertoo_core::overview::properties::PropertySelection: core::default::Default
+pub fn tylertoo_core::overview::properties::PropertySelection::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::properties::PropertySelection
 impl core::marker::Send for tylertoo_core::overview::properties::PropertySelection
 impl core::marker::Sync for tylertoo_core::overview::properties::PropertySelection
@@ -3234,6 +3233,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::CollapseMode
 pub fn tylertoo_core::overview::simplify::CollapseMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::CollapseMode
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::CollapseMode
+pub fn tylertoo_core::overview::simplify::CollapseMode::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::CollapseMode
+pub fn tylertoo_core::overview::simplify::CollapseMode::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::Send for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::Sync for tylertoo_core::overview::simplify::CollapseMode
@@ -3283,6 +3286,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::Representation
 pub fn tylertoo_core::overview::simplify::Representation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::Representation
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::Representation
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::Representation
 impl core::marker::Send for tylertoo_core::overview::simplify::Representation
 impl core::marker::Sync for tylertoo_core::overview::simplify::Representation
@@ -3345,6 +3352,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::SimplifyOptions
 pub fn tylertoo_core::overview::simplify::SimplifyOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::SimplifyOptions
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::SimplifyOptions
+pub fn tylertoo_core::overview::simplify::SimplifyOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::SimplifyOptions where tylertoo_core::overview::simplify::SimplifyOptions: core::default::Default
+pub fn tylertoo_core::overview::simplify::SimplifyOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::Send for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::Sync for tylertoo_core::overview::simplify::SimplifyOptions
@@ -3488,7 +3499,7 @@ pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<ty
 impl tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::export_defaults(bool) -> tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::ignored_by_plan_only(&self, &tylertoo_core::overview::export::ExportOptions) -> alloc::vec::Vec<&'static str>
-pub fn tylertoo_core::overview::tiles::TilesOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::TilesOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::TilesOptions::validate_plan_only(&self) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::clone(&self) -> tylertoo_core::overview::tiles::TilesOptions
@@ -3496,6 +3507,10 @@ impl core::default::Default for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::tiles::TilesOptions where tylertoo_core::overview::tiles::TilesOptions: core::default::Default
+pub fn tylertoo_core::overview::tiles::TilesOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesOptions
 impl core::marker::Send for tylertoo_core::overview::tiles::TilesOptions
 impl core::marker::Sync for tylertoo_core::overview::tiles::TilesOptions
@@ -3929,13 +3944,17 @@ pub tylertoo_core::pyramid::PyramidOptions::metadata: tylertoo_core::TilesetMeta
 pub tylertoo_core::pyramid::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
 impl tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::new(bool) -> Self
-pub fn tylertoo_core::pyramid::PyramidOptions::validate(&self) -> core::result::Result<(), tylertoo_core::Error>
+pub fn tylertoo_core::pyramid::PyramidOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::Error>
 impl core::clone::Clone for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::clone(&self) -> tylertoo_core::pyramid::PyramidOptions
 impl core::default::Default for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::pyramid::PyramidOptions
+pub fn tylertoo_core::pyramid::PyramidOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::pyramid::PyramidOptions where tylertoo_core::pyramid::PyramidOptions: core::default::Default
+pub fn tylertoo_core::pyramid::PyramidOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::pyramid::PyramidOptions
 impl core::marker::Send for tylertoo_core::pyramid::PyramidOptions
 impl core::marker::Sync for tylertoo_core::pyramid::PyramidOptions
@@ -4713,6 +4732,8 @@ pub fn tylertoo_core::TilesetMetadata::fmt(&self, &mut core::fmt::Formatter<'_>)
 impl core::marker::StructuralPartialEq for tylertoo_core::TilesetMetadata
 impl serde_core::ser::Serialize for tylertoo_core::TilesetMetadata
 pub fn tylertoo_core::TilesetMetadata::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::TilesetMetadata where tylertoo_core::TilesetMetadata: core::default::Default
+pub fn tylertoo_core::TilesetMetadata::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::TilesetMetadata
 impl core::marker::Send for tylertoo_core::TilesetMetadata
 impl core::marker::Sync for tylertoo_core::TilesetMetadata

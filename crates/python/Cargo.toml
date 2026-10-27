@@ -28,8 +28,17 @@ pyo3-log = { workspace = true }
 # Report structs (already serde::Serialize in core) to Python dicts.
 pythonize = "0.29"
 serde = { workspace = true }
-# Names the keyword a core knob group (ConvertKnobs, ExportKnobs) refused.
-serde_path_to_error = "0.1"
+# Flat keyword values are normalized by core syntax adapters.
+serde_json = "1"
 
 [lints]
 workspace = true
+
+[build-dependencies]
+tylertoo-core = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+tylertoo-core = { workspace = true, features = ["cli"] }
+clap = { workspace = true }
+pyo3 = { workspace = true, features = ["auto-initialize"] }

@@ -20,6 +20,7 @@ features = ["remote"]
 
 [features]
 default = []
+cli = ["dep:clap"]
 # Scaled byte-array ceilings for the isolated integration-test lane only.
 testing = ["tylertoo-io/testing"]
 dhat-heap = ["dhat"]
@@ -43,6 +44,7 @@ remote = [
 ]
 
 [dependencies]
+clap = { workspace = true, optional = true }
 dhat = { version = "0.3", optional = true }
 geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
@@ -77,6 +79,7 @@ fast_hilbert = "2.1"
 # already pulls in.
 rstar = "0.12"
 serde = { workspace = true }
+serde_path_to_error = "0.1"
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
 serde_json = "1.0.129"
 i_overlay = "9"

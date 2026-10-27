@@ -98,11 +98,11 @@ class TestConvertErrors:
         ],
     )
     def test_convert_rejects_removed_legacy_kwargs(self, removed_kwarg):
-        """Legacy pipeline kwargs were removed and must raise TypeError."""
+        """Removed legacy keywords raise ConfigError before input is read."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            with pytest.raises(TypeError):
+            with pytest.raises(tylertoo.ConfigError, match=next(iter(removed_kwarg))):
                 tylertoo.convert(
                     input="/some/input.parquet",
                     output=str(output),

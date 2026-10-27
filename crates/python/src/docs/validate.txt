@@ -1,0 +1,14 @@
+Check an overview file against the overview format specification.
+
+Args:
+    file: Overview file to check.
+
+Returns:
+    Each check's result. Failed checks are reported without raising.
+
+Raises:
+    RuntimeError: The file is not readable Parquet.
+
+Example:
+    >>> validate("overview.parquet")["valid"]
+    True

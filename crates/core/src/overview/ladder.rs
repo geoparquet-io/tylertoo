@@ -204,7 +204,7 @@ fn format_value(v: f64) -> String {
 }
 
 /// How a caller asked for the ladder to be built.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EntryZoomKind {
     /// Derive it: rank the column's distinct values descending, one rung per
     /// `step` zooms, starting at the coarsest level's zoom.
@@ -217,7 +217,7 @@ pub enum EntryZoomKind {
 }
 
 /// A `--magnitude-ladder` / `--entry-zoom` request: which column, and how.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntryZoomSpec {
     /// Column whose values the rungs are drawn from.
     pub column: String,
