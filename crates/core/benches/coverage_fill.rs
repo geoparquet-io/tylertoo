@@ -14,6 +14,7 @@
 //! that keeps the valve busy is too slow under the `CodSpeed` simulation.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `coverage_fill`
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 #[path = "support/fixtures.rs"]
 mod fixtures;

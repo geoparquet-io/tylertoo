@@ -1,0 +1,36 @@
+# gate: uv run --no-project --python 3.12 python scripts/ci/mirrored_hunks.py --base HEAD~1 --head HEAD
+# expect: block added at crates/core/src/g1_canary_engine_\w\.rs:\S+ is pasted again at crates/core/src/g1_canary_engine_\w\.rs
+# issue: #779 (scripts/ci/mirrored_hunks.py)
+# catches: #507/8576c61, #743: one fix pasted into two places in one PR
+diff --git a/crates/core/src/g1_canary_engine_a.rs b/crates/core/src/g1_canary_engine_a.rs
+new file mode 100644
+index 0000000..c3ab283
+--- /dev/null
++++ b/crates/core/src/g1_canary_engine_a.rs
+@@ -0,0 +1,10 @@
++//! G1 canary (#779): one half of a block pasted into two engines.
++
++pub fn effective_cap(requested: usize, raised: usize) -> Option<usize> {
++    // #507: `build_writer_options` may have raised the cap to fit parquet's
++    // row-group ceiling. Record it before the options move into the writer.
++    let effective_max_row_group_size = (raised
++        != requested)
++        .then_some(raised);
++    effective_max_row_group_size
++}
+diff --git a/crates/core/src/g1_canary_engine_b.rs b/crates/core/src/g1_canary_engine_b.rs
+new file mode 100644
+index 0000000..34232cb
+--- /dev/null
++++ b/crates/core/src/g1_canary_engine_b.rs
+@@ -0,0 +1,10 @@
++//! G1 canary (#779): the other half of a block pasted into two engines.
++
++pub fn streaming_effective_cap(requested: usize, raised: usize) -> Option<usize> {
++    // #507: `build_writer_options` may have raised the cap to fit parquet's
++    // row-group ceiling. Record it before the options move into the writer.
++    let effective_max_row_group_size = (raised
++        != requested)
++        .then_some(raised);
++    effective_max_row_group_size
++}

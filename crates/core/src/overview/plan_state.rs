@@ -1406,6 +1406,7 @@ impl ConvertPlan {
                 ),
             ));
         }
+        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
         let mut reader = FileReader::try_new(ipc_view(file), None)
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
@@ -1560,6 +1561,7 @@ fn kind_code(k: FeatureKind) -> u8 {
 /// O(input rows) and `save` runs at pass 1's memory peak, so an extra whole
 /// copy of it is exactly what a planet-scale run cannot afford.
 fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<(), ConvertError> {
+    #[allow(clippy::disallowed_methods)] // #779: plan written in place
     let file = File::create(path).map_err(|e| save_plan_err(path, &format!("{e}")))?;
     let mut w = BufWriter::new(file);
     w.write_all(PLAN_MAGIC)

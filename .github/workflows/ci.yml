@@ -10,7 +10,9 @@
 #                   Vale + proselint on the handwritten docs, the public-API
 #                   baseline, and a build on the declared MSRV
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
-#                   Cargo.toml [workspace.lints]), cargo-shear, unit tests
+#                   Cargo.toml [workspace.lints]), cargo-shear, unit tests,
+#                   and the structural gates (#779): similarity and
+#                   architecture ratchets (ci/ratchets.toml), mirrored hunks
 #   Test            the `quick` nextest tier (ubuntu/macos stable; beta on
 #                   main) — see .config/nextest.toml (#457); installs the
 #                   pinned tippecanoe so the tippecanoe-decode golden test
@@ -164,6 +166,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: the mirrored-hunks step diffs the PR's base...head
+          # and reads its commit messages for the Mirrored-ok trailer.
+          fetch-depth: 0
 
       # Only the release's Parquet fixtures are cached, keyed on their
       # pointer files (the checkout fetches no large files): adding or
@@ -201,8 +206,17 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
 
+      # Pinned: the similarity baseline (ci/similarity_baseline.txt) is
+      # only comparable across runs of one similarity-rs version.
       - name: Install similarity-rs
-        run: cargo install similarity-rs --locked
+        run: cargo install similarity-rs --version 0.5.0 --locked
+
+      # The structural-gate scripts in scripts/ci are stdlib-only Python;
+      # uv supplies the interpreter (and pytest for their own tests).
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
 
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -232,6 +246,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Structural gates (#779), cheapest first: none of these compile.
+      # See "Structural gates" in DEVELOPMENT.md.
+      - name: Test the structural-gate scripts
+        run: uv run --no-project --python 3.12 --with pytest==8.4.2 pytest scripts/ci/tests -q
+
+      - name: Check for a block added in two places (mirrored hunks)
+        # The #507/8576c61 pattern: one fix pasted into both engines (or
+        # the CLI and Python) instead of into the owner both call. Exempt a
+        # deliberate copy with a commit trailer 'Mirrored-ok: #NNN <why>'.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          uv run --no-project --python 3.12 python scripts/ci/mirrored_hunks.py \
+            --base "$BASE_SHA" --head "$HEAD_SHA"
+
       - name: Run clippy
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
@@ -257,25 +288,23 @@ jobs:
         # [package.metadata.cargo-shear] in the owning crate.
         run: cargo shear
 
-      - name: Check for duplicated code
-        # Hard gate at 0.95 APTED similarity. The workspace has zero pairs at
-        # or above this threshold. similarity-rs has no baseline or per-pair
-        # suppression, so a new finding must be refactored, not annotated.
-        # RATCHET: lower the threshold as duplication drops — never raise it.
-        run: |
-          similarity-rs \
-            --threshold 0.95 \
-            --min-lines 10 \
-            --skip-test \
-            crates/core/src crates/cli/src crates/python/src \
-            | tee similarity.txt
-          if grep -q "Similarity:" similarity.txt; then
-            echo "::error::duplicate code found at >=0.95 similarity"
-            exit 1
-          fi
+      - name: Check for duplicated code (similarity ratchet)
+        # similarity-rs at the thresholds in ci/ratchets.toml (0.85 within
+        # a file; 0.80 between overview/convert.rs and overview/stream.rs,
+        # concatenated because similarity-rs never compares across files).
+        # Findings are pinned in ci/similarity_baseline.txt: a new pair
+        # fails, and a pinned pair that is gone fails until its line is
+        # deleted and the pin lowered. RATCHET: the list only shrinks.
+        run: uv run --no-project --python 3.12 python scripts/ci/similarity_ratchet.py
 
       - name: Run unit tests
         run: cargo test --locked --lib --all-features
+
+      - name: Check structural ratchets (architecture test)
+        # Counts of code that bypasses a concept's owner (parquet opens,
+        # CLI bail!, "geometry" literals, ...), pinned in ci/ratchets.toml.
+        # Above a pin fails; below fails until the pin is lowered (#779).
+        run: cargo test --locked --all-features -p tylertoo-core --test architecture
 
       # Main only; see CACHES in the header.
       - name: Save cargo build cache

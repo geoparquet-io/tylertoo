@@ -125,6 +125,7 @@ impl OverviewReader {
             path: shown(),
             error,
         })?;
+        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
             ReaderError::Footer {
                 path: shown(),
@@ -453,6 +454,7 @@ impl OverviewReader {
     ///
     /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
     /// the Parquet reader cannot be built.
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     pub fn read_level(
         &self,
         level_idx: usize,
@@ -499,6 +501,7 @@ impl OverviewReader {
     ) -> Result<ParquetRecordBatchReader, ReaderError> {
         let selected = self.selected_row_groups_any(level_idx, bboxes)?;
         let file = File::open(&self.path)?;
+        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups(selected)
             .with_batch_size(self.batch_rows(batch_size))
@@ -560,6 +563,7 @@ impl OverviewReader {
         roots: &[usize],
     ) -> Result<ParquetRecordBatchReader, ReaderError> {
         let file = File::open(&self.path)?;
+        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_row_groups(row_groups)
             .with_batch_size(self.batch_rows(batch_size));
@@ -589,6 +593,7 @@ impl OverviewReader {
     }
 
     /// A reader builder over `level_idx`'s own row-group band.
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     fn band_builder(
         &self,
         level_idx: usize,

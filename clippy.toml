@@ -38,3 +38,44 @@ doc-valid-idents = [
     "ProtoBuf",
     "TileJSON",
 ]
+
+# Structural gates (#779): one owner per concept. Each method below has (or
+# is getting) a single owner in crates/core; calling it anywhere else is the
+# "fix lands at 1 of N sites" pattern behind #577 -> #606/#607 (the 2 GiB
+# batch-size fix reached 2 of 4 reader paths) and #427 (in-place writes).
+# A call site outside the owner needs
+#   #[allow(clippy::disallowed_methods)] // #NNN <why>
+# on the enclosing item or statement. Production allows are counted and
+# pinned in ci/ratchets.toml (`disallowed_method_allows`) by
+# crates/core/tests/architecture.rs, so the count only goes down. Test code
+# (#[cfg(test)] modules, tests/, benches/) reads trusted fixtures and may
+# allow these at module level; it is not counted.
+disallowed-methods = [
+    # Parquet reader construction. Owner: crates/core/src/untrusted.rs
+    # `open_parquet` (#779 F5), which applies the batch-size cap that keeps
+    # byte-array offsets under i32 (#577, #606, #607), the footer pre-check
+    # (#690), and catch_unwind -> InputError (#683, #684, #687).
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new_with_options", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new_with_metadata", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
+    # The async builder (`ParquetRecordBatchStreamBuilder::new`, an alias of
+    # ArrowReaderBuilder). parquet's `async` feature is off today, so the path
+    # does not resolve; `allow-invalid` keeps the entry armed for the day it
+    # is turned on instead of warning now.
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)", allow-invalid = true },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new_with_options", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)", allow-invalid = true },
+    # The batch size is the i32-offset-overflow knob (#577 -> #606/#607); only
+    # the owner may set it.
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::with_batch_size", reason = "the batch-size cap lives in untrusted::open_parquet (#779 F5; #577, #606, #607)" },
+    # Arrow IPC (plan files, spill files read back). Owner:
+    # untrusted::open_ipc (#779 F5): catch_unwind around arrow-ipc's panics
+    # on crafted schemas and offsets (#683, #684).
+    { path = "arrow_ipc::reader::FileReader::try_new", reason = "open IPC files through the untrusted::open_ipc owner (#779 F5; #683/#684)" },
+    # Concatenating record batches doubles peak memory and can overflow i32
+    # offsets in one array (#563/#606 class); each use needs a reason.
+    { path = "arrow_select::concat::concat_batches", reason = "concat_batches copies whole batches and can overflow i32 offsets (#563/#606); stream or regroup instead" },
+    # Output files are written atomically (temp + rename) by
+    # crates/core/src/atomic_output.rs (#427): a crash or error never leaves
+    # a truncated archive at the destination path.
+    { path = "std::fs::File::create", reason = "write output through atomic_output (#427); File::create truncates the destination in place" },
+]

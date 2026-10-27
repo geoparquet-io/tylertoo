@@ -422,11 +422,12 @@ cargo fmt --all --check
 cargo install cargo-shear   # once
 cargo shear
 
-# Duplicated code (hard gate: zero pairs at >=0.95)
-cargo install similarity-rs   # once
-similarity-rs --threshold 0.95 --min-lines 10 \
-  --skip-test crates/core/src crates/cli/src \
-  crates/python/src
+# Duplicated code, structural ratchets, mirrored
+# hunks: see "Structural gates" below
+cargo install similarity-rs --version 0.5.0 --locked
+uv run --no-project --python 3.12 python \
+  scripts/ci/similarity_ratchet.py
+cargo test -p tylertoo-core --test architecture
 
 # Public API surface against the baseline in
 # crates/core/api/tylertoo-core.txt. The Public API
@@ -482,7 +483,7 @@ change in review.
 
 Some thresholds are **ratchets**, set at the current code's level and
 marked `RATCHET` in the source. They are cognitive complexity 30 and
-too-many-lines 200 in `clippy.toml`, the similarity-rs threshold 0.95,
+too-many-lines 200 in `clippy.toml`, the counts in `ci/ratchets.toml`,
 and xenon's max-absolute C. Lower them as the code improves, and never
 raise them. The line-coverage floor in `ci.yml` (94%) is a ratchet in
 the other direction: raise it as coverage grows, and never lower it.
@@ -491,8 +492,7 @@ the other direction: raise it as coverage grows, and never lower it.
 dependency that no code references, such as a transitive version pin,
 list it under `[package.metadata.cargo-shear]` in the crate that owns it.
 
-similarity-rs has no baseline file and no per-pair suppression, so you
-must refactor away any new finding at or above 0.95. When the API gate
+When the API gate
 fires on an intended change, regenerate the baseline in the same PR, as
 `crates/core/api/README.md` describes.
 
@@ -509,6 +509,76 @@ The command rewrites `tests/fixtures/guard/br-clip-divergence.golden.txt`
 and then fails, so a regeneration never passes for a green run. A golden
 diff on a **dependency bump** is not a cue to regenerate. See
 [Dependency updates](#dependency-updates).
+
+### Structural gates
+
+These gates fail when code bypasses the one owner of a concept, or copies
+code instead of sharing it (#779). The pattern they stop: a fix lands at
+one site of a concept that lives at several, and the next issue hits a
+sibling. The Check job runs all of them.
+
+| Gate | What it protects | Regression it catches |
+|---|---|---|
+| `disallowed-methods` in `clippy.toml` | Parquet and IPC reads go through `untrusted::{open_parquet, open_ipc}`; output files go through `atomic_output` | #577, then #606 and #607: the 2 GiB batch-size fix reached 2 of 4 reader paths |
+| `multiple-versions = "deny"` in `deny.toml` | One version of each crate, apart from the pinned `skip` list | #649: a Dependabot bump undid the `brotli` and `zstd` deduplication of #435 |
+| `crates/core/tests/architecture.rs` | The counts in `ci/ratchets.toml`: parquet opens, `"geometry"` literals, CLI `bail!`, long parameter lists, warn-once statics, unlinked `#[ignore]`, `pytest` skips | Validation in the CLI and not in core (#458, #709); four geometry-column resolvers (#675) |
+| `scripts/ci/similarity_ratchet.py` | Near-duplicate functions, pinned in `ci/similarity_baseline.txt` | The twin engines `overview/convert.rs` and `overview/stream.rs` |
+| `scripts/ci/mirrored_hunks.py` | A PR adds the same block of 5 or more lines in two places | 8576c61, the #507 block pasted into both engines |
+
+A disallowed method outside its owner needs an allow that names an issue,
+on the same line:
+
+```rust
+#[allow(clippy::disallowed_methods)] // #NNN why this site cannot use the owner
+```
+
+The architecture test pins the number of these allows, so a new one fails
+CI until its count is pinned too. Test code is exempt: `#[cfg(test)]`
+code in core has a crate-level allow for the test build, and each
+integration test or bench that reads its own fixtures has a file-level one.
+
+Production code never allows a whole lint group. `allow(clippy::all)`,
+`allow(clippy::style)` and `allow(warnings)`, in either the `#[..]` or the
+`#![..]` form, also silence `disallowed_methods`, so they would bypass
+every ban above without an allow the test counts. The architecture test
+fails on any of them, and on `clippy::restriction`. Allow the one lint you
+mean instead.
+
+**Lowering a pin.** Every count in `ci/ratchets.toml` is checked in both
+directions. A count above its pin fails: route the new code through the
+owner instead. A count below its pin also fails, with the new count in the
+message. Set `pin` to that count in the same PR. For the similarity
+ratchet, delete the pairs that the failure lists from
+`ci/similarity_baseline.txt`, then set the pin to the new number of lines.
+`--update` regenerates the whole file, but use it only to drop pairs,
+never to admit new ones. For `deny.toml`, delete the skip entry that
+`cargo deny` reports as unused, then lower `cargo_deny_skips`. Never raise
+a pin to make CI pass.
+
+**A copy on purpose.** When a PR must add the same block in two places,
+for example to keep both engines in step until they share a stage, add a
+commit trailer with an issue number and a reason:
+
+```text
+Mirrored-ok: #NNN both engines need the guard until they share a stage
+```
+
+Run the gates locally:
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo deny check bans
+cargo test -p tylertoo-core --test architecture -- --nocapture
+uv run --no-project --python 3.12 python \
+  scripts/ci/similarity_ratchet.py
+uv run --no-project --python 3.12 python \
+  scripts/ci/mirrored_hunks.py --base origin/main
+uv run --no-project --python 3.12 --with pytest==8.4.2 \
+  pytest scripts/ci/tests -q
+```
+
+`ci/canaries/g1-*.patch` holds one injected regression per gate. Each patch
+must turn its gate red; `ci/canaries/README.md` explains the format.
 
 ### Python (`crates/python`)
 

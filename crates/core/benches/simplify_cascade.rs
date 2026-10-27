@@ -7,6 +7,7 @@
 //! coarse end (#317), matching how a `tiles` run's level plan actually looks.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `simplify_cascade`
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
