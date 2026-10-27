@@ -2,11 +2,11 @@
 # expect: Diff in .*crates/core/src/lib\.rs
 # issue: #779 (the rustfmt step of the Check job)
 diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
-index 8f7603e..ed58030 100644
+index 018a67d..4df6ed2 100644
 --- a/crates/core/src/lib.rs
 +++ b/crates/core/src/lib.rs
-@@ -105,4 +105,4 @@ pub enum Error {
-     Output(#[from] atomic_output::OutputNotWritable),
+@@ -126,4 +126,4 @@ impl Error {
+     }
  }
  
 -pub type Result<T> = std::result::Result<T, Error>;

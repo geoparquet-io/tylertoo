@@ -125,6 +125,9 @@ the issue stays open for more than 7 days.
 | `g1-cargo-deny` | `cargo deny check bans` (security.yml) | a second version of a crate without a linked skip fails `multiple-versions = "deny"` (#649) |
 | `g1-similarity` | ci.yml Check, "Check for duplicated code (similarity ratchet)" (`ci-step`) | a new near-duplicate function pair not in `ci/similarity_baseline.txt` fails (8576c61) |
 | `g1-mirrored-hunks` | `scripts/ci/mirrored_hunks.py` (ci.yml Check, PRs only) | one block added in two files in one change fails (#507, 8576c61, #743) |
-
-The other #779 tracks add their `g1-*`, `g2-*` and `g3-*` canaries to
-this table.
+| `g2-flag-without-kwarg` | `crates/python/tests/test_parity.py` (ci.yml Python Tests) | a CLI flag with no Python keyword argument fails (#443, #709) |
+| `g2-parsed-unused` | `surface_parity::every_flag_reaches_the_core_options` (ci.yml Test) | a flag that is parsed but changes no core option fails (#374, #600) |
+| `g3-byte-array-cap` | `crates/core/tests/scaled_limits.rs` (ci.yml Test) | the reader owner (`untrusted::ParquetSource::build`) dropping its batch cap fails at a scaled byte-array ceiling (#563, #606, #607) |
+| `g3-size-valve` | `run_e2e.py --invariants` (e2e.yml) | a tile over the compressed or raw cap fails `tile_size` (#752) |
+| `g3-polygon-repair` | `run_e2e.py --invariants` (e2e.yml) | an invalid polygon in a tile fails `polygon_valid` (#748, #393) |
+| `g3-silent-drop` | `run_e2e.py --invariants` (e2e.yml) | a feature dropped with no counter fails `feature_accounting` (#707) |

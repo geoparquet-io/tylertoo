@@ -1,16 +1,16 @@
 # gate: cargo nextest run --locked --package tylertoo-core --all-features --test scaled_limits
 # expect: past the \d+-byte byte-array ceiling
-# issue: #779 G3 scaled-limit lane (#563, #606, #607): the export's overview reader stops capping its batch to the byte-array ceiling, which only a 2 GiB input would show without the scaled ceiling
-diff --git a/crates/core/src/overview/reader.rs b/crates/core/src/overview/reader.rs
-index 3703070..c13642f 100644
---- a/crates/core/src/overview/reader.rs
-+++ b/crates/core/src/overview/reader.rs
-@@ -604,7 +604,7 @@ impl OverviewReader {
-     /// `requested` rows per batch, clamped to [`Self::max_batch_rows`]
-     /// (#563).
-     fn batch_rows(&self, requested: usize) -> usize {
--        requested.clamp(1, self.max_batch_rows)
-+        requested.max(1)
-     }
- }
- 
+# issue: #779 G3 scaled-limit lane (#563, #606, #607): the reader owner (untrusted::ParquetSource::build) stops capping its batch to the byte-array ceiling, which only a 2 GiB input would show without the scaled ceiling
+diff --git a/crates/core/src/untrusted.rs b/crates/core/src/untrusted.rs
+index 37bcc4f..f84c6d8 100644
+--- a/crates/core/src/untrusted.rs
++++ b/crates/core/src/untrusted.rs
+@@ -942,7 +942,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
+     /// Returns a [`ParquetError`] if the reader cannot be built or its
+     /// construction panics.
+     pub fn build(self) -> Result<UntrustedBatchReader, ParquetError> {
+-        let rows = self.capped_batch_rows();
++        let rows = self.batch_rows;
+         let mut builder = self.builder.with_batch_size(rows);
+         if let Some(row_groups) = self.row_groups {
+             builder = builder.with_row_groups(row_groups);
