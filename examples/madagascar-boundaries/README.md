@@ -216,11 +216,11 @@ Exporting madagascar-ov.parquet → madagascar.pmtiles
  z  tiles      total     mean      p50      p99      max
  1      1     74,326   74,326   74,326   74,326   74,326
 ...
-10    524  4,057,907    7,744    6,100   28,397   88,323
+10    524  4,056,479    7,741    6,100   28,397   88,349
 
 Largest 10 tile(s):
 z   x   y    bytes
-6  40  35  436,976
+6  40  35  436,949
 ...
 ```
 
