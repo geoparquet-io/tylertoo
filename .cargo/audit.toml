@@ -5,7 +5,14 @@
 # justification living in deny.toml next to the entry.
 
 [advisories]
-# object_store 0.14 reaches quick-xml 0.41 and drops rustls-pemfile, so the
-# exceptions this file used to carry (RUSTSEC-2026-0194/0195, RUSTSEC-2025-0134)
-# are all resolved rather than waived.
-ignore = []
+# zstd 0.13.3 / zstd-safe 7.3.0, pinned by parquet 59 until the arrow 60 bump.
+# The fixed versions (zstd 0.14.3, zstd-safe 8.2.0) are a semver-major step.
+# The affected APIs (`with_context`, `Seekable`, and `write::Decoder` or
+# `decompress_stream` into a Vec) are not used anywhere in the tree.
+# deny.toml has the full rationale. Expires: drop on the arrow/parquet 60
+# bump, and re-check by 2027-01-31 either way.
+ignore = [
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+]
