@@ -301,6 +301,7 @@ impl InputSource {
     ///
     /// Returns an [`InputError`] if the file cannot be opened or its Parquet
     /// footer cannot be read or fetched.
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
@@ -334,6 +335,7 @@ impl InputSource {
     /// Remote inputs ignore `meta` and take [`Self::open`]'s path: it already
     /// caches its `ArrowReaderMetadata`, and opening also re-sizes the chunk
     /// cache from the footer, which is load-bearing (#261).
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     pub(crate) fn open_with_metadata(
         &self,
         meta: &ArrowReaderMetadata,
@@ -858,6 +860,7 @@ pub(crate) mod remote {
 
         /// Open a parquet reader builder; the parsed footer is cached across
         /// opens so multi-pass pipelines fetch it once.
+        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
         pub(crate) fn open_builder(
             &self,
         ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
@@ -2987,6 +2990,7 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
 /// normal build.
 #[cfg(all(feature = "fuzzing", feature = "remote"))]
 #[doc(hidden)]
+#[allow(clippy::disallowed_methods)] // #779 F5 migrates
 pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;

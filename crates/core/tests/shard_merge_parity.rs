@@ -31,6 +31,7 @@
 //! Both are deliberately not `#[ignore]`d: this is the acceptance test for the
 //! whole feature, and a sharded build that is not proven identical is not a
 //! sharded build.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

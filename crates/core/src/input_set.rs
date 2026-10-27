@@ -1533,6 +1533,7 @@ impl SourceStream<'_> {
     /// Open part `i`'s reader with this stream's projection / row-group
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     fn open_part(&self, i: usize) -> Result<ParquetRecordBatchReader, InputError> {
         let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {

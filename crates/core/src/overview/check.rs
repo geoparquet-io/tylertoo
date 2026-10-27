@@ -120,6 +120,7 @@ struct GeoDoc {
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
     let path = path.as_ref();
     let file = File::open(path)?;
+    #[allow(clippy::disallowed_methods)] // #779 F5 migrates
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let metadata = builder.metadata().clone();
     let mut report = validate_metadata(&metadata);
@@ -708,6 +709,7 @@ const CLUSTER_READ_BATCH_ROWS: usize = 1024;
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::disallowed_methods)] // #779 F5 migrates
 fn cluster_sum_by_level(
     path: &Path,
     meta: &OverviewsMeta,
