@@ -66,8 +66,11 @@ permissions:
 
 # PRs cancel superseded runs. Main never does: each main run is the baseline
 # for the PRs after it, and cancelling one left merges unmeasured.
+# Per commit off PRs (#779): one group per ref let the next push to main
+# cancel this one's queued run, leaving that commit with no CodSpeed
+# baseline for PRs to compare against.
 concurrency:
-  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  group: codspeed-${{ github.event.pull_request.number || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

@@ -11,8 +11,9 @@ coverage:
       default:
         informational: true
 
+# crates/cli is counted (#779): #374, #600 and #709 were CLI wiring bugs in
+# code no report showed. The CI gate holds it to its own floor.
 ignore:
-  - "crates/cli/**"        # Don't require high coverage for CLI arg parsing
   - "crates/python/**"     # pyo3 bindings are integration-tested differently
   - "tests/**"
   - "benches/**"

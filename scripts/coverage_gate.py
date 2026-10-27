@@ -2,7 +2,8 @@
 """Line-coverage floor for the Rust workspace (#678).
 
 Reads the lcov file the CI Coverage job writes (`cargo llvm-cov ... --lcov`)
-and fails when total line coverage is below --min. The total is read here,
+and fails when total line coverage is below --min, or when the files under
+any --floor glob fall below that glob's own floor. The total is read here,
 in CI, so the gate does not depend on Codecov: Codecov's `codecov/project`
 status never posted on this repo, and its upload step does not fail the job.
 Codecov still gets the report, for the per-file view and the PR comment.
@@ -17,8 +18,14 @@ Counting, per source file (lcov `SF:` records):
 Codecov does the same line count on the same file set; the two totals
 should agree to within rounding.
 
+Per-crate floors (--floor GLOB=MIN, repeatable) hold one part of the tree
+to its own level, so a well-covered crate cannot carry a poorly covered one
+under the total. crates/cli joined the gate in #779: #374, #600 and #709
+were CLI wiring bugs in code no floor watched.
+
 Usage:
   coverage_gate.py --check lcov.info --min 94
+  coverage_gate.py --check lcov.info --min 94 --floor 'crates/cli/**=81.9'
   coverage_gate.py --check lcov.info --min 94 --show 15   # least-covered files
 """
 import argparse
@@ -28,7 +35,7 @@ import sys
 from typing import Dict, List
 
 # Keep in step with `ignore:` in codecov.yml.
-DEFAULT_IGNORE = ["crates/cli/**", "crates/python/**", "tests/**", "benches/**"]
+DEFAULT_IGNORE = ["crates/python/**", "tests/**", "benches/**"]
 
 
 def rel_path(path: str, root: str) -> str:
@@ -71,6 +78,13 @@ def main() -> int:
         metavar="GLOB",
         help="repo-relative glob to leave out (repeatable; replaces the codecov.yml defaults)",
     )
+    ap.add_argument(
+        "--floor",
+        action="append",
+        default=[],
+        metavar="GLOB=MIN",
+        help="also fail when the kept files matching GLOB are below MIN%% (repeatable)",
+    )
     ap.add_argument("--root", default=os.getcwd(), help="repo root that lcov paths are made relative to")
     ap.add_argument("--show", type=int, default=10, help="list this many least-covered files")
     args = ap.parse_args()
@@ -106,11 +120,32 @@ def main() -> int:
         f"{len(kept)} file(s), {total} lines, {hit} hit, {total - hit} missed "
         f"({len(files) - len(kept)} file(s) ignored): {coverage:.2f}% line coverage"
     )
+    failed = False
     if coverage < args.min:
         print(f"FAIL: line coverage {coverage:.2f}% is below the {args.min}% floor.")
-        return 1
-    print(f"OK: line coverage {coverage:.2f}% meets the {args.min}% floor.")
-    return 0
+        failed = True
+    else:
+        print(f"OK: line coverage {coverage:.2f}% meets the {args.min}% floor.")
+
+    for spec in args.floor:
+        glob, _, floor_text = spec.rpartition("=")
+        if not glob:
+            print(f"FAIL: --floor {spec!r} is not GLOB=MIN.")
+            return 1
+        floor = float(floor_text)
+        part = {path: lines for path, lines in kept.items() if fnmatch.fnmatchcase(path, glob)}
+        n = sum(len(lines) for lines in part.values())
+        h = sum(sum(lines.values()) for lines in part.values())
+        if n == 0:
+            # A floor over nothing is a vacuous gate: the glob or the run broke.
+            print(f"FAIL: --floor {glob}: no coverable lines match (was the crate left out of the run?).")
+            failed = True
+            continue
+        cov = pct(h, n)
+        verdict = "OK" if cov >= floor else "FAIL"
+        print(f"{verdict}: {glob}: {len(part)} file(s), {n} lines, {h} hit: {cov:.2f}% (floor {floor}%).")
+        failed = failed or cov < floor
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
