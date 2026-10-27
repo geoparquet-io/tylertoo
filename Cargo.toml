@@ -124,7 +124,6 @@ too_many_lines = "warn"
 # Pedantic subset (zero findings on current code)
 filter_map_next = "warn"
 flat_map_option = "warn"
-from_iter_instead_of_collect = "warn"
 inefficient_to_string = "warn"
 invalid_upcast_comparisons = "warn"
 large_stack_arrays = "warn"
