@@ -330,6 +330,7 @@ pub tylertoo_core::input::InputError::GlobPattern
 pub tylertoo_core::input::InputError::GlobPattern::message: alloc::string::String
 pub tylertoo_core::input::InputError::GlobPattern::pattern: alloc::string::String
 pub tylertoo_core::input::InputError::HostileFooter(alloc::string::String)
+pub tylertoo_core::input::InputError::HostileIpcFooter(alloc::string::String)
 pub tylertoo_core::input::InputError::IncompatiblePartition
 pub tylertoo_core::input::InputError::IncompatiblePartition::detail: alloc::string::String
 pub tylertoo_core::input::InputError::IncompatiblePartition::first: alloc::string::String
