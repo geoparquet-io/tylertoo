@@ -34,6 +34,9 @@ def _convert(tmp_path: Path, **kwargs: object) -> None:
 @pytest.mark.parametrize(
     ("kwargs", "needle"),
     [
+        ({"read_batch_size": 0}, "read-batch-size"),
+        ({"read_batch_size": 1_048_577}, "read-batch-size"),
+        ({"read_workers": 2**64 - 1}, "read-workers"),
         # #433 (1e37cbe): the export knobs that need no file.
         ({"tile_buffer": 257}, "--tile-buffer 257"),
         ({"extent": 0}, "extent 0"),
@@ -138,3 +141,12 @@ def test_one_message_for_a_nan_class_rank(tmp_path: Path) -> None:
     with pytest.raises(tylertoo.ConfigError) as err:
         _convert(tmp_path, class_rank_column="c", class_ranks={"a": math.nan})
     assert str(err.value).startswith('rank NaN for class "a" must be a finite number')
+
+
+@pytest.mark.parametrize("size", [1, 1_048_576])
+def test_batch_bounds_are_accepted_before_missing_input(
+    tmp_path: Path, size: int
+) -> None:
+    with pytest.raises(RuntimeError) as raised:
+        _convert(tmp_path, read_batch_size=size)
+    assert not isinstance(raised.value, tylertoo.ConfigError)

@@ -97,6 +97,7 @@ impl TilesInput {
         output: &Path,
         options: &ConvertOptions,
     ) -> Result<ConvertReport, ConvertError> {
+        options.validate()?;
         match self {
             TilesInput::Path(p) => convert_to_overviews(p, output, options),
             TilesInput::Manifest(_) => {

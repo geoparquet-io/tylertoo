@@ -149,48 +149,13 @@ fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
     }
 }
 
-/// Parse `--read-batch-size`: a positive row count, capped at
-/// [`READ_BATCH_SIZE_MAX`].
-///
-/// A batch is fully resident and several coexist (in flight, plus the readers'
-/// read-ahead), so an absurd row count is an out-of-memory abort rather than a
-/// tuning choice — better rejected at parse time with the ceiling named.
-fn parse_read_batch_size(s: &str) -> Result<usize, String> {
-    match s.parse::<usize>() {
-        Ok(0) => Err("read-batch-size must be >= 1".to_string()),
-        Ok(n) if n > READ_BATCH_SIZE_MAX => Err(format!(
-            "read-batch-size must be <= {READ_BATCH_SIZE_MAX} (a batch is fully resident)"
-        )),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("expected a positive integer, got `{s}`")),
-    }
-}
-
-/// Ceiling on `--read-batch-size`. One million rows of even trivial geometry
-/// is already a multi-hundred-MB batch; past that the knob stops bounding
-/// memory and starts defeating it.
-const READ_BATCH_SIZE_MAX: usize = 1_048_576;
-
-/// Parse `--read-workers`: `auto` (→ the core-sized sentinel 0) or an
-/// explicit positive integer, capped at
-/// [`tylertoo_core::overview::convert::read_workers_ceiling`] (2× this
-/// machine's cores). See
-/// [`tylertoo_core::overview::convert::resolve_read_workers`] for how the
-/// sentinel is expanded at pass-2 setup; the core clamps out-of-range values
-/// with a warning, and this mirrors the bound as a clear parse error.
+/// Parse the worker spelling; core validates its range and expands `auto`.
 fn parse_read_workers(s: &str) -> Result<usize, String> {
     if s.eq_ignore_ascii_case("auto") {
-        return Ok(tylertoo_core::overview::convert::READ_WORKERS_AUTO);
-    }
-    let ceiling = tylertoo_core::overview::convert::read_workers_ceiling();
-    match s.parse::<usize>() {
-        Ok(0) => Err("read-workers must be `auto` or >= 1".to_string()),
-        Ok(n) if n > ceiling => Err(format!(
-            "read-workers must be `auto` or 1..={ceiling} (2× this machine's cores); \
-             every worker is a thread plus its own read-ahead queue"
-        )),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
+        Ok(tylertoo_core::overview::convert::READ_WORKERS_AUTO)
+    } else {
+        s.parse()
+            .map_err(|_| format!("expected `auto` or an integer, got `{s}`"))
     }
 }
 
@@ -1136,7 +1101,6 @@ struct ConvertTuningArgs {
         long,
         value_name = "ROWS",
         default_value_t = ConvertOptions::default().read_batch_size,
-        value_parser = parse_read_batch_size,
         help_heading = "Memory & performance"
     )]
     read_batch_size: usize,
@@ -1239,7 +1203,11 @@ impl From<&ConvertTuningArgs> for ConvertKnobs {
             collapse_square: args.collapse_square,
             no_collapse: args.no_collapse,
             representation: args.representation.clone(),
-            cascade: !args.no_cascade,
+            cascade: if args.no_cascade {
+                false
+            } else {
+                ConvertKnobs::default().cascade
+            },
             point_thinning: args.point_thinning,
             line_thinning: args.line_thinning,
             polygon_thinning: args.polygon_thinning,
@@ -3946,45 +3914,13 @@ mod tests {
         assert_eq!(parse_in_flight_batches("AUTO").unwrap(), 0);
         // Explicit positive integers pass through.
         assert_eq!(parse_in_flight_batches("8").unwrap(), 8);
-        // Explicit 0 is rejected (use `auto`); non-numeric is rejected.
-        assert!(parse_in_flight_batches("0").is_err());
-        assert!(parse_in_flight_batches("banana").is_err());
-    }
-
-    #[test]
-    fn parse_read_workers_accepts_auto_and_positive() {
-        // `auto` maps to the core-sized sentinel; case-insensitive.
-        assert_eq!(
-            parse_read_workers("auto").unwrap(),
-            tylertoo_core::overview::convert::READ_WORKERS_AUTO
-        );
-        assert_eq!(parse_read_workers("AUTO").unwrap(), 0);
-        // Explicit positive integers pass through, up to the ceiling.
-        assert_eq!(parse_read_workers("1").unwrap(), 1);
-        let ceiling = tylertoo_core::overview::convert::read_workers_ceiling();
-        assert_eq!(parse_read_workers(&ceiling.to_string()).unwrap(), ceiling);
-        // Explicit 0 is rejected (use `auto`); non-numeric is rejected; a
-        // value above the ceiling is rejected with the ceiling named, rather
-        // than reaching the engine as a thread count.
-        assert!(parse_read_workers("0").is_err());
+        // Numeric values pass to core validation, including the auto sentinel.
+        assert_eq!(parse_read_workers("0").unwrap(), 0);
         assert!(parse_read_workers("banana").is_err());
-        let err = parse_read_workers(&usize::MAX.to_string()).unwrap_err();
-        assert!(
-            err.contains(&ceiling.to_string()),
-            "the rejection must name the ceiling, got: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_read_batch_size_rejects_zero_and_absurd() {
-        assert_eq!(parse_read_batch_size("8192").unwrap(), 8192);
         assert_eq!(
-            parse_read_batch_size(&READ_BATCH_SIZE_MAX.to_string()).unwrap(),
-            READ_BATCH_SIZE_MAX
+            parse_read_workers(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
         );
-        assert!(parse_read_batch_size("0").is_err());
-        assert!(parse_read_batch_size("banana").is_err());
-        assert!(parse_read_batch_size(&(READ_BATCH_SIZE_MAX + 1).to_string()).is_err());
     }
 
     #[test]

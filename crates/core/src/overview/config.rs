@@ -78,8 +78,10 @@ pub enum ConfigError {
         kind: OutputKind,
     },
     /// The output exists and overwriting it was not asked for (#427, #551).
-    #[error("{} exists (use --force to overwrite)", path.display())]
+    #[error("{} exists (use --force to overwrite){}", path.display(), if matches!(kind, OutputKind::ShardPlan) { ". Every job of a fleet must be given the SAME shard plan, so replacing one mid-build silently re-cuts the tile space." } else { "" })]
     OutputExists {
+        /// What the existing output represents.
+        kind: OutputKind,
         /// The output path.
         path: PathBuf,
     },
@@ -383,6 +385,7 @@ pub fn check_output(output: &Path, kind: OutputKind, force: bool) -> Result<(), 
     }
     if output.exists() && !force {
         return Err(ConfigError::OutputExists {
+            kind,
             path: output.to_path_buf(),
         });
     }

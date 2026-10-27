@@ -321,6 +321,10 @@ pub fn tylertoo_core::fs_probe::is_ram_backed(&std::path::Path) -> core::option:
 pub mod tylertoo_core::input
 pub enum tylertoo_core::input::InputError
 pub tylertoo_core::input::InputError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::input::InputError::ByteArrayRowTooLarge
+pub tylertoo_core::input::InputError::ByteArrayRowTooLarge::bytes: u64
+pub tylertoo_core::input::InputError::ByteArrayRowTooLarge::column: alloc::string::String
+pub tylertoo_core::input::InputError::ByteArrayRowTooLarge::limit_bytes: u64
 pub tylertoo_core::input::InputError::DecoderPanic
 pub tylertoo_core::input::InputError::DecoderPanic::message: alloc::string::String
 pub tylertoo_core::input::InputError::DecoderPanic::what: &'static str
@@ -566,26 +570,6 @@ impl<'a> core::marker::Unpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> core::marker::UnsafeUnpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::SourceStream<'a>
-pub struct tylertoo_core::input_set::WidestByteArrayColumn
-pub tylertoo_core::input_set::WidestByteArrayColumn::avg_row_bytes: u64
-pub tylertoo_core::input_set::WidestByteArrayColumn::column: alloc::string::String
-pub tylertoo_core::input_set::WidestByteArrayColumn::part: usize
-pub tylertoo_core::input_set::WidestByteArrayColumn::row_group: usize
-impl core::clone::Clone for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::clone(&self) -> tylertoo_core::input_set::WidestByteArrayColumn
-impl core::cmp::Eq for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::cmp::PartialEq for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::eq(&self, &tylertoo_core::input_set::WidestByteArrayColumn) -> bool
-impl core::fmt::Debug for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Freeze for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Send for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Sync for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Unpin for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::UnsafeUnpin for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
 pub const tylertoo_core::input_set::BYTE_ARRAY_BATCH_LIMIT: u64
 pub fn tylertoo_core::input_set::derive_layer_name(&str) -> alloc::string::String
 pub mod tylertoo_core::ioverlay_clip
@@ -593,7 +577,6 @@ pub fn tylertoo_core::ioverlay_clip::clip_guard_drop_count() -> u64
 pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::union_polygons_ioverlay(&[geo_types::geometry::polygon::Polygon<f64>]) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub mod tylertoo_core::merge
 pub struct tylertoo_core::merge::MergeOptions
 pub tylertoo_core::merge::MergeOptions::metadata: tylertoo_core::TilesetMetadata
@@ -1282,6 +1265,7 @@ pub tylertoo_core::overview::config::ConfigError::OptionIgnored::option: &'stati
 pub tylertoo_core::overview::config::ConfigError::OptionIgnored::reason: &'static str
 pub tylertoo_core::overview::config::ConfigError::Output(tylertoo_core::atomic_output::OutputNotWritable)
 pub tylertoo_core::overview::config::ConfigError::OutputExists
+pub tylertoo_core::overview::config::ConfigError::OutputExists::kind: tylertoo_core::overview::config::OutputKind
 pub tylertoo_core::overview::config::ConfigError::OutputExists::path: std::path::PathBuf
 pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory
 pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::kind: tylertoo_core::overview::config::OutputKind
@@ -1373,9 +1357,6 @@ pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::min
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::sampled: usize
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::limit_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::widest: tylertoo_core::input_set::WidestByteArrayColumn
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString
@@ -4101,7 +4082,6 @@ pub mod tylertoo_core::untrusted
 pub struct tylertoo_core::untrusted::ParquetSource<R: parquet::file::reader::ChunkReader + 'static>
 impl<R: parquet::file::reader::ChunkReader + 'static> tylertoo_core::untrusted::ParquetSource<R>
 pub fn tylertoo_core::untrusted::ParquetSource<R>::build(self) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, parquet::errors::ParquetError>
-pub fn tylertoo_core::untrusted::ParquetSource<R>::capped_batch_rows(&self) -> usize
 pub fn tylertoo_core::untrusted::ParquetSource<R>::metadata(&self) -> &alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>
 pub fn tylertoo_core::untrusted::ParquetSource<R>::parquet_schema(&self) -> &parquet::schema::types::SchemaDescriptor
 pub fn tylertoo_core::untrusted::ParquetSource<R>::reader_metadata(&self) -> &parquet::arrow::arrow_reader::ArrowReaderMetadata
@@ -4112,13 +4092,13 @@ pub fn tylertoo_core::untrusted::ParquetSource<R>::with_projection_roots(self, i
 pub fn tylertoo_core::untrusted::ParquetSource<R>::with_row_groups(self, alloc::vec::Vec<usize>) -> Self
 impl<R: parquet::file::reader::ChunkReader + 'static> core::fmt::Debug for tylertoo_core::untrusted::ParquetSource<R>
 pub fn tylertoo_core::untrusted::ParquetSource<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<R> core::marker::Freeze for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Freeze
-impl<R> core::marker::Send for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Send
-impl<R> !core::marker::Sync for tylertoo_core::untrusted::ParquetSource<R>
-impl<R> core::marker::Unpin for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Unpin
-impl<R> core::marker::UnsafeUnpin for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::UnsafeUnpin
-impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::ParquetSource<R>
-impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::ParquetSource<R>
+impl<R> core::marker::Freeze for tylertoo_core::untrusted::ParquetSource<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_core::untrusted::ParquetSource<R>
+impl<R> core::marker::Sync for tylertoo_core::untrusted::ParquetSource<R>
+impl<R> core::marker::Unpin for tylertoo_core::untrusted::ParquetSource<R> where R: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_core::untrusted::ParquetSource<R> where R: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::ParquetSource<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::ParquetSource<R> where R: core::panic::unwind_safe::UnwindSafe
 pub struct tylertoo_core::untrusted::UntrustedBatchReader
 impl arrow_array::record_batch::RecordBatchReader for tylertoo_core::untrusted::UntrustedBatchReader
 pub fn tylertoo_core::untrusted::UntrustedBatchReader::schema(&self) -> arrow_schema::schema::SchemaRef
@@ -4147,7 +4127,7 @@ impl<R> core::marker::Unpin for tylertoo_core::untrusted::UntrustedIpcReader<R> 
 impl<R> core::marker::UnsafeUnpin for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::UnsafeUnpin
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::UntrustedIpcReader<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::UntrustedIpcReader<R>
-pub fn tylertoo_core::untrusted::batch_rows_for(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, usize) -> usize
+pub const tylertoo_core::untrusted::BYTE_ARRAY_BATCH_LIMIT: u64
 pub fn tylertoo_core::untrusted::byte_array_limit() -> u64
 pub fn tylertoo_core::untrusted::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
 pub fn tylertoo_core::untrusted::input_error<'a>(&'a (dyn core::error::Error + 'static)) -> core::option::Option<&'a tylertoo_core::input::InputError>

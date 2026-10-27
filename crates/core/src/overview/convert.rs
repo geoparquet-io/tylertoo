@@ -840,8 +840,8 @@ pub fn read_workers_ceiling() -> usize {
 /// a larger share slows the compute it is feeding (12 cores → 3 readers). Any
 /// explicit positive value is honoured verbatim **up to
 /// [`read_workers_ceiling`]**; the caller opted in to the memory cost, which
-/// the engine still bounds against the memory budget. Above the ceiling the
-/// value is clamped and a warning is logged.
+/// the engine still bounds against the memory budget. Values above the
+/// ceiling are rejected by [`ConvertOptions::validate`].
 ///
 /// Output is byte-identical for every value — see `super::pipeline`'s
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
@@ -853,15 +853,7 @@ pub fn resolve_read_workers(requested: usize) -> usize {
             .unwrap_or(1)
             .clamp(1, READ_WORKERS_MAX)
     } else {
-        let ceiling = read_workers_ceiling();
-        let resolved = requested.clamp(1, ceiling);
-        if resolved != requested {
-            log::warn!(
-                "[convert] read_workers {requested} is above the ceiling of {ceiling} \
-                 (2× this machine's cores); using {resolved}"
-            );
-        }
-        resolved
+        requested
     }
 }
 
@@ -1839,19 +1831,6 @@ pub enum ConvertError {
         /// feature table must exist in full regardless of `MemoryProfile`).
         limit_bytes: u64,
     },
-    /// The rows of one byte-array column (WKB geometry, a string) average
-    /// more than arrow's `i32` offsets can address in a single batch (#563):
-    /// no batch size, and no row-group size, can decode them. Found from
-    /// footer statistics before any data page is read. Smaller rows never
-    /// get here: the read batch is capped to fit them instead
-    /// ([`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]).
-    #[error("{}", byte_array_row_too_large_message(.widest, .limit_bytes))]
-    ByteArrayRowTooLarge {
-        /// The column chunk whose rows are too large.
-        widest: crate::input_set::WidestByteArrayColumn,
-        /// The per-batch ceiling checked against.
-        limit_bytes: u64,
-    },
     /// The in-memory reference path (`--no-streaming`) holds the whole
     /// input in one arrow batch, and one byte-array column of the selected
     /// row groups sums past the bytes arrow's `i32` offsets can address in
@@ -1880,28 +1859,6 @@ fn in_memory_byte_array_too_large_message(
          this input in smaller batches.",
         largest.column,
         largest.total_bytes as f64 / GIB,
-        *limit_bytes as f64 / GIB,
-    )
-}
-
-/// The message body of [`ConvertError::ByteArrayRowTooLarge`] (#563).
-fn byte_array_row_too_large_message(
-    widest: &crate::input_set::WidestByteArrayColumn,
-    limit_bytes: &u64,
-) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    let where_ = if widest.part == 0 {
-        format!("row group {}", widest.row_group)
-    } else {
-        format!("row group {} of part {}", widest.row_group, widest.part)
-    };
-    format!(
-        "{where_}'s column '{}' averages {:.2} GiB per row, beyond the {:.2} GiB one \
-         arrow batch can hold for it (i32 offsets). Every read would fail with 'index \
-         overflow decoding byte array', whatever the batch or row-group size. Split or \
-         simplify those features before tiling.",
-        widest.column,
-        widest.avg_row_bytes as f64 / GIB,
         *limit_bytes as f64 / GIB,
     )
 }
@@ -2012,6 +1969,17 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         }
         Ok(())
     };
+    if !(1..=1_048_576).contains(&options.read_batch_size) {
+        return Err(ConvertError::InvalidConfig(
+            "read-batch-size must be in 1..=1048576 (a batch is fully resident)".into(),
+        ));
+    }
+    let ceiling = read_workers_ceiling();
+    if options.read_workers > ceiling {
+        return Err(ConvertError::InvalidConfig(format!(
+            "read-workers must be auto or 1..={ceiling} (2× this machine's cores)"
+        )));
+    }
     // #371: the zoom ceiling is checked FIRST, before the input is opened or
     // any pass runs — `--max-zoom 33` used to be accepted and spin forever.
     options.levels.check_zoom_ceiling()?;
@@ -2611,6 +2579,7 @@ pub fn write_convert_plan(
     input_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<PlanReport, ConvertError> {
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     write_convert_plan_sources(&source, options)
 }
@@ -2697,6 +2666,7 @@ pub fn convert_to_overviews(
     // requests through the same sync parquet plumbing, composing with the
     // bbox row-group pruning below so pruned row groups are never
     // downloaded at all.
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     convert_to_overviews_source_strategy(
         &source,
@@ -2770,6 +2740,7 @@ pub(crate) fn convert_to_overviews_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     convert_to_overviews_source_strategy(&source, output_path.as_ref(), options, strategy)
 }
@@ -13401,10 +13372,13 @@ mod tests {
         assert_eq!(resolve_read_workers(ceiling), ceiling);
         assert_eq!(resolve_read_workers(READ_WORKERS_MAX), READ_WORKERS_MAX);
 
-        // Above the ceiling: clamped, never honoured. `usize::MAX` is the
-        // regression case — it used to drive an O(workers) decrement loop.
-        assert_eq!(resolve_read_workers(ceiling + 1), ceiling);
-        assert_eq!(resolve_read_workers(usize::MAX), ceiling);
+        // Validation owns explicit bounds; expansion handles only auto.
+        assert!(ConvertOptions {
+            read_workers: ceiling + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

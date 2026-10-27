@@ -76,6 +76,12 @@ fn grid() -> PathBuf {
 #[test]
 fn tiles_surfaces_every_core_rule() {
     for (flags, needle) in [
+        (&["--read-batch-size", "0"][..], "read-batch-size"),
+        (&["--read-batch-size", "1048577"][..], "read-batch-size"),
+        (
+            &["--read-workers", "18446744073709551615"][..],
+            "read-workers",
+        ),
         // #433 (1e37cbe): the export knobs that need no file.
         (&["--tile-buffer", "257"][..], "--tile-buffer 257"),
         (&["--extent", "0"][..], "extent 0"),

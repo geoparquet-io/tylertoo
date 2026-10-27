@@ -605,6 +605,7 @@ pub fn estimate_max_zoom(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<AutoZoomEvidence, ConvertError> {
+    options.validate()?;
     let LevelPlan::ZoomRange { min_zoom, .. } = options.levels else {
         return Err(ConvertError::InvalidConfig(
             "--max-zoom auto needs a zoom-range level plan, not an explicit GSD list".to_string(),
