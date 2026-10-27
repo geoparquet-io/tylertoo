@@ -705,8 +705,10 @@ pub fn tylertoo_core::mvt::encode_point(&geo_types::geometry::point::Point, &tyl
 pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::flatten_geometry_collection(&geo_types::geometry::geometry_collection::GeometryCollection<f64>) -> alloc::vec::Vec<geo_types::geometry::Geometry>
 pub fn tylertoo_core::mvt::geo_to_tile_coords(f64, f64, &tylertoo_core::tile::TileBounds, u32) -> (i32, i32)
+pub fn tylertoo_core::mvt::invalid_after_encode_count() -> u64
 pub fn tylertoo_core::mvt::orient_multi_polygon_for_mvt(&geo_types::geometry::multi_polygon::MultiPolygon) -> geo_types::geometry::multi_polygon::MultiPolygon
 pub fn tylertoo_core::mvt::orient_polygon_for_mvt(&geo_types::geometry::polygon::Polygon) -> geo_types::geometry::polygon::Polygon
+pub fn tylertoo_core::mvt::tile_polygon_repair_counts() -> alloc::vec::Vec<(&'static str, u64)>
 pub fn tylertoo_core::mvt::zigzag_decode(u32) -> i32
 pub fn tylertoo_core::mvt::zigzag_encode(i32) -> u32
 pub mod tylertoo_core::overview
