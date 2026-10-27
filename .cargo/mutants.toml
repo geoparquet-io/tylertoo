@@ -5,7 +5,7 @@
 # https://github.com/sourcefrog/cargo-mutants/blob/main/src/config.rs.
 # The file is parsed with deny_unknown_fields: a typo fails every run.
 #
-# Per-mutant cost is what makes or breaks a sweep of ~8400 mutants, so
+# Per-mutant cost is what makes or breaks a sweep of ~10,300 mutants, so
 # every knob below is there to shrink it; the measurements behind each one
 # are in the PR that introduced it (perf(mutants), 2026-09) and in
 # DEVELOPMENT.md.

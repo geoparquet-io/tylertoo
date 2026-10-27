@@ -7,7 +7,7 @@
 # mutated package for every mutant, but nextest's `default-filter` only
 # decides which tests *run*. The slow-tier binaries (shard_merge_parity,
 # convert_guard_golden, ...) and the all-#[ignore] ones (debug_antarctica,
-# huge_polygon_clip) were linked ~8400 times a sweep for nothing. Passing
+# huge_polygon_clip) were linked ~10,300 times a sweep for nothing. Passing
 # `--lib --test <name>...` to cargo restricts the build to binaries that
 # have at least one test the mutation run would execute.
 #
