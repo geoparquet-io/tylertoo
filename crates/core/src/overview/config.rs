@@ -298,6 +298,72 @@ pub enum ConfigError {
     },
 }
 
+/// An [`ExportOptions`](super::export::ExportOptions) field a command that
+/// wraps the export sets itself, for [`check_ignored_export_fields`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportField {
+    LayerName,
+    MinZoom,
+    Properties,
+    TileRange,
+    ZoomCeiling,
+    SpillDir,
+    Metadata,
+}
+
+impl ExportField {
+    /// The field as [`ConfigError::OptionIgnored`] names it.
+    fn name(self) -> &'static str {
+        match self {
+            ExportField::LayerName => "export.layer_name",
+            ExportField::MinZoom => "export.min_zoom",
+            ExportField::Properties => "export.properties",
+            ExportField::TileRange => "export.tile_range",
+            ExportField::ZoomCeiling => "export.zoom_ceiling",
+            ExportField::SpillDir => "export.spill_dir",
+            ExportField::Metadata => "export.metadata",
+        }
+    }
+
+    /// Whether `export` sets the field away from its default.
+    fn is_set(self, export: &super::export::ExportOptions) -> bool {
+        let defaults = super::export::ExportOptions::default();
+        match self {
+            ExportField::LayerName => export.layer_name != defaults.layer_name,
+            ExportField::MinZoom => export.min_zoom.is_some(),
+            ExportField::Properties => export.properties != defaults.properties,
+            ExportField::TileRange => export.tile_range.is_some(),
+            ExportField::ZoomCeiling => export.zoom_ceiling.is_some(),
+            ExportField::SpillDir => export.spill_dir.is_some(),
+            ExportField::Metadata => export.metadata != defaults.metadata,
+        }
+    }
+}
+
+/// The rule every command that wraps the export shares (#600, #443): an
+/// export field the command sets itself must be left unset, or the caller's
+/// value would be silently dropped. `ignored` lists the command's fields,
+/// each with why and what to set instead.
+///
+/// # Errors
+///
+/// [`ConfigError::OptionIgnored`] for the first field of `ignored` that
+/// `export` sets.
+pub(crate) fn check_ignored_export_fields(
+    export: &super::export::ExportOptions,
+    command: &'static str,
+    ignored: &[(ExportField, &'static str)],
+) -> Result<(), ConfigError> {
+    match ignored.iter().find(|(field, _)| field.is_set(export)) {
+        Some(&(field, reason)) => Err(ConfigError::OptionIgnored {
+            option: field.name(),
+            command,
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// The output-path preflight every command that writes a file shares.
 ///
 /// #427, #452, #551: an existing directory is refused (the final rename can

@@ -29,7 +29,7 @@ use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
-use crate::overview::config::ConfigError;
+use crate::overview::config::{check_ignored_export_fields, ExportField};
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
@@ -1515,7 +1515,7 @@ pub struct PyramidOptions {
     ///
     /// This is the only publication metadata `build_pyramid` writes:
     /// [`PyramidOptions::validate`] refuses a set `export.metadata`
-    /// ([`ConfigError::OptionIgnored`]),
+    /// ([`ConfigError::OptionIgnored`](crate::overview::config::ConfigError::OptionIgnored)),
     /// so a GeoParquet band's intermediate archive carries none and passes
     /// none on.
     pub metadata: TilesetMetadata,
@@ -1537,27 +1537,27 @@ impl Default for PyramidOptions {
 }
 
 /// Export fields [`build_pyramid`] substitutes per band, or does not use,
-/// by the name the [`ConfigError::OptionIgnored`] message gives them, with
-/// why. A band's export cannot honour any of them.
-const PYRAMID_IGNORED_EXPORT_FIELDS: [(&str, &str); 5] = [
+/// for [`check_ignored_export_fields`], with why. A band's export cannot
+/// honour any of them.
+const PYRAMID_IGNORED_EXPORT_FIELDS: [(ExportField, &str); 5] = [
     (
-        "export.layer_name",
+        ExportField::LayerName,
         "each band's layer comes from its --band spec",
     ),
     (
-        "export.min_zoom",
+        ExportField::MinZoom,
         "each band declares its own --band zoom range",
     ),
     (
-        "export.tile_range",
+        ExportField::TileRange,
         "a pyramid band is not a shard; tile each band whole",
     ),
     (
-        "export.zoom_ceiling",
+        ExportField::ZoomCeiling,
         "a pyramid band is not a shard; each band's --band range bounds its zooms",
     ),
     (
-        "export.metadata",
+        ExportField::Metadata,
         "the output's name, description and attribution are PyramidOptions::metadata",
     ),
 ];
@@ -1589,26 +1589,7 @@ impl PyramidOptions {
             .validate()
             .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
         self.export.validate()?;
-        let defaults = ExportOptions::default();
-        let set = [
-            self.export.layer_name != defaults.layer_name,
-            self.export.min_zoom.is_some(),
-            self.export.tile_range.is_some(),
-            self.export.zoom_ceiling.is_some(),
-            self.export.metadata != defaults.metadata,
-        ];
-        if let Some(((option, reason), _)) = PYRAMID_IGNORED_EXPORT_FIELDS
-            .iter()
-            .zip(set)
-            .find(|(_, set)| *set)
-        {
-            return Err(ConfigError::OptionIgnored {
-                option,
-                command: "pyramid",
-                reason,
-            }
-            .into());
-        }
+        check_ignored_export_fields(&self.export, "pyramid", &PYRAMID_IGNORED_EXPORT_FIELDS)?;
         Ok(())
     }
 }
@@ -2397,6 +2378,7 @@ pub fn fuzz_layer_zooms(bytes: &[u8]) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overview::config::ConfigError;
     use crate::pmtiles_writer::{
         decode_directory, offsets_are_clustered, tile_id_to_zxy, DirEntry, MAX_LEAF_DIRECTORIES,
     };

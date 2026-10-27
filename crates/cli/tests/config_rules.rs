@@ -109,7 +109,7 @@ fn tiles_surfaces_every_core_rule() {
 }
 
 /// `overview --mode partitioning` with the flags no partitioning run can
-/// honour: formerly three `bail!`s in `build_convert_options`.
+/// honour: formerly three `bail!`s in the CLI's `build_convert_options`.
 #[test]
 fn overview_surfaces_the_mode_rules() {
     for (flags, needle) in [

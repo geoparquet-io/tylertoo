@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::config::ConfigError;
+use super::config::{check_ignored_export_fields, ConfigError, ExportField};
 use super::convert::{
     convert_to_overviews, convert_to_overviews_sources, write_convert_plan_sources, ConvertError,
     ConvertOptions, ConvertReport, LevelPlan, PlanReport,
@@ -242,28 +242,27 @@ impl Default for TilesOptions {
     }
 }
 
-/// Export fields the facade derives itself, by the name the
-/// [`ConfigError::OptionIgnored`] message gives them, with what to set
-/// instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
-const FACADE_OWNED_EXPORT_FIELDS: [(&str, &str); 5] = [
+/// Export fields the facade derives itself, for
+/// [`check_ignored_export_fields`], with what to set instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
+const FACADE_OWNED_EXPORT_FIELDS: [(ExportField, &str); 5] = [
     (
-        "export.layer_name",
+        ExportField::LayerName,
         "the facade names the layer; set TilesOptions::layer_name",
     ),
     (
-        "export.min_zoom",
+        ExportField::MinZoom,
         "the facade declares the level plan's minimum zoom",
     ),
     (
-        "export.properties",
+        ExportField::Properties,
         "the property selection is applied at convert; set convert.properties",
     ),
     (
-        "export.zoom_ceiling",
+        ExportField::ZoomCeiling,
         "a coarse shard job's ceiling comes from TilesOptions::shard",
     ),
     (
-        "export.spill_dir",
+        ExportField::SpillDir,
         "the one scratch directory is convert.spill_dir",
     ),
 ];
@@ -398,26 +397,7 @@ impl TilesOptions {
         }
         self.convert.validate().map_err(TilesError::Convert)?;
         self.export.validate()?;
-        let defaults = ExportOptions::default();
-        let set = [
-            self.export.layer_name != defaults.layer_name,
-            self.export.min_zoom.is_some(),
-            self.export.properties != defaults.properties,
-            self.export.zoom_ceiling.is_some(),
-            self.export.spill_dir.is_some(),
-        ];
-        if let Some(((option, reason), _)) = FACADE_OWNED_EXPORT_FIELDS
-            .iter()
-            .zip(set)
-            .find(|(_, set)| *set)
-        {
-            return Err(ConfigError::OptionIgnored {
-                option,
-                command: "tiles",
-                reason,
-            }
-            .into());
-        }
+        check_ignored_export_fields(&self.export, "tiles", &FACADE_OWNED_EXPORT_FIELDS)?;
         check_keep_overview(self.keep_overview.as_deref())?;
         // #386/#443: the property selection is applied at convert, so an
         // excluded column is already gone from the intermediate before export
