@@ -1,0 +1,20 @@
+# gate: cargo build --release --locked --package tylertoo && python3 benchmarks/e2e/run_e2e.py --invariants --only madagascar-adm4 --settings sf0
+# expect: FAIL +tile_size +z\d+ +\d+ tile\(s\) over the \d+ B compressed cap
+# issue: #779 G3 invariant (a), every tile within its caps (#752): the size valve never measures a tile, so dense tiles are written over both caps
+diff --git a/crates/core/src/overview/export.rs b/crates/core/src/overview/export.rs
+index bb04f7f..80397b6 100644
+--- a/crates/core/src/overview/export.rs
++++ b/crates/core/src/overview/export.rs
+@@ -6249,10 +6249,10 @@ fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
+ /// keeps the bytes for the writer.
+ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
+     let mut fit = f64::INFINITY;
+-    if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
++    if let Some(limit) = opts.tile_size_limit.filter(|_| false) {
+         fit = fit.min(limit as f64 / mvt.data.len() as f64);
+     }
+-    if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
++    if let Some(limit) = opts.compressed_tile_size_limit.filter(|_| false) {
+         let gz = compression::compress(&mvt.data, Compression::Gzip)?;
+         fit = fit.min(limit as f64 / gz.len() as f64);
+         mvt.gzip = Some(gz);
