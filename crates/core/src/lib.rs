@@ -1,4 +1,10 @@
 #![recursion_limit = "256"]
+// #779: clippy.toml's disallowed-methods name the single owner of parquet
+// and IPC reads and of output-file creation. `#[cfg(test)]` code reads and
+// writes its own trusted fixtures, so the lint is off in the test build
+// only; production code is still linted by the non-test build that
+// `cargo clippy --all-targets` also checks.
+#![cfg_attr(test, allow(clippy::disallowed_methods))] // #779: test build only
 //! Core library for GeoParquet multi-resolution overviews and PMTiles export.
 //!
 //! The product pipeline lives in [`overview`]: convert a (gpio-sorted)

@@ -59,6 +59,7 @@
 //! then, for the wagyu columns,
 //!   cargo run --release --manifest-path `corpus/hostile_wagyu/Cargo.toml`
 //! and re-run `full_scorecard` to fold them in.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 #[cfg(not(feature = "dhat-heap"))]
 use std::alloc::{GlobalAlloc, Layout, System};

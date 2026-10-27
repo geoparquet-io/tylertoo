@@ -1540,6 +1540,7 @@ impl Regrouper {
 
     /// Remove and return exactly `n` rows from the front. `n` must be `<=
     /// self.rows`.
+    #[allow(clippy::disallowed_methods)] // #779: seam joins (#494)
     fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
         debug_assert!(n > 0 && n <= self.rows);
         let front = self

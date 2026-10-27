@@ -68,6 +68,7 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     };
     if let Ok(m) = std::fs::metadata(target) {
         if !m.is_file() && !m.is_dir() {
+            #[allow(clippy::disallowed_methods)] // owner of outputs (#427)
             let file = File::create(target)?;
             return Ok((
                 file,

@@ -13,6 +13,7 @@
 //!
 //! This test is the round trip nobody had: metres in, tiles out, features
 //! where the map says they should be.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;

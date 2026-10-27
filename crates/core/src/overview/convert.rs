@@ -2231,6 +2231,7 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
 /// That matches how `overview`/`tiles` treat their own outputs; only
 /// `pyramid`, which merges several archives, gates overwrites behind
 /// `-f/--force`.
+#[allow(clippy::disallowed_methods)] // #779: writability probe, removed at once; migrate to atomic_output
 fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
     let bad = |what: String| Err(ConvertError::InvalidConfig(what));
     if path.is_dir() {
@@ -3732,6 +3733,7 @@ fn load_input_table_with_limit(
         batches.push(batch?);
     }
     // Concat with `read_schema` (the raw batches carry the original names).
+    #[allow(clippy::disallowed_methods)] // #779: in-memory input table
     let full = concat_batches(&read_schema, &batches)?;
 
     // Decode geometries once (in-memory v1), row-aligned. Rows with a null,

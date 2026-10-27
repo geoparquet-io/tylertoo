@@ -1,0 +1,48 @@
+Gate: similarity ratchet (scripts/ci/similarity_ratchet.py)
+Expect-fail: uv run --no-project --python 3.12 python scripts/ci/similarity_ratchet.py
+Catches: near-duplicate functions: the twin-function pattern of #507/8576c61
+
+diff --git a/crates/core/src/g1_canary_similarity.rs b/crates/core/src/g1_canary_similarity.rs
+new file mode 100644
+index 0000000..d553fe1
+--- /dev/null
++++ b/crates/core/src/g1_canary_similarity.rs
+@@ -0,0 +1,38 @@
++//! G1 canary (#779): the same function twice under two names, the copy a
++//! mirrored fix leaves behind. The similarity ratchet must report the pair.
++
++pub fn tally_in_memory(values: &[u64], cap: u64) -> (u64, u64, usize) {
++    let mut kept = 0u64;
++    let mut over = 0u64;
++    let mut dropped = 0usize;
++    for v in values {
++        if *v > cap {
++            over += v - cap;
++            dropped += 1;
++        } else {
++            kept += v;
++        }
++    }
++    if dropped > 0 {
++        log::warn!("{dropped} values over the cap of {cap}");
++    }
++    (kept, over, dropped)
++}
++
++pub fn tally_streaming(items: &[u64], limit: u64) -> (u64, u64, usize) {
++    let mut kept = 0u64;
++    let mut over = 0u64;
++    let mut dropped = 0usize;
++    for v in items {
++        if *v > limit {
++            over += v - limit;
++            dropped += 1;
++        } else {
++            kept += v;
++        }
++    }
++    if dropped > 0 {
++        log::warn!("{dropped} values over the cap of {limit}");
++    }
++    (kept, over, dropped)
++}

@@ -7,6 +7,7 @@
 //! 17,465 there. This pins the default close to that: every polygon wider
 //! than a pixel has its own feature at z8, and the size valve dropped
 //! nothing.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::collections::HashSet;
 use std::fs::File;

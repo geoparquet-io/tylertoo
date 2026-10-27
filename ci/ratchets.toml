@@ -1,0 +1,152 @@
+# Structural ratchets (#779): pinned counts of code that bypasses a concept's
+# owner. Each count may only go down.
+#
+# Checked by crates/core/tests/architecture.rs (every table without
+# `checked_by`) and by the script a table's `checked_by` names. A count
+# ABOVE its pin fails: the change added a bypass, so route it through the
+# owner instead. A count BELOW its pin also fails: lower `pin` to the new
+# count in the same PR, so the gain cannot be given back. Raising a pin is
+# never the fix.
+#
+# Keys per table:
+#   pin      today's count (the gate)
+#   target   where the owner work takes it
+#   owner    the owner, and the agent or issue that drives the count down
+#   catches  the regression or open issues the ratchet stands guard over
+#   scope    exactly what is counted
+#
+# PRODUCTION CODE, as the architecture test scans it:
+#   * `.rs` files under crates/core/src, crates/cli/src, crates/python/src;
+#   * minus every item carrying `#[cfg(test)]` or `#[cfg(all(test, ..))]`
+#     (inline `mod tests { .. }` blocks, functions, statics, uses): from the
+#     attribute to the item's closing `}` or `;`;
+#   * minus every file such an item declares (`#[cfg(test)] mod testutil;`
+#     excludes overview/testutil.rs and anything under overview/testutil/);
+#   * minus crates/*/tests/, crates/*/benches/, build.rs, fuzz/, corpus/.
+#   Comments, string contents and char literals are masked before matching,
+#   so a name in a comment or a doc string never counts. Feature-gated code
+#   (`fuzzing`, `remote`, `dhat-heap`) IS production: it ships.
+#   Exceptions, stated per table: `ignore_without_issue` scans test code
+#   (that is where #[ignore] lives) and `pytest_skips` scans
+#   crates/python/tests.
+#
+# Format: a flat TOML subset the Rust test parses by hand (no dependency):
+# one `key = value` per line, integers or double-quoted strings, no escapes.
+
+# #779 F5: 15 -> 3. All three are in untrusted.rs, the owner: the footer
+# parse (ParquetMetaDataReader::new), the schema (ArrowReaderMetadata::
+# try_new) and the builder (new_with_metadata).
+[parquet_open_sites]
+pin = 3
+target = 1
+owner = "untrusted::open_parquet in crates/core/src/untrusted.rs (#779 F5)"
+catches = "#577 -> #606/#607: the 2 GiB batch-size fix reached 2 of 4 reader paths; #690 footer pre-check; #683/#684/#687 panics"
+scope = "production occurrences of ParquetRecordBatchReaderBuilder::, ParquetRecordBatchStreamBuilder::, ArrowReaderBuilder::, SerializedFileReader::new/try_from, ParquetMetaDataReader::new, ArrowReaderMetadata::load/try_new (every way to open a parquet file); the report's ~60 counted test code too"
+
+[geometry_literal_files]
+pin = 6
+target = 1
+owner = "ResolvedSchema / InputDescriptor, the one geometry-column resolver (#779 F4)"
+catches = "#518 -> #519 -> #675 -> #676: four resolvers kept 'in lockstep' by hand; #675 broke on a column not named geometry"
+scope = "crates/core/src files whose production code holds the string literal \"geometry\""
+
+# #779 F5: 11 -> 12, not a warn-once flag: untrusted.rs's HOOK installs
+# the process-wide panic hook that keeps a caught decoder panic quiet
+# (libFuzzer's hook aborts otherwise). A panic hook is process-global
+# by nature; it stays when F2 retires the warn-once flags.
+[static_once_warnings]
+pin = 12
+target = 0
+owner = "typed Vec<Diagnostic> in a new diagnostics.rs (#779 F2)"
+catches = "process-global warn-once flags: a second conversion in one process (Python, tests) never warns; #708 part 3"
+scope = "core production `static NAME: Once` / `std::sync::Once` / `AtomicBool` items (quality.rs, overview/pipeline.rs, input.rs)"
+
+# #779 F5: 3 -> 5. #707's two counted drops, CLIP_GUARD_DROPS
+# (ioverlay_clip.rs) and NON_FINITE_GEOMETRIES (batch_processor.rs),
+# each marked `// F2: becomes Diagnostic::...`; F2 moves them to the
+# diagnostics channel with simplify.rs's two.
+[global_atomic_counters]
+pin = 5
+target = 1
+owner = "per-run counters in the diagnostics channel (#779 F2); atomic_output's temp-name sequence stays"
+catches = "simplify.rs FULL_RES_FALLBACKS / VALIDATION_SKIPS sum across every run in the process (#556 counter)"
+scope = "core production `static NAME: AtomicU64 | AtomicUsize | AtomicU32 | AtomicI64 | AtomicIsize` items"
+
+[cli_bail_calls]
+pin = 25
+target = 0
+owner = "core TilesConfig::validate, run before any I/O (#779 F3)"
+catches = "validation duplicated in the CLI and Python and missing from core (b8fa58a); #443, #458, #709, #438"
+scope = "production `bail!` calls in crates/cli/src"
+
+[too_many_arguments_allows]
+pin = 26
+target = 4
+owner = "Pass1Ctx and the shared stages (#779 F1); the 4 pyo3 signatures in crates/python/src/lib.rs mirror Python kwargs and stay"
+catches = "cd8a9d4 changed 9 signatures to swap one type; run_pass1_with_chunk_rows/resolve_winner_tables at 10 params. export.rs export_level_groups carries a stale allow (7 params)"
+scope = "production `clippy::too_many_arguments` attributes (allow or expect), all crates"
+
+[fns_over_7_params]
+pin = 25
+target = 4
+owner = "Pass1Ctx and the shared stages (#779 F1); the 4 pyo3 entry points stay"
+catches = "signature growth as the fix pattern (cd8a9d4, ba480dc, 8576c61)"
+scope = "production `fn` items (including methods and trait items) with more than 7 parameters, self included"
+
+[ignore_without_issue]
+pin = 10
+target = 0
+owner = "each #[ignore] gets `= \"#NNN <why>\"` or is deleted (#779; the >2 GiB one is replaced by G3's scaled-limit lane)"
+catches = "#563/#606/#607: the >2 GiB test at input_set.rs is ignored and never runs; ignores that link no issue are invisible"
+scope = "#[ignore] and cfg_attr(.., ignore) anywhere under crates/ (src, tests, benches) whose reason does not start with #NNN"
+
+[pytest_skips]
+pin = 7
+target = 0
+owner = "conftest fail-on-skip under CI, fixtures guaranteed by the fixture download (#779 G4)"
+catches = "skipif guards that pass silently when a fixture is missing (#369's failure mode)"
+scope = "pytest.mark.skipif, pytest.mark.skip, pytest.skip(, pytest.importorskip( in crates/python/tests"
+
+# #779 F5: 21 -> 7. Every reader-site allow is gone (untrusted.rs owns
+# them); the 7 left are File::create and concat_batches sites.
+[disallowed_method_allows]
+pin = 7
+target = 0
+owner = "untrusted::{open_parquet, open_ipc} (#779 F5) and atomic_output (#427) for File::create"
+catches = "#606/#607 (reader paths without the batch cap), #427 (in-place writes), #683/#684 (IPC panics)"
+scope = "production #[allow(clippy::disallowed_methods)] outside the owner modules atomic_output.rs and untrusted.rs; cfg_attr(test, ..) not counted"
+
+[cargo_deny_skips]
+pin = 24
+target = 0
+owner = "dependency bumps that collapse each duplicate (#779; geo -> i_overlay 9, aws-smithy -> http 1, the syn/thiserror migrations)"
+catches = "#649: Dependabot #624 undid #435's brotli/zstd dedupe while multiple-versions was warn"
+scope = "entries in deny.toml [bans] skip"
+
+# Measured on origin/main a49932b (production code, test items stripped):
+#   threshold      0.95  0.90  0.85  0.80
+#   in-file pairs     0    14    60   307
+#   convert<->stream  0     0     2    25
+# In-file pins at 0.85: at 0.80 most of the 307 are unrelated functions in
+# the large files (export.rs alone holds 100+), so a new function would trip
+# the gate by chance. convert<->stream pins at 0.80, the level that holds the
+# known twins: in_memory_carriers/streaming_carriers (0.837, #407 drift),
+# select_input_row_groups_combined/select_row_groups_streaming (0.815), the
+# two strategy entry points (0.802) and the two preflights (0.859, 0.800).
+[similarity_pairs]
+checked_by = "scripts/ci/similarity_ratchet.py"
+threshold = 0.85
+pin = 60
+target = 0
+owner = "the refactor that shares each pair's code (#779); F1 for overview/, F3 for the CLI parsers and Python error mappers"
+catches = "near-duplicate functions inside one file; the gate sat at 0.95, where the workspace has zero pairs, so it caught nothing"
+scope = "similarity-rs 0.5.0 pairs >= 0.85, --min-lines 10, --skip-test, over crates/{core,cli,python}/src minus top-level #[cfg(test)] items, keyed by file and function names in ci/similarity_baseline.txt"
+
+[similarity_convert_stream]
+checked_by = "scripts/ci/similarity_ratchet.py"
+threshold = 0.80
+pin = 25
+target = 0
+owner = "one staged pipeline both engines call (#779 F1)"
+catches = "the twin engines: 15 of 23 convert.rs fix PRs also edited stream.rs; #507/8576c61, #407/ab5214d (in_memory_carriers vs streaming_carriers)"
+scope = "similarity-rs pairs >= 0.80 with one side in overview/convert.rs and the other in overview/stream.rs, both minus test items, concatenated into one file since similarity-rs never compares across files"

@@ -3,8 +3,10 @@
 //! Every Parquet file tylertoo opens — a GeoParquet input (local or remote),
 //! an overview file handed to `export-pmtiles` or `validate`, the footer of
 //! its own output — and every Arrow IPC file it reads back (a `--plan`) is
-//! opened here and nowhere else. Before this module existed about 60 sites
-//! built `ParquetRecordBatchReaderBuilder`s directly, and each hardening fix
+//! opened here and nowhere else. Before this module existed 15 production
+//! sites (and some 40 more in tests) opened Parquet directly, through
+//! `ParquetRecordBatchReaderBuilder`, `SerializedFileReader` or
+//! `ArrowReaderMetadata::load`, and each hardening fix
 //! reached only some of them: the arrow i32 offset cap landed in 2 of 4 read
 //! paths (#563 → #577, then #606, #607, #657, #659), and the checks added for
 //! crafted input ran after the decode while the panics happened inside it
@@ -27,8 +29,15 @@
 //!   requested batch so no decoded byte-array column can reach arrow's i32
 //!   offset limit, from footer statistics alone. [`byte_array_limit`] is the
 //!   ceiling every path uses, so a test that scales it scales every path.
+//! - **IPC blocks inside the file**: [`open_ipc`] refuses a footer whose
+//!   dictionary or record-batch block ends past the file, before arrow-ipc
+//!   zero-allocates the block's declared length.
 //! - **One place to set the projection, row groups and batch size**:
 //!   [`ParquetSource`].
+//!
+//! clippy's `disallowed-methods` (clippy.toml) forbids the raw builders
+//! everywhere else; this module is their one permitted caller.
+#![allow(clippy::disallowed_methods)] // #779: the owner of the raw builders
 
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};

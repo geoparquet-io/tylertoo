@@ -9,6 +9,7 @@
 //! knob, not the machine's memory, so under one export warns with the same
 //! message and carries on. That is what this subprocess test pins, since the
 //! override is read from the environment.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::process::Command;

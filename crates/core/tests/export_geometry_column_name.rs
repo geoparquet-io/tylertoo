@@ -14,6 +14,7 @@
 //! declared `centroid` primary and export tiled the ungeneralized points.
 //! Every round trip here decodes the archive and checks the features are the
 //! input's polygons, not merely that some features came out.
+#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;

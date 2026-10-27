@@ -1742,6 +1742,7 @@ impl StreamingPmtilesWriter {
             }
         }
 
+        #[allow(clippy::disallowed_methods)] // #779: .partial, renamed at finish
         let mut file = File::create(&partial_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -2677,6 +2678,7 @@ impl StreamingPmtilesWriter {
             }
         };
 
+        #[allow(clippy::disallowed_methods)] // #779: .partial, renamed at finish
         let output_file = File::create(&partial_path).map_err(|e| {
             Error::PMTilesWrite(format!(
                 "Failed to create output file {}: {e}",

@@ -3270,6 +3270,7 @@ struct ProfileJsonInputs<'a> {
 /// which left a stray zero-byte dump file behind whenever the run then failed
 /// (or the pipeline never reached the dump at all) — a preflight must observe
 /// the filesystem, not change it.
+#[allow(clippy::disallowed_methods)] // #779: writability probe, removed at once; migrate to atomic_output
 pub(super) fn preflight_profile_json_path() {
     let Some(path) = profile_json_target() else {
         return;

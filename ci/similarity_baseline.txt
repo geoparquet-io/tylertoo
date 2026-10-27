@@ -1,0 +1,97 @@
+# similarity-rs findings pinned by scripts/ci/similarity_ratchet.py (#779).
+# Thresholds: in-file 0.85, convert-stream 0.8;
+# --min-lines 10, --skip-test, test items stripped. Keys are
+# file + function names (sorted), not line numbers. This list only
+# shrinks: refactor a pair away, then delete its line and lower the pin
+# in ci/ratchets.toml. Never add a line to admit new duplication.
+
+[in-file]
+crates/cli/src/main.rs :: parse_in_flight_batches <-> parse_partition_wave
+crates/cli/src/main.rs :: parse_in_flight_batches <-> parse_read_workers
+crates/cli/src/main.rs :: parse_partition_wave <-> parse_read_workers
+crates/cli/src/main.rs :: parse_read_batch_size <-> parse_read_workers
+crates/cli/src/main.rs :: resolve_io <-> resolve_io_for_planning
+crates/core/src/clip.rs :: multipolygon_rect_all_rings <-> polygon_rect_all_rings
+crates/core/src/covering.rs :: parse_bbox <-> parse_tile_coords
+crates/core/src/input.rs :: from_store_sized_with_cap_base <-> from_store_with_cap_base
+crates/core/src/input.rs :: open <-> open_with_metadata
+crates/core/src/input_set.rs :: largest_byte_array_column <-> widest_byte_array_column
+crates/core/src/input_set.rs :: part_row_counts <-> part_row_group_row_counts
+crates/core/src/input_set.rs :: selected_column_bytes <-> selected_row_count
+crates/core/src/input_set.rs :: selected_input_bytes <-> selected_row_count
+crates/core/src/input_set.rs :: selected_row_count <-> widest_byte_array_column
+crates/core/src/ioverlay_clip.rs :: clip_polygon_ioverlay <-> repair_polygon_ioverlay
+crates/core/src/mvt.rs :: encode_multi_linestring <-> encode_multi_point
+crates/core/src/mvt.rs :: get_or_insert_key <-> get_or_insert_value
+crates/core/src/mvt.rs :: quantize_ring <-> requantize_ring
+crates/core/src/mvt.rs :: segments_cross_or_overlap <-> segments_meet
+crates/core/src/mvt.rs :: union_cached <-> union_group
+crates/core/src/overview/assign.rs :: allocated_bytes <-> heap_bytes
+crates/core/src/overview/assign.rs :: default <-> default
+crates/core/src/overview/assign.rs :: row <-> row
+crates/core/src/overview/assign.rs :: set_entry_level <-> set_sort_key
+crates/core/src/overview/check.rs :: check_clustering <-> check_coalescing
+crates/core/src/overview/convert.rs :: apply_cluster_columns <-> apply_coalesced_count
+crates/core/src/overview/convert.rs :: byte_array_row_too_large_message <-> in_memory_byte_array_too_large_message
+crates/core/src/overview/convert.rs :: convert_to_overviews <-> convert_to_overviews_source
+crates/core/src/overview/convert.rs :: convert_to_overviews <-> convert_to_overviews_sources
+crates/core/src/overview/convert.rs :: convert_to_overviews_source <-> convert_to_overviews_sources
+crates/core/src/overview/convert.rs :: resolve_in_flight_batches <-> resolve_read_workers
+crates/core/src/overview/export.rs :: covering_batch_bboxes <-> decode_batch_bboxes
+crates/core/src/overview/export.rs :: export_pmtiles_impl <-> export_pmtiles_with_partition_target
+crates/core/src/overview/export.rs :: fanout_children <-> feature_tile_members_direct
+crates/core/src/overview/export.rs :: fill_features <-> merge_to_fit
+crates/core/src/overview/export.rs :: is_json_encoded <-> is_supported_scalar
+crates/core/src/overview/export.rs :: is_json_encoded <-> is_temporal_scalar
+crates/core/src/overview/export.rs :: is_supported_scalar <-> is_temporal_scalar
+crates/core/src/overview/export.rs :: property_columns <-> skipped_property_columns
+crates/core/src/overview/export.rs :: wrap_shifts <-> wrapped_extents
+crates/core/src/overview/filter.rs :: parse_and <-> parse_or
+crates/core/src/overview/filter.rs :: parse_literal <-> parse_predicate
+crates/core/src/overview/filter.rs :: range_can_match_num <-> range_can_match_ord
+crates/core/src/overview/ladder.rs :: build_ladder <-> entry_levels
+crates/core/src/overview/pipeline.rs :: read_cgroup_v1_limit <-> read_cgroup_v2_headroom
+crates/core/src/overview/reader.rs :: read_level <-> read_level_any_bbox_with_batch_size
+crates/core/src/overview/stream.rs :: process_batch_cascade <-> process_level_batch
+crates/core/src/overview/stream.rs :: stage_secs <-> stage_secs
+crates/core/src/overview/stream.rs :: write_export_profile_json <-> write_profile_json
+crates/core/src/overview/writer.rs :: drain_encoded <-> drain_wkb_encoded
+crates/core/src/overview/writer.rs :: effective_rg_cap <-> projected_row_groups
+crates/core/src/pyramid.rs :: for_each_tile <-> for_each_tile_range
+crates/core/src/shard.rs :: parse <-> parse
+crates/core/src/sutherland_hodgman.rs :: clip_ring <-> clip_ring_against_edge
+crates/core/src/wkb.rs :: geometry_to_wkb <-> wkb_to_geometry
+crates/python/src/lib.rs :: convert <-> export_pmtiles
+crates/python/src/lib.rs :: convert_error_to_py <-> tiles_error_to_py
+crates/python/src/lib.rs :: decode_error_to_py <-> export_error_to_py
+crates/python/src/lib.rs :: decode_error_to_py <-> tiles_error_to_py
+crates/python/src/lib.rs :: export_error_to_py <-> tiles_error_to_py
+
+# convert.rs and stream.rs concatenated, pairs that span both engines
+# (the twin-function pattern behind #507/8576c61 and #407/ab5214d).
+[convert-stream]
+convert.rs::build_generalization <-> stream.rs::build_level_ctxs
+convert.rs::build_generalization <-> stream.rs::preflight_profile_json_path
+convert.rs::build_generalization <-> stream.rs::resolve_ranking_tier
+convert.rs::check_zoom_ceiling <-> stream.rs::stage_secs
+convert.rs::class_ranking_provenance <-> stream.rs::stage_secs
+convert.rs::coalesce_level_chains <-> stream.rs::build_cascade_chains
+convert.rs::coalesce_level_chains <-> stream.rs::build_level_ctxs
+convert.rs::coalesce_level_chains <-> stream.rs::coalesce_level_counts
+convert.rs::coalesce_level_chains <-> stream.rs::pass2_coalesce
+convert.rs::convert_to_overviews_source_strategy <-> stream.rs::convert_streaming_strategy
+convert.rs::crs_coordinate_range <-> stream.rs::stage_secs
+convert.rs::default <-> stream.rs::build_streaming_report
+convert.rs::default <-> stream.rs::emit_profile_json
+convert.rs::default <-> stream.rs::inputs
+convert.rs::default <-> stream.rs::rss_sampler_json
+convert.rs::default <-> stream.rs::stage_secs
+convert.rs::extend <-> stream.rs::stage_secs
+convert.rs::generalization_is_off <-> stream.rs::stage_secs
+convert.rs::in_memory_carriers <-> stream.rs::streaming_carriers
+convert.rs::load_input_table <-> stream.rs::convert_preflight
+convert.rs::new <-> stream.rs::new
+convert.rs::preflight_pass1_memory_probed <-> stream.rs::convert_preflight
+convert.rs::resolve <-> stream.rs::resolve_ranking_tier
+convert.rs::resolve_read_workers <-> stream.rs::stage_secs
+convert.rs::select_input_row_groups_combined <-> stream.rs::select_row_groups_streaming
