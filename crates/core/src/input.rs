@@ -2569,8 +2569,7 @@ pub(crate) mod remote {
         #[test]
         fn a_large_window_never_fetches_a_pruned_row_group() {
             let bytes = multi_rg_parquet(1000, 5);
-            let md = parquet::file::metadata::ParquetMetaDataReader::new()
-                .parse_and_finish(&bytes::Bytes::from(bytes.clone()))
+            let md = crate::untrusted::read_parquet_metadata(&bytes::Bytes::from(bytes.clone()))
                 .unwrap();
             let pruned = md.row_group(2);
             let lo = pruned
@@ -3664,11 +3663,9 @@ mod tests {
                 parquet::file::metadata::ColumnChunkMetaDataBuilder,
             ) -> parquet::file::metadata::ColumnChunkMetaDataBuilder,
         ) -> Vec<u8> {
-            use parquet::file::metadata::{ParquetMetaDataReader, ParquetMetaDataWriter};
+            use parquet::file::metadata::ParquetMetaDataWriter;
 
-            let md = ParquetMetaDataReader::new()
-                .parse_and_finish(&Bytes::from(bytes.to_vec()))
-                .unwrap();
+            let md = crate::untrusted::read_parquet_metadata(&Bytes::from(bytes.to_vec())).unwrap();
             let row_groups: Vec<_> = md
                 .row_groups()
                 .iter()
@@ -3685,7 +3682,10 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let md = md.into_builder().set_row_groups(row_groups).build();
+            let md = Arc::unwrap_or_clone(md)
+                .into_builder()
+                .set_row_groups(row_groups)
+                .build();
             let footer_len =
                 u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
                     as usize;

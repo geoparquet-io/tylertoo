@@ -86,6 +86,7 @@ pub fn tylertoo_core::atomic_output::check_writable_in_place(&std::path::Path) -
 pub mod tylertoo_core::batch_processor
 pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>) -> tylertoo_core::Result<()>
+pub fn tylertoo_core::batch_processor::non_finite_geometry_count() -> u64
 pub fn tylertoo_core::batch_processor::resolve_parquet_files(&std::path::Path) -> tylertoo_core::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub mod tylertoo_core::clip
 pub const tylertoo_core::clip::DEFAULT_BUFFER_PIXELS: u32
@@ -319,12 +320,16 @@ pub fn tylertoo_core::fs_probe::is_ram_backed(&std::path::Path) -> core::option:
 pub mod tylertoo_core::input
 pub enum tylertoo_core::input::InputError
 pub tylertoo_core::input::InputError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::input::InputError::DecoderPanic
+pub tylertoo_core::input::InputError::DecoderPanic::message: alloc::string::String
+pub tylertoo_core::input::InputError::DecoderPanic::what: &'static str
 pub tylertoo_core::input::InputError::Footer
 pub tylertoo_core::input::InputError::Footer::error: parquet::errors::ParquetError
 pub tylertoo_core::input::InputError::Footer::input: alloc::string::String
 pub tylertoo_core::input::InputError::GlobPattern
 pub tylertoo_core::input::InputError::GlobPattern::message: alloc::string::String
 pub tylertoo_core::input::InputError::GlobPattern::pattern: alloc::string::String
+pub tylertoo_core::input::InputError::HostileFooter(alloc::string::String)
 pub tylertoo_core::input::InputError::IncompatiblePartition
 pub tylertoo_core::input::InputError::IncompatiblePartition::detail: alloc::string::String
 pub tylertoo_core::input::InputError::IncompatiblePartition::first: alloc::string::String
@@ -397,7 +402,7 @@ pub fn tylertoo_core::input::InputSource::fetched_ranges(&self) -> core::option:
 pub fn tylertoo_core::input::InputSource::from_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::from_str_input(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::is_remote(&self) -> bool
-pub fn tylertoo_core::input::InputSource::open(&self) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<tylertoo_core::input::InputReader>, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input::InputSource::open(&self) -> core::result::Result<tylertoo_core::untrusted::ParquetSource<tylertoo_core::input::InputReader>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::release_read_cache(&self)
 pub fn tylertoo_core::input::InputSource::set_spill_dir(&self, core::option::Option<&std::path::Path>)
 pub fn tylertoo_core::input::InputSource::stage_row_groups(&self, core::option::Option<&[usize]>) -> core::result::Result<(), tylertoo_core::input::InputError>
@@ -582,6 +587,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::WidestBy
 pub const tylertoo_core::input_set::BYTE_ARRAY_BATCH_LIMIT: u64
 pub fn tylertoo_core::input_set::derive_layer_name(&str) -> alloc::string::String
 pub mod tylertoo_core::ioverlay_clip
+pub fn tylertoo_core::ioverlay_clip::clip_guard_drop_count() -> u64
 pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>) -> core::option::Option<geo_types::geometry::Geometry<f64>>
@@ -2692,9 +2698,9 @@ pub fn tylertoo_core::overview::reader::OverviewReader::num_levels(&self) -> usi
 pub fn tylertoo_core::overview::reader::OverviewReader::num_row_groups(&self) -> usize
 pub fn tylertoo_core::overview::reader::OverviewReader::open<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::path(&self) -> &std::path::Path
-pub fn tylertoo_core::overview::reader::OverviewReader::read_band_with_batch_size(&self, usize, usize) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
-pub fn tylertoo_core::overview::reader::OverviewReader::read_level(&self, usize, core::option::Option<[f64; 4]>) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
-pub fn tylertoo_core::overview::reader::OverviewReader::read_level_with_batch_size(&self, usize, core::option::Option<[f64; 4]>, usize) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_band_batched(&self, usize, usize) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_level(&self, usize, core::option::Option<[f64; 4]>) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_level_batched(&self, usize, core::option::Option<[f64; 4]>, usize) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_for_level(&self, usize) -> core::result::Result<alloc::vec::Vec<usize>, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_intersecting_bbox(&self, &[f64; 4]) -> alloc::vec::Vec<usize>
 pub fn tylertoo_core::overview::reader::OverviewReader::schema(&self) -> &arrow_schema::schema::SchemaRef
@@ -3813,6 +3819,67 @@ pub fn tylertoo_core::tile::max_tile_index(u8) -> u32
 pub fn tylertoo_core::tile::tile_bounds(u32, u32, u8) -> tylertoo_core::tile::TileBounds
 pub fn tylertoo_core::tile::tiles_for_bbox(&tylertoo_core::tile::TileBounds, u8) -> impl core::iter::traits::iterator::Iterator<Item = tylertoo_core::tile::TileCoord>
 pub fn tylertoo_core::tile::tiles_per_axis(u8) -> u64
+pub mod tylertoo_core::untrusted
+pub struct tylertoo_core::untrusted::ParquetSource<R: parquet::file::reader::ChunkReader + 'static>
+impl<R: parquet::file::reader::ChunkReader + 'static> tylertoo_core::untrusted::ParquetSource<R>
+pub fn tylertoo_core::untrusted::ParquetSource<R>::build(self) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, parquet::errors::ParquetError>
+pub fn tylertoo_core::untrusted::ParquetSource<R>::capped_batch_rows(&self) -> usize
+pub fn tylertoo_core::untrusted::ParquetSource<R>::metadata(&self) -> &alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>
+pub fn tylertoo_core::untrusted::ParquetSource<R>::parquet_schema(&self) -> &parquet::schema::types::SchemaDescriptor
+pub fn tylertoo_core::untrusted::ParquetSource<R>::reader_metadata(&self) -> &parquet::arrow::arrow_reader::ArrowReaderMetadata
+pub fn tylertoo_core::untrusted::ParquetSource<R>::schema(&self) -> &arrow_schema::schema::SchemaRef
+pub fn tylertoo_core::untrusted::ParquetSource<R>::with_batch_rows(self, usize) -> Self
+pub fn tylertoo_core::untrusted::ParquetSource<R>::with_projection(self, parquet::arrow::ProjectionMask) -> Self
+pub fn tylertoo_core::untrusted::ParquetSource<R>::with_projection_roots(self, impl core::iter::traits::collect::IntoIterator<Item = usize>) -> Self
+pub fn tylertoo_core::untrusted::ParquetSource<R>::with_row_groups(self, alloc::vec::Vec<usize>) -> Self
+impl<R: parquet::file::reader::ChunkReader + 'static> core::fmt::Debug for tylertoo_core::untrusted::ParquetSource<R>
+pub fn tylertoo_core::untrusted::ParquetSource<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R> core::marker::Freeze for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Send
+impl<R> !core::marker::Sync for tylertoo_core::untrusted::ParquetSource<R>
+impl<R> core::marker::Unpin for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_core::untrusted::ParquetSource<R> where parquet::arrow::arrow_reader::ArrowReaderBuilder<parquet::arrow::arrow_reader::SyncReader<R>>: core::marker::UnsafeUnpin
+impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::ParquetSource<R>
+impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::ParquetSource<R>
+pub struct tylertoo_core::untrusted::UntrustedBatchReader
+impl arrow_array::record_batch::RecordBatchReader for tylertoo_core::untrusted::UntrustedBatchReader
+pub fn tylertoo_core::untrusted::UntrustedBatchReader::schema(&self) -> arrow_schema::schema::SchemaRef
+impl core::fmt::Debug for tylertoo_core::untrusted::UntrustedBatchReader
+pub fn tylertoo_core::untrusted::UntrustedBatchReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::iterator::Iterator for tylertoo_core::untrusted::UntrustedBatchReader
+pub type tylertoo_core::untrusted::UntrustedBatchReader::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_core::untrusted::UntrustedBatchReader::next(&mut self) -> core::option::Option<Self::Item>
+impl core::marker::Freeze for tylertoo_core::untrusted::UntrustedBatchReader
+impl core::marker::Send for tylertoo_core::untrusted::UntrustedBatchReader
+impl !core::marker::Sync for tylertoo_core::untrusted::UntrustedBatchReader
+impl core::marker::Unpin for tylertoo_core::untrusted::UntrustedBatchReader
+impl core::marker::UnsafeUnpin for tylertoo_core::untrusted::UntrustedBatchReader
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::UntrustedBatchReader
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::UntrustedBatchReader
+pub struct tylertoo_core::untrusted::UntrustedIpcReader<R: alloc::io::read::Read + core::io::seek::Seek>
+impl<R: alloc::io::read::Read + core::io::seek::Seek> tylertoo_core::untrusted::UntrustedIpcReader<R>
+pub fn tylertoo_core::untrusted::UntrustedIpcReader<R>::schema(&self) -> arrow_schema::schema::SchemaRef
+impl<R: alloc::io::read::Read + core::io::seek::Seek> core::iter::traits::iterator::Iterator for tylertoo_core::untrusted::UntrustedIpcReader<R>
+pub type tylertoo_core::untrusted::UntrustedIpcReader<R>::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_core::untrusted::UntrustedIpcReader<R>::next(&mut self) -> core::option::Option<Self::Item>
+impl<R> core::marker::Freeze for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Send
+impl<R> core::marker::Sync for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Sync
+impl<R> core::marker::Unpin for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_core::untrusted::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::UnsafeUnpin
+impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::untrusted::UntrustedIpcReader<R>
+impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::untrusted::UntrustedIpcReader<R>
+pub fn tylertoo_core::untrusted::batch_rows_for(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, usize) -> usize
+pub fn tylertoo_core::untrusted::byte_array_limit() -> u64
+pub fn tylertoo_core::untrusted::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
+pub fn tylertoo_core::untrusted::input_error<'a>(&'a (dyn core::error::Error + 'static)) -> core::option::Option<&'a tylertoo_core::input::InputError>
+pub fn tylertoo_core::untrusted::load_reader_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<parquet::arrow::arrow_reader::ArrowReaderMetadata, parquet::errors::ParquetError>
+pub fn tylertoo_core::untrusted::open_ipc<R: alloc::io::read::Read + core::io::seek::Seek>(R) -> core::result::Result<tylertoo_core::untrusted::UntrustedIpcReader<R>, arrow_schema::error::ArrowError>
+pub fn tylertoo_core::untrusted::open_parquet<R: parquet::file::reader::ChunkReader + 'static>(R) -> core::result::Result<tylertoo_core::untrusted::ParquetSource<R>, parquet::errors::ParquetError>
+pub fn tylertoo_core::untrusted::open_parquet_with_metadata<R: parquet::file::reader::ChunkReader + 'static>(R, parquet::arrow::arrow_reader::ArrowReaderMetadata) -> tylertoo_core::untrusted::ParquetSource<R>
+pub fn tylertoo_core::untrusted::precheck_footer(&[u8]) -> core::result::Result<(), tylertoo_core::input::InputError>
+pub fn tylertoo_core::untrusted::read_parquet_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, parquet::errors::ParquetError>
+pub fn tylertoo_core::untrusted::reader_metadata(alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>) -> core::result::Result<parquet::arrow::arrow_reader::ArrowReaderMetadata, parquet::errors::ParquetError>
 pub mod tylertoo_core::vector_tile
 pub mod tylertoo_core::vector_tile::tile
 #[repr(i32)] pub enum tylertoo_core::vector_tile::tile::GeomType
