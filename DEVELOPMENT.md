@@ -115,6 +115,18 @@ Plain `cargo test` ignores `nextest.toml`. It runs every test in the
 target you name, slow ones included, with no timeout. Use it for
 targeted runs, and use `cargo nextest run` for the tiers.
 
+Plain `cargo test` also runs a binary's tests as threads of one process,
+and nextest runs each test in its own process. That matters for one
+`tylertoo-core` unit-test hook: `untrusted::scale_byte_array_limit`
+lowers the byte-array ceiling to a few KiB for the whole process while
+its guard lives, which is up to about 15 seconds. A parquet read that
+another test starts in that window gets the same low ceiling, and can
+fail with "index overflow decoding byte array". If a plain `cargo test`
+run of the core library fails that way, rerun the test alone, or run the
+library under `cargo nextest run`. Integration tests that set
+`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES` set it per child process, so they don't
+have this problem.
+
 CI mirrors the tiers. The Test job runs `quick`, and the Slow Tests job
 runs the set that `quick` excludes, in three shards split by test binary:
 `heavy`, `determinism`, and `rest`. A pull request runs Test on Ubuntu

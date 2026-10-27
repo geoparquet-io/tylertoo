@@ -694,7 +694,8 @@ pub(crate) const BYTE_ARRAY_LIMIT_ENV: &str = "TYLERTOO_BYTE_ARRAY_LIMIT_BYTES";
 ///
 /// Reads the environment on every call, so callers ask once per read plan
 /// (a [`ParquetSource::build`], a preflight, an in-memory load), never per
-/// batch.
+/// batch. In unit tests the scaled value is process-wide while its guard
+/// lives (see `ScaledByteArrayLimit`).
 pub fn byte_array_limit() -> u64 {
     let limit = std::env::var(BYTE_ARRAY_LIMIT_ENV)
         .ok()
@@ -732,8 +733,19 @@ fn scaled_limit() -> Option<u64> {
 /// While alive, [`byte_array_limit`] is the scaled ceiling and every batch
 /// an [`UntrustedBatchReader`] yields is checked against it the way arrow
 /// checks the real one: a byte-array column past it fails the read with
-/// arrow's own overflow message. Process-wide, so the engines' worker
-/// threads see it; serialized, so two scaling tests cannot interleave.
+/// arrow's own overflow message. Serialized, so two scaling tests cannot
+/// interleave.
+///
+/// Process-wide, so the engines' worker threads see it. That also means
+/// any other test in the same process sees it: under plain `cargo test`
+/// (every test of the binary a thread of one process), a parquet read
+/// another test starts while a guard lives gets the scaled ceiling, and a
+/// batch with more string bytes than it fails. A reader records its
+/// ceiling when it is built, so a read started before the guard or after
+/// it is unaffected. nextest runs each test in its own process, which is
+/// why the tiers never see it. Scoping the ceiling to the scaling test's
+/// own reads would mean threading a source identity through every caller
+/// of [`byte_array_limit`]; see DEVELOPMENT.md ("Tests").
 #[cfg(test)]
 pub(crate) struct ScaledByteArrayLimit {
     _serial: std::sync::MutexGuard<'static, ()>,
