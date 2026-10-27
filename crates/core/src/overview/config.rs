@@ -12,8 +12,10 @@
 //! - [`check_output`]: the output-path preflight (an existing file without
 //!   `--force`, a directory, an unwritable parent).
 //! - [`collapse_mode`], [`entry_zoom`], [`class_ranking`] and
-//!   [`representation`]: the flag-shaped inputs both frontends translate
-//!   into [`ConvertOptions`](super::convert::ConvertOptions) fields.
+//!   [`representation`]: the flag-shaped inputs, which
+//!   [`ConvertKnobs`](super::knobs::ConvertKnobs) turns into
+//!   [`ConvertOptions`](super::convert::ConvertOptions) fields. The
+//!   frontends fill the knobs; they map no knob onto an option themselves.
 //!
 //! The option structs validate themselves before any input is read:
 //! [`ConvertOptions::validate`](super::convert::ConvertOptions::validate),

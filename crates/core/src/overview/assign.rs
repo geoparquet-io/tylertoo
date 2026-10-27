@@ -194,6 +194,13 @@ impl SortDirection {
     }
 }
 
+/// The spelling [`SortDirection::as_str`] gives.
+impl std::fmt::Display for SortDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for SortDirection {
     type Err = String;
 

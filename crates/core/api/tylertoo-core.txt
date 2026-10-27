@@ -816,6 +816,8 @@ impl core::cmp::PartialEq for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::eq(&self, &tylertoo_core::overview::assign::SortDirection) -> bool
 impl core::fmt::Debug for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::assign::SortDirection
+pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::SortDirection
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::SortDirection
 impl core::str::traits::FromStr for tylertoo_core::overview::assign::SortDirection
@@ -2223,6 +2225,139 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::filter::BoundFilter
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::filter::BoundFilter
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::filter::BoundFilter
 pub fn tylertoo_core::overview::filter::parse_filter(&str) -> core::result::Result<tylertoo_core::overview::filter::FilterExpr, tylertoo_core::overview::filter::FilterError>
+pub mod tylertoo_core::overview::knobs
+pub enum tylertoo_core::overview::knobs::SizeCap
+pub tylertoo_core::overview::knobs::SizeCap::Auto
+pub tylertoo_core::overview::knobs::SizeCap::Bytes(usize)
+impl tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::or(self, core::option::Option<usize>) -> core::option::Option<usize>
+impl core::clone::Clone for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::clone(&self) -> tylertoo_core::overview::knobs::SizeCap
+impl core::cmp::Eq for tylertoo_core::overview::knobs::SizeCap
+impl core::cmp::PartialEq for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::eq(&self, &tylertoo_core::overview::knobs::SizeCap) -> bool
+impl core::default::Default for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::default() -> tylertoo_core::overview::knobs::SizeCap
+impl core::fmt::Debug for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::knobs::SizeCap
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::SizeCap
+impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::SizeCap
+pub fn tylertoo_core::overview::knobs::SizeCap::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for tylertoo_core::overview::knobs::SizeCap
+impl core::marker::Send for tylertoo_core::overview::knobs::SizeCap
+impl core::marker::Sync for tylertoo_core::overview::knobs::SizeCap
+impl core::marker::Unpin for tylertoo_core::overview::knobs::SizeCap
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::SizeCap
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::SizeCap
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::SizeCap
+pub struct tylertoo_core::overview::knobs::ConvertKnobs
+pub tylertoo_core::overview::knobs::ConvertKnobs::accumulate_attributes: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::cascade: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank_column: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::class_rank_unknown: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::class_ranks: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, f64>>
+pub tylertoo_core::overview::knobs::ConvertKnobs::cluster: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_junction_angle: f64
+pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_lines: core::option::Option<bool>
+pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_max_level_rows: usize
+pub tylertoo_core::overview::knobs::ConvertKnobs::coalesce_snap: f64
+pub tylertoo_core::overview::knobs::ConvertKnobs::collapse: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::collapse_square: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::density_drop: core::option::Option<bool>
+pub tylertoo_core::overview::knobs::ConvertKnobs::drop_gamma: f64
+pub tylertoo_core::overview::knobs::ConvertKnobs::drop_lines: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::drop_polygons: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::drop_rate: f64
+pub tylertoo_core::overview::knobs::ConvertKnobs::entry_zoom: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::exclude_all_properties: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::exclude_properties: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub tylertoo_core::overview::knobs::ConvertKnobs::filter: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::full_column_stats: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::gsd_base: f64
+pub tylertoo_core::overview::knobs::ConvertKnobs::in_flight_batches: usize
+pub tylertoo_core::overview::knobs::ConvertKnobs::include_properties: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub tylertoo_core::overview::knobs::ConvertKnobs::ladder_step: u8
+pub tylertoo_core::overview::knobs::ConvertKnobs::line_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::line_visibility: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::magnitude_ladder: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::no_auto_rank: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::no_collapse: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::plan: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::overview::knobs::ConvertKnobs::point_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::polygon_thinning: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::polygon_visibility: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::profile: tylertoo_core::overview::level::MemoryProfile
+pub tylertoo_core::overview::knobs::ConvertKnobs::read_batch_size: usize
+pub tylertoo_core::overview::knobs::ConvertKnobs::read_workers: usize
+pub tylertoo_core::overview::knobs::ConvertKnobs::representation: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::row_group_size: usize
+pub tylertoo_core::overview::knobs::ConvertKnobs::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
+pub tylertoo_core::overview::knobs::ConvertKnobs::save_plan: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::overview::knobs::ConvertKnobs::simplify_factor: core::option::Option<f64>
+pub tylertoo_core::overview::knobs::ConvertKnobs::sort_direction: tylertoo_core::overview::assign::SortDirection
+pub tylertoo_core::overview::knobs::ConvertKnobs::sort_key: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ConvertKnobs::spill_dir: core::option::Option<std::path::PathBuf>
+pub tylertoo_core::overview::knobs::ConvertKnobs::streaming: bool
+pub tylertoo_core::overview::knobs::ConvertKnobs::verbatim: bool
+impl tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::convert_options(self, tylertoo_core::overview::level::Mode, tylertoo_core::overview::convert::LevelPlan, core::option::Option<[f64; 4]>, bool) -> core::result::Result<tylertoo_core::overview::convert::ConvertOptions, tylertoo_core::overview::convert::ConvertError>
+impl core::clone::Clone for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::clone(&self) -> tylertoo_core::overview::knobs::ConvertKnobs
+impl core::cmp::PartialEq for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::eq(&self, &tylertoo_core::overview::knobs::ConvertKnobs) -> bool
+impl core::default::Default for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::ConvertKnobs
+impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::ConvertKnobs
+pub fn tylertoo_core::overview::knobs::ConvertKnobs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::marker::Send for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::marker::Sync for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::marker::Unpin for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::ConvertKnobs
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::ConvertKnobs
+pub struct tylertoo_core::overview::knobs::ExportKnobs
+pub tylertoo_core::overview::knobs::ExportKnobs::coverage_fill: bool
+pub tylertoo_core::overview::knobs::ExportKnobs::extent: u32
+pub tylertoo_core::overview::knobs::ExportKnobs::feature_id: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::knobs::ExportKnobs::feature_order: tylertoo_core::overview::export::FeatureOrder
+pub tylertoo_core::overview::knobs::ExportKnobs::max_compressed_tile_size: tylertoo_core::overview::knobs::SizeCap
+pub tylertoo_core::overview::knobs::ExportKnobs::partition_wave: usize
+pub tylertoo_core::overview::knobs::ExportKnobs::simple_clip_fastpath: bool
+pub tylertoo_core::overview::knobs::ExportKnobs::size_valve: tylertoo_core::overview::export::SizeValve
+pub tylertoo_core::overview::knobs::ExportKnobs::tile_buffer: u32
+pub tylertoo_core::overview::knobs::ExportKnobs::tile_size_limit: tylertoo_core::overview::knobs::SizeCap
+impl tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::apply(self, tylertoo_core::overview::export::ExportOptions) -> tylertoo_core::overview::export::ExportOptions
+impl core::clone::Clone for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::clone(&self) -> tylertoo_core::overview::knobs::ExportKnobs
+impl core::cmp::PartialEq for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::eq(&self, &tylertoo_core::overview::knobs::ExportKnobs) -> bool
+impl core::default::Default for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::knobs::ExportKnobs
+impl serde_core::ser::Serialize for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::knobs::ExportKnobs
+pub fn tylertoo_core::overview::knobs::ExportKnobs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::overview::knobs::ExportKnobs
+impl core::marker::Send for tylertoo_core::overview::knobs::ExportKnobs
+impl core::marker::Sync for tylertoo_core::overview::knobs::ExportKnobs
+impl core::marker::Unpin for tylertoo_core::overview::knobs::ExportKnobs
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::knobs::ExportKnobs
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::knobs::ExportKnobs
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::knobs::ExportKnobs
 pub mod tylertoo_core::overview::ladder
 pub enum tylertoo_core::overview::ladder::EntryZoomKind
 pub tylertoo_core::overview::ladder::EntryZoomKind::DenseRank
@@ -2343,6 +2478,8 @@ pub fn tylertoo_core::overview::level::MemoryProfile::eq(&self, &tylertoo_core::
 impl core::default::Default for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::default() -> tylertoo_core::overview::level::MemoryProfile
 impl core::fmt::Debug for tylertoo_core::overview::level::MemoryProfile
+pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::MemoryProfile
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::MemoryProfile
@@ -3211,6 +3348,8 @@ pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::eq(&self, &tylertoo_
 impl core::default::Default for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::default() -> tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::fmt::Debug for tylertoo_core::overview::writer::RowGroupSizePolicy
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::writer::RowGroupSizePolicy

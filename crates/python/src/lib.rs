@@ -7,39 +7,39 @@
 //! `tylertoo._defaults()`, which `__init__.py` reads its defaults from), and
 //! every option rule is core's ([`TilesOptions::validate`] and friends),
 //! raised as `tylertoo.ConfigError`. The keyword groups shared between
-//! functions ([`TuningKwargs`], [`ExportKwargs`], [`PublicationKwargs`]) are
-//! declared once each and extracted from the call's keyword arguments, so
+//! functions are declared once each and extracted from the call's keyword
+//! arguments: the tuning and export knobs are core's own
+//! ([`ConvertKnobs`], [`ExportKnobs`]), deserialized as they are, so
 //! `convert()` takes every tuning knob `overview()` does and every export
 //! knob `export_pmtiles()` does, as `tiles` does on the CLI.
 
-use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError,
+};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
-use std::collections::BTreeMap;
+use pyo3::types::{PyDict, PyList, PyString};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::assign::{AssignConfig, BudgetKinds, DensityBudgetConfig};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::config;
 use tylertoo_core::overview::convert::{
-    convert_to_overviews, convert_to_overviews_sources, parse_accumulate, ConvertError,
-    ConvertOptions, GeneralizationOverrides, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, ConvertError, ConvertOptions, LevelPlan,
 };
 use tylertoo_core::overview::export::{
     export_pmtiles as export_pmtiles_core, ExportError, ExportOptions,
 };
+use tylertoo_core::overview::knobs::{ConvertKnobs, ExportKnobs};
 use tylertoo_core::overview::level::Mode;
 use tylertoo_core::overview::properties::PropertySelection;
-use tylertoo_core::overview::simplify::SimplifyOptions;
 use tylertoo_core::overview::tiles::{
     convert_to_pmtiles, intermediate_space_preflight, SpaceRemedies, TilesError, TilesInput,
     TilesOptions, TilesOutcome, TILES_DEFAULT_MAX_ZOOM,
 };
 use tylertoo_core::pyramid::{build_pyramid, parse_bands, PyramidOptions};
+use tylertoo_core::shard::TileRange;
 
 pyo3::create_exception!(
     _tylertoo,
@@ -98,187 +98,31 @@ fn with_sources(e: &dyn std::error::Error) -> String {
 
 // --- keyword groups ----------------------------------------------------------
 
-/// A per-tile size cap as Python spells it: `"auto"` (the function's core
-/// default: 2 MiB raw and 500 KiB compressed, or no cap under
-/// `verbatim=True` and for `pyramid()` bands), `None` or `0` for no cap, or
-/// a byte count (#761).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SizeCap {
-    Auto,
-    Bytes(usize),
-}
-
-impl SizeCap {
-    /// This cap over the function's core default.
-    fn or(self, default: Option<usize>) -> Option<usize> {
-        match self {
-            SizeCap::Auto => default,
-            SizeCap::Bytes(n) => (n > 0).then_some(n),
-        }
-    }
-}
-
-impl<'a, 'py> FromPyObject<'a, 'py> for SizeCap {
-    type Error = PyErr;
-
-    fn extract(obj: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        if obj.is_none() {
-            return Ok(SizeCap::Bytes(0));
-        }
-        if let Ok(s) = obj.extract::<String>() {
-            return if s.eq_ignore_ascii_case("auto") {
-                Ok(SizeCap::Auto)
-            } else {
-                Err(config_err(format!(
-                    "a size cap must be \"auto\", None or a byte count, got {s:?}"
-                )))
-            };
-        }
-        if obj.is_instance_of::<pyo3::types::PyBool>() {
-            return Err(PyTypeError::new_err(
-                "a size cap must be \"auto\", None or a byte count, got a bool",
-            ));
-        }
-        Ok(SizeCap::Bytes(obj.extract()?))
-    }
-}
-
-impl<'py> IntoPyObject<'py> for SizeCap {
-    type Target = PyAny;
-    type Output = Bound<'py, PyAny>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
-        Ok(match self {
-            SizeCap::Auto => "auto".into_pyobject(py)?.into_any(),
-            SizeCap::Bytes(n) => n.into_pyobject(py)?.into_any(),
-        })
-    }
-}
-
-/// The convert tuning keywords `overview()` and `convert()` share: the
-/// CLI's `ConvertTuningArgs`, plus the zoom range, ladder and box (#779).
+/// The zoom range, ladder and box `overview()` and `convert()` take besides
+/// the shared tuning knobs ([`ConvertKnobs`]), which each command owns.
 #[derive(FromPyObject, IntoPyObject)]
 #[pyo3(from_item_all)]
-struct TuningKwargs {
+struct LevelKwargs {
     min_zoom: u8,
     gsds: Option<Vec<f64>>,
-    gsd_base: f64,
     bbox: Option<(f64, f64, f64, f64)>,
-    sort_key: Option<String>,
-    sort_direction: String,
-    magnitude_ladder: Option<String>,
-    ladder_step: u8,
-    entry_zoom: Option<String>,
-    class_rank_column: Option<String>,
-    class_ranks: Option<BTreeMap<String, f64>>,
-    class_rank_unknown: Option<f64>,
-    no_auto_rank: bool,
-    verbatim: bool,
-    simplify_factor: Option<f64>,
-    collapse: bool,
-    collapse_square: bool,
-    no_collapse: bool,
-    representation: Option<String>,
-    cascade: bool,
-    point_thinning: Option<f64>,
-    line_thinning: Option<f64>,
-    polygon_thinning: Option<f64>,
-    line_visibility: Option<f64>,
-    polygon_visibility: Option<f64>,
-    drop_rate: f64,
-    drop_gamma: f64,
-    density_drop: Option<bool>,
-    drop_lines: bool,
-    drop_polygons: bool,
-    cluster: bool,
-    accumulate_attributes: Option<BTreeMap<String, String>>,
-    coalesce_lines: Option<bool>,
-    coalesce_snap: f64,
-    coalesce_junction_angle: f64,
-    coalesce_max_level_rows: usize,
-    include_properties: Option<Vec<String>>,
-    exclude_properties: Option<Vec<String>>,
-    exclude_all_properties: bool,
-    row_group_size: usize,
-    row_group_size_policy: String,
-    full_column_stats: bool,
-    streaming: bool,
-    read_batch_size: usize,
-    filter: Option<String>,
-    profile: String,
-    in_flight_batches: usize,
-    read_workers: usize,
-    spill_dir: Option<PathBuf>,
-    save_plan: Option<PathBuf>,
-    plan: Option<PathBuf>,
 }
 
-impl Default for TuningKwargs {
-    /// Core's defaults, spelled as Python keywords.
+impl Default for LevelKwargs {
     fn default() -> Self {
-        let c = ConvertOptions::default();
-        let min_zoom = match c.levels {
+        let min_zoom = match ConvertOptions::default().levels {
             LevelPlan::ZoomRange { min_zoom, .. } => min_zoom,
             LevelPlan::Gsds(_) => 0,
         };
         Self {
             min_zoom,
             gsds: None,
-            gsd_base: c.gsd_base,
             bbox: None,
-            sort_key: c.sort_key,
-            sort_direction: c.assign.sort_direction.as_str().to_string(),
-            magnitude_ladder: None,
-            ladder_step: config::DEFAULT_LADDER_STEP,
-            entry_zoom: None,
-            class_rank_column: None,
-            class_ranks: None,
-            class_rank_unknown: None,
-            no_auto_rank: c.no_auto_rank,
-            verbatim: false,
-            simplify_factor: None,
-            collapse: false,
-            collapse_square: false,
-            no_collapse: false,
-            representation: None,
-            cascade: c.simplify.cascade,
-            point_thinning: None,
-            line_thinning: None,
-            polygon_thinning: None,
-            line_visibility: None,
-            polygon_visibility: None,
-            drop_rate: c.density.drop_rate,
-            drop_gamma: c.density.gamma,
-            density_drop: None,
-            drop_lines: c.density.kinds.lines,
-            drop_polygons: c.density.kinds.polygons,
-            cluster: c.cluster,
-            accumulate_attributes: None,
-            coalesce_lines: None,
-            coalesce_snap: c.coalesce_snap,
-            coalesce_junction_angle: c.coalesce_junction_angle,
-            coalesce_max_level_rows: c.coalesce_max_level_rows,
-            include_properties: None,
-            exclude_properties: None,
-            exclude_all_properties: c.properties.exclude_all,
-            row_group_size: c.max_row_group_size,
-            row_group_size_policy: c.row_group_size_policy.as_str().to_string(),
-            full_column_stats: c.full_column_stats,
-            streaming: c.streaming,
-            read_batch_size: c.read_batch_size,
-            filter: None,
-            profile: c.profile.as_str().to_string(),
-            in_flight_batches: c.in_flight_batches,
-            read_workers: c.read_workers,
-            spill_dir: None,
-            save_plan: None,
-            plan: None,
         }
     }
 }
 
-impl TuningKwargs {
+impl LevelKwargs {
     /// The level plan: an explicit GSD ladder, or the zoom range with
     /// `max_zoom`'s placeholder (#444: `auto` is resolved later).
     fn levels(&self, max_zoom: MaxZoom) -> LevelPlan {
@@ -290,180 +134,24 @@ impl TuningKwargs {
             },
         }
     }
-
-    /// These keywords as core's [`ConvertOptions`]: pure translation, the
-    /// same mapping as the CLI's `ConvertTuningArgs::build_convert_options`.
-    /// Every rule is core's: the `config` helpers here, the rest in
-    /// [`ConvertOptions::validate`].
-    fn convert_options(
-        self,
-        mode: Mode,
-        max_zoom: MaxZoom,
-        cogp_compat: bool,
-    ) -> PyResult<ConvertOptions> {
-        let defaults = ConvertOptions::default();
-        let levels = self.levels(max_zoom);
-        // `None` is "not set": core resolves it to the normal default, or to
-        // off under `verbatim`, so an explicit value always wins (#445).
-        let overrides = GeneralizationOverrides {
-            point_thinning: self.point_thinning,
-            line_thinning: self.line_thinning,
-            polygon_thinning: self.polygon_thinning,
-            line_visibility: self.line_visibility,
-            polygon_visibility: self.polygon_visibility,
-            simplify_factor: self.simplify_factor,
-            density_drop: self.density_drop,
-            coalesce_lines: self.coalesce_lines,
-        };
-        let options = ConvertOptions {
-            mode,
-            levels,
-            assign: AssignConfig {
-                // Case-insensitive, as it always was for this keyword.
-                sort_direction: parse_kwarg("sort_direction", &self.sort_direction.to_lowercase())?,
-                ..defaults.assign
-            },
-            sort_key: self.sort_key,
-            entry_zoom: config::entry_zoom(
-                self.magnitude_ladder.as_deref(),
-                self.ladder_step,
-                self.entry_zoom.as_deref(),
-            )
-            .map_err(config_err)?,
-            class_ranking: config::class_ranking(
-                None,
-                self.class_rank_column,
-                self.class_ranks,
-                self.class_rank_unknown,
-            )
-            .map_err(config_err)?,
-            no_auto_rank: self.no_auto_rank,
-            simplify: SimplifyOptions {
-                collapse: config::collapse_mode(
-                    self.collapse,
-                    self.collapse_square,
-                    self.no_collapse,
-                )
-                .map_err(config_err)?,
-                cascade: self.cascade,
-                ..defaults.simplify
-            },
-            representation: config::representation(self.representation.as_deref())
-                .map_err(config_err)?,
-            density: DensityBudgetConfig {
-                drop_rate: self.drop_rate,
-                gamma: self.drop_gamma,
-                kinds: BudgetKinds {
-                    points: true,
-                    lines: self.drop_lines,
-                    polygons: self.drop_polygons,
-                },
-                ..defaults.density
-            },
-            gsd_base: self.gsd_base,
-            cogp_compat_key: cogp_compat,
-            max_row_group_size: self.row_group_size,
-            row_group_size_policy: parse_kwarg(
-                "row_group_size_policy",
-                &self.row_group_size_policy,
-            )?,
-            full_column_stats: self.full_column_stats,
-            streaming: self.streaming,
-            read_batch_size: self.read_batch_size,
-            profile: parse_kwarg("profile", &self.profile)?,
-            in_flight_batches: self.in_flight_batches,
-            read_workers: self.read_workers,
-            cluster: self.cluster,
-            // Core's `COL:OP` grammar, so an unknown op reads as the CLI's.
-            accumulate: self
-                .accumulate_attributes
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(column, op)| parse_accumulate(&format!("{column}:{op}")))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(config_err)?,
-            coalesce_snap: self.coalesce_snap,
-            coalesce_max_level_rows: self.coalesce_max_level_rows,
-            coalesce_junction_angle: self.coalesce_junction_angle,
-            bbox: self
-                .bbox
-                .map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
-            filter: self.filter,
-            properties: property_selection(
-                self.include_properties,
-                self.exclude_properties,
-                self.exclude_all_properties,
-            ),
-            spill_dir: self.spill_dir,
-            save_plan: self.save_plan,
-            plan: self.plan,
-            // Sharded builds (#498/#541) are a CLI/Rust-API feature: they
-            // need a shard plan every job of a fleet shares.
-            ..defaults
-        };
-        // Last: the defaults read `cluster`, the logged summary `entry_zoom`.
-        options
-            .with_generalization(&overrides, self.verbatim)
-            .map_err(convert_error_to_py)
-    }
 }
 
-/// The export knobs `export_pmtiles()`, `convert()` and `pyramid()` share:
-/// the CLI's `ExportArgs` (#779).
-#[derive(FromPyObject, IntoPyObject)]
-#[pyo3(from_item_all)]
-struct ExportKwargs {
-    tile_size_limit: SizeCap,
-    max_compressed_tile_size: SizeCap,
-    size_valve: String,
-    coverage_fill: bool,
-    simple_clip_fastpath: bool,
-    tile_buffer: u32,
-    extent: u32,
-    partition_wave: usize,
-    feature_order: String,
-    feature_id: Option<String>,
-}
-
-impl Default for ExportKwargs {
-    /// Core's defaults, spelled as Python keywords. The caps are `"auto"`:
-    /// each function's own core default.
-    fn default() -> Self {
-        let e = ExportOptions::default();
-        Self {
-            tile_size_limit: SizeCap::Auto,
-            max_compressed_tile_size: SizeCap::Auto,
-            size_valve: e.size_valve.to_string(),
-            coverage_fill: e.coverage_fill,
-            simple_clip_fastpath: e.simple_clip_fastpath,
-            tile_buffer: e.tile_buffer,
-            extent: e.extent,
-            partition_wave: e.partition_wave,
-            feature_order: e.feature_order.to_string(),
-            feature_id: e.feature_id,
-        }
-    }
-}
-
-impl ExportKwargs {
-    /// These keywords over `export`, the function's core defaults.
-    fn apply(self, export: ExportOptions) -> PyResult<ExportOptions> {
-        Ok(ExportOptions {
-            tile_size_limit: self.tile_size_limit.or(export.tile_size_limit),
-            compressed_tile_size_limit: self
-                .max_compressed_tile_size
-                .or(export.compressed_tile_size_limit),
-            size_valve: parse_kwarg("size_valve", &self.size_valve)?,
-            coverage_fill: self.coverage_fill,
-            simple_clip_fastpath: self.simple_clip_fastpath,
-            tile_buffer: self.tile_buffer,
-            extent: self.extent,
-            partition_wave: self.partition_wave,
-            feature_order: parse_kwarg("feature_order", &self.feature_order)?,
-            feature_id: self.feature_id,
-            ..export
-        })
-    }
+/// The convert options `overview()` and `convert()` describe: the call's
+/// keywords as core's [`ConvertKnobs`], which builds the options (#779).
+fn convert_options(
+    kwargs: Option<&Bound<'_, PyDict>>,
+    mode: Mode,
+    max_zoom: MaxZoom,
+    cogp_compat: bool,
+) -> PyResult<ConvertOptions> {
+    let tuning: ConvertKnobs = knobs(kwargs)?;
+    let level: LevelKwargs = group(kwargs)?;
+    let bbox = level
+        .bbox
+        .map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]);
+    tuning
+        .convert_options(mode, level.levels(max_zoom), bbox, cogp_compat)
+        .map_err(convert_error_to_py)
 }
 
 /// The archive's `name`, `description` and `attribution`.
@@ -519,6 +207,58 @@ fn group<'py, T: for<'a> FromPyObject<'a, 'py, Error = PyErr>>(
         Some(kwargs) => kwargs.extract(),
         None => Err(PyTypeError::new_err("missing keyword arguments")),
     }
+}
+
+/// Deserialize one of core's knob groups ([`ConvertKnobs`], [`ExportKnobs`])
+/// from the call's keyword arguments: its serde field names are the keyword
+/// names, so no keyword is mapped here by hand (#779). Keywords of other
+/// groups are left alone, as [`group`] leaves them.
+///
+/// An `os.PathLike` is taken wherever a `str` is, as everywhere else in this
+/// API. A wrong type (`True` for a size, a `str` for a list of names) is a
+/// `TypeError`, a value core refuses (`size_valve="squash"`) a
+/// `tylertoo.ConfigError`; both name the keyword.
+fn knobs<T: serde::de::DeserializeOwned>(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<T> {
+    let kwargs = kwargs.ok_or_else(|| PyTypeError::new_err("missing keyword arguments"))?;
+    let py = kwargs.py();
+    let fspath = py.import("os")?.getattr("fspath")?;
+    let plain = PyDict::new(py);
+    for (key, value) in kwargs.iter() {
+        let value = if !value.is_instance_of::<PyString>() && value.hasattr("__fspath__")? {
+            fspath.call1((value,))?
+        } else {
+            value
+        };
+        plain.set_item(key, value)?;
+    }
+    let mut de = pythonize::Depythonizer::from_object(plain.as_any());
+    serde_path_to_error::deserialize(&mut de).map_err(|e| {
+        let keyword = e.path().to_string();
+        let err = PyErr::from(e.into_inner());
+        let message = format!("{keyword}: {}", err.value(py));
+        // pythonize raises serde's own messages as a bare `Exception`; a
+        // pyo3 extraction error (an overflow, a non-str) keeps its type.
+        if !err.get_type(py).is(py.get_type::<PyException>()) {
+            return PyErr::from_type(err.get_type(py), message);
+        }
+        let detail = message[keyword.len() + 2..].to_string();
+        if ["invalid type", "missing field", "invalid length"]
+            .iter()
+            .any(|p| detail.starts_with(p))
+        {
+            PyTypeError::new_err(message)
+        } else {
+            config_err(message)
+        }
+    })
+}
+
+/// The `tile_range` keyword (#498) as core's [`TileRange`].
+fn tile_range_kwarg(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Option<TileRange>> {
+    item::<Option<String>>(kwargs, "tile_range")?
+        .map(|r| TileRange::parse(&r))
+        .transpose()
+        .map_err(config_err)
 }
 
 /// One keyword the functions below take on their own.
@@ -721,22 +461,18 @@ fn convert(
     let output_path = PathBuf::from(output);
 
     let max_zoom = max_zoom_kwarg(kwargs)?;
-    let tuning: TuningKwargs = group(kwargs)?;
-    let verbatim = tuning.verbatim;
     // Overviews for PMTiles are always duplicating. #444: built with
     // `auto`'s placeholder, then resolved below.
-    let convert_options = tuning.convert_options(Mode::Duplicating, max_zoom, false)?;
-    let export: ExportKwargs = group(kwargs)?;
+    let convert = convert_options(kwargs, Mode::Duplicating, max_zoom, false)?;
+    let verbatim: bool = item(kwargs, "verbatim")?;
+    let export: ExportKnobs = knobs(kwargs)?;
     let publication: PublicationKwargs = group(kwargs)?;
     let mut options = TilesOptions {
-        convert: convert_options,
+        convert,
         export: ExportOptions {
             metadata: publication.metadata(),
-            tile_range: item::<Option<String>>(kwargs, "tile_range")?
-                .map(|r| tylertoo_core::shard::TileRange::parse(&r))
-                .transpose()
-                .map_err(config_err)?,
-            ..export.apply(TilesOptions::export_defaults(verbatim))?
+            tile_range: tile_range_kwarg(kwargs)?,
+            ..export.apply(TilesOptions::export_defaults(verbatim))
         },
         // `None` lets core derive the layer name from the input.
         layer_name: item(kwargs, "layer_name")?,
@@ -790,8 +526,7 @@ fn overview(
     let mode: String = item(kwargs, "mode")?;
     let mode: Mode = parse_kwarg("mode", &mode)?;
     let max_zoom = max_zoom_kwarg(kwargs)?;
-    let tuning: TuningKwargs = group(kwargs)?;
-    let mut options = tuning.convert_options(mode, max_zoom, item(kwargs, "cogp_compat")?)?;
+    let mut options = convert_options(kwargs, mode, max_zoom, item(kwargs, "cogp_compat")?)?;
     // #779: every rule that needs no input, before anything is read.
     options.validate().map_err(convert_error_to_py)?;
 
@@ -853,7 +588,7 @@ fn export_pmtiles(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let export: ExportKwargs = group(kwargs)?;
+    let export: ExportKnobs = knobs(kwargs)?;
     let publication: PublicationKwargs = group(kwargs)?;
     let properties: PropertyKwargs = group(kwargs)?;
     let options = ExportOptions {
@@ -865,14 +600,11 @@ fn export_pmtiles(
             properties.exclude_properties,
             properties.exclude_all_properties,
         ),
-        tile_range: item::<Option<String>>(kwargs, "tile_range")?
-            .map(|r| tylertoo_core::shard::TileRange::parse(&r))
-            .transpose()
-            .map_err(config_err)?,
+        tile_range: tile_range_kwarg(kwargs)?,
         zoom_ceiling: item(kwargs, "zoom_ceiling")?,
         spill_dir: item(kwargs, "spill_dir")?,
         metadata: publication.metadata(),
-        ..export.apply(ExportOptions::default())?
+        ..export.apply(ExportOptions::default())
     };
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -956,7 +688,7 @@ fn pyramid(
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
     let bands = parse_bands(&bands).map_err(PyValueError::new_err)?;
-    let export: ExportKwargs = group(kwargs)?;
+    let export: ExportKnobs = knobs(kwargs)?;
     let publication: PublicationKwargs = group(kwargs)?;
     let properties: PropertyKwargs = group(kwargs)?;
     // The default tiles each GeoParquet band verbatim (an aggregate band
@@ -970,7 +702,7 @@ fn pyramid(
                 properties.exclude_properties,
                 properties.exclude_all_properties,
             ),
-            ..export.apply(base.export)?
+            ..export.apply(base.export)
         },
         work_dir: item(kwargs, "work_dir")?,
         allow_missing_zooms: item(kwargs, "allow_missing_zooms")?,
@@ -1000,8 +732,14 @@ fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
         }
         Ok(d)
     };
-    let tuning = || TuningKwargs::default().into_pyobject(py);
-    let export = || ExportKwargs::default().into_pyobject(py);
+    let tuning = || -> PyResult<Bound<'_, PyAny>> {
+        let d = merged(&[
+            pythonize::pythonize(py, &ConvertKnobs::default())?,
+            LevelKwargs::default().into_pyobject(py)?.into_any(),
+        ])?;
+        Ok(d.into_any())
+    };
+    let export = || pythonize::pythonize(py, &ExportKnobs::default());
     let publication = || PublicationKwargs::default().into_pyobject(py);
     let properties = || PropertyKwargs::default().into_pyobject(py);
 

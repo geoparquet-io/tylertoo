@@ -162,6 +162,13 @@ impl RowGroupSizePolicy {
     }
 }
 
+/// The spelling [`RowGroupSizePolicy::as_str`] gives.
+impl std::fmt::Display for RowGroupSizePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for RowGroupSizePolicy {
     type Err = String;
 

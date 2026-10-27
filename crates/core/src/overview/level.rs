@@ -176,6 +176,13 @@ impl MemoryProfile {
     }
 }
 
+/// The spelling [`MemoryProfile::as_str`] gives.
+impl std::fmt::Display for MemoryProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for MemoryProfile {
     type Err = String;
 

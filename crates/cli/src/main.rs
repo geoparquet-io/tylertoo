@@ -29,12 +29,15 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tylertoo_core::overview::assign::BudgetKinds;
+use tylertoo_core::overview::assign::SortDirection;
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::config::{self, OutputKind};
 use tylertoo_core::overview::convert::ConvertOptions;
 use tylertoo_core::overview::export::{ExportOptions, FeatureOrder, SizeValve};
+use tylertoo_core::overview::knobs::{ConvertKnobs, ExportKnobs, SizeCap};
+use tylertoo_core::overview::level::MemoryProfile;
 use tylertoo_core::overview::tiles::{TilesOptions, TILES_DEFAULT_MAX_ZOOM};
+use tylertoo_core::overview::writer::RowGroupSizePolicy;
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
 static QUIET: AtomicBool = AtomicBool::new(false);
@@ -109,28 +112,26 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
     })
 }
 
-/// A per-tile size cap as typed: `auto` (`None`, the command's core
-/// default), or a byte count where 0 is no cap (#280, #761).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SizeCap(Option<usize>);
-
-/// Parse `--max-tile-size` / `--max-compressed-tile-size`: `auto` or a size.
+/// Parse `--max-tile-size` / `--max-compressed-tile-size`: `auto` (the
+/// command's core default) or a size, where 0 is no cap (#280, #761).
 fn parse_size_cap(s: &str) -> Result<SizeCap, String> {
     if s.trim().eq_ignore_ascii_case("auto") {
-        return Ok(SizeCap(None));
+        return Ok(SizeCap::Auto);
     }
-    parse_size_bytes(s).map(|n| SizeCap(Some(n)))
+    parse_size_bytes(s).map(SizeCap::Bytes)
 }
 
-impl SizeCap {
-    /// This cap over `default` (the command's own, from core): `auto` keeps
-    /// it, `0` turns the cap off, any other size replaces it.
-    fn or(self, default: Option<usize>) -> Option<usize> {
-        match self.0 {
-            None => default,
-            Some(n) => (n > 0).then_some(n),
-        }
-    }
+/// A flag whose value is one of `values`, parsed into core's type: clap
+/// lists the values in `--help`, core's `FromStr` owns the meaning.
+fn spelled<T>(values: &'static [&'static str]) -> impl clap::builder::TypedValueParser<Value = T>
+where
+    T: std::str::FromStr + Clone + Send + Sync + 'static,
+    T::Err: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    clap::builder::TypedValueParser::try_map(
+        clap::builder::PossibleValuesParser::new(values.iter().copied()),
+        |s| s.parse::<T>(),
+    )
 }
 
 /// Parse `--in-flight-batches`: `auto` (→ the core-sized sentinel 0) or an
@@ -326,8 +327,8 @@ impl TilesetMetadataArgs {
 
 /// The export knobs every command that writes tiles shares (#779), flattened
 /// into `tiles`, `export-pmtiles` and `pyramid` the way [`ConvertTuningArgs`]
-/// is into `tiles` and `overview`. [`ExportArgs::apply`] lays them over the
-/// command's core defaults; validation is core's.
+/// is into `tiles` and `overview`. They are core's [`ExportKnobs`], which
+/// lays them over the command's core defaults; validation is core's.
 #[derive(Args, Debug, Clone)]
 struct ExportArgs {
     /// Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a
@@ -417,25 +418,29 @@ struct ExportArgs {
     feature_id: Option<String>,
 }
 
-impl ExportArgs {
-    /// These flags over `export`, the command's core defaults: pure
-    /// translation, so every command maps them the same way.
-    fn apply(&self, export: ExportOptions) -> ExportOptions {
-        ExportOptions {
-            tile_size_limit: self.max_tile_size.or(export.tile_size_limit),
-            compressed_tile_size_limit: self
-                .max_compressed_tile_size
-                .or(export.compressed_tile_size_limit),
-            size_valve: self.size_valve,
-            coverage_fill: self.coverage_fill,
-            simple_clip_fastpath: !self.no_simple_clip_fastpath,
-            tile_buffer: self.tile_buffer,
-            extent: self.extent,
-            partition_wave: self.partition_wave,
-            feature_order: self.feature_order.clone(),
-            feature_id: self.feature_id.clone(),
-            ..export
+impl From<&ExportArgs> for ExportKnobs {
+    /// The flags as core's knobs: the one place the CLI spells them.
+    fn from(args: &ExportArgs) -> Self {
+        ExportKnobs {
+            tile_size_limit: args.max_tile_size,
+            max_compressed_tile_size: args.max_compressed_tile_size,
+            size_valve: args.size_valve,
+            coverage_fill: args.coverage_fill,
+            simple_clip_fastpath: !args.no_simple_clip_fastpath,
+            tile_buffer: args.tile_buffer,
+            extent: args.extent,
+            partition_wave: args.partition_wave,
+            feature_order: args.feature_order.clone(),
+            feature_id: args.feature_id.clone(),
         }
+    }
+}
+
+impl ExportArgs {
+    /// These flags over `export`, the command's core defaults
+    /// ([`ExportKnobs::apply`]).
+    fn apply(&self, export: ExportOptions) -> ExportOptions {
+        ExportKnobs::from(self).apply(export)
     }
 }
 
@@ -862,10 +867,10 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         default_value = ConvertOptions::default().assign.sort_direction.as_str(),
-        value_parser = ["desc", "asc"],
+        value_parser = spelled::<SortDirection>(&["desc", "asc"]),
         help_heading = "Ranking"
     )]
-    sort_direction: String,
+    sort_direction: SortDirection,
 
     /// Rank `COL` values from highest to lowest, assigning entry zooms
     /// from `--min-zoom` in `--ladder-step` increments. Features appear at
@@ -1108,10 +1113,10 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         default_value = ConvertOptions::default().row_group_size_policy.as_str(),
-        value_parser = ["constant", "zoom-scaled"],
+        value_parser = spelled::<RowGroupSizePolicy>(&["constant", "zoom-scaled"]),
         help_heading = "Output layout"
     )]
-    row_group_size_policy: String,
+    row_group_size_policy: RowGroupSizePolicy,
 
     /// Keep Parquet min/max stats on every column, even large string and
     /// geometry columns. Use it when remote clients filter on
@@ -1142,10 +1147,10 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         default_value = ConvertOptions::default().profile.as_str(),
-        value_parser = ["auto", "speed", "bounded"],
+        value_parser = spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     )]
-    profile: String,
+    profile: MemoryProfile,
 
     /// Read batches in flight at once, or `auto` to size it to the cores.
     /// See
@@ -1198,13 +1203,10 @@ impl ConvertTuningArgs {
             .chain(self.plan.as_deref())
     }
 
-    /// Build [`ConvertOptions`] from the shared tuning flags: pure
-    /// translation onto core (#779). The parent command owns `mode`, the
-    /// `levels` plan, `bbox`, and `cogp_compat` and passes them in. Every
-    /// rule — which flags conflict, what an unset knob defaults to under
-    /// `--verbatim` — is core's ([`ConvertOptions::validate`],
-    /// [`ConvertOptions::with_generalization`] and the `config` helpers);
-    /// the errors here are core's, surfaced as they are.
+    /// Build [`ConvertOptions`] from the shared tuning flags through core's
+    /// [`ConvertKnobs`] (#779). The parent command owns `mode`, the `levels`
+    /// plan, `bbox`, and `cogp_compat` and passes them in. Every rule is
+    /// core's; the errors here are core's, surfaced as they are.
     fn build_convert_options(
         &self,
         mode: tylertoo_core::overview::level::Mode,
@@ -1212,103 +1214,74 @@ impl ConvertTuningArgs {
         bbox: Option<[f64; 4]>,
         cogp_compat: bool,
     ) -> Result<ConvertOptions> {
-        use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig};
-        use tylertoo_core::overview::convert::GeneralizationOverrides;
-        use tylertoo_core::overview::simplify::SimplifyOptions;
+        Ok(ConvertKnobs::from(self).convert_options(mode, levels, bbox, cogp_compat)?)
+    }
+}
 
-        let defaults = ConvertOptions::default();
-        let overrides = GeneralizationOverrides {
-            point_thinning: self.point_thinning,
-            line_thinning: self.line_thinning,
-            polygon_thinning: self.polygon_thinning,
-            line_visibility: self.line_visibility,
-            polygon_visibility: self.polygon_visibility,
-            simplify_factor: self.simplify_factor,
+impl From<&ConvertTuningArgs> for ConvertKnobs {
+    /// The flags as core's knobs: the one place the CLI spells them.
+    fn from(args: &ConvertTuningArgs) -> Self {
+        ConvertKnobs {
+            sort_key: args.sort_key.clone(),
+            sort_direction: args.sort_direction,
+            magnitude_ladder: args.magnitude_ladder.clone(),
+            ladder_step: args.ladder_step,
+            entry_zoom: args.entry_zoom.clone(),
+            class_rank: args.class_rank.clone(),
+            // Python's structured spelling of `--class-rank`.
+            class_rank_column: None,
+            class_ranks: None,
+            class_rank_unknown: None,
+            no_auto_rank: args.no_auto_rank,
+            verbatim: args.verbatim,
+            simplify_factor: args.simplify_factor,
+            collapse: args.collapse,
+            collapse_square: args.collapse_square,
+            no_collapse: args.no_collapse,
+            representation: args.representation.clone(),
+            cascade: !args.no_cascade,
+            point_thinning: args.point_thinning,
+            line_thinning: args.line_thinning,
+            polygon_thinning: args.polygon_thinning,
+            line_visibility: args.line_visibility,
+            polygon_visibility: args.polygon_visibility,
+            drop_rate: args.drop_rate,
+            drop_gamma: args.drop_gamma,
             // No positive spelling exists for density drop, so `--verbatim`
             // cannot be overriding an explicit request; `--coalesce-lines`
             // is the deprecated positive spelling of the default.
-            density_drop: self.no_density_drop.then_some(false),
-            coalesce_lines: if self.no_coalesce_lines {
+            density_drop: args.no_density_drop.then_some(false),
+            drop_lines: args.drop_lines,
+            drop_polygons: args.drop_polygons,
+            cluster: args.cluster,
+            accumulate_attributes: args.accumulate_attribute.clone(),
+            coalesce_lines: if args.no_coalesce_lines {
                 Some(false)
             } else {
-                self.coalesce_lines.then_some(true)
+                args.coalesce_lines.then_some(true)
             },
-        };
-        let options = ConvertOptions {
-            mode,
-            levels,
-            assign: AssignConfig {
-                sort_direction: self.sort_direction.parse().map_err(anyhow::Error::msg)?,
-                ..defaults.assign
-            },
-            sort_key: self.sort_key.clone(),
-            entry_zoom: config::entry_zoom(
-                self.magnitude_ladder.as_deref(),
-                self.ladder_step,
-                self.entry_zoom.as_deref(),
-            )?,
-            class_ranking: config::class_ranking(self.class_rank.as_deref(), None, None, None)?,
-            no_auto_rank: self.no_auto_rank,
-            simplify: SimplifyOptions {
-                collapse: config::collapse_mode(
-                    self.collapse,
-                    self.collapse_square,
-                    self.no_collapse,
-                )?,
-                cascade: !self.no_cascade,
-                ..defaults.simplify
-            },
-            representation: config::representation(self.representation.as_deref())?,
-            density: DensityBudgetConfig {
-                drop_rate: self.drop_rate,
-                gamma: self.drop_gamma,
-                kinds: BudgetKinds {
-                    points: true,
-                    lines: self.drop_lines,
-                    polygons: self.drop_polygons,
-                },
-                ..defaults.density
-            },
-            gsd_base: self.gsd_base,
-            cogp_compat_key: cogp_compat,
-            max_row_group_size: self.row_group_size,
-            row_group_size_policy: self
-                .row_group_size_policy
-                .parse()
-                .map_err(anyhow::Error::msg)?,
-            full_column_stats: self.full_column_stats,
-            streaming: !self.no_streaming,
-            read_batch_size: self.read_batch_size,
-            profile: self.profile.parse().map_err(anyhow::Error::msg)?,
-            in_flight_batches: self.in_flight_batches,
-            read_workers: self.read_workers,
-            cluster: self.cluster,
-            accumulate: self
-                .accumulate_attribute
-                .iter()
-                .map(|s| parse_accumulate(s))
-                .collect::<Result<Vec<_>>>()?,
-            coalesce_snap: self.coalesce_snap,
-            coalesce_max_level_rows: self.coalesce_max_level_rows,
-            coalesce_junction_angle: self.coalesce_junction_angle,
-            bbox,
-            filter: self.filter.clone(),
-            properties: property_selection(
-                &self.include_property,
-                &self.exclude_property,
-                self.exclude_all_properties,
-            ),
-            spill_dir: self.spill_dir.clone(),
-            save_plan: self.save_plan.clone(),
-            plan: self.plan.clone(),
-            // `tiles` sets the shard from --shard / --shard-plan (#498) and
-            // the convert-side ceiling (#541) through the facade; `overview`
-            // has no shard role.
-            ..defaults
-        };
-        // Last, because the defaults read `cluster` and the logged summary
-        // reads `entry_zoom`.
-        Ok(options.with_generalization(&overrides, self.verbatim)?)
+            coalesce_snap: args.coalesce_snap,
+            coalesce_junction_angle: args.coalesce_junction_angle,
+            coalesce_max_level_rows: args.coalesce_max_level_rows,
+            // An empty `--include-property` list is no list at all.
+            include_properties: (!args.include_property.is_empty())
+                .then(|| args.include_property.clone()),
+            exclude_properties: Some(args.exclude_property.clone()),
+            exclude_all_properties: args.exclude_all_properties,
+            gsd_base: args.gsd_base,
+            row_group_size: args.row_group_size,
+            row_group_size_policy: args.row_group_size_policy,
+            full_column_stats: args.full_column_stats,
+            streaming: !args.no_streaming,
+            read_batch_size: args.read_batch_size,
+            filter: args.filter.clone(),
+            profile: args.profile,
+            in_flight_batches: args.in_flight_batches,
+            read_workers: args.read_workers,
+            spill_dir: args.spill_dir.clone(),
+            save_plan: args.save_plan.clone(),
+            plan: args.plan.clone(),
+        }
     }
 }
 
@@ -2732,15 +2705,6 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
-/// `sum`, `max`, `min`, `mean` (case-insensitive).
-///
-/// Grammar, validation and messages live in core (#439); this adapts the
-/// error for anyhow.
-fn parse_accumulate(spec: &str) -> Result<tylertoo_core::overview::cluster::AccumulateSpec> {
-    tylertoo_core::overview::convert::parse_accumulate(spec).map_err(anyhow::Error::msg)
-}
-
 /// Run `tylertoo validate`: check a GeoParquet overview file (spec §6.2).
 fn run_validate(args: ValidateArgs) -> Result<()> {
     use tylertoo_core::overview::check::validate_file;
@@ -4021,7 +3985,7 @@ mod tests {
         assert_eq!(a.tuning.polygon_visibility, Some(2.0));
         assert!(a.tuning.collapse);
         assert_eq!(a.tuning.drop_rate, 1.3);
-        assert_eq!(a.tuning.profile, "bounded");
+        assert_eq!(a.tuning.profile, MemoryProfile::Bounded);
         assert!(a.tuning.cluster);
         assert!(a.tuning.no_coalesce_lines);
     }
@@ -4041,7 +4005,7 @@ mod tests {
     /// they build the right core options.
     #[test]
     fn representation_and_collapse_square_flags() {
-        use tylertoo_core::overview::convert::{LevelPlan, RepresentationBand};
+        use tylertoo_core::overview::convert::{ConvertError, LevelPlan, RepresentationBand};
         use tylertoo_core::overview::level::Mode;
         use tylertoo_core::overview::simplify::{CollapseMode, Representation};
 
@@ -4069,8 +4033,10 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            err.downcast_ref::<config::ConfigError>()
-                .is_some_and(|e| matches!(e, config::ConfigError::CollapseConflict)),
+            err.downcast_ref::<ConvertError>().is_some_and(|e| matches!(
+                e,
+                ConvertError::Config(config::ConfigError::CollapseConflict)
+            )),
             "{err:?}"
         );
 
@@ -4207,7 +4173,7 @@ mod tests {
     fn tile_size_limit_is_an_alias_of_max_tile_size_everywhere() {
         let a = parse_tiles(&["--max-tile-size", "500K"]);
         let b = parse_tiles(&["--tile-size-limit", "500K"]);
-        assert_eq!(a.export.max_tile_size, SizeCap(Some(500 * 1024)));
+        assert_eq!(a.export.max_tile_size, SizeCap::Bytes(500 * 1024));
         assert_eq!(a.export.max_tile_size, b.export.max_tile_size);
         assert_eq!(
             parse_export(&["--max-tile-size", "1M"])
@@ -4221,7 +4187,7 @@ mod tests {
             parse_pyramid(&["--tile-size-limit", "1M"])
                 .export
                 .max_tile_size,
-            SizeCap(Some(1024 * 1024))
+            SizeCap::Bytes(1024 * 1024)
         );
     }
 
@@ -4259,7 +4225,7 @@ mod tests {
         assert_eq!(pyramid.export.compressed_tile_size_limit, Some(300 * 1024));
 
         assert!(parse_size_cap("banana").is_err());
-        assert_eq!(parse_size_cap("AUTO").unwrap(), SizeCap(None));
+        assert_eq!(parse_size_cap("AUTO").unwrap(), SizeCap::Auto);
     }
 
     /// The flag reaches both commands that build a conversion, and switches

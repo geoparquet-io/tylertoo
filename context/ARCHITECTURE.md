@@ -1291,10 +1291,14 @@ crates/core/src/
 │   ├── config.rs       #   The one owner of the option rules every frontend shares
 │   │                   #   (#779): ConfigError, the output preflight, the flag-shaped
 │   │                   #   helpers (collapse, entry zoom, class rank). CLI and Python
-│   │                   #   only translate into the option structs and surface errors
+│   │                   #   only fill knobs.rs and surface errors
 │   ├── convert.rs      #   convert_to_overviews() orchestration
 │   ├── export.rs       #   Overview GeoParquet → PMTiles export
 │   ├── hostile.rs      #   Hostile-input hardening tests
+│   ├── knobs.rs        #   ConvertKnobs / ExportKnobs: the frontend-neutral knob input
+│   │                   #   (#779). Python deserializes its kwargs into them (serde
+│   │                   #   names = keywords); the CLI fills them in one From per flag
+│   │                   #   group; core builds the option structs from them
 │   ├── level.rs        #   Footer metadata model, SPEC_VERSION
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
