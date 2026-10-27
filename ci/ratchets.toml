@@ -133,10 +133,12 @@ scope = "entries in deny.toml [bans] skip"
 # known twins: in_memory_carriers/streaming_carriers (0.837, #407 drift),
 # select_input_row_groups_combined/select_row_groups_streaming (0.815), the
 # two strategy entry points (0.802) and the two preflights (0.859, 0.800).
+# #779 F5: 60 -> 58. clip.rs's rect pair (one finite-aware pass) and
+# reader.rs's read_level pair (one rows() helper) are gone.
 [similarity_pairs]
 checked_by = "scripts/ci/similarity_ratchet.py"
 threshold = 0.85
-pin = 60
+pin = 58
 target = 0
 owner = "the refactor that shares each pair's code (#779); F1 for overview/, F3 for the CLI parsers and Python error mappers"
 catches = "near-duplicate functions inside one file; the gate sat at 0.95, where the workspace has zero pairs, so it caught nothing"

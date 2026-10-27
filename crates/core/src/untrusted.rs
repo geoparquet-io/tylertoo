@@ -286,13 +286,26 @@ impl Skim<'_> {
         Ok(())
     }
 
-    /// Skip one value of compact type `ty`.
-    fn skip(&mut self, ty: u8, depth: u32) -> Result<(), SkimStop> {
+    /// Refuse nesting deeper than [`MAX_FOOTER_DEPTH`].
+    fn check_depth(depth: u32) -> Result<(), SkimStop> {
         if depth > MAX_FOOTER_DEPTH {
             return Err(SkimStop::Hostile(format!(
                 "the footer nests values more than {MAX_FOOTER_DEPTH} levels deep"
             )));
         }
+        Ok(())
+    }
+
+    /// Skip `size` collection elements of compact type `elem`. A boolean
+    /// element is one byte in a collection, not a type nibble.
+    fn skip_elements(&mut self, elem: u8, size: usize, depth: u32) -> Result<(), SkimStop> {
+        let elem = if matches!(elem, 1 | 2) { 3 } else { elem };
+        (0..size).try_for_each(|_| self.skip(elem, depth))
+    }
+
+    /// Skip one value of compact type `ty`.
+    fn skip(&mut self, ty: u8, depth: u32) -> Result<(), SkimStop> {
+        Self::check_depth(depth)?;
         match ty {
             // Booleans: the value is the type nibble of a field; in a
             // collection it is one byte (handled by the caller passing 3).
@@ -306,26 +319,24 @@ impl Skim<'_> {
             }
             9 | 10 => {
                 let (elem, size) = self.list_header()?;
-                let elem = if matches!(elem, 1 | 2) { 3 } else { elem };
-                (0..size).try_for_each(|_| self.skip(elem, depth + 1))
+                self.skip_elements(elem, size, depth + 1)
             }
-            11 => {
-                let size = self.varint()?;
-                self.check_count(size, "map")?;
-                if size == 0 {
-                    return Ok(());
-                }
-                let kv = self.byte()?;
-                let fix = |t: u8| if matches!(t, 1 | 2) { 3 } else { t };
-                let (k, v) = (fix(kv >> 4), fix(kv & 0x0f));
-                (0..size).try_for_each(|_| {
-                    self.skip(k, depth + 1)?;
-                    self.skip(v, depth + 1)
-                })
-            }
+            11 => self.skip_map(depth + 1),
             12 => self.fields(depth + 1, |s, _, ty| s.skip(ty, depth + 1)),
             _ => Err(SkimStop::Confused),
         }
+    }
+
+    /// Skip a map: its size, then (when non-empty) one key/value type byte
+    /// and that many pairs.
+    fn skip_map(&mut self, depth: u32) -> Result<(), SkimStop> {
+        let size = self.varint()?;
+        self.check_count(size, "map")?;
+        let kv = if size == 0 { 0 } else { self.byte()? };
+        (0..size).try_for_each(|_| {
+            self.skip_elements(kv >> 4, 1, depth)?;
+            self.skip_elements(kv & 0x0f, 1, depth)
+        })
     }
 
     /// Walk one struct's fields, handing each `(field id, type)` to `field`,
@@ -335,11 +346,7 @@ impl Skim<'_> {
         depth: u32,
         mut field: impl FnMut(&mut Self, i16, u8) -> Result<(), SkimStop>,
     ) -> Result<(), SkimStop> {
-        if depth > MAX_FOOTER_DEPTH {
-            return Err(SkimStop::Hostile(format!(
-                "the footer nests values more than {MAX_FOOTER_DEPTH} levels deep"
-            )));
-        }
+        Self::check_depth(depth)?;
         let mut last: i16 = 0;
         loop {
             let b = self.byte()?;
@@ -363,8 +370,7 @@ impl Skim<'_> {
     fn schema(&mut self, depth: u32) -> Result<(), SkimStop> {
         let (elem, size) = self.list_header()?;
         if elem != 12 {
-            let elem = if matches!(elem, 1 | 2) { 3 } else { elem };
-            return (0..size).try_for_each(|_| self.skip(elem, depth + 1));
+            return self.skip_elements(elem, size, depth + 1);
         }
         for index in 0..size {
             let after = size - index - 1;
@@ -725,7 +731,7 @@ fn check_scaled_limit(batch: &RecordBatch) -> Result<(), ArrowError> {
 // ============================================================================
 
 /// The parquet reader's default batch size, used when a caller sets none.
-const DEFAULT_BATCH_ROWS: usize = 1024;
+pub(crate) const DEFAULT_BATCH_ROWS: usize = 1024;
 
 /// A checked Parquet file, ready to read: the footer has passed the
 /// pre-check and the chunk-range check, and the Arrow schema decoded inside
@@ -861,24 +867,33 @@ pub struct UntrustedBatchReader {
     done: bool,
 }
 
+/// One batch from `next`, decoded inside the panic boundary. After an error
+/// or the end, `done` is set and every later call yields `None`.
+fn guarded_next(
+    done: &mut bool,
+    what: &'static str,
+    next: impl FnOnce() -> Option<Result<RecordBatch, ArrowError>>,
+) -> Option<Result<RecordBatch, ArrowError>> {
+    if *done {
+        return None;
+    }
+    let item = guard(what, next)
+        .unwrap_or_else(|panic| Some(Err(ArrowError::ExternalError(Box::new(panic)))));
+    *done = !matches!(item, Some(Ok(_)));
+    item
+}
+
 impl Iterator for UntrustedBatchReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
         let inner = &mut self.inner;
-        let item = match guard("parquet page", || inner.next()) {
-            Ok(item) => item,
-            Err(panic) => Some(Err(ArrowError::ExternalError(Box::new(panic)))),
-        };
-        #[cfg(test)]
-        let item = item.map(|r| r.and_then(|b| check_scaled_limit(&b).map(|()| b)));
-        if !matches!(item, Some(Ok(_))) {
-            self.done = true;
-        }
-        item
+        guarded_next(&mut self.done, "parquet page", || {
+            let item = inner.next();
+            #[cfg(test)]
+            let item = item.map(|r| r.and_then(|b| check_scaled_limit(&b).map(|()| b)));
+            item
+        })
     }
 }
 
@@ -982,18 +997,8 @@ impl<R: Read + Seek> Iterator for UntrustedIpcReader<R> {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
         let inner = &mut self.inner;
-        let item = match guard("Arrow IPC record batch", || inner.next()) {
-            Ok(item) => item,
-            Err(panic) => Some(Err(ArrowError::ExternalError(Box::new(panic)))),
-        };
-        if !matches!(item, Some(Ok(_))) {
-            self.done = true;
-        }
-        item
+        guarded_next(&mut self.done, "Arrow IPC record batch", || inner.next())
     }
 }
 
