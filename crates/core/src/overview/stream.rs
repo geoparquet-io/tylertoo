@@ -2018,7 +2018,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
-        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        crate::untrusted::byte_array_limit(),
     )
 }
 
@@ -6417,11 +6417,10 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         // The row group's geometry column in bytes, from the footer.
-        let meta = parquet::file::serialized_reader::SerializedFileReader::new(
-            std::fs::File::open(tin.path()).unwrap(),
-        )
-        .unwrap();
-        let rg = parquet::file::reader::FileReader::metadata(&meta).row_group(0);
+        let meta =
+            crate::untrusted::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap())
+                .unwrap();
+        let rg = meta.row_group(0);
         let geom_bytes = rg
             .columns()
             .iter()

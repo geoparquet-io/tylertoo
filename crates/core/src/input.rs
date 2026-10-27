@@ -49,10 +49,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::errors::ParquetError;
 use parquet::file::reader::{ChunkReader, Length};
 use serde::Serialize;
+
+use crate::untrusted::ParquetSource;
 
 /// Schemes recognized as remote inputs (when the `remote` feature is on).
 const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
@@ -178,6 +180,20 @@ pub enum InputError {
         /// The glob crate's error message.
         message: String,
     },
+    /// An upstream decoder (parquet-rs, arrow-ipc) panicked on malformed
+    /// input (#683, #684, #687). [`crate::untrusted`] catches the panic at
+    /// its boundary; the input is refused and the process carries on.
+    #[error("the {what} decoder panicked on malformed input: {message}")]
+    DecoderPanic {
+        /// What was being decoded (`parquet footer`, `parquet page`, ...).
+        what: &'static str,
+        /// The upstream panic message and location.
+        message: String,
+    },
+    /// A Parquet footer declares a count no honest footer could hold, and
+    /// was refused before parquet-rs sized an allocation from it (#690).
+    #[error("refusing a malformed Parquet footer: {0}")]
+    HostileFooter(String),
 }
 
 /// A [`ParquetError`]'s message without the `Parquet error: ` prefix its
@@ -186,6 +202,9 @@ pub enum InputError {
 pub(crate) fn parquet_error_detail(error: &ParquetError) -> String {
     match error {
         ParquetError::General(message) => message.clone(),
+        // The owner's typed errors (#779) travel as `External`: show them,
+        // not parquet's "External: " prefix.
+        ParquetError::External(inner) => inner.to_string(),
         other => other.to_string(),
     }
 }
@@ -301,19 +320,19 @@ impl InputSource {
     ///
     /// Returns an [`InputError`] if the file cannot be opened or its Parquet
     /// footer cannot be read or fetched.
-    pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+    pub fn open(&self) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
                 let file = File::open(p).map_err(|error| InputError::Open {
                     input: self.display_name(),
                     error,
                 })?;
-                ParquetRecordBatchReaderBuilder::try_new(InputReader::Local(file)).map_err(
-                    |error| InputError::Footer {
+                crate::untrusted::open_parquet(InputReader::Local(file)).map_err(|error| {
+                    InputError::Footer {
                         input: self.display_name(),
                         error,
-                    },
-                )
+                    }
+                })
             }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
@@ -337,14 +356,14 @@ impl InputSource {
     pub(crate) fn open_with_metadata(
         &self,
         meta: &ArrowReaderMetadata,
-    ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+    ) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
                 let file = File::open(p).map_err(|error| InputError::Open {
                     input: self.display_name(),
                     error,
                 })?;
-                Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+                Ok(crate::untrusted::open_parquet_with_metadata(
                     InputReader::Local(file),
                     meta.clone(),
                 ))
@@ -552,11 +571,8 @@ pub(crate) mod remote {
         ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
         ObjectStoreScheme,
     };
-    use parquet::arrow::arrow_reader::{
-        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-    };
+    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
     use parquet::errors::ParquetError;
-    use parquet::file::metadata::ParquetMetaData;
     use url::Url;
 
     use super::{FetchStats, InputError, InputReader};
@@ -860,7 +876,7 @@ pub(crate) mod remote {
         /// opens so multi-pass pipelines fetch it once.
         pub(crate) fn open_builder(
             &self,
-        ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+        ) -> Result<crate::untrusted::ParquetSource<InputReader>, InputError> {
             let reader = InputReader::Remote(self.reader());
             let metadata = self.load_footer()?;
             // Column-chunk byte ranges (sorted) for readahead clamping.
@@ -904,7 +920,7 @@ pub(crate) mod remote {
                 let mut cache = self.cache.lock().expect("chunk cache lock");
                 cache.cap = self.cap_base.max(max_row_group);
             }
-            Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+            Ok(crate::untrusted::open_parquet_with_metadata(
                 reader, metadata,
             ))
         }
@@ -938,58 +954,19 @@ pub(crate) mod remote {
                 return Ok(md.clone());
             }
             let reader = InputReader::Remote(self.reader());
-            let md =
-                ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new()).map_err(|error| {
-                    InputError::Footer {
-                        input: self.url.clone(),
-                        error,
-                    }
-                })?;
-            self.validate_chunk_ranges(md.metadata())?;
+            // The owner (#779) runs the footer pre-check, the #430 chunk-range
+            // check against the object size and the guarded schema decode,
+            // exactly as it does for a local file.
+            let md = crate::untrusted::load_reader_metadata(&reader).map_err(|error| {
+                InputError::Footer {
+                    input: self.url.clone(),
+                    error,
+                }
+            })?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
             let _ = self.metadata.set(md.clone());
             Ok(md)
-        }
-
-        /// #430: reject a footer whose column chunk byte ranges overflow or
-        /// run past the object before anything is built on it. Every later
-        /// `start + len` over these ranges (chunk map, staging spans, page
-        /// slices) would otherwise wrap in release or panic in debug on a
-        /// hostile parquet.
-        fn validate_chunk_ranges(&self, metadata: &ParquetMetaData) -> Result<(), InputError> {
-            for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
-                for (col_idx, col) in rg.columns().iter().enumerate() {
-                    // parquet's `byte_range()` asserts on a negative offset
-                    // or length, and the thrift decoder does not reject
-                    // them, so check the raw fields first.
-                    let raw_start = col
-                        .dictionary_page_offset()
-                        .unwrap_or_else(|| col.data_page_offset());
-                    let raw_len = col.compressed_size();
-                    if raw_start < 0 || raw_len < 0 {
-                        return Err(ParquetError::EOF(format!(
-                            "column chunk (row group {rg_idx}, column {col_idx}) has a \
-                             negative offset or length ({raw_start}, {raw_len}) for {}",
-                            self.location
-                        ))
-                        .into());
-                    }
-                    let (start, len) = col.byte_range();
-                    let end = start.checked_add(len).filter(|end| *end <= self.size);
-                    if end.is_none() || usize::try_from(len).is_err() {
-                        return Err(ParquetError::EOF(format!(
-                            "column chunk (row group {rg_idx}, column {col_idx}) range \
-                             {start}..{} beyond object size {} for {}",
-                            start as u128 + len as u128,
-                            self.size,
-                            self.location
-                        ))
-                        .into());
-                    }
-                }
-            }
-            Ok(())
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
@@ -3010,7 +2987,7 @@ pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     )?);
     source.stage_row_groups(None)?;
     let mut rows = 0;
-    for batch in source.open()?.with_batch_size(256).build()? {
+    for batch in source.open()?.with_batch_rows(256).build()? {
         rows += batch?.num_rows();
     }
     source.release_read_cache();
@@ -3419,7 +3396,7 @@ mod tests {
             // Floor far below one row group, forcing the eviction path.
             let source = super::super::test_memory_source_with_cap(bytes, "wide.parquet", 64);
 
-            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
             let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
             assert_eq!(rows, 4096);
 
@@ -3456,7 +3433,7 @@ mod tests {
             // Three full in-order passes, mimicking the converter's assign +
             // coarse-level + finest-streamed-last reads.
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3501,7 +3478,7 @@ mod tests {
             source.set_spill_dir(Some(Path::new("/nonexistent/tylertoo-spill-dir-272")));
 
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3529,7 +3506,7 @@ mod tests {
             source.set_spill_dir(Some(dir.path()));
 
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3629,7 +3606,7 @@ mod tests {
             let source =
                 super::super::test_memory_source_with_cap(bytes, "bench-wide.parquet", cap_base);
 
-            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
             let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
             assert_eq!(rows, 8192 * 3);
 

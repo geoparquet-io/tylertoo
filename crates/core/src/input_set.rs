@@ -41,10 +41,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-};
-use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 
 #[cfg(feature = "remote")]
@@ -300,12 +298,14 @@ pub(crate) fn byte_array_batch_rows(avg_row_bytes: u64, limit: u64) -> usize {
 }
 
 /// `requested` rows per batch, lowered when `widest` needs fewer to stay
-/// under [`BYTE_ARRAY_BATCH_LIMIT`].
+/// under the ceiling ([`crate::untrusted::byte_array_limit`], which is
+/// [`BYTE_ARRAY_BATCH_LIMIT`] outside tests). Every reader gets this through
+/// [`crate::untrusted::ParquetSource::build`].
 pub(crate) fn capped_batch_rows(requested: usize, widest: Option<&WidestByteArrayColumn>) -> usize {
     match widest {
         Some(w) => requested.min(byte_array_batch_rows(
             w.avg_row_bytes,
-            BYTE_ARRAY_BATCH_LIMIT,
+            crate::untrusted::byte_array_limit(),
         )),
         None => requested,
     }
@@ -461,7 +461,7 @@ pub struct SourceStream<'a> {
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
     part_idx: usize,
-    current: Option<ParquetRecordBatchReader>,
+    current: Option<crate::untrusted::UntrustedBatchReader>,
     done: bool,
 }
 
@@ -1148,16 +1148,16 @@ impl ConvertSource {
             .iter()
             .map(|m| m.reader.clone())
             .collect::<Vec<_>>();
-        // #563: never ask arrow for a batch whose byte-array column could
-        // pass its i32 offset ceiling. Output does not depend on the batch
-        // size; only the opaque overflow error does.
-        let widest = self.widest_byte_array_column(plan.row_groups)?;
+        // #563: each part's reader caps the batch for its selected row
+        // groups' widest byte-array column (`untrusted::ParquetSource::build`),
+        // so no batch can pass arrow's i32 offset ceiling. Output does not
+        // depend on the batch size; only the opaque overflow error does.
         Ok(SourceStream {
             parts,
             metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
-            batch_size: capped_batch_rows(plan.batch_size.max(1), widest.as_ref()),
+            batch_size: plan.batch_size.max(1),
             part_idx: 0,
             current: None,
             done: false,
@@ -1284,10 +1284,10 @@ impl ConvertSource {
 fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     let builder = source.open()?;
     let parquet = builder.metadata().clone();
-    // Re-derives the arrow schema from the footer we already have — no I/O,
-    // no second footer parse — so every later reader over this part can be
-    // built with `new_with_metadata`.
-    let reader = ArrowReaderMetadata::try_new(parquet.clone(), ArrowReaderOptions::new())?;
+    // The footer and schema the owner already checked and decoded (#779):
+    // every later reader over this part is built from it, with no second
+    // footer parse and no second `ARROW:schema` decode.
+    let reader = builder.reader_metadata().clone();
     Ok(PartMeta {
         schema: builder.schema().clone(),
         parquet,
@@ -1533,16 +1533,15 @@ impl SourceStream<'_> {
     /// Open part `i`'s reader with this stream's projection / row-group
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
-    fn open_part(&self, i: usize) -> Result<ParquetRecordBatchReader, InputError> {
+    fn open_part(&self, i: usize) -> Result<crate::untrusted::UntrustedBatchReader, InputError> {
         let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {
-            let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
-            builder = builder.with_projection(mask);
+            builder = builder.with_projection_roots(cols.iter().copied());
         }
         if let Some(sel) = &self.row_groups {
             builder = builder.with_row_groups(sel[i].clone());
         }
-        Ok(builder.with_batch_size(self.batch_size).build()?)
+        Ok(builder.with_batch_rows(self.batch_size).build()?)
     }
 }
 
@@ -2335,10 +2334,7 @@ mod tests {
         let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
 
         // Leaves 1 and 2 (pt.x, pt.y) sit under root column 1.
-        let reader =
-            parquet::file::serialized_reader::SerializedFileReader::new(File::open(&path).unwrap())
-                .unwrap();
-        let meta = parquet::file::reader::FileReader::metadata(&reader);
+        let meta = crate::untrusted::read_parquet_metadata(&File::open(&path).unwrap()).unwrap();
         assert_eq!(meta.num_row_groups(), 4);
         let rg_bytes = |g: usize| -> u64 {
             let rg = meta.row_group(g);
@@ -3042,7 +3038,6 @@ b.parquet
     #[test]
     fn largest_byte_array_column_sums_the_selected_groups_and_counted_roots() {
         use arrow_array::BinaryArray;
-        use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let dir = tmpdir();
         let f = dir.path().join("geo.parquet");
@@ -3066,8 +3061,9 @@ b.parquet
             ],
             Some(2),
         );
-        let reader = SerializedFileReader::new(std::fs::File::open(&f).unwrap()).unwrap();
-        let meta = reader.metadata();
+        let meta =
+            crate::untrusted::read_parquet_metadata(&std::fs::File::open(&f).unwrap()).unwrap();
+        let meta = meta.as_ref();
 
         let all = largest_byte_array_column(meta, None, |_| true).unwrap();
         assert_eq!(all.column, "geometry");

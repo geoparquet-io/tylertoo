@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Type as PhysicalType;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
@@ -120,8 +119,7 @@ struct GeoDoc {
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
     let path = path.as_ref();
     let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let metadata = builder.metadata().clone();
+    let metadata = crate::untrusted::read_parquet_metadata(&file)?;
     let mut report = validate_metadata(&metadata);
     check_cluster_sum_invariant(path, &metadata, &mut report);
     Ok(report)
@@ -688,22 +686,6 @@ fn check_cluster_sum_invariant(
     }
 }
 
-/// Rows per batch for the cluster sum-invariant read (#607): the reader's
-/// default of 1024, lowered as [`super::reader::OverviewReader`] lowers its
-/// own so one batch of the widest byte-array column stays under arrow's
-/// 2 GiB offset limit. Without it a file whose geometries average over ~2 MB
-/// fails with "index overflow decoding byte array".
-fn cluster_read_batch_rows(metadata: &ParquetMetaData) -> usize {
-    crate::input_set::capped_batch_rows(
-        CLUSTER_READ_BATCH_ROWS,
-        crate::input_set::widest_byte_array_column(metadata, None, 0).as_ref(),
-    )
-}
-
-/// The parquet reader's default batch size, which the cluster sum-invariant
-/// read uses when no column is wide enough to need fewer rows.
-const CLUSTER_READ_BATCH_ROWS: usize = 1024;
-
 /// Per level: `(point-row count, Σ point_count over point rows)`, read from
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
@@ -713,16 +695,14 @@ fn cluster_sum_by_level(
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
 ) -> Result<Option<Vec<(usize, i64)>>, String> {
+    use super::convert::{feature_kind, find_geometry_column};
+    use crate::batch_processor::extract_geometries_opt_from_array;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type};
     use geoarrow::array::from_arrow_array;
-    use parquet::arrow::ProjectionMask;
-
-    use super::convert::{feature_kind, find_geometry_column};
-    use crate::batch_processor::extract_geometries_opt_from_array;
 
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| e.to_string())?;
+    let builder = crate::untrusted::open_parquet(file).map_err(|e| e.to_string())?;
     let schema = builder.schema().clone();
 
     let Some(geom_idx) = find_geometry_column(&schema) else {
@@ -736,11 +716,10 @@ fn cluster_sum_by_level(
     };
     let geom_field = schema.field(geom_idx).clone();
 
-    let mask = ProjectionMask::roots(builder.parquet_schema(), [geom_idx, pc_idx, level_idx]);
-    let batch_rows = cluster_read_batch_rows(builder.metadata());
+    // The reader's default batch, capped by the owner (#607) so one batch of
+    // the widest byte-array column stays under arrow's 2 GiB offset limit.
     let reader = builder
-        .with_projection(mask)
-        .with_batch_size(batch_rows)
+        .with_projection_roots([geom_idx, pc_idx, level_idx])
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -952,9 +931,10 @@ pub fn fuzz_parquet_footer(
 ) -> Result<ValidationReport, parquet::errors::ParquetError> {
     use super::filter::{BoundFilter, CmpOp, FilterExpr, Literal};
     use super::level::Crs;
-    use parquet::file::metadata::ParquetMetaDataReader;
 
-    let md = ParquetMetaDataReader::decode_metadata(thrift)?;
+    // The owner's decode (#779): the #690 pre-check, then parquet-rs's
+    // decode inside the panic boundary.
+    let md = crate::untrusted::decode_footer(thrift)?;
     let report = validate_metadata(&md);
 
     let n = md.num_row_groups();
@@ -1144,9 +1124,8 @@ mod tests {
 
     fn meta_of(path: &std::path::Path) -> ParquetMetaData {
         let file = File::open(path).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file)
+        crate::untrusted::read_parquet_metadata(&file)
             .unwrap()
-            .metadata()
             .as_ref()
             .clone()
     }
@@ -1810,16 +1789,17 @@ mod tests {
     #[test]
     fn cluster_read_batch_rows_lowers_the_default_for_wide_rows() {
         // #607: 4 MiB rows put 1024 of them at 4 GiB, past arrow's i32
-        // offsets. The clamp keeps a batch near 1 GiB: 256 rows.
+        // offsets. The owner's cap, which the cluster read now goes
+        // through, keeps a batch near 1 GiB: 256 rows.
         let md = wide_rows_meta(4, 4 << 20);
-        let rows = cluster_read_batch_rows(&md);
-        assert!(rows < CLUSTER_READ_BATCH_ROWS, "{rows}");
+        let rows = crate::untrusted::batch_rows_for(&md, None, 1024);
+        assert!(rows < 1024, "{rows}");
         assert!((rows as u64) * (4 << 20) <= 1 << 31, "{rows}");
     }
 
     #[test]
     fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
         let md = wide_rows_meta(16, 100);
-        assert_eq!(cluster_read_batch_rows(&md), CLUSTER_READ_BATCH_ROWS);
+        assert_eq!(crate::untrusted::batch_rows_for(&md, None, 1024), 1024);
     }
 }

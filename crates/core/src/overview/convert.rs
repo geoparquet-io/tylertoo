@@ -50,7 +50,6 @@ use geo_traits::{
 use geoarrow::array::{from_arrow_array, GeometryBuilder};
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::input::InputSource;
 use crate::input_set::{ConvertSource, RowGroupSelection};
@@ -3500,12 +3499,10 @@ mod property_selection_tests {
 /// its batches will carry.
 fn project_builder_to_selection(
     source: &ConvertSource,
-    builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
-        crate::input::InputReader,
-    >,
+    builder: crate::untrusted::ParquetSource<crate::input::InputReader>,
 ) -> Result<
     (
-        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<crate::input::InputReader>,
+        crate::untrusted::ParquetSource<crate::input::InputReader>,
         SchemaRef,
     ),
     ConvertError,
@@ -3535,9 +3532,7 @@ fn project_builder_to_selection(
 /// cannot overflow and are not counted.
 fn check_in_memory_byte_array_total(
     source: &ConvertSource,
-    builder: &parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
-        crate::input::InputReader,
-    >,
+    builder: &crate::untrusted::ParquetSource<crate::input::InputReader>,
     row_groups: Option<&[usize]>,
     limit_bytes: u64,
 ) -> Result<(), ConvertError> {
@@ -3647,7 +3642,7 @@ fn load_input_table(
         source,
         source_single,
         options,
-        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        crate::untrusted::byte_array_limit(),
     )
 }
 
@@ -7828,8 +7823,7 @@ pub(super) fn fill_level_bytes(
     reports: &mut [LevelReport],
 ) -> Result<(), ConvertError> {
     let file = std::fs::File::open(output_path)?;
-    let pq = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let pmeta = pq.metadata();
+    let pmeta = crate::untrusted::read_parquet_metadata(&file)?;
 
     let mut start = 0usize;
     for (level, report) in meta.levels.iter().zip(reports.iter_mut()) {
@@ -9749,7 +9743,7 @@ mod tests {
     /// Field names of an overview output file, in schema order.
     fn output_column_names(path: &Path) -> Vec<String> {
         let file = std::fs::File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         builder
             .schema()
             .fields()
@@ -12017,14 +12011,10 @@ mod tests {
         write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
 
         // Sanity: the file really does declare 3857.
-        let reader = parquet::file::serialized_reader::SerializedFileReader::new(
-            std::fs::File::open(tin.path()).unwrap(),
-        )
-        .unwrap();
-        let kv = parquet::file::reader::FileReader::metadata(&reader)
-            .file_metadata()
-            .key_value_metadata()
-            .cloned();
+        let meta =
+            crate::untrusted::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap())
+                .unwrap();
+        let kv = meta.file_metadata().key_value_metadata().cloned();
         assert_eq!(
             detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
             Crs::Epsg3857
@@ -12196,8 +12186,7 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         let file = std::fs::File::open(tin.path()).unwrap();
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let schema = builder.schema();
         assert!(
             schema.metadata().contains_key("geo"),
@@ -12897,7 +12886,7 @@ mod tests {
     /// Raw `geo:overviews` footer JSON of an overview file.
     fn overviews_footer_json(path: &Path) -> String {
         let file = std::fs::File::open(path).unwrap();
-        let b = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let b = crate::untrusted::open_parquet(file).unwrap();
         b.metadata()
             .file_metadata()
             .key_value_metadata()
@@ -12981,12 +12970,10 @@ mod tests {
     /// run-to-run (serial-vs-serial also differs by a few bytes there), so a raw
     /// `Vec<u8>` compare is not a valid equivalence check.
     fn assert_outputs_equivalent(a: &Path, b: &Path, ctx: &str) {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-
         // Row-group layout (num groups, rows per group, column count).
         let layout = |p: &Path| -> Vec<(i64, usize)> {
-            let r = SerializedFileReader::new(std::fs::File::open(p).unwrap()).unwrap();
-            let md = r.metadata();
+            let md =
+                crate::untrusted::read_parquet_metadata(&std::fs::File::open(p).unwrap()).unwrap();
             (0..md.num_row_groups())
                 .map(|i| (md.row_group(i).num_rows(), md.row_group(i).columns().len()))
                 .collect()
@@ -15270,8 +15257,7 @@ mod tests {
         /// Byte span `[start, end)` of each row group's data pages.
         fn row_group_spans(bytes: &[u8]) -> Vec<std::ops::Range<u64>> {
             let builder =
-                ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
-                    .unwrap();
+                crate::untrusted::open_parquet(bytes::Bytes::from(bytes.to_vec())).unwrap();
             builder
                 .metadata()
                 .row_groups()

@@ -64,6 +64,7 @@ pub mod shard;
 pub mod stats;
 pub mod sutherland_hodgman;
 pub mod tile;
+pub mod untrusted;
 pub mod wkb;
 pub(crate) mod wkb_column;
 

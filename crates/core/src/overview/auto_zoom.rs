@@ -1193,7 +1193,6 @@ mod tests {
     /// not move the pinned zoom (z14), and the covering path must be taken.
     #[test]
     fn declared_covering_on_a_real_fixture_keeps_the_pinned_zoom() {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::arrow::ArrowWriter;
         use parquet::file::metadata::KeyValue;
         use std::sync::Arc;
@@ -1207,7 +1206,7 @@ mod tests {
         let dst = dir.path().join("ob-covered.parquet");
 
         let file = std::fs::File::open(src).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let kv = builder
             .metadata()
             .file_metadata()

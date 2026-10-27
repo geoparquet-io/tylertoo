@@ -6,8 +6,6 @@
 
 use std::path::Path;
 
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
 use serde_json::Value;
 
 use crate::{Error, Result};
@@ -318,7 +316,7 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
     let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("cannot open {}: {e}", first_file.display())))?;
 
-    let reader = SerializedFileReader::new(file).map_err(|e| {
+    let metadata = crate::untrusted::read_parquet_metadata(&file).map_err(|e| {
         Error::GeoParquetRead(format!(
             "cannot read the Parquet footer of {}: {}",
             first_file.display(),
@@ -326,7 +324,6 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
         ))
     })?;
 
-    let metadata = reader.metadata();
     let file_metadata = metadata.file_metadata();
     crs_info_from_kv_metadata(file_metadata.key_value_metadata())
 }

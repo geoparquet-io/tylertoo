@@ -461,10 +461,10 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
     let file = File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open {}: {}", path.display(), e)))?;
 
-    let reader = SerializedFileReader::new(file)
+    let metadata = crate::untrusted::read_parquet_metadata(&file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to read {}: {}", path.display(), e)))?;
 
-    extract_row_group_bounds_from_reader(&reader)
+    extract_row_group_bounds_from_metadata(&metadata)
 }
 
 /// Extract bounding boxes from an already-opened Parquet reader.

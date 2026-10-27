@@ -927,9 +927,7 @@ pub(super) fn build_fill_map(
                     super::EXPORT_BATCH_SIZE,
                     &[root],
                 )?,
-                None => {
-                    reader.read_level_with_batch_size(level_idx, None, super::EXPORT_BATCH_SIZE)?
-                }
+                None => reader.read_level_batched(level_idx, None, super::EXPORT_BATCH_SIZE)?,
             };
             for batch in batches {
                 let batch = batch

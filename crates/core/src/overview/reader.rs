@@ -23,12 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::covering::extract_row_group_bounds_from_metadata;
 use crate::tile::TileBounds;
+use crate::untrusted::{ParquetSource, UntrustedBatchReader};
 
 use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
@@ -100,10 +100,13 @@ pub struct OverviewReader {
     metadata: Arc<ParquetMetaData>,
     schema: SchemaRef,
     meta: OverviewsMeta,
-    /// Most rows one read batch may hold (#563): an overview level keeps its
-    /// source geometries, so a batch of very large ones would pass arrow's
-    /// i32 byte-array offset ceiling. Every read clamps its batch to this.
-    max_batch_rows: usize,
+    /// The footer and schema [`Self::open`] checked and decoded
+    /// ([`crate::untrusted`]): every read reopens the file with them rather
+    /// than parsing the footer again. Each read's batch is capped there for
+    /// its row groups' widest byte-array column (#563): an overview level
+    /// keeps its source geometries, so a batch of very large ones would pass
+    /// arrow's i32 byte-array offset ceiling.
+    reader_metadata: ArrowReaderMetadata,
 }
 
 impl OverviewReader {
@@ -125,12 +128,11 @@ impl OverviewReader {
             path: shown(),
             error,
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
-            ReaderError::Footer {
+        let builder =
+            crate::untrusted::open_parquet(file).map_err(|error| ReaderError::Footer {
                 path: shown(),
                 error,
-            }
-        })?;
+            })?;
         let metadata = builder.metadata().clone();
         let schema = builder.schema().clone();
 
@@ -150,12 +152,8 @@ impl OverviewReader {
         // values, usize-wrapped) row-group reads.
         meta.validate(metadata.num_row_groups() as i64)?;
 
-        let max_batch_rows = crate::input_set::capped_batch_rows(
-            usize::MAX,
-            crate::input_set::widest_byte_array_column(&metadata, None, 0).as_ref(),
-        );
         Ok(Self {
-            max_batch_rows,
+            reader_metadata: builder.reader_metadata().clone(),
             path,
             metadata,
             schema,
@@ -457,13 +455,11 @@ impl OverviewReader {
         &self,
         level_idx: usize,
         bbox: Option<[f64; 4]>,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+    ) -> Result<UntrustedBatchReader, ReaderError> {
         let selected = self.selected_row_groups(level_idx, bbox)?;
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?.with_row_groups(selected);
-        // The builder's default batch (1024 rows), clamped like every read.
-        let reader = builder.with_batch_size(self.batch_rows(1024)).build()?;
-        Ok(reader)
+        // The parquet reader's default batch (1024 rows), capped like every
+        // read.
+        Ok(self.reopen()?.with_row_groups(selected).build()?)
     }
 
     /// [`Self::read_level`] with an explicit Arrow batch size (the builder
@@ -474,43 +470,42 @@ impl OverviewReader {
     ///
     /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
     /// the Parquet reader cannot be built.
-    pub fn read_level_with_batch_size(
+    pub fn read_level_batched(
         &self,
         level_idx: usize,
         bbox: Option<[f64; 4]>,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        self.read_level_any_bbox_with_batch_size(
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        self.read_level_any_bbox_batched(
             level_idx,
             bbox.as_ref().map(std::slice::from_ref),
             batch_size,
         )
     }
 
-    /// [`Self::read_level_with_batch_size`] pruned by the union of several
+    /// [`Self::read_level_batched`] pruned by the union of several
     /// bboxes. The PMTiles export reads a wave this way so a feature stored
     /// one world width from the wave's tiles, which the export draws there
     /// wrapped (#342), is not pruned away.
-    pub(crate) fn read_level_any_bbox_with_batch_size(
+    pub(crate) fn read_level_any_bbox_batched(
         &self,
         level_idx: usize,
         bboxes: Option<&[[f64; 4]]>,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+    ) -> Result<UntrustedBatchReader, ReaderError> {
         let selected = self.selected_row_groups_any(level_idx, bboxes)?;
-        let file = File::open(&self.path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        Ok(self
+            .reopen()?
             .with_row_groups(selected)
-            .with_batch_size(self.batch_rows(batch_size))
-            .build()?;
-        Ok(reader)
+            .with_batch_rows(batch_size)
+            .build()?)
     }
 
     /// Read exactly `level_idx`'s **own** row-group band (`start..=end`, the
     /// §3.3 span), unpruned and independent of mode, with an explicit Arrow
     /// batch size.
     ///
-    /// Unlike [`Self::read_level_with_batch_size`] — which in partitioning mode
+    /// Unlike [`Self::read_level_batched`] — which in partitioning mode
     /// reads the accumulating prefix `0..=end` — this reads only the band that
     /// *belongs to* the level. It is the unit of work for a single-read,
     /// fan-out scan of the whole file (issue #233): reading each band once
@@ -521,15 +516,15 @@ impl OverviewReader {
     ///
     /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
     /// the Parquet reader cannot be built.
-    pub fn read_band_with_batch_size(
+    pub fn read_band_batched(
         &self,
         level_idx: usize,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+    ) -> Result<UntrustedBatchReader, ReaderError> {
         Ok(self.band_builder(level_idx, batch_size)?.build()?)
     }
 
-    /// [`Self::read_band_with_batch_size`] projected to the top-level columns
+    /// [`Self::read_band_batched`] projected to the top-level columns
     /// `roots` (indexes into [`Self::schema`]); batches carry only those
     /// columns, in schema order, with their field metadata intact.
     ///
@@ -541,10 +536,11 @@ impl OverviewReader {
         level_idx: usize,
         batch_size: usize,
         roots: &[usize],
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let builder = self.band_builder(level_idx, batch_size)?;
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
-        Ok(builder.with_projection(mask).build()?)
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        Ok(self
+            .band_builder(level_idx, batch_size)?
+            .with_projection_roots(roots.iter().copied())
+            .build()?)
     }
 
     /// Read exactly the row groups `row_groups` (ascending, file order),
@@ -558,13 +554,13 @@ impl OverviewReader {
         row_groups: Vec<usize>,
         batch_size: usize,
         roots: &[usize],
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        Ok(self
+            .reopen()?
             .with_row_groups(row_groups)
-            .with_batch_size(self.batch_rows(batch_size));
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
-        Ok(builder.with_projection(mask).build()?)
+            .with_batch_rows(batch_size)
+            .with_projection_roots(roots.iter().copied())
+            .build()?)
     }
 
     /// The parsed Parquet footer (row-group sizes and column statistics).
@@ -593,18 +589,22 @@ impl OverviewReader {
         &self,
         level_idx: usize,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReaderBuilder<File>, ReaderError> {
+    ) -> Result<ParquetSource<File>, ReaderError> {
         let (start, end) = self.level_band(level_idx)?;
-        let file = File::open(&self.path)?;
-        Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
+        Ok(self
+            .reopen()?
             .with_row_groups((start..=end).collect())
-            .with_batch_size(self.batch_rows(batch_size)))
+            .with_batch_rows(batch_size))
     }
 
-    /// `requested` rows per batch, clamped to [`Self::max_batch_rows`]
-    /// (#563).
-    fn batch_rows(&self, requested: usize) -> usize {
-        requested.clamp(1, self.max_batch_rows)
+    /// The file reopened through the owner with the footer [`Self::open`]
+    /// already checked: no second footer parse, the same batch cap.
+    fn reopen(&self) -> Result<ParquetSource<File>, ReaderError> {
+        let file = File::open(&self.path)?;
+        Ok(crate::untrusted::open_parquet_with_metadata(
+            file,
+            self.reader_metadata.clone(),
+        ))
     }
 }
 
@@ -639,7 +639,7 @@ pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
         let _ = reader.level_for_gsd(reader.meta().levels[k].gsd);
         let _ = reader.row_groups_for_level(k)?;
         let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
-        for batch in reader.read_band_with_batch_size(k, 256)? {
+        for batch in reader.read_band_batched(k, 256)? {
             rows += batch
                 .map_err(parquet::errors::ParquetError::from)?
                 .num_rows();
@@ -751,7 +751,7 @@ mod tests {
     }
 
     /// Read the `id` column across a level reader.
-    fn read_ids(reader: ParquetRecordBatchReader) -> Vec<i64> {
+    fn read_ids(reader: crate::untrusted::UntrustedBatchReader) -> Vec<i64> {
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
