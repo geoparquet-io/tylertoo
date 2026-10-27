@@ -79,7 +79,14 @@ fn bench_encode_polygon(c: &mut Criterion) {
         let poly = generate_circle_polygon(size, center, 20.0);
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &poly, |b, poly| {
-            b.iter(|| black_box(encode_polygon(black_box(poly), black_box(&bounds), 4096)));
+            b.iter(|| {
+                black_box(encode_polygon(
+                    black_box(poly),
+                    black_box(&bounds),
+                    4096,
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                ))
+            });
         });
     }
 
@@ -92,7 +99,14 @@ fn bench_encode_polygon(c: &mut Criterion) {
         // Named for the over-cap early-out in `node_ring` (the noding sweep
         // itself is covered by the synthetic sizes above).
         group.bench_function("antarctica_316k_over_cap", |b| {
-            b.iter(|| black_box(encode_polygon(black_box(&poly), black_box(&bounds), 4096)));
+            b.iter(|| {
+                black_box(encode_polygon(
+                    black_box(&poly),
+                    black_box(&bounds),
+                    4096,
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                ))
+            });
         });
     } else {
         fixtures::missing("mvt_encode", "antarctica-polygon.wkb");
@@ -158,7 +172,13 @@ fn bench_value_dedup(c: &mut Criterion) {
             b.iter(|| {
                 let mut builder = LayerBuilder::new("bench").with_extent(4096);
                 for (i, (geom, props)) in features.iter().enumerate() {
-                    builder.add_feature(Some(i as u64), geom, props, &bounds);
+                    builder.add_feature(
+                        Some(i as u64),
+                        geom,
+                        props,
+                        &bounds,
+                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                    );
                 }
                 black_box(builder.build())
             });

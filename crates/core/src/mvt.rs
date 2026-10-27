@@ -20,7 +20,6 @@ use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point
 use std::collections::HashMap;
 
 mod tile_polygon;
-pub use tile_polygon::{invalid_after_encode_count, tile_polygon_repair_counts};
 
 /// Default tile extent (4096 as per MVT spec)
 pub const DEFAULT_EXTENT: u32 = 4096;
@@ -871,7 +870,11 @@ impl QuantizedPolygons {
     /// [`EncodedFeatureGeometry::encode`] encodes the feature alone or the
     /// MultiPolygon of the group's polygons. `None` if a feature in the
     /// group is not polygonal.
-    pub(crate) fn encode(&self, group: &[usize]) -> Option<EncodedFeatureGeometry> {
+    pub(crate) fn encode(
+        &self,
+        group: &[usize],
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Option<EncodedFeatureGeometry> {
         let feats: Vec<&QuantizedFeature> = group
             .iter()
             .map(|&i| self.features[i].as_ref())
@@ -897,7 +900,7 @@ impl QuantizedPolygons {
         } else {
             polys
         };
-        let commands = encode_tile_polygons(polys);
+        let commands = encode_tile_polygons(polys, diagnostics);
         Some(if !commands.is_empty() {
             EncodedFeatureGeometry::Parts(vec![(commands, GeomType::Polygon)])
         } else if feats.iter().any(|f| f.has_coords) {
@@ -998,8 +1001,11 @@ fn encode_tile_ring(
 /// path built them (plain encode, the merge valve's cached unions, the
 /// coverage fill, placeholder squares, `--verbatim`), what leaves is a valid
 /// OGC MultiPolygon in tile space, or a counted failure (#748).
-fn encode_tile_polygons(polys: Vec<Vec<TileRing>>) -> Vec<u32> {
-    let polys = tile_polygon::finalize_polygons(polys);
+fn encode_tile_polygons(
+    polys: Vec<Vec<TileRing>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
+    let polys = tile_polygon::finalize_polygons(polys, diagnostics);
     let total: usize = polys.iter().flatten().map(|r| 4 + r.len() * 2).sum();
     let mut out = Vec::with_capacity(total);
     let mut cursor = (0i32, 0i32);
@@ -1028,11 +1034,16 @@ fn encode_tile_polygons(polys: Vec<Vec<TileRing>>) -> Vec<u32> {
 /// clamp, and `NaN`, which snaps to 0 — never panic and never produce a
 /// geometry outside the clamp. Such a clamped ring is still a valid MVT
 /// polygon, but its shape past the clamp is not preserved.
-pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+pub fn encode_polygon(
+    polygon: &Polygon,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
     // Quantize first, clean in tile space (#383), then orient on the stored
     // integer coordinates — the sign the spec is defined on.
     let proj = TileProjector::new(bounds, extent);
-    encode_tile_polygons(quantized_polygons(polygon, &proj))
+    encode_tile_polygons(quantized_polygons(polygon, &proj), diagnostics)
 }
 
 /// Encode a MultiPolygon geometry to MVT geometry commands.
@@ -1044,14 +1055,19 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 ///
 /// Out-of-tile and non-finite vertices are clamped exactly as in
 /// [`encode_polygon`] (see its "Out-of-tile input" section).
-pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+pub fn encode_multi_polygon(
+    polygons: &MultiPolygon,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
     let proj = TileProjector::new(bounds, extent);
     let polys: Vec<Vec<TileRing>> = polygons
         .0
         .iter()
         .flat_map(|p| quantized_polygons(p, &proj))
         .collect();
-    encode_tile_polygons(resolve_part_overlaps(polys))
+    encode_tile_polygons(resolve_part_overlaps(polys), diagnostics)
 }
 
 /// Encode polygons already in integer tile units (each one an exterior
@@ -1061,6 +1077,7 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
 /// coverage fill is built in tile units, so it skips the projection.
 pub(crate) fn encode_tile_unit_polygons<'a>(
     polygons: impl IntoIterator<Item = &'a Vec<Vec<(i32, i32)>>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<u32> {
     let close = |ring: &Vec<(i32, i32)>| -> Option<TileRing> {
         let mut r: TileRing = Vec::with_capacity(ring.len() + 1);
@@ -1083,7 +1100,7 @@ pub(crate) fn encode_tile_unit_polygons<'a>(
             Some(rs)
         })
         .collect();
-    encode_tile_polygons(resolve_part_overlaps(polys))
+    encode_tile_polygons(resolve_part_overlaps(polys), diagnostics)
 }
 
 /// Encode a single-type `geo::Geometry` to MVT geometry commands and return the
@@ -1094,7 +1111,12 @@ pub(crate) fn encode_tile_unit_polygons<'a>(
 /// `(vec![], GeomType::Unknown)`: split it first with
 /// [`flatten_geometry_collection`], which is what [`LayerBuilder::add_feature`]
 /// does (#431).
-pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Vec<u32>, GeomType) {
+pub fn encode_geometry(
+    geom: &Geometry,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> (Vec<u32>, GeomType) {
     match geom {
         Geometry::Point(p) => (encode_point(p, bounds, extent), GeomType::Point),
         Geometry::MultiPoint(mp) => (encode_multi_point(mp, bounds, extent), GeomType::Point),
@@ -1103,18 +1125,24 @@ pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Ve
             encode_multi_linestring(mls, bounds, extent),
             GeomType::Linestring,
         ),
-        Geometry::Polygon(p) => (encode_polygon(p, bounds, extent), GeomType::Polygon),
-        Geometry::MultiPolygon(mp) => (encode_multi_polygon(mp, bounds, extent), GeomType::Polygon),
+        Geometry::Polygon(p) => (
+            encode_polygon(p, bounds, extent, diagnostics),
+            GeomType::Polygon,
+        ),
+        Geometry::MultiPolygon(mp) => (
+            encode_multi_polygon(mp, bounds, extent, diagnostics),
+            GeomType::Polygon,
+        ),
         Geometry::Line(l) => (
             encode_linestring(&LineString::from(*l), bounds, extent),
             GeomType::Linestring,
         ),
         Geometry::Rect(r) => (
-            encode_polygon(&r.to_polygon(), bounds, extent),
+            encode_polygon(&r.to_polygon(), bounds, extent, diagnostics),
             GeomType::Polygon,
         ),
         Geometry::Triangle(t) => (
-            encode_polygon(&t.to_polygon(), bounds, extent),
+            encode_polygon(&t.to_polygon(), bounds, extent, diagnostics),
             GeomType::Polygon,
         ),
         Geometry::GeometryCollection(_) => (vec![], GeomType::Unknown),
@@ -1294,15 +1322,20 @@ impl EncodedFeatureGeometry {
     /// into one part per geometry kind present (polygons, lines, points, in
     /// that draw order). Parts that encode to nothing are skipped, since MVT
     /// 2.1 §4.2 requires a geometry.
-    pub(crate) fn encode(geometry: &Geometry, bounds: &TileBounds, extent: u32) -> Self {
+    pub(crate) fn encode(
+        geometry: &Geometry,
+        bounds: &TileBounds,
+        extent: u32,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Self {
         let parts: Vec<(Vec<u32>, GeomType)> = match geometry {
             Geometry::GeometryCollection(gc) => flatten_geometry_collection(gc)
                 .iter()
-                .map(|part| encode_geometry(part, bounds, extent))
+                .map(|part| encode_geometry(part, bounds, extent, diagnostics))
                 .filter(|(commands, _)| !commands.is_empty())
                 .collect(),
             _ => {
-                let encoded = encode_geometry(geometry, bounds, extent);
+                let encoded = encode_geometry(geometry, bounds, extent, diagnostics);
                 if encoded.0.is_empty() {
                     Vec::new()
                 } else {
@@ -1459,8 +1492,9 @@ impl LayerBuilder {
         geometry: &Geometry,
         properties: &[(String, PropertyValue)],
         bounds: &TileBounds,
+        diagnostics: &crate::diagnostics::Diagnostics,
     ) {
-        let encoded = EncodedFeatureGeometry::encode(geometry, bounds, self.extent);
+        let encoded = EncodedFeatureGeometry::encode(geometry, bounds, self.extent, diagnostics);
         self.add_encoded_feature(id, encoded, properties);
     }
 
@@ -1681,7 +1715,12 @@ mod tests {
     /// polygons in group order (`coalesce_valve::concat_geometry`).
     fn merged_reference(geoms: &[Geometry], group: &[usize]) -> EncodedFeatureGeometry {
         if let [only] = group {
-            return EncodedFeatureGeometry::encode(&geoms[*only], &test_bounds(), 4096);
+            return EncodedFeatureGeometry::encode(
+                &geoms[*only],
+                &test_bounds(),
+                4096,
+                &crate::diagnostics::Diagnostics::default(),
+            );
         }
         let mut polys = Vec::new();
         for &i in group {
@@ -1697,6 +1736,7 @@ mod tests {
             &Geometry::MultiPolygon(MultiPolygon(polys)),
             &test_bounds(),
             4096,
+            &crate::diagnostics::Diagnostics::default(),
         )
     }
 
@@ -1738,8 +1778,16 @@ mod tests {
 
         let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096)
             .expect("a few overlaps");
-        assert!(q.encode(&[19]).is_none(), "a line is not cached");
-        assert!(q.encode(&[0, 19]).is_none(), "nor a group holding one");
+        assert!(
+            q.encode(&[19], &crate::diagnostics::Diagnostics::default())
+                .is_none(),
+            "a line is not cached"
+        );
+        assert!(
+            q.encode(&[0, 19], &crate::diagnostics::Diagnostics::default())
+                .is_none(),
+            "nor a group holding one"
+        );
         let polygonal: Vec<usize> = (0..19).collect();
         let mut groups: Vec<Vec<usize>> = polygonal.iter().map(|&i| vec![i]).collect();
         groups.push(polygonal.clone());
@@ -1761,7 +1809,8 @@ mod tests {
         for pass in 0..3 {
             for g in &groups {
                 assert_eq!(
-                    q.encode(g).expect("polygonal"),
+                    q.encode(g, &crate::diagnostics::Diagnostics::default())
+                        .expect("polygonal"),
                     merged_reference(&geoms, g),
                     "pass {pass}, group {g:?}"
                 );
@@ -1805,7 +1854,12 @@ mod tests {
         )
         .expect("a few overlaps");
         for g in [vec![0, 2, 4], vec![1, 3, 5], vec![2, 4]] {
-            assert_eq!(q.encode(&g).unwrap(), merged_reference(&geoms, &g), "{g:?}");
+            assert_eq!(
+                q.encode(&g, &crate::diagnostics::Diagnostics::default())
+                    .unwrap(),
+                merged_reference(&geoms, &g),
+                "{g:?}"
+            );
         }
     }
 
@@ -1820,7 +1874,7 @@ mod tests {
             4096,
         )
         .expect("two parts");
-        let _ = q.encode(&[0, 1]);
+        let _ = q.encode(&[0, 1], &crate::diagnostics::Diagnostics::default());
     }
 
     fn test_bounds() -> TileBounds {
@@ -2048,7 +2102,12 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0), // Closing point
         ];
-        let commands = encode_polygon(&poly, &bounds, 4096);
+        let commands = encode_polygon(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Should have: MoveTo(1), x, y, LineTo(3), dx1, dy1, dx2, dy2, dx3, dy3, ClosePath(1)
         // MoveTo + 2 coords + LineTo + 6 coords + ClosePath = 10 elements
@@ -2080,7 +2139,13 @@ mod tests {
             ("value".to_string(), PropertyValue::Int(42)),
         ];
 
-        builder.add_feature(Some(1), &point, &properties, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point,
+            &properties,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2104,8 +2169,20 @@ mod tests {
         let props1 = vec![("name".to_string(), PropertyValue::String("a".to_string()))];
         let props2 = vec![("name".to_string(), PropertyValue::String("b".to_string()))];
 
-        builder.add_feature(Some(1), &point1, &props1, &bounds);
-        builder.add_feature(Some(2), &point2, &props2, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point1,
+            &props1,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        builder.add_feature(
+            Some(2),
+            &point2,
+            &props2,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2132,8 +2209,20 @@ mod tests {
             PropertyValue::String("building".to_string()),
         )];
 
-        builder.add_feature(Some(1), &point1, &props1, &bounds);
-        builder.add_feature(Some(2), &point2, &props2, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point1,
+            &props1,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        builder.add_feature(
+            Some(2),
+            &point2,
+            &props2,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2156,6 +2245,7 @@ mod tests {
             &Geometry::Point(point!(x: 0.5, y: 0.5)),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
 
         let mut layer2 = LayerBuilder::new("lines");
@@ -2163,7 +2253,13 @@ mod tests {
             (x: 0.0, y: 0.0),
             (x: 1.0, y: 1.0),
         ]);
-        layer2.add_feature(Some(2), &line, &[], &bounds);
+        layer2.add_feature(
+            Some(2),
+            &line,
+            &[],
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let mut tile_builder = TileBuilder::new();
         tile_builder.add_layer(layer1.build());
@@ -2184,12 +2280,21 @@ mod tests {
     fn test_encode_geometry_returns_correct_type() {
         let bounds = test_bounds();
 
-        let (_, geom_type) =
-            encode_geometry(&Geometry::Point(point!(x: 0.5, y: 0.5)), &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &Geometry::Point(point!(x: 0.5, y: 0.5)),
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Point);
 
         let line = Geometry::LineString(line_string![(x: 0.0, y: 0.0), (x: 1.0, y: 1.0)]);
-        let (_, geom_type) = encode_geometry(&line, &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &line,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Linestring);
 
         let poly = Geometry::Polygon(polygon![
@@ -2199,7 +2304,12 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ]);
-        let (_, geom_type) = encode_geometry(&poly, &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Polygon);
     }
 
@@ -2275,7 +2385,12 @@ mod tests {
                 ],
             ],
         ];
-        let commands = encode_polygon(&poly, &bounds, 4096);
+        let commands = encode_polygon(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Decode the command stream into rings of absolute tile coords.
         let mut rings: Vec<Vec<(i64, i64)>> = Vec::new();
@@ -2444,8 +2559,18 @@ mod tests {
         ];
 
         // Both should produce equivalent MVT output (same geometry, just different input winding)
-        let commands_cw = encode_polygon(&poly_cw, &bounds, 4096);
-        let commands_ccw = encode_polygon(&poly_ccw, &bounds, 4096);
+        let commands_cw = encode_polygon(
+            &poly_cw,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let commands_ccw = encode_polygon(
+            &poly_ccw,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // The encoded geometry should be the same for both inputs
         // because winding correction normalizes them
@@ -2535,6 +2660,7 @@ mod tests {
             &Geometry::MultiLineString(multi_linestring.clone()),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let multi_tile = TileBuilder::new();
         let mut multi_builder = multi_tile;
@@ -2548,6 +2674,7 @@ mod tests {
             &Geometry::LineString(single_linestring.clone()),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let single_tile = TileBuilder::new();
         let mut single_builder = single_tile;
@@ -2703,7 +2830,12 @@ mod tests {
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid(), "the source polygon is valid");
 
-        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        let commands = encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let rings = rings_of(&commands);
         assert!(!rings.is_empty(), "the polygon must not vanish");
         // Every emitted polygon is valid in tile space (the closed neck
@@ -2737,7 +2869,12 @@ mod tests {
             (10.1, 20.0),
             (10.0, 10.0),
         ]);
-        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        let commands = encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(commands.is_empty(), "got {commands:?}");
     }
 
@@ -2752,7 +2889,12 @@ mod tests {
             (10.0, 50.0),
             (10.0, 10.0),
         ]);
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 1);
         assert_eq!(
             rings[0].len(),
@@ -2792,7 +2934,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             )],
         );
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 2);
         assert_eq!(rings[0].len(), 5);
         assert_eq!(rings[1].len(), 5);
@@ -2824,7 +2971,12 @@ mod tests {
         ];
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid());
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 2, "pinch must split: {rings:?}");
         for p in &out {
@@ -2861,7 +3013,12 @@ mod tests {
         ];
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid());
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 1, "{rings:?}");
         assert_eq!(out[0].interiors().len(), 1, "{rings:?}");
@@ -2909,7 +3066,10 @@ mod tests {
         ];
         let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 200, y + 200)).collect();
         let before = ring_area2(&ring).abs();
-        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         let out = rings_to_geo(&flat);
         assert_eq!(out.len(), 1, "{flat:?}");
@@ -2941,7 +3101,12 @@ mod tests {
             sq(30.0, 30.0, 70.0, 70.0),
             sq(200.0, 200.0, 210.0, 210.0),
         ]);
-        let rings = rings_of(&encode_multi_polygon(&mp, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_multi_polygon(
+            &mp,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 2, "{rings:?}");
         for p in &out {
@@ -2979,7 +3144,10 @@ mod tests {
             tile_polygon::check_polygons(&[vec![ring.clone()]]).is_err(),
             "fixture must self-intersect"
         );
-        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         assert!(!flat.is_empty());
         for p in rings_to_geo(&flat) {
@@ -3145,7 +3313,12 @@ mod tests {
             (0.0, 0.0),
             (50.0, 0.0),
         ]);
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 1);
         assert_eq!(
             rings[0],
@@ -3170,6 +3343,7 @@ mod tests {
             &Geometry::Polygon(poly),
             &[("k".to_string(), PropertyValue::Int(1))],
             &unit_bounds(),
+            &crate::diagnostics::Diagnostics::default(),
         );
         let built = layer.build();
         assert_eq!(built.features.len(), 0, "{:?}", built.features);
@@ -3333,7 +3507,10 @@ mod tests {
     fn zero_net_area_bowtie_keeps_a_lobe() {
         let ring = closed(&[(0, 0), (10, 5), (20, 10), (20, 0), (10, 5), (0, 10)]);
         assert_eq!(ring_area2(&ring), 0, "fixture must have zero net area");
-        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(!polys.is_empty(), "both lobes dropped");
         let area: i64 = polys.iter().flatten().map(|r| ring_area2(r).abs()).sum();
         assert!(area > 0);
@@ -3434,7 +3611,12 @@ mod tests {
     fn encode_polygon_saturated_coordinates_do_not_overflow() {
         let far =
             polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
-        let cmds = encode_polygon(&far, &tiny_bounds(), 4096);
+        let cmds = encode_polygon(
+            &far,
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(
             !cmds.is_empty(),
             "a huge ring covering the tile still encodes"
@@ -3462,8 +3644,18 @@ mod tests {
                 (0.5, -0.5),
             ])],
         );
-        assert_clamped(&encode_polygon(&huge, &tiny_bounds(), 4096));
-        assert_clamped(&encode_polygon(&huge, &test_bounds(), 4096));
+        assert_clamped(&encode_polygon(
+            &huge,
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+        assert_clamped(&encode_polygon(
+            &huge,
+            &test_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 
     /// `f64::MAX` / MIN, ±inf and NaN vertices must be handled explicitly:
@@ -3499,9 +3691,19 @@ mod tests {
         for pts in cases {
             let poly = Polygon::new(LineString::from(pts.clone()), vec![]);
             for bounds in [tiny_bounds(), test_bounds()] {
-                assert_clamped(&encode_polygon(&poly, &bounds, 4096));
+                assert_clamped(&encode_polygon(
+                    &poly,
+                    &bounds,
+                    4096,
+                    &crate::diagnostics::Diagnostics::default(),
+                ));
                 let multi = MultiPolygon::new(vec![poly.clone(), poly.clone()]);
-                assert_clamped(&encode_multi_polygon(&multi, &bounds, 4096));
+                assert_clamped(&encode_multi_polygon(
+                    &multi,
+                    &bounds,
+                    4096,
+                    &crate::diagnostics::Diagnostics::default(),
+                ));
             }
         }
     }
@@ -3514,7 +3716,12 @@ mod tests {
             polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
         let b =
             polygon![(x: -1e12, y: 0.3), (x: 1e12, y: 0.3), (x: 1e12, y: 0.7), (x: -1e12, y: 0.7)];
-        let cmds = encode_multi_polygon(&MultiPolygon::new(vec![a, b]), &tiny_bounds(), 4096);
+        let cmds = encode_multi_polygon(
+            &MultiPolygon::new(vec![a, b]),
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(!cmds.is_empty());
         assert_clamped(&cmds);
     }
@@ -3668,7 +3875,13 @@ mod tests {
             ]),
         ]));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(42), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(42),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(builder.feature_count(), 3, "one feature per geometry kind");
         assert_eq!(builder.dropped_features(), 0);
 
@@ -3709,7 +3922,13 @@ mod tests {
             Geometry::LineString(line_string![(x: 0.1, y: 0.1), (x: 0.9, y: 0.9)]),
         ]));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(3),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(builder.dropped_features(), 0);
         let layer = builder.build();
         assert_eq!(
@@ -3738,18 +3957,31 @@ mod tests {
         let gc =
             Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new()));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(1), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(1),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A collection of empty collections is just as empty.
         let nested = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
             Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new())),
         ]));
-        builder.add_feature(Some(2), &nested, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(2),
+            &nested,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A plain point still encodes, so the counter is per input feature.
         builder.add_feature(
             Some(3),
             &Geometry::Point(point!(x: 0.5, y: 0.5)),
             &gc_props(),
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(builder.feature_count(), 1);
         assert_eq!(builder.dropped_features(), 2);
@@ -3771,7 +4003,13 @@ mod tests {
         let mut builder = LayerBuilder::new("q");
         // One point is not a line: encode_linestring returns nothing.
         let stub = Geometry::LineString(LineString::from(vec![(0.5, 0.5)]));
-        builder.add_feature(Some(1), &stub, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(1),
+            &stub,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A polygon far below one tile unit collapses to zero area.
         let eps = 1e-9;
         let sliver = Geometry::Polygon(polygon![
@@ -3780,16 +4018,34 @@ mod tests {
             (x: 0.5 + eps, y: 0.5 + eps),
             (x: 0.5, y: 0.5),
         ]);
-        builder.add_feature(Some(2), &sliver, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(2),
+            &sliver,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A collection whose only parts quantize away is quantized, not empty.
         let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
             stub.clone(),
             sliver.clone(),
         ]));
-        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(3),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // Truly empty input stays on the unencodable side.
         let empty = Geometry::LineString(LineString::from(Vec::<(f64, f64)>::new()));
-        builder.add_feature(Some(4), &empty, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(4),
+            &empty,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         assert_eq!(builder.feature_count(), 0);
         assert_eq!(builder.quantized_features(), 3);
@@ -3809,13 +4065,44 @@ mod tests {
             (0.5, 0.9).into(),
         ));
         assert_eq!(
-            encode_geometry(&line, &bounds, 4096).1,
+            encode_geometry(
+                &line,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
             GeomType::Linestring
         );
-        assert_eq!(encode_geometry(&rect, &bounds, 4096).1, GeomType::Polygon);
-        assert_eq!(encode_geometry(&tri, &bounds, 4096).1, GeomType::Polygon);
+        assert_eq!(
+            encode_geometry(
+                &rect,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
+            GeomType::Polygon
+        );
+        assert_eq!(
+            encode_geometry(
+                &tri,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
+            GeomType::Polygon
+        );
         for g in [&line, &rect, &tri] {
-            assert!(!encode_geometry(g, &bounds, 4096).0.is_empty());
+            assert!(!encode_geometry(
+                g,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .0
+            .is_empty());
         }
         // Inside a collection they group with their kind.
         let gc = geo::GeometryCollection::from(vec![line, rect, tri]);
@@ -3944,7 +4231,12 @@ mod tile_space_validity_748 {
         vertices.push(vertices[0]);
         let polygon = Polygon::new(LineString::new(vertices), vec![]);
         assert!(polygon.is_valid(), "the source must be valid");
-        let (commands, kind) = encode_geometry(&Geometry::Polygon(polygon), &b, 4096);
+        let (commands, kind) = encode_geometry(
+            &Geometry::Polygon(polygon),
+            &b,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(kind, GeomType::Polygon);
         assert_valid(&commands);
     }
@@ -3957,7 +4249,12 @@ mod tile_space_validity_748 {
             polygon(&[&[(679, 3655), (677, 3659), (669, 3653), (677, 3648)]]),
             polygon(&[&[(668, 3656), (669, 3653), (673, 3654), (677, 3659)]]),
         ]);
-        assert_valid(&encode_multi_polygon(&mp, &unit_bounds(), 4096));
+        assert_valid(&encode_multi_polygon(
+            &mp,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 
     /// Madagascar adm4 feature 15595, z4 tile 4/10/8 (shifted 200 units
@@ -3982,7 +4279,12 @@ mod tile_space_validity_748 {
         let h1 = shift(&[(-118, 3991), (-118, 3993), (-117, 3992)]);
         let h2 = shift(&[(-121, 3997), (-120, 3995), (-121, 3995)]);
         let p = polygon(&[&shell, &h1, &h2]);
-        assert_valid(&encode_polygon(&p, &unit_bounds(), 4096));
+        assert_valid(&encode_polygon(
+            &p,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 
     /// Madagascar adm4 feature 10108, `--verbatim`, z1 tile 1/1/1: a hole
@@ -4002,7 +4304,12 @@ mod tile_space_validity_748 {
             ],
             &[(1043, 385), (1042, 384), (1042, 385)],
         ]);
-        assert_valid(&encode_polygon(&p, &unit_bounds(), 4096));
+        assert_valid(&encode_polygon(
+            &p,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 
     /// The same parts through the coverage fill's tile-unit entry point.
@@ -4012,6 +4319,9 @@ mod tile_space_validity_748 {
             vec![vec![(679, 3655), (677, 3659), (669, 3653), (677, 3648)]],
             vec![vec![(668, 3656), (669, 3653), (673, 3654), (677, 3659)]],
         ];
-        assert_valid(&encode_tile_unit_polygons(parts.iter()));
+        assert_valid(&encode_tile_unit_polygons(
+            parts.iter(),
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 }

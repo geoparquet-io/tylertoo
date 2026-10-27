@@ -7,7 +7,6 @@
 //! `Vec<Geometry>` — decode per batch and process immediately.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
@@ -72,9 +71,10 @@ pub fn resolve_parquet_files(path: &Path) -> Result<Vec<PathBuf>> {
 pub fn extract_geometries_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Geometry<f64>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<()> {
     let mut opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(array.len());
-    extract_geometries_opt_from_array(array, &mut opts)?;
+    extract_geometries_opt_from_array(array, &mut opts, diagnostics)?;
     output.extend(opts.into_iter().flatten());
     Ok(())
 }
@@ -95,8 +95,15 @@ pub fn extract_geometries_from_array(
 pub fn extract_geometries_opt_from_array(
     array: &dyn GeoArrowArray,
     output: &mut Vec<Option<Geometry<f64>>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<()> {
-    visit_geoarrow_array(array, ExtractGeometries { output })
+    visit_geoarrow_array(
+        array,
+        ExtractGeometries {
+            output,
+            diagnostics,
+        },
+    )
 }
 
 /// A computation over one typed GeoArrow accessor, run by
@@ -184,6 +191,8 @@ fn check_wkb_array(wkb: &dyn GeoArrowArray) -> Result<()> {
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+
     use crate::wkb_column::{check_wkb_value, WkbCheckError};
     use arrow_array::BinaryArray;
     use geoarrow::array::WkbArray;
@@ -208,7 +217,7 @@ pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
         Err(_) => {}
     }
     let mut out = Vec::with_capacity(1);
-    extract_geometries_opt_from_array(&array, &mut out)?;
+    extract_geometries_opt_from_array(&array, &mut out, diagnostics)?;
     let decoded = out.pop().flatten();
     // #650: pass 1 scans the value in place instead of decoding it. The two
     // must agree, to the bit, on every value the decoder accepts.
@@ -225,18 +234,8 @@ pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
     Ok(decoded)
 }
 
-// F2: becomes Diagnostic::NonFiniteGeometry
-/// Process-wide count of decoded geometries that carried a NaN or infinite
-/// coordinate (#707) and were replaced by an empty geometry.
-static NON_FINITE_GEOMETRIES: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-wide non-finite geometry counter (#707).
-pub fn non_finite_geometry_count() -> u64 {
-    NON_FINITE_GEOMETRIES.load(Ordering::Relaxed)
-}
-
 /// `geometry`, or an empty geometry collection when any coordinate is NaN or
-/// infinite (#707): counted, and warned about once per process.
+/// infinite (#707): counted, and warned about once per run.
 ///
 /// This is the ingest boundary every decoded geometry crosses (the
 /// in-memory convert, pass 2, the export's reads of an overview file), so a
@@ -246,7 +245,10 @@ pub fn non_finite_geometry_count() -> u64 {
 /// stays row-aligned with the batch's other columns: an empty geometry has
 /// no bounding box, so it lands in no tile, and the convert's usable-geometry
 /// filter skips it exactly as it skipped the non-finite original.
-fn finite_or_empty(geometry: Geometry<f64>) -> Geometry<f64> {
+fn finite_or_empty(
+    geometry: Geometry<f64>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Geometry<f64> {
     use geo::CoordsIter;
     if geometry
         .coords_iter()
@@ -254,12 +256,7 @@ fn finite_or_empty(geometry: Geometry<f64>) -> Geometry<f64> {
     {
         return geometry;
     }
-    if NON_FINITE_GEOMETRIES.fetch_add(1, Ordering::Relaxed) == 0 {
-        log::warn!(
-            "a geometry with a NaN or infinite coordinate was read and left out (#707); \
-             later ones are counted, not logged"
-        );
-    }
+    diagnostics.record(crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 });
     Geometry::GeometryCollection(geo::GeometryCollection::default())
 }
 
@@ -267,6 +264,7 @@ fn finite_or_empty(geometry: Geometry<f64>) -> Geometry<f64> {
 /// `Option<Geometry>` per slot.
 struct ExtractGeometries<'o> {
     output: &'o mut Vec<Option<Geometry<f64>>>,
+    diagnostics: &'o crate::diagnostics::Diagnostics,
 }
 
 impl GeoArrowVisitor for ExtractGeometries<'_> {
@@ -283,8 +281,11 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
                     let geom_trait = geom_result.map_err(|e| {
                         Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
                     })?;
-                    self.output
-                        .push(geom_trait.try_to_geometry().map(finite_or_empty));
+                    self.output.push(
+                        geom_trait
+                            .try_to_geometry()
+                            .map(|g| finite_or_empty(g, self.diagnostics)),
+                    );
                 }
                 None => self.output.push(None),
             }
@@ -302,6 +303,8 @@ mod tests {
     /// row-aligned.
     #[test]
     fn a_non_finite_geometry_is_emptied_and_counted_at_ingest() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+
         use arrow_array::BinaryArray;
         use geoarrow::array::WkbArray;
         use geoarrow::datatypes::WkbType;
@@ -321,9 +324,10 @@ mod tests {
             BinaryArray::from_vec(rows.iter().map(Vec::as_slice).collect()),
             WkbType::default(),
         ));
-        let before = non_finite_geometry_count();
+        let before =
+            diagnostics.count(&crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 0 });
         let mut out = Vec::new();
-        extract_geometries_opt_from_array(&array, &mut out).unwrap();
+        extract_geometries_opt_from_array(&array, &mut out, &diagnostics).unwrap();
         assert_eq!(out.len(), 3, "row-aligned");
         assert_eq!(
             out[1],
@@ -333,7 +337,11 @@ mod tests {
         );
         assert!(matches!(out[0], Some(Geometry::Point(_))));
         assert!(matches!(out[2], Some(Geometry::Point(_))));
-        assert!(non_finite_geometry_count() > before, "counted");
+        assert!(
+            diagnostics.count(&crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 0 })
+                > before,
+            "counted"
+        );
     }
 
     /// A valid point, a null, and #632's 9-byte MultiPolygon that claims
@@ -351,8 +359,12 @@ mod tests {
 
     fn assert_rejects_row_2(array: &dyn GeoArrowArray) {
         let mut out = Vec::new();
-        let err = extract_geometries_opt_from_array(array, &mut out)
-            .expect_err("the hostile value must be an error, not an abort");
+        let err = extract_geometries_opt_from_array(
+            array,
+            &mut out,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect_err("the hostile value must be an error, not an abort");
         assert_eq!(
             err.to_string(),
             "Failed to read GeoParquet file: Invalid geometry at index 2: WKB declares \
@@ -391,7 +403,12 @@ mod tests {
         let refs: Vec<Option<&[u8]>> = rows[..2].iter().map(|r| r.as_deref()).collect();
         let wkb = WkbArray::from((BinaryArray::from(refs), WkbType::default()));
         let mut out = Vec::new();
-        extract_geometries_opt_from_array(&wkb, &mut out).unwrap();
+        extract_geometries_opt_from_array(
+            &wkb,
+            &mut out,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(
             out,
             vec![Some(Geometry::Point(geo::point!(x: 1.0, y: 2.0))), None]

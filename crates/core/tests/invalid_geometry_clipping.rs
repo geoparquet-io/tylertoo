@@ -144,7 +144,12 @@ fn test_self_intersecting_polygon_produces_valid_output() {
     // The polygon is in Berlin (lng ~13.38, lat ~52.507)
     let bounds = TileBounds::new(13.379, 52.506, 13.382, 52.508);
 
-    let result = clip_geometry(&Geometry::Polygon(poly), &bounds, 0.0);
+    let result = clip_geometry(
+        &Geometry::Polygon(poly),
+        &bounds,
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
 
     // The result should exist (polygon intersects bounds)
     assert!(result.is_some(), "Clipping should produce a result");
@@ -187,7 +192,12 @@ fn test_hole_intersecting_exterior_produces_valid_output() {
     // The polygon is in Berlin (lng ~13.382-13.384, lat ~52.514-52.516)
     let bounds = TileBounds::new(13.381, 52.514, 13.385, 52.517);
 
-    let result = clip_geometry(&Geometry::Polygon(poly), &bounds, 0.0);
+    let result = clip_geometry(
+        &Geometry::Polygon(poly),
+        &bounds,
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
 
     assert!(result.is_some(), "Clipping should produce a result");
 
@@ -245,7 +255,12 @@ fn test_u_shape_split_produces_multipolygon() {
     // This should produce two separate polygons (the two arms)
     let bounds = TileBounds::new(-0.1, 1.0, 1.1, 2.5);
 
-    let result = clip_geometry(&Geometry::Polygon(u_shape), &bounds, 0.0);
+    let result = clip_geometry(
+        &Geometry::Polygon(u_shape),
+        &bounds,
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
 
     assert!(result.is_some(), "Clipping should produce a result");
 
@@ -304,7 +319,12 @@ fn test_valid_polygon_clips_correctly() {
     // Clip to right half
     let bounds = TileBounds::new(0.5, -0.1, 1.1, 1.1);
 
-    let result = clip_geometry(&Geometry::Polygon(square), &bounds, 0.0);
+    let result = clip_geometry(
+        &Geometry::Polygon(square),
+        &bounds,
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
 
     assert!(result.is_some(), "Clipping should produce a result");
 
@@ -351,7 +371,12 @@ fn test_valid_polygon_with_hole_clips_correctly() {
     // Clip to encompass everything
     let bounds = TileBounds::new(-0.1, -0.1, 2.1, 2.1);
 
-    let result = clip_geometry(&Geometry::Polygon(poly_with_hole), &bounds, 0.0);
+    let result = clip_geometry(
+        &Geometry::Polygon(poly_with_hole),
+        &bounds,
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
 
     assert!(result.is_some(), "Clipping should produce a result");
 

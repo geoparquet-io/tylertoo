@@ -19,7 +19,7 @@
 //! pinches first can discard recoverable fill in crossings and zero-area rings.
 //!
 //! The result is checked again, and one that still fails is counted
-//! ([`invalid_after_encode_count`]) and logged, never passed over in silence.
+//! (through the run diagnostics) and logged, never passed over in silence.
 //!
 //! DIVERGENCE FROM TIPPECANOE: tippecanoe runs every polygon of every tile
 //! through wagyu (`clean_or_clip_poly` in `clip.cpp`: a `clip_type_union` with
@@ -41,105 +41,9 @@ use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::core::solver::Solver;
 use i_overlay::i_float::int::point::IntPoint;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Why a feature failed [`check_polygons`]: the OGC rule it breaks, named
-/// after the snapping mechanism that usually causes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Defect {
-    /// A ring with fewer than three distinct vertices, or no area: a sliver
-    /// that snapped flat. GEOS: "Too few points"; the MVT decoder drops it.
-    CollapsedRing,
-    /// A ring touches or crosses itself: a neck that snapped shut, or a spike
-    /// that folded back. GEOS: "Ring Self-intersection" / "Self-intersection".
-    RingSelfTouch,
-    /// Two rings of one polygon cross or run along each other: a hole that
-    /// snapped onto its exterior. GEOS: "Self-intersection".
-    RingsCross,
-    /// A hole is not inside its exterior. GEOS: "Hole lies outside shell".
-    HoleOutsideShell,
-    /// A hole inside another hole. GEOS: "Holes are nested".
-    NestedHoles,
-    /// Holes touch the exterior and each other in a cycle, cutting the
-    /// polygon in two. GEOS: "Interior is disconnected".
-    DisconnectedInterior,
-    /// Two parts of a MultiPolygon cross or share an edge stretch: two
-    /// neighbours that snapped onto each other. GEOS: "Self-intersection".
-    PartsOverlap,
-    /// One part lies inside another's fill. GEOS: "Nested shells".
-    NestedShells,
-}
-
-impl Defect {
-    const ALL: [Defect; 8] = [
-        Defect::CollapsedRing,
-        Defect::RingSelfTouch,
-        Defect::RingsCross,
-        Defect::HoleOutsideShell,
-        Defect::NestedHoles,
-        Defect::DisconnectedInterior,
-        Defect::PartsOverlap,
-        Defect::NestedShells,
-    ];
-
-    /// A stable name for reports and logs.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Defect::CollapsedRing => "collapsed_ring",
-            Defect::RingSelfTouch => "ring_self_touch",
-            Defect::RingsCross => "rings_cross",
-            Defect::HoleOutsideShell => "hole_outside_shell",
-            Defect::NestedHoles => "nested_holes",
-            Defect::DisconnectedInterior => "disconnected_interior",
-            Defect::PartsOverlap => "parts_overlap",
-            Defect::NestedShells => "nested_shells",
-        }
-    }
-
-    fn index(self) -> usize {
-        Defect::ALL
-            .iter()
-            .position(|&d| d == self)
-            .expect("every defect is in ALL")
-    }
-}
-
-/// Features [`finalize_polygons`] repaired, per [`Defect`] found on the way
-/// in. Process-wide, like simplify's `VALIDATION_SKIPS`.
-static REPAIRED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
-// F2: becomes Diagnostic::InvalidAfterEncode
-/// Features that left the encoder still failing [`check_polygons`] after
-/// [`repair_polygons`] (#748). The first one in a process warns; the count is
-/// [`invalid_after_encode_count`]. Zero on every fixture of the strict
-/// invariant matrix (`run_e2e.py --invariants`).
-static INVALID_AFTER_ENCODE: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-wide count of polygonal features emitted invalid
-/// because the tile-space repair could not fix them (#748).
-pub fn invalid_after_encode_count() -> u64 {
-    INVALID_AFTER_ENCODE.load(Ordering::Relaxed)
-}
-
-/// Snapshot of the process-wide count of polygonal features the tile-space
-/// owner repaired, per defect name (#748). Defects with no repairs are
-/// included with 0, in a fixed order.
-pub fn tile_polygon_repair_counts() -> Vec<(&'static str, u64)> {
-    Defect::ALL
-        .iter()
-        .map(|&d| (d.name(), REPAIRED[d.index()].load(Ordering::Relaxed)))
-        .collect()
-}
-
-fn count_invalid_after_encode(defect: Defect) {
-    if INVALID_AFTER_ENCODE.fetch_add(1, Ordering::Relaxed) == 0 {
-        log::warn!(
-            "a polygon is still invalid in tile coordinates after repair ({}); it is \
-             written as-is (#748). Later ones are counted, not logged.",
-            defect.name()
-        );
-    }
-}
+use crate::diagnostics::Diagnostic;
+use crate::diagnostics::PolygonRepairKind as Defect;
 
 /// Make a feature's polygons valid in tile integer space: the single gate
 /// every polygonal MVT geometry passes (see the module docs).
@@ -150,17 +54,24 @@ fn count_invalid_after_encode(defect: Defect) {
 /// parts unchanged when they already form a valid OGC MultiPolygon, else the
 /// repaired parts (possibly empty: a feature whose rings all collapsed has
 /// no area at this zoom).
-pub(crate) fn finalize_polygons(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
+pub(crate) fn finalize_polygons(
+    parts: Vec<Vec<TileRing>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<Vec<TileRing>> {
     if parts.is_empty() {
         return parts;
     }
     let Err(defect) = check_polygons(&parts) else {
         return parts;
     };
-    REPAIRED[defect.index()].fetch_add(1, Ordering::Relaxed);
+    diagnostics.record(Diagnostic::PolygonRepaired {
+        count: 1,
+        kind: defect,
+    });
     let repaired = repair_polygons(&parts);
     if let Err(left) = check_polygons(&repaired) {
-        count_invalid_after_encode(left);
+        let _ = left;
+        diagnostics.record(Diagnostic::InvalidAfterEncode { count: 1 });
     }
     repaired
 }
@@ -764,7 +675,10 @@ mod tests {
     fn a_plain_square_is_valid_and_untouched() {
         let parts = vec![vec![square(0, 0, 10, 10)]];
         assert_eq!(check_polygons(&parts), Ok(()));
-        assert_eq!(finalize_polygons(parts.clone()), parts);
+        assert_eq!(
+            finalize_polygons(parts.clone(), &crate::diagnostics::Diagnostics::default()),
+            parts
+        );
     }
 
     #[test]
@@ -903,7 +817,10 @@ mod tests {
             check_polygons(&madagascar_7844()),
             Err(Defect::PartsOverlap)
         );
-        let fixed = finalize_polygons(madagascar_7844());
+        let fixed = finalize_polygons(
+            madagascar_7844(),
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(check_polygons(&fixed), Ok(()));
         assert_eq!(fixed.len(), 1, "the overlapping parts merge");
     }
@@ -923,7 +840,13 @@ mod tests {
             ]]),
         ];
         assert_eq!(check_polygons(&parts), Err(Defect::NestedShells));
-        assert_eq!(check_polygons(&finalize_polygons(parts)), Ok(()));
+        assert_eq!(
+            check_polygons(&finalize_polygons(
+                parts,
+                &crate::diagnostics::Diagnostics::default()
+            )),
+            Ok(())
+        );
     }
 
     #[test]
@@ -952,7 +875,13 @@ mod tests {
             check_polygons(std::slice::from_ref(&poly)),
             Err(Defect::DisconnectedInterior)
         );
-        assert_eq!(check_polygons(&finalize_polygons(vec![poly])), Ok(()));
+        assert_eq!(
+            check_polygons(&finalize_polygons(
+                vec![poly],
+                &crate::diagnostics::Diagnostics::default()
+            )),
+            Ok(())
+        );
     }
 
     #[test]
@@ -975,7 +904,7 @@ mod tests {
             check_polygons(std::slice::from_ref(&poly)),
             Err(Defect::HoleOutsideShell)
         );
-        let fixed = finalize_polygons(vec![poly]);
+        let fixed = finalize_polygons(vec![poly], &crate::diagnostics::Diagnostics::default());
         assert_eq!(check_polygons(&fixed), Ok(()));
         assert!(fixed.iter().all(|p| p.len() == 1), "the stray hole is gone");
     }
@@ -1028,7 +957,10 @@ mod tests {
                 (2275, 666),
             ][..],
         ] {
-            let fixed = finalize_polygons(vec![vec![ring(points)]]);
+            let fixed = finalize_polygons(
+                vec![vec![ring(points)]],
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert_eq!(check_polygons(&fixed), Ok(()));
             assert!(filled_area2(&fixed) > 0, "lost {points:?}");
         }
@@ -1042,7 +974,7 @@ mod tests {
             (100, 101),
             (110, 100),
         ])]];
-        let fixed = finalize_polygons(parts);
+        let fixed = finalize_polygons(parts, &crate::diagnostics::Diagnostics::default());
         assert_eq!(check_polygons(&fixed), Ok(()));
         assert_eq!(filled_area2(&fixed), 10);
     }
@@ -1063,7 +995,10 @@ mod tests {
 
     #[test]
     fn crossing_hole_keeps_positive_fill() {
-        let fixed = finalize_polygons(vec![vec![square(0, 0, 10, 10), square(5, 5, 15, 15)]]);
+        let fixed = finalize_polygons(
+            vec![vec![square(0, 0, 10, 10), square(5, 5, 15, 15)]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(check_polygons(&fixed), Ok(()));
         assert_eq!(filled_area2(&fixed), 150);
     }
@@ -1090,7 +1025,7 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            let out = finalize_polygons(parts.clone());
+            let out = finalize_polygons(parts.clone(), &crate::diagnostics::Diagnostics::default());
             assert_eq!(check_polygons(&out), Ok(()), "{parts:?} -> {out:?}");
             assert_eq!(
                 filled_area2(&out),
@@ -1112,7 +1047,7 @@ mod tests {
     #[test]
     fn repair_unions_overlapping_parts_under_the_positive_rule() {
         let parts = vec![vec![square(0, 0, 10, 10)], vec![square(5, 5, 15, 15)]];
-        let fixed = finalize_polygons(parts);
+        let fixed = finalize_polygons(parts, &crate::diagnostics::Diagnostics::default());
         assert_eq!(fixed.len(), 1);
         assert_eq!(check_polygons(&fixed), Ok(()));
         let area: i64 = fixed.iter().flatten().map(|r| ring_area2(r)).sum();
@@ -1123,7 +1058,7 @@ mod tests {
     #[test]
     fn repair_drops_a_hole_outside_its_exterior() {
         let parts = vec![vec![square(0, 0, 10, 10), square(20, 20, 30, 30)]];
-        let fixed = finalize_polygons(parts);
+        let fixed = finalize_polygons(parts, &crate::diagnostics::Diagnostics::default());
         assert_eq!(fixed, vec![vec![fixed[0][0].clone()]]);
         assert_eq!(ring_area2(&fixed[0][0]).abs(), 200);
     }
@@ -1131,7 +1066,7 @@ mod tests {
     #[test]
     fn repair_splits_a_pinched_ring_into_valid_parts() {
         let r = ring(&[(0, 0), (5, 5), (10, 0), (10, 10), (5, 5), (0, 10)]);
-        let fixed = finalize_polygons(vec![vec![r]]);
+        let fixed = finalize_polygons(vec![vec![r]], &crate::diagnostics::Diagnostics::default());
         assert_eq!(check_polygons(&fixed), Ok(()));
         assert_eq!(fixed.len(), 2);
     }
@@ -1139,7 +1074,10 @@ mod tests {
     #[test]
     fn repair_keeps_a_hole_touching_twice_valid() {
         let hole = ring(&[(0, 5), (5, 2), (10, 5), (5, 8)]);
-        let fixed = finalize_polygons(vec![vec![square(0, 0, 10, 10), hole]]);
+        let fixed = finalize_polygons(
+            vec![vec![square(0, 0, 10, 10), hole]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(check_polygons(&fixed), Ok(()));
         let area: i64 = fixed.iter().flatten().map(|r| ring_area2(r).abs()).sum();
         assert_eq!(area, 200 - 60, "the square less the diamond, in two halves");

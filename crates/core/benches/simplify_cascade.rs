@@ -61,7 +61,12 @@ fn load_largest_boundary() -> Option<Geometry<f64>> {
         let batch = batch.ok()?;
         let garr = from_arrow_array(batch.column(gidx).as_ref(), &gfield).ok()?;
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).ok()?;
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .ok()?;
         for g in geoms {
             let len = geo::coords_iter::CoordsIter::coords_count(&g);
             if len > best_len {
@@ -130,6 +135,7 @@ fn bench_simplify_cascade(c: &mut Criterion) {
                         black_box(&steps),
                         Crs::Epsg3857,
                         black_box(opts),
+                        &tylertoo_core::diagnostics::Diagnostics::default(),
                     ))
                 });
             });

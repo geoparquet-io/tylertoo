@@ -121,9 +121,8 @@ use super::procmem::{
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
-    carrier_square, full_resolution_fallback_count, simplify_cascade, simplify_step_at,
-    validation_skip_count, CascadeFold, CascadeStep, FoldStep, Representation, Simplified,
-    SimplifyOptions,
+    carrier_square, simplify_cascade, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
+    Representation, Simplified, SimplifyOptions,
 };
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 
@@ -158,20 +157,6 @@ pub(crate) enum Pass2Strategy {
 /// Streaming counterpart of [`super::convert::convert_to_overviews`], with an
 /// explicit pass-2 [`Pass2Strategy`] (production uses `Pipelined`; tests pin
 /// `Serial` to assert the pipelined engine is equivalent).
-/// Info-level summary of RDP candidates whose validity check was skipped by
-/// the vertex cap during this conversion (#242). `skips_before` is the
-/// process-wide counter snapshot taken before pass 2.
-fn log_validation_skips(skips_before: u64) {
-    let skips = validation_skip_count() - skips_before;
-    if skips > 0 {
-        log::info!(
-            "[convert] {skips} oversized RDP candidate(s) skipped exact \
-             validity checking and were assumed valid (#242; geometry \
-             validity is not an overviews conformance requirement)"
-        );
-    }
-}
-
 /// Pass 0 (#286/#287): stage the selected row groups to local disk up front so
 /// the two passes below read from the spill, not the network.
 ///
@@ -927,6 +912,7 @@ fn build_pass2_coalesce_tables(
     finest: usize,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<Option<CoalesceTable>> {
     match coalesce_scratch {
         Some(scratch) => {
@@ -948,6 +934,7 @@ fn build_pass2_coalesce_tables(
                             e.gsd,
                             crs,
                             options,
+                            diagnostics,
                         )
                     })
                 })
@@ -1004,6 +991,7 @@ fn build_cascade_chains(
 /// through as separate parameters made the builder's signature longer than its
 /// body, so they travel together.
 struct LevelCtxInputs<'a> {
+    diagnostics: &'a crate::diagnostics::Diagnostics,
     source_schema: &'a Schema,
     cluster_schema: &'a Schema,
     out_schema: &'a Schema,
@@ -1037,6 +1025,7 @@ fn build_level_ctxs<'a>(
             let verbatim =
                 matches!(options.mode, Mode::Partitioning) || e.orig as usize == inputs.finest;
             LevelStreamCtx {
+                diagnostics: inputs.diagnostics,
                 source_schema: inputs.source_schema,
                 cluster_schema: inputs.cluster_schema,
                 out_schema: inputs.out_schema,
@@ -1442,6 +1431,10 @@ struct FooterFacts {
 /// The materialized levels' chain tables (`planned[..kept]`; a level above
 /// the ceiling never emits a row, so its table would be built and thrown
 /// away), plus [`coalesce_merged_anywhere`] over the whole plan.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#779: F1 replaces these engine adapters with shared stages"
+)]
 fn pass2_coalesce(
     scratch: Option<&CoalesceScratch>,
     prebuilt: Option<CoalesceBuild>,
@@ -1450,6 +1443,7 @@ fn pass2_coalesce(
     finest: usize,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<Option<CoalesceTable>>, bool) {
     // #570: pass 1 already ran the chain stage once per level, to count the
     // rows each level would get. Take those tables rather than rebuilding
@@ -1482,14 +1476,24 @@ fn pass2_coalesce(
                             e.gsd,
                             crs,
                             options,
+                            diagnostics,
                         ))
                     })
             })
             .collect();
         return (tables, build.merged);
     }
-    let tables = build_pass2_coalesce_tables(scratch, &planned[..kept], finest, crs, options);
-    let merged = coalesce_merged_anywhere(scratch, &tables, &planned[kept..], finest, crs, options);
+    let tables =
+        build_pass2_coalesce_tables(scratch, &planned[..kept], finest, crs, options, diagnostics);
+    let merged = coalesce_merged_anywhere(
+        scratch,
+        &tables,
+        &planned[kept..],
+        finest,
+        crs,
+        options,
+        diagnostics,
+    );
     (tables, merged)
 }
 
@@ -1500,6 +1504,7 @@ fn coalesce_merged_anywhere(
     finest: usize,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> bool {
     if built.iter().flatten().any(coalesce_table_merged) {
         return true;
@@ -1522,6 +1527,7 @@ fn coalesce_merged_anywhere(
                 e.gsd,
                 crs,
                 options,
+                diagnostics,
             ))
         })
 }
@@ -1681,11 +1687,21 @@ fn coalesce_level_counts(
     crs: Crs,
     options: &ConvertOptions,
     prebuild: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<usize>, Option<CoalesceBuild>) {
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
     let budget = super::pipeline::pass1_grid_budget_bytes(options.profile);
     let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
-    coalesce_level_counts_in_waves(scratch, level_specs, finest, crs, options, prebuild, wave)
+    coalesce_level_counts_in_waves(
+        scratch,
+        level_specs,
+        finest,
+        crs,
+        options,
+        prebuild,
+        wave,
+        diagnostics,
+    )
 }
 
 /// Modelled transient of one level's chain stage, as a multiple of the
@@ -1713,6 +1729,10 @@ fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
 /// [`coalesce_level_counts`] with an explicit wave size. The result does not
 /// depend on `wave`: each level's run is independent of every other's, and
 /// results are collected in level order.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#779: F1 replaces these engine adapters with shared stages"
+)]
 fn coalesce_level_counts_in_waves(
     scratch: &CoalesceScratch,
     level_specs: &[(f64, Option<u8>)],
@@ -1721,6 +1741,7 @@ fn coalesce_level_counts_in_waves(
     options: &ConvertOptions,
     prebuild: bool,
     wave: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<usize>, Option<CoalesceBuild>) {
     let num_levels = level_specs.len();
     let inputs = scratch.inputs();
@@ -1754,7 +1775,13 @@ fn coalesce_level_counts_in_waves(
                 return (chains.len(), None, false);
             }
             let (table, hint) = super::convert::build_level_coalesce_table_and_hint(
-                &inputs, level, finest, gsd, crs, options,
+                &inputs,
+                level,
+                finest,
+                gsd,
+                crs,
+                options,
+                diagnostics,
             );
             let merged = coalesce_table_merged(&table);
             let keep = level_within_ceiling(level_specs[level].1, options.zoom_ceiling);
@@ -1788,6 +1815,7 @@ fn resolve_winner_tables(
     options: &ConvertOptions,
     prebuild_chain_tables: bool,
     rss: &mut RssTracker,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<WinnerTables, ConvertError> {
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
@@ -1953,6 +1981,7 @@ fn resolve_winner_tables(
             crs,
             options,
             prebuild_chain_tables,
+            diagnostics,
         );
         for (count, chains) in counts.iter_mut().zip(chain_counts) {
             *count += chains;
@@ -2009,6 +2038,7 @@ struct Preflight {
 fn convert_preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
     // The UNCACHED probe: `pipeline::available_memory_bytes` must not be
     // touched before pass 1 — its first call freezes a headroom figure every
@@ -2018,6 +2048,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
+        diagnostics,
     )
 }
 
@@ -2028,6 +2059,7 @@ fn convert_preflight_with_memory_limit(
     options: &ConvertOptions,
     memory_limit: Option<super::pipeline::MemoryLimit>,
     skip_memory_preflight: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
@@ -2038,10 +2070,13 @@ fn convert_preflight_with_memory_limit(
 
     // CRS detection + rejection (spec Q3) — footer metadata only.
     let kv = source.key_value_metadata()?;
-    let (crs, crs_assumed_wgs84) =
-        super::convert::detect_crs_from_kv_assumed(kv.as_ref(), &source.display_name())?;
+    let (crs, crs_assumed_wgs84) = super::convert::detect_crs_from_kv_assumed(
+        kv.as_ref(),
+        &source.display_name(),
+        diagnostics,
+    )?;
     if crs_assumed_wgs84 {
-        super::convert::warn_assumed_wgs84(&source.display_name());
+        super::convert::warn_assumed_wgs84(&source.display_name(), diagnostics);
     }
 
     // Reserved-column collisions (#288) are resolved BEFORE row-group
@@ -2275,13 +2310,15 @@ fn run_front_half(
     options: &ConvertOptions,
     prebuild_chain_tables: bool,
     rss: &mut RssTracker,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<FrontHalf, ConvertError> {
+    pipeline::memory_diagnostic(diagnostics);
     // A numeric sort key and a categorical class ranking would both drive
     // `AssignFeature::sort_key` (Q1); refused before the input is opened.
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
     }
-    let preflight = convert_preflight(source, options)?;
+    let preflight = convert_preflight(source, options, diagnostics)?;
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
@@ -2300,6 +2337,7 @@ fn run_front_half(
         },
         options,
         rss,
+        diagnostics,
     )?;
     Ok(FrontHalf { preflight, plan })
 }
@@ -2312,12 +2350,14 @@ fn run_front_half(
 pub(crate) fn write_plan_streaming(
     source: &ConvertSource,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanReport, ConvertError> {
     let start = Instant::now();
     // Boundary sampling only: a plan-only run writes no profile JSON dump,
     // so the #571 background sampler would have no reader.
     let mut rss = RssTracker::new(false, "preflight");
-    let FrontHalf { preflight, plan } = run_front_half(source, options, false, &mut rss)?;
+    let FrontHalf { preflight, plan } =
+        run_front_half(source, options, false, &mut rss, diagnostics)?;
     let options = &preflight.options;
     let path = options
         .save_plan
@@ -2348,7 +2388,12 @@ pub(crate) fn write_plan_streaming(
         }
         return Err(ConvertError::NoData);
     }
-    warn_plan_skipped_levels(&skipped, plan.num_features, planned[0].gsd, planned[0].zoom);
+    warn_plan_skipped_levels(
+        &skipped,
+        plan.num_features,
+        (planned[0].gsd, planned[0].zoom),
+        diagnostics,
+    );
     rss.log_phase("plan-only (assignment complete)");
     log::info!(
         "[rss] plan-only peak: {}",
@@ -2396,6 +2441,7 @@ fn resolve_plan_state(
     inputs: &Pass1Inputs<'_>,
     options: &ConvertOptions,
     rss: &mut RssTracker,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     // Captured before either branch: the load path compares the saved
     // fingerprint against it, the save path stores it.
@@ -2418,9 +2464,10 @@ fn resolve_plan_state(
                 options,
                 inputs.source,
                 inputs.selected_row_groups,
+                diagnostics,
             )
         }
-        None => run_pass1_and_assign(inputs, options, fingerprint, rss),
+        None => run_pass1_and_assign(inputs, options, fingerprint, rss, diagnostics),
     }
 }
 
@@ -2431,6 +2478,7 @@ fn run_pass1_and_assign(
     options: &ConvertOptions,
     fingerprint: Option<Fingerprint>,
     rss: &mut RssTracker,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     rss.enter_phase("pass1 scan"); // #571: the preflight ends here
     let t_pass1 = Instant::now();
@@ -2457,13 +2505,12 @@ fn run_pass1_and_assign(
         inputs.bbox_query,
         inputs.bound_filter,
         inputs.crs,
+        diagnostics,
     )?;
-    if skipped_rows > 0 {
-        log::warn!(
-            "skipping {skipped_rows} of {num_rows} input rows with a null, \
-             empty, or non-finite geometry"
-        );
-    }
+    diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
+        count: skipped_rows,
+        total: num_rows,
+    });
     let num_features = features.len();
     // Per-kind counts ride along in the plan artifact (a sharded build reads
     // them to size its work); one extra O(N) pass, taken only when saving.
@@ -2484,6 +2531,7 @@ fn run_pass1_and_assign(
         Some((part, row)) => (multi_part.then_some(part), row),
         None => (None, i),
     })?;
+    tallies.record(num_features, inputs.crs, diagnostics);
 
     // Stage markers (#242): everything between pass 1 and the writer used to
     // run in total info-level silence — on planet-scale inputs that was tens
@@ -2515,6 +2563,7 @@ fn run_pass1_and_assign(
         options,
         inputs.prebuild_chain_tables,
         rss,
+        diagnostics,
     )?;
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
     // artifact rather than part of the assignment itself.
@@ -2529,15 +2578,12 @@ fn run_pass1_and_assign(
         let totals = PlanTotals {
             n_rows: num_rows,
             n_features: num_features,
-            skipped_rows,
             n_lines,
             n_points,
             n_polygons,
             geom_bytes,
-            antimeridian_suspect: tallies.antimeridian_suspect,
-            out_of_range: tallies.out_of_range,
-            unprojectable: tallies.unprojectable,
-            wrapped: tallies.wrapped,
+            diagnostics: diagnostics.snapshot_for_plan(),
+            source_losses: diagnostics.source_losses(),
         };
         let plan = ConvertPlan::from_winner_tables(
             &tables,
@@ -2593,6 +2639,7 @@ fn load_plan_state(
     options: &ConvertOptions,
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
     let mut plan = ConvertPlan::load(path)?;
@@ -2653,7 +2700,13 @@ fn load_plan_state(
     }
     // Captured after the shard re-addressing, so the report and the pass-2
     // memory estimate describe what THIS run will read.
-    let totals = plan.totals;
+    let totals = plan.totals.clone();
+    for event in &totals.diagnostics {
+        diagnostics.once(event.clone());
+    }
+    for loss in &totals.source_losses {
+        diagnostics.source_loss(loss.id, loss.zoom, loss.cause);
+    }
     let will_stream = source.selected_row_count(selected_row_groups)?;
     if will_stream != plan.min_levels.len() as i64 {
         return Err(ConvertError::InvalidConfig(format!(
@@ -2690,13 +2743,6 @@ fn load_plan_state(
             plan.finest,
         )));
     }
-    if totals.skipped_rows > 0 {
-        log::warn!(
-            "skipping {} of {} input rows with a null, empty, or non-finite geometry",
-            totals.skipped_rows,
-            totals.n_rows
-        );
-    }
     log::info!(
         "[convert] loaded the convert plan from {} — pass 1 and the level assignment are \
          skipped ({} feature(s) from {} row(s), {} level(s), ranking {:?}, {:.0}% points)",
@@ -2717,9 +2763,17 @@ fn load_plan_state(
         num_features: totals.n_features,
         geom_bytes: totals.geom_bytes,
         tallies: BboxTallies {
-            antimeridian_suspect: totals.antimeridian_suspect,
-            out_of_range: totals.out_of_range,
-            unprojectable: totals.unprojectable,
+            antimeridian_suspect: diagnostics
+                .count(&crate::diagnostics::Diagnostic::AntimeridianSuspect { count: 0 }),
+            out_of_range: diagnostics.count(&crate::diagnostics::Diagnostic::OutOfRange {
+                context: None,
+                count: 0,
+                exemplars: Vec::new(),
+            }),
+            unprojectable: diagnostics.count(&crate::diagnostics::Diagnostic::Unprojectable {
+                context: None,
+                count: 0,
+            }),
             // Only feeds the all-lost diagnosis, which already fired (or did
             // not) on the run that produced the plan.
             max_abs_out_of_range: 0.0,
@@ -2728,7 +2782,11 @@ fn load_plan_state(
             // honestly but without the "e.g. lon ... (row ...)" detail the
             // original scan had.
             out_of_range_exemplars: Vec::new(),
-            wrapped: totals.wrapped,
+            wrapped: diagnostics.count(&crate::diagnostics::Diagnostic::Wrapped {
+                exemplars: Vec::new(),
+                context: None,
+                count: 0,
+            }),
             // Same as the out-of-range exemplars: the count only (#644).
             wrapped_exemplars: Vec::new(),
         },
@@ -2781,6 +2839,7 @@ pub(crate) fn convert_streaming_strategy(
     output_path: &Path,
     options: &ConvertOptions,
     strategy: Pass2Strategy,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
     let start = Instant::now();
     // #295/#571 peak-RSS tracking: boundary samples + a continuous
@@ -2791,7 +2850,8 @@ pub(crate) fn convert_streaming_strategy(
 
     // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
     // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
-    let FrontHalf { preflight, plan } = run_front_half(source, options, true, &mut rss)?;
+    let FrontHalf { preflight, plan } =
+        run_front_half(source, options, true, &mut rss, diagnostics)?;
     let Preflight {
         options: resolved_options,
         input_schema,
@@ -2843,7 +2903,12 @@ pub(crate) fn convert_streaming_strategy(
     if planned.is_empty() {
         return Err(ConvertError::NoData);
     }
-    warn_plan_skipped_levels(&skipped, num_features, planned[0].gsd, planned[0].zoom);
+    warn_plan_skipped_levels(
+        &skipped,
+        num_features,
+        (planned[0].gsd, planned[0].zoom),
+        diagnostics,
+    );
 
     // #541: the coarse job of a sharded build materializes only the levels it
     // exports. Everything above — pass 1, the assignment, and the plan
@@ -2871,6 +2936,7 @@ pub(crate) fn convert_streaming_strategy(
         finest,
         crs,
         options,
+        diagnostics,
     );
 
     let LevelWriter {
@@ -2913,6 +2979,7 @@ pub(crate) fn convert_streaming_strategy(
         emitted,
         options,
         &LevelCtxInputs {
+            diagnostics,
             source_schema: &source_schema,
             cluster_schema: &cluster_schema,
             out_schema: &out_schema,
@@ -2932,10 +2999,6 @@ pub(crate) fn convert_streaming_strategy(
     );
 
     let hints: Vec<usize> = emitted.iter().map(|e| e.hint).collect();
-
-    // Snapshot for the end-of-pass-2 summary: the counter is process-wide,
-    // so report the delta from this conversion only (#242).
-    let validation_skips_before = validation_skip_count();
 
     // `(outcome, rows, vertices)` per emitted level, in level order. The
     // outcome distinguishes a written level from one the writer skipped because
@@ -2957,7 +3020,6 @@ pub(crate) fn convert_streaming_strategy(
         geom_bytes,
         strategy,
     )?;
-    log_validation_skips(validation_skips_before);
 
     let (mut level_reports, level_spill_bytes) =
         build_level_reports(emitted, level_stats, &mut skipped);
@@ -3024,6 +3086,7 @@ pub(crate) fn convert_streaming_strategy(
         level_reports,
         skipped,
         num_features,
+        num_rows,
         total_rows,
         total_vertices,
         total_compressed_bytes,
@@ -3033,7 +3096,8 @@ pub(crate) fn convert_streaming_strategy(
         start,
         effective_max_row_group_size,
         crs_assumed_wgs84,
-    }))
+    })
+    .with_diagnostics(diagnostics))
 }
 
 /// [`convert_streaming_strategy`]'s locals the final [`ConvertReport`]
@@ -3045,6 +3109,7 @@ struct ConvertReportInputs<'a> {
     level_reports: Vec<LevelReport>,
     skipped: Vec<SkippedLevelReport>,
     num_features: usize,
+    num_rows: usize,
     total_rows: usize,
     total_vertices: usize,
     total_compressed_bytes: i64,
@@ -3059,10 +3124,13 @@ struct ConvertReportInputs<'a> {
 
 fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
     ConvertReport {
+        diagnostics: Vec::new(),
+        source_losses: Vec::new(),
         mode: inputs.options.mode,
         levels: inputs.level_reports,
         skipped_empty_levels: inputs.skipped,
         input_features: inputs.num_features,
+        input_rows: inputs.num_rows,
         total_rows: inputs.total_rows,
         total_vertices: inputs.total_vertices,
         total_compressed_bytes: inputs.total_compressed_bytes,
@@ -4398,6 +4466,8 @@ struct ScannedRow {
 /// counts. Every row is still read, so a value the reader rejects fails the
 /// chunk whether or not the filter keeps it, as before.
 struct ScanRows<'m> {
+    diagnostics: &'m crate::diagnostics::Diagnostics,
+    row_base: usize,
     filter_mask: Option<&'m [Option<bool>]>,
     line_geoms: bool,
     all_geoms: bool,
@@ -4417,14 +4487,38 @@ impl GeoArrowVisitor for ScanRows<'_> {
                 crate::Error::GeoParquetRead(format!("Invalid geometry at index {i}: {e}"))
             })?;
             if self.filter_mask.is_some_and(|m| m[i] != Some(true)) {
+                self.diagnostics.source_loss(
+                    (self.row_base + i) as u64,
+                    None,
+                    crate::diagnostics::SourceLossCause::Filtered,
+                );
                 out.push(None);
                 continue;
             }
             let Some(g) = item else {
+                self.diagnostics.source_loss(
+                    (self.row_base + i) as u64,
+                    None,
+                    crate::diagnostics::SourceLossCause::MissingGeometry,
+                );
                 out.push(None);
                 continue;
             };
             let Some((kind, bbox)) = scan_feature_traits(&g) else {
+                use geo::CoordsIter;
+                let non_finite = g.try_to_geometry().is_some_and(|g| {
+                    g.coords_iter()
+                        .any(|c| !c.x.is_finite() || !c.y.is_finite())
+                });
+                let cause = if non_finite {
+                    self.diagnostics
+                        .record(crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 });
+                    crate::diagnostics::SourceLossCause::NonFiniteGeometry
+                } else {
+                    crate::diagnostics::SourceLossCause::MissingGeometry
+                };
+                self.diagnostics
+                    .source_loss((self.row_base + i) as u64, None, cause);
                 out.push(None);
                 continue;
             };
@@ -4470,6 +4564,7 @@ fn scan_chunk(
     collect_lines: LineCollect,
     want_areas: bool,
     timers: &Pass1Timers,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ChunkScan, ConvertError> {
     let chunk_len = gcol.len();
     let t_decode = Instant::now();
@@ -4483,6 +4578,8 @@ fn scan_chunk(
     let rows = visit_geoarrow_array(
         garr.as_ref(),
         ScanRows {
+            diagnostics,
+            row_base: diag_row_base,
             filter_mask,
             line_geoms: collect_lines != LineCollect::Off,
             all_geoms: want_areas,
@@ -4599,6 +4696,7 @@ fn run_pass1(
     bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
     crs: Crs,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Pass1Output, ConvertError> {
     run_pass1_with_chunk_rows(
         source,
@@ -4611,6 +4709,7 @@ fn run_pass1(
         filter,
         crs,
         adaptive_pass1_chunk_rows(options.read_batch_size),
+        diagnostics,
     )
 }
 
@@ -4929,6 +5028,7 @@ fn run_pass1_with_chunk_rows(
     filter: Option<&super::filter::BoundFilter>,
     crs: Crs,
     chunk_rows: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Pass1Output, ConvertError> {
     let chunk_rows = chunk_rows.max(1);
     let mut plan = build_rank_plan(input_schema, options)?;
@@ -5093,6 +5193,7 @@ fn run_pass1_with_chunk_rows(
                             collect_lines,
                             want_areas,
                             timers_ref,
+                            diagnostics,
                         )
                     })
                     .collect();
@@ -5394,6 +5495,7 @@ impl Pass2Timers {
 
 /// Immutable context for one level's pass-2 stream.
 pub(super) struct LevelStreamCtx<'a> {
+    diagnostics: &'a crate::diagnostics::Diagnostics,
     source_schema: &'a Schema,
     /// `source_schema` + trailing `point_count` when clustering, otherwise
     /// identical (the schema [`apply_cluster_columns`] produces).
@@ -5514,7 +5616,7 @@ fn write_level_streaming(
     // debug line — NLL ends that borrow before the move on return.
     let level_timers = Pass2Timers::default();
     let timers = &level_timers;
-    let fallbacks_before = full_resolution_fallback_count();
+
     let t_level = Instant::now();
 
     // One processed output batch handed from the producer to the writer.
@@ -5675,13 +5777,6 @@ fn write_level_streaming(
         build_s,
         writer_busy,
     );
-    let fallbacks = full_resolution_fallback_count() - fallbacks_before;
-    if fallbacks > 0 {
-        log::debug!(
-            "[profile] level {level_idx}: {fallbacks} feature(s) kept at full \
-             resolution (invalid RDP candidate after all epsilon retries)"
-        );
-    }
     Ok((outcome, rows.get(), vertices.get(), level_timers))
 }
 
@@ -5722,7 +5817,7 @@ pub(super) fn process_level_batch(
     let garr = from_arrow_array(geom_taken.as_ref(), gfield)
         .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms)?;
+    extract_geometries_from_array(garr.as_ref(), &mut geoms, ctx.diagnostics)?;
     Pass2Timers::add(&timers.decode, t_decode);
 
     let t_simplify = Instant::now();
@@ -5764,9 +5859,17 @@ pub(super) fn process_level_batch(
                     carrier_square(g, ctx.gsd_m, ctx.zoom, ctx.crs)
                         .map_or(Simplified::Dropped, Simplified::Keep)
                 } else if !ctx.cascade_chain.is_empty() {
-                    simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify)
+                    simplify_cascade(g, ctx.cascade_chain, ctx.crs, ctx.simplify, ctx.diagnostics)
                 } else {
-                    simplify_step_at(g, ctx.gsd_m, ctx.zoom, ctx.crs, ctx.simplify, ctx.repr)
+                    simplify_step_at(
+                        g,
+                        ctx.gsd_m,
+                        ctx.zoom,
+                        ctx.crs,
+                        ctx.simplify,
+                        ctx.repr,
+                        ctx.diagnostics,
+                    )
                 }
             })
             .collect();
@@ -5954,7 +6057,7 @@ pub(super) fn process_batch_cascade(
         let gfield = schema.field(finest.geom_idx);
         let garr = from_arrow_array(geom_taken.as_ref(), gfield)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        extract_geometries_from_array(garr.as_ref(), &mut geoms_owned)?;
+        extract_geometries_from_array(garr.as_ref(), &mut geoms_owned, finest.diagnostics)?;
     }
     let geoms: Vec<Arc<Geometry<f64>>> = geoms_owned.into_iter().map(Arc::new).collect();
     Pass2Timers::add(&timers.decode, t_decode);
@@ -6006,7 +6109,7 @@ pub(super) fn process_batch_cascade(
             // here) pays nothing.
             if !prefix.is_empty() && ml <= finest.orig_level {
                 for step in prefix {
-                    fold.step(g, step, finest.crs, finest.simplify);
+                    fold.step(g, step, finest.crs, finest.simplify, finest.diagnostics);
                 }
             }
             for (li, ctx) in ctxs.iter().enumerate().rev() {
@@ -6021,7 +6124,7 @@ pub(super) fn process_batch_cascade(
                     repr: ctx.repr,
                     zoom: ctx.zoom,
                 };
-                match fold.step(g, &step, ctx.crs, ctx.simplify) {
+                match fold.step(g, &step, ctx.crs, ctx.simplify, finest.diagnostics) {
                     FoldStep::Keep { geom, shared: s } => {
                         total += 1;
                         // An unchanged step shares its input's allocation
@@ -6244,14 +6347,26 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         // A generous mocked limit fits comfortably.
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false)
-            .expect("10 rows must fit a 1 TiB mocked limit");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("10 rows must fit a 1 TiB mocked limit");
 
         // A 1-byte mocked hard limit cannot possibly fit 10 rows' feature
         // table — this must fail from the footer row count alone, never
         // having opened a data page (the fixture is tiny; if this reached
         // pass 1 it would simply succeed, silently defeating the test).
-        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false) {
+        match convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Err(
                 err @ ConvertError::Pass1MemoryFloorExceeded {
                     rows: 10,
@@ -6273,8 +6388,14 @@ mod tests {
         }
 
         // The escape hatch downgrades it to a warning.
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), true)
-            .expect("the skip hatch must downgrade the hard error");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            true,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("the skip hatch must downgrade the hard error");
 
         // #543 review (S1-2): under a per-feature --bbox the footer count is
         // only an upper bound, so the same tiny hard limit only warns.
@@ -6282,8 +6403,14 @@ mod tests {
             bbox: Some([-180.0, -90.0, 180.0, 90.0]),
             ..options.clone()
         };
-        convert_preflight_with_memory_limit(&source, &bbox_options, hard_limit(1), false)
-            .expect("a --bbox extract must never hard-error on an upper-bound row count");
+        convert_preflight_with_memory_limit(
+            &source,
+            &bbox_options,
+            hard_limit(1),
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("a --bbox extract must never hard-error on an upper-bound row count");
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
@@ -6317,7 +6444,12 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         let before = super::super::pipeline::available_memory_bytes_calls_on_this_thread();
-        convert_preflight(&source, &options).expect("10 rows fit any real box");
+        convert_preflight(
+            &source,
+            &options,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("10 rows fit any real box");
         assert_eq!(
             super::super::pipeline::available_memory_bytes_calls_on_this_thread(),
             before,
@@ -6348,8 +6480,14 @@ mod tests {
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
-        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false)
-            .expect("a --plan replay must skip the pass-1 memory preflight entirely");
+        convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1),
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
@@ -6357,7 +6495,12 @@ mod tests {
     /// prepares its inputs).
     fn run_pass1_for_test(path: &Path, options: &ConvertOptions, chunk_rows: usize) -> Pass1Output {
         let source = ConvertSource::resolve_path(path).unwrap();
-        let pre = convert_preflight(&source, options).unwrap();
+        let pre = convert_preflight(
+            &source,
+            options,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         run_pass1_with_chunk_rows(
             &source,
             &pre.input_schema,
@@ -6369,6 +6512,7 @@ mod tests {
             pre.bound_filter.as_ref(),
             pre.crs,
             chunk_rows,
+            &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap()
     }
@@ -7516,7 +7660,12 @@ mod tests {
             ..Default::default()
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let pre = convert_preflight(&source, &options).unwrap();
+        let pre = convert_preflight(
+            &source,
+            &options,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         let res = run_pass1_with_chunk_rows(
             &source,
             &pre.input_schema,
@@ -7528,6 +7677,7 @@ mod tests {
             pre.bound_filter.as_ref(),
             pre.crs,
             CHUNK_ROWS,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let err = match res {
             Err(e) => e,
@@ -7908,7 +8058,9 @@ mod tests {
         let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
             .filter(|&c| c != geom_idx)
             .collect();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
         let ctx = LevelStreamCtx {
+            diagnostics: &diagnostics,
             source_schema: &source_schema,
             cluster_schema: &cluster_schema,
             out_schema: &out_schema,
@@ -8408,6 +8560,7 @@ mod tests {
             Crs::Epsg4326,
             &options,
             true,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let (plan_counts, plan_build) = coalesce_level_counts(
             &scratch,
@@ -8416,6 +8569,7 @@ mod tests {
             Crs::Epsg4326,
             &options,
             false,
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(plan_counts, full_counts, "plan-only plans the same levels");
         assert!(
@@ -8461,6 +8615,7 @@ mod tests {
                 &options,
                 true,
                 wave,
+                &crate::diagnostics::Diagnostics::default(),
             )
         };
         let (all_counts, all_build) = run(level_specs.len());
@@ -8492,6 +8647,7 @@ mod tests {
             finest,
             Crs::Epsg4326,
             &ConvertOptions::default(),
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(tables.len(), 3);
         assert_eq!(tables[0].as_ref().map(|t| t.len()), Some(1));
@@ -8517,6 +8673,7 @@ mod tests {
             1,
             Crs::Epsg4326,
             &ConvertOptions::default(),
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(tables.len(), 2);
         assert!(tables.iter().all(Option::is_none));
@@ -8557,7 +8714,12 @@ mod tests {
 
         let garr = from_arrow_array(gcol, field).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_opt_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         let mut out = ChunkScan {
             features: FeatureTable::new(),
             tally: super::super::convert::BboxTally::default(),
@@ -8643,6 +8805,7 @@ mod tests {
                             collect,
                             want_areas,
                             &Pass1Timers::default(),
+                            &crate::diagnostics::Diagnostics::default(),
                         )
                         .unwrap();
                         let want = pre_650_scan_chunk(field, gcol, m, bb, collect, want_areas);
@@ -8845,8 +9008,12 @@ mod tests {
         );
         let field = Field::new("geometry", DataType::Utf8, true).with_metadata(md);
         let garr = from_arrow_array(&gcol, &field).unwrap();
-        let read_err = extract_geometries_opt_from_array(garr.as_ref(), &mut Vec::new())
-            .expect_err("row 1 is not WKT");
+        let read_err = extract_geometries_opt_from_array(
+            garr.as_ref(),
+            &mut Vec::new(),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect_err("row 1 is not WKT");
         let want = ConvertError::from(decode_error_at_rows(40, 3, read_err)).to_string();
         assert!(
             want.contains("rows 40..43: Invalid geometry at index 1"),
@@ -8865,6 +9032,7 @@ mod tests {
                     collect,
                     want_areas,
                     &Pass1Timers::default(),
+                    &crate::diagnostics::Diagnostics::default(),
                 ) {
                     Ok(_) => panic!("mask {mask:?}: the unreadable row must fail the chunk"),
                     Err(e) => e.to_string(),

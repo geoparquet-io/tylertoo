@@ -45,7 +45,7 @@ pub const METERS_PER_DEGREE: f64 = 111_320.0;
 /// v0.1 restricts overviews to these two CRSs. The variant governs how a
 /// meters-denominated GSD tolerance is expressed in the geometry's
 /// coordinate units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Crs {
     /// Geographic lon/lat degrees. Meters are divided by
     /// [`METERS_PER_DEGREE`] (equatorial approximation; high-latitude

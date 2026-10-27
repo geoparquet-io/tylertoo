@@ -909,12 +909,24 @@ fn engine_production(g: &Geometry<f64>, c: &Case, simple: bool) -> Option<Geomet
     // Buffer is folded into `bounds` already: pass the tile and the buffer
     // separately, exactly as `feature_tile_members_direct` does.
     let buf = c.tile.width() * BUFFER_PX / NOMINAL_TILE_PX;
-    clip_geometry_simple(g, &c.tile, buf, simple, true)
+    clip_geometry_simple(
+        g,
+        &c.tile,
+        buf,
+        simple,
+        true,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    )
 }
 
 fn engine_production_strict(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometry<f64>> {
     let buf = c.tile.width() * BUFFER_PX / NOMINAL_TILE_PX;
-    clip_geometry(g, &c.tile, buf)
+    clip_geometry(
+        g,
+        &c.tile,
+        buf,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    )
 }
 
 fn engine_sh(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometry<f64>> {
@@ -929,15 +941,30 @@ fn engine_sh(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometry<f64>
 
 fn engine_ioverlay(g: &Geometry<f64>, c: &Case, _simple: bool) -> Option<Geometry<f64>> {
     match g {
-        Geometry::Polygon(p) => clip_polygon_ioverlay(p, &c.bounds),
-        Geometry::MultiPolygon(mp) => clip_multipolygon_ioverlay(mp, &c.bounds),
+        Geometry::Polygon(p) => clip_polygon_ioverlay(
+            p,
+            &c.bounds,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        ),
+        Geometry::MultiPolygon(mp) => clip_multipolygon_ioverlay(
+            mp,
+            &c.bounds,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        ),
         Geometry::LineString(l) => {
-            let out =
-                clip_multilinestring_ioverlay(&MultiLineString::new(vec![l.clone()]), &c.bounds);
+            let out = clip_multilinestring_ioverlay(
+                &MultiLineString::new(vec![l.clone()]),
+                &c.bounds,
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            );
             (!out.0.is_empty()).then_some(Geometry::MultiLineString(out))
         }
         Geometry::MultiLineString(ml) => {
-            let out = clip_multilinestring_ioverlay(ml, &c.bounds);
+            let out = clip_multilinestring_ioverlay(
+                ml,
+                &c.bounds,
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            );
             (!out.0.is_empty()).then_some(Geometry::MultiLineString(out))
         }
         _ => None,

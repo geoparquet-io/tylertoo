@@ -144,14 +144,27 @@ fn bench_tier(c: &mut Criterion, tier: &str, cases: &[(&str, Polygon<f64>)]) {
         group.throughput(Throughput::Elements(p.coords_count() as u64));
         group.bench_with_input(BenchmarkId::new("production", name), &geom, |b, g| {
             b.iter(|| {
-                clip_geometry_simple(black_box(g), black_box(&tile), black_box(buf), simple, true)
+                clip_geometry_simple(
+                    black_box(g),
+                    black_box(&tile),
+                    black_box(buf),
+                    simple,
+                    true,
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
             });
         });
         group.bench_with_input(BenchmarkId::new("sh", name), p, |b, p| {
             b.iter(|| clip_polygon_sh(black_box(p), black_box(&buffered)));
         });
         group.bench_with_input(BenchmarkId::new("ioverlay", name), p, |b, p| {
-            b.iter(|| clip_polygon_ioverlay(black_box(p), black_box(&buffered)));
+            b.iter(|| {
+                clip_polygon_ioverlay(
+                    black_box(p),
+                    black_box(&buffered),
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
+            });
         });
     }
     group.finish();

@@ -111,8 +111,9 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// v2 wrapped the Arrow IPC payload in the [`PLAN_MAGIC`] + checksum header
 /// (#512) and added the per-part row count to the fingerprint (#511). v3
 /// added the resolved entry-zoom ladder (`entry_zoom`) to the JSON block
-/// (#446).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 3;
+/// (#446). v4 replaces the independent diagnostic counters with the typed
+/// channel and exact source losses (#779).
+pub(super) const PLAN_FORMAT_VERSION: u32 = 4;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -121,7 +122,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 3;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x03";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x04";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -647,6 +648,18 @@ pub(super) fn rebase_plan_for_shard(
         )?);
     }
 
+    plan.totals.source_losses = plan
+        .totals
+        .source_losses
+        .iter()
+        .filter_map(|loss| {
+            let row = usize::try_from(loss.id).ok()?;
+            shard_row(&runs, row).map(|row| crate::diagnostics::SourceLoss {
+                id: row as u64,
+                ..loss.clone()
+            })
+        })
+        .collect();
     // Side tables are keyed by the same row index, so they move with it.
     // A key outside the shard's runs belongs to a row the shard does not
     // read and is dropped.
@@ -711,7 +724,6 @@ pub(super) fn rebase_plan_for_shard(
     }
     plan.totals.n_rows = shard_cursor;
     plan.totals.n_features = assigned;
-    plan.totals.skipped_rows = shard_cursor - assigned;
     log::info!(
         "[convert] shard: re-addressed the convert plan onto {shard_cursor} of its \
          {plan_cursor} row(s) in {} contiguous run(s); {assigned} feature(s) to build",
@@ -891,15 +903,13 @@ const NO_SHARD_PLAN: &str = "none";
 
 /// Dataset-wide tallies pass 2 and the convert report need, which otherwise
 /// only exist while the pass-1 feature scratch is alive.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct PlanTotals {
     /// Total input rows streamed, INCLUDING skipped-geometry rows: the domain
     /// of every row-indexed table.
     pub n_rows: usize,
     /// Features that survived the scan (rows with a usable geometry).
     pub n_features: usize,
-    /// Rows skipped for a null, empty, or non-finite geometry.
-    pub skipped_rows: usize,
     /// Line features in the scan.
     pub n_lines: usize,
     /// Point features in the scan.
@@ -909,16 +919,10 @@ pub(super) struct PlanTotals {
     /// Total Arrow byte size of the encoded geometry column across the scan
     /// (#305): sizes pass 2's RAM-vs-spill decision.
     pub geom_bytes: u64,
-    /// Features whose bbox spans more than 180° of longitude (#188).
-    pub antimeridian_suspect: usize,
-    /// Features outside their CRS's coordinate range (#429).
-    pub out_of_range: usize,
-    /// Features valid for the CRS but outside the Web Mercator tiling domain.
-    pub unprojectable: usize,
-    /// Features drawn wrapped across the antimeridian (#644). Defaults to 0
-    /// so a plan saved before the field existed still loads.
-    #[serde(default)]
-    pub wrapped: usize,
+    /// Pass-1 diagnostics, replayed through the run's sink when loading a plan.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// Exact pre-assignment source losses.
+    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
 }
 
 impl PlanTotals {
@@ -1207,7 +1211,7 @@ impl ConvertPlan {
             rank_plan: self.rank_plan.clone(),
             ladder: self.ladder.clone(),
             entry_zoom: self.entry_zoom.clone(),
-            totals: self.totals,
+            totals: self.totals.clone(),
         };
         let meta_json = serde_json::to_string(&meta)
             .map_err(|e| ConvertError::InvalidConfig(format!("--save-plan: {e}")))?;
@@ -1954,27 +1958,25 @@ mod tests {
             totals: PlanTotals {
                 n_rows: 9,
                 n_features: 8,
-                skipped_rows: 1,
                 n_lines: 4,
                 n_points: 2,
                 n_polygons: 2,
                 geom_bytes: 4096,
-                antimeridian_suspect: 1,
-                out_of_range: 0,
-                unprojectable: 2,
-                wrapped: 3,
+                diagnostics: vec![
+                    crate::diagnostics::Diagnostic::AntimeridianSuspect { count: 1 },
+                    crate::diagnostics::Diagnostic::Unprojectable {
+                        context: None,
+                        count: 2,
+                    },
+                    crate::diagnostics::Diagnostic::Wrapped {
+                        exemplars: Vec::new(),
+                        context: None,
+                        count: 3,
+                    },
+                ],
+                source_losses: Vec::new(),
             },
         }
-    }
-
-    /// #644: a plan saved before `wrapped` existed still loads, as 0.
-    #[test]
-    fn plan_totals_without_wrapped_load_as_zero() {
-        let mut json = serde_json::to_value(tiny_plan().totals).unwrap();
-        json.as_object_mut().unwrap().remove("wrapped");
-        let totals: PlanTotals = serde_json::from_value(json).unwrap();
-        assert_eq!(totals.wrapped, 0);
-        assert_eq!(totals.unprojectable, 2);
     }
 
     /// The oracle for the artifact itself: every field survives a save/load
@@ -2402,11 +2404,41 @@ mod tests {
     /// decode itself must turn the panic into the `--plan` error.
     #[test]
     fn plan_with_a_crafted_ipc_buffer_is_an_error_not_a_panic() {
-        let payload = std::fs::read(concat!(
+        let mut payload = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../fuzz/corpus/plan_file/seed-issue-684-ipc-buffer.arrow"
         ))
         .unwrap();
+        // Keep the hostile array buffers unchanged while bringing only the
+        // seed's schema metadata forward to the current plan format.
+        let reader = crate::untrusted::open_ipc(std::io::Cursor::new(payload.clone())).unwrap();
+        let schema = reader.schema();
+        let original = &schema.metadata()[PLAN_META_KEY];
+        let mut meta: serde_json::Value = serde_json::from_str(original).unwrap();
+        meta["version"] = PLAN_FORMAT_VERSION.into();
+        let totals = meta["totals"].as_object_mut().unwrap();
+        for key in [
+            "antimeridian_suspect",
+            "out_of_range",
+            "unprojectable",
+            "wrapped",
+        ] {
+            totals.remove(key);
+        }
+        totals.insert("diagnostics".into(), serde_json::json!([]));
+        totals.insert("source_losses".into(), serde_json::json!([]));
+        let mut updated = serde_json::to_string(&meta).unwrap();
+        assert!(updated.len() <= original.len());
+        updated.extend(std::iter::repeat_n(' ', original.len() - updated.len()));
+        let positions: Vec<usize> = payload
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(at, bytes)| (bytes == original.as_bytes()).then_some(at))
+            .collect();
+        assert!(!positions.is_empty());
+        for at in positions {
+            payload[at..at + original.len()].copy_from_slice(updated.as_bytes());
+        }
         let f = tempfile::NamedTempFile::new().unwrap();
         let mut bytes = PLAN_MAGIC.to_vec();
         bytes.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&payload).to_le_bytes());

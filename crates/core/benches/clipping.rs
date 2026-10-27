@@ -123,7 +123,13 @@ fn bench_ioverlay(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &poly, |b, poly| {
-            b.iter(|| clip_polygon_ioverlay(black_box(poly), black_box(&bounds)));
+            b.iter(|| {
+                clip_polygon_ioverlay(
+                    black_box(poly),
+                    black_box(&bounds),
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
+            });
         });
     }
 
@@ -153,7 +159,13 @@ fn bench_wide_polygon(c: &mut Criterion) {
     // Also test i_overlay on the smallest wide polygon for comparison
     let small_wide = generate_wide_polygon(1_000);
     group.bench_function("ioverlay/1000", |b| {
-        b.iter(|| clip_polygon_ioverlay(black_box(&small_wide), black_box(&bounds)));
+        b.iter(|| {
+            clip_polygon_ioverlay(
+                black_box(&small_wide),
+                black_box(&bounds),
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            )
+        });
     });
 
     group.finish();
@@ -172,7 +184,14 @@ fn bench_clip_geometry(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &geom, |b, geom| {
-            b.iter(|| clip_geometry(black_box(geom), black_box(&bounds), black_box(buffer)));
+            b.iter(|| {
+                clip_geometry(
+                    black_box(geom),
+                    black_box(&bounds),
+                    black_box(buffer),
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
+            });
         });
     }
 
@@ -205,12 +224,25 @@ fn bench_antarctica_polygon(c: &mut Criterion) {
     // Benchmark clip_geometry (end-to-end)
     let geom = geo::Geometry::Polygon(poly.clone());
     group.bench_function("clip_geometry", |b| {
-        b.iter(|| clip_geometry(black_box(&geom), black_box(&bounds), 0.0));
+        b.iter(|| {
+            clip_geometry(
+                black_box(&geom),
+                black_box(&bounds),
+                0.0,
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            )
+        });
     });
 
     // Benchmark i_overlay (for comparison)
     group.bench_function("ioverlay", |b| {
-        b.iter(|| clip_polygon_ioverlay(black_box(&poly), black_box(&bounds)));
+        b.iter(|| {
+            clip_polygon_ioverlay(
+                black_box(&poly),
+                black_box(&bounds),
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            )
+        });
     });
 
     group.finish();
@@ -266,7 +298,12 @@ fn bench_export_clip_mix(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &batch, |b, batch| {
             b.iter(|| {
                 for geom in batch {
-                    black_box(clip_geometry(black_box(geom), black_box(&bounds), buffer));
+                    black_box(clip_geometry(
+                        black_box(geom),
+                        black_box(&bounds),
+                        buffer,
+                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                    ));
                 }
             });
         });

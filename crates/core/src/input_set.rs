@@ -117,6 +117,8 @@ struct PartMeta {
 /// docs for the compatibility rules).
 #[derive(Debug)]
 pub struct MultiSource {
+    /// Metadata warnings deferred to the conversion that uses this source.
+    diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// The original input string (directory path or glob pattern).
     root: String,
     /// The partitions, sorted lexicographically. Ordering is load-bearing:
@@ -676,6 +678,14 @@ impl ConvertSource {
         match self {
             ConvertSource::Single(s) => s.projection.get().map(Vec::as_slice),
             ConvertSource::Multi(m) => m.projection.get().map(Vec::as_slice),
+        }
+    }
+
+    pub(crate) fn record_diagnostics(&self, sink: &crate::diagnostics::Diagnostics) {
+        if let Self::Multi(source) = self {
+            for event in &source.diagnostics {
+                sink.once(event.clone());
+            }
         }
     }
 
@@ -1270,6 +1280,7 @@ impl MultiSource {
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
         let metas = load_part_metas(&parts)?;
+        let diagnostics = crate::diagnostics::Diagnostics::silent();
 
         let first_name = parts[0].display_name();
         // The reference CRS: `Ok(crs)` per detect_crs_from_kv, `None` for an
@@ -1282,6 +1293,7 @@ impl MultiSource {
             crate::overview::convert::detect_crs_from_kv(
                 m.parquet.file_metadata().key_value_metadata(),
                 "",
+                &diagnostics,
             )
             .ok()
         };
@@ -1292,6 +1304,7 @@ impl MultiSource {
         let raw_crs_of = |m: &PartMeta| -> String {
             crate::quality::crs_info_from_kv_metadata(
                 m.parquet.file_metadata().key_value_metadata(),
+                &diagnostics,
             )
             .ok()
             .and_then(|info| info.identifier.or(info.name))
@@ -1331,6 +1344,7 @@ impl MultiSource {
 
         let schema = union_schema(&metas);
         Ok(MultiSource {
+            diagnostics: diagnostics.snapshot(),
             root,
             parts,
             metas,

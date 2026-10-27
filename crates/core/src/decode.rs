@@ -1360,7 +1360,12 @@ mod tests {
         let bounds: TileBounds = tile_bounds(x, y, z);
         // encode_geometry returns the MVT GeomType alongside the commands;
         // feed both straight into the decoder, mirroring decode_tile_features.
-        let (commands, geom_type) = encode_geometry(geom, &bounds, 4096);
+        let (commands, geom_type) = encode_geometry(
+            geom,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let parts = parse_command_stream(&commands).unwrap();
         assemble_geometry(geom_type, &parts, |px, py| {
             tile_local_to_lonlat(z, x, y, 4096, px, py)

@@ -633,6 +633,7 @@ pub(crate) fn estimate_with(
     let crs = detect_crs_from_kv(
         source.key_value_metadata()?.as_ref(),
         &source.display_name(),
+        &crate::diagnostics::Diagnostics::default(),
     )?;
     let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
         input: source.display_name(),

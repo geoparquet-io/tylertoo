@@ -103,7 +103,12 @@ fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> 
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(
             geoms.len(),
             batch.num_rows(),
@@ -322,15 +327,14 @@ fn export_counts_a_non_finite_overview_vertex() {
     }
     writer.close().unwrap();
 
-    let before = tylertoo_core::batch_processor::non_finite_geometry_count();
-    export_pmtiles(
+    let report = export_pmtiles(
         &hostile,
         dir.path().join("out.pmtiles"),
         &ExportOptions::default(),
     )
     .unwrap();
     assert!(
-        tylertoo_core::batch_processor::non_finite_geometry_count() > before,
+        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry { count } if *count > 0)),
         "the non-finite feature is counted"
     );
 }
@@ -832,7 +836,12 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "decoded rows have geometry");
         for (i, g) in geoms.into_iter().enumerate() {
             let id = (!ids.is_null(i)).then(|| ids.value(i));

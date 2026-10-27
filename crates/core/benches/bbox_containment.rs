@@ -143,6 +143,7 @@ fn bench_small_features_high_zoom(c: &mut Criterion) {
                             black_box(&geom),
                             black_box(&tile_bounds),
                             black_box(buffer),
+                            &tylertoo_core::diagnostics::Diagnostics::default(),
                         )
                         .is_some()
                         {
@@ -208,8 +209,13 @@ fn bench_small_features_boundary_crossing(c: &mut Criterion) {
             let mut clipped_count = 0;
             for building in &buildings {
                 let geom = Geometry::Polygon(building.clone());
-                if clip_geometry(black_box(&geom), black_box(&tile_bounds), black_box(buffer))
-                    .is_some()
+                if clip_geometry(
+                    black_box(&geom),
+                    black_box(&tile_bounds),
+                    black_box(buffer),
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
+                .is_some()
                 {
                     clipped_count += 1;
                 }
@@ -247,6 +253,7 @@ fn bench_large_features_low_zoom(c: &mut Criterion) {
                             black_box(&geom),
                             black_box(&tile_bounds),
                             black_box(buffer),
+                            &tylertoo_core::diagnostics::Diagnostics::default(),
                         )
                         .is_some()
                         {
@@ -332,7 +339,12 @@ fn bench_multipolygon_bbox_filter(c: &mut Criterion) {
             &geom,
             |b, geom| {
                 b.iter(|| {
-                    clip_geometry(black_box(geom), black_box(&tile_bounds), black_box(buffer))
+                    clip_geometry(
+                        black_box(geom),
+                        black_box(&tile_bounds),
+                        black_box(buffer),
+                        &tylertoo_core::diagnostics::Diagnostics::default(),
+                    )
                 });
             },
         );
@@ -358,8 +370,13 @@ fn bench_optimization_comparison(c: &mut Criterion) {
             let mut clipped_count = 0;
             for building in &buildings {
                 let geom = Geometry::Polygon(building.clone());
-                if clip_geometry(black_box(&geom), black_box(&tile_bounds), black_box(buffer))
-                    .is_some()
+                if clip_geometry(
+                    black_box(&geom),
+                    black_box(&tile_bounds),
+                    black_box(buffer),
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                )
+                .is_some()
                 {
                     clipped_count += 1;
                 }

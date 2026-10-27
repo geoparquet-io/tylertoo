@@ -52,6 +52,7 @@ pub mod compression;
 pub mod covering;
 pub mod decode;
 pub mod dedup;
+pub mod diagnostics;
 pub mod fs_probe;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
