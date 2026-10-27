@@ -22,9 +22,7 @@ crates/core/src/input_set.rs :: selected_row_count <-> widest_byte_array_column
 crates/core/src/ioverlay_clip.rs :: clip_polygon_ioverlay <-> repair_polygon_ioverlay
 crates/core/src/mvt.rs :: encode_multi_linestring <-> encode_multi_point
 crates/core/src/mvt.rs :: get_or_insert_key <-> get_or_insert_value
-crates/core/src/mvt.rs :: quantize_ring <-> requantize_ring
 crates/core/src/mvt.rs :: segments_cross_or_overlap <-> segments_meet
-crates/core/src/mvt.rs :: union_cached <-> union_group
 crates/core/src/overview/assign.rs :: allocated_bytes <-> heap_bytes
 crates/core/src/overview/assign.rs :: default <-> default
 crates/core/src/overview/assign.rs :: row <-> row

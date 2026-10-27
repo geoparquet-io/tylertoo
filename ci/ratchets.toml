@@ -67,10 +67,16 @@ scope = "core production `static NAME: Once` / `std::sync::Once` / `AtomicBool` 
 
 # #779 F5: 3 -> 5. #707's two counted drops, CLIP_GUARD_DROPS
 # (ioverlay_clip.rs) and NON_FINITE_GEOMETRIES (batch_processor.rs),
-# each marked `// F2: becomes Diagnostic::...`; F2 moves them to the
-# diagnostics channel with simplify.rs's two.
+# each marked `// F2: becomes Diagnostic::...`.
+# #779 F6 (#748): 5 -> 6, a raise. INVALID_AFTER_ENCODE
+# (mvt/tile_polygon.rs) counts polygons the tile-space validity owner could
+# not repair; zero on every strict-matrix fixture, so it is the alarm for a
+# repair gap. Its per-defect REPAIRED array is not matched by the scope
+# (an array type) but is the same kind of counter. F2 moves all three
+# counted drops, the REPAIRED array and simplify.rs's two into the
+# diagnostics channel.
 [global_atomic_counters]
-pin = 5
+pin = 6
 target = 1
 owner = "per-run counters in the diagnostics channel (#779 F2); atomic_output's temp-name sequence stays"
 catches = "simplify.rs FULL_RES_FALLBACKS / VALIDATION_SKIPS sum across every run in the process (#556 counter)"
@@ -159,10 +165,13 @@ scope = "production #[allow(..)], #![allow(..)], #[expect(..)] and #![expect(..)
 # two strategy entry points (0.802) and the two preflights (0.859, 0.800).
 # #779 F5: 60 -> 58. clip.rs's rect pair (one finite-aware pass) and
 # reader.rs's read_level pair (one rows() helper) are gone.
+# #779 F6: 58 -> 56. mvt.rs's quantize_ring/requantize_ring and
+# union_cached/union_group pairs left with the scattered tile-space
+# cleaners (one owner, mvt/tile_polygon.rs).
 [similarity_pairs]
 checked_by = "scripts/ci/similarity_ratchet.py"
 threshold = 0.85
-pin = 58
+pin = 56
 target = 0
 owner = "the refactor that shares each pair's code (#779); F1 for overview/, F3 for the CLI parsers and Python error mappers"
 catches = "near-duplicate functions inside one file; the gate sat at 0.95, where the workspace has zero pairs, so it caught nothing"
