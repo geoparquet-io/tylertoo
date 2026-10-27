@@ -4428,6 +4428,7 @@ fn decode_batch_bboxes(
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
+    crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -4813,6 +4814,7 @@ fn decode_batch_geometries(
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     ExportTimers::time(&timers.decode, || -> Result<(), ExportError> {
         let geom_field = schema.field(geom_idx).clone();
+        crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
         let garr: Arc<dyn GeoArrowArray> =
             from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
                 .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -6771,6 +6773,7 @@ fn decode_batch(
     let geom_field = schema.field(geom_idx).clone();
 
     // Decode geometries.
+    crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;

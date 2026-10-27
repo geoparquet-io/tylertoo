@@ -2018,7 +2018,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
-        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        crate::input_set::byte_array_batch_limit(),
     )
 }
 

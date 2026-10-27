@@ -32,10 +32,18 @@ fn read_pmtiles_header(path: &Path) -> (usize, u64, u64) {
     (root_dir_length, leaf_dirs_offset, leaf_dirs_length)
 }
 
-/// Verify that pmtiles CLI can read the file (if available)
+/// Verify the archive with go-pmtiles' `pmtiles verify`: `$PMTILES_BIN`
+/// when set (what `scripts/setup_go_pmtiles.sh --print-path` exports), else
+/// `pmtiles` on `PATH`.
+///
+/// Without the CLI a working copy skips the step, with a note. On CI (`CI`
+/// set, as GitHub Actions always does) a missing CLI FAILS: this check used
+/// to return `true` whenever the binary was absent, and no CI job installed
+/// it, so it verified nothing on every run (#779). The Test and Slow Tests
+/// jobs install the pinned go-pmtiles.
 fn verify_with_pmtiles_cli(path: &Path) -> bool {
-    // Try to run pmtiles verify
-    let result = Command::new("pmtiles")
+    let bin = std::env::var_os("PMTILES_BIN").unwrap_or_else(|| "pmtiles".into());
+    let result = Command::new(&bin)
         .args(["verify", path.to_str().unwrap()])
         .output();
 
@@ -51,9 +59,15 @@ fn verify_with_pmtiles_cli(path: &Path) -> bool {
                 false
             }
         }
-        Err(_) => {
-            eprintln!("pmtiles CLI not available, skipping verify step");
-            true // Don't fail if CLI not installed
+        Err(e) => {
+            let bin = bin.to_string_lossy();
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "pmtiles CLI ({bin}) not runnable on CI, so the archive went unverified: \
+                 {e}. Install it with scripts/setup_go_pmtiles.sh and export PMTILES_BIN"
+            );
+            eprintln!("pmtiles CLI ({bin}) not available, skipping verify step: {e}");
+            true
         }
     }
 }

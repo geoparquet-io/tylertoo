@@ -1,0 +1,18 @@
+# gate: cargo build --release --locked --package tylertoo && python3 benchmarks/e2e/run_e2e.py --invariants --only open-buildings --settings defaults
+# expect: FAIL +feature_accounting .*vanished with no counter
+# issue: #779 G3 invariant (c), feature accounting (#707): the export drops every 13-vertex feature with no counter, the way the clip guard drops a non-finite one
+diff --git a/crates/core/src/overview/export.rs b/crates/core/src/overview/export.rs
+index bb04f7f..0febb15 100644
+--- a/crates/core/src/overview/export.rs
++++ b/crates/core/src/overview/export.rs
+@@ -5302,6 +5302,10 @@ fn feature_tile_members_direct(
+     assume_simple: bool,
+     out: &mut Vec<(u64, Geometry<f64>)>,
+ ) {
++    // A silent drop, like the #707 clip guard's: no counter, no log.
++    if geom.coords_count() == 13 {
++        return;
++    }
+     for tc in tiles_in_ranges(ranges, zoom) {
+         let key = tile_key(tc.x, tc.y, zoom);
+         if key < key_lo || key > key_hi {

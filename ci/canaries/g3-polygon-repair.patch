@@ -1,0 +1,16 @@
+# gate: cargo build --release --locked --package tylertoo && python3 benchmarks/e2e/run_e2e.py --invariants --only fieldmaps-boundaries --settings defaults
+# expect: FAIL +polygon_valid +z\d+ +\d+ / \d+ polygon features invalid
+# issue: #779 G3 invariant (b), OGC-valid polygons (#748): the tile-space polygon cleaner (#383, #393) treats every polygon as clean, so rings that self-intersect after snapping reach the tiles
+diff --git a/crates/core/src/mvt.rs b/crates/core/src/mvt.rs
+index 79bf728..a711618 100644
+--- a/crates/core/src/mvt.rs
++++ b/crates/core/src/mvt.rs
+@@ -1012,7 +1012,7 @@ fn clean_tile_polygon(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
+     // The usual case: nothing touches, nothing crosses. One pass of the
+     // integer checks and out; noding and pinch-splitting only run on the
+     // polygons that fail it (a touch of any kind fails it).
+-    if polygon_is_clean(&rings) {
++    if !rings.is_empty() {
+         return vec![rings];
+     }
+     let mut out = Vec::new();
