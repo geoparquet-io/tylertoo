@@ -971,8 +971,12 @@ pub fn fuzz_parquet_footer(
     let some: Vec<usize> = (0..n).step_by(2).collect();
     for selected in [None, Some(some.as_slice())] {
         let _ = crate::input::selected_compressed_bytes(&md, selected);
-        let widest = crate::input_set::widest_byte_array_column(&md, selected, 0);
-        let _ = crate::input_set::capped_batch_rows(8192, widest.as_ref());
+        let _ = crate::untrusted::read_batch_plan(
+            &md,
+            selected,
+            8192,
+            crate::untrusted::byte_array_limit(),
+        );
         let _ = crate::input_set::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
     }
 
@@ -1805,7 +1809,12 @@ mod tests {
         // offsets. The owner's cap, which the cluster read now goes
         // through, keeps a batch near 1 GiB: 256 rows.
         let md = wide_rows_meta(4, 4 << 20);
-        let rows = crate::untrusted::batch_rows_for(&md, None, 1024);
+        let rows = crate::untrusted::read_batch_plan(
+            &md,
+            None,
+            1024,
+            crate::untrusted::byte_array_limit(),
+        );
         assert!(rows < 1024, "{rows}");
         assert!((rows as u64) * (4 << 20) <= 1 << 31, "{rows}");
     }
@@ -1813,6 +1822,14 @@ mod tests {
     #[test]
     fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
         let md = wide_rows_meta(16, 100);
-        assert_eq!(crate::untrusted::batch_rows_for(&md, None, 1024), 1024);
+        assert_eq!(
+            crate::untrusted::read_batch_plan(
+                &md,
+                None,
+                1024,
+                crate::untrusted::byte_array_limit()
+            ),
+            1024
+        );
     }
 }

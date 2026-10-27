@@ -62,6 +62,16 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
+    /// At least one row's byte-array values cannot fit any decoded batch.
+    #[error("column '{column}' holds {bytes} bytes in one row, past the {limit_bytes}-byte byte-array ceiling (i32 offsets). Split or simplify those features before tiling.")]
+    ByteArrayRowTooLarge {
+        /// The offending leaf column.
+        column: String,
+        /// Bytes addressed by one row.
+        bytes: u64,
+        /// The per-array byte ceiling.
+        limit_bytes: u64,
+    },
     /// Local I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

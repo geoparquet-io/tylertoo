@@ -156,77 +156,7 @@ pub struct RowGroupSelection(Vec<Vec<usize>>);
 /// The ceiling every read path sizes against is
 /// [`crate::untrusted::byte_array_limit`]: this value, unless a test scaled
 /// it down.
-pub const BYTE_ARRAY_BATCH_LIMIT: u64 = i32::MAX as u64;
-
-/// The byte-array column chunk with the most bytes per row among some row
-/// groups (#563): the one that decides how many rows one batch can hold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WidestByteArrayColumn {
-    /// Index into the source's parts (0 for a single file).
-    pub part: usize,
-    /// The row group's local index within its part.
-    pub row_group: usize,
-    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
-    pub column: String,
-    /// Decoded bytes per row, averaged over the row group, rounded up.
-    pub avg_row_bytes: u64,
-}
-
-/// The widest byte-array column chunk of `meta`'s row groups `row_groups`
-/// (`None` = all), or `None` when there is no non-empty byte-array chunk.
-///
-/// Footer-only. The per-chunk size is the larger of the chunk's
-/// `total_uncompressed_size` and, when the writer recorded it, its
-/// `unencoded_byte_array_data_bytes` size statistic: a dictionary-encoded
-/// chunk's uncompressed size counts each distinct value once, while the
-/// decoded array holds a copy per row.
-pub(crate) fn widest_byte_array_column(
-    meta: &ParquetMetaData,
-    row_groups: Option<&[usize]>,
-    part: usize,
-) -> Option<WidestByteArrayColumn> {
-    let groups = meta.row_groups();
-    let all: Vec<usize>;
-    let picked: &[usize] = match row_groups {
-        Some(p) => p,
-        None => {
-            all = (0..groups.len()).collect();
-            &all
-        }
-    };
-    let mut widest: Option<WidestByteArrayColumn> = None;
-    for &gi in picked {
-        let Some(rg) = groups.get(gi) else {
-            continue;
-        };
-        let rows = rg.num_rows().max(0) as u64;
-        if rows == 0 {
-            continue;
-        }
-        for col in rg.columns() {
-            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
-                continue;
-            }
-            let bytes = col
-                .uncompressed_size()
-                .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
-                .max(0) as u64;
-            let avg_row_bytes = bytes.div_ceil(rows);
-            if widest
-                .as_ref()
-                .is_none_or(|w| avg_row_bytes > w.avg_row_bytes)
-            {
-                widest = Some(WidestByteArrayColumn {
-                    part,
-                    row_group: gi,
-                    column: col.column_path().string(),
-                    avg_row_bytes,
-                });
-            }
-        }
-    }
-    widest
-}
+pub use crate::untrusted::BYTE_ARRAY_BATCH_LIMIT;
 
 /// The byte-array column that holds the most decoded bytes in total over some
 /// row groups (#606): what decides whether one batch can hold all of them.
@@ -288,31 +218,6 @@ pub(crate) fn largest_byte_array_column(
             column: descr.column(leaf).path().string(),
             total_bytes,
         })
-}
-
-/// Rows per batch that keep an average batch of the widest byte-array column
-/// at or under half of `limit` (#563), never below 1. The half is headroom
-/// for rows larger than their row group's average.
-pub(crate) fn byte_array_batch_rows(avg_row_bytes: u64, limit: u64) -> usize {
-    let budget = limit / 2;
-    usize::try_from(budget / avg_row_bytes.max(1))
-        .unwrap_or(usize::MAX)
-        .max(1)
-}
-
-/// `requested` rows per batch, lowered when `widest` needs fewer to stay
-/// under the ceiling in force ([`crate::untrusted::byte_array_limit`]:
-/// [`BYTE_ARRAY_BATCH_LIMIT`] unless a test scaled it). Every reader gets
-/// this through [`crate::untrusted::ParquetSource::build`].
-pub(crate) fn capped_batch_rows(requested: usize, widest: Option<&WidestByteArrayColumn>) -> usize {
-    match widest {
-        Some(w) => requested.min(byte_array_batch_rows(
-            w.avg_row_bytes,
-            crate::untrusted::byte_array_limit(),
-        )),
-        None => requested,
-    }
-    .max(1)
 }
 
 /// Maps a row's position in a [`ConvertSource`]'s read stream back to the
@@ -884,7 +789,7 @@ impl ConvertSource {
     /// when `selected` is `None`), straight from the footers: every leaf under
     /// the column, each counted as its uncompressed size or, for a byte-array
     /// leaf whose footer records it, its unencoded data bytes if larger (the
-    /// #563 rule in [`widest_byte_array_column`]).
+    /// #563 rule in [`crate::untrusted::read_batch_plan`]).
     ///
     /// `column` indexes the schema this source exposes, as a
     /// [`ReadPlan::projection`] does. Pass 1 reports this as the geometry
@@ -1055,22 +960,25 @@ impl ConvertSource {
             .fold(0, u64::saturating_add))
     }
 
-    /// The widest byte-array column chunk among the `selected` row groups of
-    /// every part (`None` selection = all), footer statistics only (#563).
-    /// See [`BYTE_ARRAY_BATCH_LIMIT`].
-    pub(crate) fn widest_byte_array_column(
+    /// Plan reads for all selected parts through the untrusted-reader owner.
+    pub(crate) fn read_batch_rows(
         &self,
         selected: Option<&RowGroupSelection>,
-    ) -> Result<Option<WidestByteArrayColumn>, InputError> {
-        let metas = self.metas()?;
-        Ok(metas
+        requested: usize,
+        limit: u64,
+    ) -> Result<usize, InputError> {
+        Ok(self
+            .metas()?
             .iter()
             .enumerate()
-            .filter_map(|(pi, m)| {
-                let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
-                widest_byte_array_column(&m.parquet, picked, pi)
-            })
-            .max_by_key(|w| w.avg_row_bytes))
+            .fold(requested, |rows, (pi, m)| {
+                crate::untrusted::read_batch_plan(
+                    &m.parquet,
+                    selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
+                    rows,
+                    limit,
+                )
+            }))
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -2991,51 +2899,6 @@ b.parquet
 
     // --- #563: byte-array batch ceiling -------------------------------------
 
-    /// A fixture with one `geometry` (Binary) column of `blob_sizes` zero
-    /// blobs, `max_row_group_size` rows per row group.
-    fn write_geometry_fixture_with_grouping(
-        path: &Path,
-        blob_sizes: &[usize],
-        max_row_group_size: Option<usize>,
-    ) {
-        use arrow_array::BinaryArray;
-
-        let blobs: Vec<Vec<u8>> = blob_sizes.iter().map(|&n| vec![0u8; n]).collect();
-        let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
-        write_parquet(
-            path,
-            vec![Field::new("geometry", DataType::Binary, false)],
-            vec![Arc::new(BinaryArray::from_vec(refs))],
-            max_row_group_size,
-        );
-    }
-
-    /// The widest column is found per row group, respecting the selection,
-    /// and averaged over the group's rows.
-    #[test]
-    fn widest_byte_array_column_names_the_row_group_and_respects_the_selection() {
-        let dir = tmpdir();
-        let f = dir.path().join("geo.parquet");
-        // Row group 0: two 16-byte rows. Row group 1: two 4096-byte rows.
-        write_geometry_fixture_with_grouping(&f, &[16, 16, 4096, 4096], Some(2));
-        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-
-        let w = src.widest_byte_array_column(None).unwrap().unwrap();
-        assert_eq!((w.part, w.row_group, w.column.as_str()), (0, 1, "geometry"));
-        assert!(
-            w.avg_row_bytes >= 4096 && w.avg_row_bytes < 4096 + 64,
-            "average bytes per row, not the chunk total: {w:?}"
-        );
-
-        let only_small = RowGroupSelection::from_parts(vec![vec![0]]);
-        let w = src
-            .widest_byte_array_column(Some(&only_small))
-            .unwrap()
-            .unwrap();
-        assert_eq!(w.row_group, 0);
-        assert!(w.avg_row_bytes < 64, "{w:?}");
-    }
-
     /// The largest column is the one with the most bytes summed over the
     /// selected row groups, counting only the roots the caller asks for.
     #[test]
@@ -3085,28 +2948,5 @@ b.parquet
             largest_byte_array_column(meta, None, |root| root == 2).is_none(),
             "a column holding no bytes is not a largest column"
         );
-    }
-
-    /// The batch cap keeps an average batch at half the ceiling, never
-    /// drops below one row, and leaves a narrow input's batch alone.
-    #[test]
-    fn byte_array_batch_rows_budgets_half_the_ceiling() {
-        assert_eq!(byte_array_batch_rows(100, 1000), 5);
-        assert_eq!(byte_array_batch_rows(10_000, 1000), 1);
-        assert_eq!(byte_array_batch_rows(0, 1000), 500);
-        // 128 KiB rows against the real ceiling: 8191 rows (1 GiB - 1 byte).
-        assert_eq!(
-            byte_array_batch_rows(128 * 1024, BYTE_ARRAY_BATCH_LIMIT),
-            8191
-        );
-        assert_eq!(capped_batch_rows(8192, None), 8192);
-        let wide = WidestByteArrayColumn {
-            part: 0,
-            row_group: 0,
-            column: "geometry".into(),
-            avg_row_bytes: 300_000,
-        };
-        assert_eq!(capped_batch_rows(8192, Some(&wide)), 3579);
-        assert_eq!(capped_batch_rows(100, Some(&wide)), 100);
     }
 }

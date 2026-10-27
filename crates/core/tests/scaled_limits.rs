@@ -19,8 +19,8 @@
 //!
 //! The output must not move: a batch size or a memory budget is scheduling,
 //! never content. Where a ceiling cannot be met, the run must fail with the
-//! typed error that names it, before reading data, never with arrow's
-//! overflow.
+//! typed error that names it, never with arrow's overflow. Oversized
+//! rows are identified from their decoded values rather than chunk averages.
 //!
 //! One `#[test]` on purpose: the overrides are process environment, and the
 //! pass-2 memory probe caches its first answer for the process, so the
@@ -93,6 +93,8 @@ fn run(input: &Path, dir: &Path, tag: &str) -> Signature {
 
 #[test]
 fn every_reader_path_honours_the_scaled_ceilings() {
+    let regression_dir = tempfile::tempdir().unwrap();
+    reader_regressions(regression_dir.path());
     let Some(input) = fixture::realdata("open-buildings.parquet") else {
         return;
     };
@@ -125,18 +127,144 @@ fn every_reader_path_honours_the_scaled_ceilings() {
         other => panic!("--no-streaming: expected InMemoryByteArrayTooLarge, got {other}"),
     }
 
-    // D: a ceiling below one row: the streaming preflight refuses with the
-    // typed #563 error, naming the column, before reading data.
+    // D: a ceiling below one row: the owner refuses with the typed #563
+    // input error, naming the actual oversized row.
     std::env::set_var(BYTE_ARRAY_ENV, BELOW_ONE_ROW.to_string());
     let err = convert_to_overviews(&input, dir.path().join("row.parquet"), &options(true))
         .expect_err("no batch can hold one row");
-    match err {
-        ConvertError::ByteArrayRowTooLarge { limit_bytes, .. } => {
-            assert_eq!(limit_bytes, BELOW_ONE_ROW);
-        }
-        other => panic!("streaming: expected ByteArrayRowTooLarge, got {other}"),
-    }
+    assert!(err.to_string().contains("one row"), "{err}");
 
     std::env::remove_var(BYTE_ARRAY_ENV);
     std::env::remove_var(MEMORY_ENV);
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#779: writes a trusted temporary regression fixture"
+)]
+fn reader_regressions(dir: &Path) {
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+    use tylertoo_core::untrusted::open_parquet;
+
+    std::env::set_var(BYTE_ARRAY_ENV, "1000");
+    let read = |name: &str, array: ArrayRef| {
+        let batch = RecordBatch::try_from_iter(vec![("name", array)]).unwrap();
+        let path = dir.join(name);
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            batch.schema(),
+            Some(
+                WriterProperties::builder()
+                    .set_dictionary_enabled(false)
+                    .build(),
+            ),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        open_parquet(std::fs::File::open(path).unwrap())
+            .unwrap()
+            .with_batch_rows(100)
+            .build()
+            .map_err(arrow_schema::ArrowError::from)?
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let mut values = vec![String::new(); 100];
+    values[0] = "x".repeat(600);
+    values[1] = "y".repeat(600);
+    let batches = read("skew.parquet", Arc::new(StringArray::from(values))).unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        100
+    );
+    assert!(batches.iter().all(|b| {
+        {
+            let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            *a.value_offsets().last().unwrap() <= 1000
+        }
+    }));
+    let mut list = ListBuilder::new(StringBuilder::new());
+    list.values().append_value("x".repeat(600));
+    list.values().append_value("y".repeat(600));
+    list.append(true);
+    let error = read("nested.parquet", Arc::new(list.finish())).unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_core::untrusted::input_error(&error),
+            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+        ),
+        "{error}"
+    );
+    let error = read(
+        "single.parquet",
+        Arc::new(StringArray::from(vec!["x".repeat(1200)])),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_core::untrusted::input_error(&error),
+            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+        ),
+        "{error}"
+    );
+    // Nested children must be split by addressed offsets, including slices.
+    let mut list = ListBuilder::new(StringBuilder::new());
+    for value in ["unused", &"a".repeat(600), &"b".repeat(600)] {
+        list.values().append_value(value);
+        list.append(true);
+    }
+    let sliced = list.finish().slice(1, 2);
+    let batches = read("list-slice.parquet", Arc::new(sliced)).unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+    use arrow_array::types::Int8Type;
+    use arrow_array::{DictionaryArray, Int8Array, LargeStringArray, StructArray};
+    use arrow_schema::{DataType, Field};
+    let dict = |bytes| {
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![0, 0]),
+                Arc::new(StringArray::from(vec!["x".repeat(bytes)])),
+            )
+            .unwrap(),
+        ) as ArrayRef
+    };
+    let batches = read("dictionary.parquet", dict(600)).unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let error = read("dictionary-too-wide.parquet", dict(1200)).unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_core::untrusted::input_error(&error),
+            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+        ),
+        "{error}"
+    );
+    let child = dict(1200);
+    let field = Arc::new(Field::new("child", child.data_type().clone(), false));
+    let nested = StructArray::from(vec![(field, child)]);
+    assert!(read("struct-dictionary.parquet", Arc::new(nested)).is_err());
+    let child: ArrayRef = Arc::new(LargeStringArray::from(vec!["x".repeat(1200)]));
+    let nested = StructArray::from(vec![(
+        Arc::new(Field::new("wide", DataType::LargeUtf8, false)),
+        child,
+    )]);
+    assert!(read("large-offsets.parquet", Arc::new(nested)).is_ok());
+    use arrow_array::builder::{FixedSizeListBuilder, MapBuilder};
+    let mut fixed = FixedSizeListBuilder::new(StringBuilder::new(), 2);
+    fixed.values().append_value("x".repeat(600));
+    fixed.values().append_value("y".repeat(600));
+    fixed.append(true);
+    assert!(read("fixed-list.parquet", Arc::new(fixed.finish())).is_err());
+    let mut map = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for key in ["a", "b"] {
+        map.keys().append_value(key);
+        map.values().append_value("x".repeat(600));
+    }
+    map.append(true).unwrap();
+    assert!(read("map.parquet", Arc::new(map.finish())).is_err());
+    std::env::remove_var(BYTE_ARRAY_ENV);
 }

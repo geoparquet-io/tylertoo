@@ -25,10 +25,11 @@
 //!   embedded `ARROW:schema` (#683), each data page (#687) and each IPC
 //!   message (#684). A panic becomes [`InputError::DecoderPanic`], carrying
 //!   the upstream message and location. See `guard` for why that is sound.
-//! - **One batch-size ceiling** (#563): [`ParquetSource::build`] lowers the
-//!   requested batch so no decoded byte-array column can reach arrow's i32
-//!   offset limit, from footer statistics alone. [`byte_array_limit`] is the
-//!   ceiling every path uses, so a test that scales it scales every path.
+//! - **One batch-size ceiling** (#563): [`ParquetSource::build`] plans the
+//!   initial decode size from footer statistics, decodes with wide byte
+//!   offsets, and splits before narrowing to i32. Skewed row widths cannot
+//!   overflow a batch. [`byte_array_limit`] is fixed in production; the
+//!   `testing` feature enables the isolated scaled-limit lane.
 //! - **IPC blocks inside the file**: [`open_ipc`] refuses a footer whose
 //!   dictionary or record-batch block ends past the file, before arrow-ipc
 //!   zero-allocates the block's declared length.
@@ -672,100 +673,25 @@ pub fn reader_metadata(
 // The byte-array ceiling (#563)
 // ============================================================================
 
-/// The environment variable that scales the byte-array ceiling down (#779):
-/// `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES=16384` makes every read path size its
-/// batches, and fail, as if arrow's i32 offset ceiling were 16 KiB. The
-/// scaled-limit lane (`crates/core/tests/scaled_limits.rs`) sets it: those
-/// tests run the CLI-facing engines from outside the crate, where the
-/// in-crate [`scale_byte_array_limit`] hook cannot reach.
-pub(crate) const BYTE_ARRAY_LIMIT_ENV: &str = "TYLERTOO_BYTE_ARRAY_LIMIT_BYTES";
+/// Arrow's fixed i32 byte-offset ceiling. Production never reads an override.
+pub const BYTE_ARRAY_BATCH_LIMIT: u64 = i32::MAX as u64;
 
-/// The most bytes of one byte-array column a decoded batch may hold:
-/// [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`], unless it is scaled down.
-///
-/// The one source of the ceiling. Every read path sizes its batches from
-/// it, and `check_byte_array_ceiling` fails a batch past it, so scaling
-/// it exercises every path's cap at a size a fixture can reach. Two things
-/// scale it, and either can only lower it:
-///
-/// - `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`, a positive integer (anything else is
-///   ignored);
-/// - in unit tests, `scale_byte_array_limit`.
-///
-/// Reads the environment on every call, so callers ask once per read plan
-/// (a [`ParquetSource::build`], a preflight, an in-memory load), never per
-/// batch. In unit tests the scaled value is process-wide while its guard
-/// lives (see `ScaledByteArrayLimit`).
+/// The byte-array ceiling used by every read and concatenation boundary.
 pub fn byte_array_limit() -> u64 {
-    let limit = std::env::var(BYTE_ARRAY_LIMIT_ENV)
+    #[cfg(feature = "testing")]
+    if let Some(limit) = std::env::var("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map_or(crate::input_set::BYTE_ARRAY_BATCH_LIMIT, |n| {
-            n.min(crate::input_set::BYTE_ARRAY_BATCH_LIMIT)
-        });
-    #[cfg(test)]
-    if let Some(scaled) = scaled_limit() {
-        return limit.min(scaled);
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+    {
+        return limit.min(BYTE_ARRAY_BATCH_LIMIT);
     }
-    limit
+    BYTE_ARRAY_BATCH_LIMIT
 }
 
-/// [`byte_array_limit`] when it is scaled below arrow's real ceiling, the
-/// one a reader must then enforce itself; `None` at the real ceiling, which
-/// arrow enforces.
 fn scaled_ceiling() -> Option<u64> {
     let limit = byte_array_limit();
-    (limit < crate::input_set::BYTE_ARRAY_BATCH_LIMIT).then_some(limit)
-}
-
-#[cfg(test)]
-static SCALED_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-fn scaled_limit() -> Option<u64> {
-    match SCALED_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        n => Some(n),
-    }
-}
-
-/// While alive, [`byte_array_limit`] is the scaled ceiling and every batch
-/// an [`UntrustedBatchReader`] yields is checked against it the way arrow
-/// checks the real one: a byte-array column past it fails the read with
-/// arrow's own overflow message. Serialized, so two scaling tests cannot
-/// interleave.
-///
-/// Process-wide, so the engines' worker threads see it. That also means
-/// any other test in the same process sees it: under plain `cargo test`
-/// (every test of the binary a thread of one process), a parquet read
-/// another test starts while a guard lives gets the scaled ceiling, and a
-/// batch with more string bytes than it fails. A reader records its
-/// ceiling when it is built, so a read started before the guard or after
-/// it is unaffected. nextest runs each test in its own process, which is
-/// why the tiers never see it. Scoping the ceiling to the scaling test's
-/// own reads would mean threading a source identity through every caller
-/// of [`byte_array_limit`]; see DEVELOPMENT.md ("Tests").
-#[cfg(test)]
-pub(crate) struct ScaledByteArrayLimit {
-    _serial: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-pub(crate) fn scale_byte_array_limit(bytes: u64) -> ScaledByteArrayLimit {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let serial = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    SCALED_LIMIT.store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
-    ScaledByteArrayLimit { _serial: serial }
-}
-
-#[cfg(test)]
-impl Drop for ScaledByteArrayLimit {
-    fn drop(&mut self) {
-        SCALED_LIMIT.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+    (limit < BYTE_ARRAY_BATCH_LIMIT).then_some(limit)
 }
 
 /// Fails `batch` the way arrow fails a batch past its i32 offset ceiling
@@ -788,46 +714,212 @@ pub(crate) fn check_byte_array_ceiling(batch: &RecordBatch) -> Result<(), ArrowE
     }
 }
 
-/// The scaled ceiling's stand-in for arrow's i32 offset check: an error
-/// carrying arrow's own "index overflow decoding byte array" wording when a
-/// `Binary`/`Utf8` column of `batch` holds more than `limit` bytes.
-fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> {
-    use arrow_array::cast::AsArray;
-    use arrow_schema::DataType;
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let offsets = match column.data_type() {
-            DataType::Binary => column.as_binary::<i32>().value_offsets(),
-            DataType::Utf8 => column.as_string::<i32>().value_offsets(),
-            _ => continue,
-        };
-        // The bytes this (possibly sliced) column addresses.
-        let bytes = match (offsets.first(), offsets.last()) {
-            (Some(&first), Some(&last)) => u64::try_from(last - first).unwrap_or(0),
-            _ => 0,
-        };
-        if bytes > limit {
-            return Err(ArrowError::ParquetError(format!(
-                "index overflow decoding byte array: column '{}' holds {bytes} bytes in one \
-                 batch, past the {limit}-byte byte-array ceiling (scaled down from arrow's \
-                 i32 offset limit, #563; {BYTE_ARRAY_LIMIT_ENV})",
-                field.name()
-            )));
-        }
-    }
-    Ok(())
+/// Decode 32-bit byte arrays using 64-bit offsets. Dictionary columns decode
+/// to their values and are re-encoded after splitting, so an unused dictionary
+/// entry cannot force an otherwise small slice over the ceiling.
+fn wide_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+    Arc::new(
+        field
+            .as_ref()
+            .clone()
+            .with_data_type(wide_type(field.data_type())),
+    )
 }
 
-/// `requested` rows per batch, lowered when the widest byte-array column of
-/// `metadata`'s row groups `row_groups` (`None` = all) needs fewer to keep a
-/// batch under [`byte_array_limit`] (#563). Never below 1.
-pub fn batch_rows_for(
+fn projected_field(
+    original: &arrow_schema::Field,
+    decoded: &arrow_schema::Field,
+) -> arrow_schema::Field {
+    use arrow_schema::DataType;
+    let target = match (original.data_type(), decoded.data_type()) {
+        (DataType::Struct(fields), DataType::Struct(projected)) => DataType::Struct(
+            projected
+                .iter()
+                .map(|field| {
+                    Arc::new(projected_field(
+                        fields.iter().find(|f| f.name() == field.name()).unwrap(),
+                        field,
+                    ))
+                })
+                .collect(),
+        ),
+        (DataType::List(field), DataType::List(projected)) => {
+            DataType::List(Arc::new(projected_field(field, projected)))
+        }
+        (DataType::LargeList(field), DataType::LargeList(projected)) => {
+            DataType::LargeList(Arc::new(projected_field(field, projected)))
+        }
+        (DataType::FixedSizeList(field, n), DataType::FixedSizeList(projected, _)) => {
+            DataType::FixedSizeList(Arc::new(projected_field(field, projected)), *n)
+        }
+        (DataType::Map(field, sorted), DataType::Map(projected, _)) => {
+            DataType::Map(Arc::new(projected_field(field, projected)), *sorted)
+        }
+        _ => original.data_type().clone(),
+    };
+    original.clone().with_data_type(target)
+}
+
+fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType;
+    match data_type {
+        DataType::Utf8 => DataType::LargeUtf8,
+        DataType::Binary => DataType::LargeBinary,
+        DataType::Dictionary(_, value) => wide_type(value),
+        DataType::List(f) => DataType::List(wide_field(f)),
+        DataType::LargeList(f) => DataType::LargeList(wide_field(f)),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(wide_field(f), *n),
+        DataType::Map(f, sorted) => DataType::Map(wide_field(f), *sorted),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(wide_field).collect()),
+        _ => data_type.clone(),
+    }
+}
+
+fn batch_overflow(batch: &RecordBatch, schema: &SchemaRef, limit: u64) -> Option<(String, u64)> {
+    batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .find_map(|(array, field)| {
+            array_overflow(array.as_ref(), field.data_type(), limit)
+                .map(|bytes| (field.name().clone(), bytes))
+        })
+}
+
+/// Only the children addressed by a slice count. Large byte arrays are exempt
+/// unless they are the temporary wide representation of an i32-offset input.
+fn array_overflow(
+    array: &dyn arrow_array::Array,
+    target: &arrow_schema::DataType,
+    limit: u64,
+) -> Option<u64> {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    let over = |bytes: u64| (bytes > limit).then_some(bytes);
+    match target {
+        DataType::Utf8 | DataType::Binary => {
+            let bytes = match array.data_type() {
+                DataType::Utf8 => {
+                    let o = array.as_string::<i32>().value_offsets();
+                    (i64::from(*o.last().unwrap()) - i64::from(o[0])) as u64
+                }
+                DataType::Binary => {
+                    let o = array.as_binary::<i32>().value_offsets();
+                    (i64::from(*o.last().unwrap()) - i64::from(o[0])) as u64
+                }
+                DataType::LargeUtf8 => {
+                    let o = array.as_string::<i64>().value_offsets();
+                    (*o.last().unwrap() - o[0]) as u64
+                }
+                DataType::LargeBinary => {
+                    let o = array.as_binary::<i64>().value_offsets();
+                    (*o.last().unwrap() - o[0]) as u64
+                }
+                _ => return None,
+            };
+            over(bytes)
+        }
+        DataType::List(field) => {
+            let list = array.as_list::<i32>();
+            let offsets = list.value_offsets();
+            let start = offsets[0] as usize;
+            let len = *offsets.last().unwrap() as usize - start;
+            array_overflow(
+                list.values().slice(start, len).as_ref(),
+                field.data_type(),
+                limit,
+            )
+        }
+        DataType::LargeList(field) => {
+            let list = array.as_list::<i64>();
+            let offsets = list.value_offsets();
+            let start = offsets[0] as usize;
+            let len = *offsets.last().unwrap() as usize - start;
+            array_overflow(
+                list.values().slice(start, len).as_ref(),
+                field.data_type(),
+                limit,
+            )
+        }
+        DataType::FixedSizeList(field, _) => array_overflow(
+            array.as_fixed_size_list().values().as_ref(),
+            field.data_type(),
+            limit,
+        ),
+        DataType::Struct(fields) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .zip(fields)
+            .find_map(|(a, f)| array_overflow(a.as_ref(), f.data_type(), limit)),
+        DataType::Map(field, _) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let start = offsets[0] as usize;
+            let len = *offsets.last().unwrap() as usize - start;
+            array_overflow(&map.entries().slice(start, len), field.data_type(), limit)
+        }
+        DataType::Dictionary(_, value) => {
+            if let Some(dictionary) = array.as_any_dictionary_opt() {
+                array_overflow(dictionary.values().as_ref(), value, limit)
+            } else {
+                array_overflow(array, value, limit)
+            }
+        }
+        _ => array.to_data().child_data().iter().find_map(|child| {
+            let child = arrow_array::make_array(child.clone());
+            array_overflow(child.as_ref(), child.data_type(), limit)
+        }),
+    }
+}
+
+fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> {
+    match batch_overflow(batch, &batch.schema(), limit) {
+        Some((column, bytes)) => Err(ArrowError::ParquetError(format!(
+            "index overflow decoding byte array: column '{column}' holds {bytes} bytes in one \
+             batch, past the {limit}-byte byte-array ceiling (i32 offsets)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The read-plan owner. Statistics choose an initial decode size only;
+/// [`UntrustedBatchReader`] splits wide-offset batches before narrowing, so
+/// skewed widths cannot defeat the estimate. Both engines and every reader
+/// use this plan. A single oversized row is refused by the decoder.
+pub(crate) fn read_batch_plan(
     metadata: &ParquetMetaData,
     row_groups: Option<&[usize]>,
     requested: usize,
+    limit: u64,
 ) -> usize {
-    crate::input_set::capped_batch_rows(
-        requested.max(1),
-        crate::input_set::widest_byte_array_column(metadata, row_groups, 0).as_ref(),
+    let avg = metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| row_groups.is_none_or(|picked| picked.contains(i)))
+        .filter(|(_, group)| group.num_rows() > 0)
+        .flat_map(|(_, group)| {
+            group
+                .columns()
+                .iter()
+                .filter(|column| {
+                    column.column_descr().physical_type() == parquet::basic::Type::BYTE_ARRAY
+                })
+                .map(move |column| {
+                    column
+                        .uncompressed_size()
+                        .max(column.unencoded_byte_array_data_bytes().unwrap_or(0))
+                        .max(0) as u64
+                        / group.num_rows() as u64
+                })
+        })
+        .max()
+        .unwrap_or(0);
+    requested.max(1).min(
+        usize::try_from((limit / 2) / avg.max(1))
+            .unwrap_or(usize::MAX)
+            .max(1),
     )
 }
 
@@ -846,7 +938,8 @@ pub(crate) const DEFAULT_BATCH_ROWS: usize = 1024;
 /// [`Self::build`] caps the batch size and returns a reader whose every
 /// batch is decoded inside the boundary.
 pub struct ParquetSource<R: ChunkReader + 'static> {
-    builder: ParquetRecordBatchReaderBuilder<R>,
+    reader: R,
+    projection: Option<ProjectionMask>,
     metadata: ArrowReaderMetadata,
     row_groups: Option<Vec<usize>>,
     batch_rows: usize,
@@ -881,7 +974,8 @@ pub fn open_parquet_with_metadata<R: ChunkReader + 'static>(
     metadata: ArrowReaderMetadata,
 ) -> ParquetSource<R> {
     ParquetSource {
-        builder: ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata.clone()),
+        reader,
+        projection: None,
         metadata,
         row_groups: None,
         batch_rows: DEFAULT_BATCH_ROWS,
@@ -891,17 +985,17 @@ pub fn open_parquet_with_metadata<R: ChunkReader + 'static>(
 impl<R: ChunkReader + 'static> ParquetSource<R> {
     /// The parsed footer.
     pub fn metadata(&self) -> &Arc<ParquetMetaData> {
-        self.builder.metadata()
+        self.metadata.metadata()
     }
 
     /// The Arrow schema of the whole file.
     pub fn schema(&self) -> &SchemaRef {
-        self.builder.schema()
+        self.metadata.schema()
     }
 
     /// The Parquet schema, for building a [`ProjectionMask`].
     pub fn parquet_schema(&self) -> &SchemaDescriptor {
-        self.builder.parquet_schema()
+        self.metadata.parquet_schema()
     }
 
     /// The checked footer and schema, to open this file again with
@@ -913,7 +1007,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     /// Read only the columns in `mask`.
     #[must_use]
     pub fn with_projection(mut self, mask: ProjectionMask) -> Self {
-        self.builder = self.builder.with_projection(mask);
+        self.projection = Some(mask);
         self
     }
 
@@ -932,8 +1026,8 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         self
     }
 
-    /// Ask for batches of `rows` rows. [`Self::build`] lowers this when the
-    /// selected row groups' widest byte-array column needs fewer rows to
+    /// Ask for batches of at most `rows` rows. The read plan may lower the
+    /// decode size, and the reader splits decoded batches when needed to
     /// stay under [`byte_array_limit`].
     #[must_use]
     pub fn with_batch_rows(mut self, rows: usize) -> Self {
@@ -941,51 +1035,75 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         self
     }
 
-    /// The batch size [`Self::build`] will use: the requested one, capped
-    /// for the selected row groups (#563).
-    pub fn capped_batch_rows(&self) -> usize {
-        batch_rows_for(self.metadata(), self.row_groups.as_deref(), self.batch_rows)
-    }
-
-    /// Build the reader.
+    /// Build a reader that decodes byte arrays with wide offsets, splits
+    /// batches against the ceiling, then restores the projected input schema.
     ///
     /// # Errors
     ///
-    /// Returns a [`ParquetError`] if the reader cannot be built or its
-    /// construction panics.
+    /// Returns a [`ParquetError`] if planning or construction fails.
     pub fn build(self) -> Result<UntrustedBatchReader, ParquetError> {
-        let rows = self.capped_batch_rows();
-        let mut builder = self.builder.with_batch_size(rows);
+        let limit = byte_array_limit();
+        let rows = read_batch_plan(
+            self.metadata(),
+            self.row_groups.as_deref(),
+            self.batch_rows,
+            limit,
+        );
+        let original = self.metadata.schema().clone();
+        let wide = Arc::new(arrow_schema::Schema::new_with_metadata(
+            original.fields().iter().map(wide_field).collect::<Vec<_>>(),
+            original.metadata().clone(),
+        ));
+        let metadata = guard_parquet("wide-offset schema", || {
+            ArrowReaderMetadata::try_new(
+                self.metadata.metadata().clone(),
+                ArrowReaderOptions::new().with_schema(wide),
+            )
+        })?;
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(self.reader, metadata)
+            .with_batch_size(rows);
+        if let Some(projection) = self.projection {
+            builder = builder.with_projection(projection);
+        }
         if let Some(row_groups) = self.row_groups {
             builder = builder.with_row_groups(row_groups);
         }
         let inner = guard_parquet("parquet reader", || builder.build())?;
-        Ok(UntrustedBatchReader::new(inner))
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            inner
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| {
+                    original
+                        .field_with_name(f.name())
+                        .map(|original| projected_field(original, f))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            original.metadata().clone(),
+        ));
+        Ok(UntrustedBatchReader {
+            inner,
+            schema,
+            done: false,
+            pending: None,
+            limit,
+        })
     }
 }
 
 /// A Parquet record batch reader whose every batch is decoded inside the
 /// panic boundary (#687).
 ///
-/// When the byte-array ceiling is scaled, every batch is also checked
-/// against it (#779). After an error it yields nothing more.
+/// Batches are split before narrowing byte-array offsets, recursively
+/// through nested columns. After an error it yields nothing more.
 #[derive(Debug)]
 pub struct UntrustedBatchReader {
     inner: ParquetRecordBatchReader,
     done: bool,
-    /// The scaled [`byte_array_limit`] every batch is held to, read once
-    /// when the reader is built; `None` at the real ceiling.
-    scaled_ceiling: Option<u64>,
-}
-
-impl UntrustedBatchReader {
-    fn new(inner: ParquetRecordBatchReader) -> Self {
-        Self {
-            inner,
-            done: false,
-            scaled_ceiling: scaled_ceiling(),
-        }
-    }
+    schema: SchemaRef,
+    pending: Option<RecordBatch>,
+    limit: u64,
 }
 
 /// One batch from `next`, decoded inside the panic boundary. After an error
@@ -1008,23 +1126,80 @@ impl Iterator for UntrustedBatchReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let inner = &mut self.inner;
-        let ceiling = self.scaled_ceiling;
-        guarded_next(&mut self.done, "parquet page", || {
-            let item = inner.next();
-            match ceiling {
-                Some(limit) => {
-                    item.map(|r| r.and_then(|b| check_batch_under(&b, limit).map(|()| b)))
+        if self.done {
+            return None;
+        }
+        let schema = self.schema.clone();
+        let limit = self.limit;
+        let item = guard("parquet page", || {
+            let from_pending = self.pending.is_some();
+            let batch = match self.pending.take() {
+                Some(batch) => batch,
+                None => match self.inner.next()? {
+                    Ok(batch) => batch,
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            let fits = |rows| batch_overflow(&batch.slice(0, rows), &schema, limit).is_none();
+            let rows = if fits(batch.num_rows()) {
+                batch.num_rows()
+            } else {
+                if let Some((column, bytes)) = batch_overflow(&batch.slice(0, 1), &schema, limit) {
+                    return Some(Err(ArrowError::ExternalError(Box::new(
+                        InputError::ByteArrayRowTooLarge {
+                            column,
+                            bytes,
+                            limit_bytes: limit,
+                        },
+                    ))));
                 }
-                None => item,
+                // Prefix byte counts are monotone, including addressed nested children.
+                let (mut lo, mut hi) = (1, batch.num_rows());
+                while lo + 1 < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if fits(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            };
+            let compact = from_pending || rows < batch.num_rows();
+            if rows < batch.num_rows() {
+                self.pending = Some(batch.slice(rows, batch.num_rows() - rows));
             }
+            let batch = batch.slice(0, rows);
+            // Arrow's cast narrows absolute offsets. Compact split slices
+            // first, including nested children, so a small suffix of a >2 GiB
+            // buffer does not retain offsets above i32::MAX.
+            let indices =
+                compact.then(|| arrow_array::UInt64Array::from_iter_values(0..rows as u64));
+            Some(
+                batch
+                    .columns()
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(a, f)| {
+                        let compact = match &indices {
+                            Some(indices) => arrow_select::take::take(a.as_ref(), indices, None)?,
+                            None => a.clone(),
+                        };
+                        arrow_cast::cast(&compact, f.data_type())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .and_then(|columns| RecordBatch::try_new(schema, columns)),
+            )
         })
+        .unwrap_or_else(|e| Some(Err(ArrowError::ExternalError(Box::new(e)))));
+        self.done = !matches!(item, Some(Ok(_)));
+        item
     }
 }
 
 impl RecordBatchReader for UntrustedBatchReader {
     fn schema(&self) -> SchemaRef {
-        self.inner.schema()
+        self.schema.clone()
     }
 }
 
@@ -1152,196 +1327,6 @@ mod tests {
             rows += batch.map_err(|e| e.to_string())?.num_rows();
         }
         Ok(rows)
-    }
-
-    /// A point GeoParquet of `n` rows whose `name` column holds `name_bytes`
-    /// per row: the byte-array column that sets every read's batch cap.
-    fn write_wide_points(path: &Path, n: usize, name_bytes: usize) {
-        use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
-        use arrow_schema::{DataType, Field, Schema};
-        use geoarrow::array::GeometryBuilder;
-        use geoarrow::datatypes::GeometryType;
-        use geoarrow_array::GeoArrowArray;
-        use geoparquet::writer::{
-            GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
-        };
-        use std::sync::Arc;
-
-        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
-            .map(|i| {
-                let (x, y) = ((i % 40) as f64 * 4.0 - 80.0, (i / 40) as f64 * 2.0 - 25.0);
-                Some(geo::Geometry::Point(geo::Point::new(x, y)))
-            })
-            .collect();
-        let mut b =
-            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
-        b.extend_from_iter(geoms.iter().map(|g| g.as_ref()));
-        let geom_arr = b.finish();
-        let schema = Arc::new(Schema::new(vec![
-            Arc::new(Field::new("id", DataType::Int64, false)),
-            Arc::new(Field::new("name", DataType::Utf8, false)),
-            Arc::new(geom_arr.data_type().to_field("geometry", true)),
-        ]));
-        let names: Vec<String> = (0..n)
-            .map(|i| format!("{i:0>width$}", width = name_bytes))
-            .collect();
-        let columns: Vec<Arc<dyn Array>> = vec![
-            Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(names)),
-            geom_arr.to_array_ref(),
-        ];
-        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-        let options = GeoParquetWriterOptionsBuilder::default()
-            .set_encoding(GeoParquetWriterEncoding::WKB)
-            .set_generate_covering(true)
-            .build();
-        let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &options).unwrap();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, encoder.target_schema(), None).unwrap();
-        writer
-            .write(&encoder.encode_record_batch(&batch).unwrap())
-            .unwrap();
-        writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
-        writer.close().unwrap();
-    }
-
-    /// One owner means one ceiling (#563, #577, #606, #607, #657, #659): with
-    /// the byte-array ceiling scaled to 8 KiB, every former reader path reads
-    /// the same file under it. The owner's readers then fail any batch whose
-    /// byte-array column passes the scaled ceiling, exactly as arrow fails
-    /// one past the real 2 GiB, so a path that bypassed the cap would fail
-    /// here with "index overflow decoding byte array".
-    #[test]
-    fn one_scaled_ceiling_reaches_every_read_path() {
-        use crate::input_set::{ConvertSource, ReadPlan};
-        use crate::overview::convert::{convert_to_overviews, ConvertError, ConvertOptions};
-
-        const LIMIT: u64 = 8 * 1024;
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        let overview = dir.path().join("overview.parquet");
-        // 1000 rows of 200-byte names: 200 KB in one column, ~25 batches'
-        // worth at the scaled ceiling, and 1024-row default batches would
-        // pass it ~25 times over.
-        write_wide_points(&input, 1000, 200);
-        let _scaled = super::scale_byte_array_limit(LIMIT);
-        assert_eq!(super::byte_array_limit(), LIMIT);
-
-        // input_set staging: the stream every engine pass reads.
-        let source = ConvertSource::resolve_path(&input).unwrap();
-        let plan = ReadPlan {
-            batch_size: 8192,
-            projection: None,
-            row_groups: None,
-        };
-        let rows: usize = source
-            .open_stream(&plan)
-            .unwrap()
-            .map(|b| b.unwrap().num_rows())
-            .sum();
-        assert_eq!(rows, 1000);
-
-        // The streaming engine: assign, pass 1, pass 2, all under the cap.
-        let options = ConvertOptions {
-            cluster: true,
-            ..ConvertOptions::default()
-        };
-        convert_to_overviews(&input, &overview, &options).unwrap();
-
-        // The in-memory engine concatenates the whole table, so no batch size
-        // can save it: it refuses from footer statistics, against the same
-        // (scaled) ceiling.
-        let in_memory = ConvertOptions {
-            streaming: false,
-            ..options.clone()
-        };
-        match convert_to_overviews(&input, dir.path().join("mem.parquet"), &in_memory) {
-            Err(ConvertError::InMemoryByteArrayTooLarge { limit_bytes, .. }) => {
-                assert_eq!(limit_bytes, LIMIT);
-            }
-            other => panic!("expected the #606 refusal at the scaled ceiling, got {other:?}"),
-        }
-
-        // The overview reader, at the export's batch size.
-        let reader = crate::overview::reader::OverviewReader::open(&overview).unwrap();
-        for k in 0..reader.num_levels() {
-            for batch in reader.read_band_batched(k, 8192).unwrap() {
-                batch.unwrap();
-            }
-        }
-
-        // validate / check: the §12.1 cluster sum read (#607).
-        let report = crate::overview::check::validate_file(&overview).unwrap();
-        assert_eq!(
-            report.check_passed("cluster_sum_invariant"),
-            Some(true),
-            "{report:?}"
-        );
-
-        // export-pmtiles reads every level through the overview reader.
-        crate::overview::export::export_pmtiles(
-            &overview,
-            dir.path().join("out.pmtiles"),
-            &crate::overview::export::ExportOptions::default(),
-        )
-        .unwrap();
-    }
-
-    /// The scaled ceiling bites: a reader asked for 1024-row batches over the
-    /// wide file without the cap would fail, so the test above is not
-    /// passing vacuously.
-    #[test]
-    fn the_scaled_ceiling_fails_an_uncapped_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("in.parquet");
-        write_wide_points(&input, 1000, 200);
-        let _scaled = super::scale_byte_array_limit(8 * 1024);
-        let file = std::fs::File::open(&input).unwrap();
-        let source = super::open_parquet(file).unwrap().with_batch_rows(1024);
-        assert!(source.capped_batch_rows() < 1024);
-        // Bypass the cap the way a raw builder would.
-        let mut reader = super::UntrustedBatchReader::new(
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(
-                std::fs::File::open(&input).unwrap(),
-                source.reader_metadata().clone(),
-            )
-            .with_batch_size(1024)
-            .build()
-            .unwrap(),
-        );
-        let err = reader.next().unwrap().unwrap_err().to_string();
-        assert!(err.contains("index overflow decoding byte array"), "{err}");
-    }
-
-    /// Batches each under the scaled ceiling can pass it together: the
-    /// in-memory engine's concatenated table goes through the owner's check
-    /// too (#606), and only past the ceiling.
-    #[test]
-    fn a_concatenated_table_is_held_to_the_scaled_ceiling() {
-        use arrow_array::{RecordBatch, StringArray};
-        use std::sync::Arc;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "name",
-            arrow_schema::DataType::Utf8,
-            false,
-        )]));
-        let batch = |rows: usize| {
-            let values: Vec<String> = (0..rows).map(|_| "x".repeat(100)).collect();
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))]).unwrap()
-        };
-        let _scaled = super::scale_byte_array_limit(1000);
-        let part = batch(8);
-        super::check_byte_array_ceiling(&part).unwrap();
-        // A slice counts only the bytes it addresses.
-        super::check_byte_array_ceiling(&batch(20).slice(5, 10)).unwrap();
-        #[allow(clippy::disallowed_methods)] // the in-memory concat under test
-        let full = arrow_select::concat::concat_batches(&schema, &[part.clone(), part]).unwrap();
-        let err = super::check_byte_array_ceiling(&full)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("index overflow decoding byte array"), "{err}");
-        assert!(err.contains("1600 bytes"), "{err}");
     }
 
     /// #683: a crafted `ARROW:schema` footer key panicked arrow-ipc's schema

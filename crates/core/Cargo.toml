@@ -20,6 +20,8 @@ features = ["remote"]
 
 [features]
 default = []
+# Scaled byte-array ceilings for the isolated integration-test lane only.
+testing = []
 dhat-heap = ["dhat"]
 # Fuzz hooks (#424): `#[doc(hidden)]` entry points that let the standalone
 # `fuzz/` crate reach parsers which are private on purpose (the MVT tile
@@ -180,3 +182,7 @@ workspace = true
 # in this crate references it directly.
 [package.metadata.cargo-shear]
 ignored = ["aws-smithy-types"]
+
+[[test]]
+name = "scaled_limits"
+required-features = ["testing"]
