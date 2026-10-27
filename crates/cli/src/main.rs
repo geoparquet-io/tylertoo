@@ -1756,6 +1756,42 @@ fn resolve_level_plan(
     }
 }
 
+/// The level flags `overview` and `tiles` both declare (`--gsd`,
+/// `--min-zoom`, `--max-zoom`, `--bbox`; their defaults differ), read the
+/// same way for both.
+trait LevelFlags {
+    /// `--gsd`, `--min-zoom`, `--max-zoom` and `--bbox` as typed.
+    fn level_flags(&self) -> (Option<&str>, u8, MaxZoom, Option<&str>);
+
+    /// The level plan and the box. #444: until `--max-zoom auto` is
+    /// resolved — after every check that does not need its value, so a typo
+    /// or a stale shard plan still fails in milliseconds (#371) — the plan
+    /// carries `auto`'s placeholder.
+    fn level_plan(
+        &self,
+    ) -> Result<(
+        tylertoo_core::overview::convert::LevelPlan,
+        Option<[f64; 4]>,
+    )> {
+        let (gsd, min_zoom, max_zoom, bbox) = self.level_flags();
+        let levels = resolve_level_plan(gsd, min_zoom, max_zoom.plan_zoom())?;
+        Ok((levels, bbox.map(parse_bbox).transpose()?))
+    }
+}
+
+/// Both commands name the flags alike, so one impl serves both.
+macro_rules! impl_level_flags {
+    ($($args:ty),+) => {$(
+        impl LevelFlags for $args {
+            fn level_flags(&self) -> (Option<&str>, u8, MaxZoom, Option<&str>) {
+                let Self { gsd, min_zoom, max_zoom, bbox, .. } = self;
+                (gsd.as_deref(), *min_zoom, *max_zoom, bbox.as_deref())
+            }
+        }
+    )+};
+}
+impl_level_flags!(OverviewArgs, TilesArgs);
+
 /// Which job of a sharded fleet this `tiles` run is, and the slice of the
 /// tile space it owns (#498).
 #[derive(Debug, Clone)]
@@ -1879,15 +1915,7 @@ fn default_zooms(options: &ConvertOptions) -> (u8, u8) {
 fn tiles_options(args: &TilesArgs) -> Result<TilesOptions> {
     use tylertoo_core::overview::level::Mode;
 
-    // #444: until `--max-zoom auto` is resolved — after every check that
-    // does not need its value, so a typo or a stale shard plan still fails
-    // in milliseconds (#371) — the plan carries `auto`'s placeholder.
-    let levels = resolve_level_plan(
-        args.gsd.as_deref(),
-        args.min_zoom,
-        args.max_zoom.plan_zoom(),
-    )?;
-    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
+    let (levels, bbox) = args.level_plan()?;
     // Overviews for PMTiles are always duplicating (partitioning can't be
     // exported to per-tile MVT).
     let convert = args
@@ -2580,12 +2608,7 @@ fn bands_split_one_archive(bands: &[tylertoo_core::pyramid::Band]) -> bool {
 /// translation (#779), with `--max-zoom auto`'s placeholder (#444).
 fn overview_options(args: &OverviewArgs) -> Result<ConvertOptions> {
     let mode = args.mode.parse().map_err(anyhow::Error::msg)?;
-    let levels = resolve_level_plan(
-        args.gsd.as_deref(),
-        args.min_zoom,
-        args.max_zoom.plan_zoom(),
-    )?;
-    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
+    let (levels, bbox) = args.level_plan()?;
     args.tuning
         .build_convert_options(mode, levels, bbox, args.cogp_compat)
 }
