@@ -2203,10 +2203,7 @@ fn export_names_an_overview_file_without_geometry() {
 
     let tout = tempfile::NamedTempFile::new().unwrap();
     let err = export_pmtiles(tbad.path(), tout.path(), &ExportOptions::default()).unwrap_err();
-    assert!(
-        matches!(err, ExportError::NoGeometryColumn { .. }),
-        "got: {err:?}"
-    );
+    assert!(matches!(err, ExportError::Reader(_)), "got: {err:?}");
     let msg = err.to_string();
     assert!(msg.contains(&tbad.path().display().to_string()), "{msg}");
 }

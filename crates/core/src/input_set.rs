@@ -100,6 +100,7 @@ impl SingleSource {
 /// Footer-derived metadata of one partition.
 #[derive(Debug, Clone)]
 struct PartMeta {
+    resolved: Arc<crate::resolved_schema::ResolvedSchema>,
     /// Arrow schema decoded from the part's footer.
     schema: SchemaRef,
     /// Parsed parquet metadata (row groups, key-value metadata).
@@ -621,6 +622,18 @@ impl ConvertSource {
         }
     }
 
+    /// The cached schema interpretation of the first part. Construction proves
+    /// all remaining parts agree on geometry and CRS.
+    ///
+    /// # Errors
+    /// Returns an input error if a part's footer cannot be resolved.
+    pub fn resolved_schema(&self) -> Result<&crate::resolved_schema::ResolvedSchema, InputError> {
+        match self {
+            ConvertSource::Single(s) => Ok(&s.meta()?.resolved),
+            ConvertSource::Multi(m) => Ok(&m.metas[0].resolved),
+        }
+    }
+
     /// Total number of row groups across all parts.
     ///
     /// # Errors
@@ -764,7 +777,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| crate::overview::convert::input_row_group_bounds(&m.parquet))
+            .map(|m| m.resolved.bounds().to_vec())
             .collect())
     }
 
@@ -825,7 +838,7 @@ impl ConvertSource {
         let per_part = self
             .metas()?
             .iter()
-            .map(|m| crate::overview::convert::select_input_row_groups_any(&m.parquet, boxes))
+            .map(|m| m.resolved.select_row_groups(boxes))
             .collect();
         Ok(RowGroupSelection(per_part))
     }
@@ -1119,7 +1132,10 @@ fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     // every later reader over this part is built from it, with no second
     // footer parse and no second `ARROW:schema` decode.
     let reader = builder.reader_metadata().clone();
+    let resolved = crate::resolved_schema::ResolvedSchema::from_parquet(builder.schema(), &parquet)
+        .map_err(|e| InputError::Parquet(tylertoo_io::ParquetError::General(e.to_string())))?;
     Ok(PartMeta {
+        resolved: Arc::new(resolved),
         schema: builder.schema().clone(),
         parquet,
         reader,
@@ -1198,24 +1214,13 @@ impl MultiSource {
         // that consistently carries one unsupported CRS still errors with
         // the standard UnsupportedCrs message.
         // Only Ok/Err is used here, so the error's input name is moot.
-        let crs_of = |m: &PartMeta| {
-            crate::overview::convert::detect_crs_from_kv(
-                m.parquet.file_metadata().key_value_metadata(),
-                "",
-            )
-            .ok()
-        };
-        // Raw CRS descriptor from the `geo` metadata: disambiguates two
-        // *different* unsupported CRSs, which both detect to `None` and
-        // would otherwise "agree" here only to error later naming just
-        // part 0's CRS.
+        let crs_of = |m: &PartMeta| m.resolved.crs();
         let raw_crs_of = |m: &PartMeta| -> String {
-            crate::quality::crs_info_from_kv_metadata(
-                m.parquet.file_metadata().key_value_metadata(),
-            )
-            .ok()
-            .and_then(|info| info.identifier.or(info.name))
-            .unwrap_or_else(|| "unknown".to_string())
+            let info = m.resolved.crs_info();
+            info.identifier
+                .clone()
+                .or_else(|| info.name.clone())
+                .unwrap_or_else(|| "unknown".to_string())
         };
         let first_crs = crs_of(&metas[0]);
 
@@ -1226,6 +1231,13 @@ impl MultiSource {
                 detail,
             };
             validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
+            if meta.resolved.geometry_name() != metas[0].resolved.geometry_name() {
+                return Err(incompatible(format!(
+                    "primary geometry mismatch: {:?} versus {:?}",
+                    meta.resolved.geometry_name(),
+                    metas[0].resolved.geometry_name()
+                )));
+            }
             let crs = crs_of(meta);
             if crs != first_crs {
                 return Err(incompatible(format!(

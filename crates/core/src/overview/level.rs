@@ -30,6 +30,8 @@ pub const COGP_KEY: &str = "cogp";
 
 /// The spec version emitted by this implementation (semver MAJOR.MINOR.PATCH).
 pub const SPEC_VERSION: &str = "0.2.0";
+/// Overview major version understood by the reader and conformance validator.
+pub const SUPPORTED_MAJOR: u64 = 0;
 
 /// Web Mercator equatorial circumference in meters (§5.2).
 pub const WEBMERC_CIRCUMFERENCE_M: f64 = 40_075_016.69;
@@ -632,6 +634,9 @@ pub enum OverviewValidationError {
         /// Previous level's value.
         previous: u8,
     },
+    /// The file uses an overview major version this reader cannot interpret.
+    #[error("unsupported overview MAJOR version in {0:?}")]
+    UnsupportedVersion(String),
     /// `duplicating` mode with `canonical_level` != `L-1` (§3.4).
     #[error("duplicating mode requires canonical_level = {expected} (L-1), got {actual:?}")]
     CanonicalLevelMismatch {
@@ -705,6 +710,12 @@ impl OverviewsMeta {
     pub fn validate(&self, num_row_groups: i64) -> Result<(), OverviewValidationError> {
         if !is_semver(&self.version) {
             return Err(OverviewValidationError::InvalidVersion(
+                self.version.clone(),
+            ));
+        }
+
+        if parse_semver_major(&self.version) != Some(SUPPORTED_MAJOR) {
+            return Err(OverviewValidationError::UnsupportedVersion(
                 self.version.clone(),
             ));
         }
@@ -831,6 +842,10 @@ pub(super) fn semver_parts(v: &str) -> Option<[&str; 3]> {
     let triple = [parts.next()?, parts.next()?, parts.next()?];
     let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
     (parts.next().is_none() && triple.iter().all(|p| numeric(p))).then_some(triple)
+}
+
+pub(super) fn parse_semver_major(v: &str) -> Option<u64> {
+    semver_parts(v)?[0].parse().ok()
 }
 
 /// Minimal `MAJOR.MINOR.PATCH` semver check (all numeric, three parts).

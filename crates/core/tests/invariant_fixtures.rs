@@ -106,12 +106,15 @@ fn shape_column_tiles_like_the_geometry_column() {
 
 // --- #708: GeoParquet 2.0, native GEOMETRY type, no `geo` key ----------------
 
-fn native_geoparquet2() -> (ConvertReport, ExportReport) {
+fn native_geoparquet2(streaming: bool) -> (ConvertReport, ExportReport) {
     tiles(
         &invariant_fixture("geoparquet2-native.parquet"),
         0,
         14,
-        ConvertOptions::default(),
+        ConvertOptions {
+            streaming,
+            ..Default::default()
+        },
         ExportOptions::default(),
     )
 }
@@ -120,29 +123,15 @@ fn native_geoparquet2() -> (ConvertReport, ExportReport) {
 /// is OGC:CRS84), so the report must not say WGS84 was assumed, and the
 /// "no CRS declared … assuming WGS84" warning must not fire.
 #[test]
-#[ignore = "#708: crs_assumed_wgs84 is true for a native GeoParquet 2.0 file (CRS read from the geo key only); F4 removes this ignore and native_geoparquet2_still_assumes_wgs84_708"]
 fn native_geoparquet2_declares_its_crs() {
-    let (conv, exp) = native_geoparquet2();
-    assert!(
-        !conv.crs_assumed_wgs84,
-        "#708: the logical type declares the CRS"
-    );
-    assert!(exp.total_tile_features > 0);
-}
-
-/// The pin for the ignore above: passes while #708 is open. When it fails,
-/// #708 is fixed — delete this test and the `#[ignore]` above.
-#[test]
-fn native_geoparquet2_still_assumes_wgs84_708() {
-    let (conv, exp) = native_geoparquet2();
-    assert!(
-        conv.crs_assumed_wgs84,
-        "#708 looks fixed: remove the #[ignore] on native_geoparquet2_declares_its_crs \
-         and delete this test"
-    );
-    // The tiling itself works: the assumption happens to be right here.
-    assert_eq!(conv.input_features, 1000);
-    assert!(exp.total_tile_features > 0);
+    for streaming in [true, false] {
+        let (conv, exp) = native_geoparquet2(streaming);
+        assert!(
+            !conv.crs_assumed_wgs84,
+            "#708: the logical type declares the CRS (streaming={streaming})"
+        );
+        assert!(exp.total_tile_features > 0);
+    }
 }
 
 // --- #643: --bbox on data stored in 0..360 ----------------------------------

@@ -1374,3 +1374,33 @@ crates/cli/src/main.rs  # Subcommands: tiles (facade), overview, validate,
 crates/python/src/lib.rs # pyo3 bindings: convert (facade), overview,
                         # export_pmtiles, validate
 ```
+
+## Resolved input schemas (#779, F4)
+
+`resolved_schema::ResolvedSchema` owns primary geometry selection, GeoParquet
+version and CRS interpretation (including native Parquet Geometry/Geography
+annotations), properties, rename provenance, and the geometry's covering.
+Its fields and serialization model are private. `input_set::PartMeta` resolves
+and caches one descriptor per part; partition compatibility and pruning consume
+that descriptor. The two engine entry points use it for geometry and CRS;
+their remaining schema-only adapters are removed by the F1 stage migration.
+
+Overview writers persist an output descriptor under the versioned private
+`tylertoo:resolved_schema` footer key. It describes the physical output fields,
+including generated covering columns. Readers validate persisted facts against
+the physical schema and GeoParquet declarations before exposing a descriptor;
+older overview files resolve once on open. Row-group bounds come from actual
+footer statistics, not a serialized copy of the input's extent. Export and
+auto-zoom consume the descriptor, and `OverviewReader::open` runs the same
+metadata and cluster-sum conformance checks as `validate`.
+
+A marked partial shard overview is readable but fails the complete-pyramid
+conformance check; export continues to enforce its recorded zoom ceiling.
+Every other failed conformance check prevents opening the reader.
+
+Spatial shard outputs also carry `tylertoo:source_subset=true`, validated by
+the descriptor. Each level is independently cropped, so its point-count sum
+need not equal the canonical band's sum. The shared validator still checks
+types and count statistics; whole-source mass equality applies to complete,
+unsharded files. Both engines set this provenance through the shared writer
+options builder.

@@ -26,7 +26,7 @@ use arrow_schema::SchemaRef;
 use tylertoo_io::ParquetMetaData;
 use tylertoo_io::ReaderMetadata;
 
-use crate::covering::extract_row_group_bounds_from_metadata;
+use crate::resolved_schema::ResolvedSchema;
 use crate::tile::TileBounds;
 use tylertoo_io::{ParquetSource, UntrustedBatchReader};
 
@@ -81,6 +81,9 @@ pub enum ReaderError {
     /// hostile `row_group_end` would otherwise drive band arithmetic).
     #[error("invalid 'geo:overviews' metadata: {0}")]
     InvalidMetadata(#[from] super::level::OverviewValidationError),
+    /// The shared schema/conformance validators rejected the file.
+    #[error("invalid overview file: {0}")]
+    Conformance(String),
     /// A level index was requested that does not exist in the file.
     #[error("level {level} out of range (file has {num_levels} levels)")]
     LevelOutOfRange {
@@ -97,6 +100,7 @@ pub enum ReaderError {
 #[derive(Debug, Clone)]
 pub struct OverviewReader {
     path: PathBuf,
+    resolved: ResolvedSchema,
     metadata: Arc<ParquetMetaData>,
     schema: SchemaRef,
     meta: OverviewsMeta,
@@ -151,7 +155,23 @@ impl OverviewReader {
         // values, usize-wrapped) row-group reads.
         meta.validate(metadata.num_row_groups() as i64)?;
 
+        let resolved = ResolvedSchema::from_parquet(&schema, &metadata)
+            .map_err(|e| ReaderError::Conformance(format!("{}: {e}", shown())))?;
+        let mut report = super::check::validate_resolved_metadata(&metadata, &resolved);
+        super::check::check_cluster_sum_invariant(&path, &metadata, &resolved, &mut report);
+        if report.read_failures().next().is_some() {
+            return Err(ReaderError::Conformance(format!(
+                "{}: {}",
+                shown(),
+                report
+                    .read_failures()
+                    .map(|c| format!("{}: {}", c.name, c.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
         Ok(Self {
+            resolved,
             reader_metadata: builder.reader_metadata().clone(),
             path,
             metadata,
@@ -168,6 +188,11 @@ impl OverviewReader {
     /// The parsed `geo:overviews` footer metadata.
     pub fn meta(&self) -> &OverviewsMeta {
         &self.meta
+    }
+
+    /// The schema descriptor read from the footer, or resolved once for older files.
+    pub fn resolved_schema(&self) -> &ResolvedSchema {
+        &self.resolved
     }
 
     /// The raw GeoParquet `geo` footer JSON, if the file carries one (an
@@ -386,7 +411,7 @@ impl OverviewReader {
     /// with missing statistics kept as in
     /// [`Self::row_groups_intersecting_bbox`].
     fn row_groups_intersecting_any(&self, bboxes: &[[f64; 4]]) -> Vec<usize> {
-        let bounds = extract_row_group_bounds_from_metadata(&self.metadata).unwrap_or_default();
+        let bounds = self.resolved.bounds();
         let filters: Vec<TileBounds> = bboxes
             .iter()
             .map(|bbox| TileBounds {
@@ -1159,7 +1184,7 @@ mod tests {
     /// to fold, so the answer is `None` (the caller then treats the column as
     /// carrying information).
     #[test]
-    fn int_column_max_is_none_without_statistics() {
+    fn open_runs_the_conformance_checks() {
         use arrow_array::Int32Array;
         use tylertoo_io::test_support::ArrowWriter;
         use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
@@ -1192,16 +1217,11 @@ mod tests {
             w.write(&batch).unwrap();
             w.close().unwrap();
         }
-        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let report = crate::overview::check::validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
         assert!(
-            reader
-                .metadata
-                .row_group(0)
-                .column(0)
-                .statistics()
-                .is_none(),
-            "fixture must carry no statistics"
+            OverviewReader::open(tmp.path()).is_err(),
+            "open must reject the same invalid file as validate"
         );
-        assert_eq!(reader.int_column_max("n"), None);
     }
 }

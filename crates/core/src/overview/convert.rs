@@ -2348,7 +2348,7 @@ pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, 
             format!("representation entry {part:?} must be LO-HI:KIND (e.g. 0-7:point)")
         })?;
         let repr = match kind.trim() {
-            "geom" | "geometry" => Representation::Geometry,
+            "geom" | crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN => Representation::Geometry,
             "point" => Representation::Point,
             "square" => Representation::Square,
             other => {
@@ -3233,7 +3233,11 @@ mod property_selection_tests {
             .iter()
             .map(|(n, t)| Field::new(*n, t.clone(), true))
             .collect();
-        v.push(Field::new("geometry", DataType::Binary, false));
+        v.push(Field::new(
+            crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+            DataType::Binary,
+            false,
+        ));
         Schema::new(v)
     }
 
@@ -3442,7 +3446,11 @@ mod property_selection_tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("extra", DataType::Utf8, true),
-            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+                DataType::Binary,
+                false,
+            ),
             Field::new(
                 "bbox",
                 DataType::Struct(
@@ -3669,10 +3677,8 @@ fn load_input_table_with_limit(
     let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
-    let (crs, crs_assumed_wgs84) = detect_crs_from_kv_assumed(
-        builder.metadata().file_metadata().key_value_metadata(),
-        &source_single.display_name(),
-    )?;
+    let descriptor = source.resolved_schema()?;
+    let (crs, crs_assumed_wgs84) = crs_from_resolved(descriptor, &source_single.display_name())?;
     if crs_assumed_wgs84 {
         warn_assumed_wgs84(&source_single.display_name());
     }
@@ -3691,8 +3697,10 @@ fn load_input_table_with_limit(
     // input schema. Syntax was already validated in `validate_options`.
     let bound_filter = bind_attribute_filter(options, &input_schema, &renames)?;
 
-    let geom_idx =
-        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+    let geom_idx = descriptor
+        .geometry_name()
+        .and_then(|n| input_schema.index_of(n).ok())
+        .ok_or_else(|| ConvertError::NoGeometryColumn {
             input: source.display_name(),
         })?;
     let geom_field = input_schema.field(geom_idx).clone();
@@ -4502,6 +4510,7 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 /// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
 /// `input` names the file in the error (#452).
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
@@ -4513,6 +4522,7 @@ pub(crate) fn detect_crs_from_kv(
 /// missing-metadata *assumption* rather than a declaration (#451 — see
 /// [`crate::quality::CrsInfo::assumed_wgs84`]), so the convert paths can
 /// warn naming the input and record the assumption on the [`ConvertReport`].
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn detect_crs_from_kv_assumed(
     kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
@@ -4542,6 +4552,25 @@ pub(crate) fn detect_crs_from_kv_assumed(
     }
 }
 
+/// Temporary engine adapter until F1 carries the descriptor through all stages.
+pub(crate) fn crs_from_resolved(
+    schema: &crate::resolved_schema::ResolvedSchema,
+    input: &str,
+) -> Result<(Crs, bool), ConvertError> {
+    let info = schema.crs_info();
+    schema
+        .crs()
+        .map(|crs| (crs, info.assumed_wgs84))
+        .ok_or_else(|| ConvertError::UnsupportedCrs {
+            crs: info
+                .identifier
+                .clone()
+                .or_else(|| info.name.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            input: input.to_string(),
+        })
+}
+
 /// #451: tell the user, BY NAME, that this input's CRS is an assumption. The
 /// once-per-process warnings in [`crate::quality`] describe the exact
 /// metadata quirk; this one names the file and the consequence, once per
@@ -4568,12 +4597,20 @@ pub(super) fn warn_assumed_wgs84(input_name: &str) {
 #[doc(hidden)]
 pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
     let _ = crate::covering::parse_covering_metadata(geo_json, None);
-    let _ = crate::covering::parse_covering_metadata(geo_json, Some("geometry"));
+    let _ = crate::covering::parse_covering_metadata(
+        geo_json,
+        Some(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN),
+    );
     let _ = crate::quality::classify_crs_identifier(geo_json);
     let schema = Schema::new_with_metadata(
-        ["geometry", "geom_shape", "centroid", "bbox"]
-            .map(|name| Field::new(name, DataType::Binary, true))
-            .to_vec(),
+        [
+            crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+            "geom_shape",
+            "centroid",
+            "bbox",
+        ]
+        .map(|name| Field::new(name, DataType::Binary, true))
+        .to_vec(),
         [("geo".to_string(), geo_json.to_string())].into(),
     );
     let _ = find_geometry_column(&schema);
@@ -4708,7 +4745,7 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// "can't tell" case.
 ///
 /// The geometry column is resolved the same way
-/// ([`crate::covering::resolve_geometry_column_name`], the footer twin of
+/// ([`crate::resolved_schema::ResolvedSchema::geometry_name`], the footer twin of
 /// [`find_geometry_column`]) and threaded into tier 2, so a file with more
 /// than one geometry column can never be pruned on an envelope the reader
 /// will not read (#518).
@@ -4716,29 +4753,9 @@ pub(crate) fn select_input_row_groups_any(
     metadata: &tylertoo_io::ParquetMetaData,
     boxes: &[[f64; 4]],
 ) -> Vec<usize> {
-    let bounds = input_row_group_bounds(metadata);
-    let filters: Vec<crate::tile::TileBounds> = boxes
-        .iter()
-        .map(|b| crate::tile::TileBounds {
-            lng_min: b[0],
-            lat_min: b[1],
-            lng_max: b[2],
-            lat_max: b[3],
-        })
-        .collect();
-    (0..metadata.num_row_groups())
-        .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
-            Some(b) => {
-                let tested = if b.xmin > b.xmax {
-                    &filters[..filters.len().min(1)]
-                } else {
-                    &filters[..]
-                };
-                tested.iter().any(|f| b.intersects(f))
-            }
-            None => true, // no stats — must read to stay correct
-        })
-        .collect()
+    crate::resolved_schema::ResolvedSchema::from_metadata(metadata)
+        .map(|schema| schema.select_row_groups(boxes))
+        .unwrap_or_else(|_| (0..metadata.num_row_groups()).collect())
 }
 
 /// [`select_input_row_groups_any`] for a single box.
@@ -4748,31 +4765,6 @@ pub(crate) fn select_input_row_groups(
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
     select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
-}
-
-/// Per-row-group bboxes for one part, from footer metadata only.
-///
-/// The extraction half of [`select_input_row_groups_any`], split out because the
-/// shard planner (#498) wants the same bboxes for a different purpose: it
-/// spreads each group's rows over the pivot tiles the bbox covers to balance
-/// the cut. Both callers therefore see exactly the same view of the input,
-/// which matters — a shard prunes against a bbox derived from the very ranges
-/// this estimate produced.
-///
-/// Entry `i` is row group `i`'s bbox, or `None` when neither statistics tier
-/// can supply one.
-pub(crate) fn input_row_group_bounds(
-    metadata: &tylertoo_io::ParquetMetaData,
-) -> Vec<Option<crate::covering::RowGroupBounds>> {
-    let geom_column = crate::covering::resolve_geometry_column_name(metadata);
-    // The error is discarded (it falls back below), so its name is moot.
-    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata(), "") {
-        Ok(crs) => {
-            crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
-        }
-        Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
-            .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
-    }
 }
 
 /// The mean share of the input's extent that one row group's bbox covers
@@ -4887,43 +4879,11 @@ fn select_input_row_groups_combined(
     }
 }
 
-/// Find the primary geometry column index: the "geo" metadata's
-/// `primary_column` when the schema carries that metadata and the named
-/// column exists, else the name heuristic (`geometry`, else first `geom*`).
-///
-/// The `primary_column` step is what keeps this in lockstep with
-/// [`crate::covering::resolve_geometry_column_name`], which pruning uses
-/// (#518): the two must name the SAME column or a pruned row group is
-/// silent data loss. GeoParquet makes `primary_column` required, so it is
-/// authoritative whenever a "geo" key exists; the heuristic covers the
-/// GeoParquet 2.0 / no-metadata case. `parquet_to_arrow_schema` copies the
-/// file's key-value metadata onto the Arrow schema, and the reserved-column
-/// rename preserves it, so it is available at every call site.
+/// Temporary schema-only adapter for engine helpers not yet migrated by F1.
 pub(super) fn find_geometry_column(schema: &Schema) -> Option<usize> {
-    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    // Case-INSENSITIVE, matching both footer readers
-    // ([`crate::covering::get_geo_metadata`] and
-    // [`crate::quality::crs_info_from_kv_metadata`], which both lowercase the
-    // key). A file whose key is spelled "GEO" would otherwise leave the
-    // reader on the name heuristic while pruning followed `primary_column` —
-    // the very disagreement #518 closed, left open on this side (#519).
-    if let Some(geo_json) = schema
-        .metadata()
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
-        .map(|(_, v)| v)
-    {
-        if let Some(primary) = serde_json::from_str::<serde_json::Value>(geo_json)
-            .ok()
-            .and_then(|v| v.get("primary_column")?.as_str().map(str::to_string))
-        {
-            if let Some(idx) = names.iter().position(|n| *n == primary) {
-                return Some(idx);
-            }
-        }
-    }
-    let pick = crate::covering::geometry_column_by_name(&names)?;
-    names.iter().position(|n| *n == pick)
+    crate::resolved_schema::ResolvedSchema::resolve(schema)
+        .ok()?
+        .geometry_index()
 }
 
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
@@ -12056,7 +12016,7 @@ mod tests {
     }
 
     /// [`find_geometry_column`] and
-    /// [`crate::covering::resolve_geometry_column_name`] must name the SAME
+    /// [`crate::resolved_schema::ResolvedSchema::geometry_name`] must name the SAME
     /// column, or pruning drops what the reader would have kept (#518).
     #[test]
     fn find_geometry_column_honors_the_primary_column() {

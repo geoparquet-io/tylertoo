@@ -9,7 +9,6 @@
 //! the file is a valid GeoParquet 1.1 overview file per this spec, not whether
 //! its coarse levels are good renderings.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -17,13 +16,14 @@ use tylertoo_io::ParquetMetaData;
 use tylertoo_io::PhysicalType;
 use tylertoo_io::Statistics;
 
-use crate::covering::{find_bbox_column_indices, get_geo_metadata, parse_covering_metadata};
+use crate::covering::find_bbox_column_indices;
+use crate::resolved_schema::ResolvedSchema;
 
 use super::level::{Mode, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY};
 use super::writer::LEVEL_COLUMN;
 
 /// The overviews-spec MAJOR version this validator supports (§3.8).
-pub const SUPPORTED_MAJOR: u64 = 0;
+pub use super::level::SUPPORTED_MAJOR;
 
 /// Result of a single conformance check.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +70,12 @@ impl ValidationReport {
         self.checks.iter().filter(|c| !c.passed)
     }
 
+    /// Failures that prevent reading. A marked partial shard overview remains
+    /// readable; export separately enforces its recorded zoom ceiling (#541).
+    pub(crate) fn read_failures(&self) -> impl Iterator<Item = &CheckResult> {
+        self.failures().filter(|c| c.name != "complete_pyramid")
+    }
+
     /// Whether a specific named check passed. `None` if it was not run.
     pub fn check_passed(&self, name: &str) -> Option<bool> {
         self.checks
@@ -96,15 +102,6 @@ pub enum CheckError {
     Parquet(#[from] tylertoo_io::ParquetError),
 }
 
-/// Minimal view of the GeoParquet `geo` metadata for structural checks.
-#[derive(Debug, serde::Deserialize)]
-struct GeoDoc {
-    #[serde(default)]
-    primary_column: Option<String>,
-    #[serde(default)]
-    columns: HashMap<String, serde_json::Value>,
-}
-
 /// Validate an overview file at `path` against the §6.2 conformance checklist.
 ///
 /// Runs every metadata-only check of [`validate_metadata`], plus the
@@ -120,19 +117,27 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
     let path = path.as_ref();
     let file = File::open(path)?;
     let metadata = tylertoo_io::read_parquet_metadata(&file)?;
-    let mut report = validate_metadata(&metadata);
-    // Every reader decodes the footer's ARROW:schema before a row, so a file
-    // whose schema cannot be decoded (#683) is one `export` refuses; it must
-    // not validate. Reported only on failure, so a valid file's checklist is
-    // unchanged.
-    if let Err(e) = tylertoo_io::reader_metadata(std::sync::Arc::clone(&metadata)) {
-        report.fail(
-            "arrow_schema_decodes",
-            format!("the footer's ARROW:schema cannot be decoded: {e}"),
-        );
-        return Ok(report);
-    }
-    check_cluster_sum_invariant(path, &metadata, &mut report);
+    let reader = match tylertoo_io::reader_metadata(std::sync::Arc::clone(&metadata)) {
+        Ok(reader) => reader,
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail(
+                "arrow_schema_decodes",
+                format!("the footer's ARROW:schema cannot be decoded: {e}"),
+            );
+            return Ok(report);
+        }
+    };
+    let descriptor = match ResolvedSchema::from_parquet(reader.schema(), &metadata) {
+        Ok(descriptor) => descriptor,
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail("resolved_schema", e.to_string());
+            return Ok(report);
+        }
+    };
+    let mut report = validate_resolved_metadata(&metadata, &descriptor);
+    check_cluster_sum_invariant(path, &metadata, &descriptor, &mut report);
     Ok(report)
 }
 
@@ -146,41 +151,36 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
 /// Does not panic in practice: the clustering check unwraps the parsed
 /// overviews metadata only after confirming it is present.
 pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
+    match ResolvedSchema::from_metadata(metadata) {
+        Ok(descriptor) => validate_resolved_metadata(metadata, &descriptor),
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail("resolved_schema", e.to_string());
+            report
+        }
+    }
+}
+
+pub(crate) fn validate_resolved_metadata(
+    metadata: &ParquetMetaData,
+    descriptor: &ResolvedSchema,
+) -> ValidationReport {
     let mut report = ValidationReport::default();
     let num_row_groups = metadata.num_row_groups();
 
     // --- GeoParquet 1.1: geo metadata + primary column + covering (§6.2). ----
-    let geo_json = get_geo_metadata(metadata).ok().flatten();
-    match &geo_json {
-        None => {
-            report.fail(
-                "geoparquet_geo_metadata",
-                "no 'geo' footer metadata: not a GeoParquet file",
-            );
-        }
-        Some(j) => match serde_json::from_str::<GeoDoc>(j) {
-            Ok(doc) if doc.primary_column.is_some() || !doc.columns.is_empty() => {
-                report.pass(
-                    "geoparquet_geo_metadata",
-                    "'geo' metadata present with geometry column(s)",
-                );
-            }
-            Ok(_) => report.fail(
-                "geoparquet_geo_metadata",
-                "'geo' metadata declares no geometry columns",
-            ),
-            Err(e) => report.fail(
-                "geoparquet_geo_metadata",
-                format!("'geo' metadata is not valid JSON: {e}"),
-            ),
-        },
+    if !descriptor.geometry_columns().is_empty() && descriptor.version().is_some() {
+        report.pass(
+            "geoparquet_geo_metadata",
+            "'geo' metadata present with geometry column(s)",
+        );
+    } else {
+        report.fail(
+            "geoparquet_geo_metadata",
+            "no valid GeoParquet geometry declaration",
+        );
     }
-
-    // Covering declared (§4.4) — on the PRIMARY column, which §4.4 is about
-    // and which the overviews this validates always declare.
-    let covering = geo_json
-        .as_deref()
-        .and_then(|j| parse_covering_metadata(j, None).ok().flatten());
+    let covering = descriptor.covering();
     match &covering {
         Some(_) => report.pass("geoparquet_covering_declared", "bbox covering declared"),
         None => report.fail(
@@ -620,8 +620,7 @@ fn check_coalescing(
     }
 }
 
-/// §12.1 strict cluster sum invariant (data-reading check, `validate_file`
-/// only): when clustering provenance is present and enabled on a structurally
+/// §12.1 strict cluster sum invariant, shared by validation and reader open: when clustering provenance is present and enabled on a structurally
 /// sound duplicating file, every level's `Σ point_count` over its **point**
 /// rows must equal the source point count exactly — taken as the number of
 /// point rows in the canonical band, which is the source data verbatim
@@ -630,11 +629,22 @@ fn check_coalescing(
 ///
 /// Skipped (no report entry) when the prerequisites are missing — the
 /// structural checks of [`validate_metadata`] already fail those files.
-fn check_cluster_sum_invariant(
+pub(crate) fn check_cluster_sum_invariant(
     path: &Path,
     metadata: &ParquetMetaData,
+    descriptor: &ResolvedSchema,
     report: &mut ValidationReport,
 ) {
+    // A malformed count/level type must be reported by the metadata validator,
+    // never passed into Arrow's infallible primitive casts. A partial file has
+    // no canonical source band against which to check the sum.
+    if report.check_passed("cluster_point_count_column") != Some(true)
+        || report.check_passed("level_column") != Some(true)
+        || report.check_passed("overviews_structure") != Some(true)
+        || report.check_passed("complete_pyramid") == Some(false)
+    {
+        return;
+    }
     // Prerequisites: parseable footer, enabled clustering, duplicating mode
     // with a valid canonical level, the named INT64 count column, the level
     // column, and a geometry column (needed to tell point rows apart).
@@ -658,7 +668,12 @@ fn check_cluster_sum_invariant(
         return; // mode_canonical already failed
     };
 
-    match cluster_sum_by_level(path, &meta, clustering) {
+    if descriptor.source_is_subset() {
+        report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+        return;
+    }
+
+    match cluster_sum_by_level(path, &meta, clustering, descriptor) {
         Err(e) => report.fail(
             "cluster_sum_invariant",
             format!("could not read cluster columns: {e}"),
@@ -705,8 +720,9 @@ fn cluster_sum_by_level(
     path: &Path,
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
+    descriptor: &ResolvedSchema,
 ) -> Result<Option<Vec<(usize, i64)>>, String> {
-    use super::convert::{feature_kind, find_geometry_column};
+    use super::convert::feature_kind;
     use crate::batch_processor::extract_geometries_opt_from_array;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type};
@@ -716,7 +732,7 @@ fn cluster_sum_by_level(
     let builder = tylertoo_io::open_parquet(file).map_err(|e| e.to_string())?;
     let schema = builder.schema().clone();
 
-    let Some(geom_idx) = find_geometry_column(&schema) else {
+    let Some(geom_idx) = descriptor.geometry_index() else {
         return Ok(None);
     };
     let Ok(pc_idx) = schema.index_of(&clustering.point_count_column) else {
@@ -916,11 +932,7 @@ fn find_level_column(metadata: &ParquetMetaData) -> Option<usize> {
     (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == LEVEL_COLUMN)
 }
 
-/// Parse a `MAJOR.MINOR.PATCH` semver and return MAJOR, or `None` if invalid
-/// (or if MAJOR does not fit a `u64`).
-fn parse_semver_major(v: &str) -> Option<u64> {
-    super::level::semver_parts(v)?[0].parse().ok()
-}
+use super::level::parse_semver_major;
 
 /// Fuzz hook (#633): decode `thrift` as a Parquet footer (the bytes before
 /// the trailing length and `PAR1`) and put it through every tylertoo reader
