@@ -111,6 +111,10 @@ pub enum Diagnostic {
         count: usize,
         reason: CrsWarning,
     },
+    CoveringRejected {
+        count: usize,
+        reason: CoveringWarning,
+    },
     UnusableGeometry {
         count: usize,
         total: usize,
@@ -165,6 +169,56 @@ pub enum CrsWarning {
     UnknownVersion(String),
 }
 
+/// Why a bbox covering cannot replace geometry decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", content = "value", rename_all = "snake_case")]
+pub enum CoveringWarning {
+    NoCovering,
+    UnsupportedPath,
+    MissingColumn,
+    DuplicateColumns,
+    NotFloat64,
+    NoFooterStatistics,
+    MissingStatistics(usize),
+    OutOfCrsRange(usize),
+    UnknownCrs,
+    InconsistentPartitions,
+    NoUsableSample,
+    ReadFailed(String),
+}
+
+impl fmt::Display for CoveringWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCovering => f.write_str("no bbox covering declared"),
+            Self::UnsupportedPath => f.write_str(
+                "unsupported covering path shape (expected four children of one struct)",
+            ),
+            Self::MissingColumn => f.write_str("declared covering column or child is missing"),
+            Self::DuplicateColumns => f.write_str("covering paths reuse the same column"),
+            Self::NotFloat64 => f.write_str(
+                "covering children are not Float64; retaining exact geometry-derived bounds",
+            ),
+            Self::NoFooterStatistics => f.write_str("no Parquet footer statistics available"),
+            Self::MissingStatistics(rg) => {
+                write!(f, "row group {rg} lacks finite covering min/max statistics")
+            }
+            Self::OutOfCrsRange(rg) => write!(
+                f,
+                "row group {rg} covering statistics exceed the declared CRS coordinate range"
+            ),
+            Self::UnknownCrs => f.write_str("the declared CRS coordinate range is unknown"),
+            Self::InconsistentPartitions => {
+                f.write_str("partitions declare different covering columns")
+            }
+            Self::NoUsableSample => {
+                f.write_str("covering yielded no usable bounds for any sampled row")
+            }
+            Self::ReadFailed(error) => write!(f, "could not read the covering: {error}"),
+        }
+    }
+}
+
 impl fmt::Display for CrsWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -203,6 +257,7 @@ impl Diagnostic {
             | Self::ValveDropped { count }
             | Self::PropertySkipped { count, .. }
             | Self::CrsMetadata { count, .. }
+            | Self::CoveringRejected { count, .. }
             | Self::UnusableGeometry { count, .. }
             | Self::CrsAssumed { count, .. }
             | Self::EmptyLevels { count, .. }
@@ -235,6 +290,7 @@ impl Diagnostic {
             | Self::ValveDropped { count }
             | Self::PropertySkipped { count, .. }
             | Self::CrsMetadata { count, .. }
+            | Self::CoveringRejected { count, .. }
             | Self::UnusableGeometry { count, .. }
             | Self::CrsAssumed { count, .. }
             | Self::EmptyLevels { count, .. }
@@ -277,6 +333,10 @@ impl Diagnostic {
                 a == b
             }
             (Self::CrsMetadata { reason: a, .. }, Self::CrsMetadata { reason: b, .. }) => a == b,
+            (
+                Self::CoveringRejected { reason: a, .. },
+                Self::CoveringRejected { reason: b, .. },
+            ) => a == b,
             (Self::PropertySkipped { name: a, .. }, Self::PropertySkipped { name: b, .. }) => {
                 a == b
             }
@@ -316,6 +376,7 @@ impl fmt::Display for Diagnostic {
             Self::ValveDropped {..} => write!(f, "{n} tile feature(s) dropped by the size valve"),
             Self::PropertySkipped {name,data_type,..} => write!(f, "property {name:?} ({data_type}) skipped: no MVT encoding"),
             Self::CrsMetadata {reason,..} => reason.fmt(f),
+            Self::CoveringRejected {reason,..} => write!(f, "bbox covering fast path declined: {reason}; reading the geometry column"),
             Self::UnusableGeometry {total,..} => write!(f, "skipping {n} of {total} input rows with a null, empty, or non-finite geometry"),
             Self::CrsAssumed {input,..} => write!(f, "input {input}: no CRS declared in the GeoParquet metadata; assuming WGS84 lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will be misplaced — check the input with `gpio inspect {input}`"),
             Self::EmptyLevels {levels,gsd_min,gsd_max,input_features,first_written_gsd,first_written_zoom,..} => {
@@ -458,6 +519,14 @@ impl Diagnostics {
                     | Diagnostic::FullResolutionFallback { .. }
                     | Diagnostic::MemoryBudget { .. }
                     | Diagnostic::ValidationSkipped { .. } => log::info!("{event}"),
+                    Diagnostic::CoveringRejected {
+                        reason:
+                            CoveringWarning::NoCovering
+                            | CoveringWarning::UnsupportedPath
+                            | CoveringWarning::NotFloat64
+                            | CoveringWarning::NoFooterStatistics,
+                        ..
+                    } => log::debug!("{event}"),
                     _ => log::warn!("{event}"),
                 }
             }

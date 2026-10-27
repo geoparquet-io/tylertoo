@@ -247,6 +247,16 @@ pub(crate) fn validate_resolved_metadata(
         // Explicit mode/canonical_level consistency (§3.4).
         check_mode_canonical(meta, &mut report);
 
+        if !descriptor.renames().is_empty() {
+            match descriptor.validate_renames() {
+                Ok(()) => report.pass(
+                    "renamed_columns",
+                    "every rename maps real output and source columns",
+                ),
+                Err(message) => report.fail("renamed_columns", message),
+            }
+        }
+
         // #541 review: a partial overview (convert-side zoom ceiling) cannot
         // satisfy §2.4 — its finest level is a simplified one, not the
         // verbatim source — so it is not a conforming file, however sound its
@@ -1061,6 +1071,119 @@ mod tests {
     }
 
     // --- fixture builders ---------------------------------------------------
+
+    fn with_rename_provenance(path: &Path, renames: serde_json::Value, persisted: bool) {
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        use tylertoo_io::KeyValue;
+        let builder = tylertoo_io::open_parquet(File::open(path).unwrap()).unwrap();
+        let mut kv = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .clone();
+        kv.retain(|kv| {
+            kv.key != crate::resolved_schema::RESOLVED_SCHEMA_KEY && kv.key != "ARROW:schema"
+        });
+        let footer = kv.iter_mut().find(|kv| kv.key == OVERVIEWS_KEY).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(footer.value.as_deref().unwrap()).unwrap();
+        json["generalization"] = serde_json::json!({
+            "engine": "test", "levels": [], "renamed_columns": renames
+        });
+        footer.value = Some(json.to_string());
+        let descriptor = if persisted {
+            let schema = Schema::new_with_metadata(
+                builder.schema().fields().clone(),
+                kv.iter()
+                    .filter_map(|kv| kv.value.as_ref().map(|v| (kv.key.clone(), v.clone())))
+                    .collect(),
+            );
+            Some(
+                ResolvedSchema::resolve(&schema)
+                    .unwrap()
+                    .footer_json()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let schema = Arc::new(Schema::new(builder.schema().fields().clone()));
+        let batches: Vec<_> = builder.build().unwrap().map(Result::unwrap).collect();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(
+                kv.into_iter()
+                    .map(|kv| KeyValue::new(kv.key, kv.value))
+                    .collect(),
+            ))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        for batch in batches {
+            writer.write(&batch).unwrap();
+        }
+        if let Some(json) = descriptor {
+            writer.append_key_value_metadata(KeyValue::new(
+                crate::resolved_schema::RESOLVED_SCHEMA_KEY.into(),
+                json,
+            ));
+        }
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn rename_provenance_is_checked_by_check_and_reader_open() {
+        for (renames, persisted) in [
+            serde_json::json!({"absent": "level"}),
+            serde_json::json!({"id": "absent_source"}),
+            serde_json::json!({"id": "id"}),
+        ]
+        .into_iter()
+        .flat_map(|r| [(r.clone(), false), (r, true)])
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_fixture(tmp.path(), Mode::Duplicating, &[vec![0, 1]], false);
+            with_rename_provenance(tmp.path(), renames.clone(), persisted);
+            let report = validate_file(tmp.path()).unwrap();
+            assert_eq!(
+                report.check_passed("renamed_columns"),
+                Some(false),
+                "{renames}: {report:?}"
+            );
+            let md = tylertoo_io::read_parquet_metadata(&File::open(tmp.path()).unwrap()).unwrap();
+            assert_eq!(
+                validate_metadata(&md).check_passed("renamed_columns"),
+                Some(false)
+            );
+            let error = super::super::reader::OverviewReader::open(tmp.path()).unwrap_err();
+            assert!(error.to_string().contains("renamed_columns"), "{error}");
+        }
+    }
+
+    #[test]
+    fn valid_and_ambiguous_rename_provenance_remains_readable() {
+        for (renames, persisted) in [
+            serde_json::json!({"id": "level"}),
+            // The spec permits duplicate source names; publication restores at most one.
+            serde_json::json!({"id": "level", "name": "level"}),
+            // A published target prevents restoration, but is still real provenance.
+            serde_json::json!({"id": "name"}),
+        ]
+        .into_iter()
+        .flat_map(|r| [(r.clone(), false), (r, true)])
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_fixture(tmp.path(), Mode::Duplicating, &[vec![0, 1]], false);
+            with_rename_provenance(tmp.path(), renames.clone(), persisted);
+            let report = validate_file(tmp.path()).unwrap();
+            assert_eq!(
+                report.check_passed("renamed_columns"),
+                Some(true),
+                "{renames}: {report:?}"
+            );
+            super::super::reader::OverviewReader::open(tmp.path()).unwrap();
+        }
+    }
 
     fn geom_for(id: i64) -> Geometry {
         if id % 2 == 0 {

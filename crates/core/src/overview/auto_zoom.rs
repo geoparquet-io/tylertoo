@@ -28,7 +28,8 @@
 //!
 //! Which column that is depends on the input (#693). When the file declares a
 //! GeoParquet 1.1 bbox covering whose four fields are all `f64`
-//! (`find_f64_covering`), the sample projects ONLY the covering struct and
+//! validated against footer statistics by `ResolvedSchema`, the sample
+//! projects ONLY the covering struct and
 //! takes each sampled row's bbox from it — no geometry bytes are read at all,
 //! which on gpio-optimized input (the documented input contract) turns the
 //! pre-conversion read from the file's dominant column into its smallest.
@@ -62,6 +63,7 @@ use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArrayAccessor;
 
 use crate::batch_processor::{visit_geoarrow_array, GeoArrowVisitor};
+use crate::diagnostics::{CoveringWarning, Diagnostic, Diagnostics};
 use crate::input_set::{ConvertSource, ReadPlan};
 use crate::tile::MAX_LATITUDE;
 
@@ -627,11 +629,10 @@ pub(crate) fn estimate_with(
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
     let descriptor = source.resolved_schema()?;
-    let (crs, _) = super::convert::crs_from_resolved(
-        descriptor,
-        &source.display_name(),
-        &crate::diagnostics::Diagnostics::default(),
-    )?;
+    let diagnostics = &Diagnostics::default();
+    source.record_diagnostics(diagnostics);
+    let (crs, _) =
+        super::convert::crs_from_resolved(descriptor, &source.display_name(), diagnostics)?;
     let geom_idx = descriptor
         .geometry_name()
         .and_then(|n| schema.index_of(n).ok())
@@ -669,7 +670,10 @@ pub(crate) fn estimate_with(
     // Sample bboxes from the f64 covering struct when the file declares one
     // (#693) — the geometry column is then never projected at all — else from
     // the geometry scalars.
-    let declared = descriptor.f64_covering();
+    let declared = crate::resolved_schema::ResolvedSchema::auto_zoom_covering(
+        source.resolved_schemas()?,
+        diagnostics,
+    );
 
     // One sampling pass over `source`, reading each row's bbox either from
     // the declared covering struct or from the geometry scalars.
@@ -761,15 +765,17 @@ pub(crate) fn estimate_with(
             // nothing either, the resulting AutoZoomNoSignal is the honest
             // answer rather than an artifact of the sidecar.
             Ok(_) => {
-                log::warn!(
-                    "the declared bbox covering column yielded no usable bounds for                      any sampled row; re-sampling --max-zoom auto from the geometry                      column"
-                );
+                diagnostics.once(Diagnostic::CoveringRejected {
+                    count: 1,
+                    reason: CoveringWarning::NoUsableSample,
+                });
                 (sample(None)?, false)
             }
             Err(e) => {
-                log::warn!(
-                    "could not read the declared bbox covering column ({e});                      re-sampling --max-zoom auto from the geometry column"
-                );
+                diagnostics.once(Diagnostic::CoveringRejected {
+                    count: 1,
+                    reason: CoveringWarning::ReadFailed(e.to_string()),
+                });
                 (sample(None)?, false)
             }
         },
@@ -998,6 +1004,103 @@ mod tests {
         let mut normalized = covered;
         normalized.sampled_from_covering = false;
         assert_eq!(normalized, plain);
+    }
+
+    fn rewrite_covering(source: &ConvertSource, path: &Path, declare: bool) {
+        use arrow_array::RecordBatch;
+        use arrow_schema::Schema;
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        use tylertoo_io::KeyValue;
+        let builder = source.parts()[0].open().unwrap();
+        let mut geo: serde_json::Value = serde_json::from_str(
+            builder
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .unwrap()
+                .iter()
+                .find(|kv| kv.key == "geo")
+                .unwrap()
+                .value
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        if !declare {
+            geo["columns"]["geometry"]
+                .as_object_mut()
+                .unwrap()
+                .remove("covering");
+        }
+        let schema = Arc::new(Schema::new(builder.schema().fields().clone()));
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new("geo".into(), geo.to_string())]))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(path).unwrap(),
+            schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let mut columns = batch.columns().to_vec();
+            let idx = batch.schema().index_of("bbox").unwrap();
+            let bbox = columns[idx].as_any().downcast_ref::<StructArray>().unwrap();
+            let children = bbox
+                .columns()
+                .iter()
+                .map(|c| {
+                    let values = c.as_any().downcast_ref::<Float64Array>().unwrap();
+                    Arc::new(Float64Array::from_iter(
+                        values.iter().map(|v| v.map(|v| v + 1000.0)),
+                    )) as ArrayRef
+                })
+                .collect();
+            columns[idx] = Arc::new(StructArray::new(
+                bbox.fields().clone(),
+                children,
+                bbox.nulls().cloned(),
+            ));
+            writer
+                .write(&RecordBatch::try_new(schema.clone(), columns).unwrap())
+                .unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn stale_covering_falls_back_before_sampling() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(20, 0.009);
+        let covered = write_covered(&dir, "covered.parquet", &geoms);
+        let stale = dir.path().join("stale.parquet");
+        rewrite_covering(&covered, &stale, true);
+        let stale = ConvertSource::resolve_path(&stale).unwrap();
+        let plain = write(&dir, "plain.parquet", &geoms);
+        assert_eq!(estimate(&stale, 0).unwrap(), estimate(&plain, 0).unwrap());
+    }
+
+    #[test]
+    fn every_partition_must_have_a_validated_covering() {
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(20, 0.009);
+        let covered = write_covered(&dir, "covered.parquet", &geoms);
+        let parts = dir.path().join("parts");
+        std::fs::create_dir(&parts).unwrap();
+        std::fs::copy(dir.path().join("covered.parquet"), parts.join("a.parquet")).unwrap();
+        // Same physical fields and CRS, but the second producer does not
+        // declare these stale bbox values as the geometry's covering.
+        rewrite_covering(&covered, &parts.join("b.parquet"), false);
+        let source = ConvertSource::resolve_path(&parts).unwrap();
+        let evidence = estimate(&source, 0).unwrap();
+        assert!(!evidence.sampled_from_covering);
+        let doubled: Vec<_> = geoms.iter().chain(&geoms).cloned().collect();
+        assert_eq!(
+            evidence,
+            estimate(&write(&dir, "plain.parquet", &doubled), 0).unwrap()
+        );
     }
 
     /// Null geometries carry null covering values (the spec ties the two), so

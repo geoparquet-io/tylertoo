@@ -642,6 +642,17 @@ impl ConvertSource {
         }
     }
 
+    /// Cached descriptors for every physical part, in read order. Consumers
+    /// using a common projection must not trust only the first part's footer.
+    pub(crate) fn resolved_schemas(
+        &self,
+    ) -> Result<Vec<&crate::resolved_schema::ResolvedSchema>, InputError> {
+        match self {
+            Self::Single(s) => Ok(vec![s.meta()?.resolved.as_ref()]),
+            Self::Multi(m) => Ok(m.metas.iter().map(|meta| meta.resolved.as_ref()).collect()),
+        }
+    }
+
     /// Total number of row groups across all parts.
     ///
     /// # Errors

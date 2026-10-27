@@ -320,6 +320,40 @@ impl core::marker::UnsafeUnpin for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::TileHasher
 pub mod tylertoo_core::diagnostics
+pub enum tylertoo_core::diagnostics::CoveringWarning
+pub tylertoo_core::diagnostics::CoveringWarning::DuplicateColumns
+pub tylertoo_core::diagnostics::CoveringWarning::InconsistentPartitions
+pub tylertoo_core::diagnostics::CoveringWarning::MissingColumn
+pub tylertoo_core::diagnostics::CoveringWarning::MissingStatistics(usize)
+pub tylertoo_core::diagnostics::CoveringWarning::NoCovering
+pub tylertoo_core::diagnostics::CoveringWarning::NoFooterStatistics
+pub tylertoo_core::diagnostics::CoveringWarning::NoUsableSample
+pub tylertoo_core::diagnostics::CoveringWarning::NotFloat64
+pub tylertoo_core::diagnostics::CoveringWarning::OutOfCrsRange(usize)
+pub tylertoo_core::diagnostics::CoveringWarning::ReadFailed(alloc::string::String)
+pub tylertoo_core::diagnostics::CoveringWarning::UnknownCrs
+pub tylertoo_core::diagnostics::CoveringWarning::UnsupportedPath
+impl core::clone::Clone for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::clone(&self) -> tylertoo_core::diagnostics::CoveringWarning
+impl core::cmp::Eq for tylertoo_core::diagnostics::CoveringWarning
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::eq(&self, &tylertoo_core::diagnostics::CoveringWarning) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::CoveringWarning
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Send for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Sync for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Unpin for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::CoveringWarning
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::CoveringWarning
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::CoveringWarning
 pub enum tylertoo_core::diagnostics::CrsWarning
 pub tylertoo_core::diagnostics::CrsWarning::MissingColumn(alloc::string::String)
 pub tylertoo_core::diagnostics::CrsWarning::MissingVersion
@@ -359,6 +393,9 @@ pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect
 pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect::count: usize
 pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped
 pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected::reason: tylertoo_core::diagnostics::CoveringWarning
 pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed
 pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::count: usize
 pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::input: alloc::string::String

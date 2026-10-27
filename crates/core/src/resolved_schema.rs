@@ -3,7 +3,7 @@
 //! Only this module constructs `ResolvedSchema`. The serialized footer is decoded into
 //! private wire data and checked against the physical schema before it becomes a descriptor.
 use crate::covering::{CoveringSpec, RowGroupBounds};
-use crate::diagnostics::{CrsWarning, Diagnostic, Diagnostics};
+use crate::diagnostics::{CoveringWarning, CrsWarning, Diagnostic, Diagnostics};
 use crate::overview::level::Crs;
 use crate::quality::{is_wgs84_projjson, CrsInfo};
 use crate::{Error, Result};
@@ -59,6 +59,7 @@ pub struct ResolvedSchema {
     schema: SchemaRef,
     bounds: Vec<Option<RowGroupBounds>>,
     diagnostics: Vec<Diagnostic>,
+    auto_zoom_covering: std::result::Result<(usize, [String; 4]), CoveringWarning>,
 }
 
 impl ResolvedSchema {
@@ -172,7 +173,9 @@ impl ResolvedSchema {
             schema: Arc::new(schema.clone()),
             bounds: Vec::new(),
             diagnostics: diagnostics.snapshot(),
+            auto_zoom_covering: Err(CoveringWarning::NoFooterStatistics),
         };
+        result.auto_zoom_covering = result.validate_auto_zoom_covering(metadata);
         if let Some(md) = metadata {
             result.bounds = result.read_bounds(md);
         }
@@ -296,7 +299,9 @@ impl ResolvedSchema {
             schema: Arc::new(schema.clone()),
             bounds: Vec::new(),
             diagnostics: diagnostics.snapshot(),
+            auto_zoom_covering: Err(CoveringWarning::NoFooterStatistics),
         };
+        result.auto_zoom_covering = result.validate_auto_zoom_covering(Some(metadata));
         result.bounds = result.read_bounds(metadata);
         Ok(result)
     }
@@ -405,12 +410,46 @@ impl ResolvedSchema {
     ///   bit-identical to the f64 bbox the geometry scalars yield — centers and
     ///   diagonals would shift and could move a marginal zoom. gpio (the
     ///   documented input contract) writes f64, so the fast path covers it; an
-    ///   f32 covering simply keeps the exact geometry path.
+    ///   f32 covering simply keeps the exact geometry path;
+    /// - all four paths select distinct leaves.
     ///
     /// Name matching is case-insensitive, like
     /// [`crate::covering::find_bbox_column_indices`] on the pruning side.
     pub(crate) fn f64_covering(&self) -> Option<(usize, [String; 4])> {
-        let spec = self.covering()?;
+        self.f64_covering_shape().ok()
+    }
+
+    /// Auto-zoom additionally requires finite footer extrema within the CRS's
+    /// drawable range (including longitude wrap) in every nonempty row group.
+    /// Eligibility is cached from the actual footer, including for persisted
+    /// descriptors. In-range stale values remain undetectable by this guard.
+    pub(crate) fn auto_zoom_covering<'a>(
+        parts: impl IntoIterator<Item = &'a Self>,
+        sink: &Diagnostics,
+    ) -> Option<(usize, [String; 4])> {
+        let mut covering = None;
+        let mut rejected = false;
+        for part in parts {
+            match &part.auto_zoom_covering {
+                Ok(candidate) if covering.as_ref().is_none_or(|c| c == candidate) => {
+                    covering = Some(candidate.clone());
+                }
+                result => {
+                    let reason = result
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .unwrap_or(CoveringWarning::InconsistentPartitions);
+                    sink.once(Diagnostic::CoveringRejected { count: 1, reason });
+                    rejected = true;
+                }
+            }
+        }
+        covering.filter(|_| !rejected)
+    }
+
+    fn f64_covering_shape(&self) -> std::result::Result<(usize, [String; 4]), CoveringWarning> {
+        let spec = self.covering().ok_or(CoveringWarning::NoCovering)?;
         let schema = self.schema();
         let paths = [
             &spec.xmin_path,
@@ -419,31 +458,107 @@ impl ResolvedSchema {
             &spec.ymax_path,
         ];
         if paths.iter().any(|p| p.len() != 2) {
-            return None;
+            return Err(CoveringWarning::UnsupportedPath);
         }
         let root = &paths[0][0];
-        if paths.iter().any(|p| &p[0] != root) {
-            return None;
+        if paths.iter().any(|p| !p[0].eq_ignore_ascii_case(root)) {
+            return Err(CoveringWarning::UnsupportedPath);
         }
         let (idx, field) = schema
             .fields()
             .iter()
             .enumerate()
-            .find(|(_, f)| f.name().eq_ignore_ascii_case(root))?;
+            .find(|(_, f)| f.name().eq_ignore_ascii_case(root))
+            .ok_or(CoveringWarning::MissingColumn)?;
         let DataType::Struct(children) = field.data_type() else {
-            return None;
+            return Err(CoveringWarning::UnsupportedPath);
         };
         let mut names: [String; 4] = Default::default();
         for (slot, p) in names.iter_mut().zip(paths) {
             let child = children
                 .iter()
-                .find(|c| c.name().eq_ignore_ascii_case(&p[1]))?;
+                .find(|c| c.name().eq_ignore_ascii_case(&p[1]))
+                .ok_or(CoveringWarning::MissingColumn)?;
             if *child.data_type() != DataType::Float64 {
-                return None;
+                return Err(CoveringWarning::NotFloat64);
             }
             *slot = child.name().clone();
         }
-        Some((idx, names))
+        if names
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+            .len()
+            != 4
+        {
+            return Err(CoveringWarning::DuplicateColumns);
+        }
+        Ok((idx, names))
+    }
+
+    fn validate_auto_zoom_covering(
+        &self,
+        metadata: Option<&ParquetMetaData>,
+    ) -> std::result::Result<(usize, [String; 4]), CoveringWarning> {
+        let covering = self.f64_covering_shape()?;
+        let spec = self.covering().ok_or(CoveringWarning::NoCovering)?;
+        let md = metadata.ok_or(CoveringWarning::NoFooterStatistics)?;
+        let crs = self.crs().ok_or(CoveringWarning::UnknownCrs)?;
+        let range = crate::overview::convert::crs_coordinate_range(crs);
+        let indices = crate::covering::find_bbox_column_indices(md, spec)
+            .ok_or(CoveringWarning::MissingColumn)?;
+        for (rg_idx, rg) in md.row_groups().iter().enumerate() {
+            if rg.num_rows() == 0 {
+                continue;
+            }
+            // Check both extrema of ALL four leaves: inverted/dateline boxes
+            // can otherwise hide an out-of-range endpoint in the inner stats.
+            for (col, is_x) in [
+                (indices.xmin, true),
+                (indices.ymin, false),
+                (indices.xmax, true),
+                (indices.ymax, false),
+            ] {
+                for min in [true, false] {
+                    let value = crate::covering::extract_stat_value(rg, col, min)
+                        .filter(|v| v.is_finite())
+                        .ok_or(CoveringWarning::MissingStatistics(rg_idx))?;
+                    // Use the tiler's supported one-world longitude wrap.
+                    if value.abs() > if is_x { 3.0 * range.max_x } else { range.max_y } {
+                        return Err(CoveringWarning::OutOfCrsRange(rg_idx));
+                    }
+                }
+            }
+        }
+        Ok(covering)
+    }
+
+    /// Validate output → source rename provenance against the physical fields.
+    /// A source name denotes the column the producer reserved in this file;
+    /// the original input schema is not part of an overview footer.
+    pub(crate) fn validate_renames(&self) -> std::result::Result<(), String> {
+        let mut problems = Vec::new();
+        for (output, source) in self.renames() {
+            if self.schema().column_with_name(output).is_none() {
+                problems.push(format!("output column {output:?} is absent"));
+            }
+            if !self
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name().eq_ignore_ascii_case(source))
+            {
+                problems.push(format!("source column {source:?} is absent"));
+            }
+            if output.eq_ignore_ascii_case(source) {
+                problems.push(format!("{output:?} maps to itself"));
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
     }
 
     /// Restore data property names without colliding with published columns.
