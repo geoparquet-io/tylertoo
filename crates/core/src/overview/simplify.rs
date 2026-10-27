@@ -1044,11 +1044,14 @@ const INVALID_RETRY_HALVINGS: u32 = 3;
 /// ring's detail, i.e. RDP removed few, near-collinear vertices from input
 /// we already assume valid — the *least* likely candidate to have acquired a
 /// crossing. The expensive-to-check case and the low-risk case coincide.
-/// The trade is the same as `clip.rs`: a giant candidate that *did* acquire
-/// a crossing ships unrepaired, which the overviews spec explicitly permits
-/// (geometry validity is not a conformance requirement, `OVERVIEWS_SPEC` §
-/// "validity") and matches tippecanoe, which never validates simplification
-/// output. Everything at or below the cap is validated exactly as before.
+/// A giant candidate that *did* acquire a crossing is stored in the level
+/// as is, which the overviews spec explicitly permits (geometry validity is
+/// not a conformance requirement, `OVERVIEWS_SPEC` § "validity") and matches
+/// tippecanoe, which never validates simplification output. It does not
+/// reach a tile invalid: every polygon is checked and repaired again in
+/// tile space after quantization (`mvt::tile_polygon`, #748), so this check
+/// is only a fast path that picks a tolerance needing no repair. Everything
+/// at or below the cap is validated exactly as before.
 const MAX_VALIDATION_VERTS: usize = 2_048;
 
 /// Total vertices across the polygon's exterior and interior rings.
