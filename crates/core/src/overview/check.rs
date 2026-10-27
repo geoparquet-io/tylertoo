@@ -921,9 +921,11 @@ fn parse_semver_major(v: &str) -> Option<u64> {
 /// row-group bbox readers (covering columns and native geo statistics), the
 /// spill-size and batch-size heuristics, and `--filter` pushdown over the
 /// footer's column statistics, with a few filters bound to the footer's own
-/// columns. The footer decode itself is parquet-rs's, and the embedded
-/// `ARROW:schema` is left to the whole-file targets. Only the `fuzz/` crate
-/// calls this; the `fuzzing` feature is never on in a normal build.
+/// columns. The footer goes through the owner's decode
+/// ([`crate::untrusted::decode_footer`]: the #690 pre-check, then parquet-rs
+/// inside the panic boundary), and the embedded `ARROW:schema` is left to
+/// the whole-file targets. Only the `fuzz/` crate calls this; the `fuzzing`
+/// feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_parquet_footer(
@@ -964,7 +966,7 @@ pub fn fuzz_parquet_footer(
     }
 
     // Without the key-value metadata: the embedded `ARROW:schema` hint is
-    // arrow-ipc's to decode (and it panics on a crafted one, #683);
+    // arrow-ipc's to decode (guarded by the owner since #779, #683);
     // `overview_file` and `remote_footer` reach that through the real open.
     // Here the filters only need column names and types.
     if let Ok(schema) =
