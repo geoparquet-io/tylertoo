@@ -73,10 +73,15 @@ fn geo_metadata_seeds() {
 
 #[test]
 fn plan_file_seeds() {
-    // #684's crash input: a crafted IPC buffer offset, refused (#779).
+    // #684's crash input: a crafted IPC buffer offset, refused (#779); and
+    // a footer block declaring a ~1 PB length, refused before arrow-ipc
+    // allocates it (found re-enabling this target).
     replay(
         "plan_file",
-        &["seed-issue-684-ipc-buffer.arrow"],
+        &[
+            "seed-issue-684-ipc-buffer.arrow",
+            "seed-ipc-block-length.arrow",
+        ],
         tylertoo_core::overview::fuzz_convert_plan,
     );
 }

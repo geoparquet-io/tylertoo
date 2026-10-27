@@ -31,7 +31,7 @@
 //!   [`ParquetSource`].
 
 use std::cell::{Cell, RefCell};
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Once};
 
@@ -898,9 +898,68 @@ pub struct UntrustedIpcReader<R: Read + Seek> {
 /// Returns an [`ArrowError`] if the footer or schema cannot be decoded; a
 /// decoder panic is an [`ArrowError::ExternalError`] holding
 /// [`InputError::DecoderPanic`].
-pub fn open_ipc<R: Read + Seek>(reader: R) -> Result<UntrustedIpcReader<R>, ArrowError> {
+pub fn open_ipc<R: Read + Seek>(mut reader: R) -> Result<UntrustedIpcReader<R>, ArrowError> {
+    guard_arrow("Arrow IPC footer", || precheck_ipc_blocks(&mut reader))?;
     let inner = guard_arrow("Arrow IPC footer", || FileReader::try_new(reader, None))?;
     Ok(UntrustedIpcReader { inner, done: false })
+}
+
+/// Refuse an IPC file whose footer, or any dictionary or record-batch block
+/// it lists, lies outside the file.
+///
+/// arrow-ipc zero-allocates the footer's declared length and each block's
+/// `metaDataLength + bodyLength` before reading them, so a crafted length
+/// aborts the process on the allocation: there is no panic for [`guard`] to
+/// catch. A footer that does not verify is left for [`FileReader`] to name.
+fn precheck_ipc_blocks<R: Read + Seek>(reader: &mut R) -> Result<(), ArrowError> {
+    const TRAILER: u64 = 10; // footer length (4) + `ARROW1`
+    let size = reader.seek(SeekFrom::End(0))?;
+    if size < TRAILER {
+        return Ok(());
+    }
+    let mut trailer = [0u8; TRAILER as usize];
+    reader.seek(SeekFrom::End(-(TRAILER as i64)))?;
+    reader.read_exact(&mut trailer)?;
+    let Ok(footer_len) = arrow_ipc::reader::read_footer_length(trailer) else {
+        return Ok(());
+    };
+    let refuse =
+        |msg: String| ArrowError::ExternalError(Box::new(InputError::HostileIpcFooter(msg)));
+    let body_end = size - TRAILER;
+    if footer_len as u64 > body_end {
+        return Err(refuse(format!(
+            "the footer declares {footer_len} bytes but the file holds {size}"
+        )));
+    }
+    let mut footer = vec![0u8; footer_len];
+    reader.seek(SeekFrom::Start(body_end - footer_len as u64))?;
+    reader.read_exact(&mut footer)?;
+    let Ok(footer) = arrow_ipc::root_as_footer(&footer) else {
+        return Ok(());
+    };
+    // A block must end before the footer starts.
+    let blocks_end = body_end - footer_len as u64;
+    let lists = [
+        ("dictionary", footer.dictionaries()),
+        ("record batch", footer.recordBatches()),
+    ];
+    for (what, blocks) in lists {
+        for (i, block) in blocks.iter().flatten().enumerate() {
+            let (offset, meta, body) = (block.offset(), block.metaDataLength(), block.bodyLength());
+            let end = u64::try_from(offset)
+                .ok()
+                .zip(u64::try_from(meta).ok())
+                .zip(u64::try_from(body).ok())
+                .and_then(|((o, m), b)| o.checked_add(m)?.checked_add(b));
+            if !end.is_some_and(|end| end <= blocks_end) {
+                return Err(refuse(format!(
+                    "{what} block {i} (offset {offset}, metadata {meta} bytes, body {body} \
+                     bytes) lies outside the file's {blocks_end} data bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<R: Read + Seek> UntrustedIpcReader<R> {
@@ -1163,5 +1222,19 @@ mod tests {
         assert!(err.contains("children"), "{err}");
         let err = read_all(&path).unwrap_err();
         assert!(err.contains("children"), "{err}");
+    }
+
+    /// The `plan_file` fuzz target's first find once re-enabled: an IPC
+    /// footer whose dictionary block declares a ~1 PB length. arrow-ipc
+    /// zero-allocates a block's length before it reads it, so the process
+    /// aborted on the allocation (no panic for the boundary to catch).
+    #[test]
+    fn an_ipc_block_past_the_file_end_is_refused_before_the_read() {
+        let bytes = std::fs::read(corpus("plan_file", "seed-ipc-block-length.arrow")).unwrap();
+        let err = super::open_ipc(std::io::Cursor::new(bytes))
+            .err()
+            .expect("a block past the file end is refused")
+            .to_string();
+        assert!(err.contains("block"), "{err}");
     }
 }

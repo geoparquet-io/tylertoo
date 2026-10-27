@@ -194,6 +194,10 @@ pub enum InputError {
     /// was refused before parquet-rs sized an allocation from it (#690).
     #[error("refusing a malformed Parquet footer: {0}")]
     HostileFooter(String),
+    /// An Arrow IPC footer points a block outside the file, and was refused
+    /// before arrow-ipc sized an allocation from the block's declared length.
+    #[error("refusing a malformed Arrow IPC footer: {0}")]
+    HostileIpcFooter(String),
 }
 
 /// A [`ParquetError`]'s message without the `Parquet error: ` prefix its
