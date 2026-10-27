@@ -110,10 +110,6 @@ def test_pyramid_refuses_a_bad_option_before_tiling(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.skipif(
-    not hasattr(os, "geteuid") or os.geteuid() == 0,
-    reason="root ignores directory modes",
-)
 def test_a_read_only_spill_dir_is_refused_before_reading(tmp_path: Path) -> None:
     # #779: formerly "Permission denied" (RuntimeError) when the spill first
     # opened, deep into the run.
@@ -121,8 +117,17 @@ def test_a_read_only_spill_dir_is_refused_before_reading(tmp_path: Path) -> None
     ro.mkdir()
     ro.chmod(0o555)
     try:
-        with pytest.raises(tylertoo.ConfigError, match="is not writable"):
-            _convert(tmp_path, spill_dir=str(ro))
+        if os.access(ro, os.W_OK):
+            # Root ignores directory modes, so the directory is writable and
+            # the rule must let it through: the run reaches the missing
+            # input instead. The refusal follows real writability, not mode
+            # bits.
+            with pytest.raises(Exception) as raised:
+                _convert(tmp_path, spill_dir=str(ro))
+            assert not isinstance(raised.value, tylertoo.ConfigError), raised.value
+        else:
+            with pytest.raises(tylertoo.ConfigError, match="is not writable"):
+                _convert(tmp_path, spill_dir=str(ro))
     finally:
         ro.chmod(0o755)
 
