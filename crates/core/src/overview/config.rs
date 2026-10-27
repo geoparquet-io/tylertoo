@@ -40,6 +40,9 @@ pub enum OutputKind {
     Pmtiles,
     /// A GeoParquet file (`overview`, `decode`).
     GeoParquet,
+    /// A shard plan (`shard-plan`, #498). Rewritten in place, so an
+    /// existing one needs only to be writable, not its directory.
+    ShardPlan,
 }
 
 impl std::fmt::Display for OutputKind {
@@ -47,6 +50,7 @@ impl std::fmt::Display for OutputKind {
         f.write_str(match self {
             OutputKind::Pmtiles => "PMTiles",
             OutputKind::GeoParquet => "GeoParquet",
+            OutputKind::ShardPlan => "shard plan",
         })
     }
 }
@@ -85,12 +89,22 @@ pub enum ConfigError {
     /// deep into the run.
     #[error("spill-dir {} is not an existing directory", .0.display())]
     SpillDirNotDirectory(PathBuf),
+    /// `--spill-dir` exists but does not accept new files (a read-only
+    /// directory): found by creating and removing a probe file.
+    #[error("spill-dir {} is not writable: {reason}", dir.display())]
+    SpillDirNotWritable {
+        /// The spill directory.
+        dir: PathBuf,
+        /// The OS error from the probe.
+        reason: String,
+    },
     /// `extent` is zero (#433). Zero quantizes every coordinate to `(0, 0)`:
     /// every polygon and line degenerates, and every consumer then divides
     /// by the layer's `extent: 0`.
     #[error(
         "extent {extent} is not a valid MVT tile extent: the extent is the tile-local \
-         coordinate resolution and must be positive (the default is 4096)"
+         coordinate resolution and must be positive (the default is {})",
+        super::export::DEFAULT_EXTENT
     )]
     InvalidExtent {
         /// The rejected extent.
@@ -101,13 +115,25 @@ pub enum ConfigError {
     #[error(
         "--tile-buffer {buffer} is wider than the {max} tile pixel cap (one full tile width): \
          past it a tile duplicates geometry from tiles it does not border and every feature \
-         belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is 8)."
+         belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is {}).",
+        super::export::DEFAULT_TILE_BUFFER_PX
     )]
     TileBufferTooWide {
         /// The requested buffer, in tile pixels.
         buffer: u32,
         /// [`MAX_TILE_BUFFER_PX`](super::export::MAX_TILE_BUFFER_PX).
         max: u32,
+    },
+    /// `--bbox` is not `xmin,ymin,xmax,ymax` with finite, ordered corners.
+    /// A NaN corner matches nothing and an inverted box selects nothing, so
+    /// the run would read the input to produce an empty archive.
+    #[error(
+        "bbox {bbox:?} must hold finite values with xmin <= xmax and ymin <= ymax \
+         (xmin,ymin,xmax,ymax)"
+    )]
+    InvalidBbox {
+        /// The rejected bbox.
+        bbox: [f64; 4],
     },
     /// The publication metadata cannot fit an archive's metadata section.
     #[error("{0}")]
@@ -118,7 +144,7 @@ pub enum ConfigError {
     #[error(
         "rank {rank} for {} must be a finite number (NaN and infinity cannot be ordered \
          against other classes)",
-        class.as_deref().map_or_else(|| "unlisted classes".to_string(), |c| format!("class {c:?}"))
+        class.as_deref().map_or_else(|| "unknown (unlisted) classes".to_string(), |c| format!("class {c:?}"))
     )]
     ClassRankNotFinite {
         /// The class, or `None` for the unknown-class rank.
@@ -159,14 +185,22 @@ pub enum ConfigError {
          exactly once with geometry verbatim, which a merged chain cannot satisfy"
     )]
     CoalescePartitioningUnsupported,
-    /// A hand-written export tile range alongside a data shard's own (#498).
-    /// The shard's range prunes the convert's reads too, so the hand-written
-    /// one could only be silently ignored.
+    /// A hand-written export tile range alongside a shard job (#498). A data
+    /// shard's own range prunes the convert's reads too, so the hand-written
+    /// one could only be silently ignored; the coarse job owns every zoom
+    /// below the pivot, which a range would silently cut.
     #[error(
-        "--tile-range cannot be combined with a data shard (--shard I/N): the shard's own range \
-         restricts the export"
+        "--tile-range cannot be combined with --shard: a data shard's own range restricts the \
+         export, and the coarse job owns every zoom below the pivot"
     )]
-    TileRangeWithDataShard,
+    TileRangeWithShard,
+    /// Both `--save-plan` and `--plan`: one writes the pass-1/assignment
+    /// artifact, the other replaces pass 1 with a saved one.
+    #[error(
+        "--save-plan and --plan are mutually exclusive: one writes the pass-1/assignment \
+         artifact, the other replaces pass 1 with a saved one"
+    )]
+    SavePlanWithPlan,
     /// The coarse job of a sharded build owns `[min_zoom, pivot - 1]`, and a
     /// pivot at or below `min_zoom` leaves it nothing to build (#498, #709).
     /// Without this the whole convert runs before the export refuses an
@@ -284,20 +318,34 @@ pub fn check_output(output: &Path, kind: OutputKind, force: bool) -> Result<(), 
             path: output.to_path_buf(),
         });
     }
-    Ok(crate::atomic_output::check_writable(output)?)
+    Ok(match kind {
+        OutputKind::ShardPlan => crate::atomic_output::check_writable_in_place(output),
+        OutputKind::Pmtiles | OutputKind::GeoParquet => {
+            crate::atomic_output::check_writable(output)
+        }
+    }?)
 }
 
-/// `--spill-dir`'s rule (#272, #427), shared by the convert and the export:
-/// unset, or an existing directory.
+/// `--spill-dir`'s rule (#272, #427), shared by the convert and the export.
+///
+/// Unset, or an existing directory that accepts new files. The spill opens
+/// lazily, so a read-only directory would otherwise fail deep into the run.
 ///
 /// # Errors
 ///
-/// [`ConfigError::SpillDirNotDirectory`].
+/// [`ConfigError::SpillDirNotDirectory`] or
+/// [`ConfigError::SpillDirNotWritable`].
 pub fn check_spill_dir(spill_dir: Option<&Path>) -> Result<(), ConfigError> {
-    match spill_dir {
-        Some(dir) if !dir.is_dir() => Err(ConfigError::SpillDirNotDirectory(dir.to_path_buf())),
-        _ => Ok(()),
+    let Some(dir) = spill_dir else {
+        return Ok(());
+    };
+    if !dir.is_dir() {
+        return Err(ConfigError::SpillDirNotDirectory(dir.to_path_buf()));
     }
+    crate::atomic_output::probe_directory(dir).map_err(|e| ConfigError::SpillDirNotWritable {
+        dir: dir.to_path_buf(),
+        reason: e.to_string(),
+    })
 }
 
 /// The below-tolerance polygon disposition from the frontends' switches.
@@ -382,7 +430,7 @@ pub fn class_ranking(
         (None, Some(column), Some(ranks)) => {
             ClassRanking::new(column, ranks.into_iter().collect(), unknown_rank)
                 .map(Some)
-                .map_err(|e| invalid(format!("class_ranks: {e}")))
+                .map_err(invalid)
         }
     }
 }
@@ -402,22 +450,30 @@ pub fn representation(spec: Option<&str>) -> Result<Vec<RepresentationBand>, Con
     })
 }
 
-/// A ranking's ranks are finite (#428). [`ClassRanking::new`] already
-/// guarantees it; this catches one built as a struct literal.
-pub(crate) fn check_class_ranking(ranking: &ClassRanking) -> Result<(), ConfigError> {
-    if let Some((class, rank)) = ranking.ranks.iter().find(|(_, r)| !r.is_finite()) {
+/// Every rank, and an explicit unknown-class rank, is finite (#428): the
+/// one rule and message behind [`ClassRanking::new`] (so `--class-rank` and
+/// Python's `class_ranks` read the same) and [`check_class_ranking`].
+pub(crate) fn check_ranks_finite(
+    ranks: &[(String, f64)],
+    unknown_rank: Option<f64>,
+) -> Result<(), ConfigError> {
+    if let Some((class, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
         return Err(ConfigError::ClassRankNotFinite {
             class: Some(class.clone()),
             rank: *rank,
         });
     }
-    if !ranking.unknown_rank.is_finite() {
-        return Err(ConfigError::ClassRankNotFinite {
-            class: None,
-            rank: ranking.unknown_rank,
-        });
+    match unknown_rank.filter(|u| !u.is_finite()) {
+        Some(rank) => Err(ConfigError::ClassRankNotFinite { class: None, rank }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// A ranking's ranks are finite (#428). [`ClassRanking::new`] already
+/// guarantees it; this catches one built as a struct literal, whose fields
+/// are public.
+pub(crate) fn check_class_ranking(ranking: &ClassRanking) -> Result<(), ConfigError> {
+    check_ranks_finite(&ranking.ranks, Some(ranking.unknown_rank))
 }
 
 #[cfg(test)]
@@ -475,6 +531,28 @@ mod tests {
         let err = check_spill_dir(Some(&missing)).unwrap_err();
         assert!(matches!(err, ConfigError::SpillDirNotDirectory(_)));
         assert!(err.to_string().contains("not an existing directory"));
+    }
+
+    /// A read-only spill dir is refused before any read, not with
+    /// "Permission denied" when the spill first opens deep into the run.
+    #[cfg(unix)]
+    #[test]
+    fn check_spill_dir_refuses_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // root ignores directory modes: nothing to assert there.
+        if std::fs::File::create(ro.join("as-root")).is_ok() {
+            return;
+        }
+        let err = check_spill_dir(Some(&ro)).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SpillDirNotWritable { ref dir, .. } if *dir == ro),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not writable"), "{err}");
     }
 
     /// #279/#745: the three switches resolve to one disposition, and any two
@@ -543,8 +621,15 @@ mod tests {
         assert!(err.to_string().contains("finite"), "{err}");
 
         let ranks = BTreeMap::from([("a".to_string(), f64::NAN)]);
-        let err = class_ranking(None, Some("road".into()), Some(ranks), None).unwrap_err();
-        assert!(err.to_string().contains("finite"), "{err}");
+        let structured = class_ranking(None, Some("road".into()), Some(ranks), None).unwrap_err();
+        // One rule, one message: the CLI string and the Python dict read the
+        // same, and match the struct-literal check's typed error.
+        assert_eq!(structured.to_string(), err.to_string());
+        let typed = ConfigError::ClassRankNotFinite {
+            class: Some("a".into()),
+            rank: f64::NAN,
+        };
+        assert_eq!(err.to_string(), typed.to_string());
 
         let literal = ClassRanking {
             column: "road".into(),
@@ -565,6 +650,31 @@ mod tests {
             check_class_ranking(&literal).unwrap_err(),
             ConfigError::ClassRankNotFinite { class: None, .. }
         ));
+    }
+
+    /// `--bbox` corners are finite and ordered, as a typed config error so
+    /// every frontend classes it with the other pre-read refusals (the CLI
+    /// bailed on the order itself before #779).
+    #[test]
+    fn bbox_must_be_finite_and_ordered() {
+        use crate::overview::convert::{ConvertError, ConvertOptions};
+        let with = |bbox| ConvertOptions {
+            bbox: Some(bbox),
+            ..ConvertOptions::default()
+        };
+        for bbox in [
+            [3.0, 0.0, 1.0, 1.0],
+            [0.0, 2.0, 1.0, 1.0],
+            [f64::NAN, 0.0, 1.0, 1.0],
+        ] {
+            let err = with(bbox).validate().unwrap_err();
+            assert!(
+                matches!(err, ConvertError::Config(ConfigError::InvalidBbox { .. })),
+                "{bbox:?}: {err:?}"
+            );
+            assert!(err.is_config());
+        }
+        with([0.0, 0.0, 1.0, 1.0]).validate().unwrap();
     }
 
     /// The structured spelling pairs its parts, and the two spellings are

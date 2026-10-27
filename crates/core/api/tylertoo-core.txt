@@ -1256,6 +1256,8 @@ pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded
 pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded::name: alloc::string::String
 pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded
 pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::InvalidBbox
+pub tylertoo_core::overview::config::ConfigError::InvalidBbox::bbox: [f64; 4]
 pub tylertoo_core::overview::config::ConfigError::InvalidExtent
 pub tylertoo_core::overview::config::ConfigError::InvalidExtent::extent: u32
 pub tylertoo_core::overview::config::ConfigError::InvalidSpec
@@ -1276,14 +1278,18 @@ pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::kind: tyler
 pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::path: std::path::PathBuf
 pub tylertoo_core::overview::config::ConfigError::PlanOnlyDataShard
 pub tylertoo_core::overview::config::ConfigError::PlanOnlyWithoutSavePlan
+pub tylertoo_core::overview::config::ConfigError::SavePlanWithPlan
 pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch
 pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::pivot: u8
 pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::range_pivot: u8
 pub tylertoo_core::overview::config::ConfigError::SpillDirNotDirectory(std::path::PathBuf)
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable::dir: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable::reason: alloc::string::String
 pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide
 pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::buffer: u32
 pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::max: u32
-pub tylertoo_core::overview::config::ConfigError::TileRangeWithDataShard
+pub tylertoo_core::overview::config::ConfigError::TileRangeWithShard
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
 pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
@@ -1310,6 +1316,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::C
 pub enum tylertoo_core::overview::config::OutputKind
 pub tylertoo_core::overview::config::OutputKind::GeoParquet
 pub tylertoo_core::overview::config::OutputKind::Pmtiles
+pub tylertoo_core::overview::config::OutputKind::ShardPlan
 impl core::clone::Clone for tylertoo_core::overview::config::OutputKind
 pub fn tylertoo_core::overview::config::OutputKind::clone(&self) -> tylertoo_core::overview::config::OutputKind
 impl core::cmp::Eq for tylertoo_core::overview::config::OutputKind
@@ -3074,6 +3081,21 @@ impl core::marker::Unpin for tylertoo_core::overview::tiles::IntermediateOvervie
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
+pub struct tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub tylertoo_core::overview::tiles::SpaceRemedies::keep_overview: &'a str
+pub tylertoo_core::overview::tiles::SpaceRemedies::spill_dir: &'a str
+impl<'a> core::clone::Clone for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub fn tylertoo_core::overview::tiles::SpaceRemedies<'a>::clone(&self) -> tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::fmt::Debug for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub fn tylertoo_core::overview::tiles::SpaceRemedies<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Freeze for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Send for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Sync for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Unpin for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::SpaceRemedies<'a>
 pub struct tylertoo_core::overview::tiles::TilesOptions
 pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
 pub tylertoo_core::overview::tiles::TilesOptions::export: tylertoo_core::overview::export::ExportOptions
@@ -3141,13 +3163,12 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles:
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesShard
 pub const tylertoo_core::overview::tiles::TILES_DEFAULT_MAX_ZOOM: u8
 pub trait tylertoo_core::overview::tiles::TilesObserver
-pub fn tylertoo_core::overview::tiles::TilesObserver::intermediate_space_low(&mut self, &str)
 pub fn tylertoo_core::overview::tiles::TilesObserver::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
 impl tylertoo_core::overview::tiles::TilesObserver for ()
-pub fn ()::intermediate_space_low(&mut self, &str)
 pub fn ()::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles_observed(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, &mut dyn tylertoo_core::overview::tiles::TilesObserver) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::intermediate_space_preflight(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, tylertoo_core::overview::tiles::SpaceRemedies<'_>) -> core::option::Option<alloc::string::String>
 pub fn tylertoo_core::overview::tiles::write_plan(&tylertoo_core::overview::tiles::TilesInput, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::tiles::TilesError>
 pub mod tylertoo_core::overview::writer
 pub enum tylertoo_core::overview::writer::LevelWriteOutcome
@@ -4146,6 +4167,8 @@ pub tylertoo_core::Error::MvtEncoding(alloc::string::String)
 pub tylertoo_core::Error::Output(tylertoo_core::atomic_output::OutputNotWritable)
 pub tylertoo_core::Error::PMTilesRead(alloc::string::String)
 pub tylertoo_core::Error::PMTilesWrite(alloc::string::String)
+impl tylertoo_core::Error
+pub fn tylertoo_core::Error::is_config(&self) -> bool
 impl core::convert::From<core::io::error::Error> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(core::io::error::Error) -> Self
 impl core::convert::From<tylertoo_core::Error> for tylertoo_core::decode::DecodeError

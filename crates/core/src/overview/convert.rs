@@ -308,17 +308,12 @@ impl ClassRanking {
         ranks: Vec<(String, f64)>,
         unknown_rank: Option<f64>,
     ) -> Result<Self, String> {
-        const NOT_FINITE: &str =
-            "must be a finite number (NaN and infinity cannot be ordered against other classes)";
         if ranks.is_empty() {
             return Err("at least one class rank is required".to_string());
         }
-        if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-            return Err(format!("rank {rank} for class {value:?} {NOT_FINITE}"));
-        }
-        if let Some(unknown) = unknown_rank.filter(|u| !u.is_finite()) {
-            return Err(format!("unknown-class rank {unknown} {NOT_FINITE}"));
-        }
+        // The one finiteness rule and message (#428), shared with a
+        // struct-literal ranking's check in `validate_options`.
+        super::config::check_ranks_finite(&ranks, unknown_rank).map_err(|e| e.to_string())?;
         let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
         Ok(Self {
             column: column.into(),
@@ -2058,16 +2053,9 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
         ));
     }
-    if let Some(bb) = &options.bbox {
-        if bb.iter().any(|v| !v.is_finite()) {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must contain only finite values"
-            )));
-        }
-        if bb[0] > bb[2] || bb[1] > bb[3] {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must satisfy xmin <= xmax and ymin <= ymax"
-            )));
+    if let Some(bb) = options.bbox {
+        if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
+            return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
         }
     }
     // Attribute filter (#315): fail fast on a syntactically invalid
@@ -2080,12 +2068,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // of the same run, and both need the streaming pipeline (the in-memory
     // reference path has no separable pass 1 to skip).
     if options.save_plan.is_some() && options.plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--save-plan and --plan are mutually exclusive: one writes the \
-             pass-1/assignment artifact, the other replaces pass 1 with a \
-             saved one"
-                .to_string(),
-        ));
+        return Err(super::config::ConfigError::SavePlanWithPlan.into());
     }
     if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
         return Err(ConvertError::InvalidConfig(
@@ -2529,12 +2512,6 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
             .trim()
             .parse()
             .map_err(|e| format!("invalid rank in '{pair}': {e}"))?;
-        if !rank.is_finite() {
-            return Err(format!(
-                "invalid rank in '{pair}': ranks must be finite numbers \
-                 (NaN and infinity cannot be ordered against other classes)"
-            ));
-        }
         ranks.push((value.to_string(), rank));
     }
     if ranks.is_empty() {
@@ -2543,8 +2520,8 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
         ));
     }
 
-    // The shared rules (unknown values lose to every named class but beat
-    // nulls); the per-entry messages above already named any offender.
+    // The shared rules: finite ranks (#428), and unknown values losing to
+    // every named class but beating nulls.
     ClassRanking::new(column, ranks, None)
 }
 
@@ -11685,6 +11662,12 @@ mod tests {
                 "{bad:?} must be rejected as non-finite, got: {err}"
             );
         }
+        // #709 item 3: the message quotes the value as typed, not as parsed
+        // (`"infinity"`, not `inf`), so the user can find it in their spec.
+        let err = parse_entry_zoom("density:infinity=4").unwrap_err();
+        assert!(err.contains("\"infinity\" is not a finite number"), "{err}");
+        let err = parse_entry_zoom("density: NaN =4").unwrap_err();
+        assert!(err.contains("\"NaN\" is not a finite number"), "{err}");
     }
 
     /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one

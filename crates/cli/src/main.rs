@@ -228,14 +228,14 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
 
 /// Exit-status contract (#452), shown under `tylertoo --help` and in the
 /// generated CLI reference. Exit 1 is `main` returning `Err` (anyhow
-/// prints it); exit 2 is clap's for a parse error, and `--quiet` with
-/// `tiles --verbose` reuses it.
+/// prints it); exit 2 is clap's for a parse error, which core's option refusals
+/// (`is_usage_error`) and `--quiet` with `tiles --verbose` reuse.
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
 
 - 0: success.
 - 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
-- 2: the command line was rejected while it was parsed.
+- 2: the command line was rejected: while it was parsed, or by an option or output-path rule checked before any input is read.
 - 101: a panic, from an internal bug or an output pipe closed early.";
 
 /// Convert GeoParquet to PMTiles vector tiles and multi-resolution
@@ -885,12 +885,9 @@ struct ConvertTuningArgs {
 
     /// Assign entry zooms: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...`, for example
     /// `density:5000=4,1000=6`. Unlisted values use the normal visibility gate.
-    #[arg(
-        long,
-        value_name = "SPEC",
-        help_heading = "Ranking",
-        conflicts_with = "magnitude_ladder"
-    )]
+    // Exclusive with --magnitude-ladder: core's rule
+    // (`config::entry_zoom`), not clap's, so Python refuses it alike (#779).
+    #[arg(long, value_name = "SPEC", help_heading = "Ranking")]
     entry_zoom: Option<String>,
 
     /// Rank categorical classes for cell winners: `COLUMN:VALUE=RANK,...`,
@@ -949,13 +946,14 @@ struct ConvertTuningArgs {
     /// Replace polygons too small for a level with a point instead of the
     /// default placeholder square. Fill styles ignore points; add a circle
     /// layer.
-    #[arg(long, conflicts_with_all = ["collapse_square", "no_collapse"], help_heading = "Generalization")]
+    // The collapse trio's exclusivity is core's (`config::collapse_mode`).
+    #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
     /// Replace polygons too small for a level, and those thinned out at
     /// coarse levels, with small placeholder squares marking their area.
     /// This is the default in duplicating mode; output remains Polygon.
-    #[arg(long, conflicts_with = "no_collapse", help_heading = "Generalization")]
+    #[arg(long, help_heading = "Generalization")]
     collapse_square: bool,
 
     /// Drop polygons too small for a level instead of replacing them with
@@ -1181,22 +1179,13 @@ struct ConvertTuningArgs {
 
     /// Save the convert plan to PATH and continue converting. Reuse it
     /// with `--plan`; sharded builds share one plan.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "plan",
-        help_heading = "Memory & performance"
-    )]
+    // Exclusive with --plan: core's rule (`ConfigError::SavePlanWithPlan`).
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     save_plan: Option<PathBuf>,
 
     /// Reuse a convert plan, skipping the first pass and level assignment.
     /// Its fingerprint must match this run's version, flags, and inputs.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "save_plan",
-        help_heading = "Memory & performance"
-    )]
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     plan: Option<PathBuf>,
 }
 
@@ -1434,17 +1423,14 @@ struct TilesArgs {
     /// Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at
     /// one zoom, plus their descendants. Prefer `--shard`, which also skips
     /// input the range cannot reach.
-    #[arg(
-        long,
-        value_name = "LO..HI",
-        conflicts_with = "shard",
-        help_heading = "Sharded builds"
-    )]
+    // Exclusive with --shard: core's rule (`ConfigError::TileRangeWithShard`).
+    #[arg(long, value_name = "LO..HI", help_heading = "Sharded builds")]
     tile_range: Option<String>,
 
     /// Write the convert plan (`--save-plan`) and stop, with no export and
     /// no OUTPUT. Use it for a coarse job whose tiles the fleet discards.
-    #[arg(long, requires = "save_plan", help_heading = "Sharded builds")]
+    // Needs --save-plan: core's rule (`ConfigError::PlanOnlyWithoutSavePlan`).
+    #[arg(long, help_heading = "Sharded builds")]
     plan_only: bool,
 
     /// Print per-level and per-zoom breakdowns.
@@ -1459,7 +1445,7 @@ struct TilesArgs {
     tuning: ConvertTuningArgs,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
     // dhat-heap.json on Drop (program exit). TYLERTOO_DHAT=off skips it:
@@ -1484,7 +1470,7 @@ fn main() -> Result<()> {
         log::set_max_level(log::max_level().min(log::LevelFilter::Warn));
     }
 
-    match cli.command {
+    let result = match cli.command {
         Command::Overview(args) => run_overview(*args),
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
@@ -1499,6 +1485,50 @@ fn main() -> Result<()> {
             print!("{}", gen_reference_markdown());
             Ok(())
         }
+    };
+    match result {
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
+        // #779: an option core refused before any work is a usage error,
+        // like clap's: exit 2, the message alone (it names no failed step).
+        Err(e) if is_usage_error(&e) => {
+            eprintln!("Error: {e:#}");
+            Ok(std::process::ExitCode::from(2))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `e` is one of core's option refusals (#779), wherever it sits in
+/// the chain: a [`config::ConfigError`], or an error its type classes as
+/// config (`is_config`). These exit 2, the code clap gives its own usage
+/// errors, so a script can tell "fix the command" from "the run failed".
+fn is_usage_error(e: &anyhow::Error) -> bool {
+    use tylertoo_core::overview::convert::ConvertError;
+    use tylertoo_core::overview::export::ExportError;
+    use tylertoo_core::overview::tiles::TilesError;
+    e.chain().any(|c| {
+        c.is::<config::ConfigError>()
+            || c.downcast_ref::<ConvertError>()
+                .is_some_and(ConvertError::is_config)
+            || c.downcast_ref::<ExportError>()
+                .is_some_and(ExportError::is_config)
+            || c.downcast_ref::<TilesError>()
+                .is_some_and(TilesError::is_config)
+            || c.downcast_ref::<tylertoo_core::Error>()
+                .is_some_and(tylertoo_core::Error::is_config)
+    })
+}
+
+/// `what failed: e`, or `e` alone (keeping its type, for
+/// [`is_usage_error`]) when `e` is an option refused before any work.
+fn step_failed<E>(what: &str, e: E, is_config: fn(&E) -> bool) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if is_config(&e) {
+        anyhow::Error::new(e)
+    } else {
+        anyhow::anyhow!("{what} failed: {e}")
     }
 }
 
@@ -1680,9 +1710,13 @@ fn run_convert(
     output: &std::path::Path,
     options: &tylertoo_core::overview::convert::ConvertOptions,
 ) -> Result<tylertoo_core::overview::convert::ConvertReport> {
-    tiles_input(spec)
-        .convert(output, options)
-        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
+    tiles_input(spec).convert(output, options).map_err(|e| {
+        step_failed(
+            "overview conversion",
+            e,
+            tylertoo_core::overview::convert::ConvertError::is_config,
+        )
+    })
 }
 
 /// The core-side view of a resolved input shape.
@@ -1721,7 +1755,7 @@ fn resolve_max_zoom(
         return Ok(max_zoom.plan_zoom());
     }
     let source = resolve_convert_source(spec)?;
-    // `None`: `check_output_path` has already checked the output.
+    // `None`: the caller ran `config::check_output` on the output first.
     Ok(max_zoom.resolve(&source, options, None)?)
 }
 
@@ -2821,8 +2855,13 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         args.input.display(),
         args.output.display()
     );
-    let report = export_pmtiles(&args.input, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+    let report = export_pmtiles(&args.input, &args.output, &opts).map_err(|e| {
+        step_failed(
+            "export",
+            e,
+            tylertoo_core::overview::export::ExportError::is_config,
+        )
+    })?;
 
     say!(
         "  mode={} zooms z{}..z{}",
@@ -2925,7 +2964,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
     opts.validate()?;
 
     let report = build_pyramid(&bands, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
+        .map_err(|e| step_failed("pyramid build", e, tylertoo_core::Error::is_config))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         say!(
@@ -3050,14 +3089,9 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     // `ConvertSource::resolve` names a bad input far better than a bare
     // stat() ever could, and is the same resolution `tiles` performs.
     let spec = resolve_io_for_planning(args.input, args.files_from)?;
-    anyhow::ensure!(
-        args.force || !args.output.exists(),
-        "{} already exists; pass -f/--force to overwrite it. Every job of a fleet must be given \
-         the SAME shard plan, so replacing one mid-build silently re-cuts the tile space.",
-        args.output.display()
-    );
-    // `ShardPlan::save` rewrites the file in place.
-    tylertoo_core::atomic_output::check_writable_in_place(&args.output)?;
+    // Every job of a fleet must be given the SAME shard plan, so replacing
+    // one mid-build silently re-cuts the tile space: --force to overwrite.
+    config::check_output(&args.output, OutputKind::ShardPlan, args.force)?;
 
     let source = resolve_convert_source(&spec)?;
     let plan = ShardPlan::compute(&source, args.pivot, args.shards)?;
@@ -3701,13 +3735,29 @@ mod tests {
 
     /// #600 kept these hard errors: `--plan-only` still requires
     /// `--save-plan`, and `--tile-range` still conflicts with `--shard`.
+    /// #779: they are core's rules now, not clap's, so the line parses and
+    /// core refuses it (`tests/config_rules.rs` runs the binary).
     #[test]
-    fn plan_only_still_refuses_contradictions_at_parse_time() {
-        let err = Cli::try_parse_from(["tylertoo", "tiles", "in.parquet", "--plan-only"])
-            .expect_err("--plan-only without --save-plan");
-        assert!(err.to_string().contains("--save-plan"), "{err}");
+    fn plan_only_contradictions_parse_and_are_refused_by_core() {
+        let a = match Cli::try_parse_from(["tylertoo", "tiles", "in.parquet", "--plan-only"])
+            .expect("parses: the rule is core's")
+            .command
+        {
+            Command::Tiles(a) => *a,
+            other => panic!("expected tiles subcommand, got {other:?}"),
+        };
+        let err = tiles_options(&a).unwrap().validate_plan_only().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                tylertoo_core::overview::tiles::TilesError::Config(
+                    config::ConfigError::PlanOnlyWithoutSavePlan
+                )
+            ),
+            "{err:?}"
+        );
 
-        let err = parse_plan_only(&[
+        parse_plan_only(&[
             "--shard",
             "coarse",
             "--shard-plan",
@@ -3715,8 +3765,7 @@ mod tests {
             "--tile-range",
             "21..40",
         ])
-        .expect_err("--tile-range with --shard");
-        assert!(err.to_string().contains("cannot be used with"), "{err}");
+        .expect("parses: core refuses it once the shard plan is read");
     }
 
     fn parse_export(flags: &[&str]) -> ExportPmtilesArgs {
@@ -4005,16 +4054,25 @@ mod tests {
         let b = parse_tiles(&["--collapse-square"]);
         assert!(b.tuning.collapse_square);
 
-        // --collapse and --collapse-square conflict.
-        assert!(Cli::try_parse_from([
-            "tylertoo",
-            "tiles",
-            "in.parquet",
-            "out.pmtiles",
-            "--collapse",
-            "--collapse-square",
-        ])
-        .is_err());
+        // --collapse and --collapse-square conflict: core's rule (#779).
+        let both = parse_tiles(&["--collapse", "--collapse-square"]);
+        let err = both
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 4,
+                },
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<config::ConfigError>()
+                .is_some_and(|e| matches!(e, config::ConfigError::CollapseConflict)),
+            "{err:?}"
+        );
 
         // build_convert_options maps both through to core.
         let opts = b

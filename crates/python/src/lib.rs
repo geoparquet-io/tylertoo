@@ -36,8 +36,8 @@ use tylertoo_core::overview::level::Mode;
 use tylertoo_core::overview::properties::PropertySelection;
 use tylertoo_core::overview::simplify::SimplifyOptions;
 use tylertoo_core::overview::tiles::{
-    convert_to_pmtiles_observed, TilesError, TilesInput, TilesObserver, TilesOptions, TilesOutcome,
-    TILES_DEFAULT_MAX_ZOOM,
+    convert_to_pmtiles, intermediate_space_preflight, SpaceRemedies, TilesError, TilesInput,
+    TilesOptions, TilesOutcome, TILES_DEFAULT_MAX_ZOOM,
 };
 use tylertoo_core::pyramid::{build_pyramid, parse_bands, PyramidOptions};
 
@@ -595,9 +595,7 @@ fn tiles_error_to_py(e: TilesError) -> PyErr {
 /// Map a pyramid build's error: a refused option is `tylertoo.ConfigError`.
 fn pyramid_error_to_py(e: tylertoo_core::Error) -> PyErr {
     match e {
-        tylertoo_core::Error::Config(_) | tylertoo_core::Error::InvalidConfig(_) => {
-            config_err(with_sources(&e))
-        }
+        e if e.is_config() => config_err(with_sources(&e)),
         other => PyRuntimeError::new_err(format!("pyramid build failed: {}", with_sources(&other))),
     }
 }
@@ -694,16 +692,11 @@ fn resolve_max_zoom_py(
 
 // --- functions -------------------------------------------------------------------
 
-/// The #314 free-space preflight's warning, heard before the convert runs
-/// (#709), so it is raised on failure as well as on success.
-#[derive(Default)]
-struct SpaceWarning(Option<String>);
-
-impl TilesObserver for SpaceWarning {
-    fn intermediate_space_low(&mut self, warning: &str) {
-        self.0 = Some(warning.to_string());
-    }
-}
+/// The #314 remedies as `convert()` spells them (#709).
+const PY_REMEDIES: SpaceRemedies<'static> = SpaceRemedies {
+    spill_dir: "spill_dir",
+    keep_overview: "keep_overview",
+};
 
 /// Native body of `tylertoo.convert()`.
 ///
@@ -760,27 +753,16 @@ fn convert(
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
-    // Release the GIL while the Rust pipelines run.
-    let mut space = SpaceWarning::default();
-    let outcome = py.detach(|| {
-        convert_to_pmtiles_observed(
-            &TilesInput::Path(input_path),
-            &output_path,
-            &options,
-            &mut space,
-        )
-    });
-    // #314/#709: core logs the preflight as a `log::warn`, which reaches
-    // Python `logging` (#445) — but a full disk mid-run is worth saying
-    // louder, and on the failure it predicts above all.
-    if let Some(msg) = &space.0 {
-        PyErr::warn(
-            py,
-            &py.get_type::<PyUserWarning>(),
-            &CString::new(&**msg)?,
-            1,
-        )?;
+    // #314/#709: core's free-space preflight, raised before the run starts
+    // (so it is heard on the failure it predicts) and naming the kwargs.
+    // Core also logs it, CLI-spelled, which reaches Python `logging` (#445).
+    let input = TilesInput::Path(input_path);
+    if let Some(msg) = intermediate_space_preflight(&input, &output_path, &options, PY_REMEDIES) {
+        PyErr::warn(py, &py.get_type::<PyUserWarning>(), &CString::new(msg)?, 1)?;
     }
+
+    // Release the GIL while the Rust pipelines run.
+    let outcome = py.detach(|| convert_to_pmtiles(&input, &output_path, &options));
     match outcome.map_err(tiles_error_to_py)? {
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.

@@ -18,7 +18,7 @@ Exit status:
 
 - 0: success.
 - 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
-- 2: the command line was rejected while it was parsed.
+- 2: the command line was rejected: while it was parsed, or by an option or output-path rule checked before any input is read.
 - 101: a panic, from an internal bug or an output pipe closed early.
 
 ### Subcommands

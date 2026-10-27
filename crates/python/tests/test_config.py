@@ -9,8 +9,8 @@ any input (every input below is missing on purpose). The CLI side is
 
 from __future__ import annotations
 
-import inspect
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,14 @@ MISSING = "/nonexistent/tylertoo-779/never-read.parquet"
 
 
 def _convert(tmp_path: Path, **kwargs: object) -> None:
-    tylertoo.convert(MISSING, str(tmp_path / "out.pmtiles"), **kwargs)  # type: ignore[arg-type]
+    # `max_zoom="auto"` reads the input to pick a zoom, so a rule checked
+    # after it would surface as the missing input's RuntimeError instead.
+    tylertoo.convert(
+        MISSING,
+        str(tmp_path / "out.pmtiles"),
+        max_zoom="auto",
+        **kwargs,  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.parametrize(
@@ -32,6 +39,13 @@ def _convert(tmp_path: Path, **kwargs: object) -> None:
         ({"extent": 0}, "extent 0"),
         # #427 (492502f): the spill directory.
         ({"spill_dir": "/nonexistent/tylertoo-779"}, "not an existing directory"),
+        # #779: the reuse and write ends of a convert plan.
+        (
+            {"save_plan": "/tmp/a.plan", "plan": "/tmp/b.plan"},
+            "--save-plan and --plan are mutually exclusive",
+        ),
+        # #779: a bbox that selects nothing.
+        ({"bbox": (3.0, 0.0, 1.0, 1.0)}, "xmin <= xmax"),
         # #428 (b8fa58a): a NaN class rank.
         ({"class_rank_column": "c", "class_ranks": {"a": math.nan}}, "finite"),
         # Q1: a sort key with a class ranking.
@@ -96,15 +110,26 @@ def test_pyramid_refuses_a_bad_option_before_tiling(tmp_path: Path) -> None:
         )
 
 
-def test_defaults_come_from_core() -> None:
-    core = tylertoo._defaults()
-    assert set(core) >= {"overview", "convert", "export_pmtiles", "pyramid"}
-    # The two zoom defaults differ by command, and both are core's.
-    assert core["overview"]["max_zoom"] == 6
-    assert core["convert"]["max_zoom"] == 14
-    # The size caps are each function's own core default.
-    assert core["convert"]["tile_size_limit"] == "auto"
-    for name, defaults in core.items():
-        params = inspect.signature(getattr(tylertoo, name)).parameters
-        for kwarg, value in defaults.items():
-            assert params[kwarg].default == value, f"{name}({kwarg})"
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="root ignores directory modes",
+)
+def test_a_read_only_spill_dir_is_refused_before_reading(tmp_path: Path) -> None:
+    # #779: formerly "Permission denied" (RuntimeError) when the spill first
+    # opened, deep into the run.
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o555)
+    try:
+        with pytest.raises(tylertoo.ConfigError, match="is not writable"):
+            _convert(tmp_path, spill_dir=str(ro))
+    finally:
+        ro.chmod(0o755)
+
+
+def test_one_message_for_a_nan_class_rank(tmp_path: Path) -> None:
+    # #428: the CLI's `--class-rank c:a=nan` and Python's dict spelling are
+    # refused by one core rule with one message.
+    with pytest.raises(tylertoo.ConfigError) as err:
+        _convert(tmp_path, class_rank_column="c", class_ranks={"a": math.nan})
+    assert str(err.value).startswith('rank NaN for class "a" must be a finite number')

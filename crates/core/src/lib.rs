@@ -110,4 +110,13 @@ pub enum Error {
     Config(#[from] overview::config::ConfigError),
 }
 
+impl Error {
+    /// Whether this is an option the caller must fix, refused before any
+    /// work (#779), as `ConvertError::is_config` and its siblings classify
+    /// theirs.
+    pub fn is_config(&self) -> bool {
+        matches!(self, Error::Config(_) | Error::InvalidConfig(_))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

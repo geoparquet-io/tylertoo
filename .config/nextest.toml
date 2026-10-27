@@ -76,6 +76,8 @@ not (
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
   | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
   | (binary(coverage_fill) & test(=coverage_fill_closes_coarse_holes_without_overdrawing))
+  | (binary(coverage_fill) & test(=a_coarse_job_draws_the_unsharded_fill_below_its_ceiling))
+  | (binary(coverage_fill) & test(=tiles_shard_coarse_draws_the_unsharded_fill))
 )
 """
 
@@ -104,6 +106,8 @@ filter = """
   | (binary(hostile_geometry_eval) & test(=full_scorecard))
   | (binary(publication_metadata) & test(=a_sharded_fleet_carries_the_values_through_empty_shards))
   | (binary(coverage_fill) & test(=coverage_fill_closes_coarse_holes_without_overdrawing))
+  | (binary(coverage_fill) & test(=a_coarse_job_draws_the_unsharded_fill_below_its_ceiling))
+  | (binary(coverage_fill) & test(=tiles_shard_coarse_draws_the_unsharded_fill))
 """
 slow-timeout = { period = "120s", terminate-after = 15 }
 

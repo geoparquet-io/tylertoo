@@ -1514,8 +1514,10 @@ pub struct PyramidOptions {
     /// unset field is inherited.
     ///
     /// This is the only publication metadata `build_pyramid` writes:
-    /// `export.metadata` is ignored, so a GeoParquet band's intermediate
-    /// archive carries none and passes none on.
+    /// [`PyramidOptions::validate`] refuses a set `export.metadata`
+    /// ([`ConfigError::OptionIgnored`](crate::overview::config::ConfigError::OptionIgnored)),
+    /// so a GeoParquet band's intermediate archive carries none and passes
+    /// none on.
     pub metadata: TilesetMetadata,
 }
 

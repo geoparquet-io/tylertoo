@@ -374,8 +374,8 @@ impl TilesOptions {
                 }
                 .into());
             }
-            if job.range.is_some() && self.export.tile_range.is_some() {
-                return Err(ConfigError::TileRangeWithDataShard.into());
+            if self.export.tile_range.is_some() {
+                return Err(ConfigError::TileRangeWithShard.into());
             }
             if job.range.is_some() && run == Run::PlanOnly {
                 return Err(ConfigError::PlanOnlyDataShard.into());
@@ -476,9 +476,9 @@ pub struct IntermediateOverview {
     pub retained: bool,
     /// The #314 free-space preflight's warning, when the volume holding the
     /// intermediate looked too small for it. Already logged (`log::warn`)
-    /// and passed to [`TilesObserver::intermediate_space_low`] before the
-    /// convert started; carried here too. `None` when the volume fits or
-    /// either side of the comparison is unknowable.
+    /// before the convert started; carried here too. `None` when the volume
+    /// fits or either side of the comparison is unknowable. A caller that
+    /// must surface it before the run calls [`intermediate_space_preflight`].
     pub space_warning: Option<String>,
 }
 
@@ -548,12 +548,6 @@ pub enum TilesOutcome {
 /// Mid-run notifications from [`convert_to_pmtiles_observed`]. Every method
 /// has a no-op default, so an observer implements only what it reports.
 pub trait TilesObserver {
-    /// The #314 free-space preflight found the volume holding the
-    /// intermediate overview too small for it. Called before the convert
-    /// starts, so a caller without a log bridge can surface the warning on
-    /// the failure it predicts as well as on success (#709).
-    fn intermediate_space_low(&mut self, _warning: &str) {}
-
     /// The convert half finished and the intermediate overview is on disk;
     /// the export half is about to run. The one moment a user-facing caller
     /// should name the intermediate's path and size (#314) — after a failed
@@ -574,10 +568,12 @@ impl TilesObserver for () {}
 pub enum TilesError {
     /// The convert half failed. Not a `#[source]` chain: the message *is*
     /// the convert error's, prefixed, the way the CLI has always printed it.
-    #[error("overview conversion failed: {0}")]
+    /// A refused option ([`ConvertError::is_config`]) is not prefixed: it is
+    /// refused before any conversion starts (#779).
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "overview conversion failed: "))]
     Convert(ConvertError),
-    /// The export half failed.
-    #[error("export failed: {0}")]
+    /// The export half failed; prefixed like [`TilesError::Convert`].
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "export failed: "))]
     Export(ExportError),
     /// An option refused before any work ([`TilesOptions::validate`], #779).
     #[error(transparent)]
@@ -604,6 +600,15 @@ pub enum TilesError {
     /// Writing an empty coarse job's archive failed (#541).
     #[error("failed to write the empty coarse archive: {0}")]
     EmptyCoarseArchive(ExportError),
+}
+
+/// `prefix`, unless the error is a refused option, which names no step.
+fn failed_prefix(is_config: bool, prefix: &'static str) -> &'static str {
+    if is_config {
+        ""
+    } else {
+        prefix
+    }
 }
 
 impl TilesError {
@@ -790,11 +795,7 @@ pub fn convert_to_pmtiles_observed(
             // Its directory was checked above.
             Some(path) => (path.clone(), None),
             None => {
-                let dir = resolve_intermediate_dir(
-                    options.convert.spill_dir.as_deref(),
-                    std::env::var_os("TMPDIR").as_deref(),
-                    output,
-                );
+                let dir = intermediate_dir(options, output);
                 let tmp = tempfile::Builder::new()
                     .prefix(".tylertoo-overview-")
                     .suffix(".parquet")
@@ -809,18 +810,12 @@ pub fn convert_to_pmtiles_observed(
         };
 
     // #314 free-space preflight: the intermediate is at least input-sized,
-    // so warn up front when the chosen volume looks too small. The observer
-    // hears it before the convert (#709: a caller without a log bridge must
-    // be able to show it on the failure it predicts), and the report carries
-    // it too.
-    let overview_dir = overview_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let space_warning = warn_intermediate_space(input, &overview_dir);
-    if let Some(warning) = &space_warning {
-        observer.intermediate_space_low(warning);
+    // so warn up front when the chosen volume looks too small. Logged here
+    // and carried in the report; a caller that must surface it before the
+    // run (#709: Python's `UserWarning`) calls `intermediate_space_preflight`.
+    let space_warning = intermediate_space_preflight(input, output, options, CLI_REMEDIES);
+    if let Some(msg) = &space_warning {
+        log::warn!("{msg}");
     }
 
     let convert_report = match input.convert(&overview_path, &convert_options) {
@@ -967,6 +962,60 @@ fn convert_produced_nothing(e: &ConvertError) -> bool {
 /// the output (same filesystem as the final artifact), else the process
 /// temp dir. Pure — the env value is injected — so the precedence is
 /// unit-testable.
+/// Where the facade puts the intermediate overview: `keep_overview`'s
+/// directory when retained, else [`resolve_intermediate_dir`]'s choice.
+fn intermediate_dir(options: &TilesOptions, output: &Path) -> PathBuf {
+    match &options.keep_overview {
+        Some(path) => path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+        None => resolve_intermediate_dir(
+            options.convert.spill_dir.as_deref(),
+            std::env::var_os("TMPDIR").as_deref(),
+            output,
+        ),
+    }
+}
+
+/// The CLI's names for the #314 remedies, which the facade's log uses.
+const CLI_REMEDIES: SpaceRemedies = SpaceRemedies {
+    spill_dir: "--spill-dir",
+    keep_overview: "--keep-overview",
+};
+
+/// How a caller spells the two #314 remedies in
+/// [`intermediate_space_preflight`]'s warning: `--spill-dir` on the CLI,
+/// `spill_dir` in Python.
+#[derive(Debug, Clone, Copy)]
+pub struct SpaceRemedies<'a> {
+    /// The spill-directory option.
+    pub spill_dir: &'a str,
+    /// The keep-the-overview option.
+    pub keep_overview: &'a str,
+}
+
+/// The #314 intermediate free-space preflight on its own (#709).
+///
+/// The warning [`convert_to_pmtiles`] logs, for a caller that must surface
+/// it before the run, as Python's `UserWarning` does, in its own spelling
+/// of the remedies. Probes the volume that will hold the intermediate.
+///
+/// `None` when the volume fits, or when either side of the comparison is
+/// unknowable (a remote input, an exotic filesystem) rather than crying
+/// wolf.
+pub fn intermediate_space_preflight(
+    input: &TilesInput,
+    output: &Path,
+    options: &TilesOptions,
+    remedies: SpaceRemedies<'_>,
+) -> Option<String> {
+    let dir = intermediate_dir(options, output);
+    let estimated = estimate_local_input_bytes(input)?;
+    let available = super::convert::probe_available_space(&dir)?;
+    intermediate_space_warning(estimated, available, &dir, remedies)
+}
+
 fn resolve_intermediate_dir(
     spill_dir: Option<&Path>,
     tmpdir_env: Option<&std::ffi::OsStr>,
@@ -1042,6 +1091,7 @@ fn intermediate_space_warning(
     estimated_bytes: u64,
     available_bytes: u64,
     dir: &Path,
+    remedies: SpaceRemedies<'_>,
 ) -> Option<String> {
     if estimated_bytes == 0 {
         return None;
@@ -1057,27 +1107,15 @@ fn intermediate_space_warning(
         "the intermediate overview `tiles` materializes (≥ ~{:.1} GiB — a \
          duplicating overview is at least as large as the input, whose local \
          size is the estimate) may not fit: {} has {:.1} GiB free ({:.1} GiB \
-         short, including a 5% margin). Point --spill-dir (or --keep-overview) \
-         at a roomier volume, or free up space first.",
+         short, including a 5% margin). Point {} (or {}) at a roomier volume, \
+         or free up space first.",
         gib(estimated_bytes),
         dir.display(),
         gib(available_bytes),
         gib(need.saturating_sub(available_bytes)),
+        remedies.spill_dir,
+        remedies.keep_overview,
     ))
-}
-
-/// Emit the #314 intermediate free-space preflight warning, if warranted,
-/// and return it for the report: probe the volume holding `dir`
-/// ([`crate::overview::convert`]'s shared `fs4` probe, the one the #272
-/// remote-spill preflight uses) and compare against the local-input-bytes
-/// estimate. Quiet (`None`) when either side is unknowable (remote input,
-/// exotic filesystem) rather than crying wolf.
-fn warn_intermediate_space(input: &TilesInput, dir: &Path) -> Option<String> {
-    let estimated = estimate_local_input_bytes(input)?;
-    let available = super::convert::probe_available_space(dir)?;
-    let msg = intermediate_space_warning(estimated, available, dir)?;
-    log::warn!("{msg}");
-    Some(msg)
 }
 
 #[cfg(test)]
@@ -1703,18 +1741,26 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
 
         // Fits comfortably: no warning.
-        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir).is_none());
+        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir, CLI_REMEDIES).is_none());
         // Exactly the estimate + 5% margin still fits.
         let est = 20 * gib;
-        assert!(intermediate_space_warning(est, est + est / 20, dir).is_none());
+        assert!(intermediate_space_warning(est, est + est / 20, dir, CLI_REMEDIES).is_none());
         // One byte short of the margin: warn, naming dir and remedies.
-        let msg =
-            intermediate_space_warning(est, est + est / 20 - 1, dir).expect("shortfall must warn");
+        let msg = intermediate_space_warning(est, est + est / 20 - 1, dir, CLI_REMEDIES)
+            .expect("shortfall must warn");
         assert!(msg.contains("/some/volume"), "names the directory: {msg}");
         assert!(msg.contains("--spill-dir"), "names the remedy: {msg}");
         assert!(msg.contains("--keep-overview"), "names the remedy: {msg}");
+        // #709: the remedies in the caller's spelling (Python's kwargs).
+        let py = SpaceRemedies {
+            spill_dir: "spill_dir",
+            keep_overview: "keep_overview",
+        };
+        let msg = intermediate_space_warning(est, 0, dir, py).expect("shortfall must warn");
+        assert!(msg.contains("Point spill_dir (or keep_overview)"), "{msg}");
+        assert!(!msg.contains("--"), "no CLI spelling: {msg}");
         // Zero estimate (unknown/empty input): never warns.
-        assert!(intermediate_space_warning(0, 0, dir).is_none());
+        assert!(intermediate_space_warning(0, 0, dir, CLI_REMEDIES).is_none());
     }
 
     /// The intermediate size estimate is the local input bytes: file size
@@ -1940,8 +1986,9 @@ mod tests {
                     )
                 },
             ),
-            // #498: a hand-written range beside a data shard's, formerly a
-            // clap `conflicts_with` only, silently resolved in core.
+            // #498: a hand-written range beside a shard job, formerly a clap
+            // `conflicts_with` only, silently resolved in core. A data shard
+            // and the coarse job alike.
             (
                 TilesOptions {
                     export: ExportOptions {
@@ -1951,7 +1998,18 @@ mod tests {
                     shard: Some(shard_job(Some(range), 5)),
                     ..base()
                 },
-                |e| matches!(e, TilesError::Config(ConfigError::TileRangeWithDataShard)),
+                |e| matches!(e, TilesError::Config(ConfigError::TileRangeWithShard)),
+            ),
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        tile_range: Some(range),
+                        ..ExportOptions::default()
+                    },
+                    shard: Some(shard_job(None, 5)),
+                    ..base()
+                },
+                |e| matches!(e, TilesError::Config(ConfigError::TileRangeWithShard)),
             ),
             // #709: a data shard whose range disagrees with its pivot.
             (

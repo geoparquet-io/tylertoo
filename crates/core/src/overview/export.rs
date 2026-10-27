@@ -159,11 +159,11 @@ use feature_id::{
 pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
 
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
-const DEFAULT_EXTENT: u32 = 4096;
+pub(crate) const DEFAULT_EXTENT: u32 = 4096;
 
 /// Default per-tile edge buffer, in tile pixels (tippecanoe default is 5; we
 /// use 8 to match the tile pipeline's historical default).
-const DEFAULT_TILE_BUFFER_PX: u32 = 8;
+pub(crate) const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 
 /// The widest `--tile-buffer` any export accepts, in tile pixels (#433).
 ///
@@ -526,8 +526,8 @@ impl ExportOptions {
         if !self.extent.is_power_of_two() {
             log::warn!(
                 "[export] extent {} is not a power of two; the MVT spec recommends one \
-                 (4096 is the default) and decoders assume one when reasoning about \
-                 coordinate precision",
+                 ({DEFAULT_EXTENT} is the default) and decoders assume one when reasoning \
+                 about coordinate precision",
                 self.extent
             );
         }

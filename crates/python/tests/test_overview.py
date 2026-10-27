@@ -180,7 +180,8 @@ class TestOverviewApi:
             )
 
     def test_overview_empty_class_ranks(self):
-        with pytest.raises(ValueError, match="class_ranks"):
+        # One message for every spelling of a class ranking (#779).
+        with pytest.raises(tylertoo.ConfigError, match="at least one class rank"):
             tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
