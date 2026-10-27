@@ -1382,6 +1382,8 @@ fn parse_layers(
 /// What a pyramid build produced.
 #[derive(Debug, Clone)]
 pub struct PyramidReport {
+    /// Aggregated diagnostics for this pyramid only.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Distinct tile ids written to the merged archive.
     pub total_tiles: usize,
     /// `(layer, min_zoom, max_zoom, tiles)` for every band, in merge order:
@@ -1431,6 +1433,7 @@ impl serde::Serialize for PyramidReport {
         }
         #[derive(serde::Serialize)]
         struct Report<'a> {
+            diagnostics: &'a [crate::diagnostics::Diagnostic],
             total_tiles: usize,
             bands: Vec<BandReport<'a>>,
             skipped_tiles: usize,
@@ -1440,6 +1443,7 @@ impl serde::Serialize for PyramidReport {
             bands_without_metadata: &'a [String],
         }
         Report {
+            diagnostics: &self.diagnostics,
             total_tiles: self.total_tiles,
             bands: self
                 .per_band_tiles
@@ -1623,6 +1627,7 @@ pub fn build_pyramid(
 ) -> Result<PyramidReport, Error> {
     // #779: the options every band runs with, before any band is read.
     opts.validate()?;
+    let diagnostics = crate::diagnostics::Diagnostics::default();
     // Validates every band up front, including (#482) that none names a
     // remote `.pmtiles` archive — pure string work, so it is cheap to run for
     // every band before any band is tiled, rather than interleaved with
@@ -1752,9 +1757,10 @@ pub fn build_pyramid(
             },
             ..opts.convert.clone()
         };
-        convert_to_overviews(&band.input, &overview, &convert).map_err(|e| {
+        let report = convert_to_overviews(&band.input, &overview, &convert).map_err(|e| {
             Error::PMTilesWrite(format!("band {:?}: convert failed: {e}", band.layer))
         })?;
+        diagnostics.extend(report.diagnostics);
 
         let export = ExportOptions {
             layer_name: band.layer.clone(),
@@ -1774,9 +1780,10 @@ pub fn build_pyramid(
             metadata: TilesetMetadata::default(),
             ..opts.export.clone()
         };
-        export_pmtiles(&overview, &archive, &export).map_err(|e| {
+        let report = export_pmtiles(&overview, &archive, &export).map_err(|e| {
             Error::PMTilesWrite(format!("band {:?}: export failed: {e}", band.layer))
         })?;
+        diagnostics.extend(report.diagnostics);
 
         tiled.push(Band {
             input: archive.to_path_buf(),
@@ -1790,14 +1797,17 @@ pub fn build_pyramid(
         scratch.push(archive);
     }
 
-    merge_bands_with_options(
+    let mut report = merge_bands_with_options(
         &tiled,
         output,
         &BandMergeOptions {
             allow_missing_zooms: opts.allow_missing_zooms,
             metadata: opts.metadata.clone(),
         },
-    )
+    )?;
+    diagnostics.extend(report.diagnostics);
+    report.diagnostics = diagnostics.snapshot();
+    Ok(report)
 }
 
 /// Add one band archive's publication metadata to `collector`, labelled
@@ -2259,7 +2269,29 @@ fn finish_merge(
         .finalize(output)
         .map_err(|e| Error::PMTilesWrite(format!("Failed to write {}: {e}", output.display())))?;
 
+    let sink = crate::diagnostics::Diagnostics::default();
+    use crate::diagnostics::Diagnostic;
+    sink.record(Diagnostic::PyramidSharedTiles {
+        count: per_band
+            .iter()
+            .map(|b| b.3)
+            .sum::<usize>()
+            .saturating_sub(tally.total_tiles),
+    });
+    sink.record(Diagnostic::PyramidSkippedTiles {
+        count: tally.skipped_total,
+    });
+    sink.record(Diagnostic::PyramidMissingBounds {
+        count: tally.bands_without_bounds.len(),
+    });
+    sink.record(Diagnostic::PyramidMetadataConflict {
+        count: tally.publication.conflicts.len(),
+    });
+    sink.record(Diagnostic::PyramidMissingMetadata {
+        count: tally.bands_without_metadata.len(),
+    });
     Ok(PyramidReport {
+        diagnostics: sink.snapshot(),
         total_tiles: tally.total_tiles,
         per_band_tiles: per_band,
         skipped: tally.skipped_total,

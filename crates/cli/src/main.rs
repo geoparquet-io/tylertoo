@@ -2284,30 +2284,18 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         output.file_name().unwrap_or_default().to_string_lossy()
     );
     say!(
-        "  {}",
-        tiles_summary_line(
-            export_report.total_tiles,
-            export_report.min_zoom,
-            export_report.max_zoom,
-            convert_report.duration_secs + export_report.duration_secs,
-            &SummaryLosses {
-                out_of_range: convert_report.out_of_range_features,
-                out_of_range_exemplars: &convert_report.out_of_range_exemplars,
-                unprojectable: convert_report.unprojectable_features,
-                encode_dropped: export_report.encode_dropped_features,
-            },
-        )
+        "  {} tiles across z{}..z{} in {:.2}s",
+        format_number(export_report.total_tiles as u64),
+        export_report.min_zoom,
+        export_report.max_zoom,
+        convert_report.duration_secs + export_report.duration_secs
     );
-    print_skipped_property_columns(&export_report.skipped_property_columns);
-    if let Some(note) = encode_quantized_note(export_report.encode_quantized_features) {
-        say!("  {note}");
-    }
-    if let Some(note) = wrapped_note_line(
-        convert_report.wrapped_features,
-        convert_report.input_features,
-    ) {
-        say!("  {note}");
-    }
+    print_diagnostics(
+        convert_report
+            .diagnostics
+            .iter()
+            .chain(&export_report.diagnostics),
+    );
     // #380: the summary line above covers the requested (declared) range,
     // which can be wider than the archive's own PMTiles header (#529, #522:
     // the header always reflects the zooms that actually hold a tile) — say
@@ -2341,10 +2329,6 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         }
     }
 
-    if let Some(note) = row_group_autoscale_note(convert_report) {
-        say!("{note}");
-    }
-
     // The combined report so the one-step run captures both halves the
     // two-step chain would write (`overview --report` + `export-pmtiles
     // --report`). Core owns its shape ({"convert", "export"}).
@@ -2359,221 +2343,16 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     Ok(())
 }
 
-/// One-line note for the #507 auto-scale, printed on both the `overview` and
-/// `tiles` summaries. `None` when the requested `--row-group-size` was used
-/// verbatim, so the common run prints nothing.
-fn row_group_autoscale_note(
-    report: &tylertoo_core::overview::convert::ConvertReport,
-) -> Option<String> {
-    report.effective_max_row_group_size.map(|cap| {
-        format!(
-            "  note: --row-group-size raised to {} so the output stays under parquet's \
-             row-group ceiling (see the warning above); pass --row-group-size {} to make \
-             it explicit",
-            format_number(cap as u64),
-            cap
-        )
-    })
-}
-
-/// The feature losses the `tiles` summary line reports (#429, #431, #553).
-#[derive(Clone, Copy, Default)]
-struct SummaryLosses<'a> {
-    /// Features outside the declared CRS range.
-    out_of_range: usize,
-    /// The first few of those, by row and coordinate (#553).
-    out_of_range_exemplars: &'a [tylertoo_core::overview::convert::OutOfRangeExemplar],
-    /// Valid lon/lat outside the Web Mercator tiling domain.
-    unprojectable: usize,
-    /// Tile features dropped at MVT encode (#431).
-    encode_dropped: usize,
-}
-
-/// The tile-count line of the `tiles` summary (#429).
-///
-/// Normally a bare count. When features were lost it says so on the same line
-/// — a wrong-CRS input reporting a bare "✓ Converted … 0 tiles" was the
-/// headline lie of issue #429. The two losses are named separately because
-/// they have different fixes: coordinates outside the declared CRS's range
-/// (usually a reprojection away), and valid lon/lat outside the Web Mercator
-/// tiling domain (nothing to reproject — Mercator does not reach the poles).
-/// A ≥99% loss never reaches here (the conversion fails outright), so this
-/// covers the partial case and the "some other filter also emptied the
-/// archive" one.
-///
-/// `out_of_range_exemplars` names the first few offending rows and
-/// coordinates (#553): root-causing a real case (a5 grid cells with
-/// vertices up to 0.6° past ±180°) used to require a separate DuckDB query
-/// against the input, when the bare count gave no lead to follow.
-fn tiles_summary_line(
-    total_tiles: usize,
-    min_zoom: u8,
-    max_zoom: u8,
-    secs: f64,
-    losses: &SummaryLosses<'_>,
-) -> String {
-    let SummaryLosses {
-        out_of_range,
-        out_of_range_exemplars,
-        unprojectable,
-        encode_dropped,
-    } = *losses;
-    let zooms = format!("z{min_zoom}..z{max_zoom}");
-    let tiles = format_number(total_tiles as u64);
-    let mut losses: Vec<String> = Vec::new();
-    if out_of_range > 0 {
-        let exemplar =
-            tylertoo_core::overview::convert::out_of_range_exemplar_note(out_of_range_exemplars);
-        let exemplar = if exemplar.is_empty() {
-            String::new()
-        } else {
-            format!(";{exemplar}")
-        };
-        losses.push(format!(
-            "{} feature(s) dropped (outside the declared CRS range{exemplar})",
-            format_number(out_of_range as u64)
-        ));
-    }
-    if unprojectable > 0 {
-        losses.push(format!(
-            "{} feature(s) dropped (|lat| > 85.05°, outside the Web Mercator tiling domain)",
-            format_number(unprojectable as u64)
-        ));
-    }
-    if encode_dropped > 0 {
-        // #431: post-clip losses at MVT encode; the core's aggregate warning
-        // names the causes. Expected extent collapses are NOT a loss and go
-        // through `encode_quantized_note` instead.
-        losses.push(format!(
-            "{} tile feature(s) dropped at MVT encode (empty geometry or empty \
-             GeometryCollection)",
-            format_number(encode_dropped as u64)
-        ));
-    }
-    if losses.is_empty() {
-        return format!("{tiles} tiles across {zooms} in {secs:.2}s");
-    }
-    let dropped = losses.join(", ");
-    if total_tiles == 0 {
-        format!("{tiles} tiles — {dropped} — {zooms} in {secs:.2}s")
-    } else {
-        format!("{tiles} tiles across {zooms} in {secs:.2}s — {dropped}")
-    }
-}
-
-/// The informational note for members that collapsed at the tile extent
-/// (#431), if any. Deliberately NOT part of the summary line: a clip sliver
-/// that quantizes to zero area at a buffered tile edge is routine on any
-/// polygon export and is not content loss.
-fn encode_quantized_note(encode_quantized: usize) -> Option<String> {
-    (encode_quantized > 0).then(|| {
-        format!(
-            "note: {} tile feature(s) collapsed at the tile extent and were not encoded \
-             (zero-area polygon rings or lines of fewer than two points, typically clip \
-             slivers at a buffered tile edge) \u{2014} expected, see \
-             `encode_quantized_features` in the report",
-            format_number(encode_quantized as u64)
-        )
-    })
-}
-
-/// The informational note for features drawn wrapped across the antimeridian
-/// (#644), if any. Not part of the summary line's losses: wrapped data (0..360
-/// longitudes, dateline cells) is valid input and nothing was dropped. It is
-/// shown because a file in a projected CRS but labeled lon/lat, with
-/// `|x| ≤ 540`, would otherwise tile silently at the wrong place. Worded for
-/// either CRS: the report does not carry it, and for EPSG:3857 input the edge
-/// is the world edge in x, not a longitude.
-fn wrapped_note_line(wrapped: usize, input_features: usize) -> Option<String> {
-    (wrapped > 0).then(|| {
-        format!(
-            "note: {} of {} input features reach past the world edge and were drawn \
-             wrapped across the antimeridian \u{2014} expected for 0..360 data and \
-             dateline cells; otherwise check the real CRS with `gpio inspect <input>`",
-            format_number(wrapped as u64),
-            format_number(input_features as u64)
-        )
-    })
-}
-
-/// The pyramid build's skipped-tile line, if any (#514 S3).
-///
-/// `report.skipped` counts every tile a band's archive held outside that
-/// band's declared zoom range — which, since #495, is *also* the documented
-/// way to split one pre-tiled archive across several `--band` entries (one
-/// declaring z0-5, another z6-13, both pointing at the same z0-13 archive).
-/// In that workflow the tiles a band leaves behind are picked up by its
-/// sibling, so nothing vanished and the old unconditional `!` alarm read as
-/// one regardless.
-///
-/// `archive_split` says whether the build actually is that workflow — see
-/// [`bands_split_one_archive`]. This used to key off `skipped ==
-/// total_tiles`, which is a count coincidence rather than evidence: a
-/// single band allowed to overshoot by `--allow-missing-zooms` hits it as
-/// soon as it happens to keep as many tiles as it drops (a z3-6 archive
-/// under a z0-4 band keeps 2 and skips 2), and printed the reassuring
-/// "expected when splitting" line for tiles that really were silently lost.
-fn pyramid_skip_message(skipped: usize, archive_split: bool) -> Option<String> {
-    if skipped == 0 {
-        return None;
-    }
-    if archive_split {
-        Some(format!(
-            "  {} tile(s) fell outside a band's declared subrange and were skipped \
-             (expected when splitting one pre-tiled archive across several bands)",
-            format_number(skipped as u64)
-        ))
-    } else {
-        // Almost always a --minzoom/--maxzoom that disagrees with --band, so
-        // this belongs on stdout next to the counts, not only in the log.
-        Some(format!(
-            "  ! {} tile(s) dropped: outside the declared band zoom ranges",
-            format_number(skipped as u64)
-        ))
-    }
-}
-
-/// The line explaining why the per-band tile counts sum past the total, or
-/// `None` when they add up (#403).
-///
-/// A tile id several bands wrote at a shared zoom is one tile in the archive
-/// (its layers concatenated) but appears in each of those bands' counts, so
-/// `report.per_band_tiles` can sum to more than `report.total_tiles`.
-fn pyramid_shared_note(per_band_sum: usize, total: usize) -> Option<String> {
-    (per_band_sum > total).then(|| {
-        format!(
-            "  band counts sum to {} but the archive holds {} tiles: a tile shared by \
-             several layers counts once per band but once in the total",
-            format_number(per_band_sum as u64),
-            format_number(total as u64)
-        )
-    })
-}
-
-/// Whether this build genuinely splits one pre-tiled archive across several
-/// bands — two or more `--band` entries that are PMTiles archives and
-/// resolve to the same file (#527 review, finding 2).
-///
-/// That, not a skipped-tile count, is what makes
-/// [`pyramid_skip_message`]'s reassuring wording true: the tiles one band
-/// drops are the ones its sibling keeps. Paths are compared through
-/// [`canonical_key`], so `./a.pmtiles` and `a.pmtiles` are one archive.
-/// Only `BandSource::Archive` bands count — a GeoParquet band is tiled to
-/// its own declared range, so it never skips anything and listing one twice
-/// is not a split.
-fn bands_split_one_archive(bands: &[tylertoo_core::pyramid::Band]) -> bool {
-    use std::collections::HashSet;
-    use tylertoo_core::pyramid::{classify_band_input, BandSource};
-
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    bands
-        .iter()
-        .filter(|b| classify_band_input(&b.input) == BandSource::Archive)
-        .any(|b| !seen.insert(canonical_key(&b.input)))
-}
-
 /// The [`ConvertOptions`] an `overview` command line describes: pure
 /// translation (#779), with `--max-zoom auto`'s placeholder (#444).
+fn print_diagnostics<'a>(
+    events: impl IntoIterator<Item = &'a tylertoo_core::diagnostics::Diagnostic>,
+) {
+    for diagnostic in events {
+        say!("  {diagnostic}");
+    }
+}
+
 fn overview_options(args: &OverviewArgs) -> Result<ConvertOptions> {
     let mode = args.mode.parse().map_err(anyhow::Error::msg)?;
     let (levels, bbox) = args.level_plan()?;
@@ -2640,50 +2419,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
             HumanBytes(lvl.compressed_bytes.max(0) as u64)
         );
     }
-    // #429: the aggregate `log::warn!` from the converter already names the
-    // declared CRS, its range and the fix; the note here only makes sure the
-    // summary itself never reads as an unqualified success.
-    if report.out_of_range_features > 0 {
-        say!(
-            "  note: {} of {} input features reach beyond the coordinate range the \
-             file's declared CRS allows and were dropped or clipped \u{2014} see the \
-             warning above, and check the real CRS with `gpio inspect <input>`",
-            format_number(report.out_of_range_features as u64),
-            format_number(report.input_features as u64)
-        );
-    }
-    if report.unprojectable_features > 0 {
-        say!(
-            "  note: {} of {} input features have valid lon/lat but lie outside the \
-             Web Mercator tiling domain (|lat| > 85.05\u{b0}); these features cannot \
-             be tiled",
-            format_number(report.unprojectable_features as u64),
-            format_number(report.input_features as u64)
-        );
-    }
-    if let Some(note) = wrapped_note_line(report.wrapped_features, report.input_features) {
-        say!("  {note}");
-    }
-    if !report.skipped_empty_levels.is_empty() {
-        let planned: Vec<String> = report
-            .skipped_empty_levels
-            .iter()
-            .map(|s| match s.zoom {
-                Some(z) => format!("z{z}"),
-                None => format!("level {}", s.planned_level),
-            })
-            .collect();
-        say!(
-            "  note: {} empty level(s) omitted ({}) — no features visible at those \
-             scales; the pyramid starts at the coarsest non-empty level",
-            report.skipped_empty_levels.len(),
-            planned.join(", ")
-        );
-    }
-
-    if let Some(note) = row_group_autoscale_note(&report) {
-        say!("{note}");
-    }
+    print_diagnostics(report.diagnostics.iter());
 
     if let Some(report_path) = &args.report {
         let json =
@@ -2826,49 +2562,21 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     );
     for z in &report.zooms {
         say!(
-            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features",
             z.zoom,
             z.level,
             z.tile_count,
             z.tile_feature_count,
-            if z.oversized_tiles > 0 {
-                format!(", {} oversized", z.oversized_tiles)
-            } else {
-                String::new()
-            },
-            if z.encode_dropped_features > 0 {
-                format!(", {} unencodable", z.encode_dropped_features)
-            } else {
-                String::new()
-            },
-            if z.encode_quantized_features > 0 {
-                format!(", {} collapsed at extent", z.encode_quantized_features)
-            } else {
-                String::new()
-            }
         );
     }
     say!(
-        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s{}",
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
         report.total_tiles,
         report.total_tile_features,
         report.oversized_tiles,
         report.duration_secs,
-        if report.encode_dropped_features > 0 {
-            // #431: never let the summary read as an unqualified success.
-            format!(
-                " \u{2014} {} tile feature(s) dropped at MVT encode (empty geometry or \
-                 empty GeometryCollection); see the warning above",
-                report.encode_dropped_features
-            )
-        } else {
-            String::new()
-        }
     );
-    print_skipped_property_columns(&report.skipped_property_columns);
-    if let Some(note) = encode_quantized_note(report.encode_quantized_features) {
-        say!("  {note}");
-    }
+    print_diagnostics(report.diagnostics.iter());
 
     if let Some(path) = &args.report {
         let json = serde_json::to_string_pretty(&report)
@@ -2878,27 +2586,6 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
         say!("  report → {}", path.display());
     }
     Ok(())
-}
-
-/// #434: the export already warned once per column through the log; the
-/// summary repeats the loss in one line so it is not missed when the log is
-/// quiet or scrolled away. Nothing is printed when nothing was dropped.
-fn print_skipped_property_columns(
-    skipped: &[tylertoo_core::overview::export::SkippedPropertyColumn],
-) {
-    if skipped.is_empty() {
-        return;
-    }
-    say!(
-        "  {} property column{} not exported (no MVT encoding for the type): {}",
-        skipped.len(),
-        if skipped.len() == 1 { "" } else { "s" },
-        skipped
-            .iter()
-            .map(|c| format!("{:?} ({})", c.name, c.data_type))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
 }
 
 /// Run `tylertoo pyramid`: merge per-band PMTiles archives into one (thin
@@ -2927,17 +2614,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
             format_number(*n as u64)
         );
     }
-    // Only consulted when something was skipped: `classify_band_input`
-    // opens each band's first bytes, which is pointless when there is no
-    // line to print.
-    let split = report.skipped > 0 && bands_split_one_archive(&bands);
-    if let Some(line) = pyramid_skip_message(report.skipped, split) {
-        say!("{line}");
-    }
-    let per_band_sum = report.per_band_tiles.iter().map(|(.., n)| n).sum();
-    if let Some(line) = pyramid_shared_note(per_band_sum, report.total_tiles) {
-        say!("{line}");
-    }
+    print_diagnostics(report.diagnostics.iter());
     print_publication(
         &report.metadata,
         &report.metadata_conflicts,
@@ -4690,291 +4367,6 @@ mod tests {
             "flags on overview/export-pmtiles not surfaced on `tiles` — add each \
              to TilesArgs, or to the allow-list with a documented reason: {missing:?}"
         );
-    }
-    // --- #429: out-of-range honesty in the tiles summary ---------------------
-
-    /// A bare "N tiles" line is fine only when nothing was lost. With lost
-    /// features the line must name them — and name WHICH loss, since the two
-    /// have different fixes — and a zero-tile archive must never read as an
-    /// unqualified success.
-    #[test]
-    fn tiles_summary_line_names_out_of_range_losses() {
-        let clean = tiles_summary_line(
-            1234,
-            0,
-            14,
-            1.5,
-            &SummaryLosses {
-                ..SummaryLosses::default()
-            },
-        );
-        assert_eq!(clean, "1,234 tiles across z0..z14 in 1.50s");
-
-        let empty = tiles_summary_line(
-            0,
-            0,
-            14,
-            0.05,
-            &SummaryLosses {
-                out_of_range: 3,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            empty.starts_with(
-                "0 tiles \u{2014} 3 feature(s) dropped (outside the declared CRS range)"
-            ),
-            "a wrong-CRS run must not read as a clean success: {empty}"
-        );
-
-        let partial = tiles_summary_line(
-            10,
-            0,
-            14,
-            0.2,
-            &SummaryLosses {
-                out_of_range: 1,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            partial.contains("10 tiles across z0..z14")
-                && partial.contains("1 feature(s) dropped (outside the declared CRS range)"),
-            "a partial loss still reports its tiles AND its losses: {partial}"
-        );
-
-        // The Mercator-domain loss is named separately: nothing to reproject.
-        let polar = tiles_summary_line(
-            0,
-            0,
-            14,
-            0.05,
-            &SummaryLosses {
-                unprojectable: 7,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            polar.contains(
-                "7 feature(s) dropped (|lat| > 85.05\u{b0}, outside the Web Mercator \
-                 tiling domain)"
-            ) && !polar.contains("declared CRS range"),
-            "an Arctic extract must be told why it tiled to nothing: {polar}"
-        );
-
-        // Both at once, both named.
-        let both = tiles_summary_line(
-            5,
-            0,
-            14,
-            0.1,
-            &SummaryLosses {
-                out_of_range: 2,
-                unprojectable: 3,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            both.contains("2 feature(s) dropped (outside the declared CRS range)")
-                && both.contains("3 feature(s) dropped (|lat| > 85.05\u{b0}"),
-            "{both}"
-        );
-
-        // #431: encode-time drops are a post-clip loss and are named as such.
-        let encode = tiles_summary_line(
-            5,
-            0,
-            14,
-            0.1,
-            &SummaryLosses {
-                encode_dropped: 4,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            encode.contains("5 tiles across z0..z14")
-                && encode.contains(
-                    "4 tile feature(s) dropped at MVT encode (empty geometry or empty \
-                     GeometryCollection)"
-                ),
-            "{encode}"
-        );
-    }
-
-    /// #431 review: extent collapses are expected and never qualify the
-    /// success line; they get their own note, naming what they are.
-    #[test]
-    fn encode_quantized_note_is_separate_and_silent_at_zero() {
-        assert_eq!(encode_quantized_note(0), None);
-        let note = encode_quantized_note(2).unwrap();
-        assert!(
-            note.contains("2 tile feature(s) collapsed at the tile extent")
-                && note.contains("lines of fewer than two points")
-                && !note.contains("dropped"),
-            "{note}"
-        );
-    }
-
-    /// #644: wrapped features are valid input, so they get their own note,
-    /// never a loss in the summary line, and nothing at zero.
-    #[test]
-    fn wrapped_note_line_is_separate_and_silent_at_zero() {
-        assert_eq!(wrapped_note_line(0, 10), None);
-        let note = wrapped_note_line(1234, 5000).unwrap();
-        assert!(
-            note.contains("1,234 of 5,000 input features reach past the world edge")
-                && note.contains("drawn wrapped across the antimeridian")
-                && !note.contains("dropped"),
-            "{note}"
-        );
-    }
-
-    /// #553: a bare count sent a real investigation to a separate DuckDB
-    /// query against the input to find the offending rows. The summary line
-    /// must name them itself.
-    #[test]
-    fn tiles_summary_line_names_out_of_range_exemplars() {
-        use tylertoo_core::overview::convert::OutOfRangeExemplar;
-
-        let exemplars = vec![
-            OutOfRangeExemplar {
-                part: None,
-                row: 1041,
-                axis: "lon",
-                value: 180.548,
-            },
-            OutOfRangeExemplar {
-                part: None,
-                row: 2210,
-                axis: "lon",
-                value: 180.101,
-            },
-        ];
-        let msg = tiles_summary_line(
-            0,
-            0,
-            14,
-            0.05,
-            &SummaryLosses {
-                out_of_range: 19,
-                out_of_range_exemplars: &exemplars,
-                ..SummaryLosses::default()
-            },
-        );
-        assert!(
-            msg.contains(
-                "19 feature(s) dropped (outside the declared CRS range; e.g. lon \
-                          180.548 (row 1041), lon 180.101 (row 2210))"
-            ),
-            "the summary must name the offending coordinates and rows, not just a count: {msg}"
-        );
-    }
-
-    // --- #514 S3: the pyramid skip line ---------------------------------
-
-    /// Nothing skipped, nothing printed.
-    #[test]
-    fn pyramid_skip_message_is_silent_when_nothing_was_skipped() {
-        assert_eq!(pyramid_skip_message(0, true), None);
-        assert_eq!(pyramid_skip_message(0, false), None);
-    }
-
-    /// The documented way to split one pre-tiled archive across several
-    /// `--band` entries means the tiles one band drops are the ones its
-    /// sibling keeps -- nothing vanished, so it gets a plain note instead of
-    /// the "!" alarm.
-    #[test]
-    fn pyramid_skip_message_downgrades_the_subrange_split_case() {
-        let msg = pyramid_skip_message(7, true).unwrap();
-        assert!(!msg.contains('!'), "{msg}");
-        assert!(msg.contains("7") && msg.contains("skipped"), "{msg}");
-    }
-
-    /// Anything that is not a genuine split keeps the "!" alarm: the tiles
-    /// really are gone and no sibling band picked them up.
-    #[test]
-    fn pyramid_skip_message_keeps_the_alarm_without_a_split() {
-        let msg = pyramid_skip_message(3, false).unwrap();
-        assert!(msg.contains('!'), "{msg}");
-        assert!(msg.contains("dropped"), "{msg}");
-    }
-
-    /// #527 review, finding 2: the reassuring line used to be keyed on
-    /// `skipped == total_tiles`, a count coincidence. A single band that
-    /// `--allow-missing-zooms` let overshoot hits it whenever it happens to
-    /// keep as many tiles as it drops -- core's own
-    /// `band_partial_overlap_allowed_with_flag_warns` is exactly that shape:
-    /// a z3-6 archive under a z0-4 band keeps 2 and skips 2 -- and the two
-    /// silently lost tiles were reported as an expected split. Equal counts
-    /// alone must not downgrade the alarm.
-    #[test]
-    fn pyramid_skip_message_does_not_trust_equal_counts() {
-        let msg = pyramid_skip_message(2, false).unwrap();
-        assert!(
-            msg.contains('!'),
-            "kept == dropped is not evidence of a split: {msg}"
-        );
-    }
-
-    // --- #403: per-band counts can sum past the total -------------------
-
-    /// Disjoint bands (or shared zooms with no tile in common): the per-band
-    /// lines add up to the total and need no explanation.
-    #[test]
-    fn pyramid_shared_note_is_silent_when_the_counts_add_up() {
-        assert_eq!(pyramid_shared_note(0, 0), None);
-        assert_eq!(pyramid_shared_note(12, 12), None);
-    }
-
-    /// A tile id several bands wrote at a shared zoom counts once per band
-    /// but once in the total, so the per-band lines sum past it. Say why,
-    /// next to the numbers, or the summary reads as tiles going missing.
-    #[test]
-    fn pyramid_shared_note_explains_a_sum_above_the_total() {
-        let msg = pyramid_shared_note(1500, 1000).unwrap();
-        assert!(msg.contains("1,500") && msg.contains("1,000"), "{msg}");
-        assert!(msg.contains("once per band"), "{msg}");
-        assert!(!msg.contains('!'), "nothing is wrong: {msg}");
-    }
-
-    /// The split signal is two `--band` entries naming the same archive,
-    /// however each one spells the path. A band listed once is not a split,
-    /// and neither is a GeoParquet source listed twice (it is tiled to its
-    /// own range and never skips anything).
-    #[test]
-    fn bands_split_one_archive_detects_a_shared_archive() {
-        use tylertoo_core::pyramid::Band;
-
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("pre.pmtiles");
-        // `classify_band_input` sniffs the magic; the rest is never read.
-        std::fs::write(&archive, b"PMTiles\x03").unwrap();
-        let source = dir.path().join("cells.parquet");
-        std::fs::write(&source, b"PAR1").unwrap();
-
-        let band = |lo: u8, hi: u8, p: PathBuf| Band {
-            input: p,
-            layer: "agg".to_string(),
-            min_zoom: lo,
-            max_zoom: hi,
-        };
-
-        assert!(!bands_split_one_archive(&[band(0, 13, archive.clone())]));
-        assert!(bands_split_one_archive(&[
-            band(0, 5, archive.clone()),
-            band(6, 13, archive.clone()),
-        ]));
-        // Same file, different spelling of the path.
-        let dotted = dir.path().join(".").join("pre.pmtiles");
-        assert!(bands_split_one_archive(&[
-            band(0, 5, archive.clone()),
-            band(6, 13, dotted),
-        ]));
-        // A GeoParquet source twice is not an archive split.
-        assert!(!bands_split_one_archive(&[
-            band(0, 5, source.clone()),
-            band(6, 13, source),
-        ]));
     }
 
     /// #510 review, S3-7: `merge`'s "input is also the output" guard compared

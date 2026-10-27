@@ -68,7 +68,12 @@ fn decode_all(gfield: &Field, gidx: usize, batches: &[RecordBatch]) -> usize {
     for batch in batches {
         let garr = from_arrow_array(batch.column(gidx).as_ref(), gfield).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         total += geoms.len();
     }
     total

@@ -86,16 +86,15 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::atomic_output::Outp
 pub fn tylertoo_core::atomic_output::check_writable(&std::path::Path) -> core::result::Result<(), tylertoo_core::atomic_output::OutputNotWritable>
 pub fn tylertoo_core::atomic_output::check_writable_in_place(&std::path::Path) -> core::result::Result<(), tylertoo_core::atomic_output::OutputNotWritable>
 pub mod tylertoo_core::batch_processor
-pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>) -> tylertoo_core::Result<()>
-pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>) -> tylertoo_core::Result<()>
-pub fn tylertoo_core::batch_processor::non_finite_geometry_count() -> u64
+pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<()>
+pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::batch_processor::resolve_parquet_files(&std::path::Path) -> tylertoo_core::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub mod tylertoo_core::clip
 pub const tylertoo_core::clip::DEFAULT_BUFFER_PIXELS: u32
 pub const tylertoo_core::clip::DEFAULT_EXTENT: u32
 pub fn tylertoo_core::clip::buffer_pixels_to_degrees(u32, &tylertoo_core::tile::TileBounds, u32) -> f64
-pub fn tylertoo_core::clip::clip_geometry(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::clip::clip_geometry_simple(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, bool, bool) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::clip::clip_geometry(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::clip::clip_geometry_simple(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, bool, bool, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::clip::geometry_is_simple(&geo_types::geometry::Geometry<f64>) -> bool
 pub mod tylertoo_core::compression
 #[repr(u8)] pub enum tylertoo_core::compression::Compression
@@ -320,6 +319,267 @@ impl core::marker::Unpin for tylertoo_core::dedup::TileHasher
 impl core::marker::UnsafeUnpin for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::TileHasher
+pub mod tylertoo_core::diagnostics
+pub enum tylertoo_core::diagnostics::CrsWarning
+pub tylertoo_core::diagnostics::CrsWarning::MissingColumn(alloc::string::String)
+pub tylertoo_core::diagnostics::CrsWarning::MissingVersion
+pub tylertoo_core::diagnostics::CrsWarning::NoColumns
+pub tylertoo_core::diagnostics::CrsWarning::NoGeoMetadata
+pub tylertoo_core::diagnostics::CrsWarning::NoKeyValueMetadata
+pub tylertoo_core::diagnostics::CrsWarning::NullCrsDegrees
+pub tylertoo_core::diagnostics::CrsWarning::NullCrsUnknown
+pub tylertoo_core::diagnostics::CrsWarning::UnexpectedFormat(alloc::string::String)
+pub tylertoo_core::diagnostics::CrsWarning::UnknownVersion(alloc::string::String)
+impl core::clone::Clone for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::clone(&self) -> tylertoo_core::diagnostics::CrsWarning
+impl core::cmp::Eq for tylertoo_core::diagnostics::CrsWarning
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::eq(&self, &tylertoo_core::diagnostics::CrsWarning) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::CrsWarning
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Send for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Sync for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Unpin for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::CrsWarning
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::CrsWarning
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::CrsWarning
+pub enum tylertoo_core::diagnostics::Diagnostic
+pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect
+pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped
+pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::input: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata::reason: tylertoo_core::diagnostics::CrsWarning
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::first_written_gsd: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::first_written_zoom: core::option::Option<u8>
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::gsd_max: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::gsd_min: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::input_features: usize
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::levels: alloc::vec::Vec<usize>
+pub tylertoo_core::diagnostics::Diagnostic::EncodeDropped
+pub tylertoo_core::diagnostics::Diagnostic::EncodeDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::EncodeQuantized
+pub tylertoo_core::diagnostics::Diagnostic::EncodeQuantized::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::FullResolutionFallback
+pub tylertoo_core::diagnostics::Diagnostic::FullResolutionFallback::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterEncode
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterEncode::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterSimplify
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterSimplify::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::limit: u64
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::machine: core::option::Option<u64>
+pub tylertoo_core::diagnostics::Diagnostic::Merged
+pub tylertoo_core::diagnostics::Diagnostic::Merged::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry
+pub tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired::kind: tylertoo_core::diagnostics::PolygonRepairKind
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::data_type: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::name: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMetadataConflict
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMetadataConflict::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingBounds
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingBounds::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingMetadata
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingMetadata::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSharedTiles
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSharedTiles::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSkippedTiles
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSkippedTiles::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::cap: usize
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry::total: usize
+pub tylertoo_core::diagnostics::Diagnostic::ValidationSkipped
+pub tylertoo_core::diagnostics::Diagnostic::ValidationSkipped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::ValveDropped
+pub tylertoo_core::diagnostics::Diagnostic::ValveDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
+impl tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::count(&self) -> usize
+impl core::clone::Clone for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::clone(&self) -> tylertoo_core::diagnostics::Diagnostic
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::eq(&self, &tylertoo_core::diagnostics::Diagnostic) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::Diagnostic
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Send for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Sync for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Unpin for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::Diagnostic
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::Diagnostic
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::Diagnostic
+pub enum tylertoo_core::diagnostics::PolygonRepairKind
+pub tylertoo_core::diagnostics::PolygonRepairKind::CollapsedRing
+pub tylertoo_core::diagnostics::PolygonRepairKind::DisconnectedInterior
+pub tylertoo_core::diagnostics::PolygonRepairKind::HoleOutsideShell
+pub tylertoo_core::diagnostics::PolygonRepairKind::NestedHoles
+pub tylertoo_core::diagnostics::PolygonRepairKind::NestedShells
+pub tylertoo_core::diagnostics::PolygonRepairKind::PartsOverlap
+pub tylertoo_core::diagnostics::PolygonRepairKind::RingSelfTouch
+pub tylertoo_core::diagnostics::PolygonRepairKind::RingsCross
+impl core::clone::Clone for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::clone(&self) -> tylertoo_core::diagnostics::PolygonRepairKind
+impl core::cmp::Eq for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::eq(&self, &tylertoo_core::diagnostics::PolygonRepairKind) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::PolygonRepairKind
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Send for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Sync for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Unpin for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::PolygonRepairKind
+pub enum tylertoo_core::diagnostics::SourceLossCause
+pub tylertoo_core::diagnostics::SourceLossCause::ClipDropped
+pub tylertoo_core::diagnostics::SourceLossCause::EncodeDropped
+pub tylertoo_core::diagnostics::SourceLossCause::Filtered
+pub tylertoo_core::diagnostics::SourceLossCause::Merged
+pub tylertoo_core::diagnostics::SourceLossCause::MissingGeometry
+pub tylertoo_core::diagnostics::SourceLossCause::NonFiniteGeometry
+pub tylertoo_core::diagnostics::SourceLossCause::OutsideBbox
+pub tylertoo_core::diagnostics::SourceLossCause::Quantized
+pub tylertoo_core::diagnostics::SourceLossCause::ValveDropped
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::clone(&self) -> tylertoo_core::diagnostics::SourceLossCause
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLossCause
+impl core::cmp::Ord for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::cmp(&self, &tylertoo_core::diagnostics::SourceLossCause) -> core::cmp::Ordering
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::eq(&self, &tylertoo_core::diagnostics::SourceLossCause) -> bool
+impl core::cmp::PartialOrd for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::partial_cmp(&self, &tylertoo_core::diagnostics::SourceLossCause) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::SourceLossCause
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLossCause
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLossCause
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLossCause
+pub struct tylertoo_core::diagnostics::Diagnostics
+impl tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::count(&self, &tylertoo_core::diagnostics::Diagnostic) -> usize
+pub fn tylertoo_core::diagnostics::Diagnostics::extend(&self, impl core::iter::traits::collect::IntoIterator<Item = tylertoo_core::diagnostics::Diagnostic>)
+pub fn tylertoo_core::diagnostics::Diagnostics::once(&self, tylertoo_core::diagnostics::Diagnostic)
+pub fn tylertoo_core::diagnostics::Diagnostics::record(&self, tylertoo_core::diagnostics::Diagnostic)
+pub fn tylertoo_core::diagnostics::Diagnostics::snapshot(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_emitted(&self, u64, u8)
+pub fn tylertoo_core::diagnostics::Diagnostics::source_loss(&self, u64, core::option::Option<u8>, tylertoo_core::diagnostics::SourceLossCause)
+pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+impl core::default::Default for tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::default() -> Self
+impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Send for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Sync for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Unpin for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::Diagnostics
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::Diagnostics
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::Diagnostics
+pub struct tylertoo_core::diagnostics::RangeContext
+pub tylertoo_core::diagnostics::RangeContext::crs: tylertoo_core::overview::level::Crs
+pub tylertoo_core::diagnostics::RangeContext::max_abs: f64
+pub tylertoo_core::diagnostics::RangeContext::total: usize
+impl core::clone::Clone for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::clone(&self) -> tylertoo_core::diagnostics::RangeContext
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::eq(&self, &tylertoo_core::diagnostics::RangeContext) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::diagnostics::RangeContext
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::RangeContext
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Send for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Sync for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Unpin for tylertoo_core::diagnostics::RangeContext
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::RangeContext
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::RangeContext
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::RangeContext
+pub struct tylertoo_core::diagnostics::SourceLoss
+pub tylertoo_core::diagnostics::SourceLoss::cause: tylertoo_core::diagnostics::SourceLossCause
+pub tylertoo_core::diagnostics::SourceLoss::id: u64
+pub tylertoo_core::diagnostics::SourceLoss::zoom: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::clone(&self) -> tylertoo_core::diagnostics::SourceLoss
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLoss
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::eq(&self, &tylertoo_core::diagnostics::SourceLoss) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::SourceLoss
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLoss
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLoss
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLoss
 pub mod tylertoo_core::fs_probe
 pub fn tylertoo_core::fs_probe::is_ram_backed(&std::path::Path) -> core::option::Option<bool>
 pub mod tylertoo_core::input
@@ -553,10 +813,9 @@ impl<'a> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::
 impl<'a> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::SourceStream<'a>
 pub fn tylertoo_core::input_set::derive_layer_name(&str) -> alloc::string::String
 pub mod tylertoo_core::ioverlay_clip
-pub fn tylertoo_core::ioverlay_clip::clip_guard_drop_count() -> u64
-pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub mod tylertoo_core::merge
 pub struct tylertoo_core::merge::MergeOptions
 pub tylertoo_core::merge::MergeOptions::metadata: tylertoo_core::TilesetMetadata
@@ -627,7 +886,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::mvt::PropertyVal
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::mvt::PropertyValue
 pub struct tylertoo_core::mvt::LayerBuilder
 impl tylertoo_core::mvt::LayerBuilder
-pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds)
+pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics)
 pub fn tylertoo_core::mvt::LayerBuilder::build(self) -> tylertoo_core::vector_tile::tile::Layer
 pub fn tylertoo_core::mvt::LayerBuilder::dropped_features(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::feature_count(&self) -> usize
@@ -659,19 +918,17 @@ pub const tylertoo_core::mvt::DEFAULT_EXTENT: u32
 pub const tylertoo_core::mvt::TILE_COORD_CLAMP: i32
 pub fn tylertoo_core::mvt::command_decode(u32) -> (u32, u32)
 pub fn tylertoo_core::mvt::command_encode(u32, u32) -> u32
-pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
+pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
 pub fn tylertoo_core::mvt::encode_linestring(&geo_types::geometry::line_string::LineString, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_multi_linestring(&geo_types::geometry::multi_line_string::MultiLineString, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_multi_point(&geo_types::geometry::multi_point::MultiPoint, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
-pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_point(&geo_types::geometry::point::Point, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
-pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::flatten_geometry_collection(&geo_types::geometry::geometry_collection::GeometryCollection<f64>) -> alloc::vec::Vec<geo_types::geometry::Geometry>
 pub fn tylertoo_core::mvt::geo_to_tile_coords(f64, f64, &tylertoo_core::tile::TileBounds, u32) -> (i32, i32)
-pub fn tylertoo_core::mvt::invalid_after_encode_count() -> u64
 pub fn tylertoo_core::mvt::orient_multi_polygon_for_mvt(&geo_types::geometry::multi_polygon::MultiPolygon) -> geo_types::geometry::multi_polygon::MultiPolygon
 pub fn tylertoo_core::mvt::orient_polygon_for_mvt(&geo_types::geometry::polygon::Polygon) -> geo_types::geometry::polygon::Polygon
-pub fn tylertoo_core::mvt::tile_polygon_repair_counts() -> alloc::vec::Vec<(&'static str, u64)>
 pub fn tylertoo_core::mvt::zigzag_decode(u32) -> i32
 pub fn tylertoo_core::mvt::zigzag_encode(i32) -> u32
 pub mod tylertoo_core::overview
@@ -716,6 +973,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -1515,9 +1776,11 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::
 pub struct tylertoo_core::overview::convert::ConvertReport
 pub tylertoo_core::overview::convert::ConvertReport::antimeridian_suspect_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::crs_assumed_wgs84: bool
+pub tylertoo_core::overview::convert::ConvertReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::overview::convert::ConvertReport::duration_secs: f64
 pub tylertoo_core::overview::convert::ConvertReport::effective_max_row_group_size: core::option::Option<usize>
 pub tylertoo_core::overview::convert::ConvertReport::input_features: usize
+pub tylertoo_core::overview::convert::ConvertReport::input_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::LevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::mode: tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::convert::ConvertReport::out_of_range_exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
@@ -1526,6 +1789,7 @@ pub tylertoo_core::overview::convert::ConvertReport::remote_fetch: core::option:
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_total: usize
 pub tylertoo_core::overview::convert::ConvertReport::skipped_empty_levels: alloc::vec::Vec<tylertoo_core::overview::convert::SkippedLevelReport>
+pub tylertoo_core::overview::convert::ConvertReport::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
 pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::total_vertices: usize
@@ -1612,6 +1876,8 @@ impl core::marker::Copy for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl serde_core::ser::Serialize for tylertoo_core::overview::convert::OutOfRangeExemplar
 pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 impl core::marker::Freeze for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::Send for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::Sync for tylertoo_core::overview::convert::OutOfRangeExemplar
@@ -1723,7 +1989,6 @@ pub const tylertoo_core::overview::convert::READ_WORKERS_MAX: usize
 pub fn tylertoo_core::overview::convert::convert_to_overviews(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_source(&tylertoo_core::input::InputSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_sources(&tylertoo_core::input_set::ConvertSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
-pub fn tylertoo_core::overview::convert::out_of_range_exemplar_note(&[tylertoo_core::overview::convert::OutOfRangeExemplar]) -> alloc::string::String
 pub fn tylertoo_core::overview::convert::overture_road_ranking(alloc::string::String) -> tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::parse_accumulate(&str) -> core::result::Result<tylertoo_core::overview::cluster::AccumulateSpec, alloc::string::String>
 pub fn tylertoo_core::overview::convert::parse_class_rank(&str) -> core::result::Result<tylertoo_core::overview::convert::ClassRanking, alloc::string::String>
@@ -1971,6 +2236,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ExportOption
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ExportOptions
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportOptions
 pub struct tylertoo_core::overview::export::ExportReport
+pub tylertoo_core::overview::export::ExportReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
 pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ExportReport::encode_quantized_features: usize
@@ -1980,6 +2246,7 @@ pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
 pub tylertoo_core::overview::export::ExportReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::skipped_property_columns: alloc::vec::Vec<tylertoo_core::overview::export::SkippedPropertyColumn>
+pub tylertoo_core::overview::export::ExportReport::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
 pub tylertoo_core::overview::export::ExportReport::total_tile_features: usize
 pub tylertoo_core::overview::export::ExportReport::total_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::valve_dropped_features: usize
@@ -2418,6 +2685,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -2984,6 +3255,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -3079,11 +3354,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::simpli
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify::SimplifyOptions
 pub const tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR: f64
 pub const tylertoo_core::overview::simplify::METERS_PER_DEGREE: f64
-pub fn tylertoo_core::overview::simplify::full_resolution_fallback_count() -> u64
-pub fn tylertoo_core::overview::simplify::simplify_cascade(&geo_types::geometry::Geometry<f64>, &[tylertoo_core::overview::simplify::CascadeStep], tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::validation_skip_count() -> u64
+pub fn tylertoo_core::overview::simplify::simplify_cascade(&geo_types::geometry::Geometry<f64>, &[tylertoo_core::overview::simplify::CascadeStep], tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
+pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
+pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
 pub fn tylertoo_core::overview::simplify::world_tolerance(f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> f64
 pub mod tylertoo_core::overview::tiles
 #[non_exhaustive] pub enum tylertoo_core::overview::tiles::TilesError
@@ -3673,6 +3946,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidOpt
 pub struct tylertoo_core::pyramid::PyramidReport
 pub tylertoo_core::pyramid::PyramidReport::bands_without_bounds: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::bands_without_metadata: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::pyramid::PyramidReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::pyramid::PyramidReport::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::pyramid::PyramidReport::metadata_conflicts: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::per_band_tiles: alloc::vec::Vec<(alloc::string::String, u8, u8, usize)>
@@ -3721,8 +3995,8 @@ impl core::marker::Unpin for tylertoo_core::quality::CrsInfo
 impl core::marker::UnsafeUnpin for tylertoo_core::quality::CrsInfo
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::quality::CrsInfo
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
-pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
-pub fn tylertoo_core::quality::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::quality::extract_crs(&std::path::Path, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
 pub mod tylertoo_core::resolved_schema
 pub struct tylertoo_core::resolved_schema::ResolvedSchema
@@ -4446,6 +4720,6 @@ impl core::marker::Unpin for tylertoo_core::TilesetMetadata
 impl core::marker::UnsafeUnpin for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesetMetadata
-pub fn tylertoo_core::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::extract_crs(&std::path::Path, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
 pub type tylertoo_core::Result<T> = core::result::Result<T, tylertoo_core::Error>

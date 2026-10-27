@@ -20,11 +20,27 @@ def test_feature_accounting_requires_exact_partition(written, dropped, ok):
         {10: ZoomScan(ids=set(range(written)))},
         {"vector_layers": [{"id": "test", "fields": {}}]},
         "test",
-        {"export": {"zooms": [{"zoom": 10, "valve_dropped_features": dropped}]}},
+        {"export": {"source_losses": [{"id": i, "zoom": 10, "cause": "valve_dropped"} for i in range(written, written + dropped)]}},
         (500_000, 500_000),
         True,
         False,
         (100, []),
+    )
+    accounting = next(o for o in outcomes if o.invariant == "feature_accounting")
+    assert accounting.ok is ok, accounting.detail
+
+@pytest.mark.parametrize("losses,ok", [
+    ([{"id": 1, "zoom": 10, "cause": "encode_dropped"}], True),
+    ([{"id": 0, "zoom": 10, "cause": "encode_dropped"}], False),
+    ([{"id": 1, "zoom": 9, "cause": "encode_dropped"}], False),
+    ([{"id": 2, "zoom": 10, "cause": "encode_dropped"}], False),
+    ([{"id": 1, "zoom": 10, "cause": "encode_dropped"}] * 2, False),
+])
+def test_feature_accounting_uses_disjoint_source_losses(losses, ok):
+    outcomes = evaluate(
+        {10: ZoomScan(ids={0})}, {"vector_layers": [{"id": "test", "fields": {}}]}, "test",
+        {"convert": {"source_losses": []}, "export": {"source_losses": losses}},
+        (500_000, 500_000), True, False, (2, []),
     )
     accounting = next(o for o in outcomes if o.invariant == "feature_accounting")
     assert accounting.ok is ok, accounting.detail

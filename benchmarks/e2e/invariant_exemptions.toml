@@ -20,27 +20,8 @@
 #   reason     one line: what fails and who is expected to remove the row
 #
 # Rows are strict: an exempted invariant that passes fails the run as XPASS,
-# so the PR that fixes the issue must delete its rows. The row count is
-# pinned by [invariant_exemptions] in ci/ratchets.toml, checked by
-# crates/core/tests/architecture.rs and by
-# `uv run scripts/verify_archive.py --check-exemptions <this file>`: the list
-# only changes on purpose, with the pin.
-
-[[exemption]]
-fixture = "open-buildings"
-settings = "pv0"
-zoom = "*"
-invariant = "decay"
-issue = 749
-reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
-
-[[exemption]]
-fixture = "madagascar-adm4"
-settings = "pv0"
-zoom = "*"
-invariant = "decay"
-issue = 749
-reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
+# so the PR that fixes the issue must delete its rows. Validate the file with:
+# `uv run scripts/verify_archive.py --check-exemptions <this file>`.
 
 [[exemption]]
 fixture = "madagascar-adm4"
@@ -56,7 +37,7 @@ settings = "pv0"
 zoom = "*"
 invariant = "decay"
 issue = 749
-reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
+reason = "source-area dithering still fails strict decay: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains"
 
 [[exemption]]
 fixture = "ftw-moldova-z10"
@@ -65,11 +46,3 @@ zoom = 9
 invariant = "monotone"
 issue = 768
 reason = "the per-tile merge valve thins z10 below z9; C2 valve design removes the row"
-
-[[exemption]]
-fixture = "nonfinite-vertex"
-settings = "defaults"
-zoom = "*"
-invariant = "feature_accounting"
-issue = 707
-reason = "a NaN and a +inf vertex: both features vanish from every zoom with no counter; F2/F5 (counted finiteness check) removes the row"

@@ -42,7 +42,7 @@ properties that must hold across the whole archive, not just its framing:
                        it); the first invalid tile and feature are printed
                        (#748)
   feature_accounting   (c) input features = distinct features at the finest
-                       zoom + the drop counters `--report` exposes. Needs
+                       zoom + disjoint source losses `--report` exposes. Needs
                        source-unique MVT ids (--ids, i.e. the archive was
                        built with `--feature-id`). A loss no counter explains
                        is a silent drop (#707: the clip guard has no counter)
@@ -632,7 +632,6 @@ def evaluate(
 
     exp = (report or {}).get("export") or {}
     conv = (report or {}).get("convert") or {}
-    zoom_reports = {zr["zoom"]: zr for zr in exp.get("zooms", [])}
 
     if ids:
         # (c) feature accounting at the finest zoom
@@ -641,45 +640,43 @@ def evaluate(
         if input_info is not None:
             n_in, src = input_info[0], "input rows"
         else:
-            n_in, src = conv.get("input_features"), "report input_features"
-        zr = zoom_reports.get(finest, {})
-        # The counters that report a feature (or a (feature, tile) pair) as
-        # lost. The pair counters are not exact source-loss data: a pair lost
-        # in one tile can be drawn in its neighbour. Until per-source loss
-        # data lands (#707), require equality and keep the #707 strict
-        # exemption; never let an overcount explain a loss.
-        # `encode_quantized_features` is left out on purpose: the report
-        # calls it informational (a clip sliver at a
-        # buffered edge), and counting it let a vanished feature hide behind
-        # an unrelated sliver.
-        counters = {
-            "out_of_range_features": conv.get("out_of_range_features", 0),
-            "unprojectable_features": conv.get("unprojectable_features", 0),
-            f"z{finest} encode_dropped_features": zr.get("encode_dropped_features", 0),
-            f"z{finest} valve_dropped_features": zr.get("valve_dropped_features", 0),
-            f"z{finest} merged_features": zr.get("merged_features", 0),
-        }
-        counted = sum(counters.values())
+            n_in, src = conv.get("input_rows"), "report input_rows"
+        # A source lost in one tile may survive in another. Only the core's
+        # final per-source losses can partition the input; pair counters do
+        # not participate in conservation.
+        losses = [
+            loss for section in (conv, exp)
+            for loss in section.get("source_losses", [])
+            if loss.get("zoom") in (None, finest)
+        ]
+        lost_ids = [loss["id"] for loss in losses]
+        lost = set(lost_ids)
+        seen = scans[finest].ids
         if n_in is None:
             out.append(Outcome("feature_accounting", None, False, "no input count"))
         else:
-            unexplained = n_in - written - counted
-            named = ", ".join(f"{k}={v}" for k, v in counters.items() if v)
+            expected = set(range(n_in))
+            missing = expected - seen - lost
+            overlap = seen & lost
+            foreign = (seen | lost) - expected
+            duplicates = len(lost_ids) - len(lost)
+            causes: dict[str, int] = defaultdict(int)
+            for loss in losses:
+                causes[loss["cause"]] += 1
+            named = ", ".join(f"{k}={v}" for k, v in sorted(causes.items()))
             detail = (
-                f"{n_in} {src} = {written} distinct at z{finest} + {counted} counted "
-                f"({named or 'no counter fired'})"
+                f"{n_in} {src} = {written} distinct at z{finest} + {len(lost)} source losses "
+                f"({named or 'no source loss'})"
             )
-            if unexplained > 0:
-                missing = sorted(set(range(n_in)) - scans[finest].ids)[:5]
-                detail += (
-                    f"; {unexplained} feature(s) vanished with no counter "
-                    f"(absent ids, i.e. input rows: {missing})"
-                )
-            elif written > n_in:
-                detail += f"; {written - n_in} more distinct ids than input rows"
-            if unexplained < 0:
-                detail += f"; {-unexplained} feature(s) overcounted by written IDs and losses"
-            ok = unexplained == 0 and written <= n_in
+            if missing:
+                detail += f"; {len(missing)} unexplained source ids: {sorted(missing)[:5]}"
+            if overlap:
+                detail += f"; {len(overlap)} source ids both written and lost: {sorted(overlap)[:5]}"
+            if foreign:
+                detail += f"; {len(foreign)} source ids outside the input: {sorted(foreign)[:5]}"
+            if duplicates:
+                detail += f"; {duplicates} duplicate source losses"
+            ok = not (missing or overlap or foreign or duplicates)
             out.append(Outcome("feature_accounting", None, ok, detail))
 
         # (d) monotone: distinct features never rise toward coarser zooms.

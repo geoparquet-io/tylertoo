@@ -818,6 +818,7 @@ fn seed_batch(
     timers: &super::ExportTimers,
     buckets: &mut std::collections::BTreeMap<u64, (Vec<Shape>, Vec<Collapsed>)>,
     features: &mut usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), super::ExportError> {
     use rayon::prelude::*;
     type Bucket = (Vec<Shape>, Vec<Collapsed>);
@@ -832,6 +833,7 @@ fn seed_batch(
         geom_idx,
         crs,
         &super::ExportTimers::default(),
+        diagnostics,
     )?;
     *features += geoms.len();
     let pieces: Vec<Vec<(u64, Bucket)>> = geoms
@@ -843,7 +845,7 @@ fn seed_batch(
             ) {
                 return Vec::new();
             }
-            super::feature_tile_members(g, seed_zoom, opts, 0, u64::MAX)
+            super::feature_tile_members(g, seed_zoom, opts, 0, u64::MAX, diagnostics)
                 .into_iter()
                 .map(|(key, clipped)| {
                     let (x, y) = super::key_to_xy(key, seed_zoom);
@@ -885,6 +887,7 @@ pub(super) fn build_fill_map(
     min_zoom: u8,
     opts: &super::ExportOptions,
     timers: &super::ExportTimers,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<FillMap, super::ExportError> {
     use rayon::prelude::*;
     use std::collections::BTreeMap;
@@ -949,6 +952,7 @@ pub(super) fn build_fill_map(
                     timers,
                     buckets_ref,
                     features_ref,
+                    diagnostics,
                 )?;
             }
             Ok(())

@@ -335,7 +335,6 @@ fn probe_available_memory_bytes() -> Option<u64> {
     }
     let machine = read_proc_mem_available();
     let cgroup = cgroup_memory_limit_bytes();
-    log_binding_cgroup_limit_once(machine, cgroup);
     effective_available(machine, cgroup)
 }
 
@@ -348,23 +347,18 @@ fn effective_available(machine: Option<u64>, cgroup: Option<u64>) -> Option<u64>
     }
 }
 
-/// Emitted once per process, at info, when the cgroup limit — not the machine —
-/// is what bounds the memory budget. Users on a shared cluster otherwise have
-/// no way to see *why* the budget is a twelfth of the node's RAM.
-fn log_binding_cgroup_limit_once(machine: Option<u64>, cgroup: Option<u64>) {
-    static LOGGED: std::sync::Once = std::sync::Once::new();
-    let Some(limit) = cgroup else { return };
-    if machine.is_some_and(|m| m <= limit) {
-        return;
+/// Record the binding cgroup budget in this operation's channel.
+pub(super) fn memory_diagnostic(sink: &crate::diagnostics::Diagnostics) {
+    let machine = read_proc_mem_available();
+    if let Some(limit) =
+        cgroup_memory_limit_bytes().filter(|&limit| machine.is_none_or(|m| m > limit))
+    {
+        sink.once(crate::diagnostics::Diagnostic::MemoryBudget {
+            count: 1,
+            machine,
+            limit,
+        });
     }
-    LOGGED.call_once(|| {
-        let machine_str =
-            machine.map_or_else(|| "unknown".to_string(), |m| format!("{:.1} GiB", gib(m)));
-        log::info!(
-            "memory budget from cgroup limit: {:.1} GiB (machine has {machine_str})",
-            gib(limit),
-        );
-    });
 }
 
 pub(super) fn gib(bytes: u64) -> f64 {

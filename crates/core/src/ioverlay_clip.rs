@@ -35,8 +35,6 @@
 //! wagyu's Vatti algorithm. However, by operating in f64 directly, we avoid
 //! the overhead of coordinate conversion that wagyu requires.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::tile::TileBounds;
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPolygon, Polygon};
 use i_overlay::core::fill_rule::FillRule;
@@ -220,13 +218,17 @@ fn contour_to_linestring(contour: &IOverlayContour) -> Option<LineString<f64>> {
 /// let bounds = TileBounds::new(-180.0, -90.0, 180.0, 90.0);
 /// let result = clip_polygon_ioverlay(&poly, &bounds);
 /// ```
-pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+pub fn clip_polygon_ioverlay(
+    poly: &Polygon<f64>,
+    bounds: &TileBounds,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
     // Input guard (#692, mirroring the #435 line-path guard): i_float 5's
     // adapter panics ("Invalid adapter bounds") on a non-finite extent or a
     // coordinate magnitude past 2^500. A hostile vertex means there is
     // nothing we can clip — return the same `None` as "doesn't intersect".
     if !polygon_representable(poly) {
-        count_guard_drop();
+        count_guard_drop(diagnostics);
         return None;
     }
 
@@ -269,11 +271,12 @@ pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option
 pub fn clip_multipolygon_ioverlay(
     multi: &MultiPolygon<f64>,
     bounds: &TileBounds,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Geometry<f64>> {
     // Input guard (#692): one hostile vertex anywhere poisons the whole
     // input — empty result, no partial output, as the #435 line guard does.
     if !multi.0.iter().all(polygon_representable) {
-        count_guard_drop();
+        count_guard_drop(diagnostics);
         return None;
     }
 
@@ -301,8 +304,7 @@ pub fn clip_multipolygon_ioverlay(
     ioverlay_to_geometry(result)
 }
 
-// F2: becomes Diagnostic::ClipGuardDropped
-/// Process-wide count of geometries the clip input guard refused (#707): a
+/// Record a geometry the clip input guard refused in this run (#707): a
 /// NaN, infinite or over-[`IOVERLAY_MAX_ABS_COORD`] vertex that `i_float`'s
 /// adapter would panic on, or that `clip.rs`'s fast path would have emitted
 /// unclipped.
@@ -313,24 +315,8 @@ pub fn clip_multipolygon_ioverlay(
 /// feature from that tile; [`repair_polygon_ioverlay`] hand their input back unmerged or unrepaired.
 /// Either way the input never reached the engine, and before #707 nothing
 /// said so: the feature vanished from every tile at every zoom with exit 0.
-/// The first refusal in a process warns; [`clip_guard_drop_count`] has the
-/// total, following simplify's `FULL_RES_FALLBACKS` precedent.
-static CLIP_GUARD_DROPS: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-wide clip-guard refusal counter (#707).
-pub fn clip_guard_drop_count() -> u64 {
-    CLIP_GUARD_DROPS.load(Ordering::Relaxed)
-}
-
-/// Count one clip-guard refusal, warning on the first in the process.
-pub(crate) fn count_guard_drop() {
-    if CLIP_GUARD_DROPS.fetch_add(1, Ordering::Relaxed) == 0 {
-        log::warn!(
-            "a geometry with a NaN, infinite or absurdly large coordinate reached the \
-             clipper and was left out of the tile (#707); later ones are counted, not \
-             logged. The input holds coordinates no valid GeoParquet or overview file does."
-        );
-    }
+pub(crate) fn count_guard_drop(diagnostics: &crate::diagnostics::Diagnostics) {
+    diagnostics.record(crate::diagnostics::Diagnostic::ClipGuardDropped { count: 1 });
 }
 
 /// Largest coordinate magnitude handed to `i_overlay`'s float adapter. `i_float` 5
@@ -387,6 +373,7 @@ fn polygon_representable(poly: &Polygon<f64>) -> bool {
 pub fn clip_multilinestring_ioverlay(
     mls: &MultiLineString<f64>,
     bounds: &TileBounds,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> MultiLineString<f64> {
     // i_float 5's adapter panics ("Invalid adapter bounds") when the
     // combined extent is non-finite or a coordinate magnitude exceeds 2^500
@@ -402,7 +389,7 @@ pub fn clip_multilinestring_ioverlay(
         .flat_map(|ls| ls.0.iter())
         .all(|c| representable(c.x) && representable(c.y))
     {
-        count_guard_drop();
+        count_guard_drop(diagnostics);
         return MultiLineString::new(Vec::new());
     }
 
@@ -446,7 +433,10 @@ pub fn clip_multilinestring_ioverlay(
 ///
 /// Returns `None` when nothing remains (degenerate rings or a fully
 /// self-canceling shape).
-pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
+pub fn repair_polygon_ioverlay(
+    poly: &Polygon<f64>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
     // Input guard (#692): a hostile vertex cannot be repaired, only panic
     // the adapter (directly, or through the padded box turning non-finite).
     // `None` is the non-panicking result both call sites already handle:
@@ -454,7 +444,7 @@ pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
     // overview/simplify's `repair_candidate` falls back to collapse /
     // full-resolution — the pass-through-unrepaired semantics of #435.
     if !polygon_representable(poly) {
-        count_guard_drop();
+        count_guard_drop(diagnostics);
         return None;
     }
 
@@ -469,7 +459,7 @@ pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
         rect.max().x + pad,
         rect.max().y + pad,
     );
-    clip_polygon_ioverlay(poly, &bounds)
+    clip_polygon_ioverlay(poly, &bounds, diagnostics)
 }
 
 // ============================================================================
@@ -487,6 +477,8 @@ mod tests {
     /// refused and counted.
     #[test]
     fn the_guard_edge_sits_at_the_max_abs_coord() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+
         let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
         let with_far_vertex = |v: f64| {
             let mut p = make_square(0.0, 0.0, 0.5, 0.5);
@@ -495,40 +487,60 @@ mod tests {
         };
         let under = with_far_vertex(IOVERLAY_MAX_ABS_COORD * 0.99);
         assert!(polygon_representable(&under));
-        let _ = clip_polygon_ioverlay(&under, &bounds);
-        let _ = repair_polygon_ioverlay(&under);
+        let _ = clip_polygon_ioverlay(&under, &bounds, &diagnostics);
+        let _ = repair_polygon_ioverlay(&under, &diagnostics);
         assert!(!polygon_representable(&with_far_vertex(
             IOVERLAY_MAX_ABS_COORD * 1.01
         )));
-        let before = clip_guard_drop_count();
+        let before =
+            diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 });
+        assert!(clip_polygon_ioverlay(
+            &with_far_vertex(IOVERLAY_MAX_ABS_COORD * 1.01),
+            &bounds,
+            &diagnostics
+        )
+        .is_none());
         assert!(
-            clip_polygon_ioverlay(&with_far_vertex(IOVERLAY_MAX_ABS_COORD * 1.01), &bounds)
-                .is_none()
+            diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 })
+                > before
         );
-        assert!(clip_guard_drop_count() > before);
     }
 
     /// #707: every guarded entry point counts its refusal instead of
     /// returning a silent `None`.
     #[test]
     fn every_guard_refusal_is_counted() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+
         let mut hostile = make_square(1.0, 1.0, 2.0, 2.0);
         hostile.exterior_mut(|ring| ring.0[2].x = f64::INFINITY);
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let counted = |f: &dyn Fn() -> bool| {
-            let before = clip_guard_drop_count();
+            let before =
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 });
             assert!(f(), "the guard refused");
-            assert!(clip_guard_drop_count() > before, "and counted it");
+            assert!(
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 })
+                    > before,
+                "and counted it"
+            );
         };
-        counted(&|| clip_polygon_ioverlay(&hostile, &bounds).is_none());
+        counted(&|| clip_polygon_ioverlay(&hostile, &bounds, &diagnostics).is_none());
         counted(&|| {
-            clip_multipolygon_ioverlay(&MultiPolygon::new(vec![hostile.clone()]), &bounds).is_none()
+            clip_multipolygon_ioverlay(
+                &MultiPolygon::new(vec![hostile.clone()]),
+                &bounds,
+                &diagnostics,
+            )
+            .is_none()
         });
-        counted(&|| repair_polygon_ioverlay(&hostile).is_none());
+        counted(&|| repair_polygon_ioverlay(&hostile, &diagnostics).is_none());
         counted(&|| {
             let line =
                 MultiLineString::new(vec![LineString::from(vec![(1.0, 1.0), (f64::NAN, 2.0)])]);
-            clip_multilinestring_ioverlay(&line, &bounds).0.is_empty()
+            clip_multilinestring_ioverlay(&line, &bounds, &diagnostics)
+                .0
+                .is_empty()
         });
     }
 
@@ -550,7 +562,8 @@ mod tests {
         let poly = make_square(1.0, 1.0, 2.0, 2.0);
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
 
-        let result = clip_polygon_ioverlay(&poly, &bounds);
+        let result =
+            clip_polygon_ioverlay(&poly, &bounds, &crate::diagnostics::Diagnostics::default());
 
         assert!(result.is_some());
         match result.unwrap() {
@@ -566,7 +579,8 @@ mod tests {
         let poly = make_square(100.0, 100.0, 200.0, 200.0);
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
 
-        let result = clip_polygon_ioverlay(&poly, &bounds);
+        let result =
+            clip_polygon_ioverlay(&poly, &bounds, &crate::diagnostics::Diagnostics::default());
 
         assert!(result.is_none());
     }
@@ -576,7 +590,8 @@ mod tests {
         let poly = make_square(-5.0, -5.0, 5.0, 5.0);
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
 
-        let result = clip_polygon_ioverlay(&poly, &bounds);
+        let result =
+            clip_polygon_ioverlay(&poly, &bounds, &crate::diagnostics::Diagnostics::default());
 
         assert!(result.is_some());
         match result.unwrap() {
@@ -604,7 +619,11 @@ mod tests {
 
         let bounds = TileBounds::new(-2.0, -2.0, 2.0, 2.0);
 
-        let result = clip_polygon_ioverlay(&bowtie, &bounds);
+        let result = clip_polygon_ioverlay(
+            &bowtie,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Should produce valid output (MultiPolygon with 2 triangles)
         assert!(result.is_some());
@@ -634,7 +653,9 @@ mod tests {
         );
         assert!(!bowtie.is_valid(), "fixture must self-intersect");
 
-        let repaired = repair_polygon_ioverlay(&bowtie).expect("bowtie repairs to non-empty");
+        let repaired =
+            repair_polygon_ioverlay(&bowtie, &crate::diagnostics::Diagnostics::default())
+                .expect("bowtie repairs to non-empty");
         match repaired {
             Geometry::MultiPolygon(mp) => {
                 assert_eq!(mp.0.len(), 2, "bowtie should split into 2 triangles");
@@ -650,7 +671,9 @@ mod tests {
     fn test_repair_valid_polygon_stays_equivalent() {
         use geo::{Area, Validation};
         let square = make_square(0.0, 0.0, 10.0, 10.0);
-        let repaired = repair_polygon_ioverlay(&square).expect("valid input survives repair");
+        let repaired =
+            repair_polygon_ioverlay(&square, &crate::diagnostics::Diagnostics::default())
+                .expect("valid input survives repair");
         match repaired {
             Geometry::Polygon(p) => {
                 assert!(p.is_valid());
@@ -681,7 +704,11 @@ mod tests {
         // Clip box that cuts through the U opening
         let bounds = TileBounds::new(-0.1, 1.0, 1.1, 2.5);
 
-        let result = clip_polygon_ioverlay(&u_shape, &bounds);
+        let result = clip_polygon_ioverlay(
+            &u_shape,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         assert!(result.is_some());
         match result.unwrap() {
@@ -704,7 +731,11 @@ mod tests {
 
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
 
-        let result = clip_multipolygon_ioverlay(&multi, &bounds);
+        let result = clip_multipolygon_ioverlay(
+            &multi,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         assert!(result.is_some());
         match result.unwrap() {
@@ -730,14 +761,22 @@ mod tests {
     #[test]
     fn test_clip_lines_crossing_is_trimmed() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 5.0), (15.0, 5.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(-5.0, 5.0), (15.0, 5.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(line_parts(&out), vec![vec![(0.0, 5.0), (10.0, 5.0)]]);
     }
 
     #[test]
     fn test_clip_lines_outside_is_empty() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(20.0, 20.0), (30.0, 30.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(20.0, 20.0), (30.0, 30.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(out.0.is_empty(), "{out:?}");
     }
 
@@ -745,14 +784,22 @@ mod tests {
     fn test_clip_lines_collinear_with_edge_is_kept() {
         // boundary_included: a run along the bottom edge survives.
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 0.0), (15.0, 0.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(-5.0, 0.0), (15.0, 0.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(line_parts(&out), vec![vec![(0.0, 0.0), (10.0, 0.0)]]);
     }
 
     #[test]
     fn test_clip_lines_corner_graze_is_dropped() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(-5.0, 5.0), (5.0, -5.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(-5.0, 5.0), (5.0, -5.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(out.0.is_empty(), "{out:?}");
     }
 
@@ -771,6 +818,7 @@ mod tests {
                 (15.0, 5.0),
             ]]),
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(
             line_parts(&out),
@@ -785,14 +833,22 @@ mod tests {
     #[test]
     fn test_clip_lines_zero_length_is_dropped() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(5.0, 5.0), (5.0, 5.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(5.0, 5.0), (5.0, 5.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(out.0.is_empty(), "{out:?}");
     }
 
     #[test]
     fn test_clip_lines_empty_input_is_empty() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&MultiLineString::new(vec![]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &MultiLineString::new(vec![]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(out.0.is_empty());
     }
 
@@ -806,6 +862,7 @@ mod tests {
             let out = clip_multilinestring_ioverlay(
                 &lines(&[&[(5.0, 5.0), (bad, 5.0)], &[(2.0, 2.0), (8.0, 8.0)]]),
                 &bounds,
+                &crate::diagnostics::Diagnostics::default(),
             );
             assert!(out.0.is_empty(), "{bad}: {out:?}");
         }
@@ -817,7 +874,11 @@ mod tests {
         // guard.
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         for bad in [1e300, -1e300, f64::MAX] {
-            let out = clip_multilinestring_ioverlay(&lines(&[&[(5.0, 5.0), (5.0, bad)]]), &bounds);
+            let out = clip_multilinestring_ioverlay(
+                &lines(&[&[(5.0, 5.0), (5.0, bad)]]),
+                &bounds,
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert!(out.0.is_empty(), "{bad}: {out:?}");
         }
     }
@@ -827,7 +888,11 @@ mod tests {
         // Well inside the guard: the engine must still run, not be
         // short-circuited.
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let out = clip_multilinestring_ioverlay(&lines(&[&[(-1e6, 5.0), (1e6, 5.0)]]), &bounds);
+        let out = clip_multilinestring_ioverlay(
+            &lines(&[&[(-1e6, 5.0), (1e6, 5.0)]]),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(line_parts(&out), vec![vec![(0.0, 5.0), (10.0, 5.0)]]);
     }
 
@@ -877,7 +942,11 @@ mod tests {
     fn test_clip_polygon_hostile_coordinate_yields_none() {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         for bad in HOSTILE_COORDS {
-            let result = clip_polygon_ioverlay(&poisoned_square(bad), &bounds);
+            let result = clip_polygon_ioverlay(
+                &poisoned_square(bad),
+                &bounds,
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert!(result.is_none(), "{bad}: {result:?}");
         }
     }
@@ -896,7 +965,8 @@ mod tests {
                     Coord { x: 1.0, y: 1.0 },
                 ])],
             );
-            let result = clip_polygon_ioverlay(&poly, &bounds);
+            let result =
+                clip_polygon_ioverlay(&poly, &bounds, &crate::diagnostics::Diagnostics::default());
             assert!(result.is_none(), "{bad}: {result:?}");
         }
     }
@@ -906,7 +976,11 @@ mod tests {
         // Well inside the guard: the engine must still run, not be
         // short-circuited.
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let result = clip_polygon_ioverlay(&make_square(-1e6, -1e6, 1e6, 1e6), &bounds);
+        let result = clip_polygon_ioverlay(
+            &make_square(-1e6, -1e6, 1e6, 1e6),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         match result {
             Some(Geometry::Polygon(p)) => assert!(p.exterior().0.len() >= 4),
             other => panic!("expected Polygon, got {other:?}"),
@@ -921,7 +995,11 @@ mod tests {
         for bad in HOSTILE_COORDS {
             let multi =
                 MultiPolygon::new(vec![make_square(1.0, 1.0, 2.0, 2.0), poisoned_square(bad)]);
-            let result = clip_multipolygon_ioverlay(&multi, &bounds);
+            let result = clip_multipolygon_ioverlay(
+                &multi,
+                &bounds,
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert!(result.is_none(), "{bad}: {result:?}");
         }
     }
@@ -933,14 +1011,21 @@ mod tests {
             make_square(1.0, 1.0, 2.0, 2.0),
             make_square(-1e6, -1e6, 1e6, 1e6),
         ]);
-        let result = clip_multipolygon_ioverlay(&multi, &bounds);
+        let result = clip_multipolygon_ioverlay(
+            &multi,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some(), "{result:?}");
     }
 
     #[test]
     fn test_repair_polygon_hostile_coordinate_yields_none() {
         for bad in HOSTILE_COORDS {
-            let result = repair_polygon_ioverlay(&poisoned_square(bad));
+            let result = repair_polygon_ioverlay(
+                &poisoned_square(bad),
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert!(result.is_none(), "{bad}: {result:?}");
         }
     }

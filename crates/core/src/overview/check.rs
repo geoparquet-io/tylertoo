@@ -114,6 +114,8 @@ pub enum CheckError {
 /// cannot be parsed. Failed conformance checks are reported in the
 /// [`ValidationReport`], not as an error.
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+
     let path = path.as_ref();
     let file = File::open(path)?;
     let metadata = tylertoo_io::read_parquet_metadata(&file)?;
@@ -137,7 +139,7 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
         }
     };
     let mut report = validate_resolved_metadata(&metadata, &descriptor);
-    check_cluster_sum_invariant(path, &metadata, &descriptor, &mut report);
+    check_cluster_sum_invariant(path, &metadata, &descriptor, &mut report, diagnostics);
     Ok(report)
 }
 
@@ -634,6 +636,7 @@ pub(crate) fn check_cluster_sum_invariant(
     metadata: &ParquetMetaData,
     descriptor: &ResolvedSchema,
     report: &mut ValidationReport,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     // A malformed count/level type must be reported by the metadata validator,
     // never passed into Arrow's infallible primitive casts. A partial file has
@@ -673,7 +676,7 @@ pub(crate) fn check_cluster_sum_invariant(
         return;
     }
 
-    match cluster_sum_by_level(path, &meta, clustering, descriptor) {
+    match cluster_sum_by_level(path, &meta, clustering, descriptor, diagnostics) {
         Err(e) => report.fail(
             "cluster_sum_invariant",
             format!("could not read cluster columns: {e}"),
@@ -721,6 +724,7 @@ fn cluster_sum_by_level(
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
     descriptor: &ResolvedSchema,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<(usize, i64)>>, String> {
     use super::convert::feature_kind;
     use crate::batch_processor::extract_geometries_opt_from_array;
@@ -776,7 +780,7 @@ fn cluster_sum_by_level(
         let garr = from_arrow_array(g.as_ref(), &geom_field)
             .map_err(|e| format!("geometry decode: {e}"))?;
         geoms.clear();
-        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms)
+        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms, diagnostics)
             .map_err(|e| format!("geometry decode: {e}"))?;
 
         for (i, geom) in geoms.iter().enumerate() {

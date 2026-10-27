@@ -3,6 +3,7 @@
 //! Only this module constructs `ResolvedSchema`. The serialized footer is decoded into
 //! private wire data and checked against the physical schema before it becomes a descriptor.
 use crate::covering::{CoveringSpec, RowGroupBounds};
+use crate::diagnostics::{CrsWarning, Diagnostic, Diagnostics};
 use crate::overview::level::Crs;
 use crate::quality::{is_wgs84_projjson, CrsInfo};
 use crate::{Error, Result};
@@ -57,6 +58,7 @@ pub struct ResolvedSchema {
     facts: SchemaFacts,
     schema: SchemaRef,
     bounds: Vec<Option<RowGroupBounds>>,
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl ResolvedSchema {
@@ -69,6 +71,7 @@ impl ResolvedSchema {
     }
 
     fn resolve_with(schema: &Schema, metadata: Option<&ParquetMetaData>) -> Result<Self> {
+        let diagnostics = &Diagnostics::silent();
         let geo_json = schema
             .metadata()
             .iter()
@@ -82,7 +85,7 @@ impl ResolvedSchema {
                 Error::GeoParquetRead(format!("Failed to parse geo metadata JSON: {e}"))
             })?;
         if let Some(geo) = &geo {
-            warn_geo_version(geo);
+            warn_geo_version(geo, diagnostics);
         }
         let fields: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let primary_column = geo.as_ref().and_then(primary_name).map(str::to_owned);
@@ -96,6 +99,7 @@ impl ResolvedSchema {
             geo.as_ref(),
             selected.or(primary_column.as_deref()),
             native.as_ref().map(|(_, lt)| lt),
+            diagnostics,
         );
         let version = geo
             .as_ref()
@@ -131,6 +135,7 @@ impl ResolvedSchema {
             },
             schema: Arc::new(schema.clone()),
             bounds: Vec::new(),
+            diagnostics: diagnostics.snapshot(),
         };
         if let Some(md) = metadata {
             result.bounds = result.read_bounds(md);
@@ -153,6 +158,7 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error for malformed or inconsistent footer facts.
     pub(crate) fn from_parquet(schema: &Schema, metadata: &ParquetMetaData) -> Result<Self> {
+        let diagnostics = &Diagnostics::silent();
         let persisted = metadata
             .file_metadata()
             .key_value_metadata()
@@ -199,6 +205,9 @@ impl ResolvedSchema {
             .map(serde_json::from_str::<Value>)
             .transpose()
             .map_err(|e| Error::GeoParquetRead(format!("invalid geo metadata: {e}")))?;
+        if let Some(geo) = &declared {
+            warn_geo_version(geo, diagnostics);
+        }
         let native = facts
             .geometry_name
             .as_deref()
@@ -210,6 +219,7 @@ impl ResolvedSchema {
                 .as_deref()
                 .or(facts.primary_column.as_deref()),
             native.as_ref().map(|(_, lt)| lt),
+            diagnostics,
         );
         let covering = facts
             .geo_json
@@ -249,9 +259,17 @@ impl ResolvedSchema {
             facts,
             schema: Arc::new(schema.clone()),
             bounds: Vec::new(),
+            diagnostics: diagnostics.snapshot(),
         };
         result.bounds = result.read_bounds(metadata);
         Ok(result)
+    }
+
+    /// Replay immutable schema warnings once into the current operation.
+    pub(crate) fn record_diagnostics(&self, sink: &Diagnostics) {
+        for event in &self.diagnostics {
+            sink.once(event.clone());
+        }
     }
 
     /// Serialize the output descriptor, including rename provenance.
@@ -524,12 +542,13 @@ fn resolve_crs(
     geo: Option<&Value>,
     selected: Option<&str>,
     native: Option<&LogicalType>,
+    diagnostics: &Diagnostics,
 ) -> CrsInfo {
     if let Some(col) = geo
         .and_then(|g| g.get("columns"))
         .and_then(|c| c.get(selected?))
     {
-        crs_from_column(col)
+        crs_from_column(col, diagnostics)
     } else if let Some(lt) = native {
         let id = match lt {
             LogicalType::Geometry(g) => g.crs.as_deref(),
@@ -541,6 +560,14 @@ fn resolve_crs(
             Some(id) => CrsInfo::from_identifier(id),
         }
     } else {
+        let reason = match geo {
+            None => CrsWarning::NoGeoMetadata,
+            Some(g) if !g.get("columns").is_some_and(Value::is_object) => CrsWarning::NoColumns,
+            Some(_) => {
+                CrsWarning::MissingColumn(selected.unwrap_or(DEFAULT_GEOMETRY_COLUMN).to_owned())
+            }
+        };
+        diagnostics.once(Diagnostic::CrsMetadata { count: 1, reason });
         CrsInfo::wgs84_assumed()
     }
 }
@@ -651,33 +678,6 @@ pub(crate) fn parse_covering_metadata(
     )))
 }
 
-/// One-shot gates for the "assuming WGS84 / unknown CRS" warnings below.
-///
-/// [`crs_info_from_kv_metadata`] runs once PER PART of a multi-file input
-/// (`MultiSource::from_sources` detects the CRS of every part, plus a raw
-/// descriptor read for the mismatch message), so an 800-part glob whose parts
-/// all share one metadata quirk used to print 800 identical `warn!` lines
-/// (#429 review). Each distinct warning fires once per process instead —
-/// which for a single-part input is exactly the old behavior.
-mod warn_once {
-    use std::sync::Once;
-
-    /// Fire `f` the first time this gate is reached.
-    pub(super) fn gate(once: &'static Once, f: impl FnOnce()) {
-        once.call_once(f);
-    }
-
-    pub(super) static NO_KV_METADATA: Once = Once::new();
-    pub(super) static NO_GEO_METADATA: Once = Once::new();
-    pub(super) static NO_COLUMNS: Once = Once::new();
-    pub(super) static MISSING_COLUMN: Once = Once::new();
-    pub(super) static NULL_CRS_DEGREES: Once = Once::new();
-    pub(super) static NULL_CRS_UNKNOWN: Once = Once::new();
-    pub(super) static UNEXPECTED_CRS_FORMAT: Once = Once::new();
-    pub(super) static GEO_VERSION_MISSING: Once = Once::new();
-    pub(super) static GEO_VERSION_UNKNOWN: Once = Once::new();
-}
-
 /// What a `geo` metadata `version` field says about how safely this reader
 /// can interpret the rest of the metadata (#451).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,22 +709,20 @@ pub(crate) fn geo_version_disposition(version: Option<&str>) -> GeoVersionDispos
     }
 }
 
-/// Warn (once per process) when a `geo` metadata `version` is missing or
+/// Warn (once per run) when a `geo` metadata `version` is missing or
 /// names a spec this reader does not know (#451). A warning, never an error:
 /// the fields read from the metadata (`primary_column`, `crs`, `bbox`,
 /// `covering`) are read best-effort and a future spec most likely still
 /// carries them, so rejecting the file outright would refuse inputs that
 /// parse fine — matching the issue's "hard-warn on unknown majors" ask.
-fn warn_geo_version(geo_json: &Value) {
+fn warn_geo_version(geo_json: &Value, diagnostics: &crate::diagnostics::Diagnostics) {
     let version = geo_json.get("version").and_then(Value::as_str);
     match geo_version_disposition(version) {
         GeoVersionDisposition::Known => {}
         GeoVersionDisposition::Missing => {
-            warn_once::gate(&warn_once::GEO_VERSION_MISSING, || {
-                log::warn!(
-                    "GeoParquet 'geo' metadata has no 'version' field (the spec \
-                     requires one); reading it as GeoParquet 1.x"
-                )
+            diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
+                count: 1,
+                reason: crate::diagnostics::CrsWarning::MissingVersion,
             });
         }
         GeoVersionDisposition::Unknown => {
@@ -732,19 +730,9 @@ fn warn_geo_version(geo_json: &Value) {
             // {:?} escapes it and the cap keeps a pathological value short.
             let version = version.unwrap_or_default();
             let shown: String = version.chars().take(64).collect();
-            warn_once::gate(&warn_once::GEO_VERSION_UNKNOWN, || {
-                log::warn!(
-                    "GeoParquet 'geo' metadata declares version {:?}{}, which this \
-                     version of tylertoo does not know (GeoParquet 1.x and 2.x are \
-                     supported); reading it best-effort as 1.x \u{2014} metadata \
-                     fields may be misread",
-                    shown,
-                    if shown.len() < version.len() {
-                        "…"
-                    } else {
-                        ""
-                    }
-                )
+            diagnostics.once(crate::diagnostics::Diagnostic::CrsMetadata {
+                count: 1,
+                reason: crate::diagnostics::CrsWarning::UnknownVersion(shown),
             });
         }
     }
@@ -762,12 +750,14 @@ fn warn_geo_version(geo_json: &Value) {
 /// Returns [`Error::GeoParquetRead`] if the geo metadata JSON is malformed.
 pub(crate) fn crs_info_from_kv_metadata(
     kv_metadata: Option<&Vec<tylertoo_io::KeyValue>>,
+    diagnostics: &Diagnostics,
 ) -> Result<CrsInfo> {
     // Look for the "geo" key in key-value metadata
     let Some(kv_metadata) = kv_metadata else {
         // No metadata at all - assume WGS84 with warning
-        warn_once::gate(&warn_once::NO_KV_METADATA, || {
-            log::warn!("GeoParquet file has no key-value metadata; assuming WGS84")
+        diagnostics.once(Diagnostic::CrsMetadata {
+            count: 1,
+            reason: CrsWarning::NoKeyValueMetadata,
         });
         return Ok(CrsInfo::wgs84_assumed());
     };
@@ -779,8 +769,9 @@ pub(crate) fn crs_info_from_kv_metadata(
 
     let Some(geo_json_str) = geo_value else {
         // No geo metadata - assume WGS84 with warning
-        warn_once::gate(&warn_once::NO_GEO_METADATA, || {
-            log::warn!("GeoParquet file has no 'geo' metadata; assuming WGS84")
+        diagnostics.once(Diagnostic::CrsMetadata {
+            count: 1,
+            reason: CrsWarning::NoGeoMetadata,
         });
         return Ok(CrsInfo::wgs84_assumed());
     };
@@ -791,33 +782,32 @@ pub(crate) fn crs_info_from_kv_metadata(
 
     // #451: flag a `geo.version` from a spec this reader does not know
     // before interpreting any of its fields.
-    warn_geo_version(&geo_json);
+    warn_geo_version(&geo_json, diagnostics);
 
     let primary_column = primary_name(&geo_json).unwrap_or(DEFAULT_GEOMETRY_COLUMN);
 
     // Get the columns object
     let Some(columns) = geo_json.get("columns").and_then(Value::as_object) else {
-        warn_once::gate(&warn_once::NO_COLUMNS, || {
-            log::warn!("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84")
+        diagnostics.once(Diagnostic::CrsMetadata {
+            count: 1,
+            reason: CrsWarning::NoColumns,
         });
         return Ok(CrsInfo::wgs84_assumed());
     };
 
     // Get the primary column's metadata
     let Some(column_meta) = columns.get(primary_column) else {
-        warn_once::gate(&warn_once::MISSING_COLUMN, || {
-            log::warn!(
-                "GeoParquet 'geo' metadata missing column '{}'; assuming WGS84",
-                primary_column
-            )
+        diagnostics.once(Diagnostic::CrsMetadata {
+            count: 1,
+            reason: CrsWarning::MissingColumn(primary_column.to_owned()),
         });
         return Ok(CrsInfo::wgs84_assumed());
     };
 
-    Ok(crs_from_column(column_meta))
+    Ok(crs_from_column(column_meta, diagnostics))
 }
 
-fn crs_from_column(column_meta: &Value) -> CrsInfo {
+fn crs_from_column(column_meta: &Value, diagnostics: &Diagnostics) -> CrsInfo {
     // Extract CRS - can be a string identifier or PROJJSON object
     let crs = column_meta.get("crs");
 
@@ -860,19 +850,15 @@ fn crs_from_column(column_meta: &Value) -> CrsInfo {
                 // the missing-geo-metadata precedent and assume.
                 .unwrap_or(true);
             if bbox_plausible_degrees {
-                warn_once::gate(&warn_once::NULL_CRS_DEGREES, || {
-                    log::warn!(
-                        "GeoParquet 'crs' is explicitly null (no CRS assigned); \
-                         assuming OGC:CRS84 (lon/lat WGS84)"
-                    )
+                diagnostics.once(Diagnostic::CrsMetadata {
+                    count: 1,
+                    reason: CrsWarning::NullCrsDegrees,
                 });
                 CrsInfo::wgs84_assumed()
             } else {
-                warn_once::gate(&warn_once::NULL_CRS_UNKNOWN, || {
-                    log::warn!(
-                        "GeoParquet 'crs' is explicitly null and the declared bbox \
-                         is outside lon/lat degree ranges; treating CRS as unknown"
-                    )
+                diagnostics.once(Diagnostic::CrsMetadata {
+                    count: 1,
+                    reason: CrsWarning::NullCrsUnknown,
                 });
                 CrsInfo::unknown()
             }
@@ -907,8 +893,9 @@ fn crs_from_column(column_meta: &Value) -> CrsInfo {
             }
         }
         Some(other) => {
-            warn_once::gate(&warn_once::UNEXPECTED_CRS_FORMAT, || {
-                log::warn!("Unexpected CRS format in GeoParquet metadata: {:?}", other)
+            diagnostics.once(Diagnostic::CrsMetadata {
+                count: 1,
+                reason: CrsWarning::UnexpectedFormat(format!("{other:?}")),
             });
             CrsInfo::unknown()
         }

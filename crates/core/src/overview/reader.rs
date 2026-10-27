@@ -158,7 +158,13 @@ impl OverviewReader {
         let resolved = ResolvedSchema::from_parquet(&schema, &metadata)
             .map_err(|e| ReaderError::Conformance(format!("{}: {e}", shown())))?;
         let mut report = super::check::validate_resolved_metadata(&metadata, &resolved);
-        super::check::check_cluster_sum_invariant(&path, &metadata, &resolved, &mut report);
+        super::check::check_cluster_sum_invariant(
+            &path,
+            &metadata,
+            &resolved,
+            &mut report,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         if report.read_failures().next().is_some() {
             return Err(ReaderError::Conformance(format!(
                 "{}: {}",

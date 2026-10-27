@@ -225,7 +225,12 @@ fn decoded_bounds(path: &Path) -> (f64, f64, f64, f64) {
         let batch = batch.unwrap();
         let arr = from_arrow_array(batch.column(gidx).as_ref(), &gfield).unwrap();
         let mut geoms: Vec<Geometry<f64>> = Vec::new();
-        extract_geometries_from_array(arr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            arr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         for g in &geoms {
             if let Some(r) = g.bounding_rect() {
                 x0 = x0.min(r.min().x);

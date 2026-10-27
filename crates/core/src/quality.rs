@@ -303,14 +303,14 @@ pub(crate) fn is_wgs84_projjson(projjson: &Value) -> bool {
 /// Returns [`Error::GeoParquetRead`] if `path` resolves to no Parquet file, if
 /// the file cannot be opened or its footer read, or if its geo metadata JSON is
 /// malformed.
-pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
+pub fn extract_crs(path: &Path, diagnostics: &crate::diagnostics::Diagnostics) -> Result<CrsInfo> {
     let source = crate::input_set::ConvertSource::resolve_path(path)
         .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
-    Ok(source
+    let schema = source
         .resolved_schema()
-        .map_err(|e| Error::GeoParquetRead(e.to_string()))?
-        .crs_info()
-        .clone())
+        .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
+    schema.record_diagnostics(diagnostics);
+    Ok(schema.crs_info().clone())
 }
 
 /// Extract CRS from legacy key-value metadata. Full input readers use
@@ -320,8 +320,9 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
 /// Returns an error if the geo JSON is malformed.
 pub fn crs_info_from_kv_metadata(
     kv_metadata: Option<&Vec<tylertoo_io::KeyValue>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<CrsInfo> {
-    crate::resolved_schema::crs_info_from_kv_metadata(kv_metadata)
+    crate::resolved_schema::crs_info_from_kv_metadata(kv_metadata, diagnostics)
 }
 
 #[cfg(test)]
@@ -344,7 +345,7 @@ use crate::resolved_schema::{geo_version_disposition, GeoVersionDisposition};
 /// Returns an error if the CRS cannot be read (see [`extract_crs`]) or the file
 /// is not in WGS84; the message includes reprojection instructions.
 pub fn validate_wgs84(path: &Path) -> Result<()> {
-    let crs_info = extract_crs(path)?;
+    let crs_info = extract_crs(path, &crate::diagnostics::Diagnostics::default())?;
 
     if crs_info.is_wgs84 {
         return Ok(());
@@ -379,7 +380,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let corrupt = dir.path().join("corrupt.parquet");
         std::fs::write(&corrupt, b"definitely not parquet").unwrap();
-        let msg = extract_crs(&corrupt).unwrap_err().to_string();
+        let msg = extract_crs(&corrupt, &crate::diagnostics::Diagnostics::default())
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains(&corrupt.display().to_string()), "{msg}");
         assert!(!msg.to_lowercase().contains("parquet error"), "{msg}");
     }
@@ -407,7 +410,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84, "null CRS with degree-range bbox → CRS84");
     }
 
@@ -422,7 +429,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(
             !info.is_wgs84,
             "null CRS with out-of-degree-range bbox must stay unknown"
@@ -445,7 +456,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(
             info.is_wgs84,
             "null CRS with a 3D degree-range bbox must still assume CRS84"
@@ -464,7 +479,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(
             !info.is_wgs84,
             "null CRS with an out-of-degree-range 3D bbox must stay unknown"
@@ -484,7 +503,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84);
     }
 
@@ -497,7 +520,11 @@ mod tests {
             "primary_column": "geometry",
             "columns": {"geometry": {"encoding": "WKB", "crs": null}}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84);
     }
 
@@ -791,7 +818,11 @@ mod tests {
             "primary_column": "geometry",
             "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:3857"}}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(!info.is_wgs84);
         assert_eq!(info.identifier.as_deref(), Some("EPSG:3857"));
         assert!(
@@ -806,7 +837,8 @@ mod tests {
     #[test]
     fn missing_metadata_fallbacks_set_assumed_wgs84() {
         // (1) No key-value metadata at all.
-        let info = crs_info_from_kv_metadata(None).unwrap();
+        let info =
+            crs_info_from_kv_metadata(None, &crate::diagnostics::Diagnostics::default()).unwrap();
         assert!(info.is_wgs84 && info.assumed_wgs84, "no kv metadata");
 
         // (2) Key-value metadata without a "geo" key.
@@ -814,12 +846,18 @@ mod tests {
             "writer".to_string(),
             "something".to_string(),
         )];
-        let info = crs_info_from_kv_metadata(Some(&kv)).unwrap();
+        let info =
+            crs_info_from_kv_metadata(Some(&kv), &crate::diagnostics::Diagnostics::default())
+                .unwrap();
         assert!(info.is_wgs84 && info.assumed_wgs84, "no geo key");
 
         // (3) geo metadata without "columns".
         let geo = serde_json::json!({"version": "1.1.0"});
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && info.assumed_wgs84, "no columns");
 
         // (4) primary column missing from "columns".
@@ -828,7 +866,11 @@ mod tests {
             "primary_column": "geometry",
             "columns": {"other": {"encoding": "WKB"}}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && info.assumed_wgs84, "missing column");
 
         // (5) Explicit `crs: null` with a degrees-plausible bbox (the
@@ -842,7 +884,11 @@ mod tests {
                 "crs": null
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && info.assumed_wgs84, "null crs, degree bbox");
     }
 
@@ -856,7 +902,11 @@ mod tests {
             "primary_column": "geometry",
             "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && !info.assumed_wgs84, "explicit EPSG:4326");
 
         // `crs` key omitted: the spec defines this as OGC:CRS84 — a
@@ -866,7 +916,11 @@ mod tests {
             "primary_column": "geometry",
             "columns": {"geometry": {"encoding": "WKB"}}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && !info.assumed_wgs84, "spec-default CRS84");
 
         // PROJJSON declaration.
@@ -879,7 +933,11 @@ mod tests {
                         "id": {"authority": "EPSG", "code": 4326}}
             }}
         });
-        let info = crs_info_from_kv_metadata(Some(&kv_with_geo(&geo))).unwrap();
+        let info = crs_info_from_kv_metadata(
+            Some(&kv_with_geo(&geo)),
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert!(info.is_wgs84 && !info.assumed_wgs84, "PROJJSON EPSG:4326");
     }
 
@@ -891,7 +949,8 @@ mod tests {
             return;
         }
 
-        let crs_info = extract_crs(fixture).expect("Should extract CRS");
+        let crs_info = extract_crs(fixture, &crate::diagnostics::Diagnostics::default())
+            .expect("Should extract CRS");
         assert!(
             crs_info.is_wgs84,
             "open-buildings fixture should be in WGS84, got: {:?}",

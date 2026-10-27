@@ -131,7 +131,12 @@ fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         for (i, g) in geoms.into_iter().enumerate() {
             rows.push((zoom.value(i), id.value(i), g));
         }

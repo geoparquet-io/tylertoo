@@ -51,7 +51,11 @@ fn clip_huge_polygon_with_ioverlay() {
 
     println!("\nClipping with i_overlay...");
     let start = Instant::now();
-    let result = clip_polygon_ioverlay(&poly, &tile_bounds);
+    let result = clip_polygon_ioverlay(
+        &poly,
+        &tile_bounds,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     let elapsed = start.elapsed();
 
     println!("i_overlay clip time: {:.3}s", elapsed.as_secs_f64());
@@ -88,7 +92,12 @@ fn clip_huge_polygon_with_sutherland_hodgman() {
 
     println!("\nClipping with Sutherland-Hodgman (should be fast)...");
     let start = Instant::now();
-    let result = clip::clip_geometry(&geo::Geometry::Polygon(poly), &tile_bounds, buffer);
+    let result = clip::clip_geometry(
+        &geo::Geometry::Polygon(poly),
+        &tile_bounds,
+        buffer,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     let elapsed = start.elapsed();
 
     println!("SH clip time: {:.3}s", elapsed.as_secs_f64());

@@ -1289,33 +1289,18 @@ pub struct SkippedLevelReport {
 pub(super) fn warn_plan_skipped_levels(
     skipped: &[SkippedLevelReport],
     input_features: usize,
-    first_written_gsd: f64,
-    first_written_zoom: Option<u8>,
+    (first_written_gsd, first_written_zoom): (f64, Option<u8>),
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
-    if skipped.is_empty() {
-        return;
-    }
-    let ids: Vec<String> = skipped
-        .iter()
-        .map(|s| s.planned_level.to_string())
-        .collect();
-    let gsd_max = skipped.iter().map(|s| s.gsd).fold(f64::MIN, f64::max);
-    let gsd_min = skipped.iter().map(|s| s.gsd).fold(f64::MAX, f64::min);
-    let zoom_note = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
-    log::warn!(
-        "omitting {} empty level(s) [{}] spanning GSD {:.2}–{:.2} m: none of the {} input \
-         feature(s) are visible at those scales (visibility gates / density budget); the \
-         output pyramid starts at GSD {:.2} m{}. To populate coarse levels, lower \
-         --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD \
-         polygons as representative points (see docs/OVERVIEW_TUNING.md)",
-        skipped.len(),
-        ids.join(", "),
-        gsd_max,
-        gsd_min,
+    diagnostics.once(crate::diagnostics::Diagnostic::EmptyLevels {
+        count: skipped.len(),
+        levels: skipped.iter().map(|s| s.planned_level).collect(),
+        gsd_max: skipped.iter().map(|s| s.gsd).fold(f64::MIN, f64::max),
+        gsd_min: skipped.iter().map(|s| s.gsd).fold(f64::MAX, f64::min),
         input_features,
         first_written_gsd,
-        zoom_note,
-    );
+        first_written_zoom,
+    });
 }
 
 /// Fold one [`OverviewWriter::write_level`] outcome into the driver
@@ -1441,6 +1426,12 @@ pub struct PlanReport {
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConvertReport {
+    /// Input rows read before filtering unusable geometries.
+    pub input_rows: usize,
+    /// Exact source losses, disjoint from any source emitted at that zoom.
+    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    /// Aggregated diagnostics for this conversion only.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Level materialization mode used.
     pub mode: Mode,
     /// Per-level statistics, coarse→fine. `level` here is the index in the
@@ -1533,6 +1524,34 @@ pub struct ConvertReport {
     /// memory, which scales with the cap — while `--row-group-size` still
     /// reads as whatever the caller asked for.
     pub effective_max_row_group_size: Option<usize>,
+}
+
+impl ConvertReport {
+    pub(crate) fn with_diagnostics(mut self, sink: &crate::diagnostics::Diagnostics) -> Self {
+        use crate::diagnostics::Diagnostic;
+        if let Some(cap) = self.effective_max_row_group_size {
+            sink.once(Diagnostic::RowGroupAutoscaled { count: 1, cap });
+        }
+        self.diagnostics = sink.snapshot();
+        self.source_losses = sink.source_losses();
+        self.antimeridian_suspect_features =
+            sink.count(&Diagnostic::AntimeridianSuspect { count: 0 });
+        self.out_of_range_features = sink.count(&Diagnostic::OutOfRange {
+            context: None,
+            count: 0,
+            exemplars: Vec::new(),
+        });
+        self.unprojectable_features = sink.count(&Diagnostic::Unprojectable {
+            context: None,
+            count: 0,
+        });
+        self.wrapped_features = sink.count(&Diagnostic::Wrapped {
+            exemplars: Vec::new(),
+            context: None,
+            count: 0,
+        });
+        self
+    }
 }
 
 /// Errors from [`convert_to_overviews`].
@@ -2597,6 +2616,9 @@ pub fn write_convert_plan_sources(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<PlanReport, ConvertError> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+    source.record_diagnostics(diagnostics);
+
     // The plan IS the output: without a target there is nothing for this run
     // to produce, and silently doing the whole scan for nothing is the one
     // outcome worth refusing outright.
@@ -2637,7 +2659,7 @@ pub fn write_convert_plan_sources(
     }
     // `--save-plan` already requires the streaming pipeline (validated above),
     // which is where the separable pass-1 + assignment stage lives.
-    super::stream::write_plan_streaming(source, options)
+    super::stream::write_plan_streaming(source, options, diagnostics)
 }
 
 /// Convert a GeoParquet input into a multi-resolution overview file.
@@ -2757,12 +2779,13 @@ fn decode_and_filter_geometries(
     geom_field: &Field,
     bbox_query: Option<&BboxQuery>,
     filter_mask: Option<&[Option<bool>]>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<DecodedInput, ConvertError> {
     let geom_array: Arc<dyn GeoArrowArray> =
         from_arrow_array(full.column(geom_idx).as_ref(), geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
     let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
-    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
+    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts, diagnostics)?;
     let mut geom_skipped = 0usize;
     let keep: Vec<bool> = geom_opts
         .iter()
@@ -2772,14 +2795,34 @@ fn decode_and_filter_geometries(
             // evaluated TRUE (SQL-UNKNOWN drops, like FALSE).
             if let Some(mask) = filter_mask {
                 if mask[i] != Some(true) {
+                    diagnostics.source_loss(
+                        i as u64,
+                        None,
+                        crate::diagnostics::SourceLossCause::Filtered,
+                    );
                     return false;
                 }
             }
             match g.as_ref().filter(|g| usable_geometry(g)) {
                 // Regional extract (#102): drop features whose bbox misses the
                 // requested region exactly, independent of row-group pruning.
-                Some(g) => bbox_query.is_none_or(|q| q.intersects(&geometry_bbox(g))),
+                Some(g) => {
+                    let keep = bbox_query.is_none_or(|q| q.intersects(&geometry_bbox(g)));
+                    if !keep {
+                        diagnostics.source_loss(
+                            i as u64,
+                            None,
+                            crate::diagnostics::SourceLossCause::OutsideBbox,
+                        );
+                    }
+                    keep
+                }
                 None => {
+                    diagnostics.source_loss(
+                        i as u64,
+                        None,
+                        crate::diagnostics::SourceLossCause::MissingGeometry,
+                    );
                     geom_skipped += 1;
                     false
                 }
@@ -2794,13 +2837,10 @@ fn decode_and_filter_geometries(
             kept_rows: None,
         });
     }
-    if geom_skipped > 0 {
-        log::warn!(
-            "skipping {geom_skipped} of {} input rows with a null, empty, or \
-             non-finite geometry",
-            full.num_rows()
-        );
-    }
+    diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
+        count: geom_skipped,
+        total: full.num_rows(),
+    });
     let mask = arrow_array::BooleanArray::from(keep.clone());
     let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
     let kept_rows = keep
@@ -3647,12 +3687,14 @@ fn load_input_table(
     source: &ConvertSource,
     source_single: &InputSource,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<LoadedInput, ConvertError> {
     load_input_table_with_limit(
         source,
         source_single,
         options,
         tylertoo_io::byte_array_limit(),
+        diagnostics,
     )
 }
 
@@ -3665,6 +3707,7 @@ fn load_input_table_with_limit(
     source_single: &InputSource,
     options: &ConvertOptions,
     byte_array_limit: u64,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<LoadedInput, ConvertError> {
     // #543: the same footer-only pass-1 memory preflight the streaming path
     // runs, before the whole table is loaded.
@@ -3678,9 +3721,10 @@ fn load_input_table_with_limit(
 
     // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
     let descriptor = source.resolved_schema()?;
-    let (crs, crs_assumed_wgs84) = crs_from_resolved(descriptor, &source_single.display_name())?;
+    let (crs, crs_assumed_wgs84) =
+        crs_from_resolved(descriptor, &source_single.display_name(), diagnostics)?;
     if crs_assumed_wgs84 {
-        warn_assumed_wgs84(&source_single.display_name());
+        warn_assumed_wgs84(&source_single.display_name(), diagnostics);
     }
 
     // Reserved-column collisions (#288): rename any input column named `level`
@@ -3770,6 +3814,7 @@ fn load_input_table_with_limit(
         &geom_field,
         bbox_query.as_ref(),
         filter_mask.as_deref(),
+        diagnostics,
     )?;
     let row_locator = source.stream_row_locator(
         read_selection
@@ -3874,6 +3919,7 @@ fn build_emitted_levels(
     row_min_levels: &[u8],
     carriers: &[Vec<usize>],
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<EmittedLevel>, Vec<SkippedLevelReport>) {
     // --- Build per-level generalized selections (coarse→fine). ---------------
     // Each emitted entry: (spec, feature indices, geometries, vertex_count).
@@ -3918,7 +3964,13 @@ fn build_emitted_levels(
                 })
                 .collect();
             Some(build_level_coalesce_table(
-                &inputs, level, finest, gsd_m, crs, options,
+                &inputs,
+                level,
+                finest,
+                gsd_m,
+                crs,
+                options,
+                diagnostics,
             ))
         } else {
             None
@@ -3996,9 +4048,16 @@ fn build_emitted_levels(
                         crs,
                         &options.simplify,
                         repr,
+                        diagnostics,
                     )
                 } else {
-                    simplify_cascade(&geometries[i], &cascade_chain, crs, &options.simplify)
+                    simplify_cascade(
+                        &geometries[i],
+                        &cascade_chain,
+                        crs,
+                        &options.simplify,
+                        diagnostics,
+                    )
                 };
                 match simplified {
                     Simplified::Keep(g) => {
@@ -4082,12 +4141,19 @@ fn warn_profile_json_not_streaming() {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "#779: F1 merges the engine report and writer stages next"
+)]
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+    source.record_diagnostics(diagnostics);
+
     let adjusted = normalize_convert_options(source, options)?;
     let options: &ConvertOptions = adjusted.as_ref().unwrap_or(options);
     // #452: the output is created after pass 1; a missing or read-only
@@ -4100,7 +4166,13 @@ pub(crate) fn convert_to_overviews_source_strategy(
     // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
     // is kept as the reference implementation (`streaming: false`).
     if options.streaming {
-        return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
+        return super::stream::convert_streaming_strategy(
+            source,
+            output_path,
+            options,
+            strategy,
+            diagnostics,
+        );
     }
 
     warn_profile_json_not_streaming();
@@ -4114,12 +4186,6 @@ pub(crate) fn convert_to_overviews_source_strategy(
     };
 
     let start = Instant::now();
-
-    // A numeric sort key and a categorical class ranking are mutually
-    // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
-    }
 
     let LoadedInput {
         options: resolved_options,
@@ -4135,7 +4201,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         row_groups_total,
         row_groups_read,
         crs_assumed_wgs84,
-    } = load_input_table(source, source_single, options)?;
+    } = load_input_table(source, source_single, options, diagnostics)?;
     let options = &resolved_options;
     let num_features = full.num_rows();
 
@@ -4181,6 +4247,7 @@ pub(crate) fn convert_to_overviews_source_strategy(
         });
     }
     let tallies = tally.finish(features.len(), crs, &|i| rows.locate(i))?;
+    tallies.record(features.len(), crs, diagnostics);
 
     // #306: cap the transient winner-grid memory at the profile-derived RAM
     // budget (`speed` stays unbounded). Pure scheduling — output-identical.
@@ -4257,12 +4324,18 @@ pub(crate) fn convert_to_overviews_source_strategy(
         &row_min_levels,
         &carriers,
         options,
+        diagnostics,
     );
 
     if emitted.is_empty() {
         return Err(ConvertError::NoData);
     }
-    warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
+    warn_plan_skipped_levels(
+        &skipped,
+        num_features,
+        (emitted[0].gsd, emitted[0].zoom),
+        diagnostics,
+    );
 
     // --- Build the output writer schema (source schema + geoarrow geometry). -
     // Base + point_count when clustering (Q4) + coalesced_count when
@@ -4332,10 +4405,18 @@ pub(crate) fn convert_to_overviews_source_strategy(
     let total_compressed_bytes: i64 = level_reports.iter().map(|l| l.compressed_bytes).sum();
 
     Ok(ConvertReport {
+        diagnostics: Vec::new(),
+        source_losses: Vec::new(),
         mode: options.mode,
         levels: level_reports,
         skipped_empty_levels: skipped,
         input_features: num_features,
+        input_rows: num_features
+            + diagnostics
+                .source_losses()
+                .iter()
+                .filter(|l| l.zoom.is_none())
+                .count(),
         total_rows,
         total_vertices,
         total_compressed_bytes,
@@ -4350,7 +4431,8 @@ pub(crate) fn convert_to_overviews_source_strategy(
         duration_secs: start.elapsed().as_secs_f64(),
         remote_fetch: log_remote_fetch(source),
         effective_max_row_group_size,
-    })
+    }
+    .with_diagnostics(diagnostics))
 }
 
 /// Everything the in-memory level-write loop reads besides the levels.
@@ -4514,8 +4596,9 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 pub(crate) fn detect_crs_from_kv(
     kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Crs, ConvertError> {
-    detect_crs_from_kv_assumed(kv, input).map(|(crs, _)| crs)
+    detect_crs_from_kv_assumed(kv, input, diagnostics).map(|(crs, _)| crs)
 }
 
 /// [`detect_crs_from_kv`], also reporting whether the WGS84 answer was the
@@ -4526,10 +4609,11 @@ pub(crate) fn detect_crs_from_kv(
 pub(crate) fn detect_crs_from_kv_assumed(
     kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
 
-    let info = crate::quality::crs_info_from_kv_metadata(kv)?;
+    let info = crate::quality::crs_info_from_kv_metadata(kv, diagnostics)?;
     // Ask the shared classifier what the declaration IS, rather than
     // substring-matching here (#518 — the duplicated matcher in
     // `crate::covering` read EPSG:3857's "WGS 84 / Pseudo-Mercator"
@@ -4556,7 +4640,9 @@ pub(crate) fn detect_crs_from_kv_assumed(
 pub(crate) fn crs_from_resolved(
     schema: &crate::resolved_schema::ResolvedSchema,
     input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Crs, bool), ConvertError> {
+    schema.record_diagnostics(diagnostics);
     let info = schema.crs_info();
     schema
         .crs()
@@ -4572,15 +4658,14 @@ pub(crate) fn crs_from_resolved(
 }
 
 /// #451: tell the user, BY NAME, that this input's CRS is an assumption. The
-/// once-per-process warnings in [`crate::quality`] describe the exact
+/// per-run warnings in [`crate::quality`] describe the exact
 /// metadata quirk; this one names the file and the consequence, once per
 /// conversion, from both pipelines.
-pub(super) fn warn_assumed_wgs84(input_name: &str) {
-    log::warn!(
-        "input {input_name}: no CRS declared in the GeoParquet metadata; assuming WGS84 \
-         lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will \
-         be misplaced \u{2014} check the input with `gpio inspect {input_name}`"
-    );
+pub(super) fn warn_assumed_wgs84(input_name: &str, diagnostics: &crate::diagnostics::Diagnostics) {
+    diagnostics.once(crate::diagnostics::Diagnostic::CrsAssumed {
+        count: 1,
+        input: input_name.to_owned(),
+    });
 }
 
 /// Fuzz hook (#633): run one GeoParquet `geo` key-value string through every
@@ -4618,7 +4703,11 @@ pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
         "geo".to_string(),
         geo_json.to_string(),
     )];
-    detect_crs_from_kv(Some(&kv), "fuzz input")
+    detect_crs_from_kv(
+        Some(&kv),
+        "fuzz input",
+        &crate::diagnostics::Diagnostics::default(),
+    )
 }
 
 use crate::tile::WEBMERC_HALF_M;
@@ -4903,24 +4992,10 @@ pub(super) fn bbox_antimeridian_suspect(bbox: &[f64; 4], crs: Crs) -> bool {
     bbox[2] - bbox[0] > crs.meters_to_units(180.0 * METERS_PER_DEGREE)
 }
 
-/// Emit the single aggregate antimeridian warning (#188 follow-up). Called
-/// once per convert, from both the streaming and in-memory paths.
-pub(super) fn warn_antimeridian_suspects(count: usize) {
-    if count > 0 {
-        log::warn!(
-            "{count} feature(s) have bounding boxes wider than 180° of longitude — \
-             likely antimeridian-crossing geometry. These will be assigned to \
-             overly coarse levels and defeat bbox pruning; pre-split them at \
-             ±180° before converting (see docs/advanced-usage.md, \
-             \"Antimeridian-Crossing Geometry\")."
-        );
-    }
-}
-
 /// The coordinate range a [`Crs`] admits, plus the words a message needs for
 /// it. Feeds the #429 out-of-range gate and every message derived from it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct CrsRange {
+pub(crate) struct CrsRange {
     /// Largest legal `|x|` (longitude degrees, or Web Mercator meters).
     pub max_x: f64,
     /// Largest legal `|y|` (latitude degrees, or Web Mercator meters).
@@ -4932,7 +5007,7 @@ pub(super) struct CrsRange {
 }
 
 /// The coordinate range `crs` admits (#429).
-pub(super) fn crs_coordinate_range(crs: Crs) -> CrsRange {
+pub(crate) fn crs_coordinate_range(crs: Crs) -> CrsRange {
     match crs {
         Crs::Epsg4326 => CrsRange {
             max_x: 180.0,
@@ -5004,34 +5079,6 @@ fn wrapped_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
     (axis, if east >= west { bbox[2] } else { bbox[0] })
 }
 
-/// #644 message (pure, so it is unit-testable without capturing logs): the
-/// one aggregate info line for `count` of `total` features drawn wrapped
-/// across the antimeridian, or `None` to stay quiet. `exemplars` names the
-/// first few rows, in the out-of-range warning's format.
-pub(super) fn wrapped_note(
-    count: usize,
-    total: usize,
-    crs: Crs,
-    exemplars: &[OutOfRangeExemplar],
-) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let edge = match crs {
-        Crs::Epsg4326 => "±180° longitude",
-        Crs::Epsg3857 => "the ±20037508.34 m world edge in x",
-    };
-    let pct = count as f64 / total as f64 * 100.0;
-    let exemplar = exemplar_note(exemplars, ExemplarEdge::Wrap);
-    let stop = if exemplar.is_empty() { "" } else { "." };
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) reach past {edge} and are drawn \
-         wrapped across the antimeridian.{exemplar}{stop} That is expected for 0..360 data \
-         and dateline cells; otherwise check that the coordinates really are the \
-         declared CRS."
-    ))
-}
-
 /// Whether a bbox is legal for its CRS yet lies wholly outside the Web
 /// Mercator TILING domain (#429, review S1-3).
 ///
@@ -5089,7 +5136,7 @@ fn looks_projected(crs: Crs, max_abs: f64) -> bool {
 /// declared CRS (#429, review S2-3). Honest for both a 4326-labeled file
 /// holding projected coordinates and a file that already declares a projected
 /// CRS but overflows its world extent.
-fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
+pub(crate) fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
     if !looks_projected(crs, max_abs) {
         return String::new();
     }
@@ -5132,6 +5179,32 @@ pub struct OutOfRangeExemplar {
     pub value: f64,
 }
 
+impl<'de> serde::Deserialize<'de> for OutOfRangeExemplar {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Owned {
+            part: Option<usize>,
+            row: usize,
+            axis: String,
+            value: f64,
+        }
+        let value = Owned::deserialize(de)?;
+        let axis = match value.axis.as_str() {
+            "lon" => "lon",
+            "lat" => "lat",
+            "x" => "x",
+            "y" => "y",
+            _ => return Err(serde::de::Error::custom("unknown coordinate axis")),
+        };
+        Ok(Self {
+            part: value.part,
+            row: value.row,
+            axis,
+            value: value.value,
+        })
+    }
+}
+
 /// At most this many out-of-range exemplars are kept (#553): enough to show
 /// a pattern (e.g. "every offender near +180°") without holding a growing
 /// `Vec` for a run where millions of features are out of range.
@@ -5166,118 +5239,6 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
         .unwrap_or((lon, bbox[0]))
 }
 
-/// The suffix naming the first few out-of-range exemplars (#553).
-///
-/// It reads "e.g. lat 95.5 (row 1041), lat -91.2 (row 2210)", or `""`
-/// when there are none. Shared by the aggregate `log::warn!` (`out_of_range_warning`) and the
-/// CLI's `tiles` summary line, so both name where the loss came from instead
-/// of only how much was lost.
-pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
-    exemplar_note(exemplars, ExemplarEdge::OutOfRange)
-}
-
-/// The range edge an exemplar's coordinate lies past, which sets where
-/// [`exemplar_value_text`] must not round it back to.
-#[derive(Debug, Clone, Copy)]
-enum ExemplarEdge {
-    /// [`bbox_out_of_crs_range`]'s edges: x and longitude carry the export's
-    /// one-world wrap (#342).
-    OutOfRange,
-    /// [`bbox_wraps`]'s edge: the world's own ±180° (#644).
-    Wrap,
-}
-
-impl ExemplarEdge {
-    /// The `|value|` an exemplar on `axis` lies beyond.
-    fn limit(self, axis: &str) -> f64 {
-        let wrap = match self {
-            Self::OutOfRange => 3.0,
-            Self::Wrap => 1.0,
-        };
-        match axis {
-            "lon" => wrap * 180.0,
-            "lat" => 90.0,
-            "x" => wrap * WEBMERC_HALF_M,
-            _ => WEBMERC_HALF_M,
-        }
-    }
-}
-
-/// [`out_of_range_exemplar_note`] for exemplars past `edge`.
-fn exemplar_note(exemplars: &[OutOfRangeExemplar], edge: ExemplarEdge) -> String {
-    if exemplars.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = exemplars
-        .iter()
-        .map(|e| {
-            let value = exemplar_value_text(e.value, edge.limit(e.axis));
-            match e.part {
-                None => format!("{} {value} (row {})", e.axis, e.row),
-                Some(p) => format!("{} {value} (part {p}, row {})", e.axis, e.row),
-            }
-        })
-        .collect();
-    format!(" e.g. {}", parts.join(", "))
-}
-
-/// An exemplar's coordinate as text: three decimals, unless rounding to
-/// three decimals would land it back on the range edge `limit` (540.0000001
-/// as "540.000"), in which case the shortest exact form, which always shows
-/// the excess.
-fn exemplar_value_text(value: f64, limit: f64) -> String {
-    let short = format!("{value:.3}");
-    match short.parse::<f64>() {
-        Ok(rounded) if rounded.abs() > limit => short,
-        _ => format!("{value}"),
-    }
-}
-
-/// #429 decision + message (pure, so it is unit-testable without capturing
-/// logs). The one aggregate warning for `count` of `total` out-of-range
-/// features, or `None` to stay quiet.
-///
-/// `max_abs` is the largest `|coordinate|` among the offenders: the
-/// projected-CRS diagnosis (and its `gpio` hint) is gated on it, so one
-/// stray point at lng 600 gets neutral wording rather than being told
-/// its whole file is in the wrong CRS (review S2-2). `exemplars` names the
-/// first few offending rows and coordinates (#553).
-pub(super) fn out_of_range_warning(
-    count: usize,
-    total: usize,
-    crs: Crs,
-    max_abs: f64,
-    exemplars: &[OutOfRangeExemplar],
-) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let range = crs_coordinate_range(crs);
-    let (label, text) = (range.label, range.text);
-    let pct = count as f64 / total as f64 * 100.0;
-    let advice = reprojection_advice(crs, max_abs);
-    let exemplar = out_of_range_exemplar_note(exemplars);
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) reach beyond the {label} coordinate \
-         range ({text}) and were dropped or clipped.{exemplar}{advice}"
-    ))
-}
-
-/// The one aggregate warning for features that are valid lon/lat but lie
-/// outside the Web Mercator tiling domain (#429, review S1-3), or `None`.
-pub(super) fn unprojectable_warning(count: usize, total: usize) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let pct = count as f64 / total as f64 * 100.0;
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) have valid lon/lat but lie outside the \
-         Web Mercator tiling domain (|lat| > 85.05°); these features cannot be tiled. \
-         Web Mercator does not reach the poles — clip the input to |lat| ≤ 85.05° or use \
-         a polar tiling scheme instead."
-    ))
-}
-
 /// Share of the input that must be lost before a conversion is a failure
 /// rather than a warning (#429, review S2-1). Exactly 100% let a million-row
 /// wrong-CRS file sail through on a dozen `POINT(0 0)` placeholder rows.
@@ -5307,6 +5268,38 @@ pub(super) struct BboxTallies {
     /// The first [`OUT_OF_RANGE_EXEMPLAR_CAP`] wrapped features' rows and
     /// the coordinate past the edge.
     pub wrapped_exemplars: Vec<OutOfRangeExemplar>,
+}
+impl BboxTallies {
+    pub(super) fn record(
+        &self,
+        total: usize,
+        crs: Crs,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) {
+        use crate::diagnostics::{Diagnostic, RangeContext};
+        let context = Some(RangeContext {
+            total,
+            crs,
+            max_abs: self.max_abs_out_of_range,
+        });
+        diagnostics.once(Diagnostic::AntimeridianSuspect {
+            count: self.antimeridian_suspect,
+        });
+        diagnostics.once(Diagnostic::OutOfRange {
+            count: self.out_of_range,
+            exemplars: self.out_of_range_exemplars.clone(),
+            context,
+        });
+        diagnostics.once(Diagnostic::Unprojectable {
+            count: self.unprojectable,
+            context,
+        });
+        diagnostics.once(Diagnostic::Wrapped {
+            exemplars: self.wrapped_exemplars.clone(),
+            count: self.wrapped,
+            context,
+        });
+    }
 }
 
 impl BboxTallies {
@@ -5492,22 +5485,6 @@ impl BboxTally {
             wrapped: self.wrapped,
             wrapped_exemplars: resolve(self.wrapped_exemplars),
         };
-        warn_antimeridian_suspects(t.antimeridian_suspect);
-        if let Some(msg) = out_of_range_warning(
-            t.out_of_range,
-            total,
-            crs,
-            t.max_abs_out_of_range,
-            &t.out_of_range_exemplars,
-        ) {
-            log::warn!("{msg}");
-        }
-        if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
-            log::warn!("{msg}");
-        }
-        if let Some(msg) = wrapped_note(t.wrapped, total, crs, &t.wrapped_exemplars) {
-            log::info!("{msg}");
-        }
         match all_lost_error(&t, total, crs) {
             Some(e) => Err(e),
             None => Ok(t),
@@ -7083,8 +7060,9 @@ pub(super) fn build_level_coalesce_table(
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> CoalesceTable {
-    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options).0
+    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options, diagnostics).0
 }
 
 /// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
@@ -7104,6 +7082,7 @@ pub(super) fn build_level_coalesce_table_and_hint(
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (CoalesceTable, usize) {
     use rayon::prelude::*;
 
@@ -7127,12 +7106,12 @@ pub(super) fn build_level_coalesce_table_and_hint(
     // consumer depends on its order — they sort the keys or look up by one).
     let table: CoalesceTable = chains
         .into_par_iter()
-        .filter_map(
-            |chain| match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
+        .filter_map(|chain| {
+            match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify, diagnostics) {
                 Simplified::Keep(g) => Some((chain.rep, (g, chain.count))),
                 Simplified::Dropped => None,
-            },
-        )
+            }
+        })
         .collect();
     // Per-level chain-stage split. Simplification of a coalesced stroke is
     // RDP, whose worst case is O(vertices²) (#575), so "how long was the
@@ -7963,78 +7942,6 @@ mod tests {
         assert_eq!(tallies.out_of_range_exemplars[0].axis, "lon");
     }
 
-    /// The exemplar note is what turns a bare count into something naming
-    /// WHERE the loss came from (#553's ask), and is empty when there is
-    /// nothing to name.
-    #[test]
-    fn out_of_range_exemplar_note_names_rows_and_coordinates() {
-        assert_eq!(out_of_range_exemplar_note(&[]), "");
-
-        let exemplars = vec![
-            OutOfRangeExemplar {
-                part: None,
-                row: 1041,
-                axis: "lon",
-                value: 600.548,
-            },
-            OutOfRangeExemplar {
-                part: None,
-                row: 2210,
-                axis: "lon",
-                value: 600.101,
-            },
-        ];
-        let note = out_of_range_exemplar_note(&exemplars);
-        assert!(note.contains("lon 600.548 (row 1041)"), "{note}");
-        assert!(note.contains("lon 600.101 (row 2210)"), "{note}");
-
-        // The full aggregate warning includes it too.
-        let msg =
-            out_of_range_warning(19, 1000, Crs::Epsg4326, 600.548, &exemplars).expect("warns");
-        assert!(msg.contains("19 of 1000"), "{msg}");
-        assert!(msg.contains("lon 600.548 (row 1041)"), "{msg}");
-    }
-
-    /// #553 review: an exemplar just past the edge (float noise from a
-    /// reprojection, a vertex at 540.0000001) must not print as
-    /// "lon 540.000", a value that reads as in range. Three decimals when
-    /// they still show the excess, full precision when they do not.
-    #[test]
-    fn out_of_range_exemplar_note_never_rounds_back_into_range() {
-        let ex = |axis: &'static str, value: f64| OutOfRangeExemplar {
-            part: None,
-            row: 7,
-            axis,
-            value,
-        };
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 540.000_000_1)]),
-            " e.g. lon 540.0000001 (row 7)"
-        );
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lat", -90.000_2)]),
-            " e.g. lat -90.0002 (row 7)"
-        );
-        // 3857's y edge (20037508.342789...) rounds UP at three decimals,
-        // so the short form already shows the excess.
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("y", WEBMERC_HALF_M + 0.0001)]),
-            " e.g. y 20037508.343 (row 7)"
-        );
-        // Its x edge (60112525.028367...) rounds DOWN, so the long form.
-        let note = out_of_range_exemplar_note(&[ex("x", 3.0 * WEBMERC_HALF_M + 0.0001)]);
-        assert!(note.starts_with(" e.g. x 60112525.0284"), "{note}");
-        // Clearly out of range: the short form.
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 600.548_123)]),
-            " e.g. lon 600.548 (row 7)"
-        );
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("x", 70_000_000.0)]),
-            " e.g. x 70000000.000 (row 7)"
-        );
-    }
-
     /// #644: [`BboxTally`] counts the features past ±180° that the export
     /// wraps, apart from the losses, and names the first few in file order
     /// across merged chunks.
@@ -8078,39 +7985,6 @@ mod tests {
         let rows: Vec<usize> = t.wrapped_exemplars.iter().map(|e| e.row).collect();
         assert_eq!(rows, vec![0, 11, 12]);
         assert_eq!(t.wrapped_exemplars[0].value, -181.5, "the west edge");
-    }
-
-    /// #644: the wrapped note is quiet at zero, and otherwise names the count,
-    /// the edge, and the first rows, with the same exemplar format as the
-    /// out-of-range warning.
-    #[test]
-    fn wrapped_note_names_rows_and_stays_quiet_at_zero() {
-        let ex = |part, row, axis: &'static str, value| OutOfRangeExemplar {
-            part,
-            row,
-            axis,
-            value,
-        };
-        assert_eq!(wrapped_note(0, 10, Crs::Epsg4326, &[]), None);
-
-        let msg = wrapped_note(1, 10, Crs::Epsg4326, &[ex(None, 7, "lon", 190.25)])
-            .expect("a wrapped feature is noted");
-        assert!(msg.contains("1 of 10 feature(s)"), "{msg}");
-        assert!(msg.contains("±180° longitude"), "{msg}");
-        assert!(msg.contains("e.g. lon 190.250 (row 7). That"), "{msg}");
-        let bare = wrapped_note(1, 10, Crs::Epsg4326, &[]).unwrap();
-        assert!(bare.contains("antimeridian. That"), "{bare}");
-
-        let msg = wrapped_note(2, 4, Crs::Epsg4326, &[ex(Some(1), 3, "lon", -180.5)]).unwrap();
-        assert!(msg.contains("lon -180.500 (part 1, row 3)"), "{msg}");
-
-        // Just past the edge prints in full, never as "180.000".
-        let msg = wrapped_note(1, 1, Crs::Epsg4326, &[ex(None, 0, "lon", 180.000_000_1)]).unwrap();
-        assert!(msg.contains("lon 180.0000001 (row 0)"), "{msg}");
-
-        let msg = wrapped_note(1, 1, Crs::Epsg3857, &[ex(None, 0, "x", 30_000_000.0)]).unwrap();
-        assert!(msg.contains("±20037508.34 m"), "{msg}");
-        assert!(msg.contains("x 30000000.000 (row 0)"), "{msg}");
     }
 
     /// The filter path reads the same columns but must NOT lose ±inf: it is a
@@ -9413,8 +9287,10 @@ mod tests {
         // A plan written by a FUTURE tylertoo: reported as the version skew
         // it is, not as "bad magic bytes", which sends whoever reads the
         // message looking for a corrupt file instead.
-        let future = dir.path().join("v4.plan");
-        let mut bytes = b"TTPLAN\x00\x04".to_vec();
+        let next = super::super::plan_state::PLAN_FORMAT_VERSION_BYTE + 1;
+        let future = dir.path().join(format!("v{next}.plan"));
+        let mut bytes = super::super::plan_state::PLAN_MAGIC.to_vec();
+        bytes[7] = next;
         bytes.extend_from_slice(&0u64.to_le_bytes());
         std::fs::write(&future, &bytes).unwrap();
         let msg = validate_options(&ConvertOptions {
@@ -9424,7 +9300,7 @@ mod tests {
         .expect_err("a future plan format must be rejected")
         .to_string();
         assert!(
-            msg.contains("format v4"),
+            msg.contains(&format!("format v{next}")),
             "names the version it found: {msg}"
         );
         assert!(!msg.contains("bad magic"), "{msg}");
@@ -9904,7 +9780,12 @@ mod tests {
             )
             .unwrap();
             let mut gvec = Vec::new();
-            extract_geometries_from_array(garr.as_ref(), &mut gvec).unwrap();
+            extract_geometries_from_array(
+                garr.as_ref(),
+                &mut gvec,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
             for (i, g) in gvec.iter().enumerate() {
                 out.push((
                     ids.value(i),
@@ -10149,7 +10030,13 @@ mod tests {
             ..multi_test_options()
         };
 
-        let Err(err) = load_input_table_with_limit(&source, single.input(), &opts, limit) else {
+        let Err(err) = load_input_table_with_limit(
+            &source,
+            single.input(),
+            &opts,
+            limit,
+            &crate::diagnostics::Diagnostics::default(),
+        ) else {
             panic!("the whole table passes the ceiling");
         };
         let ConvertError::InMemoryByteArrayTooLarge {
@@ -10174,18 +10061,35 @@ mod tests {
             bbox: Some([-30.0, -60.0, -20.0, -50.0]),
             ..opts.clone()
         };
-        let loaded = load_input_table_with_limit(&source, single.input(), &pruned, limit)
-            .expect("the pruned row groups fit the ceiling");
+        let loaded = load_input_table_with_limit(
+            &source,
+            single.input(),
+            &pruned,
+            limit,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("the pruned row groups fit the ceiling");
         assert_eq!(loaded.row_groups_read, 1);
 
-        let unlimited = load_input_table_with_limit(&source, single.input(), &opts, u64::MAX)
-            .expect("the real ceiling reads a small input");
+        let unlimited = load_input_table_with_limit(
+            &source,
+            single.input(),
+            &opts,
+            u64::MAX,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("the real ceiling reads a small input");
         assert_eq!(unlimited.full.num_rows(), geoms.len());
 
         // The ceiling is inclusive: a total equal to it fits one batch.
-        let at_limit =
-            load_input_table_with_limit(&source, single.input(), &opts, largest.total_bytes)
-                .expect("a total equal to the ceiling fits");
+        let at_limit = load_input_table_with_limit(
+            &source,
+            single.input(),
+            &opts,
+            largest.total_bytes,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("a total equal to the ceiling fits");
         assert_eq!(at_limit.full.num_rows(), geoms.len());
     }
 
@@ -11919,7 +11823,12 @@ mod tests {
         });
         let kv = kv_geo_with_crs(projjson);
         assert_eq!(
-            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg3857
         );
 
@@ -11927,7 +11836,12 @@ mod tests {
         for id in ["EPSG:3857", "EPSG:900913"] {
             let kv = kv_geo_with_crs(serde_json::Value::String(id.to_string()));
             assert_eq!(
-                detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+                detect_crs_from_kv(
+                    Some(&kv),
+                    "t.parquet",
+                    &crate::diagnostics::Diagnostics::default()
+                )
+                .unwrap(),
                 Crs::Epsg3857,
                 "{id}"
             );
@@ -11939,7 +11853,12 @@ mod tests {
             "id": { "authority": "EPSG", "code": 4326 }
         }));
         assert_eq!(
-            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg4326
         );
 
@@ -11951,7 +11870,11 @@ mod tests {
             "id": { "authority": "EPSG", "code": 32633 }
         }));
         assert!(matches!(
-            detect_crs_from_kv(Some(&kv), "t.parquet"),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Err(ConvertError::UnsupportedCrs { .. })
         ));
     }
@@ -11986,7 +11909,12 @@ mod tests {
             tylertoo_io::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap()).unwrap();
         let kv = meta.file_metadata().key_value_metadata().cloned();
         assert_eq!(
-            detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                kv.as_ref(),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg3857
         );
 
@@ -15128,10 +15056,7 @@ mod tests {
                 value: 591.5,
             }]
         );
-        assert_eq!(
-            out_of_range_exemplar_note(&report.out_of_range_exemplars),
-            " e.g. lon 591.500 (part 1, row 1)"
-        );
+        assert!(report.diagnostics.iter().any(|d| matches!(d, crate::diagnostics::Diagnostic::OutOfRange {exemplars,..} if exemplars[0].part == Some(1))));
     }
 
     /// String equality / IN, IS NULL, and OR-composition semantics.

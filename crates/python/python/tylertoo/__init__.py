@@ -23,6 +23,7 @@ __all__ = [
     "ConfigError",
     "ConvertReport",
     "DecodeReport",
+    "Diagnostic",
     "ExportReport",
     "LevelReport",
     "OutOfRangeExemplar",
@@ -33,6 +34,7 @@ __all__ = [
     "RemoteFetch",
     "SkippedLevel",
     "SkippedPropertyColumn",
+    "SourceLoss",
     "ValidationCheck",
     "ValidationReport",
     "ZoomReport",
@@ -87,6 +89,43 @@ class RemoteFetch(TypedDict):
     object_size: int
 
 
+class _DiagnosticDetails(TypedDict, total=False):
+    """Variant-specific fields of a serialized core diagnostic."""
+
+    exemplars: list[OutOfRangeExemplar]
+    context: dict[str, Any] | None
+    repair_kind: str
+    cap: int
+    name: str
+    data_type: str
+    reason: dict[str, Any]
+    machine: int | None
+    limit: int
+    input: str
+    total: int
+    levels: list[int]
+    gsd_min: float
+    gsd_max: float
+    input_features: int
+    first_written_gsd: float
+    first_written_zoom: int | None
+
+
+class Diagnostic(_DiagnosticDetails):
+    """One aggregated event from this operation."""
+
+    kind: str
+    count: int
+
+
+class SourceLoss(TypedDict):
+    """An absent source row or exported feature ID."""
+
+    id: int
+    zoom: int | None
+    cause: str
+
+
 class OverviewReport(TypedDict):
     """Overview output counts, sizes, and input diagnostics.
 
@@ -112,6 +151,9 @@ class OverviewReport(TypedDict):
             file under Parquet's row-group limit. None otherwise.
     """
 
+    diagnostics: list[Diagnostic]
+    source_losses: list[SourceLoss]
+    input_rows: int
     mode: Literal["duplicating", "partitioning"]
     levels: list[LevelReport]
     skipped_empty_levels: list[SkippedLevel]
@@ -177,6 +219,8 @@ class ExportReport(TypedDict):
             binary. Struct, list, and map columns become JSON strings.
     """
 
+    diagnostics: list[Diagnostic]
+    source_losses: list[SourceLoss]
     mode: str
     min_zoom: int
     max_zoom: int
@@ -244,6 +288,7 @@ class PyramidReport(TypedDict):
             valid JSON, and so passed on no credit.
     """
 
+    diagnostics: list[Diagnostic]
     total_tiles: int
     bands: list[PyramidBandReport]
     skipped_tiles: int

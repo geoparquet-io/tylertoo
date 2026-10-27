@@ -600,6 +600,14 @@ impl ConvertSource {
         }
     }
 
+    pub(crate) fn record_diagnostics(&self, sink: &crate::diagnostics::Diagnostics) {
+        if let Self::Multi(source) = self {
+            for meta in &source.metas {
+                meta.resolved.record_diagnostics(sink);
+            }
+        }
+    }
+
     /// Parquet key-value metadata of partition 0 (the `geo` metadata used
     /// for CRS detection; construction validated all parts agree).
     ///

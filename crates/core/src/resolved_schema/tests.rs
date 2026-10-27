@@ -100,3 +100,51 @@ fn persisted_descriptor_cannot_claim_a_spatial_subset() {
     json["source_is_subset"] = Value::Bool(true);
     assert!(ResolvedSchema::from_metadata(&with_descriptor(&md, json.to_string())).is_err());
 }
+
+#[test]
+fn cached_schema_warnings_are_replayed_once_for_each_run() {
+    use crate::diagnostics::{CrsWarning, Diagnostic, Diagnostics};
+    let schema = Schema::new_with_metadata(
+        vec![arrow_schema::Field::new(
+            "shape",
+            arrow_schema::DataType::Binary,
+            true,
+        )],
+        [(
+            "geo".to_owned(),
+            serde_json::json!({
+                "version": "9.0.0", "primary_column": "shape",
+                "columns": {"shape": {"encoding": "WKB", "crs": null}}
+            })
+            .to_string(),
+        )]
+        .into(),
+    );
+    let resolved = ResolvedSchema::resolve(&schema).unwrap();
+    for _ in 0..2 {
+        let sink = Diagnostics::silent();
+        resolved.record_diagnostics(&sink);
+        resolved.record_diagnostics(&sink);
+        let mut expected = vec![
+            Diagnostic::CrsMetadata {
+                count: 1,
+                reason: CrsWarning::UnknownVersion("9.0.0".into()),
+            },
+            Diagnostic::CrsMetadata {
+                count: 1,
+                reason: CrsWarning::NullCrsDegrees,
+            },
+        ];
+        expected.sort_by_cached_key(|event| serde_json::to_string(event).unwrap());
+        assert_eq!(sink.snapshot(), expected);
+    }
+}
+
+#[test]
+fn native_declared_crs_has_no_assumption_diagnostics() {
+    let metadata = native_metadata(Some("EPSG:3857"));
+    let resolved = ResolvedSchema::from_metadata(&metadata).unwrap();
+    let sink = crate::diagnostics::Diagnostics::silent();
+    resolved.record_diagnostics(&sink);
+    assert!(sink.snapshot().is_empty());
+}

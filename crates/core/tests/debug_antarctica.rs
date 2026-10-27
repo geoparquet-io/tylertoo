@@ -81,7 +81,11 @@ fn find_problematic_tiles() {
             }
 
             let start = Instant::now();
-            let _result = clip_multipolygon_ioverlay(&mp, &bounds);
+            let _result = clip_multipolygon_ioverlay(
+                &mp,
+                &bounds,
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            );
             let elapsed = start.elapsed();
 
             if elapsed > slow_threshold {
@@ -144,7 +148,11 @@ fn test_single_tile() {
     println!("Testing z5/x0/y22: {:?}", bounds);
 
     let start = Instant::now();
-    let result = clip_multipolygon_ioverlay(&mp, &bounds);
+    let result = clip_multipolygon_ioverlay(
+        &mp,
+        &bounds,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     let elapsed = start.elapsed();
 
     println!("Completed in {:.3}s", elapsed.as_secs_f64());

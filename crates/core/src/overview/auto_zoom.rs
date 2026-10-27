@@ -627,7 +627,11 @@ pub(crate) fn estimate_with(
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
     let descriptor = source.resolved_schema()?;
-    let (crs, _) = super::convert::crs_from_resolved(descriptor, &source.display_name())?;
+    let (crs, _) = super::convert::crs_from_resolved(
+        descriptor,
+        &source.display_name(),
+        &crate::diagnostics::Diagnostics::default(),
+    )?;
     let geom_idx = descriptor
         .geometry_name()
         .and_then(|n| schema.index_of(n).ok())

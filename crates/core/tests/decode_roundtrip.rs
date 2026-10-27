@@ -178,7 +178,12 @@ fn read_rows(path: &Path) -> Vec<Row> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "no null geometry rows");
         for (i, geometry) in geoms.into_iter().enumerate() {
             rows.push(Row {
