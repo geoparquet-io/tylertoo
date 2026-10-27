@@ -1,0 +1,1797 @@
+{
+  "decode": [
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "input",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "output",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "zoom",
+      "kind": "value",
+      "long": "zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "min_zoom",
+      "kind": "value",
+      "long": "min-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "max_zoom",
+      "kind": "value",
+      "long": "max-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "layer",
+      "kind": "value",
+      "long": "layer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "force",
+      "kind": "flag",
+      "long": "force",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": true,
+      "id": "files_from",
+      "kind": "value",
+      "long": "files-from",
+      "positional": false,
+      "possible_values": []
+    }
+  ],
+  "export-pmtiles": [
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "input",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "output",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "overview",
+      "hidden": false,
+      "id": "layer_name",
+      "kind": "value",
+      "long": "layer-name",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "name",
+      "kind": "value",
+      "long": "name",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "description",
+      "kind": "value",
+      "long": "description",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "attribution",
+      "kind": "value",
+      "long": "attribution",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "min_zoom",
+      "kind": "value",
+      "long": "min-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "include_property",
+      "kind": "append",
+      "long": "include-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "exclude_property",
+      "kind": "append",
+      "long": "exclude-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "exclude_all_properties",
+      "kind": "flag",
+      "long": "exclude-all-properties",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8",
+      "hidden": false,
+      "id": "tile_buffer",
+      "kind": "value",
+      "long": "tile-buffer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [
+        "max-tile-size"
+      ],
+      "default": "2M",
+      "hidden": false,
+      "id": "tile_size_limit",
+      "kind": "value",
+      "long": "tile-size-limit",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "500K",
+      "hidden": false,
+      "id": "max_compressed_tile_size",
+      "kind": "value",
+      "long": "max-compressed-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "merge",
+      "hidden": false,
+      "id": "size_valve",
+      "kind": "value",
+      "long": "size-valve",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "coverage_fill",
+      "kind": "flag",
+      "long": "coverage-fill",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_simple_clip_fastpath",
+      "kind": "flag",
+      "long": "no-simple-clip-fastpath",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "partition_wave",
+      "kind": "value",
+      "long": "partition-wave",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "input",
+      "hidden": false,
+      "id": "feature_order",
+      "kind": "value",
+      "long": "feature-order",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "feature_id",
+      "kind": "value",
+      "long": "feature-id",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "tile_range",
+      "kind": "value",
+      "long": "tile-range",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "zoom_ceiling",
+      "kind": "value",
+      "long": "zoom-ceiling",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "spill_dir",
+      "kind": "value",
+      "long": "spill-dir",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "force",
+      "kind": "flag",
+      "long": "force",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": true,
+      "id": "files_from",
+      "kind": "value",
+      "long": "files-from",
+      "positional": false,
+      "possible_values": []
+    }
+  ],
+  "overview": [
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "input",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "output",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "files_from",
+      "kind": "value",
+      "long": "files-from",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "duplicating",
+      "hidden": false,
+      "id": "mode",
+      "kind": "value",
+      "long": "mode",
+      "positional": false,
+      "possible_values": [
+        "duplicating",
+        "partitioning"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": "0",
+      "hidden": false,
+      "id": "min_zoom",
+      "kind": "value",
+      "long": "min-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "6",
+      "hidden": false,
+      "id": "max_zoom",
+      "kind": "value",
+      "long": "max-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "gsd",
+      "kind": "value",
+      "long": "gsd",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "bbox",
+      "kind": "value",
+      "long": "bbox",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "cogp_compat",
+      "kind": "flag",
+      "long": "cogp-compat",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "force",
+      "kind": "flag",
+      "long": "force",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "verbatim",
+      "kind": "flag",
+      "long": "verbatim",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "sort_key",
+      "kind": "value",
+      "long": "sort-key",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "magnitude_ladder",
+      "kind": "value",
+      "long": "magnitude-ladder",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1",
+      "hidden": false,
+      "id": "ladder_step",
+      "kind": "value",
+      "long": "ladder-step",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "entry_zoom",
+      "kind": "value",
+      "long": "entry-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "class_rank",
+      "kind": "value",
+      "long": "class-rank",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_auto_rank",
+      "kind": "flag",
+      "long": "no-auto-rank",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [
+        "where"
+      ],
+      "default": null,
+      "hidden": false,
+      "id": "filter",
+      "kind": "value",
+      "long": "filter",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "include_property",
+      "kind": "append",
+      "long": "include-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "exclude_property",
+      "kind": "append",
+      "long": "exclude-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "exclude_all_properties",
+      "kind": "flag",
+      "long": "exclude-all-properties",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1024.0",
+      "hidden": false,
+      "id": "gsd_base",
+      "kind": "value",
+      "long": "gsd-base",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "simplify_factor",
+      "kind": "value",
+      "long": "simplify-factor",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "collapse",
+      "kind": "flag",
+      "long": "collapse",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "collapse_square",
+      "kind": "flag",
+      "long": "collapse-square",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_collapse",
+      "kind": "flag",
+      "long": "no-collapse",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "representation",
+      "kind": "value",
+      "long": "representation",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_cascade",
+      "kind": "flag",
+      "long": "no-cascade",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "point_thinning",
+      "kind": "value",
+      "long": "point-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "line_thinning",
+      "kind": "value",
+      "long": "line-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "polygon_thinning",
+      "kind": "value",
+      "long": "polygon-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "line_visibility",
+      "kind": "value",
+      "long": "line-visibility",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "polygon_visibility",
+      "kind": "value",
+      "long": "polygon-visibility",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.65",
+      "hidden": false,
+      "id": "drop_rate",
+      "kind": "value",
+      "long": "drop-rate",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.5",
+      "hidden": false,
+      "id": "drop_gamma",
+      "kind": "value",
+      "long": "drop-gamma",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_density_drop",
+      "kind": "flag",
+      "long": "no-density-drop",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "drop_lines",
+      "kind": "flag",
+      "long": "drop-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "drop_polygons",
+      "kind": "flag",
+      "long": "drop-polygons",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "cluster",
+      "kind": "flag",
+      "long": "cluster",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "accumulate_attribute",
+      "kind": "append",
+      "long": "accumulate-attribute",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_coalesce_lines",
+      "kind": "flag",
+      "long": "no-coalesce-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": true,
+      "id": "coalesce_lines",
+      "kind": "flag",
+      "long": "coalesce-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "0.0",
+      "hidden": false,
+      "id": "coalesce_junction_angle",
+      "kind": "value",
+      "long": "coalesce-junction-angle",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.0",
+      "hidden": false,
+      "id": "coalesce_snap",
+      "kind": "value",
+      "long": "coalesce-snap",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "2000000",
+      "hidden": false,
+      "id": "coalesce_max_level_rows",
+      "kind": "value",
+      "long": "coalesce-max-level-rows",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "10000",
+      "hidden": false,
+      "id": "row_group_size",
+      "kind": "value",
+      "long": "row-group-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "constant",
+      "hidden": false,
+      "id": "row_group_size_policy",
+      "kind": "value",
+      "long": "row-group-size-policy",
+      "positional": false,
+      "possible_values": [
+        "constant",
+        "zoom-scaled"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "full_column_stats",
+      "kind": "flag",
+      "long": "full-column-stats",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_streaming",
+      "kind": "flag",
+      "long": "no-streaming",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8192",
+      "hidden": false,
+      "id": "read_batch_size",
+      "kind": "value",
+      "long": "read-batch-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "profile",
+      "kind": "value",
+      "long": "profile",
+      "positional": false,
+      "possible_values": [
+        "auto",
+        "speed",
+        "bounded"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "in_flight_batches",
+      "kind": "value",
+      "long": "in-flight-batches",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "read_workers",
+      "kind": "value",
+      "long": "read-workers",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "spill_dir",
+      "kind": "value",
+      "long": "spill-dir",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "save_plan",
+      "kind": "value",
+      "long": "save-plan",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "plan",
+      "kind": "value",
+      "long": "plan",
+      "positional": false,
+      "possible_values": []
+    }
+  ],
+  "pyramid": [
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "output",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "bands",
+      "kind": "append",
+      "long": "band",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "name",
+      "kind": "value",
+      "long": "name",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "description",
+      "kind": "value",
+      "long": "description",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "attribution",
+      "kind": "value",
+      "long": "attribution",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "generalize",
+      "kind": "flag",
+      "long": "generalize",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "max_tile_size",
+      "kind": "value",
+      "long": "max-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "input",
+      "hidden": false,
+      "id": "feature_order",
+      "kind": "value",
+      "long": "feature-order",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "work_dir",
+      "kind": "value",
+      "long": "work-dir",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "allow_missing_zooms",
+      "kind": "flag",
+      "long": "allow-missing-zooms",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "force",
+      "kind": "flag",
+      "long": "force",
+      "positional": false,
+      "possible_values": []
+    }
+  ],
+  "tiles": [
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "input",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "output",
+      "kind": "value",
+      "long": null,
+      "positional": true,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "files_from",
+      "kind": "value",
+      "long": "files-from",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "0",
+      "hidden": false,
+      "id": "min_zoom",
+      "kind": "value",
+      "long": "min-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "14",
+      "hidden": false,
+      "id": "max_zoom",
+      "kind": "value",
+      "long": "max-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "gsd",
+      "kind": "value",
+      "long": "gsd",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "bbox",
+      "kind": "value",
+      "long": "bbox",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "layer_name",
+      "kind": "value",
+      "long": "layer-name",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "name",
+      "kind": "value",
+      "long": "name",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "description",
+      "kind": "value",
+      "long": "description",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "attribution",
+      "kind": "value",
+      "long": "attribution",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [
+        "tile-size-limit"
+      ],
+      "default": null,
+      "hidden": false,
+      "id": "max_tile_size",
+      "kind": "value",
+      "long": "max-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "max_compressed_tile_size",
+      "kind": "value",
+      "long": "max-compressed-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "merge",
+      "hidden": false,
+      "id": "size_valve",
+      "kind": "value",
+      "long": "size-valve",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "coverage_fill",
+      "kind": "flag",
+      "long": "coverage-fill",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_simple_clip_fastpath",
+      "kind": "flag",
+      "long": "no-simple-clip-fastpath",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8",
+      "hidden": false,
+      "id": "tile_buffer",
+      "kind": "value",
+      "long": "tile-buffer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "partition_wave",
+      "kind": "value",
+      "long": "partition-wave",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "input",
+      "hidden": false,
+      "id": "feature_order",
+      "kind": "value",
+      "long": "feature-order",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "feature_id",
+      "kind": "value",
+      "long": "feature-id",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "keep_overview",
+      "kind": "value",
+      "long": "keep-overview",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "shard",
+      "kind": "value",
+      "long": "shard",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "shard_plan",
+      "kind": "value",
+      "long": "shard-plan",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "tile_range",
+      "kind": "value",
+      "long": "tile-range",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "plan_only",
+      "kind": "flag",
+      "long": "plan-only",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "verbose",
+      "kind": "flag",
+      "long": "verbose",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "force",
+      "kind": "flag",
+      "long": "force",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "verbatim",
+      "kind": "flag",
+      "long": "verbatim",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "sort_key",
+      "kind": "value",
+      "long": "sort-key",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "magnitude_ladder",
+      "kind": "value",
+      "long": "magnitude-ladder",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1",
+      "hidden": false,
+      "id": "ladder_step",
+      "kind": "value",
+      "long": "ladder-step",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "entry_zoom",
+      "kind": "value",
+      "long": "entry-zoom",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "class_rank",
+      "kind": "value",
+      "long": "class-rank",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_auto_rank",
+      "kind": "flag",
+      "long": "no-auto-rank",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [
+        "where"
+      ],
+      "default": null,
+      "hidden": false,
+      "id": "filter",
+      "kind": "value",
+      "long": "filter",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "include_property",
+      "kind": "append",
+      "long": "include-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "exclude_property",
+      "kind": "append",
+      "long": "exclude-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "exclude_all_properties",
+      "kind": "flag",
+      "long": "exclude-all-properties",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1024.0",
+      "hidden": false,
+      "id": "gsd_base",
+      "kind": "value",
+      "long": "gsd-base",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "simplify_factor",
+      "kind": "value",
+      "long": "simplify-factor",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "collapse",
+      "kind": "flag",
+      "long": "collapse",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "collapse_square",
+      "kind": "flag",
+      "long": "collapse-square",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_collapse",
+      "kind": "flag",
+      "long": "no-collapse",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "representation",
+      "kind": "value",
+      "long": "representation",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_cascade",
+      "kind": "flag",
+      "long": "no-cascade",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "point_thinning",
+      "kind": "value",
+      "long": "point-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "line_thinning",
+      "kind": "value",
+      "long": "line-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "polygon_thinning",
+      "kind": "value",
+      "long": "polygon-thinning",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "line_visibility",
+      "kind": "value",
+      "long": "line-visibility",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "polygon_visibility",
+      "kind": "value",
+      "long": "polygon-visibility",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.65",
+      "hidden": false,
+      "id": "drop_rate",
+      "kind": "value",
+      "long": "drop-rate",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.5",
+      "hidden": false,
+      "id": "drop_gamma",
+      "kind": "value",
+      "long": "drop-gamma",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_density_drop",
+      "kind": "flag",
+      "long": "no-density-drop",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "drop_lines",
+      "kind": "flag",
+      "long": "drop-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "drop_polygons",
+      "kind": "flag",
+      "long": "drop-polygons",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "cluster",
+      "kind": "flag",
+      "long": "cluster",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "accumulate_attribute",
+      "kind": "append",
+      "long": "accumulate-attribute",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_coalesce_lines",
+      "kind": "flag",
+      "long": "no-coalesce-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": true,
+      "id": "coalesce_lines",
+      "kind": "flag",
+      "long": "coalesce-lines",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "0.0",
+      "hidden": false,
+      "id": "coalesce_junction_angle",
+      "kind": "value",
+      "long": "coalesce-junction-angle",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "1.0",
+      "hidden": false,
+      "id": "coalesce_snap",
+      "kind": "value",
+      "long": "coalesce-snap",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "2000000",
+      "hidden": false,
+      "id": "coalesce_max_level_rows",
+      "kind": "value",
+      "long": "coalesce-max-level-rows",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "10000",
+      "hidden": false,
+      "id": "row_group_size",
+      "kind": "value",
+      "long": "row-group-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "constant",
+      "hidden": false,
+      "id": "row_group_size_policy",
+      "kind": "value",
+      "long": "row-group-size-policy",
+      "positional": false,
+      "possible_values": [
+        "constant",
+        "zoom-scaled"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "full_column_stats",
+      "kind": "flag",
+      "long": "full-column-stats",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_streaming",
+      "kind": "flag",
+      "long": "no-streaming",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8192",
+      "hidden": false,
+      "id": "read_batch_size",
+      "kind": "value",
+      "long": "read-batch-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "profile",
+      "kind": "value",
+      "long": "profile",
+      "positional": false,
+      "possible_values": [
+        "auto",
+        "speed",
+        "bounded"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "in_flight_batches",
+      "kind": "value",
+      "long": "in-flight-batches",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "read_workers",
+      "kind": "value",
+      "long": "read-workers",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "spill_dir",
+      "kind": "value",
+      "long": "spill-dir",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "save_plan",
+      "kind": "value",
+      "long": "save-plan",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "plan",
+      "kind": "value",
+      "long": "plan",
+      "positional": false,
+      "possible_values": []
+    }
+  ]
+}

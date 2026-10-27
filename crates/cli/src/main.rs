@@ -5452,3 +5452,11 @@ mod tests {
         assert!(err.contains("description"), "{err}");
     }
 }
+
+// Surface-parity gates (#779, track G2): flag/kwarg parity, defaults,
+// parsed-but-unused flags and pyramid/tiles flag parity. The test source lives
+// with the other CLI tests; it is compiled here because the Args structs and
+// the option builders are private to this binary crate.
+#[cfg(test)]
+#[path = "../tests/parity/in_crate.rs"]
+mod surface_parity;

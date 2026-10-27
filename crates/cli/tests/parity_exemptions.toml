@@ -1,0 +1,759 @@
+# Surface-parity exemption ledger for the CLI (#779, track G2).
+#
+# Read by crates/cli/tests/parity/in_crate.rs, which is compiled into the
+# binary's unit tests. Every entry has a reason and an issue number. The
+# number of entries per table and kind is pinned in PINNED there, so adding
+# or dropping one shows up in review.
+#
+# `xfail = true` marks known drift, not an allowed difference. The test
+# passes while the drift is there, and fails once it is gone and the entry
+# remains, like a strict pytest xfail. #779's F3 track (one TilesConfig, one
+# builder per command) removes these entries.
+#
+# Tables:
+#   [[parsed_unused]]     (c) a flag whose change leaves the core options the
+#                         command's builder makes unchanged. exempt: the flag
+#                         is presentation only. xfail: the flag is mapped
+#                         inline in a run_* function no test can call.
+#   [[defaults]]          (b) a core options field whose clap default differs
+#                         from the core Default on purpose.
+#   [[pyramid_vs_tiles]]  (d) a flag on `tiles` and not `pyramid`, or the
+#                         reverse. xfail: an export knob pyramid lacks.
+
+
+# --- (c) parsed but unused: presentation only ------------------------------
+
+[[parsed_unused]]
+command = "tiles"
+flag = "files-from"
+reason = "Input selection: reaches the InputSpec, not the options; files_from_parses_on_both_subcommands covers it."
+issue = 779
+
+[[parsed_unused]]
+command = "tiles"
+flag = "report"
+reason = "Output path for the JSON report; no core option."
+issue = 779
+
+[[parsed_unused]]
+command = "tiles"
+flag = "shard"
+reason = "Needs a shard plan file on disk; sharded_builds.rs covers the mapping."
+issue = 498
+
+[[parsed_unused]]
+command = "tiles"
+flag = "shard-plan"
+reason = "Needs a shard plan file on disk; sharded_builds.rs covers the mapping."
+issue = 498
+
+[[parsed_unused]]
+command = "tiles"
+flag = "plan-only"
+reason = "Control flow (run_plan_only), not an option; plan_only_parses_and_names_every_export_only_flag covers it."
+issue = 560
+
+[[parsed_unused]]
+command = "tiles"
+flag = "verbose"
+reason = "Logging only."
+issue = 779
+
+[[parsed_unused]]
+command = "tiles"
+flag = "force"
+reason = "Overwrite guard checked before any work; no core option."
+issue = 427
+
+[[parsed_unused]]
+command = "overview"
+flag = "files-from"
+reason = "Input selection: reaches the InputSpec, not the options."
+issue = 779
+
+[[parsed_unused]]
+command = "overview"
+flag = "report"
+reason = "Output path for the JSON report; no core option."
+issue = 779
+
+[[parsed_unused]]
+command = "overview"
+flag = "force"
+reason = "Overwrite guard checked before any work; no core option."
+issue = 427
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "report"
+reason = "Output path for the JSON report; no core option."
+issue = 779
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "force"
+reason = "Overwrite guard checked before any work; no core option."
+issue = 427
+
+[[parsed_unused]]
+command = "pyramid"
+flag = "band"
+reason = "Band specs are parsed by core parse_bands in run_pyramid, not by pyramid_options."
+issue = 445
+
+[[parsed_unused]]
+command = "pyramid"
+flag = "force"
+reason = "Overwrite guard checked before any work; no core option."
+issue = 427
+
+
+# --- (c) parsed but unused: xfail, no callable builder ----------------------
+
+[[parsed_unused]]
+command = "tiles"
+flag = "layer-name"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "name"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "description"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "attribution"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "max-tile-size"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "max-compressed-tile-size"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "size-valve"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "coverage-fill"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "no-simple-clip-fastpath"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "tile-buffer"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "partition-wave"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "feature-order"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "feature-id"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "tiles"
+flag = "keep-overview"
+reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "mode"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "min-zoom"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "max-zoom"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "gsd"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "bbox"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "overview"
+flag = "cogp-compat"
+reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "layer-name"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "name"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "description"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "attribution"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "min-zoom"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "include-property"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "exclude-property"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "exclude-all-properties"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "tile-buffer"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "tile-size-limit"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "max-compressed-tile-size"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "size-valve"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "coverage-fill"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "no-simple-clip-fastpath"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "partition-wave"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "feature-order"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "feature-id"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "tile-range"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "zoom-ceiling"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+[[parsed_unused]]
+command = "export-pmtiles"
+flag = "spill-dir"
+reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
+issue = 779
+xfail = true
+
+
+# --- (b) defaults -----------------------------------------------------------
+
+[[defaults]]
+command = "tiles"
+field = "levels"
+reason = "tiles defaults to --max-zoom 14, the web-map depth tippecanoe's -z also defaults to; overview and ConvertOptions::default() keep z6."
+issue = 779
+
+
+# --- (d) pyramid vs tiles ---------------------------------------------------
+
+[[pyramid_vs_tiles]]
+flag = "accumulate-attribute"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "allow-missing-zooms"
+reason = "Applies only to a pre-tiled band archive, which tiles never reads."
+issue = 495
+
+[[pyramid_vs_tiles]]
+flag = "band"
+reason = "pyramid's input: each band names its input, zoom range and layer."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "bbox"
+reason = "A band is a prepared input; crop it before banding."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "class-rank"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "cluster"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "coalesce-junction-angle"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "coalesce-max-level-rows"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "coalesce-snap"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "collapse"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "collapse-square"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "coverage-fill"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "drop-gamma"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "drop-lines"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "drop-polygons"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "drop-rate"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "entry-zoom"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "exclude-all-properties"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "exclude-property"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "feature-id"
+reason = "pyramid lacks --feature-id: the pyramid half of #443."
+issue = 443
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "files-from"
+reason = "Each band names its own input."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "filter"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "full-column-stats"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "generalize"
+reason = "pyramid bands default to verbatim; --generalize is the opposite of tiles --verbatim."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "gsd"
+reason = "Each band names its own zoom range."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "gsd-base"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "in-flight-batches"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "include-property"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "keep-overview"
+reason = "The per-band intermediates are temporary by design."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "ladder-step"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "layer-name"
+reason = "Each band names its own layer."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "line-thinning"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "line-visibility"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "magnitude-ladder"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "max-compressed-tile-size"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "max-zoom"
+reason = "Each band names its own zoom range."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "min-zoom"
+reason = "Each band names its own zoom range."
+issue = 345
+
+[[pyramid_vs_tiles]]
+flag = "no-auto-rank"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "no-cascade"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "no-coalesce-lines"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "no-collapse"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "no-density-drop"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "no-simple-clip-fastpath"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "no-streaming"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "partition-wave"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "plan"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "plan-only"
+reason = "Sharded builds are a single-input tiles feature."
+issue = 560
+
+[[pyramid_vs_tiles]]
+flag = "point-thinning"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "polygon-thinning"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "polygon-visibility"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "profile"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "read-batch-size"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "read-workers"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "report"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "representation"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "row-group-size"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "row-group-size-policy"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "save-plan"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "shard"
+reason = "Sharded builds are a single-input tiles feature."
+issue = 498
+
+[[pyramid_vs_tiles]]
+flag = "shard-plan"
+reason = "Sharded builds are a single-input tiles feature."
+issue = 498
+
+[[pyramid_vs_tiles]]
+flag = "simplify-factor"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "size-valve"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "sort-key"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "spill-dir"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "tile-buffer"
+reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+issue = 458
+xfail = true
+
+[[pyramid_vs_tiles]]
+flag = "tile-range"
+reason = "Sharded builds are a single-input tiles feature."
+issue = 498
+
+[[pyramid_vs_tiles]]
+flag = "verbatim"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
+issue = 458
+
+[[pyramid_vs_tiles]]
+flag = "verbose"
+reason = "pyramid always prints its per-band lines."
+issue = 779
+
+[[pyramid_vs_tiles]]
+flag = "work-dir"
+reason = "Directory for the per-band intermediates; the tiles scratch knob is --spill-dir."
+issue = 345
