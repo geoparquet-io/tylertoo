@@ -138,7 +138,7 @@ class TestOverviewApi:
             tylertoo.overview()  # type: ignore[call-arg]
 
     def test_overview_invalid_mode(self):
-        with pytest.raises(ValueError, match=r"[Ii]nvalid mode"):
+        with pytest.raises(tylertoo.ConfigError, match=r"mode.*bogus"):
             tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
@@ -911,7 +911,7 @@ class TestPublicationMetadata:
     @pytest.mark.parametrize("key", KEYS)
     def test_wrong_type_is_refused(self, overview_file, tmp_path, key):
         kwargs: dict[str, Any] = {key: 1}
-        with pytest.raises(TypeError):
+        with pytest.raises(tylertoo.ConfigError):
             tylertoo.export_pmtiles(
                 str(overview_file), str(tmp_path / "pm.pmtiles"), **kwargs
             )

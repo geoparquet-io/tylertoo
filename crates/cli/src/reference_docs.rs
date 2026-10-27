@@ -3,7 +3,27 @@
 use clap::{Args, CommandFactory};
 use std::fmt::Write;
 
-use super::{Cli, ConvertTuningArgs};
+use super::Cli;
+type ConvertTuningArgs = tylertoo_core::overview::config::cli::ConvertArgs<false>;
+
+/// Honor clap's hidden defaults and inverted switches in clap-markdown 0.1.5.
+pub(super) fn command_for_markdown(command: clap::Command) -> clap::Command {
+    command
+        .mut_args(|arg| {
+            let arg = if arg.is_hide_default_value_set() {
+                arg.default_value(None::<&str>)
+            } else {
+                arg
+            };
+            if matches!(arg.get_action(), clap::ArgAction::SetFalse) {
+                arg.action(clap::ArgAction::SetTrue)
+                    .default_value(None::<&str>)
+            } else {
+                arg
+            }
+        })
+        .mut_subcommands(command_for_markdown)
+}
 
 /// Group options under their CLI help headings and print shared tuning once.
 pub(super) fn format(markdown: String) -> String {

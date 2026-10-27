@@ -13,9 +13,9 @@
 //!   `--force`, a directory, an unwritable parent).
 //! - [`collapse_mode`], [`entry_zoom`], [`class_ranking`] and
 //!   [`representation`]: the flag-shaped inputs, which
-//!   [`ConvertKnobs`](super::knobs::ConvertKnobs) turns into
+//!   [`keywords`] turns into
 //!   [`ConvertOptions`](super::convert::ConvertOptions) fields. The
-//!   frontends fill the knobs; they map no knob onto an option themselves.
+//!   frontends deserialize core options.
 //!
 //! The option structs validate themselves before any input is read:
 //! [`ConvertOptions::validate`](super::convert::ConvertOptions::validate),
@@ -23,7 +23,11 @@
 //! [`TilesOptions::validate`](super::tiles::TilesOptions::validate) and
 //! [`PyramidOptions::validate`](crate::pyramid::PyramidOptions::validate).
 
+use serde::de::{self, Deserializer, Visitor};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::convert::{
@@ -417,6 +421,23 @@ pub fn check_spill_dir(spill_dir: Option<&Path>) -> Result<(), ConfigError> {
         dir: dir.to_path_buf(),
         reason: e.to_string(),
     })
+}
+
+/// Check an explicitly selected pyramid work directory before reading bands.
+///
+/// # Errors
+/// Returns a diagnostic naming `work_dir` for an unavailable directory.
+pub fn check_work_dir(work_dir: Option<&Path>) -> Result<(), ConfigError> {
+    if let Some(dir) = work_dir {
+        crate::atomic_output::probe_directory(dir).map_err(|error| ConfigError::InvalidSpec {
+            option: "--work-dir / work_dir",
+            message: format!(
+                "--work-dir / work_dir {} cannot be used: {error}",
+                dir.display()
+            ),
+        })?;
+    }
+    Ok(())
 }
 
 /// The below-tolerance polygon disposition from the frontends' switches.
@@ -843,5 +864,245 @@ mod tests {
         assert_eq!(representation(Some("0-3:point")).unwrap().len(), 1);
         let err = representation(Some("bogus")).unwrap_err();
         assert!(err.to_string().starts_with("--representation: "), "{err}");
+    }
+}
+
+pub(crate) mod spelled {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+    use std::fmt::Display;
+    use std::str::FromStr;
+
+    pub fn serialize<S: Serializer, T: Display>(value: &T, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromStr,
+        T::Err: Display,
+    {
+        parse(&String::deserialize(d)?)
+    }
+
+    /// [`deserialize`], ignoring case.
+    pub fn deserialize_lowercase<'de, D, T>(d: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromStr,
+        T::Err: Display,
+    {
+        parse(&String::deserialize(d)?.to_lowercase())
+    }
+
+    fn parse<T: FromStr, E: de::Error>(s: &str) -> Result<T, E>
+    where
+        T::Err: Display,
+    {
+        s.parse().map_err(E::custom)
+    }
+}
+
+/// Options which have passed their core validation rules.
+///
+/// The borrowed options cannot be changed while this proof is alive. There is
+/// deliberately no public constructor or mutable accessor.
+///
+/// ```compile_fail
+/// use tylertoo_core::overview::{config::ValidatedConfig, convert::ConvertOptions};
+/// let options = ConvertOptions::default();
+/// let _config = ValidatedConfig { options: &options };
+/// ```
+///
+/// ```compile_fail
+/// use tylertoo_core::overview::convert::ConvertOptions;
+/// let mut options = ConvertOptions::default();
+/// let config = options.validate().unwrap();
+/// options.read_batch_size = 0;
+/// assert!(config.options().read_batch_size > 0);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedConfig<'a, T> {
+    options: &'a T,
+}
+
+impl<'a, T> ValidatedConfig<'a, T> {
+    fn new(options: &'a T) -> Self {
+        Self { options }
+    }
+
+    /// The validated options, available for reading only.
+    pub fn options(&self) -> &'a T {
+        self.options
+    }
+}
+
+pub(crate) mod tile_range {
+    use crate::shard::TileRange;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<TileRange>, s: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(range) => s.serialize_some(&format!("{}..{}", range.lo(), range.hi())),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TileRange>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|s| TileRange::parse(&s).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
+pub(crate) mod accumulation {
+    use super::super::cluster::AccumulateSpec;
+    use super::super::convert::parse_accumulate;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(value: &[AccumulateSpec], s: S) -> Result<S::Ok, S::Error> {
+        if value.is_empty() {
+            return s.serialize_none();
+        }
+        s.collect_seq(
+            value
+                .iter()
+                .map(|spec| format!("{}:{}", spec.column, spec.op.as_str())),
+        )
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<AccumulateSpec>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Specs {
+            List(Vec<String>),
+            Mapping(BTreeMap<String, String>),
+        }
+        let specs = match Option::<Specs>::deserialize(d)? {
+            Some(Specs::List(specs)) => specs,
+            Some(Specs::Mapping(specs)) => specs
+                .into_iter()
+                .map(|(column, op)| format!("{column}:{op}"))
+                .collect(),
+            None => Vec::new(),
+        };
+        specs
+            .iter()
+            .map(|spec| parse_accumulate(spec).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
+/// Validate convert options before they can reach either engine.
+pub(super) fn validate_convert(
+    options: &super::convert::ConvertOptions,
+) -> Result<ValidatedConfig<'_, super::convert::ConvertOptions>, super::convert::ConvertError> {
+    options.check()?;
+    Ok(ValidatedConfig::new(options))
+}
+
+/// Validate export options before they can reach the export engine.
+pub(super) fn validate_export(
+    options: &super::export::ExportOptions,
+) -> Result<ValidatedConfig<'_, super::export::ExportOptions>, ConfigError> {
+    options.check()?;
+    Ok(ValidatedConfig::new(options))
+}
+
+/// Validate the complete tiles facade configuration.
+pub(super) fn validate_tiles(
+    options: &super::tiles::TilesOptions,
+) -> Result<ValidatedConfig<'_, super::tiles::TilesOptions>, super::tiles::TilesError> {
+    options.check()?;
+    Ok(ValidatedConfig::new(options))
+}
+
+/// Validate a complete pyramid before reading any band.
+pub(crate) fn validate_pyramid(
+    options: &crate::pyramid::PyramidOptions,
+) -> Result<ValidatedConfig<'_, crate::pyramid::PyramidOptions>, crate::Error> {
+    options.check()?;
+    Ok(ValidatedConfig::new(options))
+}
+
+/// A per-tile size cap as a caller states it: `auto` (the command's own core
+/// default) or a byte count, `0` for no cap (#761). Python also takes `None`
+/// for no cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizeCap {
+    /// The command's own default cap.
+    #[default]
+    Auto,
+    /// This many bytes; `0` is no cap.
+    Bytes(usize),
+}
+
+impl SizeCap {
+    /// This cap over `default`, the command's own: `Auto` keeps it, `0`
+    /// turns the cap off, any other size replaces it.
+    pub fn or(self, default: Option<usize>) -> Option<usize> {
+        match self {
+            SizeCap::Auto => default,
+            SizeCap::Bytes(n) => (n > 0).then_some(n),
+        }
+    }
+}
+
+impl Serialize for SizeCap {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SizeCap::Auto => s.serialize_str("auto"),
+            SizeCap::Bytes(n) => s.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SizeCap {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct CapVisitor;
+        impl Visitor<'_> for CapVisitor {
+            type Value = SizeCap;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("\"auto\", None or a byte count")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<SizeCap, E> {
+                if s.trim().eq_ignore_ascii_case("auto") {
+                    Ok(SizeCap::Auto)
+                } else {
+                    Err(E::invalid_value(de::Unexpected::Str(s), &self))
+                }
+            }
+            fn visit_u64<E: de::Error>(self, n: u64) -> Result<SizeCap, E> {
+                usize::try_from(n)
+                    .map(SizeCap::Bytes)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(n), &self))
+            }
+            fn visit_i64<E: de::Error>(self, n: i64) -> Result<SizeCap, E> {
+                u64::try_from(n)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(n), &self))
+                    .and_then(|n| self.visit_u64(n))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<SizeCap, E> {
+                Ok(SizeCap::Bytes(0))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<SizeCap, E> {
+                Ok(SizeCap::Bytes(0))
+            }
+        }
+        d.deserialize_any(CapVisitor)
+    }
+}
+
+#[cfg(feature = "cli")]
+pub mod cli;
+pub mod keywords;
+mod values;
+
+pub(super) fn finite_number(name: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(format!("{name} = {value} must be a finite value"))
     }
 }

@@ -119,7 +119,7 @@ const MIN_LINESTRING_POINTS: usize = 2;
 ///   point, area-dithered so aggregate area stays truthful (tippecanoe's
 ///   tiny-polygon reduction). Type-preserving — `geometry_types` stays
 ///   `["Polygon"]`, so fill-styled renderers need no style changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CollapseMode {
     /// Omit the collapsed feature (the default before #745).
     Drop,
@@ -154,13 +154,22 @@ impl CollapseMode {
 }
 
 /// Options controlling per-level simplification.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct SimplifyOptions {
     /// Tolerance multiplier: `tolerance = factor * gsd`. See
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
+    #[serde(rename = "simplify_factor")]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().factor, long = "simplify-factor", id = "simplify_factor", help_heading = "Generalization"))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(value_name = "SIMPLIFY_FACTOR"))]
     pub factor: f64,
     /// Disposition of polygons that collapse below the visibility gate
     /// (default [`CollapseMode::Auto`]; see [`CollapseMode`]).
+    #[serde(rename = "collapse_mode")]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().collapse))]
     pub collapse: CollapseMode,
     /// Cascading simplification (#218, default **on**). When `true`:
     ///
@@ -176,6 +185,8 @@ pub struct SimplifyOptions {
     ///
     /// Output-changing: coarse-level geometry differs from the non-cascaded
     /// pipeline. `false` reproduces the pre-#218 output byte-for-byte.
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().cascade, action = clap::ArgAction::SetFalse, long = "no-cascade", help_heading = "Generalization"))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source", long_help = None))]
     pub cascade: bool,
 }
 
@@ -446,7 +457,7 @@ pub(super) fn simplify_for_level_checked(
 ///
 /// Kept an enum (never a boolean) in options, contexts, and cascade steps so
 /// further dispositions slot in without another plumbing change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Representation {
     /// Full (simplified) geometry — the normal path. Below-tolerance
     /// polygons follow the global [`CollapseMode`].

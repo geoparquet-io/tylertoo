@@ -4440,7 +4440,6 @@ dependencies = [
  "parquet",
  "serde_json",
  "tempfile",
- "toml_edit",
  "trycmd",
  "tylertoo-core",
 ]
@@ -4463,6 +4462,7 @@ dependencies = [
  "aws-smithy-types",
  "brotli",
  "bytes",
+ "clap",
  "codspeed-criterion-compat",
  "crossbeam-channel",
  "dhat",
@@ -4490,6 +4490,7 @@ dependencies = [
  "rstar",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4503,11 +4504,12 @@ dependencies = [
 name = "tylertoo-python"
 version = "0.8.0"
 dependencies = [
+ "clap",
  "pyo3",
  "pyo3-log",
  "pythonize",
  "serde",
- "serde_path_to_error",
+ "serde_json",
  "tylertoo-core",
 ]
 

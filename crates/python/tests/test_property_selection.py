@@ -87,7 +87,7 @@ class TestOverviewPropertySelection:
                 )
 
     def test_a_plain_string_is_not_a_column_list(self) -> None:
-        with pytest.raises(TypeError):
+        with pytest.raises(tylertoo.ConfigError, match="exclude_properties"):
             tylertoo.overview(
                 str(OVERTURE_NAMES),
                 "/tmp/o.parquet",
@@ -149,5 +149,5 @@ class TestConvertPropertySelection:
                 True,
                 "input",
                 None,
-                ["id"],  # type: ignore[misc]
+                ["id"],  # type: ignore[misc, arg-type]
             )

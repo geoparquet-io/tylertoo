@@ -20,6 +20,68 @@ import tylertoo
 MISSING = "/nonexistent/tylertoo-779/never-read.parquet"
 
 
+def test_legacy_positional_spill_path_accepts_pathlike(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="never-read"):
+        tylertoo.convert(
+            MISSING,
+            str(tmp_path / "out.pmtiles"),
+            0,
+            1,
+            None,
+            "auto",
+            True,
+            "input",
+            tmp_path,
+        )
+
+
+def test_pyramid_checks_options_before_band_input_exists(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match="extent"):
+        tylertoo.pyramid([f"0-2:{MISSING}"], str(tmp_path / "out.pmtiles"), extent=0)
+
+
+@pytest.mark.parametrize("keyword", ["class_ranks", "class_rank_unknown"])
+def test_rank_syntax_type_errors_name_the_keyword(tmp_path: Path, keyword: str) -> None:
+    with pytest.raises(tylertoo.ConfigError, match=keyword):
+        _convert(tmp_path, **{keyword: "wrong"})
+
+
+@pytest.mark.parametrize("keyword", ["point_thinning", "simplify_factor", "drop_gamma"])
+def test_non_finite_numbers_are_not_treated_as_missing_overrides(
+    tmp_path: Path, keyword: str
+) -> None:
+    with pytest.raises(tylertoo.ConfigError, match=keyword.replace("_", ".")):
+        _convert(tmp_path, **{keyword: math.nan})
+
+
+def test_inverted_levels_fail_before_input_lookup(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match="min_zoom"):
+        tylertoo.overview(
+            MISSING, str(tmp_path / "out.parquet"), min_zoom=7, max_zoom=2
+        )
+
+
+def test_export_zoom_bounds_fail_before_input_lookup(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match=r"min.zoom"):
+        tylertoo.export_pmtiles(MISSING, str(tmp_path / "out.pmtiles"), min_zoom=255)
+
+
+def test_pyramid_work_dir_fails_before_band_input_lookup(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match=r"work.dir"):
+        tylertoo.pyramid(
+            [f"0-2:{MISSING}"],
+            str(tmp_path / "out.pmtiles"),
+            work_dir=tmp_path / "missing",
+        )
+
+
+def test_pyramid_metadata_fails_before_band_input_lookup(tmp_path: Path) -> None:
+    with pytest.raises(tylertoo.ConfigError, match="metadata"):
+        tylertoo.pyramid(
+            [f"0-2:{MISSING}"], str(tmp_path / "out.pmtiles"), name="\0" * 3_000_000
+        )
+
+
 def _convert(tmp_path: Path, **kwargs: object) -> None:
     # `max_zoom="auto"` reads the input to pick a zoom, so a rule checked
     # after it would surface as the missing input's RuntimeError instead.

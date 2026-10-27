@@ -199,7 +199,9 @@ impl TilesShard {
 /// Note: #436 will freeze this shape (`#[non_exhaustive]` + a builder);
 /// construct it with `..TilesOptions::default()` so that lands as a
 /// non-event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct TilesOptions {
     /// The convert half ([`super::convert::convert_to_overviews`]). The
     /// facade reads `spill_dir` from here for the intermediate's location
@@ -209,19 +211,27 @@ pub struct TilesOptions {
     /// [`TilesOptions::shard`]'s convert-side consequences (`shard`,
     /// `shard_plan_digest`, the coarse `zoom_ceiling`) to its own copy, so
     /// leave those fields alone.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().convert))]
     pub convert: ConvertOptions,
     /// The export half ([`super::export::export_pmtiles`]): the size caps
     /// and valve, the tile buffer and extent, the feature order and id, the
     /// publication metadata, the hand-written tile range. See the type docs
     /// for the fields the facade derives itself.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().export))]
     pub export: ExportOptions,
     /// MVT layer name; `None` derives it from the input
     /// ([`TilesInput::derive_layer_name`]).
+    #[cfg_attr(feature = "cli", arg(long))]
+    #[cfg_attr(feature = "cli", arg(help = "Layer name for the tiles. Defaults to the input's file stem", long_help = None))]
     pub layer_name: Option<String>,
     /// Retain the intermediate overview at this path instead of a removed
     /// temp file (#314). Its parent directory must exist.
+    #[cfg_attr(feature = "cli", arg(long, value_name = "PATH"))]
+    #[cfg_attr(feature = "cli", arg(help = "Save the intermediate overview GeoParquet to PATH after export. Does not change the PMTiles output", long_help = None))]
     pub keep_overview: Option<PathBuf>,
     /// The sharded-fleet job, if any (#498).
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TilesShard>,
 }
 
@@ -299,7 +309,12 @@ impl TilesOptions {
     /// # Errors
     ///
     /// The first rule broken; [`TilesError::is_config`] is true for each.
-    pub fn validate(&self) -> Result<(), TilesError> {
+    /// Validate these options and return the immutable engine configuration.
+    pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, TilesError> {
+        super::config::validate_tiles(self)
+    }
+
+    pub(crate) fn check(&self) -> Result<(), TilesError> {
         self.validate_for(Run::Tiles)
     }
 
@@ -717,10 +732,17 @@ pub fn convert_to_pmtiles_observed(
     options: &TilesOptions,
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
-    // #779: the whole configuration, before the convert — which on a large
-    // input runs for minutes before the export would otherwise refuse a bad
-    // export knob (#433).
-    options.validate()?;
+    let config = options.validate()?;
+    convert_to_pmtiles_validated(input, output, &config, observer)
+}
+
+fn convert_to_pmtiles_validated(
+    input: &TilesInput,
+    output: &Path,
+    config: &super::config::ValidatedConfig<'_, TilesOptions>,
+    observer: &mut dyn TilesObserver,
+) -> Result<TilesOutcome, TilesError> {
+    let options = config.options();
     // #452: before the intermediate is created — which would otherwise be
     // the first thing to trip over a missing output directory, with a
     // message about the intermediate — and long before the export.

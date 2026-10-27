@@ -23,7 +23,6 @@ pub mod export;
 pub mod filter;
 #[cfg(test)]
 mod hostile;
-pub mod knobs;
 pub mod ladder;
 pub mod level;
 mod pipe;
