@@ -44,7 +44,6 @@ use crate::Error;
 use arrow_schema::{DataType, Schema};
 use parquet::basic::LogicalType;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -467,25 +466,11 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
     extract_row_group_bounds_from_metadata(&metadata)
 }
 
-/// Extract bounding boxes from an already-opened Parquet reader.
-///
-/// This is useful when you already have a reader open and don't want to re-open the file.
-///
-/// # Errors
-///
-/// Returns [`Error::GeoParquetRead`] if the file's geo metadata JSON is
-/// malformed.
-pub fn extract_row_group_bounds_from_reader(
-    reader: &SerializedFileReader<File>,
-) -> Result<Vec<Option<RowGroupBounds>>, Error> {
-    extract_row_group_bounds_from_metadata(reader.metadata())
-}
-
 /// Extract per-row-group bounding boxes directly from parsed Parquet metadata.
 ///
-/// This is the metadata-only variant of [`extract_row_group_bounds_from_reader`]:
-/// callers that already hold a [`ParquetMetaData`] (e.g. from a
-/// `ParquetRecordBatchReaderBuilder`) can prune without re-opening the file.
+/// Callers that already hold a [`ParquetMetaData`] (e.g. from
+/// [`crate::untrusted::read_parquet_metadata`] or a `ParquetSource`) can
+/// prune without re-opening the file.
 /// Returns `None` for row groups whose covering statistics are unavailable —
 /// including a bbox with a NaN corner, which cannot bound anything (#428) —
 /// and `vec![None; n]` when the file lacks geo/covering metadata entirely.

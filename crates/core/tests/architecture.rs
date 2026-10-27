@@ -478,7 +478,12 @@ fn prod_occurrences(inv: &Inventory, prefix: &str, needles: &[&str]) -> Vec<Stri
     out
 }
 
-/// Every way to open a parquet file for reading.
+/// Every way to open a parquet file, a parquet footer, or an Arrow IPC file
+/// or stream for reading. `ParquetMetaDataReader::new` also covers
+/// `new_with_metadata` and the `parse_and_finish` its result needs;
+/// `SerializedFileReader::new` covers `new_with_options`; and
+/// `FileReader::try_new` and `StreamReader::try_new` cover their
+/// `_buffered` / `_unbuffered` forms.
 fn parquet_open_sites(inv: &Inventory) -> Vec<String> {
     prod_occurrences(
         inv,
@@ -487,11 +492,18 @@ fn parquet_open_sites(inv: &Inventory) -> Vec<String> {
             "ParquetRecordBatchReaderBuilder::",
             "ParquetRecordBatchStreamBuilder::",
             "ArrowReaderBuilder::",
+            "ParquetRecordBatchReader::try_new",
             "SerializedFileReader::new",
             "SerializedFileReader::try_from",
             "ParquetMetaDataReader::new",
+            "ParquetMetaDataReader::decode_metadata",
             "ArrowReaderMetadata::load",
             "ArrowReaderMetadata::try_new",
+            "FileReader::try_new",
+            "FileReaderBuilder::",
+            "FileDecoder::new",
+            "StreamReader::try_new",
+            "StreamDecoder::new",
         ],
     )
 }

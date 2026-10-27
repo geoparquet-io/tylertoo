@@ -199,7 +199,6 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::covering::RowGro
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::covering::RowGroupBounds
 pub fn tylertoo_core::covering::extract_row_group_bounds(&std::path::Path) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::extract_row_group_bounds_from_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
-pub fn tylertoo_core::covering::extract_row_group_bounds_from_reader(&parquet::file::serialized_reader::SerializedFileReader<std::fs::File>) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::find_bbox_column_indices(&parquet::file::metadata::ParquetMetaData, &tylertoo_core::covering::CoveringSpec) -> core::option::Option<tylertoo_core::covering::BboxColumnIndices>
 pub fn tylertoo_core::covering::get_geo_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<core::option::Option<alloc::string::String>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::parse_bounds(&str) -> core::result::Result<tylertoo_core::tile::TileBounds, tylertoo_core::Error>

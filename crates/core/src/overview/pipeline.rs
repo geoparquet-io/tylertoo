@@ -2233,6 +2233,7 @@ impl SpillState {
             .ok_or_else(|| internal("spill writer joined twice"))?;
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
+        #[allow(clippy::disallowed_methods)] // #779: this run's own spill, written above; trusted
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
         Ok((reader, done.temp))
     }
