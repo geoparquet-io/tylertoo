@@ -1,5 +1,5 @@
 # gate: uv run scripts/ci/canary.py ci-step ci.yml check "Check structural ratchets (architecture test)"
-# expect: \[cli_bail_calls\] is 26, above its pin 25
+# expect: \[cli_bail_calls\] is \d+, above its pin \d+
 # issue: #779 (ci/ratchets.toml, crates/core/tests/architecture.rs)
 # catches: #458/#709/b8fa58a: validation added in the CLI instead of core's config validate()
 diff --git a/crates/cli/src/g1_canary.rs b/crates/cli/src/g1_canary.rs
