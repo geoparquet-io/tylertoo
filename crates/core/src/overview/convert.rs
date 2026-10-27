@@ -3647,7 +3647,7 @@ fn load_input_table(
         source,
         source_single,
         options,
-        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+        crate::input_set::byte_array_batch_limit(),
     )
 }
 
@@ -3734,10 +3734,15 @@ fn load_input_table_with_limit(
     let reader = builder.build()?;
     let mut batches: Vec<RecordBatch> = Vec::new();
     for batch in reader {
-        batches.push(batch?);
+        let batch = batch?;
+        crate::input_set::check_scaled_byte_array_batch(&batch)?;
+        batches.push(batch);
     }
     // Concat with `read_schema` (the raw batches carry the original names).
     let full = concat_batches(&read_schema, &batches)?;
+    // #606: the concat is where a >2 GiB column overflows; the #779 scaled
+    // lane emulates that here (a no-op at the real ceiling).
+    crate::input_set::check_scaled_byte_array_batch(&full)?;
 
     // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
     // empty, or non-finite geometry cannot participate in level assignment:

@@ -767,6 +767,8 @@ fn cluster_sum_by_level(
             .as_primitive::<Int64Type>()
             .clone();
 
+        crate::input_set::check_scaled_byte_array(geom_field.name(), g.as_ref())
+            .map_err(|e| e.to_string())?;
         let garr = from_arrow_array(g.as_ref(), &geom_field)
             .map_err(|e| format!("geometry decode: {e}"))?;
         geoms.clear();
