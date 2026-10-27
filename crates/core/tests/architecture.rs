@@ -787,6 +787,58 @@ fn cargo_deny_skips(inv: &Inventory) -> Vec<String> {
     deny_skip_entries(&inv.root)
 }
 
+/// Lint groups whose `allow` also silences `clippy::disallowed_methods`
+/// (a `clippy::style` lint), and with it every owner ban in clippy.toml,
+/// without an allow that `disallowed_method_allows` counts. Allowing
+/// `clippy::restriction` doesn't reach `disallowed_methods`, but it hides
+/// every lint the group gains later, so it's banned with the others.
+const BLANKET_LINT_GROUPS: &[&str] = &[
+    "clippy::all",
+    "clippy::style",
+    "clippy::restriction",
+    "warnings",
+];
+
+/// Positions in `m` of a lint group from `BLANKET_LINT_GROUPS` inside an
+/// `allow(..)` or `expect(..)` of a `#[..]` or `#![..]` attribute. A
+/// `cfg_attr(test, ..)` attribute isn't counted, because it only applies
+/// to the test build.
+fn blanket_allows_in(m: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for group in BLANKET_LINT_GROUPS {
+        for p in find_words(m, group) {
+            // The attribute the group sits in runs from the last `#` before
+            // it; a `]` in between means the group is outside any attribute.
+            let Some(open) = m[..p].iter().rposition(|&b| b == b'#') else {
+                continue;
+            };
+            let attr = &m[open..p];
+            let in_attr =
+                (attr.starts_with(b"#[") || attr.starts_with(b"#![")) && !attr.contains(&b']');
+            let lowers = find(attr, b"allow(", 0).is_some() || find(attr, b"expect(", 0).is_some();
+            if in_attr && lowers && find(attr, b"cfg_attr(test", 0).is_none() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn blanket_clippy_allows(inv: &Inventory) -> Vec<String> {
+    let mut out: Vec<String> = prod_files(inv, "crates/")
+        .flat_map(|f| {
+            blanket_allows_in(&f.lexed.masked)
+                .into_iter()
+                .filter(|&p| f.is_prod(p))
+                .map(|p| f.site(p))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 const METRICS: &[(&str, Metric)] = &[
     ("parquet_open_sites", parquet_open_sites),
     ("geometry_literal_files", geometry_literal_files),
@@ -799,6 +851,7 @@ const METRICS: &[(&str, Metric)] = &[
     ("pytest_skips", pytest_skips),
     ("disallowed_method_allows", disallowed_method_allows),
     ("cargo_deny_skips", cargo_deny_skips),
+    ("blanket_clippy_allows", blanket_clippy_allows),
 ];
 
 // ---------------------------------------------------------------------------
@@ -941,6 +994,23 @@ fn ratchet_entries_are_complete() {
     }
 }
 
+/// Production code never allows a whole lint group. Clippy can't ban this
+/// itself (`clippy::allow_attributes` only swaps `allow` for `expect`), so
+/// the ban lives here. It holds whatever `blanket_clippy_allows` is pinned
+/// at in ci/ratchets.toml.
+#[test]
+fn no_blanket_lint_allows_in_production() {
+    let sites = blanket_clippy_allows(&inventory());
+    assert!(
+        sites.is_empty(),
+        "allow the one lint you mean, with `// #NNN <why>`, not a whole group. \
+         allow(clippy::all), allow(clippy::style) and allow(warnings) also silence \
+         clippy::disallowed_methods, which bypasses the owner bans in clippy.toml \
+         (#779). Sites:\n  {}",
+        sites.join("\n  ")
+    );
+}
+
 /// A production `allow(clippy::disallowed_methods)` says why, with an issue
 /// number on the same line, so each exemption is tied to the work that
 /// removes it.
@@ -1008,6 +1078,20 @@ fn lexer_masks_comments_strings_and_chars() {
     assert!(m.contains("'static"), "lifetimes stay code: {m}");
     let contents: Vec<&str> = l.strings.iter().map(|s| s.content.as_str()).collect();
     assert_eq!(contents, ["{ x }", "}"]);
+}
+
+#[test]
+fn blanket_allow_scanner_finds_lint_group_allows_only() {
+    let src = "#[allow(clippy::all)]\nfn a() {}\n#![expect(clippy::style, reason = \"x\")]\n\
+               #[allow(dead_code, warnings)]\nfn b() {}\n#[warn(clippy::all)]\nfn c() {}\n\
+               #[allow(clippy::allow_attributes)]\nfn d() {}\n// #[allow(clippy::all)]\n\
+               #[cfg_attr(test, allow(clippy::restriction))]\nfn e() {}\n\
+               #[cfg_attr(feature = \"x\", allow(clippy::restriction))]\nfn f() {}\n";
+    let lines: Vec<usize> = blanket_allows_in(&lex(src).masked)
+        .into_iter()
+        .map(|p| src[..p].matches('\n').count() + 1)
+        .collect();
+    assert_eq!(lines, [1, 3, 4, 13]);
 }
 
 #[test]

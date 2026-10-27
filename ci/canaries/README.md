@@ -121,6 +121,7 @@ the issue stays open for more than 7 days.
 | `g4-cli-flag-parity` | `tiles_has_parity_with_two_step_flags` (ci.yml Test) | an `export-pmtiles` flag that `tiles` doesn't surface fails (#374, #600) |
 | `g1-clippy-disallowed` | ci.yml Check, "Run clippy" (`ci-step`) | a parquet reader built outside its owner fails `disallowed-methods` in `clippy.toml` (#577, #606, #607) |
 | `g1-architecture-ratchet` | ci.yml Check, "Check structural ratchets (architecture test)" (`ci-step`) | a new CLI `bail!` goes above its pin in `ci/ratchets.toml` (#458, #709) |
+| `g1-blanket-allow` | ci.yml Check, "Check structural ratchets (architecture test)" (`ci-step`) | an `#[allow(clippy::all)]` that would hide a raw parquet reader from `disallowed-methods` fails |
 | `g1-cargo-deny` | `cargo deny check bans` (security.yml) | a second version of a crate without a linked skip fails `multiple-versions = "deny"` (#649) |
 | `g1-similarity` | ci.yml Check, "Check for duplicated code (similarity ratchet)" (`ci-step`) | a new near-duplicate function pair not in `ci/similarity_baseline.txt` fails (8576c61) |
 | `g1-mirrored-hunks` | `scripts/ci/mirrored_hunks.py` (ci.yml Check, PRs only) | one block added in two files in one change fails (#507, 8576c61, #743) |

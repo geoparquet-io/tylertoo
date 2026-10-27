@@ -537,6 +537,13 @@ CI until its count is pinned too. Test code is exempt: `#[cfg(test)]`
 code in core has a crate-level allow for the test build, and each
 integration test or bench that reads its own fixtures has a file-level one.
 
+Production code never allows a whole lint group. `allow(clippy::all)`,
+`allow(clippy::style)` and `allow(warnings)`, in either the `#[..]` or the
+`#![..]` form, also silence `disallowed_methods`, so they would bypass
+every ban above without an allow the test counts. The architecture test
+fails on any of them, and on `clippy::restriction`. Allow the one lint you
+mean instead.
+
 **Lowering a pin.** Every count in `ci/ratchets.toml` is checked in both
 directions. A count above its pin fails: route the new code through the
 owner instead. A count below its pin also fails, with the new count in the

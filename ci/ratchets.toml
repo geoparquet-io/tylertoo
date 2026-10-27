@@ -110,6 +110,15 @@ owner = "dependency bumps that collapse each duplicate (#779; geo -> i_overlay 9
 catches = "#649: Dependabot #624 undid #435's brotli/zstd dedupe while multiple-versions was warn"
 scope = "entries in deny.toml [bans] skip"
 
+# Pinned at 0 and also a hard ban: no_blanket_lint_allows_in_production in
+# crates/core/tests/architecture.rs fails on any site, whatever the pin.
+[blanket_clippy_allows]
+pin = 0
+target = 0
+owner = "an allow of the one lint meant, with `// #NNN <why>` (the disallowed_method_allows convention)"
+catches = "allow(clippy::all|style) or allow(warnings) silences clippy::disallowed_methods, so it bypasses every owner ban in clippy.toml uncounted (found by #779 F5)"
+scope = "production #[allow(..)], #![allow(..)], #[expect(..)] and #![expect(..)] of clippy::all, clippy::style, clippy::restriction or warnings, including cfg_attr(<not test>, ..)"
+
 # Measured on origin/main a49932b (production code, test items stripped):
 #   threshold      0.95  0.90  0.85  0.80
 #   in-file pairs     0    14    60   307
