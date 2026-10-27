@@ -533,6 +533,33 @@ mod tests {
     use super::*;
     use geo::Coord;
 
+    /// #707: the guard's edge, just under and just over
+    /// [`IOVERLAY_MAX_ABS_COORD`]: under reaches the engine (which must not
+    /// panic on it, whatever its precision makes of a unit tile), over is
+    /// refused and counted.
+    #[test]
+    fn the_guard_edge_sits_at_the_max_abs_coord() {
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        let with_far_vertex = |v: f64| {
+            let mut p = make_square(0.0, 0.0, 0.5, 0.5);
+            p.exterior_mut(|ring| ring.0[2] = Coord { x: v, y: v });
+            p
+        };
+        let under = with_far_vertex(IOVERLAY_MAX_ABS_COORD * 0.99);
+        assert!(polygon_representable(&under));
+        let _ = clip_polygon_ioverlay(&under, &bounds);
+        let _ = repair_polygon_ioverlay(&under);
+        assert!(!polygon_representable(&with_far_vertex(
+            IOVERLAY_MAX_ABS_COORD * 1.01
+        )));
+        let before = clip_guard_drop_count();
+        assert!(
+            clip_polygon_ioverlay(&with_far_vertex(IOVERLAY_MAX_ABS_COORD * 1.01), &bounds)
+                .is_none()
+        );
+        assert!(clip_guard_drop_count() > before);
+    }
+
     /// #707: every guarded entry point counts its refusal instead of
     /// returning a silent `None`.
     #[test]
