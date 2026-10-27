@@ -11,7 +11,6 @@ crates/cli/src/main.rs :: parse_in_flight_batches <-> parse_read_workers
 crates/cli/src/main.rs :: parse_partition_wave <-> parse_read_workers
 crates/cli/src/main.rs :: parse_read_batch_size <-> parse_read_workers
 crates/cli/src/main.rs :: resolve_io <-> resolve_io_for_planning
-crates/core/src/clip.rs :: multipolygon_rect_all_rings <-> polygon_rect_all_rings
 crates/core/src/covering.rs :: parse_bbox <-> parse_tile_coords
 crates/core/src/input.rs :: from_store_sized_with_cap_base <-> from_store_with_cap_base
 crates/core/src/input.rs :: open <-> open_with_metadata
@@ -51,7 +50,6 @@ crates/core/src/overview/filter.rs :: parse_literal <-> parse_predicate
 crates/core/src/overview/filter.rs :: range_can_match_num <-> range_can_match_ord
 crates/core/src/overview/ladder.rs :: build_ladder <-> entry_levels
 crates/core/src/overview/pipeline.rs :: read_cgroup_v1_limit <-> read_cgroup_v2_headroom
-crates/core/src/overview/reader.rs :: read_level <-> read_level_any_bbox_with_batch_size
 crates/core/src/overview/stream.rs :: process_batch_cascade <-> process_level_batch
 crates/core/src/overview/stream.rs :: stage_secs <-> stage_secs
 crates/core/src/overview/stream.rs :: write_export_profile_json <-> write_profile_json

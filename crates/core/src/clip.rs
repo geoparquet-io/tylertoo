@@ -363,48 +363,62 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
         && rect.min().y <= bounds.lat_max
 }
 
-/// Bounding rect over EVERY ring of a polygon.
+/// A polygon's bounding rect over every ring, and whether every coordinate
+/// is finite.
 ///
-/// `geo`'s `Polygon::bounding_rect` covers the exterior only. That is the
-/// right answer for valid input (holes lie inside the exterior), but the
-/// convert pass carries invalid input verbatim (#188), and a hole outside or
-/// across its exterior would otherwise ride the fully-inside fast path below
-/// into the tile unclipped — thousands of MVT units past the buffer (found by
-/// the #205 hostile-geometry harness). For valid polygons the result is the
-/// exterior's rect, so the fast path is byte-identical there.
-fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<Rect<f64>> {
-    let mut rect = poly.exterior().bounding_rect()?;
-    for hole in poly.interiors() {
-        if let Some(h) = hole.bounding_rect() {
-            rect = Rect::new(
-                Coord {
-                    x: rect.min().x.min(h.min().x),
-                    y: rect.min().y.min(h.min().y),
-                },
-                Coord {
-                    x: rect.max().x.max(h.max().x),
-                    y: rect.max().y.max(h.max().y),
-                },
-            );
-        }
+/// Over every ring, not just the exterior: `geo`'s `Polygon::bounding_rect`
+/// covers the exterior only, which is right for valid input (holes lie
+/// inside the exterior), but the convert pass carries invalid input verbatim
+/// (#188), and a hole outside or across its exterior would otherwise ride
+/// the fully-inside fast path below into the tile unclipped — thousands of
+/// MVT units past the buffer (found by the #205 hostile-geometry harness).
+/// For valid polygons the rect is the exterior's, so the fast path is
+/// byte-identical there.
+///
+/// And with a finiteness flag, from the same pass: `geo`'s min/max skip a
+/// NaN that is not a ring's first coordinate, so a NaN-bearing polygon could
+/// take the fully-inside fast path and never reach the `i_overlay` guard
+/// (#707). The callers refuse a non-finite polygon, counted, instead.
+fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<(Rect<f64>, bool)> {
+    let mut coords = poly
+        .exterior()
+        .0
+        .iter()
+        .chain(poly.interiors().iter().flat_map(|ring| ring.0.iter()));
+    let first = coords.next()?;
+    let (mut min, mut max) = (*first, *first);
+    let mut finite = first.x.is_finite() && first.y.is_finite();
+    for c in coords {
+        finite &= c.x.is_finite() && c.y.is_finite();
+        min = Coord {
+            x: min.x.min(c.x),
+            y: min.y.min(c.y),
+        };
+        max = Coord {
+            x: max.x.max(c.x),
+            y: max.y.max(c.y),
+        };
     }
-    Some(rect)
+    Some((Rect::new(min, max), finite))
 }
 
 /// [`polygon_rect_all_rings`] over every part of a MultiPolygon.
-fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<Rect<f64>> {
+fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<(Rect<f64>, bool)> {
     let mut rects = mp.0.iter().filter_map(polygon_rect_all_rings);
     let first = rects.next()?;
-    Some(rects.fold(first, |acc, r| {
-        Rect::new(
-            Coord {
-                x: acc.min().x.min(r.min().x),
-                y: acc.min().y.min(r.min().y),
-            },
-            Coord {
-                x: acc.max().x.max(r.max().x),
-                y: acc.max().y.max(r.max().y),
-            },
+    Some(rects.fold(first, |(acc, acc_finite), (r, finite)| {
+        (
+            Rect::new(
+                Coord {
+                    x: acc.min().x.min(r.min().x),
+                    y: acc.min().y.min(r.min().y),
+                },
+                Coord {
+                    x: acc.max().x.max(r.max().x),
+                    y: acc.max().y.max(r.max().y),
+                },
+            ),
+            acc_finite && finite,
         )
     }))
 }
@@ -487,7 +501,13 @@ fn clip_polygon(
     // Quick rejection test using bounding box. Over every ring, not just the
     // exterior, so an interior ring outside its exterior cannot take the
     // fully-inside fast path below unclipped (#205).
-    let poly_rect = polygon_rect_all_rings(poly)?;
+    let (poly_rect, finite) = polygon_rect_all_rings(poly)?;
+    if !finite {
+        // A NaN or infinite vertex: nothing to clip, and the fast path below
+        // would emit it unclipped. Dropped, and counted (#707).
+        ioverlay_clip::count_guard_drop();
+        return None;
+    }
     if !intersects_bounds(&poly_rect, bounds) {
         return None;
     }
@@ -568,7 +588,13 @@ fn clip_multipolygon(
 ) -> Option<MultiPolygon<f64>> {
     // Level 1: Quick rejection using overall MultiPolygon bbox (every ring,
     // see `polygon_rect_all_rings`).
-    let mp_rect = multipolygon_rect_all_rings(mp)?;
+    let (mp_rect, finite) = multipolygon_rect_all_rings(mp)?;
+    if !finite {
+        // One hostile vertex poisons the whole input, as in the i_overlay
+        // guard: dropped, and counted (#707).
+        ioverlay_clip::count_guard_drop();
+        return None;
+    }
     if !intersects_bounds(&mp_rect, bounds) {
         return None;
     }
@@ -586,8 +612,9 @@ fn clip_multipolygon(
     for poly in &mp.0 {
         // Per-polygon bbox filter: compute each polygon's bbox and check
         // intersection before calling into the clip pipeline
+        // Every part is finite: the whole MultiPolygon was checked above.
         let poly_rect = match polygon_rect_all_rings(poly) {
-            Some(r) => r,
+            Some((r, _)) => r,
             None => continue, // Degenerate polygon, skip
         };
 
@@ -630,6 +657,38 @@ fn clip_multipolygon(
 mod tests {
     use super::*;
     use geo::point;
+
+    // ========== Non-finite coordinates (issue #707) ==========
+
+    /// A simple square fully inside the tile with a NaN at its third vertex:
+    /// `geo`'s bounding rect skips a NaN that is not a ring's first
+    /// coordinate, so this rode the fully-inside fast path and came back
+    /// unclipped, never reaching the `i_overlay` guard.
+    #[test]
+    fn a_nan_vertex_cannot_take_the_fully_inside_fast_path() {
+        let poly = Polygon::new(
+            LineString::from(vec![
+                (1.0, 1.0),
+                (2.0, 1.0),
+                (f64::NAN, 2.0),
+                (1.0, 2.0),
+                (1.0, 1.0),
+            ]),
+            vec![],
+        );
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for geom in [
+            Geometry::Polygon(poly.clone()),
+            Geometry::MultiPolygon(MultiPolygon::new(vec![poly])),
+        ] {
+            let before = ioverlay_clip::clip_guard_drop_count();
+            assert_eq!(clip_geometry_simple(&geom, &bounds, 0.0, true, true), None);
+            assert!(
+                ioverlay_clip::clip_guard_drop_count() > before,
+                "the drop is counted"
+            );
+        }
+    }
 
     // ========== Interior rings outside their exterior (issue #205) ==========
 

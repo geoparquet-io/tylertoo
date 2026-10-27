@@ -2080,9 +2080,10 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let reader = parquet::file::reader::SerializedFileReader::new(f).unwrap();
-        use parquet::file::reader::FileReader;
-        let meta = reader.metadata().clone();
+        let meta = crate::untrusted::read_parquet_metadata(&f)
+            .unwrap()
+            .as_ref()
+            .clone();
         (file, meta)
     }
 
@@ -2288,9 +2289,10 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let reader = parquet::file::reader::SerializedFileReader::new(f).unwrap();
-        use parquet::file::reader::FileReader;
-        let meta = reader.metadata().clone();
+        let meta = crate::untrusted::read_parquet_metadata(&f)
+            .unwrap()
+            .as_ref()
+            .clone();
         (file, meta)
     }
 

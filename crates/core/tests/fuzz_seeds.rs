@@ -44,7 +44,14 @@ fn replay<T: Debug, E: Debug>(
     hostile: &[&str],
     hook: impl Fn(&[u8]) -> Result<T, E>,
 ) {
-    for (name, bytes) in seeds(target) {
+    let all = seeds(target);
+    for name in hostile {
+        assert!(
+            all.iter().any(|(n, _)| n == name),
+            "{target}: hostile seed {name} is not in the corpus"
+        );
+    }
+    for (name, bytes) in all {
         let result = hook(&bytes);
         if !hostile.contains(&name.as_str()) {
             assert!(result.is_ok(), "{target}/{name}: {result:?}");
@@ -66,7 +73,17 @@ fn geo_metadata_seeds() {
 
 #[test]
 fn plan_file_seeds() {
-    replay("plan_file", &[], tylertoo_core::overview::fuzz_convert_plan);
+    // #684's crash input: a crafted IPC buffer offset, refused (#779); and
+    // a footer block declaring a ~1 PB length, refused before arrow-ipc
+    // allocates it (found re-enabling this target).
+    replay(
+        "plan_file",
+        &[
+            "seed-issue-684-ipc-buffer.arrow",
+            "seed-ipc-block-length.arrow",
+        ],
+        tylertoo_core::overview::fuzz_convert_plan,
+    );
 }
 
 /// `decode_pmtiles` on `archive`, written to a temp file.
@@ -120,18 +137,36 @@ fn layer_zooms_seeds() {
 
 #[test]
 fn parquet_footer_seeds() {
+    // #690's crash input: a schema child count the footer pre-check
+    // refuses before parquet-rs reserves memory for it (#779).
     replay(
         "parquet_footer",
-        &[],
+        &["seed-issue-690-num-children.thrift"],
         tylertoo_core::overview::check::fuzz_parquet_footer,
+    );
+    // Not just "no crash": with overcommit, parquet-rs's 12 GB reservation
+    // succeeds and the decode fails later on its own, so only the error's
+    // kind proves the pre-check refused the footer first.
+    let (_, bytes) = seeds("parquet_footer")
+        .into_iter()
+        .find(|(n, _)| n == "seed-issue-690-num-children.thrift")
+        .unwrap();
+    let err = tylertoo_core::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            tylertoo_core::untrusted::input_error(&err),
+            Some(tylertoo_core::input::InputError::HostileFooter(_))
+        ),
+        "#690's seed must be refused by the footer pre-check: {err:?}"
     );
 }
 
 #[test]
 fn overview_file_seeds() {
+    // #683's crash input: a crafted ARROW:schema key, refused (#779).
     replay(
         "overview_file",
-        &[],
+        &["seed-issue-683-arrow-schema.parquet"],
         tylertoo_core::overview::reader::fuzz_overview_file,
     );
 }
@@ -139,9 +174,14 @@ fn overview_file_seeds() {
 #[cfg(feature = "remote")]
 #[test]
 fn remote_footer_seeds() {
+    // #683's and #687's crash inputs: a crafted ARROW:schema key and a
+    // crafted page's definition levels, refused (#779).
     replay(
         "remote_footer",
-        &[],
+        &[
+            "seed-issue-683-arrow-schema.parquet",
+            "seed-issue-687-def-levels.parquet",
+        ],
         tylertoo_core::input::fuzz_remote_footer,
     );
 }

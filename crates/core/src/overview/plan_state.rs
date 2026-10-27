@@ -89,7 +89,6 @@ use arrow_array::{
     Array, BinaryArray, Float64Array, Int64Array, LargeListArray, RecordBatch, UInt32Array,
     UInt64Array, UInt8Array,
 };
-use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -1406,8 +1405,7 @@ impl ConvertPlan {
                 ),
             ));
         }
-        #[allow(clippy::disallowed_methods)] // #779 F5 migrates
-        let mut reader = FileReader::try_new(ipc_view(file), None)
+        let mut reader = crate::untrusted::open_ipc(ipc_view(file))
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
@@ -2321,7 +2319,7 @@ mod tests {
     /// Re-open a saved plan's IPC payload, so a test can forge a hostile
     /// variant of a *real* artifact.
     fn reopen(path: &Path) -> (Arc<Schema>, RecordBatch) {
-        let mut r = FileReader::try_new(ipc_view(File::open(path).unwrap()), None).unwrap();
+        let mut r = crate::untrusted::open_ipc(ipc_view(File::open(path).unwrap())).unwrap();
         let schema = r.schema();
         let batch = r.next().unwrap().unwrap();
         (schema, batch)
@@ -2398,6 +2396,31 @@ mod tests {
     /// accepted (121/203 positions), quietly wrong, or panic inside arrow's
     /// buffer/IPC decoders (11/203). The checksum turns every one of those
     /// into the same named error, before a byte reaches a decoder.
+    /// #684: a plan whose checksum is right but whose Arrow IPC payload was
+    /// crafted (a buffer offset past its body) panicked inside arrow-ipc's
+    /// `read_buffer`. The checksum cannot catch a crafted plan, so the
+    /// decode itself must turn the panic into the `--plan` error.
+    #[test]
+    fn plan_with_a_crafted_ipc_buffer_is_an_error_not_a_panic() {
+        let payload = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fuzz/corpus/plan_file/seed-issue-684-ipc-buffer.arrow"
+        ))
+        .unwrap();
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = PLAN_MAGIC.to_vec();
+        bytes.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        std::fs::write(f.path(), &bytes).unwrap();
+        let err = ConvertPlan::load(f.path())
+            .and_then(ConvertPlan::into_winner_tables)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--plan"), "{err}");
+        assert!(err.contains("panicked"), "names the decoder panic: {err}");
+    }
+
     #[test]
     fn plan_rejects_a_flipped_byte() {
         let f = tempfile::NamedTempFile::new().unwrap();

@@ -35,6 +35,8 @@
 //! wagyu's Vatti algorithm. However, by operating in f64 directly, we avoid
 //! the overhead of coordinate conversion that wagyu requires.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::tile::TileBounds;
 use geo::{BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPolygon, Polygon};
 use i_overlay::core::fill_rule::FillRule;
@@ -224,6 +226,7 @@ pub fn clip_polygon_ioverlay(poly: &Polygon<f64>, bounds: &TileBounds) -> Option
     // coordinate magnitude past 2^500. A hostile vertex means there is
     // nothing we can clip — return the same `None` as "doesn't intersect".
     if !polygon_representable(poly) {
+        count_guard_drop();
         return None;
     }
 
@@ -270,6 +273,7 @@ pub fn clip_multipolygon_ioverlay(
     // Input guard (#692): one hostile vertex anywhere poisons the whole
     // input — empty result, no partial output, as the #435 line guard does.
     if !multi.0.iter().all(polygon_representable) {
+        count_guard_drop();
         return None;
     }
 
@@ -295,6 +299,39 @@ pub fn clip_multipolygon_ioverlay(
     let result: IOverlayShapes = overlay.overlay(OverlayRule::Intersect, FillRule::EvenOdd);
 
     ioverlay_to_geometry(result)
+}
+
+// F2: becomes Diagnostic::ClipGuardDropped
+/// Process-wide count of geometries the clip input guard refused (#707): a
+/// NaN, infinite or over-[`IOVERLAY_MAX_ABS_COORD`] vertex that `i_float`'s
+/// adapter would panic on, or that `clip.rs`'s fast path would have emitted
+/// unclipped.
+///
+/// What the refusal means depends on the entry point: the clippers
+/// ([`clip_polygon_ioverlay`], [`clip_multipolygon_ioverlay`],
+/// [`clip_multilinestring_ioverlay`], and `clip.rs`'s polygon paths) drop the
+/// feature from that tile; [`union_polygons_ioverlay`] and
+/// [`repair_polygon_ioverlay`] hand their input back unmerged or unrepaired.
+/// Either way the input never reached the engine, and before #707 nothing
+/// said so: the feature vanished from every tile at every zoom with exit 0.
+/// The first refusal in a process warns; [`clip_guard_drop_count`] has the
+/// total, following simplify's `FULL_RES_FALLBACKS` precedent.
+static CLIP_GUARD_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-wide clip-guard refusal counter (#707).
+pub fn clip_guard_drop_count() -> u64 {
+    CLIP_GUARD_DROPS.load(Ordering::Relaxed)
+}
+
+/// Count one clip-guard refusal, warning on the first in the process.
+pub(crate) fn count_guard_drop() {
+    if CLIP_GUARD_DROPS.fetch_add(1, Ordering::Relaxed) == 0 {
+        log::warn!(
+            "a geometry with a NaN, infinite or absurdly large coordinate reached the \
+             clipper and was left out of the tile (#707); later ones are counted, not \
+             logged. The input holds coordinates no valid GeoParquet or overview file does."
+        );
+    }
 }
 
 /// Largest coordinate magnitude handed to `i_overlay`'s float adapter. `i_float` 5
@@ -358,13 +395,16 @@ pub fn clip_multilinestring_ioverlay(
     // (its documented f64 limit). The geo path returned nothing for such
     // input; keep that contract. `bounds` are lon/lat, so only the subject
     // can trip it.
-    if mls.0.is_empty()
-        || !mls
-            .0
-            .iter()
-            .flat_map(|ls| ls.0.iter())
-            .all(|c| representable(c.x) && representable(c.y))
+    if mls.0.is_empty() {
+        return MultiLineString::new(Vec::new());
+    }
+    if !mls
+        .0
+        .iter()
+        .flat_map(|ls| ls.0.iter())
+        .all(|c| representable(c.x) && representable(c.y))
     {
+        count_guard_drop();
         return MultiLineString::new(Vec::new());
     }
 
@@ -412,6 +452,7 @@ pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> 
     // `None` is the "could not trace" result the caller (mvt.rs merge)
     // already handles by emitting the parts as they are.
     if !polys.iter().all(polygon_representable) {
+        count_guard_drop();
         return None;
     }
 
@@ -465,6 +506,7 @@ pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
     // overview/simplify's `repair_candidate` falls back to collapse /
     // full-resolution — the pass-through-unrepaired semantics of #435.
     if !polygon_representable(poly) {
+        count_guard_drop();
         return None;
     }
 
@@ -490,6 +532,58 @@ pub fn repair_polygon_ioverlay(poly: &Polygon<f64>) -> Option<Geometry<f64>> {
 mod tests {
     use super::*;
     use geo::Coord;
+
+    /// #707: the guard's edge, just under and just over
+    /// [`IOVERLAY_MAX_ABS_COORD`]: under reaches the engine (which must not
+    /// panic on it, whatever its precision makes of a unit tile), over is
+    /// refused and counted.
+    #[test]
+    fn the_guard_edge_sits_at_the_max_abs_coord() {
+        let bounds = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        let with_far_vertex = |v: f64| {
+            let mut p = make_square(0.0, 0.0, 0.5, 0.5);
+            p.exterior_mut(|ring| ring.0[2] = Coord { x: v, y: v });
+            p
+        };
+        let under = with_far_vertex(IOVERLAY_MAX_ABS_COORD * 0.99);
+        assert!(polygon_representable(&under));
+        let _ = clip_polygon_ioverlay(&under, &bounds);
+        let _ = repair_polygon_ioverlay(&under);
+        assert!(!polygon_representable(&with_far_vertex(
+            IOVERLAY_MAX_ABS_COORD * 1.01
+        )));
+        let before = clip_guard_drop_count();
+        assert!(
+            clip_polygon_ioverlay(&with_far_vertex(IOVERLAY_MAX_ABS_COORD * 1.01), &bounds)
+                .is_none()
+        );
+        assert!(clip_guard_drop_count() > before);
+    }
+
+    /// #707: every guarded entry point counts its refusal instead of
+    /// returning a silent `None`.
+    #[test]
+    fn every_guard_refusal_is_counted() {
+        let mut hostile = make_square(1.0, 1.0, 2.0, 2.0);
+        hostile.exterior_mut(|ring| ring.0[2].x = f64::INFINITY);
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let counted = |f: &dyn Fn() -> bool| {
+            let before = clip_guard_drop_count();
+            assert!(f(), "the guard refused");
+            assert!(clip_guard_drop_count() > before, "and counted it");
+        };
+        counted(&|| clip_polygon_ioverlay(&hostile, &bounds).is_none());
+        counted(&|| {
+            clip_multipolygon_ioverlay(&MultiPolygon::new(vec![hostile.clone()]), &bounds).is_none()
+        });
+        counted(&|| union_polygons_ioverlay(std::slice::from_ref(&hostile)).is_none());
+        counted(&|| repair_polygon_ioverlay(&hostile).is_none());
+        counted(&|| {
+            let line =
+                MultiLineString::new(vec![LineString::from(vec![(1.0, 1.0), (f64::NAN, 2.0)])]);
+            clip_multilinestring_ioverlay(&line, &bounds).0.is_empty()
+        });
+    }
 
     fn make_square(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Polygon<f64> {
         Polygon::new(

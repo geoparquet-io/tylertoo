@@ -3912,7 +3912,7 @@ fn fill_member_store(
                 // the `tx.send` below (a bounded-channel send that can block
                 // on the consumer, which must not be charged to reading).
                 let mut band_reader = ExportTimers::time(&timers.band_read, || {
-                    reader.read_band_with_batch_size(band, EXPORT_BATCH_SIZE)
+                    reader.read_band_batched(band, EXPORT_BATCH_SIZE)
                 })?;
                 loop {
                     let next = ExportTimers::time(&timers.band_read, || band_reader.next());
@@ -4136,7 +4136,7 @@ fn encode_buckets(
 /// `k >= j` whose prefix includes it: `Σ_k |prefix_k|` row-group decodes.
 ///
 /// This reads each level's **own band once** (`Σ_j |band_j|` = every row group
-/// exactly once via [`OverviewReader::read_band_with_batch_size`]) and *fans*
+/// exactly once via [`OverviewReader::read_band_batched`]) and *fans*
 /// every decoded feature to the accumulators of every level whose render set
 /// includes its band — level `j`'s features contribute to levels `{j}`
 /// (duplicating, self-contained bands) or `{j..N}` (partitioning prefix).
@@ -4278,7 +4278,7 @@ fn scan_all_levels_from(
             for j in 0..num_levels {
                 let mut band_reader = ExportTimers::time(&timers.scan_read, || match root {
                     Some(r) => reader.read_band_projected(j, EXPORT_BATCH_SIZE, &[r]),
-                    None => reader.read_band_with_batch_size(j, EXPORT_BATCH_SIZE),
+                    None => reader.read_band_batched(j, EXPORT_BATCH_SIZE),
                 })?;
                 while let Some(batch) = ExportTimers::time(&timers.scan_read, || band_reader.next())
                 {
@@ -4425,7 +4425,6 @@ fn decode_batch_bboxes(
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, geometry)?;
     let geom_field = schema.field(geom_idx).clone();
-    crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -4549,7 +4548,7 @@ fn ranges_contain(ranges: &BboxTileRanges, tc: TileCoord) -> bool {
 }
 
 /// Per-level scan oracle: reads level `level_idx`'s full render set (the
-/// mode-dependent prefix, via [`OverviewReader::read_level_with_batch_size`])
+/// mode-dependent prefix, via [`OverviewReader::read_level_batched`])
 /// and sizes it at `zoom`. This is the pre-#233 independent-per-level read path,
 /// retained as the byte-identity oracle for [`scan_all_levels`] — a genuinely
 /// different read (one prefix vs a fan of per-band reads) that must yield the
@@ -4562,7 +4561,7 @@ fn scan_level(
     zoom: u8,
     opts: &ExportOptions,
 ) -> Result<LevelScan, ExportError> {
-    let batch_reader = reader.read_level_with_batch_size(level_idx, None, EXPORT_BATCH_SIZE)?;
+    let batch_reader = reader.read_level_batched(level_idx, None, EXPORT_BATCH_SIZE)?;
     let mut scan = LevelScan {
         feature_count: 0,
         bounds: None,
@@ -4752,7 +4751,7 @@ fn collect_wave(ctx: &LevelCtx<'_>, wave: &[Partition]) -> Result<CollectedWave,
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
             let mut batch_reader = ExportTimers::time(&timers.band_read, || {
-                ctx.reader.read_level_any_bbox_with_batch_size(
+                ctx.reader.read_level_any_bbox_batched(
                     ctx.level_idx,
                     bboxes.as_ref().map(|b| b.as_slice()),
                     EXPORT_BATCH_SIZE,
@@ -4811,7 +4810,6 @@ fn decode_batch_geometries(
     let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
     ExportTimers::time(&timers.decode, || -> Result<(), ExportError> {
         let geom_field = schema.field(geom_idx).clone();
-        crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
         let garr: Arc<dyn GeoArrowArray> =
             from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
                 .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -6788,7 +6786,6 @@ fn decode_batch(
     let geom_field = schema.field(geom_idx).clone();
 
     // Decode geometries.
-    crate::input_set::check_scaled_byte_array(geom_field.name(), batch.column(geom_idx))?;
     let garr: Arc<dyn GeoArrowArray> =
         from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
             .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
@@ -9446,11 +9443,11 @@ mod tests {
     /// ([`rewrite_without_covering`]).
     fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, strip_covering: bool) {
         use arrow_array::{Array, BinaryArray};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
         use parquet::arrow::ArrowWriter;
         use parquet::file::metadata::KeyValue;
 
-        let probe = ParquetRecordBatchReaderBuilder::try_new(File::open(src).unwrap()).unwrap();
+        let probe = crate::untrusted::open_parquet(File::open(src).unwrap()).unwrap();
         let in_schema = probe.schema().clone();
         let num_rgs = probe.metadata().num_row_groups();
         let strip_geo = |kv: KeyValue| match (strip_covering, kv.key.as_str()) {
@@ -9491,10 +9488,10 @@ mod tests {
             ArrowWriter::try_new(File::create(dst).unwrap(), schema.clone(), None).unwrap();
         let mut row0 = 0usize;
         for rg in 0..num_rgs {
-            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(src).unwrap())
+            let reader = crate::untrusted::open_parquet(File::open(src).unwrap())
                 .unwrap()
                 .with_row_groups(vec![rg])
-                .with_batch_size(usize::MAX >> 1)
+                .with_batch_rows(usize::MAX >> 1)
                 .build()
                 .unwrap();
             for batch in reader {
@@ -11914,7 +11911,6 @@ mod tests {
     /// The decoded parquet's property column names (everything `decode`
     /// adds and the geometry left out).
     fn decoded_property_names(pmtiles: &Path) -> Vec<String> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let decoded = tempfile::NamedTempFile::new().unwrap();
         crate::decode::decode_pmtiles(
             pmtiles,
@@ -11923,7 +11919,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file)
+        crate::untrusted::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14088,8 +14084,6 @@ mod tests {
     /// Export the fixture and return the property names the tiles carry, as
     /// seen through `decode_pmtiles` (the union of every layer's keys).
     fn exported_property_names(input: &Path) -> Vec<String> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
         let tout = tempfile::NamedTempFile::new().unwrap();
         export_pmtiles(input, tout.path(), &ExportOptions::default()).unwrap();
         let decoded = tempfile::NamedTempFile::new().unwrap();
@@ -14100,7 +14094,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file)
+        crate::untrusted::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14140,8 +14134,6 @@ mod tests {
     /// names it wants it (a style that keys on it, a debugging pass).
     #[test]
     fn coalesced_count_explicit_include_overrides_suppression() {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_coalesced_fixture(tin.path(), &[vec![1, 1], vec![1, 1]]);
         let opts = ExportOptions {
@@ -14161,7 +14153,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        let names: Vec<String> = ParquetRecordBatchReaderBuilder::try_new(file)
+        let names: Vec<String> = crate::untrusted::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14716,8 +14708,6 @@ mod tests {
     /// Export the plain two-column fixture (`id`, `name`) under a selection
     /// and return the property names the tiles carry.
     fn exported_names_with(selection: PropertySelection) -> Result<Vec<String>, ExportError> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
         let a = Geometry::Point(Point::new(-120.0, 40.0));
         let b = Geometry::Point(Point::new(120.0, -40.0));
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -14742,7 +14732,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        Ok(ParquetRecordBatchReaderBuilder::try_new(file)
+        Ok(crate::untrusted::open_parquet(file)
             .unwrap()
             .schema()
             .fields()

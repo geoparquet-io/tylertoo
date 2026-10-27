@@ -2018,7 +2018,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
-        crate::input_set::byte_array_batch_limit(),
+        crate::untrusted::byte_array_limit(),
     )
 }
 
@@ -2026,8 +2026,8 @@ fn convert_preflight(
 /// escape-hatch decision, and the #563 oversized-geometry-column ceiling
 /// (test seam: mirrors [`build_writer_options_with_ceiling`]'s #509
 /// pattern). Production always calls it via `convert_preflight` with the
-/// real uncached memory probe and the real
-/// [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]; tests pass a tiny
+/// real uncached memory probe and the owner's ceiling
+/// ([`crate::untrusted::byte_array_limit`]); tests pass a tiny
 /// mocked memory limit (#543) or byte-array batch ceiling (#563) to prove
 /// each hard error fires from footer statistics alone — before
 /// `stage_input_pass0` or pass 1 ever runs — without needing an actually
@@ -6418,11 +6418,10 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         // The row group's geometry column in bytes, from the footer.
-        let meta = parquet::file::serialized_reader::SerializedFileReader::new(
-            std::fs::File::open(tin.path()).unwrap(),
-        )
-        .unwrap();
-        let rg = parquet::file::reader::FileReader::metadata(&meta).row_group(0);
+        let meta =
+            crate::untrusted::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap())
+                .unwrap();
+        let rg = meta.row_group(0);
         let geom_bytes = rg
             .columns()
             .iter()

@@ -3,10 +3,11 @@
 //! reader path.
 //!
 //! - arrow's i32 byte-array ceiling (2 GiB per decoded batch, #563):
-//!   `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES` scales it, and every path that sizes a
-//!   batch reads the scaled value, while the decode sites fail a batch past
-//!   it the way arrow fails past the real one
-//!   (`input_set::check_scaled_byte_array_batch`). The fix for #563 reached
+//!   `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES` scales it. The ceiling has one owner,
+//!   `untrusted::byte_array_limit`: every path that sizes a batch reads the
+//!   scaled value from it, and the owner's reader (plus the in-memory
+//!   engine's concatenated table) fails a batch past it the way arrow fails
+//!   past the real one (`untrusted::check_byte_array_ceiling`). The fix for #563 reached
 //!   two of four reader paths (#606 `--no-streaming`, #607 `validate`) because
 //!   only a >2 GiB file could show the other two. This replaces the
 //!   `#[ignore]`d test that wrote such a file (`input_set.rs`,

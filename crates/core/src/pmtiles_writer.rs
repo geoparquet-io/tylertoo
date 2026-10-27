@@ -769,71 +769,152 @@ impl ArchiveBytes for &[u8] {
     }
 }
 
+/// Why [`walk_directories`] refused an archive's directories.
+///
+/// Structured so each reader reports in its own error type without a second
+/// walk: [`read_all_entries_from`] folds it into [`Error`], and `decode`
+/// keeps its typed `Decompress` / `InvalidArchive` errors.
+#[derive(Debug)]
+pub(crate) enum DirWalkError {
+    /// A directory section did not decompress.
+    Decompress {
+        /// `root directory` or `leaf directory`.
+        what: &'static str,
+        /// The section's absolute byte offset.
+        offset: u64,
+        /// The section's stored length.
+        length: u64,
+        /// The decompressor's error.
+        source: std::io::Error,
+    },
+    /// Reading a section from the source failed.
+    Read(Error),
+    /// Any other refusal, as a message.
+    Invalid(String),
+}
+
+impl std::fmt::Display for DirWalkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirWalkError::Decompress {
+                what,
+                offset,
+                length,
+                source,
+            } => write!(
+                f,
+                "failed to decompress {what} at byte offset {offset} ({length} bytes): {source}"
+            ),
+            DirWalkError::Read(e) => write!(f, "{e}"),
+            DirWalkError::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
 /// [`read_all_entries`] over any [`ArchiveBytes`] source.
 pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
     src: &S,
     header: &Header,
 ) -> Result<Vec<DirEntry>> {
-    let past_end = |what: &str| Error::PMTilesWrite(format!("{what} past end of archive"));
-    let slice = |off: u64, len: u64, what: &str| -> Result<std::borrow::Cow<'_, [u8]>> {
+    walk_directories(src, header).map_err(|e| match e {
+        DirWalkError::Read(e) => e,
+        other => Error::PMTilesWrite(other.to_string()),
+    })
+}
+
+/// The one PMTiles directory walk (#417, #510, #779): the root directory,
+/// then each leaf it points at, into one list of entries in ascending
+/// tile-id order, run lengths unexpanded.
+///
+/// Every reader goes through this — [`crate::archive_index::ArchiveIndex`]
+/// (the pyramid merge), the in-memory band reader and `decode` — so each
+/// ceiling and check is written once:
+///
+/// - a section's declared length is capped at [`MAX_INTERNAL_BYTES`] before
+///   anything is allocated for it, and must lie inside the file;
+/// - a leaf pointer must lie inside the leaf-directory section, not merely
+///   inside the file;
+/// - accumulated entries are bounded by [`max_expanded_entries`], and the
+///   number of leaves visited by [`MAX_LEAF_DIRECTORIES`], since one huge
+///   leaf and a million tiny ones are different attacks;
+/// - a leaf pointing at another leaf is refused rather than read as a tile
+///   (the spec allows deeper directories; no writer here produces them).
+pub(crate) fn walk_directories<S: ArchiveBytes + ?Sized>(
+    src: &S,
+    header: &Header,
+) -> std::result::Result<Vec<DirEntry>, DirWalkError> {
+    let invalid = DirWalkError::Invalid;
+    let section = |offset: u64,
+                   length: u64,
+                   what: &str|
+     -> std::result::Result<std::borrow::Cow<'_, [u8]>, DirWalkError> {
         // #417, extended in #510: the declared length is checked against the
         // internal-section ceiling BEFORE anything is allocated. Bounding it
         // by the file's own length is no bound at all for a file-backed
         // source — a header claiming a 256 MiB root directory made a reader
         // allocate 256 MiB per archive, and a merge opens every shard at
-        // once. The section is decompressed under the same ceiling anyway, so
-        // a compressed body larger than it cannot be a legitimate directory.
-        if len > MAX_INTERNAL_BYTES {
-            return Err(Error::PMTilesWrite(format!(
-                "{what} claims {len} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
+        // once. The section is decompressed under the same ceiling anyway,
+        // so a compressed body larger than it cannot be a directory.
+        if length > MAX_INTERNAL_BYTES {
+            return Err(invalid(format!(
+                "{what} claims {length} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
                  ceiling on an archive's internal sections"
             )));
         }
-        // Both come from the archive; a `as usize` truncation on a 32-bit
+        // Both come from the archive; an `as usize` truncation on a 32-bit
         // target would turn a wild offset into a plausible in-range one.
-        let start = usize::try_from(off).map_err(|_| past_end(what))?;
-        let end = usize::try_from(len)
-            .ok()
-            .and_then(|l| start.checked_add(l))
-            .filter(|&e| u64::try_from(e).is_ok_and(|e| e <= src.total_len()))
-            .ok_or_else(|| past_end(what))?;
-        src.read_range(start, end - start)
+        let start =
+            usize::try_from(offset).map_err(|_| invalid(format!("{what} offset overflow")))?;
+        let len =
+            usize::try_from(length).map_err(|_| invalid(format!("{what} length overflow")))?;
+        start
+            .checked_add(len)
+            .filter(|&end| u64::try_from(end).is_ok_and(|end| end <= src.total_len()))
+            .ok_or_else(|| invalid(format!("{what} extends past end of file")))?;
+        src.read_range(start, len).map_err(DirWalkError::Read)
+    };
+    let directory = |offset: u64,
+                     length: u64,
+                     what: &'static str|
+     -> std::result::Result<Vec<DirEntry>, DirWalkError> {
+        let raw = section(offset, length, what)?;
+        let plain =
+            compression::decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
+                .map_err(|source| DirWalkError::Decompress {
+                what,
+                offset,
+                length,
+                source,
+            })?;
+        decode_directory(&plain).ok_or_else(|| {
+            invalid(format!(
+                "undecodable {what} at byte offset {offset} ({length} bytes)"
+            ))
+        })
     };
     // An entry's range must lie inside the section it is relative to, not
     // merely inside the file: a leaf pointer aimed at the tile data would
     // otherwise be parsed as a directory (#417).
-    let within = |off: u64, len: u64, section_len: u64, what: &str| -> Result<()> {
-        match off.checked_add(len) {
+    let within =
+        |offset: u64, length: u64, section_len: u64, what: &str| match offset.checked_add(length) {
             Some(end) if end <= section_len => Ok(()),
-            _ => Err(Error::PMTilesWrite(format!(
-                "{what} at {off} ({len} bytes) extends past its {section_len}-byte section"
+            _ => Err(invalid(format!(
+                "{what} at {offset} ({length} bytes) extends past its {section_len}-byte section"
             ))),
-        }
-    };
-    let dir = |raw: &[u8], what: &str| -> Result<Vec<DirEntry>> {
-        let plain = compression::decompress_capped(
-            raw,
-            header.internal_compression,
-            compression::MAX_INTERNAL_BYTES,
-        )
-        .map_err(|e| Error::PMTilesWrite(format!("{what}: {e}")))?;
-        decode_directory(&plain).ok_or_else(|| Error::PMTilesWrite(format!("undecodable {what}")))
-    };
+        };
 
-    let root = dir(
-        &slice(header.root_dir_offset, header.root_dir_length, "root dir")?,
-        "root dir",
+    let root = directory(
+        header.root_dir_offset,
+        header.root_dir_length,
+        "root directory",
     )?;
-    // Entries accumulated across the walk are bounded by what the archive
-    // could legitimately address; the number of leaves is bounded
-    // separately, since an empty leaf costs no entries while still costing a
-    // bounded-but-real decompression apiece.
     let entry_limit = max_expanded_entries(header);
     let mut entry_budget = entry_limit;
     let mut leaves_visited = 0usize;
     let too_many_entries = || {
-        Error::PMTilesWrite(format!(
-            "directory entries exceed this archive's limit of {entry_limit} entries"
+        invalid(format!(
+            "directory entries across this archive's directories exceed its limit of \
+             {entry_limit} entries"
         ))
     };
 
@@ -846,42 +927,39 @@ pub(crate) fn read_all_entries_from<S: ArchiveBytes + ?Sized>(
         }
         leaves_visited += 1;
         if leaves_visited > MAX_LEAF_DIRECTORIES {
-            return Err(Error::PMTilesWrite(format!(
-                "root directory points at more than {MAX_LEAF_DIRECTORIES} leaf directories"
+            return Err(invalid(format!(
+                "archive's root directory points at more than {MAX_LEAF_DIRECTORIES} leaf \
+                 directories"
             )));
         }
         within(
             e.offset,
             u64::from(e.length),
             header.leaf_dirs_length,
-            "leaf dir",
+            "leaf directory",
         )?;
         // Base and entry offset both come from the archive, so the sum is
         // checked rather than wrapped into a plausible-looking one.
         let leaf_at = header
             .leaf_dirs_offset
             .checked_add(e.offset)
-            .ok_or_else(|| Error::PMTilesWrite("leaf dir offset overflow".to_string()))?;
-        let leaf = slice(leaf_at, u64::from(e.length), "leaf dir")?;
-        let decoded = dir(&leaf, "leaf dir")?;
+            .ok_or_else(|| invalid("leaf directory offset overflow".to_string()))?;
+        let leaf = directory(leaf_at, u64::from(e.length), "leaf directory")?;
         // Spent before the entries are kept, not after: a root full of
         // pointers at one 16 MiB leaf body is a ~50 KB file that would
         // otherwise accumulate entries until the process died.
         entry_budget = entry_budget
-            .checked_sub(decoded.len() as u64)
+            .checked_sub(leaf.len() as u64)
             .ok_or_else(too_many_entries)?;
-        for inner in decoded {
-            // run_length 0 inside a leaf is a second-level leaf pointer. The
-            // spec allows arbitrarily deep directories; this reader handles
-            // one level, and falling through would emit directory bytes as a
-            // tile.
-            if inner.run_length == 0 {
-                return Err(Error::PMTilesWrite(
-                    "multi-level leaf directories are not supported".to_string(),
-                ));
-            }
-            entries.push(inner);
+        // run_length 0 inside a leaf is a second-level leaf pointer. The spec
+        // allows arbitrarily deep directories; this reader handles one level,
+        // and falling through would emit directory bytes as a tile.
+        if leaf.iter().any(|inner| inner.run_length == 0) {
+            return Err(invalid(
+                "multi-level leaf directories are not supported".to_string(),
+            ));
         }
+        entries.extend(leaf);
     }
 
     Ok(entries)

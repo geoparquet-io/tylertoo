@@ -1664,7 +1664,7 @@ mod tests {
     use geoarrow::array::GeometryBuilder;
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
     use parquet::file::statistics::Statistics;
 
     /// Deterministic geometry for a feature id: even ids are points, odd ids are
@@ -1740,7 +1740,7 @@ mod tests {
     /// Read the `level` column values for a single row group.
     fn read_level_column(path: &std::path::Path, rg: usize) -> Vec<i32> {
         let file = File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let reader = builder.with_row_groups(vec![rg]).build().unwrap();
         let mut out = Vec::new();
         for batch in reader {
@@ -1762,7 +1762,7 @@ mod tests {
     /// byte compare is invalid; #296).
     fn layout_and_rows(path: &std::path::Path) -> (Vec<i64>, Vec<(i32, i64)>) {
         let file = File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let md = builder.metadata().clone();
         let rows_per_rg: Vec<i64> = (0..md.num_row_groups())
             .map(|i| md.row_group(i).num_rows())
@@ -1869,7 +1869,7 @@ mod tests {
     /// faithful to exactly what is written.
     fn geo_footer(path: &std::path::Path) -> serde_json::Value {
         let file = File::open(path).unwrap();
-        let md = ParquetRecordBatchReaderBuilder::try_new(file)
+        let md = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -1888,7 +1888,7 @@ mod tests {
     /// determinism checks (#508).
     fn geo_footer_raw(path: &std::path::Path) -> String {
         let file = File::open(path).unwrap();
-        let md = ParquetRecordBatchReaderBuilder::try_new(file)
+        let md = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -2521,7 +2521,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let parquet_meta = ParquetRecordBatchReaderBuilder::try_new(file)
+        let parquet_meta = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -2611,7 +2611,7 @@ mod tests {
 
         // Re-open and inspect the physical file.
         let file = File::open(tmp.path()).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let parquet_meta = builder.metadata().clone();
         assert_eq!(parquet_meta.num_row_groups(), 3);
 
@@ -2695,7 +2695,7 @@ mod tests {
 
         // Canonical-level rows (RG 2) re-read value-identical to the input.
         let file = File::open(tmp.path()).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader = crate::untrusted::open_parquet(file)
             .unwrap()
             .with_row_groups(vec![2])
             .build()
@@ -2776,7 +2776,7 @@ mod tests {
         assert_eq!(written_meta.canonical_level, None);
 
         let file = File::open(tmp.path()).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = crate::untrusted::open_parquet(file).unwrap();
         let kvs = builder
             .metadata()
             .file_metadata()
@@ -2889,7 +2889,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -2963,7 +2963,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -3005,7 +3005,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -3115,7 +3115,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -3175,7 +3175,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();
@@ -3198,7 +3198,7 @@ mod tests {
     /// `path`? Helper for the stats-suppression tests.
     fn rg_has_stats(path: &std::path::Path, rg: usize, col_path: &str) -> bool {
         let file = File::open(path).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
+        let pm = crate::untrusted::open_parquet(file)
             .unwrap()
             .metadata()
             .clone();

@@ -1307,6 +1307,15 @@ crates/core/src/
 │   │                   #   combined report) and TilesOptions { convert, export } with
 │   │                   #   its one validate(). CLI `tiles` and Python convert() are callers
 │   └── writer.rs       #   Level-banded GeoParquet writer
+├── untrusted.rs        # The one owner of Parquet and Arrow IPC reader
+│                       # construction (#779): footer pre-check (#690),
+│                       # chunk-range check (#430), the panic boundary around
+│                       # upstream decodes (#683/#684/#687), and the one
+│                       # byte-array batch cap and ceiling (#563):
+│                       # byte_array_limit() is the only source, scaled
+│                       # down by TYLERTOO_BYTE_ARRAY_LIMIT_BYTES for the
+│                       # scaled-limit lane. No other module builds a
+│                       # parquet or IPC reader
 ├── input.rs            # Input source abstraction: local file or remote
 │                       # object (s3/https/gs) via byte-range reads (#210)
 ├── input_set.rs        # ConvertSource: one file/object or an ordered set of
@@ -1345,6 +1354,8 @@ crates/core/src/
 ├── archive_index.rs    # Read a PMTiles archive's header + directories and
 │                       # fetch tile bodies by offset; what lets pyramid.rs
 │                       # and merge.rs work on archives bigger than RAM.
+│                       # Its directory walk (pmtiles_writer::walk_directories)
+│                       # is the one decode.rs and the band reader share (#779).
 │                       # MergedTiles: the k-way, ascending-id merge of
 │                       # several archives both share (one look-ahead each)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)

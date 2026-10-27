@@ -248,6 +248,93 @@ fn partial_null_geometry_rows_skipped_with_aligned_attributes() {
 // Class 2: invalid / degenerate source geometries
 // ============================================================================
 
+/// #707, end to end: an overview file with one `+inf` vertex in a polygon
+/// exports without a panic, and the left-out feature is counted rather than
+/// vanishing from every tile in silence.
+#[test]
+fn export_counts_a_non_finite_overview_vertex() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid = dir.path().join("valid.parquet");
+    make_valid_overview(&valid);
+
+    // Rewrite the overview row group by row group (the level bands must
+    // keep their row groups), with row 0's geometry replaced by a square
+    // carrying one infinite vertex.
+    let mut hostile_wkb = vec![1u8, 3, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0];
+    for (x, y) in [
+        (0.0f64, 0.0f64),
+        (1.0, 0.0),
+        (f64::INFINITY, 1.0),
+        (0.0, 1.0),
+        (0.0, 0.0),
+    ] {
+        hostile_wkb.extend_from_slice(&x.to_le_bytes());
+        hostile_wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    let hostile = dir.path().join("hostile.parquet");
+    let open = || ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&valid).unwrap());
+    let probe = open().unwrap();
+    let schema = probe.schema().clone();
+    let kvs = probe
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .clone();
+    let geom_idx = schema.index_of("geometry").unwrap();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&hostile).unwrap(),
+        schema.clone(),
+        None,
+    )
+    .unwrap();
+    let mut first = true;
+    for rg in 0..probe.metadata().num_row_groups() {
+        for batch in open().unwrap().with_row_groups(vec![rg]).build().unwrap() {
+            let mut batch = batch.unwrap();
+            if std::mem::take(&mut first) {
+                let geoms = batch
+                    .column(geom_idx)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                let values: Vec<Option<&[u8]>> = (0..batch.num_rows())
+                    .map(|i| {
+                        Some(if i == 0 {
+                            &hostile_wkb[..]
+                        } else {
+                            geoms.value(i)
+                        })
+                    })
+                    .collect();
+                let mut columns = batch.columns().to_vec();
+                columns[geom_idx] = Arc::new(BinaryArray::from(values));
+                batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            }
+            writer.write(&batch).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    for kv in kvs {
+        if kv.key != "ARROW:schema" {
+            writer.append_key_value_metadata(kv);
+        }
+    }
+    writer.close().unwrap();
+
+    let before = tylertoo_core::batch_processor::non_finite_geometry_count();
+    export_pmtiles(
+        &hostile,
+        dir.path().join("out.pmtiles"),
+        &ExportOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        tylertoo_core::batch_processor::non_finite_geometry_count() > before,
+        "the non-finite feature is counted"
+    );
+}
+
 #[test]
 fn nonfinite_coordinate_rows_skipped() {
     // NaN / infinite coordinates cannot be placed on any grid: those rows are

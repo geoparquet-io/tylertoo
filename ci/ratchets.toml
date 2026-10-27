@@ -33,12 +33,19 @@
 # Format: a flat TOML subset the Rust test parses by hand (no dependency):
 # one `key = value` per line, integers or double-quoted strings, no escapes.
 
+# #779 F5: 15 -> 6, with the scope widened to every parquet footer and
+# Arrow IPC open (the verifier's gate holes). Five are in untrusted.rs, the
+# owner: decode_footer (decode_metadata), read_parquet_metadata
+# (ParquetMetaDataReader::new), reader_metadata (ArrowReaderMetadata::
+# try_new), the builder (new_with_metadata) and open_ipc
+# (FileReader::try_new). The sixth is overview/pipeline.rs's spill
+# StreamReader, reading back the file the same run wrote (trusted, allowed).
 [parquet_open_sites]
-pin = 15
-target = 1
+pin = 6
+target = 6
 owner = "untrusted::open_parquet in crates/core/src/untrusted.rs (#779 F5)"
 catches = "#577 -> #606/#607: the 2 GiB batch-size fix reached 2 of 4 reader paths; #690 footer pre-check; #683/#684/#687 panics"
-scope = "production occurrences of ParquetRecordBatchReaderBuilder::, ParquetRecordBatchStreamBuilder::, ArrowReaderBuilder::, SerializedFileReader::new/try_from, ParquetMetaDataReader::new, ArrowReaderMetadata::load/try_new (every way to open a parquet file); the report's ~60 counted test code too"
+scope = "production occurrences of ParquetRecordBatchReaderBuilder::, ParquetRecordBatchStreamBuilder::, ArrowReaderBuilder::, ParquetRecordBatchReader::try_new, SerializedFileReader::new/try_from, ParquetMetaDataReader::new/decode_metadata, ArrowReaderMetadata::load/try_new, and arrow_ipc FileReader::try_new, FileReaderBuilder::, FileDecoder::new, StreamReader::try_new, StreamDecoder::new (every way to open a parquet file, a parquet footer, or an IPC file or stream); the report's ~60 counted test code too"
 
 [geometry_literal_files]
 pin = 6
@@ -47,15 +54,23 @@ owner = "ResolvedSchema / InputDescriptor, the one geometry-column resolver (#77
 catches = "#518 -> #519 -> #675 -> #676: four resolvers kept 'in lockstep' by hand; #675 broke on a column not named geometry"
 scope = "crates/core/src files whose production code holds the string literal \"geometry\""
 
+# #779 F5: 11 -> 12, not a warn-once flag: untrusted.rs's HOOK installs
+# the process-wide panic hook that keeps a caught decoder panic quiet
+# (libFuzzer's hook aborts otherwise). A panic hook is process-global
+# by nature; it stays when F2 retires the warn-once flags.
 [static_once_warnings]
-pin = 11
-target = 0
+pin = 12
+target = 1
 owner = "typed Vec<Diagnostic> in a new diagnostics.rs (#779 F2)"
 catches = "process-global warn-once flags: a second conversion in one process (Python, tests) never warns; #708 part 3"
-scope = "core production `static NAME: Once` / `std::sync::Once` / `AtomicBool` items (quality.rs, overview/pipeline.rs, input.rs)"
+scope = "core production `static NAME: Once` / `std::sync::Once` / `AtomicBool` items (quality.rs, overview/pipeline.rs, input.rs, and untrusted.rs's panic-hook HOOK, the 1 that stays)"
 
+# #779 F5: 3 -> 5. #707's two counted drops, CLIP_GUARD_DROPS
+# (ioverlay_clip.rs) and NON_FINITE_GEOMETRIES (batch_processor.rs),
+# each marked `// F2: becomes Diagnostic::...`; F2 moves them to the
+# diagnostics channel with simplify.rs's two.
 [global_atomic_counters]
-pin = 3
+pin = 5
 target = 1
 owner = "per-run counters in the diagnostics channel (#779 F2); atomic_output's temp-name sequence stays"
 catches = "simplify.rs FULL_RES_FALLBACKS / VALIDATION_SKIPS sum across every run in the process (#556 counter)"
@@ -96,8 +111,12 @@ owner = "conftest fail-on-skip under CI, fixtures guaranteed by the fixture down
 catches = "skipif guards that pass silently when a fixture is missing (#369's failure mode)"
 scope = "pytest.mark.skipif, pytest.mark.skip, pytest.skip(, pytest.importorskip( in crates/python/tests"
 
+# #779 F5: 21 -> 8. Every reader-site allow is gone (untrusted.rs owns
+# them). The 8 left: File::create and concat_batches sites, plus
+# overview/pipeline.rs's spill StreamReader once the IPC stream opens were
+# banned too (the run's own spill, trusted).
 [disallowed_method_allows]
-pin = 21
+pin = 8
 target = 0
 owner = "untrusted::{open_parquet, open_ipc} (#779 F5) and atomic_output (#427) for File::create"
 catches = "#606/#607 (reader paths without the batch cap), #427 (in-place writes), #683/#684 (IPC panics)"
@@ -129,10 +148,12 @@ scope = "production #[allow(..)], #![allow(..)], #[expect(..)] and #![expect(..)
 # known twins: in_memory_carriers/streaming_carriers (0.837, #407 drift),
 # select_input_row_groups_combined/select_row_groups_streaming (0.815), the
 # two strategy entry points (0.802) and the two preflights (0.859, 0.800).
+# #779 F5: 60 -> 58. clip.rs's rect pair (one finite-aware pass) and
+# reader.rs's read_level pair (one rows() helper) are gone.
 [similarity_pairs]
 checked_by = "scripts/ci/similarity_ratchet.py"
 threshold = 0.85
-pin = 60
+pin = 58
 target = 0
 owner = "the refactor that shares each pair's code (#779); F1 for overview/, F3 for the CLI parsers and Python error mappers"
 catches = "near-duplicate functions inside one file; the gate sat at 0.95, where the workspace has zero pairs, so it caught nothing"
