@@ -1,0 +1,18 @@
+# gate: cargo test --locked -p tylertoo --bin tylertoo -- surface_parity::every_flag_reaches_the_core_options
+# expect: `tiles --canary-unused` is parsed but changes no core option
+# issue: #374, #600 (a flag parsed and never threaded into the core options; G2 of #779)
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index bb75e7b..9561e5c 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -759,6 +759,10 @@ struct ConvertTuningArgs {
+     #[arg(long, help_heading = "Thinning & visibility")]
+     verbatim: bool,
+ 
++    /// Gate canary (#779 G2): parsed, and never read by a builder.
++    #[arg(long, default_value = "3")]
++    canary_unused: u32,
++
+     /// Numeric column used to choose each thinning cell's winning feature.
+     /// Conflicts with `--class-rank`.
+     #[arg(long, value_name = "COL", help_heading = "Ranking")]

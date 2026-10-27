@@ -1,0 +1,39 @@
+# gate: cd crates/python && uv run pytest tests/test_parity.py -q -p no:cacheprovider
+# expect: FAILED tests/test_parity.py::test_every_flag_has_a_kwarg\[decode:canary-kwargless\]
+# issue: #443, #709 (a CLI flag with no Python keyword argument; G2 of #779)
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index bb75e7b..a62d98c 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -507,6 +507,10 @@ struct DecodeArgs {
+     #[arg(long, value_name = "NAME")]
+     layer: Option<String>,
+ 
++    /// Gate canary (#779 G2): a flag with no Python keyword argument.
++    #[arg(long)]
++    canary_kwargless: bool,
++
+     /// Write the JSON decode report to this path.
+     #[arg(long, value_name = "PATH")]
+     report: Option<PathBuf>,
+diff --git a/crates/cli/tests/parity/clap_surface.json b/crates/cli/tests/parity/clap_surface.json
+index c323731..358bbd2 100644
+--- a/crates/cli/tests/parity/clap_surface.json
++++ b/crates/cli/tests/parity/clap_surface.json
+@@ -60,6 +60,16 @@
+       "positional": false,
+       "possible_values": []
+     },
++    {
++      "aliases": [],
++      "default": "false",
++      "hidden": false,
++      "id": "canary_kwargless",
++      "kind": "flag",
++      "long": "canary-kwargless",
++      "positional": false,
++      "possible_values": []
++    },
+     {
+       "aliases": [],
+       "default": null,
