@@ -380,6 +380,15 @@ jobs:
           eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
           dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
 
+      # leaf_directory_integration runs `pmtiles verify` on its archives and
+      # fails on CI when the CLI is missing (#779; it passed vacuously
+      # before). The pinned, checksummed go-pmtiles that e2e.yml uses.
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
+
       - name: Run all tests (quick tier)
         # `quick` excludes the slow end-to-end suites (#524) and the manual
         # large-polygon regression test (see tests/fixtures/realdata/README.md)
@@ -513,6 +522,15 @@ jobs:
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
+
+      # leaf_directory_integration runs `pmtiles verify` on its archives and
+      # fails on CI when the CLI is missing (#779; it passed vacuously
+      # before). The pinned, checksummed go-pmtiles that e2e.yml uses.
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
 
       - name: Run slow tests (${{ matrix.shard }})
         env:
