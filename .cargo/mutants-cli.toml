@@ -1,0 +1,24 @@
+# cargo-mutants configuration for the CLI crate (`tylertoo`, crates/cli),
+# read by mutation-diff.yml and scripts/mutants-diff.sh with
+# `--package tylertoo --config .cargo/mutants-cli.toml` (#779).
+#
+# The CLI used to be mutated nowhere, and #374, #600 and #709 were CLI
+# wiring bugs: a flag parsed and never used, a check only one front end ran.
+# .cargo/mutants.toml cannot serve both crates: its `additional_cargo_args`
+# names tylertoo-core's test binaries, which do not exist in this package.
+# Everything else follows that file; see it for the reasoning behind each
+# knob.
+
+test_tool = "nextest"
+profile = "mutants"
+
+# The `mutants` nextest profile is the `quick` set, so the CLI's slow
+# binaries (sharded_builds, thread_count_determinism, sink_downgrade, ...)
+# are built but not run per mutant; the required Slow Tests checks gate them.
+additional_cargo_test_args = ["--profile", "mutants"]
+
+timeout_multiplier = 3.0
+minimum_test_timeout = 120.0
+
+skip_calls_defaults = true
+skip_calls = ["debug!", "trace!", "info!", "warn!", "error!"]

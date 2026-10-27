@@ -401,7 +401,9 @@ the script's inline metadata.
 ## CI gates — and how to run them locally
 
 Branch protection requires every gate below on every PR, and each one
-runs locally.
+runs locally. [`ci/README.md`](ci/README.md) lists every gate in one
+table: what each asserts, whether it is required, the canary that
+proves it can still fail, and the command that reproduces it.
 
 ### Rust
 
@@ -467,14 +469,18 @@ python3 benchmarks/overview/ci_guard.py --check
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
-# Coverage: CI fails below the floor in the Coverage job's
+# Coverage: CI fails below a floor in the Coverage job's
 # "Coverage floor" step, then uploads to Codecov (report only)
 cargo install cargo-llvm-cov    # once
 rustup component add llvm-tools-preview
 cargo llvm-cov nextest --all-features --workspace \
   --exclude tylertoo-python \
   --lcov --output-path lcov.info
-python3 scripts/coverage_gate.py --check lcov.info --min 94
+python3 scripts/coverage_gate.py --check lcov.info --min 94 \
+  --floor 'crates/core/**=94' --floor 'crates/cli/**=81.9'
+
+# Baseline and band ratchet (CI: the Gate scripts job)
+python3 scripts/ci/baseline_ratchet.py --base origin/main --head HEAD
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
@@ -485,8 +491,21 @@ Some thresholds are **ratchets**, set at the current code's level and
 marked `RATCHET` in the source. They are cognitive complexity 30 and
 too-many-lines 200 in `clippy.toml`, the counts in `ci/ratchets.toml`,
 and xenon's max-absolute C. Lower them as the code improves, and never
-raise them. The line-coverage floor in `ci.yml` (94%) is a ratchet in
-the other direction: raise it as coverage grows, and never lower it.
+raise them. The line-coverage floors in `ci.yml` (94% for the workspace
+and for `crates/core`, 81.9% for `crates/cli`) are ratchets in the other
+direction: raise them as coverage grows, and never lower them.
+
+The tippecanoe bands, `benchmarks/overview/ci_baseline.json`, the
+golden tile digests and the golden archives are baselines. A PR that
+loosens a band, or changes any of the others, needs a commit trailer
+that names the issue and the measurement behind the change:
+
+```text
+Baseline-change: #761 z3 features 0.910 on CI run 1234
+```
+
+Without the trailer, the Gate scripts job fails the PR. Narrowing a
+band needs no trailer.
 
 `cargo shear` also inspects `[workspace.dependencies]`. To keep a
 dependency that no code references, such as a transitive version pin,
@@ -825,7 +844,13 @@ around it rather than for the whole file:
 
 ```bash
 # CI config lint (action refs must stay SHA-pinned)
-uvx zizmor --min-severity low .github/workflows
+uvx zizmor==1.26.1 --min-severity low .github/workflows .github/actions
+# Workflow syntax and expressions (not a CI gate)
+uvx --from actionlint-py actionlint
+
+# The gate helpers in scripts/ci/ (CI: the Gate scripts job)
+uv run --no-project --with pytest==8.3.4 --with pyyaml==6.0.2 \
+  pytest scripts/ci/tests
 ```
 
 ### Version consistency
@@ -844,16 +869,19 @@ The Version Consistency job checks all five. Move versions only with
 
 ## Scheduled and advisory jobs
 
-These jobs never block a merge.
+These jobs don't block a merge, with one exception: the Mutation gate
+blocks a `fix` PR.
 
 ### Mutation testing
 
 Every PR gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
-check "Mutation score (diff-scoped)"). It runs
-`cargo mutants --package tylertoo-core --in-diff` on the PR's diff
-against `origin/main`, so it tests only the mutants inside changed core
-lines. The mutants are split across up to four runners, about twelve
-each, so a diff of up to ~50 mutants finishes in about 15 minutes. One
+check "Mutation score (diff-scoped)"). It runs `cargo mutants
+--in-diff` on the PR's diff against `origin/main`, once for
+`tylertoo-core` (`.cargo/mutants.toml`) and once for the CLI
+(`.cargo/mutants-cli.toml`). So it tests only the mutants inside changed
+core and CLI lines. The mutants are split across up to four runners,
+about twelve each, so a diff of up to ~50 mutants finishes in about 15
+minutes. One
 runner used to take 40 minutes for 65 mutants and time out past ~130.
 A bigger diff gets a random sample instead: each runner takes its share
 from across the whole diff in shuffled order and stops after 20 minutes,
@@ -861,8 +889,18 @@ and the summary says how many of the planned mutants ran.
 
 The score and the missed mutants (`file:line`) go to the job summary. A
 same-repo PR with missed mutants also gets one sticky comment, updated
-on every push. Missed mutants from a sampled run are posted too. A PR that touches no Rust under `crates/core/` skips the
+on every push. Missed mutants from a sampled run are posted too. A PR
+that touches no Rust under `crates/core/` or `crates/cli/` skips the
 run, and a diff with no mutation site reports "no mutants in this diff".
+
+The "Mutation gate" check blocks a PR whose title starts with `fix`,
+such as `fix:` or `fix(cli):`, on any missed mutant on a changed line.
+The exception is a mutant annotated as equivalent, with `// mutants:
+equivalent #NNN` at the end of its line or on a comment line just above
+it. A fix whose own lines can change with no test noticing hasn't pinned
+what it fixed. For every other PR the gate passes, and the missed
+mutants stay a hint. The gate reads the title when it runs, so re-run
+the workflow after you retitle a PR.
 
 `scripts/mutants-diff.sh` is the local twin. It also covers uncommitted
 changes and new `.rs` files, and it exits 1 on a missed mutant, so you
@@ -880,8 +918,9 @@ inherits `quick`'s filter, so marking a test slow also drops it from
 every mutant's test run. Missed mutants and timeouts show up as the
 score in the job summary, not as a red run. If a failed baseline or a
 timed-out shard leaves part of the run unmeasured, the job opens or
-updates a pinned `mutation-tests` issue. To test a workflow fix
-without a full sweep, dispatch a subset of shards:
+updates a pinned `mutation-tests` issue. Close that issue only after a
+full green scheduled run, never after a subset (#677). To test a
+workflow fix without a full sweep, dispatch a subset of shards:
 
 ```bash
 gh workflow run mutation-tests.yml -f shard_list=0,1
@@ -938,7 +977,11 @@ third-party bytes:
 - the `--filter` grammar
 
 A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
-and opens or updates a pinned `fuzz` issue. `fuzz/README.md` lists the
+and opens or updates a pinned `fuzz` issue. Targets held out of the
+nightly are listed, with their issues, in `FUZZ_HOLDOUTS` in
+`fuzz.yml`. The nightly `gate-canary.yml` fails when one of those issues
+closes, so a held-out target goes back in once its reason is gone.
+`fuzz/README.md` lists the
 targets and shows how to run one and how to turn a crash into a
 regression test. The fuzz crate is its own workspace and stays out of
 the per-PR build.

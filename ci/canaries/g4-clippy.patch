@@ -1,0 +1,17 @@
+# gate: uv run scripts/ci/canary.py ci-step ci.yml check "Run clippy"
+# expect: clippy::len_zero|len_zero
+# issue: #695 (clippy's exit status was swallowed by a pipe in the pre-commit hook)
+diff --git a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+index 8f7603e..0d4fa60 100644
+--- a/crates/core/src/lib.rs
++++ b/crates/core/src/lib.rs
+@@ -106,3 +106,9 @@ pub enum Error {
+ }
+ 
+ pub type Result<T> = std::result::Result<T, Error>;
++
++/// Gate canary (#779): `clippy -D warnings` must reject this (`len_zero`).
++#[must_use]
++pub fn gate_canary_clippy(bytes: &[u8]) -> bool {
++    bytes.len() == 0
++}

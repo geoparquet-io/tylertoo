@@ -12,7 +12,18 @@
 # a failed baseline, a usage or internal error, a lost runner, or a shard
 # that hit its time limit (which GitHub reports as cancelled, not failed).
 #
-# Why shards: the core crate yields ~8200 mutants and each one costs a
+# CLOSE RULE (#677). The auto-filed `mutation-tests` issue closes only
+# after a FULL green SCHEDULED run: every one of the SHARD_COUNT shards
+# reported, none failed or was cancelled. A dispatched subset
+# (`shard_list`) checks a workflow fix in one shard's time; it measures
+# only its slices and never closes the issue. #635 was closed after a
+# 2-of-40-shard check and the next full sweep failed again (#677).
+# gate-canary.yml's staleness job fails while this issue stays open past
+# 7 days, or when the last successful scheduled run is older than 8 days.
+#
+# Why shards: the core crate yields ~10,300 mutants (10,327 from
+# `cargo mutants --package tylertoo-core --list` on 2026-10-27; it was
+# ~8200 when this comment was first written, #677) and each one costs a
 # build plus a `quick`-tier nextest run (~50s locally, more on a runner),
 # so an unsharded sweep needs days and GitHub kills a job at 360 minutes.
 # The shard count below is sized so each shard finishes well inside that;
@@ -66,6 +77,9 @@ env:
   # 350-minute limit below at the slow end, which a slow runner day could
   # eat. At 40 shards each slice is ~205 mutants, so the same slow end is
   # ~3.0 h (~170 minutes of headroom, 1.5x runner slowdown still fits).
+  # The crate has grown since: at ~10,300 mutants a slice is ~258 again,
+  # the slow end of #602 (~3.7 h, ~130 minutes of headroom). Raise this
+  # when a shard's elapsed time passes ~4.5 h.
   # Runner usage barely moves: the per-shard setup (toolchain, tippecanoe,
   # baseline, ~10 min) is the only duplicated cost, and with the 20-job
   # concurrency cap the sweep runs in two waves either way (32 = 20 + 12,
@@ -589,8 +603,10 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/mutation-tests.yml. It is
-          updated (not duplicated) on every failing run; close it once a run
-          completes. A low mutation score does not open this issue; the job
+          updated (not duplicated) on every failing run. Close it only after a
+          full green scheduled run (all shards reported, none failed or
+          cancelled), never after a dispatched subset (#677). A low mutation
+          score does not open this issue; the job
           summary reports the score. A shard that failed with \"The runner has
           received a shutdown signal\" in its log and nothing else was a lost
           runner (a runaway allocation escaping the memory cap, or GitHub

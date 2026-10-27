@@ -35,7 +35,12 @@
 # When a PR moves a ratio on purpose (a closed divergence, a new default),
 # it updates the band in tippecanoe_tolerances.toml in the same PR with the
 # new measurement in the comment - the same ratchet rule as the convert
-# guard baseline and the golden tile digests.
+# guard baseline and the golden tile digests. A band that gets wider or
+# moves (admits a ratio the old one rejected) also needs a
+# `Baseline-change: #NNN <measured>` commit trailer: the Gate scripts job in
+# ci.yml fails the PR without one (scripts/ci/baseline_ratchet.py, #779;
+# 09673f5 widened z3-z6 features from [0.29, 0.55] to [0.86, 1.50] in the
+# PR that moved them). Narrowing a band needs nothing.
 
 name: tippecanoe parity
 
@@ -53,8 +58,11 @@ on:
 permissions:
   contents: read
 
+# PRs cancel their superseded runs; every other run gets its own group per
+# event and commit, so a push to main is never cancelled by the next one
+# (#779; see ci.yml's concurrency note).
 concurrency:
-  group: parity-${{ github.workflow }}-${{ github.ref }}
+  group: parity-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -218,10 +226,12 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/tippecanoe-compare.yml. It is
-          updated (not duplicated) on every failing scheduled run; close it once
-          the ratio is back in band or the band in
-          benchmarks/e2e/tippecanoe_tolerances.toml has been moved on purpose,
-          with the new measurement in its comment._"
+          updated (not duplicated) on every failing scheduled run. Close it only
+          after a full green scheduled (or dispatched) run on main, once the
+          ratio is back in band or the band in
+          benchmarks/e2e/tippecanoe_tolerances.toml has been moved on purpose
+          (new measurement in its comment, \`Baseline-change:\` trailer on the
+          commit). gate-canary.yml fails while it stays open past 7 days._"
 
           EXISTING=$(gh issue list --label tippecanoe-parity --state open \
             --json number --jq '.[0].number // empty')
