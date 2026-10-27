@@ -653,6 +653,11 @@ pub tylertoo_core::input::InputError::Open
 pub tylertoo_core::input::InputError::Open::error: core::io::error::Error
 pub tylertoo_core::input::InputError::Open::input: alloc::string::String
 pub tylertoo_core::input::InputError::Parquet(parquet::errors::ParquetError)
+pub tylertoo_core::input::InputError::PlanInputChanged
+pub tylertoo_core::input::InputError::PlanInputChanged::current: alloc::string::String
+pub tylertoo_core::input::InputError::PlanInputChanged::field: &'static str
+pub tylertoo_core::input::InputError::PlanInputChanged::input: alloc::string::String
+pub tylertoo_core::input::InputError::PlanInputChanged::saved: alloc::string::String
 pub tylertoo_core::input::InputError::RemoteDisabled(alloc::string::String)
 pub tylertoo_core::input::InputError::RemotePrefixUnsupported
 pub tylertoo_core::input::InputError::RemotePrefixUnsupported::url: alloc::string::String
@@ -712,6 +717,7 @@ pub fn tylertoo_core::input::InputSource::from_str_input(&str) -> core::result::
 pub fn tylertoo_core::input::InputSource::is_remote(&self) -> bool
 pub fn tylertoo_core::input::InputSource::open(&self) -> core::result::Result<tylertoo_io::untrusted::ParquetSource<tylertoo_core::input::InputReader>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::release_read_cache(&self)
+pub fn tylertoo_core::input::InputSource::remote_meta(&self) -> core::option::Option<&tylertoo_io::input::RemoteObjectMeta>
 pub fn tylertoo_core::input::InputSource::set_spill_dir(&self, core::option::Option<&std::path::Path>)
 pub fn tylertoo_core::input::InputSource::stage_row_groups(&self, core::option::Option<&[usize]>) -> core::result::Result<(), tylertoo_core::input::InputError>
 impl core::clone::Clone for tylertoo_core::input::InputSource

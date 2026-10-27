@@ -764,8 +764,8 @@ pub struct ConvertOptions {
     /// pass 1 and the level assignment.
     ///
     /// The plan's fingerprint must match this run: the tylertoo version, every
-    /// thinning-relevant option, and each input part's path, size, mtime and
-    /// selected row groups. Any mismatch is a hard error naming the offending
+    /// thinning-relevant option, and each input part's path, size, local mtime
+    /// or remote ETag, and selected row groups. Any mismatch names the offending
     /// field — a stale plan never silently produces a different pyramid. The
     /// *write-side* knobs (profile, row-group sizing, in-flight depth,
     /// compression, spill directory) are deliberately not fingerprinted, so

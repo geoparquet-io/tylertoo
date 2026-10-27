@@ -10,6 +10,7 @@ repository.workspace = true
 
 [features]
 default = []
+remote = ["dep:object_store"]
 testing = []
 # Raw fixture builders for downstream tests and benchmarks only.
 test-support = []
@@ -24,6 +25,7 @@ arrow-select.workspace = true
 bytes = "1"
 log.workspace = true
 thiserror.workspace = true
+object_store = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

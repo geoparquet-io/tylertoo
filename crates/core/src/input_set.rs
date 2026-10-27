@@ -2638,11 +2638,10 @@ b.parquet
             let parts: Vec<InputSource> = listed
                 .into_iter()
                 .map(|p| {
-                    InputSource::Remote(RemoteSource::from_store_sized(
+                    InputSource::Remote(RemoteSource::from_store_meta(
                         Arc::clone(&store),
-                        p.location.clone(),
                         format!("memory://{}", p.location),
-                        p.size,
+                        p,
                     ))
                 })
                 .collect();

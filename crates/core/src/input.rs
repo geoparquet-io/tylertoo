@@ -62,6 +62,18 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
+    /// A saved convert plan belongs to a different version of an input.
+    #[error("--plan: saved plan does not match this run: input {input:?} {field} was {saved:?} when the plan was saved but is {current:?} now. Re-run without --plan (add --save-plan to write a fresh one).")]
+    PlanInputChanged {
+        /// Input path or URL.
+        input: String,
+        /// Identity field that changed.
+        field: &'static str,
+        /// Value stored in the plan.
+        saved: String,
+        /// Value observed for this run.
+        current: String,
+    },
     /// A checked-I/O boundary refused the input.
     #[error(transparent)]
     Decode(#[from] tylertoo_io::Error),
@@ -282,6 +294,16 @@ impl InputSource {
             InputSource::Local(_) => false,
             #[cfg(feature = "remote")]
             InputSource::Remote(_) => true,
+        }
+    }
+
+    /// Metadata captured when the remote object was opened or listed.
+    /// Local files continue to use filesystem metadata for plan binding.
+    pub fn remote_meta(&self) -> Option<&tylertoo_io::RemoteObjectMeta> {
+        match self {
+            Self::Local(_) => None,
+            #[cfg(feature = "remote")]
+            Self::Remote(source) => Some(&source.object_meta),
         }
     }
 
@@ -653,7 +675,7 @@ pub(crate) mod remote {
         url: String,
         store: Arc<dyn ObjectStore>,
         location: ObjectPath,
-        size: u64,
+        pub(super) object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
         #[expect(
             clippy::disallowed_types,
@@ -748,14 +770,6 @@ pub(crate) mod remote {
         Ok((store, location))
     }
 
-    /// One `.parquet` object found under a remote prefix.
-    pub(crate) struct ListedPart {
-        /// Full object key (from the bucket root).
-        pub location: ObjectPath,
-        /// Object size in bytes, straight from the listing (no HEAD).
-        pub size: u64,
-    }
-
     /// List the `.parquet` objects under remote prefix `prefix`, applying
     /// the same hygiene as the local directory walk
     /// ([`crate::input_set::list_parquet_files`]): keys must end
@@ -767,13 +781,13 @@ pub(crate) mod remote {
         store: &Arc<dyn ObjectStore>,
         prefix: &ObjectPath,
         url_str: &str,
-    ) -> Result<Vec<ListedPart>, InputError> {
+    ) -> Result<Vec<object_store::ObjectMeta>, InputError> {
         use futures_util::TryStreamExt;
         let metas: Vec<object_store::ObjectMeta> = runtime()
             .block_on(store.list(Some(prefix)).try_collect())
             .map_err(|e| store_error(url_str, e))?;
         let prefix_depth = prefix.parts().count();
-        let mut parts: Vec<ListedPart> = metas
+        let mut parts: Vec<object_store::ObjectMeta> = metas
             .into_iter()
             .filter(|m| {
                 m.size > 0
@@ -782,10 +796,6 @@ pub(crate) mod remote {
                         .parts()
                         .skip(prefix_depth)
                         .all(|c| !c.as_ref().starts_with(['.', '_']))
-            })
-            .map(|m| ListedPart {
-                location: m.location,
-                size: m.size,
             })
             .collect();
         parts.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
@@ -803,7 +813,7 @@ pub(crate) mod remote {
             .into_iter()
             .map(|p| {
                 let url = part_url(url_str, &p.location);
-                RemoteSource::from_store_sized(Arc::clone(&store), p.location, url, p.size)
+                RemoteSource::from_store_meta(Arc::clone(&store), url, p)
             })
             .collect())
     }
@@ -849,35 +859,33 @@ pub(crate) mod remote {
             let head = runtime()
                 .block_on(store.head(&location))
                 .map_err(|e| store_error(&url, e))?;
-            Ok(Self::from_store_sized_with_cap_base(
-                store, location, url, head.size, cap_base,
+            Ok(Self::from_store_meta_with_cap_base(
+                store, url, head, cap_base,
             ))
         }
 
-        /// [`Self::from_store`] with the object size already known (from a
+        /// [`Self::from_store`] with object metadata already known (from a
         /// prefix listing) — skips the HEAD request, so connecting N listed
         /// parts costs no network round-trips at all.
-        pub(crate) fn from_store_sized(
+        pub(crate) fn from_store_meta(
             store: Arc<dyn ObjectStore>,
-            location: ObjectPath,
             url: String,
-            size: u64,
+            meta: object_store::ObjectMeta,
         ) -> Self {
-            Self::from_store_sized_with_cap_base(store, location, url, size, CHUNK_CACHE_MAX_BYTES)
+            Self::from_store_meta_with_cap_base(store, url, meta, CHUNK_CACHE_MAX_BYTES)
         }
 
-        fn from_store_sized_with_cap_base(
+        fn from_store_meta_with_cap_base(
             store: Arc<dyn ObjectStore>,
-            location: ObjectPath,
             url: String,
-            size: u64,
+            meta: object_store::ObjectMeta,
             cap_base: u64,
         ) -> Self {
             Self {
                 url,
                 store,
-                location,
-                size,
+                location: meta.location.clone(),
+                object_meta: meta.into(),
                 shared: Arc::new(SharedState::default()),
                 #[expect(
                     clippy::disallowed_types,
@@ -954,7 +962,7 @@ pub(crate) mod remote {
             RemoteReader {
                 store: Arc::clone(&self.store),
                 location: self.location.clone(),
-                size: self.size,
+                size: self.object_meta.size,
                 shared: Arc::clone(&self.shared),
                 cache: Arc::clone(&self.cache),
                 spill: Arc::clone(&self.spill),
@@ -1058,13 +1066,13 @@ pub(crate) mod remote {
                     // fetch the wrong bytes.
                     let chunk_end = s
                         .checked_add(len)
-                        .filter(|e| *e <= self.size)
+                        .filter(|e| *e <= self.object_meta.size)
                         .zip(usize::try_from(len).ok())
                         .ok_or_else(|| {
                             ParquetError::EOF(format!(
                                 "column chunk range {s}..{} beyond object size {} for {}",
                                 s as u128 + len as u128,
-                                self.size,
+                                self.object_meta.size,
                                 self.location
                             ))
                         })?;
@@ -1172,7 +1180,7 @@ pub(crate) mod remote {
             FetchStats {
                 requests: self.shared.requests.load(Ordering::Relaxed),
                 bytes_fetched: self.shared.bytes.load(Ordering::Relaxed),
-                object_size: self.size,
+                object_size: self.object_meta.size,
             }
         }
 
@@ -3128,11 +3136,10 @@ pub(crate) fn test_memory_multi_source(
     let parts: Vec<InputSource> = listed
         .into_iter()
         .map(|p| {
-            InputSource::Remote(remote::RemoteSource::from_store_sized(
+            InputSource::Remote(remote::RemoteSource::from_store_meta(
                 Arc::clone(&store),
-                p.location.clone(),
                 format!("memory://{}", p.location),
-                p.size,
+                p,
             ))
         })
         .collect();

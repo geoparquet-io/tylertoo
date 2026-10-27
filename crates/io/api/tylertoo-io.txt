@@ -163,6 +163,25 @@ impl core::marker::Unpin for tylertoo_io::ReaderMetadata
 impl core::marker::UnsafeUnpin for tylertoo_io::ReaderMetadata
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::ReaderMetadata
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::ReaderMetadata
+pub struct tylertoo_io::RemoteObjectMeta
+pub tylertoo_io::RemoteObjectMeta::e_tag: core::option::Option<alloc::string::String>
+pub tylertoo_io::RemoteObjectMeta::last_modified: alloc::string::String
+pub tylertoo_io::RemoteObjectMeta::size: u64
+impl core::clone::Clone for tylertoo_io::RemoteObjectMeta
+pub fn tylertoo_io::RemoteObjectMeta::clone(&self) -> tylertoo_io::RemoteObjectMeta
+impl core::cmp::Eq for tylertoo_io::RemoteObjectMeta
+impl core::cmp::PartialEq for tylertoo_io::RemoteObjectMeta
+pub fn tylertoo_io::RemoteObjectMeta::eq(&self, &tylertoo_io::RemoteObjectMeta) -> bool
+impl core::fmt::Debug for tylertoo_io::RemoteObjectMeta
+pub fn tylertoo_io::RemoteObjectMeta::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_io::RemoteObjectMeta
+impl core::marker::Freeze for tylertoo_io::RemoteObjectMeta
+impl core::marker::Send for tylertoo_io::RemoteObjectMeta
+impl core::marker::Sync for tylertoo_io::RemoteObjectMeta
+impl core::marker::Unpin for tylertoo_io::RemoteObjectMeta
+impl core::marker::UnsafeUnpin for tylertoo_io::RemoteObjectMeta
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::RemoteObjectMeta
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::RemoteObjectMeta
 pub struct tylertoo_io::UntrustedBatchReader
 impl arrow_array::record_batch::RecordBatchReader for tylertoo_io::UntrustedBatchReader
 pub fn tylertoo_io::UntrustedBatchReader::schema(&self) -> arrow_schema::schema::SchemaRef

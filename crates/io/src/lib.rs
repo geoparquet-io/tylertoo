@@ -4,10 +4,12 @@
 //! required by the remote byte-range adapter, statistics pruning, and parallel
 //! row-group encoding; none permits constructing an unchecked reader.
 
+mod input;
 mod ipc;
 mod untrusted;
 mod writer;
 
+pub use input::RemoteObjectMeta;
 pub use ipc::{IpcFileWriter, IpcStreamReader, IpcStreamWriter};
 pub use untrusted::{
     byte_array_limit, check_byte_array_ceiling, decode_footer, input_error,

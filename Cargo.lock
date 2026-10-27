@@ -4510,6 +4510,7 @@ dependencies = [
  "arrow-select",
  "bytes",
  "log",
+ "object_store",
  "parquet",
  "tempfile",
  "thiserror 2.0.21",

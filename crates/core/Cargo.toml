@@ -33,6 +33,7 @@ fuzzing = []
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
 remote = [
+    "tylertoo-io/remote",
     "dep:object_store",
     "dep:tokio",
     "dep:aws-config",

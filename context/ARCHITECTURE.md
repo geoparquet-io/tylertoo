@@ -326,12 +326,15 @@ thinning-relevant option field by field, and each input part's identity) and
 hard-errors naming the offending field rather than running stale. Input
 identity is, for local files **and** remote objects alike, the path/URL, the
 byte size, the footer **row count**, the footer row-group count and the
-selected row groups, plus mtime for a local file (#511). The row count is the
-load-bearing term: the winner table is addressed by row *position*, so it is
-the only cheap fact that catches a swapped remote object — `fs::metadata` on
-an `s3://` display name sees nothing. There is no ETag or object mtime term
-(neither is plumbed past `RemoteSource::connect`), so a remote part gets a
-one-line warning on save and load naming what is and is not pinned.
+selected row groups, plus mtime for a local file (#511). Remote objects also
+pin their ETag (#547), retained by `tylertoo-io::RemoteObjectMeta` from the
+HEAD or prefix listing that opens them. The plan records last-modified for
+provenance; content identity compares the opaque ETag and size. A changed or
+missing previously saved ETag, or a changed size, returns a typed
+`InputError::PlanInputChanged` before replay. Stores without ETags and older
+plans without that optional field retain the size/footer binding; stores
+without ETags get a warning explaining its limits. The row count remains
+essential because the winner table is addressed by row *position*.
 
 Both paths are preflighted in `validate_options` (#513), alongside the #272
 `--spill-dir` check: `--plan` must be readable and carry the plan magic, and

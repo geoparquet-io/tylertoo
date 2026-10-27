@@ -61,7 +61,7 @@
 //! fingerprint pins the tylertoo version, every thinning-relevant option, and
 //! each input part's identity: path/URL, byte size, footer row count, footer
 //! row-group count and selected row groups for every part, plus mtime for a
-//! local file. See [`Fingerprint`].
+//! local file and ETag for a remote object. See [`Fingerprint`].
 //!
 //! # Entry-zoom ladder
 //!
@@ -223,9 +223,16 @@ pub(super) struct InputFingerprint {
     /// only when neither is obtainable.
     pub byte_len: Option<u64>,
     /// Modification time in nanoseconds since the Unix epoch. Local files
-    /// only — an object store's `LastModified` is not plumbed through the
-    /// input layer, so this stays `None` for remote parts.
+    /// only; remote last-modified is recorded separately below.
     pub mtime_nanos: Option<i128>,
+    /// Remote entity tag, compared as an opaque string when saved. Older
+    /// plans and stores without entity tags retain the size/footer binding.
+    #[serde(default)]
+    pub e_tag: Option<String>,
+    /// Remote last-modified time (RFC 3339), retained for provenance. The
+    /// content binding uses ETag and size, rather than timestamp precision.
+    #[serde(default)]
+    pub last_modified: Option<String>,
     /// Row groups selected for this part by `--bbox` / `--filter` pruning.
     /// `None` = every row group.
     pub row_groups: Option<Vec<usize>>,
@@ -283,7 +290,10 @@ impl Fingerprint {
             .enumerate()
             .map(|(i, part)| {
                 let path = part.display_name();
-                let meta = std::fs::metadata(&path).ok();
+                let remote = part.remote_meta();
+                let meta = (!part.is_remote())
+                    .then(|| std::fs::metadata(&path).ok())
+                    .flatten();
                 InputFingerprint {
                     // A remote object has no local metadata; its
                     // Content-Length is already in hand from the HEAD /
@@ -291,12 +301,14 @@ impl Fingerprint {
                     byte_len: meta
                         .as_ref()
                         .map(std::fs::Metadata::len)
-                        .or_else(|| part.fetch_stats().map(|s| s.object_size)),
+                        .or_else(|| remote.map(|m| m.size)),
                     mtime_nanos: meta
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i128),
+                    e_tag: remote.and_then(|m| m.e_tag.clone()),
+                    last_modified: remote.map(|m| m.last_modified.clone()),
                     row_groups: selected.and_then(|s| s.get(i).cloned()),
                     row_groups_total: footer.get(i).map(|&(_, groups)| groups),
                     num_rows: footer.get(i).map(|&(rows, _)| rows),
@@ -417,11 +429,26 @@ fn verify_input(
         ));
     }
     if saved.byte_len != now.byte_len {
-        return Err(mismatch(
-            &what("byte_len"),
-            &opt_str(saved.byte_len),
-            &opt_str(now.byte_len),
-        ));
+        return Err(crate::input::InputError::PlanInputChanged {
+            input: saved.path.clone(),
+            field: "byte_len",
+            saved: opt_str(saved.byte_len),
+            current: opt_str(now.byte_len),
+        }
+        .into());
+    }
+    // A saved ETag must still be available and identical. Stores that never
+    // supplied one (and older plans) keep the existing size/footer checks.
+    if let Some(etag) = &saved.e_tag {
+        if now.e_tag.as_ref() != Some(etag) {
+            return Err(crate::input::InputError::PlanInputChanged {
+                input: saved.path.clone(),
+                field: "ETag",
+                saved: etag.clone(),
+                current: now.e_tag.clone().unwrap_or_else(|| "<none>".into()),
+            }
+            .into());
+        }
     }
     if saved.mtime_nanos != now.mtime_nanos {
         return Err(mismatch(
@@ -770,32 +797,21 @@ fn selection_excess(
     }
 }
 
-/// One-line honesty note about what a plan does and does not pin for a
-/// **remote** part (#511), emitted on save and on load alike.
-///
-/// A local file is pinned by path, size, mtime, row count and row-group
-/// layout. A remote object has no mtime and no ETag here — the input layer
-/// does not carry either past `connect()` — so its binding is URL,
-/// Content-Length, row count and row-group layout. That catches every
-/// replay that would corrupt the pyramid (the row-indexed winner table
-/// cannot survive a row-count change), but it does not catch an object
-/// rewritten in place with the identical size, row count and row-group
-/// layout.
+/// Explain the weaker binding only for stores that do not supply an ETag.
 fn warn_remote_binding(source: &ConvertSource, flag: &str) {
     let remote = source
         .parts()
         .iter()
-        .filter(|p| p.is_remote())
+        .filter(|p| p.remote_meta().is_some_and(|m| m.e_tag.is_none()))
         .map(|p| p.display_name())
         .collect::<Vec<_>>();
     let Some(first) = remote.first() else {
         return;
     };
     log::warn!(
-        "--{flag}: {} remote input part(s) (e.g. {first}) are pinned by URL, object size, \
-         row count and row-group layout only — an object has no mtime here, so one rewritten \
-         in place with the same size and row count would NOT be detected. Local parts also \
-         pin mtime.",
+        "--{flag}: {} remote input part(s) (e.g. {first}) have no ETag and are pinned by URL, \
+         object size, row count and row-group layout only. An object rewritten in place \
+         with the same size and row structure would NOT be detected. Local parts also pin mtime.",
         remote.len(),
     );
 }
@@ -1867,6 +1883,187 @@ fn rebuild_coalesce(batch: &RecordBatch, path: &Path) -> Result<CoalescePlan, Co
 mod tests {
     use super::*;
 
+    #[cfg(feature = "remote")]
+    fn remote_plan_roundtrip(rewrite: bool, listed: bool) {
+        use crate::input::{remote, InputSource};
+        use object_store::{
+            memory::InMemory, path::Path as ObjectPath, ObjectStore, ObjectStoreExt,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        super::super::testutil::write_input(&input, &point_fixture(), true, None);
+        let bytes = std::fs::read(input).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("set/in.parquet");
+        rt.block_on(store.put(&location, bytes.clone().into()))
+            .unwrap();
+        let initial = rt.block_on(store.head(&location)).unwrap();
+        let source = || {
+            if listed {
+                let part = remote::list_parquet_under_prefix(
+                    &store,
+                    &ObjectPath::from("set"),
+                    "memory://set/",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+                // Exercise the production constructor used by prefix inputs.
+                InputSource::Remote(remote::RemoteSource::from_store_meta(
+                    Arc::clone(&store),
+                    "memory://set/in.parquet".into(),
+                    part,
+                ))
+            } else {
+                InputSource::Remote(
+                    remote::RemoteSource::from_store(
+                        Arc::clone(&store),
+                        location.clone(),
+                        "memory://set/in.parquet".into(),
+                    )
+                    .unwrap(),
+                )
+            }
+        };
+        let plan_path = dir.path().join("convert.plan");
+        let base = ConvertOptions {
+            levels: super::super::convert::LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            ..Default::default()
+        };
+        super::super::convert::convert_to_overviews_source(
+            &source(),
+            &dir.path().join("saved.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        if rewrite {
+            // Identical bytes, size and footer layout; only object identity changes.
+            rt.block_on(store.put(&location, bytes.into())).unwrap();
+        }
+        let current = rt.block_on(store.head(&location)).unwrap();
+        assert_eq!(initial.size, current.size);
+        assert!(initial.e_tag.is_some());
+        assert_eq!(initial.e_tag == current.e_tag, !rewrite);
+        let output = dir.path().join("replayed.parquet");
+        let result = super::super::convert::convert_to_overviews_source(
+            &source(),
+            &output,
+            &ConvertOptions {
+                plan: Some(plan_path.clone()),
+                ..base
+            },
+        );
+        if rewrite {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConvertError::Input(crate::input::InputError::PlanInputChanged {
+                        field: "ETag",
+                        ..
+                    })
+                ),
+                "{err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("--plan") && message.contains("ETag"),
+                "{message}"
+            );
+            assert!(message.contains("memory://set/in.parquet"), "{message}");
+            assert!(
+                message.contains(&format!("{:?}", initial.e_tag.as_ref().unwrap())),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("{:?}", current.e_tag.as_ref().unwrap())),
+                "{message}"
+            );
+            assert!(!output.exists());
+        } else {
+            result.unwrap();
+            let saved = ConvertPlan::load(&plan_path).unwrap();
+            let binding = serde_json::to_value(&saved.fingerprint.inputs[0]).unwrap();
+            assert_eq!(binding["e_tag"], initial.e_tag.unwrap());
+            assert_eq!(binding["last_modified"], initial.last_modified.to_rfc3339());
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_plan_accepts_unchanged_etag() {
+        for listed in [false, true] {
+            remote_plan_roundtrip(false, listed);
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_plan_rejects_changed_etag() {
+        for listed in [false, true] {
+            remote_plan_roundtrip(true, listed);
+        }
+    }
+
+    #[test]
+    fn remote_plan_rejects_changed_size() {
+        let mut saved = tiny_fingerprint();
+        saved.inputs[0].path = "s3://bucket/in.parquet".into();
+        saved.inputs[0].mtime_nanos = None;
+        let mut current = saved.clone();
+        current.inputs[0].byte_len = Some(5678);
+        let err = saved.verify(&current).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::Input(crate::input::InputError::PlanInputChanged {
+                field: "byte_len",
+                ..
+            })
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("1234") && message.contains("5678"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn remote_plan_handles_missing_etags_and_legacy_metadata() {
+        let mut current = tiny_fingerprint();
+        current.inputs[0].path = "s3://bucket/in.parquet".into();
+        current.inputs[0].mtime_nanos = None;
+        current.inputs[0].e_tag = Some("\"opaque-tag\"".into());
+        current.inputs[0].last_modified = Some("2026-10-27T00:00:00+00:00".into());
+        let mut json = serde_json::to_value(&current).unwrap();
+        let input = json["inputs"][0].as_object_mut().unwrap();
+        input.remove("e_tag");
+        input.remove("last_modified");
+        let legacy: Fingerprint = serde_json::from_value(json).unwrap();
+        // No saved ETag: retain the old size/footer binding, including for
+        // stores that never supply ETags. No incompatible plan version bump.
+        legacy.verify(&legacy).unwrap();
+        legacy.verify(&current).unwrap();
+        let err = current.verify(&legacy).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::Input(crate::input::InputError::PlanInputChanged { field: "ETag", .. })
+        ));
+        // Last-modified is recorded as provenance, not a second content key.
+        let mut touched = current.clone();
+        touched.inputs[0].last_modified = None;
+        current.verify(&touched).unwrap();
+    }
+
     fn tiny_fingerprint() -> Fingerprint {
         Fingerprint {
             tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1875,6 +2072,8 @@ mod tests {
                 path: "/tmp/in.parquet".to_string(),
                 byte_len: Some(1234),
                 mtime_nanos: Some(99),
+                e_tag: None,
+                last_modified: None,
                 row_groups: Some(vec![0, 2]),
                 row_groups_total: Some(3),
                 num_rows: Some(9),
@@ -2092,6 +2291,8 @@ mod tests {
                 // absent and the size is whatever the object store reported.
                 byte_len,
                 mtime_nanos: None,
+                e_tag: None,
+                last_modified: None,
                 row_groups: None,
                 row_groups_total: Some(12),
                 num_rows: Some(rows),
