@@ -76,29 +76,38 @@ owner = "per-run counters in the diagnostics channel (#779 F2); atomic_output's 
 catches = "simplify.rs FULL_RES_FALLBACKS / VALIDATION_SKIPS sum across every run in the process (#556 counter)"
 scope = "core production `static NAME: AtomicU64 | AtomicUsize | AtomicU32 | AtomicI64 | AtomicIsize` items"
 
+# #779 F3: 25 -> 14. Core's TilesConfig::validate took over the CLI's
+# option checks; the 14 left parse argument shapes (--bbox, INPUT/OUTPUT)
+# and report validate/decode results.
 [cli_bail_calls]
-pin = 25
+pin = 14
 target = 0
 owner = "core TilesConfig::validate, run before any I/O (#779 F3)"
 catches = "validation duplicated in the CLI and Python and missing from core (b8fa58a); #443, #458, #709, #438"
 scope = "production `bail!` calls in crates/cli/src"
 
+# #779 F3: 26 -> 22, and target 4 -> 0. The 4 were the pyo3 entry
+# points, which mirrored every Python kwarg; F3 builds them from one
+# TilesConfig through **kwargs, so they carry no allow now.
 [too_many_arguments_allows]
-pin = 26
-target = 4
-owner = "Pass1Ctx and the shared stages (#779 F1); the 4 pyo3 signatures in crates/python/src/lib.rs mirror Python kwargs and stay"
+pin = 22
+target = 0
+owner = "Pass1Ctx and the shared stages (#779 F1)"
 catches = "cd8a9d4 changed 9 signatures to swap one type; run_pass1_with_chunk_rows/resolve_winner_tables at 10 params. export.rs export_level_groups carries a stale allow (7 params)"
 scope = "production `clippy::too_many_arguments` attributes (allow or expect), all crates"
 
+# #779 F3: 25 -> 21 and target 4 -> 0, the same pyo3 entry points.
 [fns_over_7_params]
-pin = 25
-target = 4
-owner = "Pass1Ctx and the shared stages (#779 F1); the 4 pyo3 entry points stay"
+pin = 21
+target = 0
+owner = "Pass1Ctx and the shared stages (#779 F1)"
 catches = "signature growth as the fix pattern (cd8a9d4, ba480dc, 8576c61)"
 scope = "production `fn` items (including methods and trait items) with more than 7 parameters, self included"
 
+# #779 G3: 10 -> 9. The ignored >2 GiB test in input_set.rs is deleted,
+# replaced by the scaled-limit lane (crates/core/tests/scaled_limits.rs).
 [ignore_without_issue]
-pin = 10
+pin = 9
 target = 0
 owner = "each #[ignore] gets `= \"#NNN <why>\"` or is deleted (#779; the >2 GiB one is replaced by G3's scaled-limit lane)"
 catches = "#563/#606/#607: the >2 GiB test at input_set.rs is ignored and never runs; ignores that link no issue are invisible"
