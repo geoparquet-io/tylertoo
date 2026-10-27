@@ -62,8 +62,8 @@ name a plain command in `gate`. If the named step doesn't exist,
 
 ## Add a canary
 
-Name the file `<owner>-<gate>.patch`. The `g1-`, `g2-`, `g3-` and `g4-`
-prefixes are the #779 tracks. Use a short gate name, such as
+Name the file `<owner>-<gate>.patch`. The `g1-`, `g2-`, `g3-`, `g4-` and
+`f6-` prefixes are the #779 tracks. Use a short gate name, such as
 `g4-clippy`.
 
 ```bash
@@ -129,5 +129,5 @@ the issue stays open for more than 7 days.
 | `g2-parsed-unused` | `surface_parity::every_flag_reaches_the_core_options` (ci.yml Test) | a flag that is parsed but changes no core option fails (#374, #600) |
 | `g3-byte-array-cap` | `crates/core/tests/scaled_limits.rs` (ci.yml Test) | the reader owner (`untrusted::ParquetSource::build`) dropping its batch cap fails at a scaled byte-array ceiling (#563, #606, #607) |
 | `g3-size-valve` | `run_e2e.py --invariants` (e2e.yml) | a tile over the compressed or raw cap fails `tile_size` (#752) |
-| `g3-polygon-repair` | `run_e2e.py --invariants` (e2e.yml) | an invalid polygon in a tile fails `polygon_valid` (#748, #393) |
+| `f6-skip-repair` | `run_e2e.py --invariants` (e2e.yml) | bypassing the tile-space validity owner (`mvt::tile_polygon::finalize_polygons`) fails `polygon_valid` (#748) |
 | `g3-silent-drop` | `run_e2e.py --invariants` (e2e.yml) | a feature dropped with no counter fails `feature_accounting` (#707) |
