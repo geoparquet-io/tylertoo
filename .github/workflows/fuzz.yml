@@ -50,17 +50,16 @@ env:
   # `include: [{target: remote_footer, features: remote}]` when it names a
   # fuzz-crate feature), and when a target in
   # fuzz/fuzz_targets/ is in neither the matrix nor this list (#779).
+  #
+  # Empty since #779 F5 (#784): untrusted.rs refuses #690's footer and the
+  # IPC block lengths before parquet-rs/arrow-ipc see them, and its panic
+  # boundary turns #683's, #684's and #687's upstream panics into
+  # InputError::DecoderPanic. All four targets ran clean under cargo fuzz
+  # with the crash seeds in the corpus. #683 and #687 stay open to track the
+  # arrow/parquet 60 upgrade that removes the panics themselves; fuzzing
+  # their paths nightly is what catches a regression of the boundary.
   FUZZ_HOLDOUTS: >-
-    [
-    {"target": "overview_file", "issues": [683],
-     "why": "arrow-ipc panics on a crafted ARROW:schema footer key; fixed in arrow 60"},
-    {"target": "remote_footer", "issues": [683, 687], "features": "remote",
-     "why": "#683, and parquet-rs panics on a crafted page's definition levels"},
-    {"target": "plan_file", "issues": [684],
-     "why": "arrow-ipc panics on a crafted IPC buffer"},
-    {"target": "parquet_footer", "issues": [690],
-     "why": "parquet-rs reserves ~12 GB for a crafted schema's child count; libFuzzer's malloc limit calls it an OOM"}
-    ]
+    []
 
 jobs:
   fuzz:
@@ -85,12 +84,19 @@ jobs:
           - shard_plan
           - decompress
           - cli_args
+          # Re-enabled by #779 F5 (#683, #684, #687, #690).
+          - overview_file
+          - plan_file
+          - parquet_footer
           # Targets held out of this list live in FUZZ_HOLDOUTS above, not
           # here: gate-canary.yml's staleness job reads that list.
         # No fuzz-crate feature by default; an `include:` entry for a target
         # that needs one (remote_footer: remote) sets it. Declared so
         # `matrix.features` below is a known key (actionlint).
         features: [""]
+        include:
+          - target: remote_footer
+            features: remote
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
