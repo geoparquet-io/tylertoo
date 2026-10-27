@@ -64,8 +64,17 @@ use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 use super::convert::ConvertError;
 use super::level::{MemoryProfile, Mode};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight};
-use super::stream::{process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers};
+use super::stream::{
+    process_batch_cascade, process_level_batch, LevelStreamCtx, Pass2Timers, StreamRead,
+};
 use super::writer::{LevelWriteOutcome, OverviewWriter};
+
+pub(super) struct BufferOptions<'a> {
+    pub(super) profile: MemoryProfile,
+    pub(super) backing: SinkBacking,
+    pub(super) out_schema: &'a Schema,
+    pub(super) spill_dir: Option<&'a Path>,
+}
 
 /// How a level's buffered output is held until it is written.
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +154,10 @@ pub(super) fn auto_backing(
 pub(super) fn available_memory_bytes() -> Option<u64> {
     #[cfg(test)]
     AVAILABLE_MEMORY_CALLS.with(|c| c.set(c.get() + 1));
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#455: cache the memory probe; fresh hard-limit preflights remain separate"
+    )]
     static CACHED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *CACHED.get_or_init(probe_available_memory_bytes)
 }
@@ -1366,7 +1379,10 @@ impl Regrouper {
 
     /// Remove and return exactly `n` rows from the front. `n` must be `<=
     /// self.rows`.
-    #[allow(clippy::disallowed_methods)] // #779: seam joins (#494)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#494: regrouping joins only bounded segment seams to preserve reader batch boundaries"
+    )] // #779: seam joins (#494)
     fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
         debug_assert!(n > 0 && n <= self.rows);
         let front = self
@@ -2067,7 +2083,6 @@ impl SpillState {
             .ok_or_else(|| internal("spill writer joined twice"))?;
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
-        #[allow(clippy::disallowed_methods)] // #779: this run's own spill, written above; trusted
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
         Ok((reader, done.temp))
     }
@@ -2118,20 +2133,25 @@ pub(super) struct Pass2EngineResult {
 /// rows_written, vertex_count, spill_bytes_written)`, in level order — the
 /// outcome flags a level the writer skipped because every candidate collapsed
 /// during simplification (#211) — plus the engine's stage-timer snapshot.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_pass2_buffered(
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
-    source: &dyn super::source::BatchSource,
-    read_tuning: ReadTuning,
-    selected_row_groups: Option<&RowGroupSelection>,
-    in_flight: usize,
-    profile: MemoryProfile,
-    backing: SinkBacking,
-    out_schema: &Schema,
-    spill_dir: Option<&Path>,
+    read: StreamRead<'_>,
+    inputs: BufferOptions<'_>,
 ) -> Result<Pass2EngineResult, ConvertError> {
+    let StreamRead {
+        source,
+        read_tuning,
+        row_groups: selected_row_groups,
+        in_flight,
+    } = read;
+    let BufferOptions {
+        profile,
+        backing,
+        out_schema,
+        spill_dir,
+    } = inputs;
     let num_levels = ctxs.len();
     debug_assert_eq!(num_levels, hints.len());
 

@@ -42,7 +42,7 @@
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_ipc::reader::FileReader;
@@ -90,7 +90,11 @@ thread_local! {
 /// With `RUST_BACKTRACE` set, the hook still prints the panic and its
 /// backtrace to stderr, as the default hook would.
 fn install_quiet_hook() {
-    static HOOK: Once = Once::new();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: installs the panic boundary hook once; no warning counters"
+    )]
+    static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
@@ -474,6 +478,10 @@ pub fn precheck_footer(thrift: &[u8]) -> Result<(), InputError> {
 ///
 /// Returns a [`ParquetError`] if the pre-check refuses the footer, the
 /// decode fails, or the decoder panics.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#779: footer decoder owner runs the precheck and panic boundary"
+)]
 pub fn decode_footer(thrift: &[u8]) -> Result<ParquetMetaData, ParquetError> {
     precheck_footer(thrift).map_err(|e| ParquetError::External(Box::new(e)))?;
     guard_parquet("parquet footer", || {
@@ -629,6 +637,10 @@ pub(crate) fn validate_chunk_ranges(
 ///
 /// Returns a [`ParquetError`] if the footer cannot be read, the pre-check
 /// refuses it, its chunk ranges are out of bounds, or the decoder panics.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#779: metadata owner prechecks and validates chunk ranges"
+)]
 pub fn read_parquet_metadata<R: ChunkReader>(
     reader: &R,
 ) -> Result<Arc<ParquetMetaData>, ParquetError> {
@@ -1164,6 +1176,10 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
                 ArrowReaderOptions::new().with_schema(wide),
             )
         })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#779: reader owner reuses checked metadata and applies batch limits"
+        )]
         let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(self.reader, metadata)
             .with_batch_size(rows);
         if let Some(projection) = self.projection {
@@ -1331,6 +1347,10 @@ pub struct UntrustedIpcReader<R: Read + Seek> {
 /// [`InputError::DecoderPanic`].
 pub fn open_ipc<R: Read + Seek>(mut reader: R) -> Result<UntrustedIpcReader<R>, ArrowError> {
     guard_arrow("Arrow IPC footer", || precheck_ipc_blocks(&mut reader))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#779: IPC owner validates block bounds before construction"
+    )]
     let inner = guard_arrow("Arrow IPC footer", || FileReader::try_new(reader, None))?;
     Ok(UntrustedIpcReader { inner, done: false })
 }

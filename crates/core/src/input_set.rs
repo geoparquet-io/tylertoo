@@ -64,6 +64,10 @@ pub enum ConvertSource {
 /// row-group counts, selection) parse the footer ONCE — matching the pre-v0.7
 /// single-open header cost.
 #[derive(Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub struct SingleSource {
     source: InputSource,
     meta: std::sync::OnceLock<PartMeta>,
@@ -72,6 +76,10 @@ pub struct SingleSource {
 }
 
 impl SingleSource {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+    )]
     fn new(source: InputSource) -> Self {
         SingleSource {
             source,
@@ -117,6 +125,10 @@ struct PartMeta {
 /// objects) with footers loaded and validated up front (see the module
 /// docs for the compatibility rules).
 #[derive(Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub struct MultiSource {
     /// The original input string (directory path or glob pattern).
     root: String,
@@ -468,15 +480,14 @@ impl ConvertSource {
     fn from_explicit_list(root: &str, entries: &[(String, String)]) -> Result<Self, InputError> {
         let parts = resolve_list_entries(entries, |context, entry| {
             let src = InputSource::from_str_input(entry)?;
-            // Without the `remote` feature `Local` is the only variant.
-            #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
-            if let InputSource::Local(p) = &src {
-                if !p.is_file() {
+            match &src {
+                InputSource::Local(p) if !p.is_file() => {
                     return Err(InputError::MissingListedInput {
                         context: context.to_string(),
                         input: entry.to_string(),
                     });
                 }
+                _ => {}
             }
             Ok(src)
         })?;
@@ -1172,6 +1183,10 @@ const FOOTER_LOAD_CONCURRENCY: usize = 8;
 /// are written into per-index slots so the returned order always matches
 /// `parts` regardless of completion order; the first error (by part index)
 /// wins.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let workers = FOOTER_LOAD_CONCURRENCY.min(parts.len());
@@ -1222,6 +1237,10 @@ impl MultiSource {
     /// # Panics
     ///
     /// Panics if `parts` is empty.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: initializes per-input or per-tile worker caches"
+    )]
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
         let metas = load_part_metas(&parts)?;
@@ -1476,6 +1495,10 @@ const LIST_CONNECT_CONCURRENCY: usize = 8;
 /// per-index slots, so the returned vector always matches `entries` order
 /// regardless of completion order — the row-order invariant — and the
 /// first error (by entry index) wins.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-input metadata caches and per-call worker coordination"
+)]
 fn resolve_list_entries<F>(
     entries: &[(String, String)],
     resolve: F,
@@ -1537,7 +1560,6 @@ pub(crate) fn manifest_entries(text: &str) -> Vec<(usize, &str)> {
 /// single object (the pre-v0.7 classification).
 // Used by `resolve` only when remote support is compiled in; the pure
 // classification is unit-tested under every feature set.
-#[cfg_attr(not(feature = "remote"), allow(dead_code))]
 fn remote_url_is_prefix(url: &str) -> bool {
     let no_fragment = url.split('#').next().unwrap_or(url);
     let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
@@ -2642,6 +2664,10 @@ b.parquet
         /// order VERBATIM (the row-order invariant) — never completion or
         /// lexicographic order.
         #[test]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: test observes concurrent per-call worker progress"
+        )]
         fn explicit_list_parallel_connect_preserves_order() {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::{Condvar, Mutex as StdMutex};

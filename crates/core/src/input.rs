@@ -387,8 +387,9 @@ impl InputSource {
     /// which never spill. Call before reading: chunks already spilled stay
     /// in the previously created file; only the spill-file creation (lazy,
     /// on the first spilled chunk) honors the directory.
-    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn set_spill_dir(&self, dir: Option<&Path>) {
+        #[cfg(not(feature = "remote"))]
+        let _ = dir;
         #[cfg(feature = "remote")]
         if let InputSource::Remote(r) = self {
             r.set_spill_dir(dir);
@@ -420,8 +421,9 @@ impl InputSource {
     ///
     /// Returns an [`InputError`] if fetching a remote row group or writing it
     /// to the spill fails.
-    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
+        #[cfg(not(feature = "remote"))]
+        let _ = selected;
         match self {
             InputSource::Local(_) => Ok(()),
             #[cfg(feature = "remote")]
@@ -546,7 +548,15 @@ pub(crate) mod remote {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Range;
     use std::path::{Path, PathBuf};
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::{Arc, Mutex, OnceLock};
 
     use bytes::Bytes;
@@ -579,6 +589,10 @@ pub(crate) mod remote {
     /// synchronous reader plumbing. Two worker threads: requests are issued
     /// one at a time per reader, so this only needs to run the HTTP client.
     fn runtime() -> &'static tokio::runtime::Runtime {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -594,6 +608,10 @@ pub(crate) mod remote {
     /// fetched-range log, and (once the footer is parsed) the column-chunk
     /// byte ranges used to clamp sequential readahead.
     #[derive(Debug, Default)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+    )]
     struct SharedState {
         requests: AtomicU64,
         bytes: AtomicU64,
@@ -637,6 +655,10 @@ pub(crate) mod remote {
         location: ObjectPath,
         size: u64,
         shared: Arc<SharedState>,
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         metadata: OnceLock<ReaderMetadata>,
         cache: Arc<Mutex<ChunkCache>>,
         /// On-disk overflow for fetched column chunks (issue #219), shared by
@@ -661,6 +683,10 @@ pub(crate) mod remote {
     pub(crate) fn store_and_location(
         url_str: &str,
     ) -> Result<(Arc<dyn ObjectStore>, ObjectPath), InputError> {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
             OnceLock::new();
 
@@ -853,6 +879,10 @@ pub(crate) mod remote {
                 location,
                 size,
                 shared: Arc::new(SharedState::default()),
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+                )]
                 metadata: OnceLock::new(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
                 spill: Arc::new(Mutex::new(DiskSpill::default())),
@@ -1346,6 +1376,10 @@ pub(crate) mod remote {
     /// on the first store build, logging warnings plus one info line naming
     /// the overrides in force (so a #290 sweep run records what it tested).
     fn effective_client_overrides() -> &'static [(ClientConfigKey, String)] {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static CELL: OnceLock<Vec<(ClientConfigKey, String)>> = OnceLock::new();
         CELL.get_or_init(|| {
             let vars = std::env::vars_os()
@@ -1631,7 +1665,15 @@ pub(crate) mod remote {
         /// values — info when an override is set (so a #290 sweep run can
         /// confirm what it tested), debug otherwise.
         pub(super) fn effective() -> &'static StagingTunables {
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+            )]
             use std::sync::OnceLock;
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+            )]
             static CELL: OnceLock<StagingTunables> = OnceLock::new();
             CELL.get_or_init(|| {
                 let lookup = |name: &str| std::env::var(name).ok();
@@ -1658,7 +1700,7 @@ pub(crate) mod remote {
             })
         }
 
-        /// Log the *live* in-flight concurrency once per process, at info
+        /// Log this operation's *live* in-flight concurrency, at info
         /// when an override is set.
         ///
         /// [`effective`]'s line reports the concurrency *ceiling*, but the
@@ -1667,13 +1709,10 @@ pub(crate) mod remote {
         /// recording a concurrency it never actually ran — the 8 and 16
         /// points of a 1/2/4/8/16 sweep produce identical runs on an input
         /// whose row groups are large enough, and only the ceiling appears in
-        /// the log. Logged once rather than per call, because
-        /// `stage_row_groups` runs per part and a multi-part input would
-        /// otherwise repeat it for every partition.
+        /// the log. Each staging operation reports its own value, including
+        /// later operations in the same process.
         pub(super) fn log_live_concurrency(t: &StagingTunables, concurrency: usize, max_span: u64) {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !t.overridden || LOGGED.swap(true, Ordering::Relaxed) {
+            if !t.overridden {
                 return;
             }
             if concurrency < t.max_concurrency {
@@ -2088,7 +2127,7 @@ pub(crate) mod remote {
 
     /// `Read` adapter fetching forward in [`SEQUENTIAL_CHUNK`] steps, each
     /// step clamped to the column chunk containing the read position.
-    pub struct SequentialRemoteRead {
+    pub(crate) struct SequentialRemoteRead {
         reader: RemoteReader,
         pos: u64,
         buf: Bytes,
@@ -2783,6 +2822,38 @@ pub(crate) mod remote {
         }
 
         #[test]
+        fn live_staging_concurrency_is_logged_for_each_operation() {
+            if !run_in_child("live_staging_concurrency_is_logged_for_each_operation", &[]) {
+                return;
+            }
+            struct Capture;
+            static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            impl log::Log for Capture {
+                fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                    true
+                }
+                fn log(&self, record: &log::Record<'_>) {
+                    LINES.lock().unwrap().push(record.args().to_string());
+                }
+                fn flush(&self) {}
+            }
+            log::set_logger(&Capture).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+            let (mut tunables, _) = staging_tunables::resolve(|_| None);
+            tunables.overridden = true;
+            staging_tunables::log_live_concurrency(&tunables, 2, 4096);
+            staging_tunables::log_live_concurrency(&tunables, 3, 8192);
+            let lines = LINES.lock().unwrap();
+            assert_eq!(
+                lines.len(),
+                2,
+                "each operation must report its own live concurrency"
+            );
+            assert!(lines[0].contains("live concurrency 2"));
+            assert!(lines[1].contains("live concurrency 3"));
+        }
+
+        #[test]
         fn effective_staging_tunables_read_the_environment() {
             if !run_in_child(
                 "effective_staging_tunables_read_the_environment",
@@ -2991,8 +3062,16 @@ pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStoreExt;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::{Arc, OnceLock};
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let rt = RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()

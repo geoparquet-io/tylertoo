@@ -113,11 +113,19 @@ where
 /// # Errors
 /// Returns a specific configuration error for invalid syntax or option values.
 pub fn parse_in_flight_batches(s: &str) -> Result<usize, String> {
+    positive_or_auto(
+        s,
+        crate::overview::convert::IN_FLIGHT_BATCHES_AUTO,
+        "in-flight-batches",
+    )
+}
+
+fn positive_or_auto(s: &str, automatic: usize, option: &str) -> Result<usize, String> {
     if s.eq_ignore_ascii_case("auto") {
-        return Ok(crate::overview::convert::IN_FLIGHT_BATCHES_AUTO);
+        return Ok(automatic);
     }
     match s.parse::<usize>() {
-        Ok(0) => Err("in-flight-batches must be `auto` or >= 1".to_string()),
+        Ok(0) => Err(format!("{option} must be `auto` or >= 1")),
         Ok(n) => Ok(n),
         Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
     }
@@ -141,14 +149,11 @@ pub fn parse_read_workers(s: &str) -> Result<usize, String> {
 /// # Errors
 /// Returns a specific configuration error for invalid syntax or option values.
 pub fn parse_partition_wave(s: &str) -> Result<usize, String> {
-    if s.eq_ignore_ascii_case("auto") {
-        return Ok(crate::overview::export::PARTITION_WAVE_AUTO);
-    }
-    match s.parse::<usize>() {
-        Ok(0) => Err("partition-wave must be `auto` or >= 1".to_string()),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("expected `auto` or a positive integer, got `{s}`")),
-    }
+    positive_or_auto(
+        s,
+        crate::overview::export::PARTITION_WAVE_AUTO,
+        "partition-wave",
+    )
 }
 
 ///

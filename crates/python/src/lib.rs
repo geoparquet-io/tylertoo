@@ -12,6 +12,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#445: process-wide Python logging bridge reset handle"
+)]
 use std::sync::OnceLock;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
@@ -39,6 +43,10 @@ pyo3::create_exception!(
 );
 
 /// The installed log bridge's cache handle (#445), set once at import.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#445: process-wide Python logging bridge reset handle"
+)]
 static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
 
 /// Drop pyo3-log's cached Python loggers and levels, so a `logging`

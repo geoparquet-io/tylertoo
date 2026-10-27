@@ -10,10 +10,15 @@
 //! table and streams or spills generalized batches using `super::pipeline`.
 //! The per-run `MemoryBudget` supplies every phase's memory snapshot.
 
+use super::pipeline::BufferOptions;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -75,6 +80,79 @@ use super::source::{BatchSource, MemorySource};
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
 use crate::resolved_schema::ResolvedSchema;
 
+struct ScanCollection {
+    collect_lines: LineCollect,
+    want_areas: bool,
+}
+
+struct Pass1Keys<'a> {
+    explicit_keys: &'a mut Vec<Option<f64>>,
+    confidence_keys: &'a mut Vec<Option<f64>>,
+    explicit_interner: &'a mut GroupInterner,
+    explicit_groups: &'a mut Vec<u32>,
+    acc_cols: &'a [usize],
+    acc_values: &'a mut [Vec<Option<f64>>],
+    ladder_values: &'a mut Vec<Option<f64>>,
+}
+
+struct Pass1Accum<'a> {
+    features: &'a mut FeatureTable,
+    tally: &'a mut super::convert::BboxTally,
+    areas: &'a mut Vec<f32>,
+    lines: &'a mut LineScratch,
+    point_count: &'a mut usize,
+    skipped_rows: &'a mut usize,
+}
+
+struct WriterProvenance<'a> {
+    crs: Crs,
+    ranking_provenance: RankingProvenance,
+    renames: &'a [(String, String)],
+}
+
+struct Pass2Inputs<'a> {
+    source: &'a dyn BatchSource,
+    options: &'a ConvertOptions,
+    selected_row_groups: Option<&'a RowGroupSelection>,
+    in_flight_batches: usize,
+    out_schema: &'a Schema,
+    num_rows: usize,
+    geom_bytes: u64,
+}
+
+struct AssignmentInputs<'a> {
+    features: &'a mut FeatureTable,
+    acc_values: Vec<Vec<Option<f64>>>,
+    areas: Vec<f32>,
+    coalesce_scratch: Option<CoalesceScratch>,
+    line_tally: (usize, u64),
+    num_rows: usize,
+}
+
+struct CoalescePlan<'a> {
+    planned: &'a [EmitLevel],
+    kept: usize,
+    finest: usize,
+    crs: Crs,
+    options: &'a ConvertOptions,
+}
+
+struct CoalesceCountPlan<'a> {
+    level_specs: &'a [(f64, Option<u8>)],
+    finest: usize,
+    crs: Crs,
+    options: &'a ConvertOptions,
+    prebuild: bool,
+    wave: usize,
+}
+
+pub(super) struct StreamRead<'a> {
+    pub(super) source: &'a dyn BatchSource,
+    pub(super) read_tuning: ReadTuning,
+    pub(super) in_flight: usize,
+    pub(super) row_groups: Option<&'a RowGroupSelection>,
+}
+
 /// Row-indexed winner-table sentinel for rows with no feature (null, empty,
 /// or non-finite geometry — skipped in pass 1). It matches no level in either
 /// mode: [`super::convert::MAX_LEVELS`] caps the plan at 255 levels, so the
@@ -97,7 +175,7 @@ struct EmitLevel {
 #[derive(Clone, Copy)]
 pub(crate) enum Pass2Strategy {
     /// One in-order re-read per level (the reference path).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Serial,
     /// Single-read pipelined engine ([`super::pipeline`]); the production path.
     Pipelined,
@@ -658,9 +736,11 @@ pub(super) fn build_writer_options(
         writer_levels,
         emitted_gsds,
         level_row_counts,
-        descriptor.crs().expect("preflight checked CRS"),
-        ranking_provenance,
-        &renames,
+        WriterProvenance {
+            crs: descriptor.crs().expect("preflight checked CRS"),
+            ranking_provenance,
+            renames: &renames,
+        },
         options,
         super::writer::SAFE_ROW_GROUP_CEILING,
         diagnostics,
@@ -672,18 +752,20 @@ pub(super) fn build_writer_options(
 /// [`super::writer::SAFE_ROW_GROUP_CEILING`]; tests pass a tiny ceiling to
 /// exercise the auto-scale / unreachable-error paths without constructing
 /// tens of thousands of row groups.
-#[allow(clippy::too_many_arguments)]
 fn build_writer_options_with_ceiling(
     writer_levels: Vec<LevelSpec>,
     emitted_gsds: &[f64],
     level_row_counts: &[usize],
-    crs: Crs,
-    ranking_provenance: RankingProvenance,
-    renames: &[(String, String)],
+    inputs: WriterProvenance<'_>,
     options: &ConvertOptions,
     ceiling: usize,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<OverviewWriterOptions, ConvertError> {
+    let WriterProvenance {
+        crs,
+        ranking_provenance,
+        renames,
+    } = inputs;
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
     writer_opts.row_group_size_policy = options.row_group_size_policy;
@@ -1033,21 +1115,23 @@ type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 ///
 /// The outcome distinguishes a written level from one the writer skipped
 /// because every candidate collapsed during simplification (#211).
-#[allow(clippy::too_many_arguments)]
 fn run_pass2_levels(
     budget: MemoryBudget,
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
-    source: &dyn BatchSource,
-    options: &ConvertOptions,
-    selected_row_groups: Option<&RowGroupSelection>,
-    in_flight_batches: usize,
-    out_schema: &Schema,
-    num_rows: usize,
-    geom_bytes: u64,
+    inputs: Pass2Inputs<'_>,
     strategy: Pass2Strategy,
 ) -> Result<(Vec<LevelStat>, Pass2Timers, pipeline::SinkMeasurement), ConvertError> {
+    let Pass2Inputs {
+        source,
+        options,
+        selected_row_groups,
+        in_flight_batches,
+        out_schema,
+        num_rows,
+        geom_bytes,
+    } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
     // Serial reference path and for a ladder with nothing to buffer — neither
@@ -1066,6 +1150,7 @@ fn run_pass2_levels(
     };
     let (level_stats, engine_timers): (Vec<LevelStat>, Pass2Timers) = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
+        #[cfg(test)]
         Pass2Strategy::Serial => (
             ctxs.iter()
                 .enumerate()
@@ -1074,10 +1159,12 @@ fn run_pass2_levels(
                         writer,
                         i,
                         hints[i],
-                        source,
-                        read_tuning,
-                        in_flight_batches,
-                        selected_row_groups,
+                        StreamRead {
+                            source,
+                            read_tuning,
+                            in_flight: in_flight_batches,
+                            row_groups: selected_row_groups,
+                        },
                         ctx,
                     )
                     // Serial is a reference/test path (pre-#213 behavior, no
@@ -1125,14 +1212,18 @@ fn run_pass2_levels(
                     writer,
                     &ctxs[..buffered],
                     &hints[..buffered],
-                    source,
-                    read_tuning,
-                    selected_row_groups,
-                    in_flight_batches,
-                    options.profile,
-                    backing,
-                    out_schema,
-                    options.spill_dir.as_deref(),
+                    StreamRead {
+                        source,
+                        read_tuning,
+                        row_groups: selected_row_groups,
+                        in_flight: in_flight_batches,
+                    },
+                    BufferOptions {
+                        profile: options.profile,
+                        backing,
+                        out_schema,
+                        spill_dir: options.spill_dir.as_deref(),
+                    },
                 )?;
                 sink_measurement = result.sink;
                 (result.levels, result.timers)
@@ -1144,10 +1235,12 @@ fn run_pass2_levels(
                     writer,
                     n - 1,
                     hints[n - 1],
-                    source,
-                    read_tuning,
-                    in_flight_batches,
-                    selected_row_groups,
+                    StreamRead {
+                        source,
+                        read_tuning,
+                        in_flight: in_flight_batches,
+                        row_groups: selected_row_groups,
+                    },
                     &ctxs[n - 1],
                 )?;
                 // #517 S1: the finest level's own stage timers never otherwise
@@ -1397,20 +1490,19 @@ struct FooterFacts {
 /// The materialized levels' chain tables (`planned[..kept]`; a level above
 /// the ceiling never emits a row, so its table would be built and thrown
 /// away), plus [`coalesce_merged_anywhere`] over the whole plan.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "#779: F1 replaces these engine adapters with shared stages"
-)]
 fn pass2_coalesce(
     scratch: Option<&CoalesceScratch>,
     prebuilt: Option<CoalesceBuild>,
-    planned: &[EmitLevel],
-    kept: usize,
-    finest: usize,
-    crs: Crs,
-    options: &ConvertOptions,
+    inputs: CoalescePlan<'_>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<Option<CoalesceTable>>, bool) {
+    let CoalescePlan {
+        planned,
+        kept,
+        finest,
+        crs,
+        options,
+    } = inputs;
     // #570: pass 1 already ran the chain stage once per level, to count the
     // rows each level would get. Take those tables rather than rebuilding
     // them; `merged` came out of the same run, over the whole planned ladder.
@@ -1498,7 +1590,6 @@ fn coalesce_merged_anywhere(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn create_level_writer(
     output_path: &Path,
     descriptor: &ResolvedSchema,
@@ -1662,12 +1753,14 @@ fn coalesce_level_counts(
     let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
     coalesce_level_counts_in_waves(
         scratch,
-        level_specs,
-        finest,
-        crs,
-        options,
-        prebuild,
-        wave,
+        CoalesceCountPlan {
+            level_specs,
+            finest,
+            crs,
+            options,
+            prebuild,
+            wave,
+        },
         diagnostics,
     )
 }
@@ -1697,20 +1790,19 @@ fn chain_stage_wave(levels: usize, line_bytes: u64, budget: u64) -> usize {
 /// [`coalesce_level_counts`] with an explicit wave size. The result does not
 /// depend on `wave`: each level's run is independent of every other's, and
 /// results are collected in level order.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "#779: F1 replaces these engine adapters with shared stages"
-)]
 fn coalesce_level_counts_in_waves(
     scratch: &CoalesceScratch,
-    level_specs: &[(f64, Option<u8>)],
-    finest: usize,
-    crs: Crs,
-    options: &ConvertOptions,
-    prebuild: bool,
-    wave: usize,
+    inputs: CoalesceCountPlan<'_>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<usize>, Option<CoalesceBuild>) {
+    let CoalesceCountPlan {
+        level_specs,
+        finest,
+        crs,
+        options,
+        prebuild,
+        wave,
+    } = inputs;
     let num_levels = level_specs.len();
     let inputs = scratch.inputs();
     let wave = wave.max(1);
@@ -1771,21 +1863,24 @@ fn coalesce_level_counts_in_waves(
     (counts, build)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resolve_winner_tables(
-    memory: MemoryBudget,
-    features: &mut FeatureTable,
-    acc_values: Vec<Vec<Option<f64>>>,
-    areas: Vec<f32>,
-    coalesce_scratch: Option<CoalesceScratch>,
-    line_tally: (usize, u64),
-    num_rows: usize,
-    crs: Crs,
-    options: &ConvertOptions,
-    prebuild_chain_tables: bool,
+    ctx: &Pass1Ctx<'_>,
+    inputs: AssignmentInputs<'_>,
     rss: &mut RssTracker,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<WinnerTables, ConvertError> {
+    let AssignmentInputs {
+        features,
+        acc_values,
+        areas,
+        coalesce_scratch,
+        line_tally,
+        num_rows,
+    } = inputs;
+    let memory = *ctx.budget;
+    let crs = ctx.crs;
+    let options = ctx.config.options();
+    let prebuild_chain_tables = ctx.prebuild_chain_tables;
+    let diagnostics = ctx.diagnostics;
     // --- Winner tables (assignment + Q2 density budget). ---------------------
     let level_specs = options.levels.resolve(options.gsd_base)?;
     let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
@@ -2569,18 +2664,16 @@ fn run_pass1_and_assign(
 
     let t_assign = Instant::now();
     let tables = resolve_winner_tables(
-        *inputs.budget,
-        &mut features,
-        acc_values,
-        areas,
-        coalesce_scratch,
-        line_tally,
-        num_rows,
-        inputs.crs,
-        options,
-        inputs.prebuild_chain_tables,
+        inputs,
+        AssignmentInputs {
+            features: &mut features,
+            acc_values,
+            areas,
+            coalesce_scratch,
+            line_tally,
+            num_rows,
+        },
         rss,
-        diagnostics,
     )?;
     // Stops before `--save-plan` serialization, which is I/O for an opt-in
     // artifact rather than part of the assignment itself.
@@ -2957,11 +3050,13 @@ pub(crate) fn run_stages(
     let (coalesce_tables, coalesce_merged) = pass2_coalesce(
         coalesce_scratch.as_ref(),
         coalesce_build,
-        &planned,
-        kept,
-        finest,
-        crs,
-        options,
+        CoalescePlan {
+            planned: &planned,
+            kept,
+            finest,
+            crs,
+            options,
+        },
         diagnostics,
     );
 
@@ -3035,13 +3130,15 @@ pub(crate) fn run_stages(
         &mut writer,
         &ctxs,
         &hints,
-        reader,
-        options,
-        selected_row_groups.as_ref(),
-        in_flight_batches,
-        &out_schema,
-        num_rows,
-        geom_bytes,
+        Pass2Inputs {
+            source: reader,
+            options,
+            selected_row_groups: selected_row_groups.as_ref(),
+            in_flight_batches,
+            out_schema: &out_schema,
+            num_rows,
+            geom_bytes,
+        },
         strategy,
     )?;
 
@@ -3317,7 +3414,6 @@ struct ProfileJsonInputs<'a> {
 /// which left a stray zero-byte dump file behind whenever the run then failed
 /// (or the pipeline never reached the dump at all) — a preflight must observe
 /// the filesystem, not change it.
-#[allow(clippy::disallowed_methods)] // #779: writability probe, removed at once; migrate to atomic_output
 pub(super) fn preflight_profile_json_path(diagnostics: &crate::diagnostics::Diagnostics) {
     let Some(path) = profile_json_target() else {
         return;
@@ -3338,14 +3434,7 @@ pub(super) fn preflight_profile_json_path(diagnostics: &crate::diagnostics::Diag
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let probe = parent.join(format!(
-            ".tylertoo-profile-json-probe.{}.{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
-        std::fs::File::create(&probe).map(|_| {
-            let _ = std::fs::remove_file(&probe);
-        })
+        crate::atomic_output::probe_directory(parent)
     };
     if let Err(e) = probed {
         // The sink deduplicates warnings within this operation. A later run
@@ -3611,6 +3700,10 @@ fn append_profile_line(
 /// run's convert and export lines share it, and lines from concurrent runs
 /// appending to the same file can be told apart even when their timestamps
 /// interleave.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#535: process correlation ID joins convert and export profile records"
+)]
 pub(super) fn profile_run_id() -> &'static str {
     static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     RUN_ID.get_or_init(|| {
@@ -3624,11 +3717,19 @@ pub(super) fn profile_run_id() -> &'static str {
 /// Add a pre-measured duration to a nanosecond accumulator — the shared
 /// mutator behind every profiling timer set in this module ([`Pass1Timers`],
 /// [`Pass2Timers`], [`ExportTimers`]).
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 pub(super) fn add_nanos(cell: &AtomicU64, dur: Duration) {
     cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
 }
 
 /// Read a nanosecond accumulator as seconds (see [`add_nanos`]).
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 fn nanos_secs(cell: &AtomicU64) -> f64 {
     Duration::from_nanos(cell.load(Ordering::Relaxed)).as_secs_f64()
 }
@@ -3648,6 +3749,10 @@ fn nanos_secs(cell: &AtomicU64) -> f64 {
 /// per-tile member sort before encode, channel waits, rayon scheduling) is
 /// uncounted, not mis-attributed. See `context/PROFILING.md`.
 #[derive(Default)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 pub(super) struct ExportTimers {
     /// Reading overview rows: opening the Parquet reader (footer / page-index
     /// setup — paid once per band in partitioning mode, once per wave in
@@ -3743,6 +3848,10 @@ pub(super) struct ExportStageSecs {
     pub(super) fill_encode: f64,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 impl ExportTimers {
     /// Run `f`, charging its duration to `cell`. The per-item form used
     /// inside rayon closures (one geometry, one tile): an `Instant` pair and a
@@ -3787,6 +3896,10 @@ impl ExportTimers {
 
 /// Drop guard from [`ExportTimers::scope`]: adds the time since it was
 /// created to its cell when it goes out of scope.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 pub(super) struct StageScope<'a> {
     cell: &'a AtomicU64,
     start: Instant,
@@ -4191,6 +4304,10 @@ struct Pass1Output {
 /// actual wall time, exactly like [`Pass2Timers`]'s "stage sums are
 /// core-seconds, overlap wall" already reads.
 #[derive(Default)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 struct Pass1Timers {
     /// Parquet read + Arrow decode of the raw batch (`reader.next()`), timed
     /// on the reader thread — overlaps every other stage below.
@@ -4230,6 +4347,10 @@ pub(super) struct Pass1StageSecs {
     pub(super) assemble: f64,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 impl Pass1Timers {
     fn add(cell: &AtomicU64, start: Instant) {
         add_nanos(cell, start.elapsed());
@@ -4592,17 +4713,19 @@ impl GeoArrowVisitor for ScanRows<'_> {
 /// every index this function produces stays chunk-local and is rebased by the
 /// consumer ([`merge_pass1_chunks`]), which is what makes double-rebasing
 /// structurally impossible (see [`ChunkScan`]).
-#[allow(clippy::too_many_arguments)]
 fn scan_chunk(
     ctx: &Pass1Ctx<'_>,
     geom_field: &Field,
     gcol: &dyn Array,
     diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
-    collect_lines: LineCollect,
-    want_areas: bool,
+    inputs: ScanCollection,
     timers: &Pass1Timers,
 ) -> Result<ChunkScan, ConvertError> {
+    let ScanCollection {
+        collect_lines,
+        want_areas,
+    } = inputs;
     let bbox_query = ctx.bbox_query;
     let crs = ctx.crs;
     let diagnostics = ctx.diagnostics;
@@ -4735,7 +4858,6 @@ fn scan_chunk(
 /// Pulled out of [`run_pass1_with_chunk_rows`] rather than inlined: it is a
 /// self-contained step with no other reader of the intermediate state, and
 /// inlining it pushes that function over the workspace's line-count lint.
-#[allow(clippy::too_many_arguments)]
 fn extract_pass1_batch_keys(
     batch: &RecordBatch,
     proj: &dyn Fn(usize) -> usize,
@@ -4743,14 +4865,17 @@ fn extract_pass1_batch_keys(
     collect_lines: bool,
     ladder_col: Option<usize>,
     kept_row: &[bool],
-    explicit_keys: &mut Vec<Option<f64>>,
-    confidence_keys: &mut Vec<Option<f64>>,
-    explicit_interner: &mut GroupInterner,
-    explicit_groups: &mut Vec<u32>,
-    acc_cols: &[usize],
-    acc_values: &mut [Vec<Option<f64>>],
-    ladder_values: &mut Vec<Option<f64>>,
+    inputs: Pass1Keys<'_>,
 ) -> Result<(), ConvertError> {
+    let Pass1Keys {
+        explicit_keys,
+        confidence_keys,
+        explicit_interner,
+        explicit_groups,
+        acc_cols,
+        acc_values,
+        ladder_values,
+    } = inputs;
     match plan {
         RankPlan::ExplicitSort { idx, .. } => {
             explicit_keys.extend(extract_sort_keys(batch.column(proj(*idx)).as_ref()));
@@ -4958,18 +5083,20 @@ fn release_coalesce_groups(
 /// Pulled out of [`run_pass1_with_chunk_rows`] rather than inlined: it is a
 /// self-contained step (no other reader of `ranges`/`chunk_results` exists)
 /// and inlining it pushes that function over the workspace's line-count lint.
-#[allow(clippy::too_many_arguments)]
 fn merge_pass1_chunks(
     chunk_results: Vec<Result<ChunkScan, ConvertError>>,
     ranges: &[(usize, usize)],
     base: usize,
-    features: &mut FeatureTable,
-    tally: &mut super::convert::BboxTally,
-    areas: &mut Vec<f32>,
-    lines: &mut LineScratch,
-    point_count: &mut usize,
-    skipped_rows: &mut usize,
+    inputs: Pass1Accum<'_>,
 ) -> Result<Vec<bool>, ConvertError> {
+    let Pass1Accum {
+        features,
+        tally,
+        areas,
+        lines,
+        point_count,
+        skipped_rows,
+    } = inputs;
     // The ranges tile the batch contiguously from 0, so the last one's end is
     // the batch row count (0 for an empty batch).
     let n = ranges.last().map_or(0, |&(start, len)| start + len);
@@ -5028,7 +5155,6 @@ fn merge_pass1_chunks(
 /// batches ([`ConvertOptions::in_flight_batches`]) ahead of the chunked-scan
 /// consumer, up from the pre-#460 `O(read batch)` — pass 1 shares the same
 /// read/compute overlap knob pass 2 already used.
-#[allow(clippy::too_many_arguments)]
 fn run_pass1_with_chunk_rows(
     ctx: &Pass1Ctx<'_>,
     chunk_rows: usize,
@@ -5206,8 +5332,10 @@ fn run_pass1_with_chunk_rows(
                             // index itself.
                             base + start,
                             mask_slice,
-                            collect_lines,
-                            want_areas,
+                            ScanCollection {
+                                collect_lines,
+                                want_areas,
+                            },
                             timers_ref,
                         )
                     })
@@ -5222,12 +5350,14 @@ fn run_pass1_with_chunk_rows(
                     chunk_results,
                     &ranges,
                     base,
-                    &mut features,
-                    &mut bbox_tally,
-                    &mut areas,
-                    &mut lines,
-                    &mut point_count,
-                    &mut skipped_rows,
+                    Pass1Accum {
+                        features: &mut features,
+                        tally: &mut bbox_tally,
+                        areas: &mut areas,
+                        lines: &mut lines,
+                        point_count: &mut point_count,
+                        skipped_rows: &mut skipped_rows,
+                    },
                 )?;
                 if collect_lines == LineCollect::Collect && lines.mode != LineCollect::Collect {
                     release_coalesce_groups(
@@ -5250,13 +5380,15 @@ fn run_pass1_with_chunk_rows(
                     lines.mode == LineCollect::Collect,
                     ladder_col,
                     &kept_row,
-                    &mut explicit_keys,
-                    &mut confidence_keys,
-                    &mut explicit_interner,
-                    &mut explicit_groups,
-                    acc_cols,
-                    &mut acc_values,
-                    &mut ladder_values,
+                    Pass1Keys {
+                        explicit_keys: &mut explicit_keys,
+                        confidence_keys: &mut confidence_keys,
+                        explicit_interner: &mut explicit_interner,
+                        explicit_groups: &mut explicit_groups,
+                        acc_cols,
+                        acc_values: &mut acc_values,
+                        ladder_values: &mut ladder_values,
+                    },
                 )?;
                 Pass1Timers::add(&timers_ref.keys, t_keys);
             }
@@ -5331,6 +5463,10 @@ fn run_pass1_with_chunk_rows(
 /// parallel per-level processing of a batch; the serial
 /// [`write_level_streaming`] path uses it single-threaded.
 #[derive(Default)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 pub(super) struct Pass2Timers {
     /// Parquet read + Arrow decode of the raw batch (`reader.next()`).
     ///
@@ -5392,6 +5528,10 @@ pub(super) struct Pass2StageSecs {
     pub(super) spill_write: f64,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-run profiling counters shared by scoped worker threads"
+)]
 impl Pass2Timers {
     fn add(cell: &AtomicU64, start: Instant) {
         add_nanos(cell, start.elapsed());
@@ -5616,17 +5756,19 @@ const STREAMED_OUTPUT_DEPTH: usize = 2;
 /// [`Pass2Timers`] (#517 S1) — the caller folds it into the shared
 /// `TYLERTOO_PROFILE_JSON` accumulator, since the finest level streamed here
 /// never otherwise reaches `run_pass2_buffered`'s returned timers.
-#[allow(clippy::too_many_arguments)]
 fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
     hint: usize,
-    source: &dyn BatchSource,
-    read_tuning: ReadTuning,
-    in_flight: usize,
-    row_groups: Option<&RowGroupSelection>,
+    inputs: StreamRead<'_>,
     ctx: &LevelStreamCtx<'_>,
 ) -> Result<(LevelWriteOutcome, usize, usize, Pass2Timers), ConvertError> {
+    let StreamRead {
+        source,
+        read_tuning,
+        in_flight,
+        row_groups,
+    } = inputs;
     let rows = Cell::new(0usize);
     let vertices = Cell::new(0usize);
     // Writer-thread time spent blocked waiting on the producer; the writer's
@@ -6446,7 +6588,10 @@ mod tests {
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "#543: test helper returns the optional memory-limit shape consumed by preflight"
+    )]
     fn hard_limit(bytes: u64) -> Option<super::super::pipeline::MemoryLimit> {
         Some(super::super::pipeline::MemoryLimit {
             bytes,
@@ -7776,9 +7921,11 @@ mod tests {
             three_levels(),
             &[100.0, 50.0, 10.0],
             &counts,
-            Crs::Epsg4326,
-            ranking_provenance(),
-            &[],
+            WriterProvenance {
+                crs: Crs::Epsg4326,
+                ranking_provenance: ranking_provenance(),
+                renames: &[],
+            },
             &options,
             32_000,
             &crate::diagnostics::Diagnostics::default(),
@@ -7802,9 +7949,11 @@ mod tests {
             three_levels(),
             &[100.0, 50.0, 10.0],
             &counts,
-            Crs::Epsg4326,
-            ranking_provenance(),
-            &[],
+            WriterProvenance {
+                crs: Crs::Epsg4326,
+                ranking_provenance: ranking_provenance(),
+                renames: &[],
+            },
             &options,
             ceiling,
             &crate::diagnostics::Diagnostics::default(),
@@ -7843,9 +7992,11 @@ mod tests {
             three_levels(),
             &[100.0, 50.0, 10.0],
             &counts,
-            Crs::Epsg4326,
-            ranking_provenance(),
-            &[],
+            WriterProvenance {
+                crs: Crs::Epsg4326,
+                ranking_provenance: ranking_provenance(),
+                renames: &[],
+            },
             &options,
             ceiling,
             &crate::diagnostics::Diagnostics::default(),
@@ -8146,7 +8297,18 @@ mod tests {
             avg_geom_bytes: None,
             profile: MemoryProfile::Speed,
         };
-        match write_level_streaming(&mut writer, 0, ROWS, &source, tuning, 1, None, &ctx) {
+        match write_level_streaming(
+            &mut writer,
+            0,
+            ROWS,
+            StreamRead {
+                source: &source,
+                read_tuning: tuning,
+                in_flight: 1,
+                row_groups: None,
+            },
+            &ctx,
+        ) {
             // The row-group stage reports its caught panic as a parquet
             // error, the WKB stage as a geoparquet-encoder one; both are the
             // writer's own typed error, which is the contract here.
@@ -8666,12 +8828,14 @@ mod tests {
         let run = |wave: usize| {
             coalesce_level_counts_in_waves(
                 &scratch,
-                &level_specs,
-                finest,
-                Crs::Epsg4326,
-                &options,
-                true,
-                wave,
+                CoalesceCountPlan {
+                    level_specs: &level_specs,
+                    finest,
+                    crs: Crs::Epsg4326,
+                    options: &options,
+                    prebuild: true,
+                    wave,
+                },
                 &crate::diagnostics::Diagnostics::default(),
             )
         };
@@ -8697,13 +8861,16 @@ mod tests {
             merged: true,
         };
         let (tables, merged) = pass2_coalesce(
-            None, // no scratch: a rebuild would panic, which is the point
+            None,
+            // no scratch: a rebuild would panic, which is the point
             Some(prebuilt),
-            &planned,
-            planned.len(),
-            finest,
-            Crs::Epsg4326,
-            &ConvertOptions::default(),
+            CoalescePlan {
+                planned: &planned,
+                kept: planned.len(),
+                finest,
+                crs: Crs::Epsg4326,
+                options: &ConvertOptions::default(),
+            },
             &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(tables.len(), 3);
@@ -8725,11 +8892,13 @@ mod tests {
         let (tables, merged) = pass2_coalesce(
             None,
             None,
-            &planned,
-            planned.len(),
-            1,
-            Crs::Epsg4326,
-            &ConvertOptions::default(),
+            CoalescePlan {
+                planned: &planned,
+                kept: planned.len(),
+                finest: 1,
+                crs: Crs::Epsg4326,
+                options: &ConvertOptions::default(),
+            },
             &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(tables.len(), 2);
@@ -8840,7 +9009,10 @@ mod tests {
     /// Assert `scan_chunk` over `gcol` matches [`pre_650_scan_chunk`] in
     /// every output, for every coalescing mode, with and without areas,
     /// the attribute filter (`mask`) and the regional extract (`region`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "#650: test seam mirrors the independent scan oracle inputs"
+    )]
     fn scan_chunk_for_test(
         field: &Field,
         col: &dyn Array,
@@ -8879,7 +9051,18 @@ mod tests {
             crs,
             prebuild_chain_tables: false,
         };
-        scan_chunk(&ctx, field, col, base, mask, collect, areas, timers)
+        scan_chunk(
+            &ctx,
+            field,
+            col,
+            base,
+            mask,
+            ScanCollection {
+                collect_lines: collect,
+                want_areas: areas,
+            },
+            timers,
+        )
     }
 
     fn assert_scan_chunk_matches_pre_650(

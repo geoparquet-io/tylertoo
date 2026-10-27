@@ -28,6 +28,10 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount};
 use std::path::{Path, PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#452: immutable CLI quiet setting shared by status output"
+)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::config::cli::{
@@ -40,6 +44,10 @@ use tylertoo_core::overview::tiles::TilesOptions;
 use tylertoo_core::TilesetMetadata as TilesetMetadataArgs;
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#452: immutable CLI quiet setting shared by status output"
+)]
 static QUIET: AtomicBool = AtomicBool::new(false);
 
 /// `println!` for the status and summary lines of a subcommand that writes
@@ -733,7 +741,7 @@ fn resolve_shard_job(
     }))
 }
 
-/// Resolve an [`InputSpec`] to the core's [`ConvertSource`], the one way.
+/// Resolve an [`InputSpec`] to the core's [`ConvertSource`](tylertoo_core::input_set::ConvertSource), the one way.
 ///
 /// Shared by `tiles --shard` and `shard-plan` so the two can never disagree
 /// about what an input *is* — a shard plan cut over a manifest has to bind to

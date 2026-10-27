@@ -99,6 +99,9 @@ proptest = "1"
 # cargo-codspeed builds the benches with `--cfg codspeed` (#614); declare it
 # so `cfg!(codspeed)` in a bench is not an unexpected_cfgs warning.
 [workspace.lints.rust]
+unreachable_pub = "deny"
+dead_code = "deny"
+unused = { level = "deny", priority = -1 }
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(codspeed)"] }
 
 # Curated lint gates shared by every crate (each crate opts in with
@@ -109,6 +112,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(codspeed)"] }
 # The subset below is the curated slice that current code passes with zero
 # findings — ratchet by adding lints here, not by editing CI.
 [workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+ignore_without_reason = "deny"
+too_many_arguments = "deny"
 # Complexity gate: clippy default threshold (25); zero findings today.
 # Tighten via `cognitive-complexity-threshold` in clippy.toml if desired.
 cognitive_complexity = "warn"

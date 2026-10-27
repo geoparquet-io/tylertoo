@@ -155,17 +155,28 @@ pub enum Diagnostic {
 }
 
 /// Why CRS metadata could only be read best-effort.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "reason", content = "value", rename_all = "snake_case")]
 pub enum CrsWarning {
+    #[error("GeoParquet file has no key-value metadata; assuming WGS84")]
     NoKeyValueMetadata,
+    #[error("GeoParquet file has no 'geo' metadata; assuming WGS84")]
     NoGeoMetadata,
+    #[error("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84")]
     NoColumns,
+    #[error("GeoParquet 'geo' metadata missing column '{0}'; assuming WGS84")]
     MissingColumn(String),
+    #[error(
+        "GeoParquet 'crs' is explicitly null (no CRS assigned); assuming OGC:CRS84 (lon/lat WGS84)"
+    )]
     NullCrsDegrees,
+    #[error("GeoParquet 'crs' is explicitly null and the declared bbox is outside lon/lat degree ranges; treating CRS as unknown")]
     NullCrsUnknown,
+    #[error("Unexpected CRS format in GeoParquet metadata: {0}")]
     UnexpectedFormat(String),
+    #[error("GeoParquet 'geo' metadata has no 'version' field (the spec requires one); reading it as GeoParquet 1.x")]
     MissingVersion,
+    #[error("GeoParquet 'geo' metadata declares version {0:?}, which this version of tylertoo does not know (GeoParquet 1.x and 2.x are supported); reading it best-effort as 1.x — metadata fields may be misread")]
     UnknownVersion(String),
 }
 
@@ -219,59 +230,9 @@ impl fmt::Display for CoveringWarning {
     }
 }
 
-impl fmt::Display for CrsWarning {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoKeyValueMetadata => f.write_str("GeoParquet file has no key-value metadata; assuming WGS84"),
-            Self::NoGeoMetadata => f.write_str("GeoParquet file has no 'geo' metadata; assuming WGS84"),
-            Self::NoColumns => f.write_str("GeoParquet 'geo' metadata has no 'columns'; assuming WGS84"),
-            Self::MissingColumn(name) => write!(f, "GeoParquet 'geo' metadata missing column '{name}'; assuming WGS84"),
-            Self::NullCrsDegrees => f.write_str("GeoParquet 'crs' is explicitly null (no CRS assigned); assuming OGC:CRS84 (lon/lat WGS84)"),
-            Self::NullCrsUnknown => f.write_str("GeoParquet 'crs' is explicitly null and the declared bbox is outside lon/lat degree ranges; treating CRS as unknown"),
-            Self::UnexpectedFormat(value) => write!(f, "Unexpected CRS format in GeoParquet metadata: {value}"),
-            Self::MissingVersion => f.write_str("GeoParquet 'geo' metadata has no 'version' field (the spec requires one); reading it as GeoParquet 1.x"),
-            Self::UnknownVersion(version) => write!(f, "GeoParquet 'geo' metadata declares version {version:?}, which this version of tylertoo does not know (GeoParquet 1.x and 2.x are supported); reading it best-effort as 1.x — metadata fields may be misread"),
-        }
-    }
-}
-
-impl Diagnostic {
-    /// Number of events represented by this aggregate.
-    pub fn count(&self) -> usize {
-        match self {
-            Self::OutOfRange { count, .. }
-            | Self::Unprojectable { count, .. }
-            | Self::Wrapped { count, .. }
-            | Self::AntimeridianSuspect { count }
-            | Self::EncodeDropped { count }
-            | Self::EncodeQuantized { count }
-            | Self::ClipGuardDropped { count }
-            | Self::NonFiniteGeometry { count }
-            | Self::PolygonRepaired { count, .. }
-            | Self::InvalidAfterEncode { count }
-            | Self::RowGroupAutoscaled { count, .. }
-            | Self::InvalidAfterSimplify { count }
-            | Self::FullResolutionFallback { count }
-            | Self::ValidationSkipped { count }
-            | Self::Merged { count }
-            | Self::ValveDropped { count }
-            | Self::PropertySkipped { count, .. }
-            | Self::CrsMetadata { count, .. }
-            | Self::CoveringRejected { count, .. }
-            | Self::UnusableGeometry { count, .. }
-            | Self::CrsAssumed { count, .. }
-            | Self::EmptyLevels { count, .. }
-            | Self::MemoryBudget { count, .. }
-            | Self::Advisory { count, .. }
-            | Self::PyramidSharedTiles { count }
-            | Self::PyramidSkippedTiles { count }
-            | Self::PyramidMissingBounds { count }
-            | Self::PyramidMetadataConflict { count }
-            | Self::PyramidMissingMetadata { count } => *count,
-        }
-    }
-    fn count_mut(&mut self) -> &mut usize {
-        match self {
+macro_rules! event_count {
+    ($event:expr) => {{
+        match $event {
             Self::OutOfRange { count, .. }
             | Self::Unprojectable { count, .. }
             | Self::Wrapped { count, .. }
@@ -302,6 +263,16 @@ impl Diagnostic {
             | Self::PyramidMetadataConflict { count }
             | Self::PyramidMissingMetadata { count } => count,
         }
+    }};
+}
+
+impl Diagnostic {
+    /// Number of events represented by this aggregate.
+    pub fn count(&self) -> usize {
+        *event_count!(self)
+    }
+    fn count_mut(&mut self) -> &mut usize {
+        event_count!(self)
     }
     fn accumulate(&mut self, event: &Self) {
         let count = self.count().saturating_add(event.count());

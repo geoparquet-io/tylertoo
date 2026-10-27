@@ -4,7 +4,13 @@
 // writes its own trusted fixtures, so the lint is off in the test build
 // only; production code is still linted by the non-test build that
 // `cargo clippy --all-targets` also checks.
-#![cfg_attr(test, allow(clippy::disallowed_methods))] // #779: test build only
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "#779: tests construct trusted fixtures; production is checked by the non-test build"
+    )
+)] // #779: test build only
 //! Core library for GeoParquet multi-resolution overviews and PMTiles export.
 //!
 //! The product pipeline lives in [`overview`]: convert a (gpio-sorted)

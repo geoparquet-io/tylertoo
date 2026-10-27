@@ -9,7 +9,10 @@ use geo::{Geometry, LineString, Polygon};
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "#779: this test binary uses a subset of the shared fixture writers"
+)]
 #[path = "../src/overview/testutil.rs"]
 mod testutil;
 

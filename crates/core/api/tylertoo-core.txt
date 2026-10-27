@@ -106,8 +106,8 @@ pub tylertoo_core::compression::Compression::Zstd = 4
 impl tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::code(&self) -> u8
 pub fn tylertoo_core::compression::Compression::from_code(u8) -> core::option::Option<Self>
-pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::option::Option<Self>
 pub fn tylertoo_core::compression::Compression::name(&self) -> &'static str
+pub fn tylertoo_core::compression::Compression::parse(&str) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::clone(&self) -> tylertoo_core::compression::Compression
 impl core::cmp::Eq for tylertoo_core::compression::Compression
@@ -119,6 +119,9 @@ impl core::fmt::Debug for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::compression::Compression
 impl core::marker::StructuralPartialEq for tylertoo_core::compression::Compression
+impl core::str::traits::FromStr for tylertoo_core::compression::Compression
+pub type tylertoo_core::compression::Compression::Err = alloc::string::String
+pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::compression::Compression
 impl core::marker::Send for tylertoo_core::compression::Compression
 impl core::marker::Sync for tylertoo_core::compression::Compression
@@ -369,6 +372,7 @@ pub fn tylertoo_core::diagnostics::CrsWarning::clone(&self) -> tylertoo_core::di
 impl core::cmp::Eq for tylertoo_core::diagnostics::CrsWarning
 impl core::cmp::PartialEq for tylertoo_core::diagnostics::CrsWarning
 pub fn tylertoo_core::diagnostics::CrsWarning::eq(&self, &tylertoo_core::diagnostics::CrsWarning) -> bool
+impl core::error::Error for tylertoo_core::diagnostics::CrsWarning
 impl core::fmt::Debug for tylertoo_core::diagnostics::CrsWarning
 pub fn tylertoo_core::diagnostics::CrsWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for tylertoo_core::diagnostics::CrsWarning
@@ -3859,7 +3863,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Hea
 pub struct tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, u8, u32, u32, u64, &[u8], usize, usize) -> core::io::error::Result<()>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, tylertoo_core::tile::TileCoord, u64, &[u8], usize, usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
@@ -4618,8 +4622,8 @@ pub tylertoo_core::Compression::Zstd = 4
 impl tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::code(&self) -> u8
 pub fn tylertoo_core::compression::Compression::from_code(u8) -> core::option::Option<Self>
-pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::option::Option<Self>
 pub fn tylertoo_core::compression::Compression::name(&self) -> &'static str
+pub fn tylertoo_core::compression::Compression::parse(&str) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::clone(&self) -> tylertoo_core::compression::Compression
 impl core::cmp::Eq for tylertoo_core::compression::Compression
@@ -4631,6 +4635,9 @@ impl core::fmt::Debug for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::compression::Compression
 impl core::marker::StructuralPartialEq for tylertoo_core::compression::Compression
+impl core::str::traits::FromStr for tylertoo_core::compression::Compression
+pub type tylertoo_core::compression::Compression::Err = alloc::string::String
+pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::compression::Compression
 impl core::marker::Send for tylertoo_core::compression::Compression
 impl core::marker::Sync for tylertoo_core::compression::Compression
@@ -4703,7 +4710,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
 pub struct tylertoo_core::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, u8, u32, u32, u64, &[u8], usize, usize) -> core::io::error::Result<()>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, tylertoo_core::tile::TileCoord, u64, &[u8], usize, usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>

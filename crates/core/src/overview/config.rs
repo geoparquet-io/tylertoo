@@ -872,11 +872,11 @@ pub(crate) mod spelled {
     use std::fmt::Display;
     use std::str::FromStr;
 
-    pub fn serialize<S: Serializer, T: Display>(value: &T, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer, T: Display>(value: &T, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(value)
     }
 
-    pub fn deserialize<'de, D, T>(d: D) -> Result<T, D::Error>
+    pub(crate) fn deserialize<'de, D, T>(d: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
         T: FromStr,
@@ -886,7 +886,7 @@ pub(crate) mod spelled {
     }
 
     /// [`deserialize`], ignoring case.
-    pub fn deserialize_lowercase<'de, D, T>(d: D) -> Result<T, D::Error>
+    pub(crate) fn deserialize_lowercase<'de, D, T>(d: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
         T: FromStr,
@@ -941,14 +941,19 @@ pub(crate) mod tile_range {
     use crate::shard::TileRange;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(value: &Option<TileRange>, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        value: &Option<TileRange>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         match value {
             Some(range) => s.serialize_some(&format!("{}..{}", range.lo(), range.hi())),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TileRange>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<TileRange>, D::Error> {
         Option::<String>::deserialize(d)?
             .map(|s| TileRange::parse(&s).map_err(serde::de::Error::custom))
             .transpose()
@@ -961,7 +966,10 @@ pub(crate) mod accumulation {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::collections::BTreeMap;
 
-    pub fn serialize<S: Serializer>(value: &[AccumulateSpec], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        value: &[AccumulateSpec],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         if value.is_empty() {
             return s.serialize_none();
         }
@@ -972,7 +980,9 @@ pub(crate) mod accumulation {
         )
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<AccumulateSpec>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<AccumulateSpec>, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Specs {

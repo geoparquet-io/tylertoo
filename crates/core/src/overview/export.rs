@@ -147,6 +147,32 @@ mod coalesce_valve;
 
 mod coverage_fill;
 use coalesce_valve::RowGapCursor;
+struct PartitionBudget {
+    partition_target: usize,
+    ceiling_wave: usize,
+    auto_wave: bool,
+    member_bytes: Option<u64>,
+    available_ram: Option<u64>,
+    fit_limit: Option<MemoryLimit>,
+}
+
+struct FanoutRows<'a> {
+    plans: &'a [LevelPlan],
+    targets: &'a [usize],
+    per_level: Vec<RowMembers>,
+    row_gaps: &'a [(u64, u16)],
+}
+
+#[derive(Clone, Copy)]
+struct TileTarget<'a> {
+    zoom: u8,
+    opts: &'a ExportOptions,
+    key_lo: u64,
+    key_hi: u64,
+    assume_simple: bool,
+    diagnostics: &'a crate::diagnostics::Diagnostics,
+}
+
 #[cfg(test)]
 use coalesce_valve::GAP_NONE;
 mod feature_id;
@@ -1772,18 +1798,20 @@ pub fn write_empty_archive(
 /// ([`check_levels_fit`], #665). `fit_limit` is probed fresh rather than
 /// taken from the cached `available_ram`: in a `tiles` run that figure was
 /// fixed during convert's pass 1.
-#[allow(clippy::too_many_arguments)]
 fn plan_levels(
     scans: &[LevelScan],
     meta: &OverviewsMeta,
     num_levels: usize,
-    partition_target: usize,
-    ceiling_wave: usize,
-    auto_wave: bool,
-    member_bytes: Option<u64>,
-    available_ram: Option<u64>,
-    fit_limit: Option<MemoryLimit>,
+    inputs: PartitionBudget,
 ) -> Result<Vec<LevelPlan>, ExportError> {
+    let PartitionBudget {
+        partition_target,
+        ceiling_wave,
+        auto_wave,
+        member_bytes,
+        available_ram,
+        fit_limit,
+    } = inputs;
     let plans = scans
         .iter()
         .enumerate()
@@ -1918,13 +1946,13 @@ struct Pass2Knobs {
 struct Pass2Run {
     report: ExportReport,
     /// The [`plan_level_groups`] schedule the levels ran in.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     level_groups: Vec<std::ops::Range<usize>>,
     /// The zoom each checkpoint was capped at, in order.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     checkpoint_zooms: Vec<u8>,
     /// Whether the levels read from the single-read member store (#235).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     single_read: bool,
 }
 
@@ -1941,7 +1969,7 @@ fn export_pmtiles_run(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "#779: F1 merges the engine report and writer stages next"
+    reason = "#779: export orchestration keeps scan, writer and checkpoint lifetimes explicit"
 )]
 fn export_pmtiles_validated(
     input_path: impl AsRef<Path>,
@@ -2139,8 +2167,7 @@ fn export_pmtiles_validated(
     // `TYLERTOO_PROFILE_JSON` line at the end ([`emit_export_profile_json`]).
     // #571: `ExportProgress` also owns the continuous RSS sampler started
     // before the scan (`None` when profiling is off).
-    let mut progress =
-        ExportProgress::new(num_levels, timers, rss_sampler, knobs.checkpoint_interval);
+    let mut progress = ExportProgress::new(num_levels, timers, rss_sampler, knobs);
 
     // Plan every level's partitions and wave width up front. The partitioning
     // single-read fill (#235) routes members by (level, partition, wave), so
@@ -2150,12 +2177,14 @@ fn export_pmtiles_validated(
         &scans,
         &meta,
         num_levels,
-        partition_target,
-        ceiling_wave,
-        auto_wave,
-        member_bytes,
-        available_ram,
-        knobs.memory_limit.or_else(probe_oom_memory_limit),
+        PartitionBudget {
+            partition_target,
+            ceiling_wave,
+            auto_wave,
+            member_bytes,
+            available_ram,
+            fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
+        },
     )?;
     progress.end_scan(t_scan);
 
@@ -2244,7 +2273,6 @@ fn export_pmtiles_validated(
             output_path: output_path.as_ref(),
             coarsest_zoom,
         },
-        knobs.fail_level,
         &mut progress,
         diagnostics,
     )?);
@@ -2285,8 +2313,11 @@ fn export_pmtiles_validated(
             start,
         )
         .with_diagnostics(diagnostics),
+        #[cfg(test)]
         level_groups,
+        #[cfg(test)]
         checkpoint_zooms: progress.checkpoint_zooms,
+        #[cfg(test)]
         single_read,
     })
 }
@@ -2415,6 +2446,7 @@ fn checkpoint_if_due(
     progress.checkpoint_throttle = Instant::now();
     add_nanos(&progress.profile.timers.checkpoint, dur);
     progress.profile.checkpoints += 1;
+    #[cfg(test)]
     progress.checkpoint_zooms.push(zoom);
     log::info!(
         "[export] checkpoint written: zooms {}..={zoom} salvageable at {} ({:.2}s)",
@@ -2464,6 +2496,7 @@ fn auto_fill_backing(
 /// - `profile` is diagnostics only (#535): nothing in it is ever read by
 ///   anything that affects the archive.
 struct ExportProgress {
+    fail_level: Option<usize>,
     /// When the last checkpoint was written (or the export started): a
     /// checkpoint is due once [`CHECKPOINT_INTERVAL`] has elapsed since. A
     /// fast export finishes before the first interval elapses and never
@@ -2472,6 +2505,7 @@ struct ExportProgress {
     /// The throttle's interval: [`CHECKPOINT_INTERVAL`], or a test's value.
     checkpoint_interval: Duration,
     /// The zoom each checkpoint was capped at, in order (#647 tests).
+    #[cfg(test)]
     checkpoint_zooms: Vec<u8>,
     profile: ExportProfile,
     /// #571: the continuous background sampler, running only when
@@ -2489,11 +2523,13 @@ impl ExportProgress {
         num_levels: usize,
         timers: Arc<ExportTimers>,
         rss_sampler: Option<RssSampler>,
-        checkpoint_interval: Duration,
+        knobs: &Pass2Knobs,
     ) -> Self {
         Self {
             checkpoint_throttle: Instant::now(),
-            checkpoint_interval,
+            checkpoint_interval: knobs.checkpoint_interval,
+            fail_level: knobs.fail_level,
+            #[cfg(test)]
             checkpoint_zooms: Vec::new(),
             profile: ExportProfile {
                 timers,
@@ -2817,31 +2853,18 @@ fn build_fills_if_asked(
         );
         return Ok(None);
     }
-    coverage_fill::build_fill_map(
-        first.reader,
-        last.level_idx,
-        first.crs,
-        first.published.geometry.as_deref(),
-        last.plan.zoom,
-        first.plan.zoom,
-        options,
-        timers,
-        diagnostics,
-    )
-    .map(Some)
+    coverage_fill::build_fill_map(last, first.plan.zoom, timers, diagnostics).map(Some)
 }
 
 /// Export every level, one [`plan_level_groups`] group at a time. Each level
 /// is followed by a throttled salvage checkpoint (#229) once its tiles are
 /// written, inside a group too (#647).
-#[allow(clippy::too_many_arguments)]
 fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
     mut store: Option<&mut MemberStore>,
     levels: &[ExportLevelCtx<'_>],
     groups: &[std::ops::Range<usize>],
     ckpt: &CheckpointCtx<'_>,
-    fail_level: Option<usize>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<ZoomReport>, ExportError> {
@@ -2860,7 +2883,7 @@ fn export_level_groups(
             store.as_deref_mut(),
             &levels[group.clone()],
             ckpt,
-            fail_level,
+            progress.fail_level,
             progress,
             diagnostics,
         )?);
@@ -3193,9 +3216,11 @@ fn write_encoded_tiles(
             tally.oversized += 1;
         }
         writer.add_tile_precompressed(
-            zoom,
-            t.x,
-            t.y,
+            crate::tile::TileCoord {
+                z: zoom,
+                x: t.x,
+                y: t.y,
+            },
             t.hash,
             &t.data,
             t.raw_len,
@@ -4152,10 +4177,12 @@ fn fanout_batch_members(
     let routed = route_fanout_rows(
         batch,
         &cols,
-        plans,
-        &targets,
-        per_level,
-        &row_gaps,
+        FanoutRows {
+            plans,
+            targets: &targets,
+            per_level,
+            row_gaps: &row_gaps,
+        },
         seq,
         store,
         diagnostics,
@@ -4180,18 +4207,20 @@ type SharedProps = Arc<Vec<(Arc<str>, PropertyValue)>>;
 /// [`fanout_batch_members`]' second half: attach each member-producing row's
 /// properties (materialized once per row, shared via `Arc`) and push its
 /// members into their `(level, wave)` store buckets, in band order.
-#[allow(clippy::too_many_arguments)]
 fn route_fanout_rows(
     batch: &RecordBatch,
     cols: &AttrColumns<'_>,
-    plans: &[LevelPlan],
-    targets: &[usize],
-    mut per_level: Vec<RowMembers>,
-    row_gaps: &[(u64, u16)],
+    inputs: FanoutRows<'_>,
     seq: &mut u64,
     store: &mut MemberStore,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
+    let FanoutRows {
+        plans,
+        targets,
+        mut per_level,
+        row_gaps,
+    } = inputs;
     // Extract property columns once per batch; materialize per-feature props
     // only for rows that produced members at any level, shared across the
     // row's members via `Arc` (as the legacy path does per wave).
@@ -5170,13 +5199,15 @@ fn feature_tile_members(
         copy_tile_members(
             geom,
             &bbox,
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
-            assume_simple,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             &mut out,
-            diagnostics,
         );
         return out;
     }
@@ -5186,13 +5217,15 @@ fn feature_tile_members(
         copy_tile_members(
             &copy,
             &shift_bbox(&bbox, shift),
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
-            assume_simple,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             &mut out,
-            diagnostics,
         );
         for (key, piece) in out.drain(..) {
             match by_key.remove(&key) {
@@ -5311,18 +5344,20 @@ fn join_wrapped_pieces(a: Geometry<f64>, b: Geometry<f64>) -> Geometry<f64> {
 /// One world copy's share of [`feature_tile_members`]: clip `geom` (whose
 /// bbox is `bbox`) into every tile it belongs to at `zoom` within
 /// `[key_lo, key_hi]`, appending to `out`.
-#[allow(clippy::too_many_arguments)]
 fn copy_tile_members(
     geom: &Geometry<f64>,
     bbox: &TileBounds,
-    zoom: u8,
-    opts: &ExportOptions,
-    key_lo: u64,
-    key_hi: u64,
-    assume_simple: bool,
+    inputs: TileTarget<'_>,
     out: &mut Vec<(u64, Geometry<f64>)>,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    let TileTarget {
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        assume_simple,
+        diagnostics,
+    } = inputs;
     let bbox = *bbox;
     // Target leaf-tile ranges at `zoom` — the authority for which tiles this
     // feature belongs to. Derived from the BUFFER-EXPANDED bbox so a feature
@@ -5355,14 +5390,16 @@ fn copy_tile_members(
         feature_tile_members_direct(
             geom,
             &bbox,
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             &ranges,
-            assume_simple,
             out,
-            diagnostics,
         );
     } else {
         // Start the descent at the feature's covering tile (the deepest tile
@@ -5374,14 +5411,16 @@ fn copy_tile_members(
             root,
             geom,
             &bbox,
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             &ranges,
-            assume_simple,
             out,
-            diagnostics,
         );
     }
 }
@@ -5503,19 +5542,21 @@ fn tile_span(ranges: &BboxTileRanges) -> u64 {
 /// [`DIRECT_CLIP_BUDGET`]; its output is byte-identical to the historical
 /// export. Appends `(key, geom)` members within `[key_lo, key_hi]` to `out`.
 /// `assume_simple` is the per-feature ring-simplicity hint (issue #237, RC3).
-#[allow(clippy::too_many_arguments)]
 fn feature_tile_members_direct(
     geom: &Geometry<f64>,
     bbox: &TileBounds,
-    zoom: u8,
-    opts: &ExportOptions,
-    key_lo: u64,
-    key_hi: u64,
+    inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    let TileTarget {
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        assume_simple,
+        diagnostics,
+    } = inputs;
     for tc in tiles_in_ranges(ranges, zoom) {
         let key = tile_key(tc.x, tc.y, zoom);
         if key < key_lo || key > key_hi {
@@ -5604,20 +5645,22 @@ fn node_key_overlaps(node: TileCoord, zoom: u8, key_lo: u64, key_hi: u64) -> boo
     *range.start() <= key_hi && key_lo <= *range.end()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn split_feature_into_tiles(
     node: TileCoord,
     cur: &Geometry<f64>,
     cur_bbox: &TileBounds,
-    zoom: u8,
-    opts: &ExportOptions,
-    key_lo: u64,
-    key_hi: u64,
+    inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    let TileTarget {
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        assume_simple,
+        diagnostics,
+    } = inputs;
     // Prune: outside the feature's target tiles, or outside this partition.
     if !node_overlaps_ranges(node, zoom, ranges) || !node_key_overlaps(node, zoom, key_lo, key_hi) {
         return;
@@ -5667,14 +5710,16 @@ fn split_feature_into_tiles(
             node.z,
             cur,
             cur_bbox,
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             ranges,
-            assume_simple,
             out,
-            diagnostics,
         );
     } else if let Some(clipped) = clip_geometry_simple(
         cur,
@@ -5693,14 +5738,16 @@ fn split_feature_into_tiles(
             node.z,
             &clipped,
             &cbbox,
-            zoom,
-            opts,
-            key_lo,
-            key_hi,
+            TileTarget {
+                zoom,
+                opts,
+                key_lo,
+                key_hi,
+                assume_simple,
+                diagnostics,
+            },
             ranges,
-            assume_simple,
             out,
-            diagnostics,
         );
     }
     // else: `cur` does not intersect this node's buffered bounds — whole
@@ -5713,21 +5760,23 @@ fn split_feature_into_tiles(
 /// small-cascade case — it stays sequential. Emission order is irrelevant:
 /// `collect_wave_members` buckets members by tile key, and a feature emits at
 /// most one member per key, so parallel interleaving cannot change the archive.
-#[allow(clippy::too_many_arguments)]
 fn fanout_children(
     children: [TileCoord; 4],
     node_z: u8,
     child_geom: &Geometry<f64>,
     child_bbox: &TileBounds,
-    zoom: u8,
-    opts: &ExportOptions,
-    key_lo: u64,
-    key_hi: u64,
+    inputs: TileTarget<'_>,
     ranges: &BboxTileRanges,
-    assume_simple: bool,
     out: &mut Vec<(u64, Geometry<f64>)>,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    let TileTarget {
+        zoom,
+        opts,
+        key_lo,
+        key_hi,
+        assume_simple,
+        diagnostics,
+    } = inputs;
     if (zoom - node_z) as u32 > CASCADE_PARALLEL_DEPTH {
         let mut left = Vec::new();
         let mut right = Vec::new();
@@ -5738,14 +5787,16 @@ fn fanout_children(
                         child,
                         child_geom,
                         child_bbox,
-                        zoom,
-                        opts,
-                        key_lo,
-                        key_hi,
+                        TileTarget {
+                            zoom,
+                            opts,
+                            key_lo,
+                            key_hi,
+                            assume_simple,
+                            diagnostics,
+                        },
                         ranges,
-                        assume_simple,
                         &mut left,
-                        diagnostics,
                     );
                 }
             },
@@ -5755,14 +5806,16 @@ fn fanout_children(
                         child,
                         child_geom,
                         child_bbox,
-                        zoom,
-                        opts,
-                        key_lo,
-                        key_hi,
+                        TileTarget {
+                            zoom,
+                            opts,
+                            key_lo,
+                            key_hi,
+                            assume_simple,
+                            diagnostics,
+                        },
                         ranges,
-                        assume_simple,
                         &mut right,
-                        diagnostics,
                     );
                 }
             },
@@ -5775,14 +5828,16 @@ fn fanout_children(
                 child,
                 child_geom,
                 child_bbox,
-                zoom,
-                opts,
-                key_lo,
-                key_hi,
+                TileTarget {
+                    zoom,
+                    opts,
+                    key_lo,
+                    key_hi,
+                    assume_simple,
+                    diagnostics,
+                },
                 ranges,
-                assume_simple,
                 out,
-                diagnostics,
             );
         }
     }
@@ -5809,14 +5864,16 @@ fn members_direct_vec(
     feature_tile_members_direct(
         geom,
         &bbox,
-        zoom,
-        opts,
-        key_lo,
-        key_hi,
+        TileTarget {
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            assume_simple,
+            diagnostics: &crate::diagnostics::Diagnostics::default(),
+        },
         &ranges,
-        assume_simple,
         &mut out,
-        &crate::diagnostics::Diagnostics::default(),
     );
     out
 }
@@ -5845,14 +5902,16 @@ fn members_recursive_vec(
         root,
         geom,
         &bbox,
-        zoom,
-        opts,
-        key_lo,
-        key_hi,
+        TileTarget {
+            zoom,
+            opts,
+            key_lo,
+            key_hi,
+            assume_simple,
+            diagnostics: &crate::diagnostics::Diagnostics::default(),
+        },
         &ranges,
-        assume_simple,
         &mut out,
-        &crate::diagnostics::Diagnostics::default(),
     );
     out
 }
@@ -9374,7 +9433,10 @@ mod tests {
 
     /// The schedule with all four levels of [`level_group_fixture`] in one
     /// group. It is one range on purpose, not the range's elements.
-    #[allow(clippy::single_range_in_vec_init)]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "#647: one range represents a group of four levels, not four individual indices"
+    )]
     const ONE_GROUP_OF_FOUR: [std::ops::Range<usize>; 1] = [0..4];
 
     /// Members in the dense z8 tile of [`level_group_fixture`]. Each is a

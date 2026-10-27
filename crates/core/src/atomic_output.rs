@@ -68,7 +68,10 @@ pub(crate) fn create(target: &Path) -> io::Result<(File, PendingOutput)> {
     };
     if let Ok(m) = std::fs::metadata(target) {
         if !m.is_file() && !m.is_dir() {
-            #[allow(clippy::disallowed_methods)] // owner of outputs (#427)
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "#427: output owner opens device sinks directly; regular files use atomic rename"
+            )] // owner of outputs (#427)
             let file = File::create(target)?;
             return Ok((
                 file,
@@ -251,7 +254,15 @@ fn not_writable(target: &Path, reason: String) -> Result<(), OutputNotWritable> 
 /// Create and remove a uniquely named file in `dir`. Not `tempfile`: its
 /// errors append the random probe name, which means nothing to a user.
 pub(crate) fn probe_directory(dir: &Path) -> io::Result<()> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#427: unique temporary output names across concurrent writers"
+    )]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#427: unique temporary output names across concurrent writers"
+    )]
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);

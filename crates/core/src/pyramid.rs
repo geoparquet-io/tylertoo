@@ -1939,6 +1939,17 @@ fn open_merge_archives(
     Ok((archives, fits))
 }
 
+fn append_compressed_tile(
+    writer: &mut StreamingPmtilesWriter,
+    tile: crate::tile::TileCoord,
+    data: &[u8],
+    raw_len: usize,
+) -> Result<(), Error> {
+    writer
+        .add_tile_precompressed(tile, TileHasher::hash(data), data, raw_len, 0)
+        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))
+}
+
 /// [`merge_bands`] with [`BandMergeOptions`]: a band's declared zoom range
 /// may overshoot its archive, and the merged archive's publication metadata
 /// can be set.
@@ -2073,6 +2084,7 @@ fn merge_prepared_bands(
         while let Some((first_band, tile)) = merged.next() {
             let t = tile.map_err(|e| in_band(&bands[first_band].input, e))?;
             let (id, z, x, y) = (t.id, t.z, t.x, t.y);
+            let coord = crate::tile::TileCoord { z, x, y };
             ensure_ascending(&mut last_id, id, &bands[first_band])?;
 
             // Gather every band's copy of `id`. A peeked error is left for
@@ -2115,10 +2127,7 @@ fn merge_prepared_bands(
                 [] => continue,
                 [(bi, range)] => {
                     let data = read_cached(&archives[*bi], &mut cache[*bi], range.clone())?;
-                    let hash = TileHasher::hash(&data);
-                    writer
-                        .add_tile_precompressed(z, x, y, hash, &data, data.len(), 0)
-                        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+                    append_compressed_tile(&mut writer, coord, &data, data.len())?;
                 }
                 refs => {
                     buf.clear();
@@ -2145,9 +2154,7 @@ fn merge_prepared_bands(
                     let gz = compression::compress(&buf, Compression::Gzip).map_err(|e| {
                         Error::PMTilesWrite(format!("tile {z}/{x}/{y} failed to compress: {e}"))
                     })?;
-                    writer
-                        .add_tile_precompressed(z, x, y, TileHasher::hash(&gz), &gz, buf.len(), 0)
-                        .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+                    append_compressed_tile(&mut writer, coord, &gz, buf.len())?;
                     combined += 1;
                 }
             }
@@ -2231,10 +2238,12 @@ fn merge_prepared_bands(
             // This is conservative: identical compressed bytes are certainly
             // identical tiles, so it can miss a duplicate (two band archives
             // written with different gzip settings) but never invents one.
-            let hash = TileHasher::hash(data);
-            writer
-                .add_tile_precompressed(z, x, y, hash, data, data.len(), 0)
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to add tile: {e}")))?;
+            append_compressed_tile(
+                &mut writer,
+                crate::tile::TileCoord { z, x, y },
+                data,
+                data.len(),
+            )?;
             n += 1;
             Ok(())
         })?;

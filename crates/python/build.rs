@@ -54,7 +54,7 @@ fn main() {
         let doc_path = format!("src/docs/{name}.txt");
         println!("cargo:rerun-if-changed={doc_path}");
         let docs = fs::read_to_string(doc_path).expect("Python API docstring");
-        output.push_str(&format!("macro_rules! signature_{name} {{ ($function:item) => {{ #[expect(clippy::doc_markdown, reason = \"Public Python docstrings use Python identifiers and Google-style sections\")] #[pyfunction] #[pyo3(signature = ({args}), text_signature = {signature:?})] #[doc = {docs:?}] $function }}; }}\n"));
+        output.push_str(&format!("macro_rules! signature_{name} {{ ($function:item) => {{ #[expect(clippy::doc_markdown, reason = \"#779: public Python docstrings use Python identifiers and Google-style sections\")] #[pyfunction] #[pyo3(signature = ({args}), text_signature = {signature:?})] #[doc = {docs:?}] $function }}; }}\n"));
     }
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR")).join("signatures.rs"),

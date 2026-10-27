@@ -28,7 +28,7 @@ fn load_huge_polygon() -> Option<Polygon<f64>> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual timing requiring /tmp/huge_antarctica_poly.wkb"]
 fn clip_huge_polygon_with_ioverlay() {
     let poly = match load_huge_polygon() {
         Some(p) => p,
@@ -73,7 +73,7 @@ fn clip_huge_polygon_with_ioverlay() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual timing requiring /tmp/huge_antarctica_poly.wkb"]
 fn clip_huge_polygon_with_sutherland_hodgman() {
     let poly = match load_huge_polygon() {
         Some(p) => p,

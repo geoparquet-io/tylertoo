@@ -64,6 +64,10 @@ fn table(feats: &[AssignFeature]) -> FeatureTable {
 /// dhat's `#[global_allocator]` and a second one in this crate is a hard
 /// compile error. The B/ft columns then read `-`; use dhat for that build.
 #[cfg(not(feature = "dhat-heap"))]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#565: benchmark allocator tracks process-wide heap allocation without recursing"
+)]
 mod track {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -84,7 +88,7 @@ mod track {
     /// Whether `ASSIGN_BENCH_TRACK_MEM` asked for allocation tracking. Read
     /// once and cached — `std::env::var` allocates, and doing that inside the
     /// allocator would recurse.
-    pub fn requested() -> bool {
+    pub(super) fn requested() -> bool {
         static REQUESTED: OnceLock<bool> = OnceLock::new();
         *REQUESTED.get_or_init(|| {
             std::env::var("ASSIGN_BENCH_TRACK_MEM")
@@ -95,12 +99,12 @@ mod track {
 
     /// Turn tracking on or off. Called once, before the fixture is built, so
     /// `LIVE` is accurate for everything the run allocates.
-    pub fn enable(on: bool) {
+    pub(super) fn enable(on: bool) {
         TRACKING.store(on, Ordering::Relaxed);
     }
 
     /// Re-arm the high-water mark at the current live total and return it.
-    pub fn arm() -> isize {
+    pub(super) fn arm() -> isize {
         let live = LIVE.load(Ordering::Relaxed);
         PEAK.store(live, Ordering::Relaxed);
         live
@@ -110,7 +114,7 @@ mod track {
     /// returned. `Relaxed` throughout: this is read only after the measured
     /// phase has joined (a rayon `install` is a full barrier), so nothing
     /// beyond atomicity is needed.
-    pub fn added_since(base: isize) -> usize {
+    pub(super) fn added_since(base: isize) -> usize {
         PEAK.load(Ordering::Relaxed)
             .saturating_sub(base)
             .max(0)
@@ -160,14 +164,14 @@ mod track {
 /// B/ft columns print `-`.
 #[cfg(feature = "dhat-heap")]
 mod track {
-    pub fn requested() -> bool {
+    pub(super) fn requested() -> bool {
         false
     }
-    pub fn enable(_on: bool) {}
-    pub fn arm() -> isize {
+    pub(super) fn enable(_on: bool) {}
+    pub(super) fn arm() -> isize {
         0
     }
-    pub fn added_since(_base: isize) -> usize {
+    pub(super) fn added_since(_base: isize) -> usize {
         0
     }
 }

@@ -2382,7 +2382,6 @@ fn preflight_plan_readable(path: &Path) -> Result<(), ConvertError> {
 /// That matches how `overview`/`tiles` treat their own outputs; only
 /// `pyramid`, which merges several archives, gates overwrites behind
 /// `-f/--force`.
-#[allow(clippy::disallowed_methods)] // #779: writability probe, removed at once; migrate to atomic_output
 fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
     let bad = |what: String| Err(ConvertError::InvalidConfig(what));
     if path.is_dir() {
@@ -2403,22 +2402,12 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
             parent.display(),
         ));
     }
-    let probe = parent.join(format!(
-        ".tylertoo-save-plan-probe.{}.{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-    ));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(e) => {
-            return bad(format!(
-                "--save-plan {}: its parent directory {} is not writable: {e}",
-                path.display(),
-                parent.display(),
-            ));
-        }
+    if let Err(e) = crate::atomic_output::probe_directory(parent) {
+        return bad(format!(
+            "--save-plan {}: its parent directory {} is not writable: {e}",
+            path.display(),
+            parent.display(),
+        ));
     }
     if path.exists() {
         // #513 follow-up: a writable parent says nothing about an existing
@@ -2869,12 +2858,7 @@ pub fn convert_to_overviews_source(
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
     // `InputSource` clones are cheap handles sharing caches and counters.
-    convert_to_overviews_source_strategy(
-        &ConvertSource::single(source.clone()),
-        output_path,
-        options,
-        super::stream::Pass2Strategy::Pipelined,
-    )
+    convert_to_overviews_sources(&ConvertSource::single(source.clone()), output_path, options)
 }
 
 /// [`convert_to_overviews`] over a path with an explicit pass-2
@@ -4411,7 +4395,7 @@ impl BboxTallies {
 
 impl BboxTallies {
     /// Features that cannot be tiled at all, by either cause.
-    pub fn lost(&self) -> usize {
+    pub(super) fn lost(&self) -> usize {
         self.out_of_range + self.unprojectable
     }
 }
@@ -7650,7 +7634,10 @@ mod tests {
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "#543: test helper returns the optional memory-limit shape consumed by preflight"
+    )]
     fn mem_limit(bytes: u64, source: MemoryLimitSource) -> Option<MemoryLimit> {
         Some(MemoryLimit { bytes, source })
     }
@@ -8296,26 +8283,21 @@ mod tests {
         );
         assert!(msg.contains("does not exist"), "{msg}");
 
-        // A writable parent passes, and leaves no probe file behind.
+        // A writable parent passes, and leaves the directory unchanged.
+        let entries = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = entries();
         let ok = dir.path().join("fine.plan");
         validate_options(&ConvertOptions {
             save_plan: Some(ok.clone()),
             ..Default::default()
         })
         .expect("a writable --save-plan target is accepted");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| {
-                let name = e.unwrap().file_name();
-                name.to_string_lossy()
-                    .starts_with(".tylertoo-save-plan-probe")
-                    .then_some(name)
-            })
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "probe file left behind: {leftovers:?}"
-        );
+        assert_eq!(entries(), before, "preflight left an artifact behind");
 
         // Clobbering an existing plan is ALLOWED (matching how overview and
         // tiles treat their own outputs); only `pyramid` gates that behind

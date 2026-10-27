@@ -3160,7 +3160,7 @@ mod rdp_tests {
     /// (that is the bug); run it deliberately:
     /// `cargo test --lib geo_rdp_overflows -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "#575: upstream recursive RDP aborts on stack overflow; manual negative control"]
     fn geo_rdp_overflows_the_same_small_stack() {
         let amp = 0.0002_f64;
         let ls = zigzag(SMALL_STACK_ZIGZAG, amp, 0.0004);
@@ -3172,7 +3172,7 @@ mod rdp_tests {
     }
 
     #[test]
-    #[ignore] // measurement, not an assertion (#575)
+    #[ignore = "#575: manual timing and scaling measurement"] // measurement, not an assertion (#575)
     fn probe_rdp_scaling() {
         // `geo`'s recursive side needs one frame per retained vertex, so at
         // n = 12,000 it overflows the default 2 MiB test thread (release

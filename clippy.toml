@@ -13,6 +13,7 @@ cognitive-complexity-threshold = 30
 # one is 183 clippy lines. RATCHET: lower this toward 100 as the remaining long
 # functions get split — never raise it.
 too-many-lines-threshold = 200
+too-many-arguments-threshold = 7
 
 # doc_markdown (enabled in Cargo.toml) treats CamelCase words as code that
 # needs backticks. These are product, format, and OGC geometry-type names
@@ -43,6 +44,18 @@ doc-valid-idents = [
 # Parquet/IPC readers and writers belong to tylertoo-io; deny.toml rejects
 # dependencies that would let core bypass that crate boundary.
 disallowed-methods = [
+    { path = "parquet::file::metadata::ParquetMetaDataReader::decode_metadata_with_options", reason = "#779: decode_footer owns checked footer decoding" },
+    { path = "parquet::file::metadata::ParquetMetaDataReader::decode_metadata", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::file::metadata::ParquetMetaDataReader::parse_and_finish", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::file::metadata::ParquetMetaDataReader::try_parse", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::file::metadata::ParquetMetaDataReader::try_parse_sized", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderMetadata::load", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new_with_options", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new_with_metadata", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "arrow_ipc::reader::FileReader::try_new", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+    { path = "arrow_ipc::reader::StreamReader::try_new", reason = "#779: raw decoding belongs to the checked tylertoo-io reader owner" },
+
     # Concatenating record batches doubles peak memory and can overflow i32
     # offsets in one array (#563/#606 class); each use needs a reason.
     { path = "arrow_select::concat::concat_batches", reason = "concat_batches copies whole batches and can overflow i32 offsets (#563/#606); stream or regroup instead" },
@@ -50,4 +63,24 @@ disallowed-methods = [
     # crates/core/src/atomic_output.rs (#427): a crash or error never leaves
     # a truncated archive at the destination path.
     { path = "std::fs::File::create", reason = "write output through atomic_output (#427); File::create truncates the destination in place" },
+]
+
+# New global warning gates must use the per-operation Diagnostics channel.
+# Caches and synchronization owners make local, checked expectations (#779).
+disallowed-types = [
+    { path = "std::sync::Once", reason = "#779: warning state belongs to per-run Diagnostics; cache owners need a local expectation" },
+    { path = "std::sync::OnceLock", reason = "#779: warning state belongs to per-run Diagnostics; cache owners need a local expectation" },
+    { path = "std::sync::LazyLock", reason = "#779: warning state belongs to per-run Diagnostics; cache owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicBool", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicI8", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicI16", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicI32", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicI64", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicIsize", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicU8", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicU16", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicU32", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicU64", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicUsize", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
+    { path = "std::sync::atomic::AtomicPtr", reason = "#779: no process-global diagnostic state; synchronization owners need a local expectation" },
 ]

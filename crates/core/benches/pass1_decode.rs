@@ -14,7 +14,7 @@
 //! the timed closure.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `pass1_decode`
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
+// #779: test code; reads and writes its own trusted fixtures
 
 #[path = "support/fixtures.rs"]
 mod fixtures;

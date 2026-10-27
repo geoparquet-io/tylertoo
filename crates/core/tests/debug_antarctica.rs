@@ -46,7 +46,7 @@ fn load_antarctica() -> Option<MultiPolygon<f64>> {
 }
 
 #[test]
-#[ignore] // Run explicitly with: cargo test --release -p tylertoo-core --test debug_antarctica -- --ignored --nocapture
+#[ignore = "manual investigation requiring /tmp/antarctica.wkb"] // Run explicitly with: cargo test --release -p tylertoo-core --test debug_antarctica -- --ignored --nocapture
 fn find_problematic_tiles() {
     let mp = match load_antarctica() {
         Some(mp) => mp,
@@ -133,7 +133,7 @@ fn find_problematic_tiles() {
 
 /// Test a single specific tile to reproduce the issue
 #[test]
-#[ignore]
+#[ignore = "manual investigation requiring /tmp/antarctica.wkb"]
 fn test_single_tile() {
     let mp = match load_antarctica() {
         Some(mp) => mp,

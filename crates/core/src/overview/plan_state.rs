@@ -267,7 +267,7 @@ impl Fingerprint {
     ///
     /// `flag` is the plan flag that asked for it (`"save-plan"` or
     /// `"plan"`), used only in the remote-input honesty warning.
-    pub fn capture(
+    pub(super) fn capture(
         source: &ConvertSource,
         selected_row_groups: Option<&RowGroupSelection>,
         options: &ConvertOptions,
@@ -315,13 +315,13 @@ impl Fingerprint {
     /// Verify `self` (loaded from a plan) against the current run's
     /// fingerprint. Any mismatch is a hard error naming the offending field.
     #[cfg(test)]
-    pub fn verify(&self, current: &Fingerprint) -> Result<(), ConvertError> {
+    pub(super) fn verify(&self, current: &Fingerprint) -> Result<(), ConvertError> {
         self.verify_with(current, SelectionRule::Identical)
     }
 
     /// [`Fingerprint::verify`], with an explicit rule for the one term a
     /// shard is allowed to narrow.
-    pub fn verify_with(
+    pub(super) fn verify_with(
         &self,
         current: &Fingerprint,
         selection: SelectionRule,
@@ -927,7 +927,7 @@ pub(super) struct PlanTotals {
 
 impl PlanTotals {
     /// The point/total ratio the profile heuristics read.
-    pub fn point_ratio(&self) -> f64 {
+    pub(super) fn point_ratio(&self) -> f64 {
         if self.n_features == 0 {
             0.0
         } else {
@@ -952,7 +952,7 @@ pub(super) struct RankPlanProvenance {
 
 impl RankPlanProvenance {
     /// Derive from the resolved [`RankingProvenance`] the writer records.
-    pub fn from_provenance(p: &RankingProvenance) -> Self {
+    pub(super) fn from_provenance(p: &RankingProvenance) -> Self {
         RankPlanProvenance {
             mode: p.mode.clone(),
             column: p.column.clone(),
@@ -1031,7 +1031,7 @@ pub(super) struct ConvertPlan {
 impl ConvertPlan {
     /// Build a plan from the winner tables the assignment just produced,
     /// plus the pass-1 scalars pass 2 and the report consume.
-    pub fn from_winner_tables(
+    pub(super) fn from_winner_tables(
         tables: &WinnerTables,
         fingerprint: Fingerprint,
         rank_provenance: &RankingProvenance,
@@ -1085,7 +1085,7 @@ impl ConvertPlan {
 
     /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
     /// O(dataset) tables rather than cloning them.
-    pub fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
+    pub(super) fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
         let coalesce_scratch = self
             .coalesce
             .map(|c| {
@@ -1179,8 +1179,8 @@ macro_rules! list_col {
     ($builder:expr, $present:expr, $push:expr) => {{
         let mut b = LargeListBuilder::new($builder);
         if $present {
-            #[allow(clippy::redundant_closure_call)]
-            $push(&mut b);
+            let push = $push;
+            push(&mut b);
             b.append(true);
         } else {
             b.append(false);
@@ -1191,7 +1191,7 @@ macro_rules! list_col {
 
 impl ConvertPlan {
     /// Write the plan to `path` as an Arrow IPC file.
-    pub fn save(&self, path: &Path) -> Result<(), ConvertError> {
+    pub(super) fn save(&self, path: &Path) -> Result<(), ConvertError> {
         let stride = self
             .cluster_tables
             .as_ref()
@@ -1353,7 +1353,7 @@ impl ConvertPlan {
     /// reach an arrow decoder, and every structural check past that point
     /// reports through [`plan_err`] — a hostile or damaged plan is an error
     /// naming `--plan` and the path, never a panic (#512).
-    pub fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
+    pub(super) fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
         let mut file = File::open(path).map_err(|e| plan_err(path, &format!("{e}")))?;
         let mut header = [0u8; PLAN_HEADER_LEN];
         file.read_exact(&mut header).map_err(|_| {
@@ -1563,7 +1563,10 @@ fn kind_code(k: FeatureKind) -> u8 {
 /// O(input rows) and `save` runs at pass 1's memory peak, so an extra whole
 /// copy of it is exactly what a planet-scale run cannot afford.
 fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<(), ConvertError> {
-    #[allow(clippy::disallowed_methods)] // #779: plan written in place
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#521: saved plans intentionally overwrite in place after preflight"
+    )] // #779: plan written in place
     let file = File::create(path).map_err(|e| save_plan_err(path, &format!("{e}")))?;
     let mut w = BufWriter::new(file);
     w.write_all(PLAN_MAGIC)

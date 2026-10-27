@@ -325,7 +325,17 @@ pub fn merge_shards(
         // this tile to a stored body (#531).
         let hash = TileHasher::hash(&data);
         writer
-            .add_tile_precompressed(t.z, t.x, t.y, hash, &data, data.len(), 0)
+            .add_tile_precompressed(
+                crate::tile::TileCoord {
+                    z: t.z,
+                    x: t.x,
+                    y: t.y,
+                },
+                hash,
+                &data,
+                data.len(),
+                0,
+            )
             .map_err(|e| Error::PMTilesWrite(format!("failed to add tile: {e}")))?;
         *per_zoom_tile_counts.entry(t.z).or_insert(0) += 1;
         tiles_total += 1;

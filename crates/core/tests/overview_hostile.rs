@@ -23,7 +23,10 @@
 //! `write_input`/`write_input_with_f64` come from `overview::testutil`,
 //! included by `#[path]` below (that module is `pub(crate)`, so it cannot be
 //! imported through the crate's public API).
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;
@@ -49,7 +52,10 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 // to this integration-test crate), but it depends only on std and external
 // crates, so `#[path]` can include the same source here and the two can't
 // drift. Not every helper in it is used by this binary.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "#779: this test binary uses a subset of the shared fixture writers"
+)]
 #[path = "../src/overview/testutil.rs"]
 mod testutil;
 

@@ -94,6 +94,10 @@ impl<R: Read> IpcStreamReader<R> {
     ///
     /// Returns an Arrow error if the schema is invalid or the decoder panics.
     pub fn try_new(reader: R, projection: Option<Vec<usize>>) -> Result<Self, ArrowError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#779: stream owner guards schema decoding and every next call"
+        )]
         let inner = guard_arrow("Arrow IPC stream schema", || {
             arrow_ipc::reader::StreamReader::try_new(reader, projection)
         })?;

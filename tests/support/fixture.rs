@@ -17,7 +17,10 @@
 //! in the parquet reader with `Corrupt footer` — a failure that points at the
 //! conversion path rather than at the missing fixture.
 
-#![allow(dead_code)] // not every including test uses every helper
+#![expect(
+    dead_code,
+    reason = "#369: including test binaries use different subsets of the shared fixture guards"
+)] // not every including test uses every helper
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +42,7 @@ const FIXTURE_RELEASE: &str = "fixtures-v1";
 /// for six months* while reporting `ok`. A guard whose designed outcome is
 /// silence would reintroduce exactly that, so `CI` (always set by GitHub
 /// Actions) turns the skip back into a failure.
-pub fn realdata(name: &str) -> Option<PathBuf> {
+pub(crate) fn realdata(name: &str) -> Option<PathBuf> {
     let path = workspace_root().join("tests/fixtures/realdata").join(name);
     match usability(&path) {
         Ok(()) => Some(path),
@@ -67,7 +70,7 @@ pub fn realdata(name: &str) -> Option<PathBuf> {
 /// including a fresh one with no LFS fetch, has the real bytes. There is
 /// nothing to skip on: a missing or unusable golden fixture is a repo bug,
 /// not an environment gap, so this panics rather than silently skipping.
-pub fn golden(name: &str) -> PathBuf {
+pub(crate) fn golden(name: &str) -> PathBuf {
     let path = workspace_root().join("tests/fixtures/golden").join(name);
     usability(&path).unwrap_or_else(|why| {
         panic!("golden fixture {} {why}", path.display());
@@ -87,7 +90,7 @@ pub fn golden(name: &str) -> PathBuf {
 ///
 /// So this one never skips and never returns `None`: it panics, everywhere,
 /// and names the remedy.
-pub fn guard(name: &str) -> PathBuf {
+pub(crate) fn guard(name: &str) -> PathBuf {
     let path = workspace_root().join("tests/fixtures/guard").join(name);
     if let Err(why) = usability(&path) {
         panic!(

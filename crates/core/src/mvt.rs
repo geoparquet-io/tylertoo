@@ -677,6 +677,10 @@ fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
 /// have thousands, and storing their pairs would cost more than re-encoding.
 const MAX_CANDIDATES_PER_PART: u32 = 64;
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub(crate) struct QuantizedPolygons {
     /// Per feature, `None` when it is not polygonal.
     features: Vec<Option<QuantizedFeature>>,
@@ -725,6 +729,10 @@ impl QuantizedPolygons {
     /// polygons can (scene footprints, buffers): their pairs grow with the
     /// square of the part count, and the caller encodes such a tile without
     /// the cache.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: initializes per-input or per-tile worker caches"
+    )]
     pub(crate) fn new<'a>(
         features: impl IntoIterator<Item = (&'a Geometry, u64)>,
         bounds: &TileBounds,

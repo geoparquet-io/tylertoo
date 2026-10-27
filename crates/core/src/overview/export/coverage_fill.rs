@@ -56,6 +56,15 @@ pub(super) const FILL_EXTENT: f64 = 4096.0;
 /// default `--gsd-base`, the tolerance the level geometry is drawn at.
 pub(super) const FILL_SIMPLIFY_PX: f64 = 4.0;
 
+struct FillSeed<'a> {
+    geometry: Option<&'a str>,
+    crs: super::Crs,
+    seed_zoom: u8,
+    opts: &'a super::ExportOptions,
+    timers: &'a super::ExportTimers,
+    diagnostics: &'a crate::diagnostics::Diagnostics,
+}
+
 /// A ring the simplification collapsed: its area (pixels²) and where it was.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Collapsed {
@@ -749,6 +758,10 @@ pub(super) fn assign_hosts(polys: &[FillPolygon], hosts: &[[f64; 4]]) -> Vec<usi
 /// Every coarse tile's fill, in integer tile units keyed by PMTiles tile id.
 /// Built before the export writes anything, so the export keeps its
 /// coarse→fine order.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub(super) struct FillMap {
     tiles: std::collections::HashMap<u64, Vec<FillPolygon>>,
     used: std::sync::atomic::AtomicUsize,
@@ -808,18 +821,20 @@ fn project_polygon(p: &geo::Polygon<f64>, proj: &crate::mvt::TileProjector) -> S
 /// One seed batch: every polygon clipped into its tiles at `seed_zoom`,
 /// projected to tile pixels and simplified, appended to its tile's bucket in
 /// file order.
-#[allow(clippy::too_many_arguments)]
 fn seed_batch(
     batch: &super::RecordBatch,
-    geometry: Option<&str>,
-    crs: super::Crs,
-    seed_zoom: u8,
-    opts: &super::ExportOptions,
-    timers: &super::ExportTimers,
+    inputs: FillSeed<'_>,
     buckets: &mut std::collections::BTreeMap<u64, (Vec<Shape>, Vec<Collapsed>)>,
     features: &mut usize,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), super::ExportError> {
+    let FillSeed {
+        geometry,
+        crs,
+        seed_zoom,
+        opts,
+        timers,
+        diagnostics,
+    } = inputs;
     use rayon::prelude::*;
     type Bucket = (Vec<Shape>, Vec<Collapsed>);
     // The whole batch is the fill's seed time; its decode is not the
@@ -877,18 +892,18 @@ fn seed_batch(
 /// Each of its polygons is clipped into the tiles one zoom below the finest
 /// (the export's own clip), projected to tile pixels and simplified there;
 /// each zoom's fills are then built and lifted into the next, coarsest last.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_fill_map(
-    reader: &super::OverviewReader,
-    level_idx: usize,
-    crs: super::Crs,
-    geometry: Option<&str>,
-    finest_zoom: u8,
+    level: &super::ExportLevelCtx<'_>,
     min_zoom: u8,
-    opts: &super::ExportOptions,
     timers: &super::ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<FillMap, super::ExportError> {
+    let reader = level.reader;
+    let level_idx = level.level_idx;
+    let crs = level.crs;
+    let geometry = level.published.geometry.as_deref();
+    let finest_zoom = level.plan.zoom;
+    let opts = level.options;
     use rayon::prelude::*;
     use std::collections::BTreeMap;
 
@@ -945,14 +960,16 @@ pub(super) fn build_fill_map(
             for batch in rx.iter() {
                 seed_batch(
                     &batch,
-                    geometry,
-                    crs,
-                    seed_zoom,
-                    &seed_opts,
-                    timers,
+                    FillSeed {
+                        geometry,
+                        crs,
+                        seed_zoom,
+                        opts: &seed_opts,
+                        timers,
+                        diagnostics,
+                    },
                     buckets_ref,
                     features_ref,
-                    diagnostics,
                 )?;
             }
             Ok(())

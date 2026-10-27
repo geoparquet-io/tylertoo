@@ -954,7 +954,7 @@ mod tests {
     // cargo test --package tylertoo-core covering -- --ignored
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ~/Downloads/adm4_polygons.parquet"]
     fn test_extract_row_group_bounds_from_file() {
         // This test requires ~/Downloads/adm4_polygons.parquet
         let path = std::path::PathBuf::from(

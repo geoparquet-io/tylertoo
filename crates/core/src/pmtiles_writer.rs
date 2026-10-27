@@ -1742,7 +1742,10 @@ impl StreamingPmtilesWriter {
             }
         }
 
-        #[allow(clippy::disallowed_methods)] // #779: .partial, renamed at finish
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#427: checkpoint writer owns the partial file, renamed only after finalization"
+        )] // #779: .partial, renamed at finish
         let mut file = File::create(&partial_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -2091,9 +2094,7 @@ impl StreamingPmtilesWriter {
         // injective, so unequal tiles never do.
         let compressed = compression::compress(data, self.tile_compression)?;
         self.add_tile_precompressed(
-            z,
-            x,
-            y,
+            crate::tile::TileCoord { z, x, y },
             crate::dedup::TileHasher::hash(data),
             &compressed,
             data.len(),
@@ -2135,17 +2136,15 @@ impl StreamingPmtilesWriter {
     ///
     /// Does not panic: the spool file is used only after the finalized check
     /// has confirmed it is present.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_tile_precompressed(
         &mut self,
-        z: u8,
-        x: u32,
-        y: u32,
+        tile: crate::tile::TileCoord,
         hash: u64,
         compressed: &[u8],
         raw_len: usize,
         feature_count: usize,
     ) -> std::io::Result<()> {
+        let crate::tile::TileCoord { z, x, y } = tile;
         let id = checked_tile_id(z, x, y)?;
         self.note_add(id);
 
@@ -2678,7 +2677,10 @@ impl StreamingPmtilesWriter {
             }
         };
 
-        #[allow(clippy::disallowed_methods)] // #779: .partial, renamed at finish
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "#427: checkpoint writer owns the partial file, renamed only after finalization"
+        )] // #779: .partial, renamed at finish
         let output_file = File::create(&partial_path).map_err(|e| {
             Error::PMTilesWrite(format!(
                 "Failed to create output file {}: {e}",
@@ -2921,7 +2923,7 @@ mod tests {
             let body = vec![(i % 251) as u8; len];
             let hash = crate::dedup::TileHasher::hash(&body);
             writer
-                .add_tile_precompressed(14, x, y, hash, &body, len, 0)
+                .add_tile_precompressed(crate::tile::TileCoord { z: 14, x, y }, hash, &body, len, 0)
                 .unwrap();
         }
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -3337,8 +3339,14 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             let len = 64 + (rng >> 33) as usize % 512;
             let (z, x, y) = tile_id_to_zxy(tile_id(14, 0, 0) + u64::from(i) * 7).unwrap();
-            w.add_tile_precompressed(z, x, y, u64::from(i), &vec![(i % 251) as u8; len], len, 1)
-                .unwrap();
+            w.add_tile_precompressed(
+                crate::tile::TileCoord { z, x, y },
+                u64::from(i),
+                &vec![(i % 251) as u8; len],
+                len,
+                1,
+            )
+            .unwrap();
         }
         w.finalize(&out).unwrap();
 
@@ -3458,9 +3466,7 @@ mod tests {
                 let len = 4096 + (rng >> 33) as usize % 2048;
                 let (z, x, y) = tile_id_to_zxy(tile_id(12, 0, 0) + u64::from(i)).unwrap();
                 w.add_tile_precompressed(
-                    z,
-                    x,
-                    y,
+                    crate::tile::TileCoord { z, x, y },
                     u64::from(i),
                     &vec![(i % 251) as u8; len],
                     len,
@@ -3698,7 +3704,13 @@ mod tests {
                 "error names the zoom: {err}"
             );
             assert!(streaming
-                .add_tile_precompressed(z, 0, 0, 0, &tile, tile.len(), 0)
+                .add_tile_precompressed(
+                    crate::tile::TileCoord { z, x: 0, y: 0 },
+                    0,
+                    &tile,
+                    tile.len(),
+                    0
+                )
                 .is_err());
         }
 
@@ -3740,7 +3752,7 @@ mod tests {
                 "error names the tile: {err}"
             );
             assert!(streaming
-                .add_tile_precompressed(z, x, y, 0, &tile, tile.len(), 0)
+                .add_tile_precompressed(crate::tile::TileCoord { z, x, y }, 0, &tile, tile.len(), 0)
                 .is_err());
         }
 
@@ -5259,7 +5271,17 @@ mod tests {
             let hash = crate::dedup::TileHasher::hash(data);
             let compressed = compression::compress(data, Compression::Gzip).unwrap();
             parallel
-                .add_tile_precompressed(*z, *x, *y, hash, &compressed, data.len(), 1)
+                .add_tile_precompressed(
+                    crate::tile::TileCoord {
+                        z: *z,
+                        x: *x,
+                        y: *y,
+                    },
+                    hash,
+                    &compressed,
+                    data.len(),
+                    1,
+                )
                 .unwrap();
         }
         let parallel_path = dir.join("gpq-227-parallel.pmtiles");
@@ -5661,8 +5683,14 @@ mod tests {
         let mut add = |w: &mut StreamingPmtilesWriter, hash: u64, body: &[u8]| {
             let (z, x, y) = tail_coord(next);
             next += 1;
-            w.add_tile_precompressed(z, x, y, hash, body, body.len(), 0)
-                .unwrap();
+            w.add_tile_precompressed(
+                crate::tile::TileCoord { z, x, y },
+                hash,
+                body,
+                body.len(),
+                0,
+            )
+            .unwrap();
             tile_id(z, x, y)
         };
 
@@ -5734,12 +5762,30 @@ mod tests {
         let big_a = vec![0xA1u8; 100 * 1024];
         let mut big_b = big_a.clone();
         *big_b.last_mut().unwrap() = 0xB2; // differs in the last byte only
-        w.add_tile_precompressed(1, 0, 0, FORCED_HASH, &big_a, big_a.len(), 0)
-            .unwrap();
-        w.add_tile_precompressed(1, 0, 1, FORCED_HASH, &big_b, big_b.len(), 0)
-            .unwrap();
-        w.add_tile_precompressed(1, 1, 1, FORCED_HASH, &big_a, big_a.len(), 0)
-            .unwrap();
+        w.add_tile_precompressed(
+            crate::tile::TileCoord { z: 1, x: 0, y: 0 },
+            FORCED_HASH,
+            &big_a,
+            big_a.len(),
+            0,
+        )
+        .unwrap();
+        w.add_tile_precompressed(
+            crate::tile::TileCoord { z: 1, x: 0, y: 1 },
+            FORCED_HASH,
+            &big_b,
+            big_b.len(),
+            0,
+        )
+        .unwrap();
+        w.add_tile_precompressed(
+            crate::tile::TileCoord { z: 1, x: 1, y: 1 },
+            FORCED_HASH,
+            &big_a,
+            big_a.len(),
+            0,
+        )
+        .unwrap();
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let stats = w.finalize(tmp.path()).unwrap();
@@ -5765,8 +5811,14 @@ mod tests {
         // Every body, then every body again.
         for (i, body) in (0u32..).zip(bodies.iter().chain(&bodies)) {
             let (z, x, y) = tail_coord(i);
-            w.add_tile_precompressed(z, x, y, FORCED_HASH, body, body.len(), 0)
-                .unwrap();
+            w.add_tile_precompressed(
+                crate::tile::TileCoord { z, x, y },
+                FORCED_HASH,
+                body,
+                body.len(),
+                0,
+            )
+            .unwrap();
             expected.insert(tile_id(z, x, y), body.clone());
         }
 
@@ -5796,8 +5848,14 @@ mod tests {
         let mut add = |w: &mut StreamingPmtilesWriter, hash: u64, body: &[u8]| {
             let (z, x, y) = tail_coord(next);
             next += 1;
-            w.add_tile_precompressed(z, x, y, hash, body, body.len(), 0)
-                .unwrap();
+            w.add_tile_precompressed(
+                crate::tile::TileCoord { z, x, y },
+                hash,
+                body,
+                body.len(),
+                0,
+            )
+            .unwrap();
             tile_id(z, x, y)
         };
 

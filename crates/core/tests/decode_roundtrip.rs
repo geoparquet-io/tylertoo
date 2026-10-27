@@ -10,7 +10,10 @@
 //!
 //! Run with:
 //!   cargo test --package tylertoo-core --test `decode_roundtrip` -- --nocapture
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

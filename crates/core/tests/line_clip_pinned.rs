@@ -31,7 +31,6 @@
 //!
 //! Run with:
 //!   cargo test --package tylertoo-core --test `line_clip_pinned` -- --nocapture
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::PathBuf;
 

@@ -59,7 +59,10 @@
 //! then, for the wagyu columns,
 //!   cargo run --release --manifest-path `corpus/hostile_wagyu/Cargo.toml`
 //! and re-run `full_scorecard` to fold them in.
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 #[cfg(not(feature = "dhat-heap"))]
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -69,6 +72,10 @@ use std::fs;
 use std::io::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+#[expect(
+    clippy::disallowed_types,
+    reason = "#205: counting test allocator tracks process-wide heap use"
+)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -95,7 +102,15 @@ use tylertoo_core::tile::{tiles_for_bbox, TileBounds, TileCoord};
 #[cfg(not(feature = "dhat-heap"))]
 struct Counting;
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#205: counting test allocator tracks process-wide heap use"
+)]
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
+#[expect(
+    clippy::disallowed_types,
+    reason = "#205: counting test allocator tracks process-wide heap use"
+)]
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(not(feature = "dhat-heap"))]
@@ -387,7 +402,10 @@ fn circle(cx: f64, cy: f64, r: f64, n: usize) -> Vec<(f64, f64)> {
 /// (#383).
 // A fixture table, one entry per hostile shape; splitting it by category
 // would hide what the suite covers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "#205: keep the named hostile geometry scorecard fixtures together"
+)]
 fn synthetic_suite() -> Vec<Fixture> {
     let mut v: Vec<(&str, Geometry<f64>)> = Vec::new();
 

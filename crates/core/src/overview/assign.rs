@@ -673,29 +673,35 @@ impl FeatureTable {
     /// by doubling. [`Self::allocated_bytes`] is the allocation figure. Zero
     /// for an empty table.
     pub fn heap_bytes(&self) -> u64 {
-        let w = |len: usize, width: usize| (len * width) as u64;
-        w(self.index.len(), std::mem::size_of::<usize>())
-            + w(self.center_x.len(), std::mem::size_of::<f64>())
-            + w(self.center_y.len(), std::mem::size_of::<f64>())
-            + w(self.diag_sq.len(), std::mem::size_of::<f64>())
-            + w(self.kind.len(), std::mem::size_of::<u8>())
-            + w(self.sort_key.len(), std::mem::size_of::<f64>())
-            + w(self.entry_level.len(), std::mem::size_of::<u8>())
+        self.memory_bytes().0
     }
 
-    /// Heap bytes the columns have **allocated**: each column's `capacity()`
-    /// times its element width. Unlike [`Self::heap_bytes`] this includes
-    /// capacity slack, so it is the figure that shows whether a fill pattern
-    /// actually costs what the layout promises.
+    /// Heap bytes allocated by the columns, including capacity slack.
     pub fn allocated_bytes(&self) -> u64 {
-        let w = |cap: usize, width: usize| (cap * width) as u64;
-        w(self.index.capacity(), std::mem::size_of::<usize>())
-            + w(self.center_x.capacity(), std::mem::size_of::<f64>())
-            + w(self.center_y.capacity(), std::mem::size_of::<f64>())
-            + w(self.diag_sq.capacity(), std::mem::size_of::<f64>())
-            + w(self.kind.capacity(), std::mem::size_of::<u8>())
-            + w(self.sort_key.capacity(), std::mem::size_of::<f64>())
-            + w(self.entry_level.capacity(), std::mem::size_of::<u8>())
+        self.memory_bytes().1
+    }
+
+    fn memory_bytes(&self) -> (u64, u64) {
+        fn footprint<T>(column: &Vec<T>) -> (u64, u64) {
+            let width = std::mem::size_of::<T>();
+            (
+                (column.len() * width) as u64,
+                (column.capacity() * width) as u64,
+            )
+        }
+        [
+            footprint(&self.index),
+            footprint(&self.center_x),
+            footprint(&self.center_y),
+            footprint(&self.diag_sq),
+            footprint(&self.kind),
+            footprint(&self.sort_key),
+            footprint(&self.entry_level),
+        ]
+        .into_iter()
+        .fold((0, 0), |(used, allocated), (len, cap)| {
+            (used + len, allocated + cap)
+        })
     }
 
     /// What this table actually costs per row: [`Self::BASE_BYTES_PER_ROW`]
@@ -2232,7 +2238,10 @@ pub fn apply_density_budget(
     //
     // `level` is a scalar used in arithmetic/comparisons throughout the body
     // (not merely an index), so a range loop is the clearest form here.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "#534: serial coarse-to-fine admission uses the level index in arithmetic and state"
+    )]
     for level in 0..num_levels {
         // Nothing downstream depends on the ORDER of `cands`: the "everything
         // fits" branch only sets flags, and both paths of

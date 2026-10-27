@@ -10,7 +10,10 @@
 //! public API). `crates/core/tests/overview_hostile.rs` compiles this same
 //! file in via `#[path]` instead (#457), so keep it free of `crate::` /
 //! `super::` imports: std and external crates only.
-#![allow(clippy::disallowed_methods)] // #779: test code; reads and writes its own trusted fixtures
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;

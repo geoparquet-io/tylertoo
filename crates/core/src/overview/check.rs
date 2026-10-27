@@ -436,199 +436,145 @@ fn check_clustering(
     clustering: &crate::overview::level::ClusteringProvenance,
     report: &mut ValidationReport,
 ) {
-    // Mode: duplicating only.
-    match meta.mode {
-        Some(Mode::Duplicating) => report.pass(
-            "cluster_mode",
-            "clustering metadata on a duplicating-mode file",
-        ),
-        other => {
-            report.fail(
-                "cluster_mode",
-                format!(
-                    "clustering metadata requires duplicating mode, found {other:?} \
-                     (a partitioning row is read across many zoom prefixes; a \
-                     per-level point_count would double count)"
-                ),
-            );
-            return;
-        }
-    }
-
-    // Column exists, INT64, NOT NULL.
-    let name = clustering.point_count_column.as_str();
-    let descr = metadata.file_metadata().schema_descr();
-    let col_idx = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name);
-    let col_idx = match col_idx {
-        None => {
-            report.fail(
-                "cluster_point_count_column",
-                format!("clustering metadata names column {name:?} but it is absent"),
-            );
-            return;
-        }
-        Some(idx) => {
-            let col = descr.column(idx);
-            let phys_ok = col.physical_type() == PhysicalType::INT64;
-            let required = col.max_def_level() == 0;
-            if phys_ok && required {
-                report.pass(
-                    "cluster_point_count_column",
-                    format!("{name:?} is INT64 NOT NULL"),
-                );
-                idx
-            } else {
-                report.fail(
-                    "cluster_point_count_column",
-                    format!(
-                        "{name:?} must be INT64 NOT NULL (physical={:?}, max_def_level={})",
-                        col.physical_type(),
-                        col.max_def_level()
-                    ),
-                );
-                return;
-            }
-        }
-    };
-
-    // Values: min >= 1 everywhere; canonical band exactly 1 (via RG stats).
-    let canonical = meta.canonical_level;
-    let mut problems: Vec<String> = Vec::new();
-    for rg in 0..metadata.num_row_groups() {
-        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == canonical;
-        let chunk = metadata.row_group(rg).column(col_idx);
-        match chunk.statistics() {
-            Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
-                (Some(&min), Some(&max)) => {
-                    if min < 1 {
-                        problems.push(format!("RG {rg}: point_count min={min} < 1"));
-                    }
-                    if is_canonical && (min != 1 || max != 1) {
-                        problems.push(format!(
-                            "RG {rg} (canonical): point_count min={min} max={max}, expected 1"
-                        ));
-                    }
-                }
-                _ => problems.push(format!("RG {rg}: point_count has no min/max stats")),
-            },
-            Some(other) => {
-                problems.push(format!("RG {rg}: point_count stats not Int64 ({other:?})"))
-            }
-            None => problems.push(format!("RG {rg}: point_count column has no statistics")),
-        }
-    }
-    if problems.is_empty() {
-        report.pass(
-            "cluster_point_count_values",
-            "point_count >= 1 everywhere; canonical level all 1",
-        );
-    } else {
-        report.fail("cluster_point_count_values", problems.join("; "));
-    }
+    check_count_conformance(metadata, meta, CountConformance {
+        kind: "clustering", mode_key: "cluster_mode",
+        mode_detail: "a partitioning row is read across many zoom prefixes; a per-level point_count would double count",
+        name: &clustering.point_count_column, column_key: "cluster_point_count_column",
+        values_key: "cluster_point_count_values", label: "point_count", physical: PhysicalType::INT64,
+    }, report);
 }
 
-/// Coalescing conformance (Q3, spec §13 draft): when the footer's
-/// `generalization.coalescing` block is present and enabled,
-/// - the mode must be `duplicating` (merged chains cannot satisfy
-///   partitioning's feature-once / geometry-verbatim contract);
-/// - the named merged-count column must exist as INT32 NOT NULL;
-/// - every row group's `coalesced_count` stats must have `min >= 1`, and the
-///   canonical level band's must be exactly `min == max == 1` (the
-///   canonical level is never coalesced, §2.4).
+/// Coalescing count columns follow the same positive-count and canonical
+/// singleton rules as clustering, with an INT32 physical representation.
 fn check_coalescing(
     metadata: &ParquetMetaData,
     meta: &OverviewsMeta,
     coalescing: &crate::overview::level::CoalescingProvenance,
     report: &mut ValidationReport,
 ) {
-    // Mode: duplicating only.
-    match meta.mode {
-        Some(Mode::Duplicating) => report.pass(
-            "coalesce_mode",
-            "coalescing metadata on a duplicating-mode file",
-        ),
-        other => {
-            report.fail(
-                "coalesce_mode",
-                format!(
-                    "coalescing metadata requires duplicating mode, found {other:?} \
-                     (a merged chain replaces several source rows, which \
-                     partitioning's feature-once contract cannot represent)"
-                ),
-            );
-            return;
-        }
+    check_count_conformance(metadata, meta, CountConformance {
+        kind: "coalescing", mode_key: "coalesce_mode",
+        mode_detail: "a merged chain replaces several source rows, which partitioning's feature-once contract cannot represent",
+        name: &coalescing.coalesced_count_column, column_key: "coalesce_count_column",
+        values_key: "coalesce_count_values", label: "coalesced_count", physical: PhysicalType::INT32,
+    }, report);
+}
+
+struct CountConformance<'a> {
+    kind: &'static str,
+    mode_key: &'static str,
+    mode_detail: &'static str,
+    name: &'a str,
+    column_key: &'static str,
+    values_key: &'static str,
+    label: &'static str,
+    physical: PhysicalType,
+}
+
+fn check_count_conformance(
+    metadata: &ParquetMetaData,
+    meta: &OverviewsMeta,
+    spec: CountConformance<'_>,
+    report: &mut ValidationReport,
+) {
+    let CountConformance {
+        kind,
+        mode_key,
+        mode_detail,
+        name,
+        column_key,
+        values_key,
+        label,
+        physical,
+    } = spec;
+    if meta.mode != Some(Mode::Duplicating) {
+        report.fail(
+            mode_key,
+            format!(
+                "{kind} metadata requires duplicating mode, found {:?} ({mode_detail})",
+                meta.mode
+            ),
+        );
+        return;
     }
+    report.pass(
+        mode_key,
+        format!("{kind} metadata on a duplicating-mode file"),
+    );
 
-    // Column exists, INT32, NOT NULL.
-    let name = coalescing.coalesced_count_column.as_str();
     let descr = metadata.file_metadata().schema_descr();
-    let col_idx = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name);
-    let col_idx = match col_idx {
-        None => {
-            report.fail(
-                "coalesce_count_column",
-                format!("coalescing metadata names column {name:?} but it is absent"),
-            );
-            return;
-        }
-        Some(idx) => {
-            let col = descr.column(idx);
-            let phys_ok = col.physical_type() == PhysicalType::INT32;
-            let required = col.max_def_level() == 0;
-            if phys_ok && required {
-                report.pass(
-                    "coalesce_count_column",
-                    format!("{name:?} is INT32 NOT NULL"),
-                );
-                idx
-            } else {
-                report.fail(
-                    "coalesce_count_column",
-                    format!(
-                        "{name:?} must be INT32 NOT NULL (physical={:?}, max_def_level={})",
-                        col.physical_type(),
-                        col.max_def_level()
-                    ),
-                );
-                return;
-            }
-        }
+    let Some(col_idx) = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name)
+    else {
+        report.fail(
+            column_key,
+            format!("{kind} metadata names column {name:?} but it is absent"),
+        );
+        return;
     };
+    let col = descr.column(col_idx);
+    if col.physical_type() != physical || col.max_def_level() != 0 {
+        report.fail(
+            column_key,
+            format!(
+                "{name:?} must be {physical:?} NOT NULL (physical={:?}, max_def_level={})",
+                col.physical_type(),
+                col.max_def_level()
+            ),
+        );
+        return;
+    }
+    report.pass(column_key, format!("{name:?} is {physical:?} NOT NULL"));
 
-    // Values: min >= 1 everywhere; canonical band exactly 1 (via RG stats).
-    let canonical = meta.canonical_level;
-    let mut problems: Vec<String> = Vec::new();
+    let stat_kind = if physical == PhysicalType::INT32 {
+        "Int32"
+    } else {
+        "Int64"
+    };
+    let mut problems = Vec::new();
     for rg in 0..metadata.num_row_groups() {
-        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == canonical;
-        let chunk = metadata.row_group(rg).column(col_idx);
-        match chunk.statistics() {
-            Some(Statistics::Int32(s)) => match (s.min_opt(), s.max_opt()) {
-                (Some(&min), Some(&max)) => {
-                    if min < 1 {
-                        problems.push(format!("RG {rg}: coalesced_count min={min} < 1"));
-                    }
-                    if is_canonical && (min != 1 || max != 1) {
-                        problems.push(format!(
-                            "RG {rg} (canonical): coalesced_count min={min} max={max}, expected 1"
-                        ));
-                    }
-                }
-                _ => problems.push(format!("RG {rg}: coalesced_count has no min/max stats")),
-            },
-            Some(other) => problems.push(format!(
-                "RG {rg}: coalesced_count stats not Int32 ({other:?})"
+        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == meta.canonical_level;
+        let stats = metadata.row_group(rg).column(col_idx).statistics();
+        let bounds = match stats {
+            Some(Statistics::Int32(s)) if physical == PhysicalType::INT32 => Some((
+                s.min_opt().copied().map(i64::from),
+                s.max_opt().copied().map(i64::from),
             )),
-            None => problems.push(format!("RG {rg}: coalesced_count column has no statistics")),
+            Some(Statistics::Int64(s)) if physical == PhysicalType::INT64 => {
+                Some((s.min_opt().copied(), s.max_opt().copied()))
+            }
+            Some(other) => {
+                problems.push(format!(
+                    "RG {rg}: {label} stats not {stat_kind} ({other:?})"
+                ));
+                None
+            }
+            None => {
+                problems.push(format!("RG {rg}: {label} column has no statistics"));
+                None
+            }
+        };
+        match bounds {
+            Some((Some(min), Some(max))) => {
+                if min < 1 {
+                    problems.push(format!("RG {rg}: {label} min={min} < 1"));
+                }
+                if is_canonical && (min != 1 || max != 1) {
+                    problems.push(format!(
+                        "RG {rg} (canonical): {label} min={min} max={max}, expected 1"
+                    ));
+                }
+            }
+            Some(_) => problems.push(format!("RG {rg}: {label} has no min/max stats")),
+            None => {}
         }
     }
     if problems.is_empty() {
         report.pass(
-            "coalesce_count_values",
-            "coalesced_count >= 1 everywhere; canonical level all 1",
+            values_key,
+            format!("{label} >= 1 everywhere; canonical level all 1"),
         );
     } else {
-        report.fail("coalesce_count_values", problems.join("; "));
+        report.fail(values_key, problems.join("; "));
     }
 }
 
@@ -728,7 +674,6 @@ pub(crate) fn check_cluster_sum_invariant(
 /// Per level: `(point-row count, Σ point_count over point rows)`, read from
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
-#[allow(clippy::type_complexity)]
 fn cluster_sum_by_level(
     path: &Path,
     meta: &OverviewsMeta,
