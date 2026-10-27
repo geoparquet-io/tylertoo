@@ -90,8 +90,9 @@ confidence-threshold = 0.8
 multiple-versions = "deny"
 wildcards = "deny"
 deny = [
-    { crate = "parquet", wrappers = ["tylertoo-io"] },
-    { crate = "arrow-ipc", wrappers = ["tylertoo-io"] },
+    # Upstream direct parents must also be named; workspace callers use io.
+    { crate = "parquet", wrappers = ["tylertoo-io", "geoparquet"] },
+    { crate = "arrow-ipc", wrappers = ["tylertoo-io", "parquet"] },
 ]
 skip = [
     # hyper-util 0.1 is still on base64 0.22; arrow/parquet/object_store use 0.23.

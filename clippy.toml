@@ -39,56 +39,10 @@ doc-valid-idents = [
     "TileJSON",
 ]
 
-# Structural gates (#779): one owner per concept. Each method below has (or
-# is getting) a single owner in crates/core; calling it anywhere else is the
-# "fix lands at 1 of N sites" pattern behind #577 -> #606/#607 (the 2 GiB
-# batch-size fix reached 2 of 4 reader paths) and #427 (in-place writes).
-# Clippy emits the owner-specific reason at each disallowed call site.
-# Trusted fixture readers in tests and benches have local lint exemptions.
+# Structural gates (#779): shared batch assembly and atomic output owners.
+# Parquet/IPC readers and writers belong to tylertoo-io; deny.toml rejects
+# dependencies that would let core bypass that crate boundary.
 disallowed-methods = [
-    # Parquet reader construction. Owner: crates/core/src/untrusted.rs
-    # `open_parquet` (#779 F5), which applies the batch-size cap that keeps
-    # byte-array offsets under i32 (#577, #606, #607), the footer pre-check
-    # (#690), and catch_unwind -> InputError (#683, #684, #687).
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new_with_options", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new_with_metadata", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)" },
-    # The async builder (`ParquetRecordBatchStreamBuilder::new`, an alias of
-    # ArrowReaderBuilder). parquet's `async` feature is off today, so the path
-    # does not resolve; `allow-invalid` keeps the entry armed for the day it
-    # is turned on instead of warning now.
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)", allow-invalid = true },
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::new_with_options", reason = "open parquet through the untrusted::open_parquet owner (#779 F5; #606/#607)", allow-invalid = true },
-    # The batch size is the i32-offset-overflow knob (#577 -> #606/#607); only
-    # the owner may set it.
-    { path = "parquet::arrow::arrow_reader::ArrowReaderBuilder::with_batch_size", reason = "the batch-size cap lives in untrusted::open_parquet (#779 F5; #577, #606, #607)" },
-    # The batch reader built without its builder: sets a batch size directly,
-    # bypassing the owner's cap.
-    { path = "parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new", reason = "the batch-size cap lives in untrusted::open_parquet (#779 F5; #577, #606, #607)" },
-    { path = "parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new_with_row_groups", reason = "the batch-size cap lives in untrusted::open_parquet (#779 F5; #577, #606, #607)" },
-    # Footer-only readers: the footer pre-check (#690), chunk-range check
-    # (#430) and panic boundary (#683) live in untrusted::read_parquet_metadata
-    # and untrusted::reader_metadata.
-    { path = "parquet::file::metadata::ParquetMetaDataReader::new", reason = "read a footer through untrusted::read_parquet_metadata (#779 F5; #690)" },
-    { path = "parquet::file::metadata::ParquetMetaDataReader::new_with_metadata", reason = "read a footer through untrusted::read_parquet_metadata (#779 F5; #690)" },
-    { path = "parquet::file::metadata::ParquetMetaDataReader::decode_metadata", reason = "decode a footer through untrusted::decode_footer (#779 F5; #690)" },
-    { path = "parquet::file::metadata::ParquetMetaDataReader::decode_metadata_with_options", reason = "decode a footer through untrusted::decode_footer (#779 F5; #690)" },
-    { path = "parquet::file::metadata::ParquetMetaDataReader::parse_and_finish", reason = "read a footer through untrusted::read_parquet_metadata (#779 F5; #690)" },
-    { path = "parquet::file::serialized_reader::SerializedFileReader::new", reason = "read a footer through untrusted::read_parquet_metadata (#779 F5; #690)" },
-    { path = "parquet::file::serialized_reader::SerializedFileReader::new_with_options", reason = "read a footer through untrusted::read_parquet_metadata (#779 F5; #690)" },
-    { path = "parquet::arrow::arrow_reader::ArrowReaderMetadata::load", reason = "load reader metadata through untrusted::load_reader_metadata (#779 F5; #683, #690)" },
-    { path = "parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new", reason = "derive the Arrow schema through untrusted::reader_metadata (#779 F5; #683)" },
-    # Arrow IPC (plan files, spill files read back). Owner:
-    # untrusted::open_ipc (#779 F5): catch_unwind around arrow-ipc's panics
-    # on crafted schemas and offsets (#683, #684), and the block-range check.
-    { path = "arrow_ipc::reader::FileReader::try_new", reason = "open IPC files through the untrusted::open_ipc owner (#779 F5; #683/#684)" },
-    { path = "arrow_ipc::reader::FileReader::try_new_buffered", reason = "open IPC files through the untrusted::open_ipc owner (#779 F5; #683/#684)" },
-    { path = "arrow_ipc::reader::FileReaderBuilder::build", reason = "open IPC files through the untrusted::open_ipc owner (#779 F5; #683/#684)" },
-    { path = "arrow_ipc::reader::FileDecoder::new", reason = "open IPC files through the untrusted::open_ipc owner (#779 F5; #683/#684)" },
-    { path = "arrow_ipc::reader::StreamReader::try_new", reason = "an IPC stream from outside the run goes through the untrusted owner (#779 F5; #684); a run's own spill needs an allow saying so" },
-    { path = "arrow_ipc::reader::StreamReader::try_new_buffered", reason = "an IPC stream from outside the run goes through the untrusted owner (#779 F5; #684); a run's own spill needs an allow saying so" },
-    { path = "arrow_ipc::reader::StreamReader::try_new_unbuffered", reason = "an IPC stream from outside the run goes through the untrusted owner (#779 F5; #684); a run's own spill needs an allow saying so" },
-    { path = "arrow_ipc::reader::StreamDecoder::new", reason = "an IPC stream from outside the run goes through the untrusted owner (#779 F5; #684); a run's own spill needs an allow saying so" },
     # Concatenating record batches doubles peak memory and can overflow i32
     # offsets in one array (#563/#606 class); each use needs a reason.
     { path = "arrow_select::concat::concat_batches", reason = "concat_batches copies whole batches and can overflow i32 offsets (#563/#606); stream or regroup instead" },

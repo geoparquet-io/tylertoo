@@ -38,7 +38,6 @@
 //!
 //! The workspace dependency policy keeps these builders out of core.
 //! This private module is the reader construction owner.
-#![allow(clippy::disallowed_methods)] // #779: the owner of the raw builders
 
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Seek, SeekFrom};

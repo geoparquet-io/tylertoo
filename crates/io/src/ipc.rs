@@ -1,8 +1,4 @@
 //! IPC files for saved plans and streams for run-local spills.
-#![expect(
-    clippy::disallowed_methods,
-    reason = "#779: IPC stream construction owner"
-)]
 
 use std::io::{Read, Write};
 
