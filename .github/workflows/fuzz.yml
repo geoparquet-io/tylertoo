@@ -43,13 +43,8 @@ env:
   # Targets held out of the matrix below until the upstream panics they
   # find are fixed, so they don't keep the run red (a crashing target finds
   # nothing else). Their seeds still replay on every PR
-  # (crates/core/tests/fuzz_seeds.rs). Machine-read, as JSON, by
-  # scripts/ci/staleness.py (gate-canary.yml, nightly), which fails when an
-  # issue a hold-out links is closed (drop it from the entry; with none left,
-  # re-enable the target: add it to the matrix, or as
-  # `include: [{target: remote_footer, features: remote}]` when it names a
-  # fuzz-crate feature), and when a target in
-  # fuzz/fuzz_targets/ is in neither the matrix nor this list (#779).
+  # (crates/core/tests/fuzz_seeds.rs). FUZZ_HOLDOUTS records their issue
+  # references; it is empty while every target is enabled.
   #
   # Empty since #779 F5 (#784): untrusted.rs refuses #690's footer and the
   # IPC block lengths before parquet-rs/arrow-ipc see them, and its panic
@@ -89,7 +84,7 @@ jobs:
           - plan_file
           - parquet_footer
           # Targets held out of this list live in FUZZ_HOLDOUTS above, not
-          # here: gate-canary.yml's staleness job reads that list.
+          # here.
         # No fuzz-crate feature by default; an `include:` entry for a target
         # that needs one (remote_footer: remote) sets it. Declared so
         # `matrix.features` below is a known key (actionlint).
@@ -249,8 +244,7 @@ jobs:
           _This issue is managed by .github/workflows/fuzz.yml. It is updated
           (not duplicated) on every failing nightly run. Close it only after
           a full green nightly run of every target in the matrix, never after
-          a run of one target. gate-canary.yml fails while it stays open past
-          7 days._"
+          a run of one target._"
 
           # Match on the title this job opens with, not the label alone:
           # people file fuzz-found bugs and fuzz work under the `fuzz` label

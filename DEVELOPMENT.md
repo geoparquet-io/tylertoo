@@ -414,8 +414,7 @@ the script's inline metadata.
 
 Branch protection requires every gate below on every PR, and each one
 runs locally. [`ci/README.md`](ci/README.md) lists every gate in one
-table: what each asserts, whether it is required, the canary that
-proves it can still fail, and the command that reproduces it.
+table: what each asserts, its scope, and the command that reproduces it.
 
 ### Rust
 
@@ -436,12 +435,11 @@ cargo fmt --all --check
 cargo install cargo-shear   # once
 cargo shear
 
-# Duplicated code, structural ratchets, mirrored
-# hunks: see "Structural gates" below
+# Rust function similarity and Rust/Python token clones
 cargo install similarity-rs --version 0.5.0 --locked
-uv run --no-project --python 3.12 python \
-  scripts/ci/similarity_ratchet.py
-cargo test -p tylertoo-core --test architecture
+similarity-rs --threshold 0.95 --min-lines 10 --skip-test \
+  --fail-on-duplicates crates/core/src crates/cli/src crates/python/src
+npx --yes jscpd@4.0.5 --config .jscpd.json
 
 # Public API surface against the baseline in
 # crates/core/api/tylertoo-core.txt. The Public API
@@ -481,43 +479,22 @@ python3 benchmarks/overview/ci_guard.py --check
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
-# Coverage: CI fails below a floor in the Coverage job's
-# "Coverage floor" step, then uploads to Codecov (report only)
+# Coverage: Codecov native project targets in codecov.yml
 cargo install cargo-llvm-cov    # once
 rustup component add llvm-tools-preview
 cargo llvm-cov nextest --all-features --workspace \
   --exclude tylertoo-python \
   --lcov --output-path lcov.info
-python3 scripts/coverage_gate.py --check lcov.info --min 94 \
-  --floor 'crates/core/**=94' --floor 'crates/cli/**=81.9'
-
-# Baseline and band ratchet (CI: the Gate scripts job)
-python3 scripts/ci/baseline_ratchet.py --base origin/main --head HEAD
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
 `tylertoo-core` API freeze. The Public API check still surfaces each API
 change in review.
 
-Some thresholds are **ratchets**, set at the current code's level and
-marked `RATCHET` in the source. They are cognitive complexity 30 and
-too-many-lines 200 in `clippy.toml`, the counts in `ci/ratchets.toml`,
-and xenon's max-absolute C. Lower them as the code improves, and never
-raise them. The line-coverage floors in `ci.yml` (94% for the workspace
-and for `crates/core`, 81.9% for `crates/cli`) are ratchets in the other
-direction: raise them as coverage grows, and never lower them.
-
-The tippecanoe bands, `benchmarks/overview/ci_baseline.json`, the
-golden tile digests and the golden archives are baselines. A PR that
-loosens a band, or changes any of the others, needs a commit trailer
-that names the issue and the measurement behind the change:
-
-```text
-Baseline-change: #761 z3 features 0.910 on CI run 1234
-```
-
-Without the trailer, the Gate scripts job fails the PR. Narrowing a
-band needs no trailer.
+Clippy thresholds live in `clippy.toml`; token-clone limits live in
+`.jscpd.json`. Codecov project targets are 94% for the workspace and core,
+and 81.9% for the CLI. Python vulture scans package code and tests at 60%
+confidence; its configuration is in `crates/python/pyproject.toml`.
 
 `cargo shear` also inspects `[workspace.dependencies]`. To keep a
 dependency that no code references, such as a transitive version pin,
@@ -541,75 +518,20 @@ and then fails, so a regeneration never passes for a green run. A golden
 diff on a **dependency bump** is not a cue to regenerate. See
 [Dependency updates](#dependency-updates).
 
-### Structural gates
+### Structure and duplication
 
-These gates fail when code bypasses the one owner of a concept, or copies
-code instead of sharing it (#779). The pattern they stop: a fix lands at
-one site of a concept that lives at several, and the next issue hits a
-sibling. The Check job runs all of them.
+Clippy uses `clippy.toml` to reject calls that bypass the reader and
+output owners. Cargo-deny checks licenses, advisories, sources and duplicate
+dependency versions against `deny.toml`.
 
-| Gate | What it protects | Regression it catches |
-|---|---|---|
-| `disallowed-methods` in `clippy.toml` | Parquet and IPC reads go through `untrusted::{open_parquet, open_ipc}`; output files go through `atomic_output` | #577, then #606 and #607: the 2 GiB batch-size fix reached 2 of 4 reader paths |
-| `multiple-versions = "deny"` in `deny.toml` | One version of each crate, apart from the pinned `skip` list | #649: a Dependabot bump undid the `brotli` and `zstd` deduplication of #435 |
-| `crates/core/tests/architecture.rs` | The counts in `ci/ratchets.toml`: parquet opens, `"geometry"` literals, CLI `bail!`, long parameter lists, warn-once statics, unlinked `#[ignore]`, `pytest` skips | Validation in the CLI and not in core (#458, #709); four geometry-column resolvers (#675) |
-| `scripts/ci/similarity_ratchet.py` | Near-duplicate functions, pinned in `ci/similarity_baseline.txt` | The twin engines `overview/convert.rs` and `overview/stream.rs` |
-| `scripts/ci/mirrored_hunks.py` | A PR adds the same block of 5 or more lines in two places | 8576c61, the #507 block pasted into both engines |
+Jscpd scans Rust and Python for token clones, including copies across files.
+Similarity-rs scans every production Rust source directory and fails on
+functions above its configured similarity threshold. Version 0.5.0 compares
+functions within files; jscpd supplies cross-file token-clone detection.
 
-A disallowed method outside its owner needs an allow that names an issue,
-on the same line:
-
-```rust
-#[allow(clippy::disallowed_methods)] // #NNN why this site cannot use the owner
-```
-
-The architecture test pins the number of these allows, so a new one fails
-CI until its count is pinned too. Test code is exempt: `#[cfg(test)]`
-code in core has a crate-level allow for the test build, and each
-integration test or bench that reads its own fixtures has a file-level one.
-
-Production code never allows a whole lint group. `allow(clippy::all)`,
-`allow(clippy::style)` and `allow(warnings)`, in either the `#[..]` or the
-`#![..]` form, also silence `disallowed_methods`, so they would bypass
-every ban above without an allow the test counts. The architecture test
-fails on any of them, and on `clippy::restriction`. Allow the one lint you
-mean instead.
-
-**Lowering a pin.** Every count in `ci/ratchets.toml` is checked in both
-directions. A count above its pin fails: route the new code through the
-owner instead. A count below its pin also fails, with the new count in the
-message. Set `pin` to that count in the same PR. For the similarity
-ratchet, delete the pairs that the failure lists from
-`ci/similarity_baseline.txt`, then set the pin to the new number of lines.
-`--update` regenerates the whole file, but use it only to drop pairs,
-never to admit new ones. For `deny.toml`, delete the skip entry that
-`cargo deny` reports as unused, then lower `cargo_deny_skips`. Never raise
-a pin to make CI pass.
-
-**A copy on purpose.** When a PR must add the same block in two places,
-for example to keep both engines in step until they share a stage, add a
-commit trailer with an issue number and a reason:
-
-```text
-Mirrored-ok: #NNN both engines need the guard until they share a stage
-```
-
-Run the gates locally:
-
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
-cargo deny check bans
-cargo test -p tylertoo-core --test architecture -- --nocapture
-uv run --no-project --python 3.12 python \
-  scripts/ci/similarity_ratchet.py
-uv run --no-project --python 3.12 python \
-  scripts/ci/mirrored_hunks.py --base origin/main
-uv run --no-project --python 3.12 --with pytest==8.4.2 \
-  pytest scripts/ci/tests -q
-```
-
-`ci/canaries/g1-*.patch` holds one injected regression per gate. Each patch
-must turn its gate red; `ci/canaries/README.md` explains the format.
+The blocking mutation check runs cargo-mutants directly with `--in-diff`
+for core and CLI. A missed mutant or a failed baseline fails the check.
+Run it locally with `scripts/mutants-diff.sh origin/main`.
 
 ### Python (`crates/python`)
 
@@ -728,9 +650,8 @@ uv run benchmarks/e2e/compare_tippecanoe.py \
   --json /tmp/cmp/parity.json
 ```
 
-The bands are a ratchet, like the convert guard baseline. When a change
-moves a ratio on purpose, edit the band in the same PR and record the new
-measured value in its comment.
+The comparison reads its per-zoom ratio bands from
+`benchmarks/e2e/tippecanoe_tolerances.toml`.
 
 The Test and Coverage jobs build the same pinned tippecanoe, so that
 `decode_golden_against_tippecanoe_decode` in `decode_roundtrip.rs` runs.
@@ -991,8 +912,7 @@ third-party bytes:
 A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
 and opens or updates a pinned `fuzz` issue. Targets held out of the
 nightly are listed, with their issues, in `FUZZ_HOLDOUTS` in
-`fuzz.yml`. The nightly `gate-canary.yml` fails when one of those issues
-closes, so a held-out target goes back in once its reason is gone.
+`fuzz.yml`.
 `fuzz/README.md` lists the
 targets and shows how to run one and how to turn a crash into a
 regression test. The fuzz crate is its own workspace and stays out of

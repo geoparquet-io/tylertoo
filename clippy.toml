@@ -43,13 +43,8 @@ doc-valid-idents = [
 # is getting) a single owner in crates/core; calling it anywhere else is the
 # "fix lands at 1 of N sites" pattern behind #577 -> #606/#607 (the 2 GiB
 # batch-size fix reached 2 of 4 reader paths) and #427 (in-place writes).
-# A call site outside the owner needs
-#   #[allow(clippy::disallowed_methods)] // #NNN <why>
-# on the enclosing item or statement. Production allows are counted and
-# pinned in ci/ratchets.toml (`disallowed_method_allows`) by
-# crates/core/tests/architecture.rs, so the count only goes down. Test code
-# (#[cfg(test)] modules, tests/, benches/) reads trusted fixtures and may
-# allow these at module level; it is not counted.
+# Clippy emits the owner-specific reason at each disallowed call site.
+# Trusted fixture readers in tests and benches have local lint exemptions.
 disallowed-methods = [
     # Parquet reader construction. Owner: crates/core/src/untrusted.rs
     # `open_parquet` (#779 F5), which applies the batch-size cap that keeps

@@ -1,0 +1,14 @@
+# Architecture and quality policy, reviewed by the maintainer.
+/clippy.toml @nlebovits
+/deny.toml @nlebovits
+/.jscpd.json @nlebovits
+/crates/python/pyproject.toml @nlebovits
+/.github/ @nlebovits
+/crates/*/api/ @nlebovits
+/benchmarks/e2e/invariant_exemptions.toml @nlebovits
+/crates/cli/tests/parity_exemptions.toml @nlebovits
+/crates/python/tests/parity_exemptions.toml @nlebovits
+/codecov.yml @nlebovits
+/.config/nextest.toml @nlebovits
+/ci/ @nlebovits
+/.github/CODEOWNERS @nlebovits

@@ -11,8 +11,7 @@
 #                   baseline, and a build on the declared MSRV
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
 #                   Cargo.toml [workspace.lints]), cargo-shear, unit tests,
-#                   and the structural gates (#779): similarity and
-#                   architecture ratchets (ci/ratchets.toml), mirrored hunks
+#                   jscpd and similarity-rs duplicate detection
 #   Test            the `quick` nextest tier (ubuntu/macos stable; beta on
 #                   main) — see .config/nextest.toml (#457); installs the
 #                   pinned tippecanoe so the tippecanoe-decode golden test
@@ -29,14 +28,10 @@
 #                   matches regeneration from source; rustdoc -D warnings;
 #                   tests/docs runs both tutorials, the README quickstart,
 #                   the --help flag check, and the strict site build
-#   Coverage        cargo-llvm-cov -> lcov; scripts/coverage_gate.py fails
-#                   below the line-coverage floors (workspace, core, cli);
-#                   codecov gets the report (informational)
-#   Gate scripts    pytest for scripts/ci/ (the gate helpers), and on PRs
-#                   the baseline and band ratchet (scripts/ci/
-#                   baseline_ratchet.py): loosening a tippecanoe band or
-#                   re-cutting a committed baseline needs a
-#                   `Baseline-change: #NNN <measured>` commit trailer (#779)
+#   Coverage        cargo-llvm-cov -> lcov; Codecov native project targets
+#                   cover workspace, core and CLI
+#   Gate scripts    pytest for the independent archive verifier
+#   Mutation gate   cargo-mutants --in-diff for core and CLI on PRs
 #   CI passed       fails if any job above failed or was cancelled; the only
 #                   CI context branch protection requires
 #
@@ -49,7 +44,8 @@
 #                   touches only docs and the Python side
 #                   (scripts/ci/python_only.sh: crates/python outside its
 #                   Rust, examples/) also runs the Python jobs, and skips
-#                   Check, Test, Slow Tests, Coverage and Lint's Rust steps.
+#                   Test, Slow Tests, Coverage and Lint's build steps. Check and
+#                   cargo-deny still run, alongside Python Quality.
 #   push to main    everything: adds the beta Test lanes and the macOS Slow
 #                   Tests, so a macOS-only or beta break shows up on the
 #                   merge that caused it. This is also the backstop for two
@@ -169,16 +165,13 @@ jobs:
   check:
     name: Check
     needs: plan
-    if: needs.plan.outputs.rust == 'true'
+    if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Full history: the mirrored-hunks step diffs the PR's base...head
-          # and reads its commit messages for the Mirrored-ok trailer.
-          fetch-depth: 0
 
       # Only the release's Parquet fixtures are cached, keyed on their
       # pointer files (the checkout fetches no large files): adding or
@@ -216,17 +209,15 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      # Pinned: the similarity baseline (ci/similarity_baseline.txt) is
-      # only comparable across runs of one similarity-rs version.
       - name: Install similarity-rs
-        run: cargo install similarity-rs --version 0.5.0 --locked
-
-      # The structural-gate scripts in scripts/ci are stdlib-only Python;
-      # uv supplies the interpreter (and pytest for their own tests).
-      - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          enable-cache: false
+          tool: similarity-rs@0.5.0
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
 
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -256,23 +247,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Structural gates (#779), cheapest first: none of these compile.
-      # See "Structural gates" in DEVELOPMENT.md.
-      - name: Test the structural-gate scripts
-        run: uv run --no-project --python 3.12 --with pytest==8.4.2 pytest scripts/ci/tests -q
-
-      - name: Check for a block added in two places (mirrored hunks)
-        # The #507/8576c61 pattern: one fix pasted into both engines (or
-        # the CLI and Python) instead of into the owner both call. Exempt a
-        # deliberate copy with a commit trailer 'Mirrored-ok: #NNN <why>'.
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          uv run --no-project --python 3.12 python scripts/ci/mirrored_hunks.py \
-            --base "$BASE_SHA" --head "$HEAD_SHA"
-
       - name: Run clippy
         # -D warnings also denies the curated [workspace.lints.clippy] set
         # (pedantic subset + cognitive_complexity) defined in Cargo.toml.
@@ -298,23 +272,14 @@ jobs:
         # [package.metadata.cargo-shear] in the owning crate.
         run: cargo shear
 
-      - name: Check for duplicated code (similarity ratchet)
-        # similarity-rs at the thresholds in ci/ratchets.toml (0.85 within
-        # a file; 0.80 between overview/convert.rs and overview/stream.rs,
-        # concatenated because similarity-rs never compares across files).
-        # Findings are pinned in ci/similarity_baseline.txt: a new pair
-        # fails, and a pinned pair that is gone fails until its line is
-        # deleted and the pin lowered. RATCHET: the list only shrinks.
-        run: uv run --no-project --python 3.12 python scripts/ci/similarity_ratchet.py
+      - name: Check for duplicated Rust and Python (jscpd)
+        run: npx --yes jscpd@4.0.5 --config .jscpd.json
+
+      - name: Check for duplicated Rust functions (similarity-rs)
+        run: similarity-rs --threshold 0.95 --min-lines 10 --skip-test --fail-on-duplicates crates/core/src crates/cli/src crates/python/src
 
       - name: Run unit tests
         run: cargo test --locked --lib --all-features
-
-      - name: Check structural ratchets (architecture test)
-        # Counts of code that bypasses a concept's owner (parquet opens,
-        # CLI bail!, "geometry" literals, ...), pinned in ci/ratchets.toml.
-        # Above a pin fails; below fails until the pin is lowered (#779).
-        run: cargo test --locked --all-features -p tylertoo-core --test architecture
 
       # Main only; see CACHES in the header.
       - name: Save cargo build cache
@@ -698,7 +663,7 @@ jobs:
 
       - name: xenon (complexity gate)
         # Max absolute grade C: two golden-report tests rank C today.
-        # RATCHET: tighten to B once they are split up — never loosen.
+        # Current complexity limit for Python functions.
         run: uv run xenon --max-absolute C --max-modules A --max-average A tests
 
       - name: pip-audit (uv lockfile)
@@ -1024,31 +989,13 @@ jobs:
           --exclude tylertoo-python
           --lcov --output-path lcov.info
 
-      # The coverage gate (#678). It reads the lcov total here rather than
-      # waiting on Codecov: the codecov/project status never posted on this
-      # repo, so the 80% target in codecov.yml gated nothing. Same file set
-      # as Codecov (the script's defaults mirror codecov.yml's `ignore:`).
-      # Main was at 95.6% (Codecov, 2026-10-15) when the floor went in.
-      # crates/cli joined in #779 with its own floor, the measured 82.96%
-      # (2026-10-27, this command on a49932b) minus 1; core keeps the 94%
-      # it had alone, so the CLI's lower figure cannot pull it down.
-      # RATCHET: raise the floors as coverage grows — never lower them.
-      - name: Coverage floor
-        run: >-
-          python3 scripts/coverage_gate.py --check lcov.info --min 94
-          --floor 'crates/core/**=94'
-          --floor 'crates/cli/**=81.9'
-
-      # Report only: the per-file view and the PR comment. The gate is the
-      # step above, so a Codecov outage or a missing token (fork PRs) must
-      # not fail the job.
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          fail_ci_if_error: true
 
       # Main only; see CACHES in the header.
       - name: Save cargo build cache
@@ -1328,10 +1275,7 @@ jobs:
             exit 1
           fi
 
-  # Gate scripts: the tests for scripts/ci/ (the canary runner, the
-  # staleness check, the mutation gate, the ratchet), then the ratchet
-  # itself on PRs. Cheap and Rust-free, so it runs on every PR, docs-only
-  # included: a docs-only PR can still re-cut a baseline.
+  # Independent archive-verifier regression tests; one scripts/ci pytest step.
   gate-scripts:
     name: Gate scripts
     runs-on: ubuntu-latest
@@ -1340,22 +1284,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The ratchet reads every commit of the PR for its trailer, and
-          # its tests replay a real widening from history (09673f5).
-          fetch-depth: 0
-
       - name: Install uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: Test the archive verifier
+        run: >-
+          uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1
+          --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0
+          pytest -q scripts/ci/tests
 
-      - name: Test the gate scripts
-        run: uv run --no-project --with pytest==8.3.4 --with pyyaml==6.0.2 pytest -q scripts/ci/tests
-
-      # Baseline and band ratchet (#779). On a PR the checkout is the merge
-      # commit: HEAD^1 is the base tip, HEAD^2 the PR head, so the range is
-      # exactly the PR's commits. A merged PR was already checked here.
-      - name: Baseline ratchet
-        if: github.event_name == 'pull_request'
-        run: python3 scripts/ci/baseline_ratchet.py --base HEAD^1 --head HEAD^2
+  mutation-diff:
+    name: Mutation gate
+    needs: plan
+    if: github.event_name == 'pull_request' && needs.plan.outputs.code == 'true'
+    uses: ./.github/workflows/mutation-diff.yml
 
   # The one CI context branch protection requires. Every job above is
   # blocking through it: it fails when any of them failed or was cancelled.
@@ -1376,6 +1317,7 @@ jobs:
       - docs
       - coverage
       - gate-scripts
+      - mutation-diff
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

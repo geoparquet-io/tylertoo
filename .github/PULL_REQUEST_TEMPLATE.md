@@ -4,16 +4,11 @@
 
 Closes #
 
-## Concept owner / sites (required)
+## Concept owner / sites
 
 <!--
-Which concept does this PR touch (an option, a counter, a reader, a
-resolver, an error, a pipeline stage)? Name its one owner in crates/core,
-and list every site that now goes through that owner. Find the sites with
-`git grep` across core (both engines), the CLI, Python and pyramid.
-If the concept lived in more than one place, this PR consolidates it; it
-never patches one site. See CLAUDE.md, "Fix at the Owner".
-"None" is a valid answer only for docs, CI or test-only changes.
+For changes to shared concepts, describe the owner in core and the callers
+that consume it. Duplication and lint checks are listed in ci/README.md.
 -->
 
 - Concept:
@@ -32,12 +27,7 @@ Local CI gates (see [ci/README.md](https://github.com/geoparquet-io/tylertoo/blo
       `cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md`
 - [ ] Version files untouched (or bumped only via `uv run cz bump` from the
       repo root, per CONTRIBUTING.md), if applicable
-- [ ] **Baseline-change:** if this PR loosens a band in
-      `benchmarks/e2e/tippecanoe_tolerances.toml`, or changes
-      `benchmarks/overview/ci_baseline.json`,
-      `tests/fixtures/guard/*.golden.txt` or `tests/fixtures/golden/*`, a
-      commit carries `Baseline-change: #NNN <measured evidence>`. Otherwise
-      the Gate scripts job fails.
-- [ ] **fix PRs:** every mutant on a changed line is caught, or annotated
-      `// mutants: equivalent #NNN` (`scripts/mutants-diff.sh`; the
-      Mutation gate blocks a `fix` PR on a missed one)
+- [ ] Rust/Python duplication checks pass (`npx --yes jscpd@4.0.5` and
+      similarity-rs; see DEVELOPMENT.md)
+- [ ] Diff-scoped cargo-mutants passes for core and CLI
+      (`scripts/mutants-diff.sh origin/main`)

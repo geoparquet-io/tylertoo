@@ -86,10 +86,7 @@ confidence-threshold = 0.8
 # `skip` lists today's real duplicates, each pinned to the exact version that
 # is NOT the one most of the graph uses, so a third version still fails.
 # Each entry names who pulls it and links an open issue (#779 when there is
-# no better one). The entry count is pinned in ci/ratchets.toml
-# (`cargo_deny_skips`) and checked by crates/core/tests/architecture.rs: it
-# can only go down. When a bump removes a duplicate, `cargo deny check bans`
-# warns that the skip matches nothing; delete the entry and lower the pin.
+# no better one).
 multiple-versions = "deny"
 wildcards = "deny"
 deny = []
