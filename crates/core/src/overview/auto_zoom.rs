@@ -62,14 +62,10 @@ use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArrayAccessor;
 
 use crate::batch_processor::{visit_geoarrow_array, GeoArrowVisitor};
-use crate::covering::find_f64_covering;
 use crate::input_set::{ConvertSource, ReadPlan};
 use crate::tile::MAX_LATITUDE;
 
-use super::convert::{
-    detect_crs_from_kv, find_geometry_column, validate_options, BboxQuery, ConvertError,
-    ConvertOptions, LevelPlan,
-};
+use super::convert::{validate_options, BboxQuery, ConvertError, ConvertOptions, LevelPlan};
 use super::filter::{parse_filter, BoundFilter};
 use super::level::{Crs, WEBMERC_CIRCUMFERENCE_M};
 
@@ -630,13 +626,14 @@ pub(crate) fn estimate_with(
 ) -> Result<AutoZoomEvidence, ConvertError> {
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
-    let crs = detect_crs_from_kv(
-        source.key_value_metadata()?.as_ref(),
-        &source.display_name(),
-    )?;
-    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
-        input: source.display_name(),
-    })?;
+    let descriptor = source.resolved_schema()?;
+    let (crs, _) = super::convert::crs_from_resolved(descriptor, &source.display_name())?;
+    let geom_idx = descriptor
+        .geometry_name()
+        .and_then(|n| schema.index_of(n).ok())
+        .ok_or_else(|| ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        })?;
     let geom_field = schema.field(geom_idx).clone();
     // Bound against the file's own column names: a filter naming a column
     // the conversion renames (#288) addresses it by that same input name.
@@ -668,7 +665,7 @@ pub(crate) fn estimate_with(
     // Sample bboxes from the f64 covering struct when the file declares one
     // (#693) — the geometry column is then never projected at all — else from
     // the geometry scalars.
-    let declared = find_f64_covering(&schema, geom_idx);
+    let declared = descriptor.f64_covering();
 
     // One sampling pass over `source`, reading each row's bbox either from
     // the declared covering struct or from the geometry scalars.

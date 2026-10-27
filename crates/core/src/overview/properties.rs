@@ -190,34 +190,10 @@ impl PropertySelection {
 /// The covering the schema's `geo` metadata declares for the geometry
 /// column counts under any name, as it does on export: parquet carries the
 /// file's key-value metadata into the Arrow schema.
-pub(crate) fn property_indices(schema: &Schema, geom_idx: usize) -> Vec<usize> {
-    let geom = schema.field(geom_idx).name().as_str();
-    let declared = declared_covering(schema, geom);
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|&(i, f)| {
-            i != geom_idx && !super::writer::is_covering_column(f, Some(geom), declared.as_deref())
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// The top-level struct name of the covering that `schema`'s `geo`
-/// metadata declares for `geom` (the spec paths are `["bbox","xmin"]` and so
-/// on). `None` when there is no `geo` key, it does not parse, or it
-/// declares no covering for `geom`.
-fn declared_covering(schema: &Schema, geom: &str) -> Option<String> {
-    let json = schema
-        .metadata()
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
-        .map(|(_, v)| v)?;
-    crate::covering::parse_covering_metadata(json, Some(geom))
-        .ok()
-        .flatten()
-        .and_then(|spec| spec.xmin_path.first().cloned())
+pub(crate) fn property_indices(schema: &Schema, _geom_idx: usize) -> Vec<usize> {
+    crate::resolved_schema::ResolvedSchema::resolve(schema)
+        .map(|s| s.properties().to_vec())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

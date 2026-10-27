@@ -106,8 +106,7 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Schema};
 use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
@@ -128,9 +127,7 @@ use crate::vector_tile::tile::GeomType;
 use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
-use super::convert::{
-    find_geometry_column, human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV,
-};
+use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
@@ -1866,7 +1863,7 @@ fn export_pmtiles_run(
 
     let reader = OverviewReader::open(input_path)?;
     let meta = reader.meta().clone();
-    let crs = detect_crs(input_path)?;
+    let crs = crs_from_descriptor(reader.resolved_schema(), input_path)?;
 
     let num_levels = reader.num_levels();
     // #371: every level's zoom is resolved (and ceiling-checked) before any
@@ -1988,7 +1985,7 @@ fn export_pmtiles_run(
     warn_if_order_column_is_absent(reader.schema(), &published, &options.feature_order);
     writer.set_fields(field_metadata(
         reader.schema(),
-        geometry_index(reader.schema()),
+        reader.resolved_schema().geometry_index(),
         &published,
     ));
 
@@ -2244,7 +2241,9 @@ fn export_member_bytes(
     published: &PublishedNames,
     mean_stored_bytes: Option<u64>,
 ) -> Option<u64> {
-    let properties = geometry_index(reader.schema())
+    let properties = reader
+        .resolved_schema()
+        .geometry_index()
         .map_or(0, |g| property_columns(reader.schema(), g, published).len());
     mean_stored_bytes.map(|mean| member_resident_bytes(mean, properties))
 }
@@ -2496,10 +2495,13 @@ fn resolve_export_columns(
     level_zooms: &[u8],
 ) -> Result<ResolvedColumns, ExportError> {
     let geom_idx =
-        geometry_index(reader.schema()).ok_or_else(|| ExportError::NoGeometryColumn {
-            path: Some(reader.path().display().to_string()),
-        })?;
-    if let Some(by_name) = geometry_name_disagreement(reader.schema(), geom_idx) {
+        reader
+            .resolved_schema()
+            .geometry_index()
+            .ok_or_else(|| ExportError::NoGeometryColumn {
+                path: Some(reader.path().display().to_string()),
+            })?;
+    if let Some(by_name) = reader.resolved_schema().geometry_name_disagreement() {
         log::warn!(
             "[export] tiling geometry column {:?}, the file's `primary_column`, not {:?}, \
              which its name suggests; an overview converted before #675 may declare the \
@@ -4184,14 +4186,14 @@ fn scan_all_levels(
     }
     let scans = scan_all_levels_from(reader, crs, meta, opts, timers, &ScanBboxSource::Geometry)?
         .expect("a geometry scan never abandons its pass");
-    Ok(done(scans, "geometry"))
+    Ok(done(scans, crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN))
 }
 
 /// Where [`scan_all_levels`] gets each feature's bbox (#730).
 #[derive(Debug, Clone, PartialEq)]
 enum ScanBboxSource {
     /// The geometry column's f64 bbox covering
-    /// ([`crate::covering::find_f64_covering`]): the struct column's name and
+    /// ([`crate::resolved_schema::ResolvedSchema::f64_covering`]): the struct column's name and
     /// its `xmin, ymin, xmax, ymax` child names.
     ///
     /// DIVERGENCE FROM THE GEOMETRY PATH: the covering's writer (the
@@ -4212,8 +4214,9 @@ impl ScanBboxSource {
     /// geometry column, else the geometry.
     fn for_reader(reader: &OverviewReader) -> Self {
         let schema = reader.schema();
-        geometry_index(schema)
-            .and_then(|g| crate::covering::find_f64_covering(schema, g))
+        reader
+            .resolved_schema()
+            .f64_covering()
             .map_or(Self::Geometry, |(idx, names)| Self::Covering {
                 column: schema.field(idx).name().clone(),
                 names,
@@ -4266,7 +4269,7 @@ fn scan_all_levels_from(
     let geometry = geometry_name(reader);
     let root = match source {
         ScanBboxSource::Covering { column, .. } => reader.schema().index_of(column).ok(),
-        ScanBboxSource::Geometry => geometry_index(reader.schema()),
+        ScanBboxSource::Geometry => reader.resolved_schema().geometry_index(),
     };
     let scans_ref = &mut scans;
     let zooms_ref = &zooms;
@@ -5805,8 +5808,14 @@ fn order_column_is_absent(
 
 /// The MVT property keys this schema will advertise.
 fn published_property_names(schema: &Schema, published: &PublishedNames) -> Vec<String> {
-    let Some(geom_idx) = geometry_index(schema) else {
-        return Vec::new(); // the export will fail for its own reasons
+    let geom_idx = published
+        .geometry
+        .as_ref()
+        .and_then(|name| schema.index_of(name).ok());
+    #[cfg(test)]
+    let geom_idx = geom_idx.or_else(|| geometry_index(schema));
+    let Some(geom_idx) = geom_idx else {
+        return Vec::new();
     };
     property_columns(schema, geom_idx, published)
         .into_iter()
@@ -6820,47 +6829,42 @@ fn decode_batch(
 /// ([`OverviewReader::schema`], which carries the footer's `geo` key).
 ///
 /// Resolved exactly as convert resolves its input and as
-/// [`crate::covering::resolve_geometry_column_name`] resolves the footer for
+/// [`crate::resolved_schema::ResolvedSchema::geometry_name`] resolves the footer for
 /// pruning (#518): the `geo` metadata's `primary_column`, then the name
 /// heuristic (`geometry`, else the first `geom*`). The overview writer pins
 /// `primary_column` to convert's geometry column, so a column named `SHAPE`
 /// (an Esri file geodatabase) resolves by name (#675). Choosing by `geoarrow.*`
 /// extension type instead would pick the first of several geometry columns
 /// in schema order, which is not necessarily the primary one.
+#[cfg(test)]
 fn geometry_index(schema: &Schema) -> Option<usize> {
-    find_geometry_column(schema)
+    crate::resolved_schema::ResolvedSchema::resolve(schema)
+        .ok()?
+        .geometry_index()
 }
 
 /// The other geometry column the name heuristic alone would pick, when it
-/// differs from `geom_idx` ([`geometry_index`]).
+/// differs from `geom_idx` ([`crate::resolved_schema::ResolvedSchema::geometry_index`]).
 ///
 /// Overview files converted before #675 left `primary_column` to the
 /// geoparquet crate, which names the alphabetically first geometry column,
 /// so an input with `geom` and a `centroid` beside it was written declaring
 /// `centroid`. Export used to take `geom` by name and now follows the footer;
 /// only a re-convert fixes such a file, so the export says so.
+#[cfg(test)]
 fn geometry_name_disagreement(schema: &Schema, geom_idx: usize) -> Option<&str> {
-    let is_geometry = |f: &Field| {
-        f.metadata()
-            .get(EXTENSION_TYPE_NAME_KEY)
-            .is_some_and(|name| name.starts_with("geoarrow"))
-    };
-    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    let by_name = crate::covering::geometry_column_by_name(&names)?;
-    (by_name != names[geom_idx] && schema.field_with_name(by_name).is_ok_and(is_geometry))
-        .then_some(by_name)
+    crate::resolved_schema::geometry_name_disagreement(schema, geom_idx)
 }
 
-/// The name of the overview file's geometry column ([`geometry_index`]).
+/// The name of the overview file's geometry column ([`crate::resolved_schema::ResolvedSchema::geometry_index`]).
 fn geometry_name(reader: &OverviewReader) -> Option<&str> {
-    let schema = reader.schema();
-    geometry_index(schema).map(|i| schema.field(i).name().as_str())
+    reader.resolved_schema().geometry_name()
 }
 
 /// The index of the geometry column `geometry` ([`geometry_name`]) in a batch
 /// read from the overview file.
 ///
-/// [`geometry_index`] cannot resolve a batch: the Parquet reader builds each
+/// [`crate::resolved_schema::ResolvedSchema::geometry_index`] cannot resolve a batch: the Parquet reader builds each
 /// batch's schema from its columns alone, so the file's `geo` key, and with
 /// it `primary_column`, is gone, and the name heuristic would take an
 /// attribute such as `geom_type` over a geometry column named `SHAPE`. Field
@@ -6920,10 +6924,12 @@ struct PublishedNames {
     /// The geometry column's name ([`geometry_name`]), resolved once from the
     /// file schema for the batches read from it ([`batch_geometry_index`]).
     geometry: Option<String>,
+    properties: Option<HashSet<usize>>,
 }
 
 impl PublishedNames {
     /// Every column keeps its schema name.
+    #[cfg(test)]
     fn identity() -> Self {
         Self::default()
     }
@@ -6931,47 +6937,13 @@ impl PublishedNames {
     /// Resolve publication names for `schema` from a file's `renamed_columns`
     /// provenance (output name → source name; see [`Generalization`]), with
     /// `suppressed` the schema columns the export withholds (#379).
+    #[cfg(test)]
     fn from_renames(
         renames: &BTreeMap<String, String>,
         schema: &Schema,
         suppressed: HashSet<String>,
     ) -> Self {
-        // Names already spoken for by a column that will publish under its own
-        // schema name. `level` is excluded because the export drops it, which
-        // is precisely what frees the name for restoration; a suppressed
-        // counter is excluded for the same reason.
-        let occupied: HashSet<String> = schema
-            .fields()
-            .iter()
-            .filter(|f| {
-                !f.name().eq_ignore_ascii_case(LEVEL_COLUMN) && !suppressed.contains(f.name())
-            })
-            .map(|f| f.name().to_ascii_lowercase())
-            .collect();
-
-        // Fold rather than filter: each accepted restoration *takes* its source
-        // name, so the next one sees it. Two columns can be renamed away from
-        // one source name — `resolve_reserved_column_collisions` iterates
-        // fields, not distinct names, so an input carrying two columns both
-        // called `level` yields `{"level_": "level", "level__": "level"}` —
-        // and restoring both would put the same key on a feature twice, which
-        // is worse than the renamed name and worse than what `main` produces
-        // for that input. `HashSet::insert` returning false covers the
-        // already-a-column case and the already-restored case in one check.
-        // `renames` is a `BTreeMap`, so which of the two wins is deterministic.
-        let mut occupied = occupied;
-        let mut restored: HashMap<String, String> = HashMap::new();
-        for (renamed, source) in renames {
-            // Only touch columns this file actually has.
-            if schema.column_with_name(renamed).is_none() {
-                continue;
-            }
-            if !occupied.insert(source.to_ascii_lowercase()) {
-                continue;
-            }
-            restored.insert(renamed.clone(), source.clone());
-        }
-
+        let restored = crate::resolved_schema::publication_names(schema, renames, &suppressed);
         for (renamed, source) in &restored {
             log::info!(
                 "[export] publishing overview column {renamed:?} under its \
@@ -6984,23 +6956,7 @@ impl PublishedNames {
             suppressed,
             covering: None,
             geometry: None,
-        }
-    }
-
-    /// Build from an overview file's footer metadata, with `suppressed` the
-    /// schema columns the export withholds (#379); the rename mapping is the
-    /// identity when the file carries no rename provenance.
-    fn from_meta(meta: &OverviewsMeta, schema: &Schema, suppressed: HashSet<String>) -> Self {
-        match meta
-            .generalization
-            .as_ref()
-            .and_then(|g| g.renamed_columns.as_ref())
-        {
-            Some(renames) => Self::from_renames(renames, schema, suppressed),
-            None => Self {
-                suppressed,
-                ..Self::identity()
-            },
+            properties: None,
         }
     }
 
@@ -7041,20 +6997,16 @@ impl PublishedNames {
                 suppressed.insert(column.to_string());
             }
         }
-        let mut names = Self::from_meta(meta, reader.schema(), suppressed);
-        // The covering the `geo` metadata declares for the geometry column,
-        // as its top-level struct name (the spec paths are `["bbox","xmin"]`
-        // and so on). A parse failure or an absent declaration leaves the
-        // default-name and shape rules to recognise it.
-        let geometry = geometry_name(reader);
-        names.covering = geometry.and_then(|geom| {
-            let json = reader.geo_metadata_json()?;
-            crate::covering::parse_covering_metadata(json, Some(geom))
-                .ok()
-                .flatten()
-                .and_then(|spec| spec.xmin_path.first().cloned())
-        });
-        names.geometry = geometry.map(str::to_string);
+        let descriptor = reader.resolved_schema();
+        let names = Self {
+            restored: descriptor.publication_names(&suppressed),
+            suppressed,
+            covering: descriptor
+                .covering()
+                .and_then(|c| c.xmin_path.first().cloned()),
+            geometry: descriptor.geometry_name().map(str::to_owned),
+            properties: Some(descriptor.properties().iter().copied().collect()),
+        };
         names
     }
 
@@ -7271,10 +7223,12 @@ fn candidate_columns<'a>(
         .iter()
         .enumerate()
         .filter(move |&(i, f)| {
-            i != geom_idx
-                && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
-                && !published.is_suppressed(f.name())
-                && !super::writer::is_covering_column(f, geom, published.covering.as_deref())
+            published.properties.as_ref().map_or(
+                i != geom_idx
+                    && !f.name().eq_ignore_ascii_case(LEVEL_COLUMN)
+                    && !super::writer::is_covering_column(f, geom, published.covering.as_deref()),
+                |indices| indices.contains(&i),
+            ) && !published.is_suppressed(f.name())
         })
         .map(|(i, f)| (i, f.as_ref()))
 }
@@ -7954,10 +7908,21 @@ fn write_json_str(out: &mut Vec<u8>, s: &str) {
 /// `identifier.contains("3857")` this replaces never saw a PROJJSON blob
 /// whose `id` is structured rather than spelled out in the string, which is
 /// exactly what an overview converted from a Web Mercator input now declares.
+#[cfg(test)]
 fn detect_crs(path: &Path) -> Result<Crs, ExportError> {
-    use crate::quality::CrsKind;
+    let file = File::open(path).map_err(crate::Error::Io)?;
+    let metadata = crate::untrusted::read_parquet_metadata(&file)
+        .map_err(|e| crate::Error::GeoParquetRead(e.to_string()))?;
+    let descriptor = crate::resolved_schema::ResolvedSchema::from_metadata(&metadata)?;
+    crs_from_descriptor(&descriptor, path)
+}
 
-    let info = crate::quality::extract_crs(path).map_err(ExportError::Core)?;
+fn crs_from_descriptor(
+    descriptor: &crate::resolved_schema::ResolvedSchema,
+    path: &Path,
+) -> Result<Crs, ExportError> {
+    use crate::quality::CrsKind;
+    let info = descriptor.crs_info().clone();
     match crate::quality::classify_crs_info(&info) {
         CrsKind::Wgs84 => Ok(Crs::Epsg4326),
         CrsKind::WebMercator => Ok(Crs::Epsg3857),
@@ -9418,30 +9383,18 @@ mod tests {
         }
     }
 
-    /// Rewrite overview file `src` to `dst` without its bbox covering (#730):
-    /// the `bbox` struct column is dropped and the `geo` metadata no longer
-    /// declares it — an overview file as a producer that writes no covering
-    /// would leave it.
-    fn rewrite_without_covering(src: &Path, dst: &Path) {
+    /// A conforming foreign producer with a float32 covering: the scan must
+    /// read geometry because only float64 covering values are bit-exact.
+    fn rewrite_with_float32_covering(src: &Path, dst: &Path) {
         rewrite_overview(src, dst, None, true);
-    }
-
-    /// The `geo` metadata JSON `json` with the geometry column's `covering`
-    /// declaration removed.
-    fn geo_json_without_covering(json: &str) -> String {
-        let mut geo: serde_json::Value = serde_json::from_str(json).unwrap();
-        for column in geo["columns"].as_object_mut().unwrap().values_mut() {
-            column.as_object_mut().unwrap().remove("covering");
-        }
-        geo.to_string()
     }
 
     /// Rewrite overview file `src` to `dst` row group for row group (same
     /// boundaries, schema and footer keys). `bad_row` blanks the WKB geometry
     /// of that global row — an undecodable value the export's geometry decode
-    /// rejects with a typed error; `strip_covering` drops the bbox covering
-    /// ([`rewrite_without_covering`]).
-    fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, strip_covering: bool) {
+    /// rejects with a typed error; `float32_covering` narrows the bbox covering to float32
+    /// ([`rewrite_with_float32_covering`]).
+    fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, float32_covering: bool) {
         use arrow_array::{Array, BinaryArray};
 
         use parquet::arrow::ArrowWriter;
@@ -9450,13 +9403,6 @@ mod tests {
         let probe = crate::untrusted::open_parquet(File::open(src).unwrap()).unwrap();
         let in_schema = probe.schema().clone();
         let num_rgs = probe.metadata().num_row_groups();
-        let strip_geo = |kv: KeyValue| match (strip_covering, kv.key.as_str()) {
-            (true, "geo") => KeyValue::new(
-                kv.key.clone(),
-                geo_json_without_covering(kv.value.as_deref().unwrap()),
-            ),
-            _ => kv,
-        };
         let kvs: Vec<KeyValue> = probe
             .metadata()
             .file_metadata()
@@ -9464,24 +9410,33 @@ mod tests {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|kv| kv.key != "ARROW:schema")
-            .map(strip_geo)
-            .collect();
-        let keep: Vec<usize> = (0..in_schema.fields().len())
-            .filter(|&i| !(strip_covering && in_schema.field(i).name() == "bbox"))
+            .filter(|kv| {
+                kv.key != "ARROW:schema" && kv.key != crate::resolved_schema::RESOLVED_SCHEMA_KEY
+            })
             .collect();
         let mut schema_metadata = in_schema.metadata().clone();
-        if strip_covering {
-            if let Some(json) = schema_metadata.get_mut("geo") {
-                *json = geo_json_without_covering(json);
-            }
-        }
-        let schema = Arc::new(
-            in_schema
-                .project(&keep)
-                .unwrap()
-                .with_metadata(schema_metadata),
-        );
+        // This fixture models a foreign producer, without a persisted descriptor.
+        schema_metadata.remove(crate::resolved_schema::RESOLVED_SCHEMA_KEY);
+        let fields: Vec<Field> = in_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if float32_covering && f.name() == "bbox" {
+                    let DataType::Struct(children) = f.data_type() else {
+                        unreachable!()
+                    };
+                    f.as_ref().clone().with_data_type(DataType::Struct(
+                        children
+                            .iter()
+                            .map(|c| Arc::new(c.as_ref().clone().with_data_type(DataType::Float32)))
+                            .collect(),
+                    ))
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new_with_metadata(fields, schema_metadata));
         let geom_idx = schema.index_of("geometry").unwrap();
 
         let mut writer =
@@ -9495,8 +9450,14 @@ mod tests {
                 .build()
                 .unwrap();
             for batch in reader {
-                let batch = batch.unwrap().project(&keep).unwrap();
-                let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap();
+                let batch = batch.unwrap();
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| arrow_cast::cast(col, schema.field(i).data_type()).unwrap())
+                    .collect();
+                let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
                 let n = batch.num_rows();
                 let batch = if bad_row.is_some_and(|bad_row| (row0..row0 + n).contains(&bad_row)) {
                     let bad_row = bad_row.unwrap();
@@ -9775,20 +9736,20 @@ mod tests {
         assert_eq!(scans, geometry);
     }
 
-    /// #730's fallback: an overview file with no bbox covering still exports,
-    /// from the geometry, to the same archive bytes as with one.
+    /// #730's fallback: a float32 covering uses the geometry scan and exports
+    /// to the same archive bytes as a bit-exact float64 covering.
     #[test]
-    fn export_without_covering_matches_export_with_covering() {
+    fn export_float32_covering_matches_export_with_f64_covering() {
         for mode in [Mode::Partitioning, Mode::Duplicating] {
             let dir = tempfile::tempdir().unwrap();
             let with = dir.path().join("with.parquet");
             let without = dir.path().join("without.parquet");
             write_mode_fixture_opt(&with, &covering_corpus(1.0), mode);
-            rewrite_without_covering(&with, &without);
+            rewrite_with_float32_covering(&with, &without);
             assert_eq!(
                 ScanBboxSource::for_reader(&OverviewReader::open(&without).unwrap()),
                 ScanBboxSource::Geometry,
-                "the rewrite must leave no covering to read"
+                "the float32 covering must use the geometry scan"
             );
             let archive = |input: &Path, name: &str| {
                 let out = dir.path().join(name);
@@ -9798,7 +9759,7 @@ mod tests {
             assert_eq!(
                 archive(&with, "with.pmtiles"),
                 archive(&without, "without.pmtiles"),
-                "{mode:?}: the archive depends on whether the file has a covering"
+                "{mode:?}: the archive depends on covering precision"
             );
         }
     }
@@ -9883,7 +9844,7 @@ mod tests {
         assert!(c.bounds.unwrap().lat_max > g.bounds.unwrap().lat_max);
 
         let without = dir.path().join("without.parquet");
-        rewrite_without_covering(&with, &without);
+        rewrite_with_float32_covering(&with, &without);
         let tiles = |input: &Path, name: &str| {
             let out = dir.path().join(name);
             export_pmtiles(input, &out, &ExportOptions::default()).unwrap();
@@ -13994,7 +13955,7 @@ mod tests {
         }
     }
 
-    /// Two-level fixture with the given footer provenance whose INT32
+    /// Two-level fixture with the given footer provenance whose typed
     /// `counter` column holds `counts[k]` at level k. Schema: `id`, then
     /// `user_column` (an INT32 user column, when given), `geometry`, `counter`.
     fn write_counter_fixture(
@@ -14005,13 +13966,30 @@ mod tests {
         user_column: Option<&str>,
     ) {
         use arrow_array::Int32Array;
+        let is_point_count = counter == "point_count";
         write_typed_counter_fixture(
             path,
             generalization,
-            Field::new(counter, DataType::Int32, false),
+            Field::new(
+                counter,
+                if is_point_count {
+                    DataType::Int64
+                } else {
+                    DataType::Int32
+                },
+                false,
+            ),
             &counts
                 .iter()
-                .map(|c| Arc::new(Int32Array::from(c.clone())) as ArrayRef)
+                .map(|c| {
+                    if is_point_count {
+                        Arc::new(Int64Array::from(
+                            c.iter().copied().map(i64::from).collect::<Vec<_>>(),
+                        )) as ArrayRef
+                    } else {
+                        Arc::new(Int32Array::from(c.clone())) as ArrayRef
+                    }
+                })
                 .collect::<Vec<_>>(),
             user_column,
         );
@@ -14122,7 +14100,11 @@ mod tests {
         // ... and the layer must not advertise it either.
         let reader = OverviewReader::open(tin.path()).unwrap();
         let published = PublishedNames::from_reader(&reader);
-        let fields = field_metadata(reader.schema(), geometry_index(reader.schema()), &published);
+        let fields = field_metadata(
+            reader.schema(),
+            reader.resolved_schema().geometry_index(),
+            &published,
+        );
         assert!(
             !fields.contains_key("coalesced_count"),
             "vector_layers fields must not advertise it: {fields:?}"
@@ -14170,7 +14152,7 @@ mod tests {
 
         // ... and the layer advertises it.
         let reader = OverviewReader::open(tin.path()).unwrap();
-        let geom_idx = geometry_index(reader.schema()).unwrap();
+        let geom_idx = reader.resolved_schema().geometry_index().unwrap();
         let published = PublishedNames::from_reader(&reader)
             .with_selection(
                 reader.schema(),
@@ -14258,10 +14240,38 @@ mod tests {
 
         let reader = OverviewReader::open(tin.path()).unwrap();
         let published = PublishedNames::from_reader(&reader);
-        let fields = field_metadata(reader.schema(), geometry_index(reader.schema()), &published);
+        let fields = field_metadata(
+            reader.schema(),
+            reader.resolved_schema().geometry_index(),
+            &published,
+        );
         assert_eq!(
             fields.get("point_count").map(String::as_str),
             Some("Number")
+        );
+    }
+
+    #[test]
+    fn invalid_cluster_count_type_is_reported_before_reading_data() {
+        use arrow_array::Int32Array;
+        let input = tempfile::NamedTempFile::new().unwrap();
+        write_typed_counter_fixture(
+            input.path(),
+            clustering_generalization(),
+            Field::new("point_count", DataType::Int32, false),
+            &[Arc::new(Int32Array::from(vec![1, 1])) as ArrayRef],
+            None,
+        );
+        let report = crate::overview::check::validate_file(input.path()).unwrap();
+        assert_eq!(
+            report.check_passed("cluster_point_count_column"),
+            Some(false)
+        );
+        assert_eq!(report.check_passed("cluster_sum_invariant"), None);
+        let error = OverviewReader::open(input.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("cluster_point_count_column"),
+            "{error}"
         );
     }
 
@@ -14285,18 +14295,17 @@ mod tests {
             &[vec![1, 1], vec![1, 1]],
             None,
         );
-        let names = exported_property_names(tin.path());
+        let error = OverviewReader::open(tin.path()).unwrap_err();
         assert!(
-            names.contains(&"id".to_string()),
-            "id was withheld: {names:?}"
+            error.to_string().contains("coalesce_count_column"),
+            "{error}"
         );
     }
 
-    /// #399: a foreign writer's nullable `coalesced_count` holding `{1, null}`
-    /// has max 1 but is not 1 everywhere — the null/1 distinction is data the
-    /// tiles would lose. The counter must stay exported.
+    /// A nullable counter contradicts the coalescing provenance. Both entry
+    /// points must reject it before publication can suppress any property.
     #[test]
-    fn nullable_coalesced_count_with_nulls_is_not_withheld() {
+    fn nullable_coalesced_count_is_rejected_as_invalid_provenance() {
         use arrow_array::Int32Array;
 
         let tin = tempfile::NamedTempFile::new().unwrap();
@@ -14310,14 +14319,13 @@ mod tests {
             ],
             None,
         );
-        let reader = OverviewReader::open(tin.path()).unwrap();
-        assert_eq!(
-            reader.int_column_max("coalesced_count"),
-            None,
-            "a row group with a null must not fold to a max"
+        let report = crate::overview::check::validate_file(tin.path()).unwrap();
+        assert_eq!(report.check_passed("coalesce_count_column"), Some(false));
+        let error = OverviewReader::open(tin.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("coalesce_count_column"),
+            "{error}"
         );
-        let names = exported_property_names(tin.path());
-        assert_eq!(names, vec!["coalesced_count", "id"]);
     }
 
     /// #399: a foreign writer's `UInt32` `coalesced_count` is compared as

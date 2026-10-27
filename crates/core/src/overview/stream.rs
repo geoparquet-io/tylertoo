@@ -103,8 +103,8 @@ use super::convert::{
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_table_merged,
     count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
-    extract_sort_keys, fill_level_bytes, find_geometry_column, mixed_geometry_field,
-    overture_road_ranking, record_coalesce_merged, record_level_outcome, resolve_read_workers,
+    extract_sort_keys, fill_level_bytes, mixed_geometry_field, overture_road_ranking,
+    record_coalesce_merged, record_level_outcome, resolve_read_workers,
     resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
     validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
     CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
@@ -741,6 +741,7 @@ fn build_writer_options_with_ceiling(
     writer_opts.max_row_group_size = options.max_row_group_size;
     writer_opts.row_group_size_policy = options.row_group_size_policy;
     writer_opts.full_column_stats = options.full_column_stats;
+    writer_opts.source_is_subset = options.shard.is_some();
     writer_opts.cogp_compat_key = options.cogp_compat_key;
     writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
     writer_opts.generalization = Some(build_generalization(
@@ -2037,9 +2038,9 @@ fn convert_preflight_with_memory_limit(
     let input_schema: SchemaRef = source.schema()?;
 
     // CRS detection + rejection (spec Q3) — footer metadata only.
-    let kv = source.key_value_metadata()?;
+    let descriptor = source.resolved_schema()?;
     let (crs, crs_assumed_wgs84) =
-        super::convert::detect_crs_from_kv_assumed(kv.as_ref(), &source.display_name())?;
+        super::convert::crs_from_resolved(descriptor, &source.display_name())?;
     if crs_assumed_wgs84 {
         super::convert::warn_assumed_wgs84(&source.display_name());
     }
@@ -2057,8 +2058,10 @@ fn convert_preflight_with_memory_limit(
     // can name the column before any row-group selection or staging reads
     // it. The geometry column is never one of the #288 reserved names, so
     // it is never touched by the rename above.
-    let geom_idx =
-        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
+    let geom_idx = descriptor
+        .geometry_name()
+        .and_then(|n| input_schema.index_of(n).ok())
+        .ok_or_else(|| ConvertError::NoGeometryColumn {
             input: source.display_name(),
         })?;
     let geom_field = input_schema.field(geom_idx).clone();
@@ -7879,7 +7882,8 @@ mod tests {
         // drops the input's own bbox covering from the read.
         super::super::convert::apply_property_selection(&source, &options).unwrap();
         let input_schema = source.schema().unwrap();
-        let geom_idx = find_geometry_column(&input_schema).expect("fixture has a geometry column");
+        let geom_idx = crate::overview::convert::find_geometry_column(&input_schema)
+            .expect("fixture has a geometry column");
         let geom_name = input_schema.field(geom_idx).name().clone();
         let crs = Crs::Epsg4326;
         let (source_schema, cluster_schema, out_schema) =

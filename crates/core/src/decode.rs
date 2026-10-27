@@ -103,7 +103,12 @@ use crate::vector_tile::Tile;
 const BATCH_SIZE: usize = 8192;
 
 /// Provenance / structural column names reserved by the decoder.
-const RESERVED_COLUMNS: [&str; 4] = ["zoom", "layer", "mvt_id", "geometry"];
+const RESERVED_COLUMNS: [&str; 4] = [
+    "zoom",
+    "layer",
+    "mvt_id",
+    crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+];
 
 // ============================================================================
 // Public API
@@ -305,7 +310,7 @@ pub fn decode_pmtiles(
     let geom_field = GeometryBuilder::new(GeometryType::new(Default::default()))
         .finish()
         .data_type()
-        .to_field("geometry", true);
+        .to_field(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN, true);
     let mut fields: Vec<Arc<Field>> = vec![
         Arc::new(Field::new("zoom", DataType::UInt8, false)),
         Arc::new(Field::new("layer", DataType::Utf8, false)),

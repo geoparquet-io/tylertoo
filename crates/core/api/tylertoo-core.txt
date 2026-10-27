@@ -168,6 +168,10 @@ pub fn tylertoo_core::covering::CoveringSpec::eq(&self, &tylertoo_core::covering
 impl core::fmt::Debug for tylertoo_core::covering::CoveringSpec
 pub fn tylertoo_core::covering::CoveringSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::covering::CoveringSpec
+impl serde_core::ser::Serialize for tylertoo_core::covering::CoveringSpec
+pub fn tylertoo_core::covering::CoveringSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::covering::CoveringSpec
+pub fn tylertoo_core::covering::CoveringSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::covering::CoveringSpec
 impl core::marker::Send for tylertoo_core::covering::CoveringSpec
 impl core::marker::Sync for tylertoo_core::covering::CoveringSpec
@@ -466,6 +470,7 @@ pub fn tylertoo_core::input_set::ConvertSource::part_row_counts(&self) -> core::
 pub fn tylertoo_core::input_set::ConvertSource::parts(&self) -> &[tylertoo_core::input::InputSource]
 pub fn tylertoo_core::input_set::ConvertSource::resolve(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::resolve_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::resolved_schema(&self) -> core::result::Result<&tylertoo_core::resolved_schema::ResolvedSchema, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::restrict_columns(&self, alloc::vec::Vec<usize>) -> core::result::Result<(), tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::schema(&self) -> core::result::Result<arrow_schema::schema::SchemaRef, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::select_row_groups(&self, &[f64; 4]) -> core::result::Result<tylertoo_core::input_set::RowGroupSelection, tylertoo_core::input::InputError>
@@ -2532,6 +2537,7 @@ pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::index: usize
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::num_row_groups: i64
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::value: i64
+pub tylertoo_core::overview::level::OverviewValidationError::UnsupportedVersion(alloc::string::String)
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing::index: usize
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing::previous: u8
@@ -2830,6 +2836,7 @@ pub const tylertoo_core::overview::level::GSD_TILE_BASE: f64
 pub const tylertoo_core::overview::level::METERS_PER_DEGREE: f64
 pub const tylertoo_core::overview::level::OVERVIEWS_KEY: &str
 pub const tylertoo_core::overview::level::SPEC_VERSION: &str
+pub const tylertoo_core::overview::level::SUPPORTED_MAJOR: u64
 pub const tylertoo_core::overview::level::WEBMERC_CIRCUMFERENCE_M: f64
 pub fn tylertoo_core::overview::level::gsd(u8) -> f64
 pub fn tylertoo_core::overview::level::gsd_with_base(u8, f64) -> f64
@@ -2892,6 +2899,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::proper
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::properties::PropertySelection
 pub mod tylertoo_core::overview::reader
 pub enum tylertoo_core::overview::reader::ReaderError
+pub tylertoo_core::overview::reader::ReaderError::Conformance(alloc::string::String)
 pub tylertoo_core::overview::reader::ReaderError::Footer
 pub tylertoo_core::overview::reader::ReaderError::Footer::error: parquet::errors::ParquetError
 pub tylertoo_core::overview::reader::ReaderError::Footer::path: alloc::string::String
@@ -2944,6 +2952,7 @@ pub fn tylertoo_core::overview::reader::OverviewReader::path(&self) -> &std::pat
 pub fn tylertoo_core::overview::reader::OverviewReader::read_band_batched(&self, usize, usize) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::read_level(&self, usize, core::option::Option<[f64; 4]>) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::read_level_batched(&self, usize, core::option::Option<[f64; 4]>, usize) -> core::result::Result<tylertoo_core::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::resolved_schema(&self) -> &tylertoo_core::resolved_schema::ResolvedSchema
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_for_level(&self, usize) -> core::result::Result<alloc::vec::Vec<usize>, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_intersecting_bbox(&self, &[f64; 4]) -> alloc::vec::Vec<usize>
 pub fn tylertoo_core::overview::reader::OverviewReader::schema(&self) -> &arrow_schema::schema::SchemaRef
@@ -3427,6 +3436,7 @@ pub tylertoo_core::overview::writer::OverviewWriterOptions::max_row_group_size: 
 pub tylertoo_core::overview::writer::OverviewWriterOptions::mode: tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::writer::OverviewWriterOptions::primary_column: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::writer::OverviewWriterOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
+pub tylertoo_core::overview::writer::OverviewWriterOptions::source_is_subset: bool
 pub tylertoo_core::overview::writer::OverviewWriterOptions::version: alloc::string::String
 pub tylertoo_core::overview::writer::OverviewWriterOptions::zstd_level: i32
 impl tylertoo_core::overview::writer::OverviewWriterOptions
@@ -3720,8 +3730,15 @@ pub tylertoo_core::quality::CrsInfo::is_wgs84: bool
 pub tylertoo_core::quality::CrsInfo::name: core::option::Option<alloc::string::String>
 impl core::clone::Clone for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::clone(&self) -> tylertoo_core::quality::CrsInfo
+impl core::cmp::PartialEq for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::eq(&self, &tylertoo_core::quality::CrsInfo) -> bool
 impl core::fmt::Debug for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::quality::CrsInfo
+impl serde_core::ser::Serialize for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::quality::CrsInfo
 impl core::marker::Send for tylertoo_core::quality::CrsInfo
 impl core::marker::Sync for tylertoo_core::quality::CrsInfo
@@ -3732,6 +3749,36 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
+pub mod tylertoo_core::resolved_schema
+pub struct tylertoo_core::resolved_schema::ResolvedSchema
+impl tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::bounds(&self) -> &[core::option::Option<tylertoo_core::covering::RowGroupBounds>]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::covering(&self) -> core::option::Option<&tylertoo_core::covering::CoveringSpec>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::crs(&self) -> core::option::Option<tylertoo_core::overview::level::Crs>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::crs_info(&self) -> &tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::from_metadata(&parquet::file::metadata::ParquetMetaData) -> tylertoo_core::Result<Self>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_columns(&self) -> &[alloc::string::String]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_index(&self) -> core::option::Option<usize>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_name(&self) -> core::option::Option<&str>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::primary_column(&self) -> core::option::Option<&str>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::properties(&self) -> &[usize]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::renames(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::resolve(&arrow_schema::schema::Schema) -> tylertoo_core::Result<Self>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::schema(&self) -> &arrow_schema::schema::Schema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::version(&self) -> core::option::Option<&str>
+impl core::clone::Clone for tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::clone(&self) -> tylertoo_core::resolved_schema::ResolvedSchema
+impl core::fmt::Debug for tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Send for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Sync for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Unpin for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::UnsafeUnpin for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::resolved_schema::ResolvedSchema
+pub const tylertoo_core::resolved_schema::DEFAULT_GEOMETRY_COLUMN: &str
+pub const tylertoo_core::resolved_schema::RESOLVED_SCHEMA_KEY: &str
 pub mod tylertoo_core::shard
 pub enum tylertoo_core::shard::ShardError
 pub tylertoo_core::shard::ShardError::BadShardSelector
@@ -4389,8 +4436,15 @@ pub tylertoo_core::CrsInfo::is_wgs84: bool
 pub tylertoo_core::CrsInfo::name: core::option::Option<alloc::string::String>
 impl core::clone::Clone for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::clone(&self) -> tylertoo_core::quality::CrsInfo
+impl core::cmp::PartialEq for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::eq(&self, &tylertoo_core::quality::CrsInfo) -> bool
 impl core::fmt::Debug for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::quality::CrsInfo
+impl serde_core::ser::Serialize for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::quality::CrsInfo
 impl core::marker::Send for tylertoo_core::quality::CrsInfo
 impl core::marker::Sync for tylertoo_core::quality::CrsInfo

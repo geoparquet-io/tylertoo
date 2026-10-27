@@ -66,6 +66,7 @@ mod pmtiles_metadata;
 pub mod pmtiles_writer;
 pub mod pyramid;
 pub mod quality;
+pub mod resolved_schema;
 pub mod shard;
 pub mod stats;
 pub mod sutherland_hodgman;

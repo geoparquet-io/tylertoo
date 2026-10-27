@@ -921,7 +921,7 @@ pub(super) fn build_fill_map(
         |tx: &super::Sender<super::RecordBatch>| -> Result<(), super::ExportError> {
             // Only the geometry is needed: project the read to it, over the
             // level's whole render set (its prefix in partitioning mode).
-            let batches = match super::geometry_index(reader.schema()) {
+            let batches = match reader.resolved_schema().geometry_index() {
                 Some(root) => reader.read_row_groups_projected(
                     reader.selected_row_groups(level_idx, None)?,
                     super::EXPORT_BATCH_SIZE,

@@ -61,7 +61,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch};
-use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_channel::{bounded, Receiver, RecvError, RecvTimeoutError};
 use parquet::arrow::arrow_writer::{
@@ -242,6 +241,9 @@ pub struct OverviewWriterOptions {
     /// every reader of the overview would tile the wrong column. The convert
     /// paths set it to the input's primary column. Default `None`.
     pub primary_column: Option<String>,
+    /// The levels were independently cropped to a shard's spatial domain.
+    /// Such levels do not obey a whole-source cluster-mass equality.
+    pub source_is_subset: bool,
 }
 
 impl OverviewWriterOptions {
@@ -260,6 +262,7 @@ impl OverviewWriterOptions {
             generalization: None,
             encode_concurrency: 1,
             primary_column: None,
+            source_is_subset: false,
         }
     }
 }
@@ -523,7 +526,9 @@ impl<W: Write + Send> OverviewWriter<W> {
             return Err(WriterError::LevelColumnExists);
         }
 
-        let geometry_columns = geometry_columns(source_schema);
+        let descriptor = crate::resolved_schema::ResolvedSchema::resolve(source_schema)
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        let geometry_columns = descriptor.geometry_columns().to_vec();
         if geometry_columns.is_empty() {
             return Err(WriterError::NoGeometryColumn);
         }
@@ -549,17 +554,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map(|(i, _)| i)
             .collect();
 
-        let wkb_columns: Vec<(usize, String)> = source_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                f.metadata()
-                    .get(EXTENSION_TYPE_NAME_KEY)
-                    .is_some_and(|name| name == "geoarrow.wkb")
-            })
-            .map(|(i, f)| (i, f.name().clone()))
-            .collect();
+        let wkb_columns = descriptor.wkb_columns();
 
         // Augment schema: retained source fields + NOT NULL Int32 `level`
         // column (§4.1).
@@ -571,10 +566,9 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map(|(_, f)| f.clone())
             .collect();
         fields.push(Arc::new(Field::new(LEVEL_COLUMN, DataType::Int32, false)));
-        let augmented_schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            source_schema.metadata().clone(),
-        ));
+        let mut source_metadata = source_schema.metadata().clone();
+        source_metadata.remove(crate::resolved_schema::SOURCE_SUBSET_KEY);
+        let augmented_schema = Arc::new(Schema::new_with_metadata(fields, source_metadata));
 
         let gpq_options = geoparquet_options(options.primary_column.as_deref());
         let encoder = GeoParquetRecordBatchEncoder::try_new(&augmented_schema, &gpq_options)
@@ -1023,11 +1017,38 @@ impl<W: Write + Send> OverviewWriter<W> {
             Some(geo_meta) => geo_meta,
             None => self.encoder.into_geoparquet_metadata(),
         };
-        let geo_kv = KeyValue::new(
-            "geo".to_string(),
-            geo_metadata_json_deterministic(&geo_meta)?,
-        );
-        self.writer.append_key_value_metadata(geo_kv);
+        let geo_json = geo_metadata_json_deterministic(&geo_meta)?;
+        // The descriptor describes the PHYSICAL output schema (generated covering
+        // and level column included), not the input's now-stale bbox or indices.
+        let mut schema_metadata = self.target_schema.metadata().clone();
+        schema_metadata.retain(|key, _| {
+            !key.eq_ignore_ascii_case("geo") && key != crate::resolved_schema::RESOLVED_SCHEMA_KEY
+        });
+        schema_metadata.insert("geo".to_string(), geo_json.clone());
+        schema_metadata.insert(OVERVIEWS_KEY.to_string(), meta.to_json()?);
+        if self.options.source_is_subset {
+            schema_metadata.insert(
+                crate::resolved_schema::SOURCE_SUBSET_KEY.to_string(),
+                "true".to_string(),
+            );
+            self.writer.append_key_value_metadata(KeyValue::new(
+                crate::resolved_schema::SOURCE_SUBSET_KEY.to_string(),
+                "true".to_string(),
+            ));
+        }
+        let output_schema =
+            Schema::new_with_metadata(self.target_schema.fields().clone(), schema_metadata);
+        let descriptor = crate::resolved_schema::ResolvedSchema::resolve(&output_schema)
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        let descriptor_json = descriptor
+            .footer_json()
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        self.writer
+            .append_key_value_metadata(KeyValue::new("geo".to_string(), geo_json));
+        self.writer.append_key_value_metadata(KeyValue::new(
+            crate::resolved_schema::RESOLVED_SCHEMA_KEY.to_string(),
+            descriptor_json,
+        ));
 
         // `geo:overviews` footer key (§3).
         let overviews_json = meta.to_json()?;
@@ -1368,21 +1389,6 @@ pub(crate) fn geo_metadata_json_deterministic(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
-/// extension type). Mirrors the geoparquet encoder's detection.
-fn geometry_columns(schema: &Schema) -> Vec<String> {
-    schema
-        .fields()
-        .iter()
-        .filter(|f| {
-            f.metadata()
-                .get(EXTENSION_TYPE_NAME_KEY)
-                .is_some_and(|name| name.starts_with("geoarrow"))
-        })
-        .map(|f| f.name().clone())
-        .collect()
-}
-
 /// Whether `field` is a bbox-covering struct: a `Struct` whose child field
 /// names are exactly `{xmin, ymin, xmax, ymax}` (case-insensitive). Used to
 /// recognise (and drop) a pre-existing covering column that would collide with
@@ -1445,7 +1451,8 @@ pub(crate) fn is_covering_column(
 /// Covering column name the encoder will produce for a geometry column, per its
 /// default rule (`bbox` for `geometry`/`geography`, else `{name}_bbox`).
 pub(crate) fn covering_name_for(column_name: &str) -> String {
-    if column_name == "geometry" || column_name == "geography" {
+    if column_name == crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN || column_name == "geography"
+    {
         "bbox".to_string()
     } else {
         format!("{column_name}_bbox")
