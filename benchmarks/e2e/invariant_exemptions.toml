@@ -1,0 +1,195 @@
+# Known failures of the strict whole-archive invariants (#779, G3).
+#
+# `benchmarks/e2e/run_e2e.py --invariants` runs `tylertoo tiles` over each
+# (fixture, settings) cell and `scripts/verify_archive.py --strict` over the
+# archive. A failing invariant fails the run unless a row below matches it.
+#
+# One row per {fixture, settings, zoom, invariant, issue}:
+#   fixture    a run_e2e.py dataset id (open-buildings, road-detections,
+#              madagascar-adm4, ftw-moldova-z10, fieldmaps-boundaries)
+#   settings   a run_e2e.py INVARIANT_SETTINGS name (defaults, verbatim,
+#              pv0, sf0, fill)
+#   zoom       an integer zoom, or "*" for every zoom of the invariant;
+#              archive-wide invariants (feature_accounting, decay,
+#              property_accounting) always take "*". For monotone the zoom
+#              is the COARSER of the pair that rose.
+#   invariant  tile_size, polygon_valid, feature_accounting, monotone,
+#              decay, property_accounting
+#   issue      the OPEN issue tracking the failure; e2e.yml fails on a row
+#              whose issue is closed
+#   reason     one line: what fails and who is expected to remove the row
+#
+# Rows are strict: an exempted invariant that passes fails the run as XPASS,
+# so the PR that fixes the issue must delete its rows. The row count is
+# pinned by EXPECTED_EXEMPTION_ROWS in scripts/verify_archive.py, checked by
+# `uv run scripts/verify_archive.py --check-exemptions <this file>`: the list
+# only changes on purpose, in both places at once.
+
+[[exemption]]
+fixture = "open-buildings"
+settings = "verbatim"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z8-z10 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "open-buildings"
+settings = "pv0"
+zoom = "*"
+invariant = "decay"
+issue = 749
+reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
+
+[[exemption]]
+fixture = "open-buildings"
+settings = "sf0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z10 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "defaults"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z5 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "verbatim"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z1-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "pv0"
+zoom = "*"
+invariant = "decay"
+issue = 749
+reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "pv0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z5 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "sf0"
+zoom = 4
+invariant = "monotone"
+issue = 768
+reason = "the per-tile merge valve thins z5 below z4; C2 valve design removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "sf0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z3-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "fill"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z13 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "defaults"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z6-z12 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "verbatim"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z1-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "pv0"
+zoom = "*"
+invariant = "decay"
+issue = 749
+reason = "placeholder squares survive the cascade with the polygon gate at 0; F2 (#749 stopgap: dither on the source area) removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "pv0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z6-z12 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "sf0"
+zoom = 9
+invariant = "monotone"
+issue = 768
+reason = "the per-tile merge valve thins z10 below z9; C2 valve design removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "sf0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "fill"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z13 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "fieldmaps-boundaries"
+settings = "verbatim"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "fieldmaps-boundaries"
+settings = "sf0"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z4-z9 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "fieldmaps-boundaries"
+settings = "fill"
+zoom = "*"
+invariant = "polygon_valid"
+issue = 748
+reason = "OGC-invalid polygons in tile coordinates at z7-z13 (nested shells, self-intersections, disconnected interiors); no wave-1 owner, the #748 fix removes the row"
+
+[[exemption]]
+fixture = "nonfinite-vertex"
+settings = "defaults"
+zoom = "*"
+invariant = "feature_accounting"
+issue = 707
+reason = "a NaN and a +inf vertex: both features vanish from every zoom with no counter; F2/F5 (counted finiteness check) removes the row"
+
