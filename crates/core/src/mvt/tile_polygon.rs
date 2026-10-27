@@ -295,6 +295,14 @@ enum Loc {
 /// rules: every hole inside its exterior, no hole in another hole, no part
 /// inside another part's fill.
 pub(crate) fn check_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Result<(), Defect> {
+    // The usual feature, one polygon without holes: only the ring's own
+    // rules apply, and the sweep runs on the ring itself, without the
+    // ring/part bookkeeping the general case needs.
+    if let [only] = parts {
+        if let [ring] = only.as_ref() {
+            return check_lone_ring(ring);
+        }
+    }
     // Flat ring list, and the part of each ring.
     let mut ring_part: Vec<u32> = Vec::new();
     let mut rings: Vec<&TileRing> = Vec::new();
@@ -433,6 +441,28 @@ fn separates(a: [(i64, i64); 2], b: [(i64, i64); 2]) -> bool {
     });
     // Alternating A, B, A, B around the point.
     all[0].1 == all[2].1
+}
+
+/// [`check_polygons`] for a feature that is one ring: it has area, does not
+/// fold back, and no two of its non-adjacent edges meet.
+fn check_lone_ring(ring: &TileRing) -> Result<(), Defect> {
+    if ring.len() < 4 || ring.first() != ring.last() || ring_area2(ring) == 0 {
+        return Err(Defect::CollapsedRing);
+    }
+    if folds_back(ring) {
+        return Err(Defect::RingSelfTouch);
+    }
+    let n = ring.len() - 1;
+    let boxes: Vec<_> = ring.windows(2).map(|w| edge_box(w[0], w[1])).collect();
+    let touches = any_box_pair(&boxes, |i, j| {
+        let adjacent = (i + 1) % n == j || (j + 1) % n == i;
+        !adjacent && segments_meet((ring[i], ring[i + 1]), (ring[j], ring[j + 1]))
+    });
+    if touches {
+        Err(Defect::RingSelfTouch)
+    } else {
+        Ok(())
+    }
 }
 
 /// Does a closed ring run straight back along the edge it arrived on at
