@@ -860,47 +860,6 @@ fn regroup_pinched(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
     polys
 }
 
-/// Make a quantized polygon valid in tile space: the cheap, per-polygon
-/// fast path in front of the validity owner ([`tile_polygon`]).
-///
-/// Snapping to the tile grid can fold a ring onto itself: two source
-/// vertices that were a fraction of a unit apart land on the same column,
-/// and the ring now runs back down an edge it already ran up (raster-derived
-/// field boundaries with near-collinear vertices do this constantly), or a
-/// narrow neck closes and the ring touches itself. The source was valid; the
-/// tile geometry is not, and a fill renderer can show slivers or holes where
-/// the ring overlaps. tippecanoe cleans every polygon after snapping; this
-/// does the same, but only as much as each polygon needs:
-///
-/// 1. the polygon is checked with the owner's exact integer tests
-///    ([`tile_polygon::check_polygons`]) — the usual outcome, returned
-///    untouched;
-/// 2. one that fails has its rings noded (a vertex lying on another edge is
-///    inserted into it) and split at pinch points (a vertex visited twice),
-///    and the pieces regrouped — this settles the common neck-snapped-shut
-///    and vertex-on-edge cases without an overlay;
-/// 3. pieces that still fail together (a loop that folded inward, a hole
-///    left outside, holes that cut the interior) are rebuilt by the owner's
-///    integer union ([`tile_polygon::repair_polygons`]).
-///
-/// The result may be several polygons (a neck that closed splits the
-/// shape) — that is the correct tile geometry. Rings that collapse to
-/// nothing are dropped; an empty result means the polygon has no area at
-/// this zoom. [`encode_tile_polygons`] checks the whole feature once more.
-fn clean_tile_polygon(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
-    if rings.is_empty() {
-        return Vec::new();
-    }
-    if tile_polygon::check_polygons(&[&rings[..]]).is_ok() {
-        return vec![rings];
-    }
-    let pieces = regroup_pinched(rings);
-    if tile_polygon::check_polygons(&pieces).is_ok() {
-        return pieces;
-    }
-    tile_polygon::repair_polygons(&pieces)
-}
-
 /// Do two polygons (exterior first) interact: would they fail the owner's
 /// check as two parts of one MultiPolygon ([`tile_polygon::check_polygons`])?
 /// That is: they cross or share an edge stretch, one passes from outside
@@ -1003,15 +962,16 @@ fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
     tile_polygon::repair_polygons(&members)
 }
 
-/// A tile's polygonal features projected, quantized and cleaned once, and
-/// which of their parts interact, so that the size valve can encode them in
-/// many groupings without redoing either (#758).
+/// A tile's polygonal features projected and quantized once, and which of
+/// their parts interact, so that the size valve can encode them in many
+/// groupings without redoing either (#758).
 ///
 /// The merge valve (`overview::export::merge_to_fit`) encodes a tile once
 /// per pass, merging more features into each other every time. A merged
 /// feature is a MultiPolygon of its members' polygons, and encoding it
-/// quantizes and cleans each polygon on its own, then unions the parts that
-/// interact. Neither the cleaned parts nor whether two parts interact depend
+/// quantizes each polygon, unions the parts that interact, and hands the
+/// result to the validity owner. Neither the quantized parts nor whether two
+/// parts interact depend
 /// on the grouping, so this quantizes once per tile and tests a pair of
 /// parts at most once, when a pass first puts both in one feature; each pass
 /// then only unions. A component of interacting parts unions to the same pieces
@@ -1027,7 +987,7 @@ const MAX_CANDIDATES_PER_PART: u32 = 64;
 pub(crate) struct QuantizedPolygons {
     /// Per feature, `None` when it is not polygonal.
     features: Vec<Option<QuantizedFeature>>,
-    /// Every feature's cleaned parts, feature by feature.
+    /// Every feature's quantized parts, feature by feature.
     parts: Vec<Vec<TileRing>>,
     /// Per part, its feature's merge key: parts with different keys are
     /// never grouped, so they are never tested against each other.
@@ -1080,7 +1040,7 @@ impl QuantizedPolygons {
         use rayon::prelude::*;
         let proj = TileProjector::new(bounds, extent);
         let (geometries, feature_keys): (Vec<&Geometry>, Vec<u64>) = features.into_iter().unzip();
-        // Per feature: its cleaned parts, `multi` and `has_coords`.
+        // Per feature: its quantized parts, `multi` and `has_coords`.
         type Quantized = (Vec<Vec<TileRing>>, bool, bool);
         let quantized: Vec<Option<Quantized>> = geometries
             .par_iter()
@@ -1282,8 +1242,10 @@ impl QuantizedPolygons {
     }
 }
 
-/// Quantize every ring of `polygon`, clean the result, and return the
-/// polygons to emit (exterior first in each).
+/// Quantize every ring of `polygon`: the polygon in tile units (exterior
+/// first), or nothing when its exterior collapses. Not cleaned: snapping
+/// defects are settled once per feature by [`tile_polygon::finalize_polygons`]
+/// in [`encode_tile_polygons`].
 fn quantized_polygons(polygon: &Polygon, proj: &TileProjector) -> Vec<Vec<TileRing>> {
     let Some(exterior) = quantize_ring(polygon.exterior(), proj) else {
         return Vec::new();
@@ -1295,7 +1257,7 @@ fn quantized_polygons(polygon: &Polygon, proj: &TileProjector) -> Vec<Vec<TileRi
             .iter()
             .filter_map(|r| quantize_ring(r, proj)),
     );
-    clean_tile_polygon(rings)
+    vec![rings]
 }
 
 /// Encode one closed integer ring with the orientation the spec requires
@@ -1400,7 +1362,7 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
 
 /// Encode polygons already in integer tile units (each one an exterior
 /// followed by its holes, rings open or closed) as one MultiPolygon command
-/// stream: clean, resolve overlapping parts and orient exactly as
+/// stream: resolve overlapping parts, make valid and orient exactly as
 /// [`encode_multi_polygon`] does. Empty when nothing has area. The #750
 /// coverage fill is built in tile units, so it skips the projection.
 pub(crate) fn encode_tile_unit_polygons<'a>(
@@ -1426,7 +1388,6 @@ pub(crate) fn encode_tile_unit_polygons<'a>(
             rs.extend(rings[1..].iter().filter_map(close));
             Some(rs)
         })
-        .flat_map(clean_tile_polygon)
         .collect();
     encode_tile_polygons(resolve_part_overlaps(polys))
 }
@@ -3254,7 +3215,7 @@ mod tests {
         ];
         let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 200, y + 200)).collect();
         let before = ring_area2(&ring).abs();
-        let polys = clean_tile_polygon(vec![ring]);
+        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         let out = rings_to_geo(&flat);
         assert_eq!(out.len(), 1, "{flat:?}");
@@ -3324,7 +3285,7 @@ mod tests {
             tile_polygon::check_polygons(&[vec![ring.clone()]]).is_err(),
             "fixture must self-intersect"
         );
-        let polys = clean_tile_polygon(vec![ring]);
+        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         assert!(!flat.is_empty());
         for p in rings_to_geo(&flat) {
@@ -3913,7 +3874,7 @@ mod tests {
     fn zero_net_area_bowtie_keeps_a_lobe() {
         let ring = closed(&[(0, 0), (10, 5), (20, 10), (20, 0), (10, 5), (0, 10)]);
         assert_eq!(ring_area2(&ring), 0, "fixture must have zero net area");
-        let polys = clean_tile_polygon(vec![ring]);
+        let polys = tile_polygon::finalize_polygons(vec![vec![ring]]);
         assert!(!polys.is_empty(), "both lobes dropped");
         let area: i64 = polys.iter().flatten().map(|r| ring_area2(r).abs()).sum();
         assert!(area > 0);

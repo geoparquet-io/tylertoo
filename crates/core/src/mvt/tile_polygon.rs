@@ -5,20 +5,27 @@
 //! and that function hands its parts to [`finalize_polygons`] first, whatever
 //! produced them: a plain encode, the merge valve's cached unions (#758), the
 //! coverage fill (#750), a placeholder square or a `--verbatim` polygon. The
-//! cleanup stages in front of it (pinch splitting and the first overlay
-//! rounds of #393, the part unions of #383) are fast paths: they settle the
-//! common snapping defects cheaply, and whatever they leave behind is caught
-//! here.
+//! part unions in front of it ([`super::resolve_part_overlaps`], #383) are a
+//! fast path for multipolygons whose parts overlap; whatever reaches this
+//! module is checked here regardless.
 //!
 //! [`finalize_polygons`] checks the feature as one OGC MultiPolygon with
 //! exact integer tests ([`check_polygons`]), the same rules GEOS's
 //! `IsValidOp` (and so `shapely.is_valid`) applies to the decoded tile. The
-//! usual outcome is "valid", and the parts go out untouched. A feature that
-//! fails is rebuilt by one `i_overlay` union in the tile's own integer grid
-//! ([`repair_polygons`]), whose OGC extraction cannot produce the defects the
-//! check looks for; the result is checked again, and one that still fails is
-//! counted ([`invalid_after_encode_count`]) and logged, never passed over in
-//! silence.
+//! usual outcome is "valid", and the parts go out untouched: a valid polygon
+//! pays one check and nothing else. A feature that fails is repaired in two
+//! tiers:
+//!
+//! 1. the parts that fail on their own have their rings noded and split at
+//!    pinch vertices, and the pieces regrouped ([`super::regroup_pinched`],
+//!    #393): the neck that snapped shut and the spike that folded back, the
+//!    commonest snapping defects, settle without an overlay;
+//! 2. what still fails is rebuilt by one `i_overlay` union on the tile's own
+//!    integer grid ([`repair_polygons`]), whose OGC extraction cannot produce
+//!    the defects the check looks for.
+//!
+//! The result is checked again, and one that still fails is counted
+//! ([`invalid_after_encode_count`]) and logged, never passed over in silence.
 //!
 //! DIVERGENCE FROM TIPPECANOE: tippecanoe runs every polygon of every tile
 //! through wagyu (`clean_or_clip_poly` in `clip.cpp`: a `clip_type_union` with
@@ -157,7 +164,24 @@ pub(crate) fn finalize_polygons(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>>
         return parts;
     };
     REPAIRED[defect.index()].fetch_add(1, Ordering::Relaxed);
-    let repaired = repair_polygons(&parts);
+    // Tier 1: split the pinches of the parts that fail on their own.
+    let single = parts.len() == 1;
+    let pieces: Vec<Vec<TileRing>> = parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .flat_map(|p| {
+            if !single && check_polygons(std::slice::from_ref(&p)).is_ok() {
+                vec![p]
+            } else {
+                super::regroup_pinched(p)
+            }
+        })
+        .collect();
+    if check_polygons(&pieces).is_ok() {
+        return pieces;
+    }
+    // Tier 2: one union on the grid.
+    let repaired = repair_polygons(&pieces);
     if let Err(left) = check_polygons(&repaired) {
         count_invalid_after_encode(left);
     }
