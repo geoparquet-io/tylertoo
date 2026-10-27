@@ -35,6 +35,7 @@ crates/core/src/overview/convert.rs :: byte_array_row_too_large_message <-> in_m
 crates/core/src/overview/convert.rs :: convert_to_overviews <-> convert_to_overviews_source
 crates/core/src/overview/convert.rs :: convert_to_overviews <-> convert_to_overviews_sources
 crates/core/src/overview/convert.rs :: convert_to_overviews_source <-> convert_to_overviews_sources
+crates/core/src/overview/convert.rs :: generalization_is_off <-> is_config
 crates/core/src/overview/convert.rs :: resolve_in_flight_batches <-> resolve_read_workers
 crates/core/src/overview/export.rs :: covering_batch_bboxes <-> decode_batch_bboxes
 crates/core/src/overview/export.rs :: export_pmtiles_impl <-> export_pmtiles_with_partition_target
@@ -59,11 +60,10 @@ crates/core/src/pyramid.rs :: for_each_tile <-> for_each_tile_range
 crates/core/src/shard.rs :: parse <-> parse
 crates/core/src/sutherland_hodgman.rs :: clip_ring <-> clip_ring_against_edge
 crates/core/src/wkb.rs :: geometry_to_wkb <-> wkb_to_geometry
-crates/python/src/lib.rs :: convert <-> export_pmtiles
-crates/python/src/lib.rs :: convert_error_to_py <-> tiles_error_to_py
-crates/python/src/lib.rs :: decode_error_to_py <-> export_error_to_py
-crates/python/src/lib.rs :: decode_error_to_py <-> tiles_error_to_py
-crates/python/src/lib.rs :: export_error_to_py <-> tiles_error_to_py
+crates/python/src/lib.rs :: convert_error_to_py <-> export_error_to_py
+crates/python/src/lib.rs :: decode <-> export_pmtiles
+crates/python/src/lib.rs :: export_pmtiles <-> overview
+crates/python/src/lib.rs :: export_pmtiles <-> pyramid
 
 # convert.rs and stream.rs concatenated, pairs that span both engines
 # (the twin-function pattern behind #507/8576c61 and #407/ab5214d).
@@ -87,7 +87,8 @@ convert.rs::default <-> stream.rs::stage_secs
 convert.rs::extend <-> stream.rs::stage_secs
 convert.rs::generalization_is_off <-> stream.rs::stage_secs
 convert.rs::in_memory_carriers <-> stream.rs::streaming_carriers
-convert.rs::load_input_table <-> stream.rs::convert_preflight
+convert.rs::is_config <-> stream.rs::inputs
+convert.rs::is_config <-> stream.rs::stage_secs
 convert.rs::new <-> stream.rs::new
 convert.rs::preflight_pass1_memory_probed <-> stream.rs::convert_preflight
 convert.rs::resolve <-> stream.rs::resolve_ranking_tier
