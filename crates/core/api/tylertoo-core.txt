@@ -63,6 +63,8 @@ impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for ty
 pub fn tylertoo_core::Error::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::decode::DecodeError
 pub fn tylertoo_core::decode::DecodeError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::export::ExportError
@@ -797,6 +799,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify:
 pub enum tylertoo_core::overview::assign::SortDirection
 pub tylertoo_core::overview::assign::SortDirection::Asc
 pub tylertoo_core::overview::assign::SortDirection::Desc
+impl tylertoo_core::overview::assign::SortDirection
+pub fn tylertoo_core::overview::assign::SortDirection::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::clone(&self) -> tylertoo_core::overview::assign::SortDirection
 impl core::cmp::Eq for tylertoo_core::overview::assign::SortDirection
@@ -1232,6 +1236,105 @@ pub const tylertoo_core::overview::coalesce::DEFAULT_COALESCE_MAX_LEVEL_ROWS: us
 pub const tylertoo_core::overview::coalesce::DEFAULT_JUNCTION_ANGLE_DEG: f64
 pub const tylertoo_core::overview::coalesce::DEFAULT_SNAP_GSD_FACTOR: f64
 pub fn tylertoo_core::overview::coalesce::coalesce_level_lines(&[tylertoo_core::overview::coalesce::CoalesceInput<'_>], f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::coalesce::CoalesceParams) -> alloc::vec::Vec<tylertoo_core::overview::coalesce::CoalescedLine>
+pub mod tylertoo_core::overview::config
+#[non_exhaustive] pub enum tylertoo_core::overview::config::ConfigError
+pub tylertoo_core::overview::config::ConfigError::ClassRankIncomplete
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite::class: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite::rank: f64
+pub tylertoo_core::overview::config::ConfigError::ClassRankSpelledTwice
+pub tylertoo_core::overview::config::ConfigError::CoalescePartitioningUnsupported
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom::min_zoom: u8
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom::pivot: u8
+pub tylertoo_core::overview::config::ConfigError::CollapseConflict
+pub tylertoo_core::overview::config::ConfigError::EntryZoomConflict
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated::op: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded
+pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded
+pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::InvalidExtent
+pub tylertoo_core::overview::config::ConfigError::InvalidExtent::extent: u32
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec::message: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec::option: &'static str
+pub tylertoo_core::overview::config::ConfigError::KeepOverviewDirMissing
+pub tylertoo_core::overview::config::ConfigError::KeepOverviewDirMissing::dir: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::MetadataTooLarge(alloc::string::String)
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::command: &'static str
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::option: &'static str
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::reason: &'static str
+pub tylertoo_core::overview::config::ConfigError::Output(tylertoo_core::atomic_output::OutputNotWritable)
+pub tylertoo_core::overview::config::ConfigError::OutputExists
+pub tylertoo_core::overview::config::ConfigError::OutputExists::path: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::kind: tylertoo_core::overview::config::OutputKind
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::path: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::PlanOnlyDataShard
+pub tylertoo_core::overview::config::ConfigError::PlanOnlyWithoutSavePlan
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::pivot: u8
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::range_pivot: u8
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotDirectory(std::path::PathBuf)
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::buffer: u32
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::max: u32
+pub tylertoo_core::overview::config::ConfigError::TileRangeWithDataShard
+impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::error::Error for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::overview::config::ConfigError
+impl core::marker::Send for tylertoo_core::overview::config::ConfigError
+impl core::marker::Sync for tylertoo_core::overview::config::ConfigError
+impl core::marker::Unpin for tylertoo_core::overview::config::ConfigError
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::ConfigError
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::ConfigError
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::ConfigError
+pub enum tylertoo_core::overview::config::OutputKind
+pub tylertoo_core::overview::config::OutputKind::GeoParquet
+pub tylertoo_core::overview::config::OutputKind::Pmtiles
+impl core::clone::Clone for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::clone(&self) -> tylertoo_core::overview::config::OutputKind
+impl core::cmp::Eq for tylertoo_core::overview::config::OutputKind
+impl core::cmp::PartialEq for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::eq(&self, &tylertoo_core::overview::config::OutputKind) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::config::OutputKind
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::config::OutputKind
+impl core::marker::Freeze for tylertoo_core::overview::config::OutputKind
+impl core::marker::Send for tylertoo_core::overview::config::OutputKind
+impl core::marker::Sync for tylertoo_core::overview::config::OutputKind
+impl core::marker::Unpin for tylertoo_core::overview::config::OutputKind
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::OutputKind
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::OutputKind
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::OutputKind
+pub const tylertoo_core::overview::config::DEFAULT_LADDER_STEP: u8
+pub fn tylertoo_core::overview::config::check_output(&std::path::Path, tylertoo_core::overview::config::OutputKind, bool) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::check_spill_dir(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::class_ranking(core::option::Option<&str>, core::option::Option<alloc::string::String>, core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, f64>>, core::option::Option<f64>) -> core::result::Result<core::option::Option<tylertoo_core::overview::convert::ClassRanking>, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::collapse_mode(bool, bool, bool) -> core::result::Result<tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::entry_zoom(core::option::Option<&str>, u8, core::option::Option<&str>) -> core::result::Result<core::option::Option<tylertoo_core::overview::ladder::EntryZoomSpec>, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::representation(core::option::Option<&str>) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, tylertoo_core::overview::config::ConfigError>
 pub mod tylertoo_core::overview::convert
 #[non_exhaustive] pub enum tylertoo_core::overview::convert::ConvertError
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing
@@ -1264,6 +1367,7 @@ pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString::na
 pub tylertoo_core::overview::convert::ConvertError::ClusterInvariant(alloc::string::String)
 pub tylertoo_core::overview::convert::ConvertError::ClusterPartitioningUnsupported
 pub tylertoo_core::overview::convert::ConvertError::CoalescedCountColumnPresent
+pub tylertoo_core::overview::convert::ConvertError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::convert::ConvertError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::convert::ConvertError::Filter(tylertoo_core::overview::filter::FilterError)
 pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge
@@ -1302,6 +1406,8 @@ pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::asked: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::zoom: i64
+impl tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::is_config(&self) -> bool
 impl core::convert::From<arrow_schema::error::ArrowError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(arrow_schema::error::ArrowError) -> Self
 impl core::convert::From<core::io::error::Error> for tylertoo_core::overview::convert::ConvertError
@@ -1314,6 +1420,8 @@ impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for ty
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::input::InputError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::overview::filter::FilterError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::filter::FilterError) -> Self
 impl core::convert::From<tylertoo_core::overview::properties::PropertySelectionError> for tylertoo_core::overview::convert::ConvertError
@@ -1410,6 +1518,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::streaming: bool
 pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
+pub fn tylertoo_core::overview::convert::ConvertOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
 pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertOptions
@@ -1650,6 +1759,7 @@ pub fn tylertoo_core::overview::convert::write_convert_plan_sources(&tylertoo_co
 pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::overview::export::ExportError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::export::ExportError::CoveringProperty
 pub tylertoo_core::overview::export::ExportError::CoveringProperty::name: alloc::string::String
@@ -1662,8 +1772,6 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declar
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::reason: tylertoo_core::overview::export::FeatureIdColumnProblem
-pub tylertoo_core::overview::export::ExportError::InvalidExtent
-pub tylertoo_core::overview::export::ExportError::InvalidExtent::extent: u32
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::level: usize
@@ -1686,7 +1794,6 @@ pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previo
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::zoom: u8
-pub tylertoo_core::overview::export::ExportError::MetadataTooLarge(alloc::string::String)
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportError::Output(tylertoo_core::atomic_output::OutputNotWritable)
@@ -1700,10 +1807,6 @@ pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
-pub tylertoo_core::overview::export::ExportError::SpillDirNotDirectory(std::path::PathBuf)
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::buffer: u32
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1725,6 +1828,8 @@ pub tylertoo_core::overview::export::ExportError::UnsupportedCrs::path: alloc::s
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty::data_type: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty::name: alloc::string::String
+impl tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::is_config(&self) -> bool
 impl core::convert::From<arrow_schema::error::ArrowError> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(arrow_schema::error::ArrowError) -> Self
 impl core::convert::From<core::io::error::Error> for tylertoo_core::overview::export::ExportError
@@ -1733,6 +1838,8 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::overview::reader::ReaderError> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::reader::ReaderError) -> Self
 impl core::error::Error for tylertoo_core::overview::export::ExportError
@@ -1787,6 +1894,8 @@ impl core::default::Default for tylertoo_core::overview::export::FeatureOrder
 pub fn tylertoo_core::overview::export::FeatureOrder::default() -> tylertoo_core::overview::export::FeatureOrder
 impl core::fmt::Debug for tylertoo_core::overview::export::FeatureOrder
 pub fn tylertoo_core::overview::export::FeatureOrder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::FeatureOrder
+pub fn tylertoo_core::overview::export::FeatureOrder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::FeatureOrder
 impl core::str::traits::FromStr for tylertoo_core::overview::export::FeatureOrder
 pub type tylertoo_core::overview::export::FeatureOrder::Err = alloc::string::String
@@ -1835,6 +1944,8 @@ impl core::default::Default for tylertoo_core::overview::export::SizeValve
 pub fn tylertoo_core::overview::export::SizeValve::default() -> tylertoo_core::overview::export::SizeValve
 impl core::fmt::Debug for tylertoo_core::overview::export::SizeValve
 pub fn tylertoo_core::overview::export::SizeValve::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::export::SizeValve
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::SizeValve
 impl core::str::traits::FromStr for tylertoo_core::overview::export::SizeValve
@@ -1866,7 +1977,8 @@ pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Op
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::export::ExportOptions
-pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
+pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::export::ExportOptions::verbatim(self) -> Self
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
 impl core::default::Default for tylertoo_core::overview::export::ExportOptions
@@ -2206,6 +2318,8 @@ pub enum tylertoo_core::overview::level::MemoryProfile
 pub tylertoo_core::overview::level::MemoryProfile::Auto
 pub tylertoo_core::overview::level::MemoryProfile::Bounded
 pub tylertoo_core::overview::level::MemoryProfile::Speed
+impl tylertoo_core::overview::level::MemoryProfile
+pub fn tylertoo_core::overview::level::MemoryProfile::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::clone(&self) -> tylertoo_core::overview::level::MemoryProfile
 impl core::cmp::Eq for tylertoo_core::overview::level::MemoryProfile
@@ -2234,6 +2348,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::Me
 pub enum tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::level::Mode::Duplicating
 pub tylertoo_core::overview::level::Mode::Partitioning
+impl tylertoo_core::overview::level::Mode
+pub fn tylertoo_core::overview::level::Mode::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::clone(&self) -> tylertoo_core::overview::level::Mode
 impl core::cmp::Eq for tylertoo_core::overview::level::Mode
@@ -2854,25 +2970,21 @@ pub fn tylertoo_core::overview::simplify::validation_skip_count() -> u64
 pub fn tylertoo_core::overview::simplify::world_tolerance(f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> f64
 pub mod tylertoo_core::overview::tiles
 #[non_exhaustive] pub enum tylertoo_core::overview::tiles::TilesError
+pub tylertoo_core::overview::tiles::TilesError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::tiles::TilesError::Convert(tylertoo_core::overview::convert::ConvertError)
 pub tylertoo_core::overview::tiles::TilesError::EmptyCoarseArchive(tylertoo_core::overview::export::ExportError)
 pub tylertoo_core::overview::tiles::TilesError::EmptyShardArchive(tylertoo_core::overview::export::ExportError)
 pub tylertoo_core::overview::tiles::TilesError::Export(tylertoo_core::overview::export::ExportError)
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::name: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::op: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded::name: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded
-pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded::name: alloc::string::String
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::dir: std::path::PathBuf
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::source: core::io::error::Error
-pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing
-pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing::dir: std::path::PathBuf
 pub tylertoo_core::overview::tiles::TilesError::Output(tylertoo_core::atomic_output::OutputNotWritable)
+impl tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::is_config(&self) -> bool
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::tiles::TilesError
 pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::error::Error for tylertoo_core::overview::tiles::TilesError
 pub fn tylertoo_core::overview::tiles::TilesError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesError
@@ -2892,6 +3004,7 @@ pub tylertoo_core::overview::tiles::TilesInput::Path(std::path::PathBuf)
 impl tylertoo_core::overview::tiles::TilesInput
 pub fn tylertoo_core::overview::tiles::TilesInput::convert(&self, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::tiles::TilesInput::derive_layer_name(&self) -> alloc::string::String
+pub fn tylertoo_core::overview::tiles::TilesInput::source(&self) -> core::result::Result<tylertoo_core::input_set::ConvertSource, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesInput
 pub fn tylertoo_core::overview::tiles::TilesInput::clone(&self) -> tylertoo_core::overview::tiles::TilesInput
 impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesInput
@@ -2962,21 +3075,16 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateO
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 pub struct tylertoo_core::overview::tiles::TilesOptions
-pub tylertoo_core::overview::tiles::TilesOptions::compressed_tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
-pub tylertoo_core::overview::tiles::TilesOptions::coverage_fill: bool
-pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
+pub tylertoo_core::overview::tiles::TilesOptions::export: tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::tiles::TilesOptions::layer_name: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::tiles::TilesOptions::metadata: tylertoo_core::TilesetMetadata
-pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
 pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
-pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
-pub tylertoo_core::overview::tiles::TilesOptions::size_valve: tylertoo_core::overview::export::SizeValve
-pub tylertoo_core::overview::tiles::TilesOptions::tile_buffer: u32
-pub tylertoo_core::overview::tiles::TilesOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
-pub tylertoo_core::overview::tiles::TilesOptions::tile_size_limit: core::option::Option<usize>
+impl tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::export_defaults(bool) -> tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::ignored_by_plan_only(&self, &tylertoo_core::overview::export::ExportOptions) -> alloc::vec::Vec<&'static str>
+pub fn tylertoo_core::overview::tiles::TilesOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::TilesOptions::validate_plan_only(&self) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::clone(&self) -> tylertoo_core::overview::tiles::TilesOptions
 impl core::default::Default for tylertoo_core::overview::tiles::TilesOptions
@@ -3016,7 +3124,6 @@ pub tylertoo_core::overview::tiles::TilesShard::range: core::option::Option<tyle
 pub tylertoo_core::overview::tiles::TilesShard::role: tylertoo_core::shard::ShardRole
 impl tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::apply_selection(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
-pub fn tylertoo_core::overview::tiles::TilesShard::apply_to_convert(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::clone(&self) -> tylertoo_core::overview::tiles::TilesShard
 impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesShard
@@ -3032,14 +3139,16 @@ impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesShard
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesShard
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesShard
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesShard
+pub const tylertoo_core::overview::tiles::TILES_DEFAULT_MAX_ZOOM: u8
 pub trait tylertoo_core::overview::tiles::TilesObserver
+pub fn tylertoo_core::overview::tiles::TilesObserver::intermediate_space_low(&mut self, &str)
 pub fn tylertoo_core::overview::tiles::TilesObserver::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
 impl tylertoo_core::overview::tiles::TilesObserver for ()
+pub fn ()::intermediate_space_low(&mut self, &str)
 pub fn ()::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
-pub fn tylertoo_core::overview::tiles::check_keep_overview(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
-pub fn tylertoo_core::overview::tiles::check_knob_columns(&tylertoo_core::overview::convert::ConvertOptions, &tylertoo_core::overview::export::FeatureOrder, core::option::Option<&str>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles_observed(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, &mut dyn tylertoo_core::overview::tiles::TilesObserver) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::write_plan(&tylertoo_core::overview::tiles::TilesInput, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::tiles::TilesError>
 pub mod tylertoo_core::overview::writer
 pub enum tylertoo_core::overview::writer::LevelWriteOutcome
 pub tylertoo_core::overview::writer::LevelWriteOutcome::SkippedEmpty
@@ -3063,6 +3172,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::writer::L
 pub enum tylertoo_core::overview::writer::RowGroupSizePolicy
 pub tylertoo_core::overview::writer::RowGroupSizePolicy::Constant
 pub tylertoo_core::overview::writer::RowGroupSizePolicy::ZoomScaled
+impl tylertoo_core::overview::writer::RowGroupSizePolicy
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::clone(&self) -> tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::cmp::Eq for tylertoo_core::overview::writer::RowGroupSizePolicy
@@ -3409,6 +3520,9 @@ pub tylertoo_core::pyramid::PyramidOptions::convert: tylertoo_core::overview::co
 pub tylertoo_core::pyramid::PyramidOptions::export: tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::pyramid::PyramidOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::pyramid::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
+impl tylertoo_core::pyramid::PyramidOptions
+pub fn tylertoo_core::pyramid::PyramidOptions::new(bool) -> Self
+pub fn tylertoo_core::pyramid::PyramidOptions::validate(&self) -> core::result::Result<(), tylertoo_core::Error>
 impl core::clone::Clone for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::clone(&self) -> tylertoo_core::pyramid::PyramidOptions
 impl core::default::Default for tylertoo_core::pyramid::PyramidOptions
@@ -3434,6 +3548,8 @@ impl core::clone::Clone for tylertoo_core::pyramid::PyramidReport
 pub fn tylertoo_core::pyramid::PyramidReport::clone(&self) -> tylertoo_core::pyramid::PyramidReport
 impl core::fmt::Debug for tylertoo_core::pyramid::PyramidReport
 pub fn tylertoo_core::pyramid::PyramidReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::pyramid::PyramidReport
+pub fn tylertoo_core::pyramid::PyramidReport::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl core::marker::Freeze for tylertoo_core::pyramid::PyramidReport
 impl core::marker::Send for tylertoo_core::pyramid::PyramidReport
 impl core::marker::Sync for tylertoo_core::pyramid::PyramidReport
@@ -4019,6 +4135,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::compression::Compression
 pub enum tylertoo_core::Error
+pub tylertoo_core::Error::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::Error::GeoParquetRead(alloc::string::String)
 pub tylertoo_core::Error::InvalidConfig(alloc::string::String)
 pub tylertoo_core::Error::InvalidGeometry
@@ -4039,6 +4156,8 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::error::Error for tylertoo_core::Error
 pub fn tylertoo_core::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::Error

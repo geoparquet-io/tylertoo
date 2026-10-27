@@ -184,6 +184,16 @@ pub enum SortDirection {
     Asc,
 }
 
+impl SortDirection {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortDirection::Desc => "desc",
+            SortDirection::Asc => "asc",
+        }
+    }
+}
+
 impl std::str::FromStr for SortDirection {
     type Err = String;
 

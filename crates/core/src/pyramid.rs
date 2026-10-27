@@ -29,6 +29,7 @@ use crate::archive_index::{ArchiveIndex, MergedTiles};
 use crate::compression::{self, Compression, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
 use crate::dedup::TileHasher;
 use crate::input::url_scheme;
+use crate::overview::config::ConfigError;
 use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use crate::overview::export::{export_pmtiles, ExportOptions};
 use crate::pmtiles_metadata::{MetadataCollector, Resolved};
@@ -1416,6 +1417,50 @@ pub struct PyramidReport {
     pub bands_without_metadata: Vec<String>,
 }
 
+/// The `pyramid --report` JSON and the Python `pyramid()` dict: one shape for
+/// both (#779), with each band as a `{layer, min_zoom, max_zoom, tiles}`
+/// object and [`PyramidReport::skipped`] as `skipped_tiles`.
+impl serde::Serialize for PyramidReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct BandReport<'a> {
+            layer: &'a str,
+            min_zoom: u8,
+            max_zoom: u8,
+            tiles: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct Report<'a> {
+            total_tiles: usize,
+            bands: Vec<BandReport<'a>>,
+            skipped_tiles: usize,
+            bands_without_bounds: &'a [String],
+            metadata: &'a TilesetMetadata,
+            metadata_conflicts: &'a [String],
+            bands_without_metadata: &'a [String],
+        }
+        Report {
+            total_tiles: self.total_tiles,
+            bands: self
+                .per_band_tiles
+                .iter()
+                .map(|(layer, min_zoom, max_zoom, tiles)| BandReport {
+                    layer,
+                    min_zoom: *min_zoom,
+                    max_zoom: *max_zoom,
+                    tiles: *tiles,
+                })
+                .collect(),
+            skipped_tiles: self.skipped,
+            bands_without_bounds: &self.bands_without_bounds,
+            metadata: &self.metadata,
+            metadata_conflicts: &self.metadata_conflicts,
+            bands_without_metadata: &self.bands_without_metadata,
+        }
+        .serialize(serializer)
+    }
+}
+
 /// Knobs for [`merge_bands_with_options`].
 #[derive(Debug, Clone, Default)]
 pub struct BandMergeOptions {
@@ -1481,15 +1526,88 @@ impl Default for PyramidOptions {
             // Every feature of an aggregate band must be drawn, so the default
             // per-tile size valve — which sheds features to fit a byte budget
             // — is off on both caps, matching `tiles --verbatim` (#761).
-            export: ExportOptions {
-                tile_size_limit: None,
-                compressed_tile_size_limit: None,
-                ..ExportOptions::default()
-            },
+            export: ExportOptions::default().verbatim(),
             work_dir: None,
             allow_missing_zooms: false,
             metadata: TilesetMetadata::default(),
         }
+    }
+}
+
+/// Export fields [`build_pyramid`] substitutes per band, or does not use,
+/// by the name the [`ConfigError::OptionIgnored`] message gives them, with
+/// why. A band's export cannot honour any of them.
+const PYRAMID_IGNORED_EXPORT_FIELDS: [(&str, &str); 5] = [
+    (
+        "export.layer_name",
+        "each band's layer comes from its --band spec",
+    ),
+    (
+        "export.min_zoom",
+        "each band declares its own --band zoom range",
+    ),
+    (
+        "export.tile_range",
+        "a pyramid band is not a shard; tile each band whole",
+    ),
+    (
+        "export.zoom_ceiling",
+        "a pyramid band is not a shard; each band's --band range bounds its zooms",
+    ),
+    (
+        "export.metadata",
+        "the output's name, description and attribution are PyramidOptions::metadata",
+    ),
+];
+
+impl PyramidOptions {
+    /// The defaults for a build that tiles its GeoParquet bands verbatim
+    /// (`generalize: false`, [`PyramidOptions::default`]) or through the
+    /// normal generalization ladder (`--generalize`). Neither puts a size
+    /// cap on a band unless one is asked for (#761).
+    pub fn new(generalize: bool) -> Self {
+        let mut options = Self::default();
+        if generalize {
+            options.convert = ConvertOptions::default();
+        }
+        options
+    }
+
+    /// Check every option rule that needs no band (#779): the convert and
+    /// export knobs every band runs with, and the export fields a band's
+    /// export cannot honour (its layer, zoom range and the archive's
+    /// metadata come from elsewhere; a band is never a shard).
+    /// [`build_pyramid`] runs this first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`], or [`Error::InvalidConfig`] for a convert knob.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.convert
+            .validate()
+            .map_err(|e| Error::InvalidConfig(format!("band convert options: {e}")))?;
+        self.export.validate()?;
+        let defaults = ExportOptions::default();
+        let set = [
+            self.export.layer_name != defaults.layer_name,
+            self.export.min_zoom.is_some(),
+            self.export.tile_range.is_some(),
+            self.export.zoom_ceiling.is_some(),
+            self.export.metadata != defaults.metadata,
+        ];
+        if let Some(((option, reason), _)) = PYRAMID_IGNORED_EXPORT_FIELDS
+            .iter()
+            .zip(set)
+            .find(|(_, set)| *set)
+        {
+            return Err(ConfigError::OptionIgnored {
+                option,
+                command: "pyramid",
+                reason,
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -1520,6 +1638,8 @@ pub fn build_pyramid(
     output: &Path,
     opts: &PyramidOptions,
 ) -> Result<PyramidReport, Error> {
+    // #779: the options every band runs with, before any band is read.
+    opts.validate()?;
     // Validates every band up front, including (#482) that none names a
     // remote `.pmtiles` archive — pure string work, so it is cheap to run for
     // every band before any band is tiled, rather than interleaved with
@@ -5188,7 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn build_pyramid_passes_on_archive_bands_and_ignores_export_metadata() {
+    fn build_pyramid_passes_on_archive_bands_and_refuses_export_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let coarse = dir.path().join("coarse.parquet");
         write_cell_source(&coarse, 40, 0.6);
@@ -5212,15 +5332,30 @@ mod tests {
             metadata: last,
             ..Default::default()
         };
-        // A GeoParquet band passes nothing on, whatever `export.metadata`
-        // says; the archive band's values pass through.
+        // #779: `export.metadata` would be ignored (the output's metadata is
+        // `PyramidOptions::metadata`), so setting it is refused up front
+        // rather than silently dropped.
         let out = dir.path().join("plain.pmtiles");
-        let report = build_pyramid(
+        let err = build_pyramid(
             &bands,
             &out,
             &opts(meta().with_name("Grid").with_attribution("Census"), meta()),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Config(ConfigError::OptionIgnored {
+                    option: "export.metadata",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(!out.exists());
+        // A GeoParquet band passes nothing on; the archive band's values
+        // pass through.
+        let report = build_pyramid(&bands, &out, &opts(meta(), meta())).unwrap();
         let want = meta().with_name("Cells").with_attribution("Survey");
         assert_eq!(publication(&out), want);
         assert_eq!(report.metadata, want);

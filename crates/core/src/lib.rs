@@ -103,6 +103,11 @@ pub enum Error {
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] atomic_output::OutputNotWritable),
+
+    /// An option refused before any work
+    /// ([`pyramid::PyramidOptions::validate`], #779).
+    #[error(transparent)]
+    Config(#[from] overview::config::ConfigError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

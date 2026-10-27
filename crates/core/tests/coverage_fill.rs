@@ -337,3 +337,78 @@ fn coverage_fill_work_stays_bounded_on_scattered_fields() {
         );
     }
 }
+
+/// #771 option 1: the coarse job of a sharded build (a zoom ceiling) builds
+/// the fill from the file's finest level, which it reads but does not emit,
+/// so its zooms carry exactly the fill the unsharded export draws there. A
+/// data shard (a tile range) still builds none.
+#[test]
+fn a_coarse_job_draws_the_unsharded_fill_below_its_ceiling() {
+    use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
+    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions, ExportReport};
+    use tylertoo_core::shard::TileRange;
+
+    let Some(fixture_path) = fixture::realdata("ftw-moldova-z10.parquet") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let overview = dir.path().join("overview.parquet");
+    convert_to_overviews(
+        &fixture_path,
+        &overview,
+        &ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 12,
+            },
+            ..Default::default()
+        },
+    )
+    .expect("convert");
+    let export = |name: &str, opts: ExportOptions| -> ExportReport {
+        let opts = ExportOptions {
+            coverage_fill: true,
+            ..opts
+        };
+        export_pmtiles(&overview, dir.path().join(name), &opts).expect("export")
+    };
+    let fill = |r: &ExportReport, z: u8| {
+        r.zooms
+            .iter()
+            .find(|zr| zr.zoom == z)
+            .map(|zr| (zr.tile_count, zr.fill_polygons, zr.fill_vertices))
+    };
+
+    let whole = export("whole.pmtiles", ExportOptions::default());
+    let ceiling = 8;
+    let coarse = export(
+        "coarse.pmtiles",
+        ExportOptions {
+            zoom_ceiling: Some(ceiling),
+            ..ExportOptions::default()
+        },
+    );
+    let drawn: usize = coarse.zooms.iter().map(|z| z.fill_polygons).sum();
+    assert!(drawn > 0, "the coarse job drew no fill");
+    for z in 0..=ceiling {
+        assert_eq!(
+            fill(&coarse, z),
+            fill(&whole, z),
+            "z{z}: the coarse job's fill differs from the unsharded export's"
+        );
+    }
+
+    // A data shard owns the zooms from its pivot down, where the fill
+    // matters least, and does not build it.
+    let shard = export(
+        "shard.pmtiles",
+        ExportOptions {
+            tile_range: Some(TileRange::parse("5..12").expect("a valid range")),
+            ..ExportOptions::default()
+        },
+    );
+    assert_eq!(
+        shard.zooms.iter().map(|z| z.fill_polygons).sum::<usize>(),
+        0
+    );
+}
