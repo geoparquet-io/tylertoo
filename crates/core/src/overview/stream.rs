@@ -2835,6 +2835,10 @@ fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerRep
     (peak_rss_mib, rss_sampler_report)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "#779: F1 merges the engine report and writer stages next"
+)]
 pub(crate) fn convert_streaming_strategy(
     source: &ConvertSource,
     output_path: &Path,

@@ -360,6 +360,21 @@ impl<const FULL: bool> ConvertArgs<FULL> {
     }
 }
 
+/// Deserialize the supplied scope over the option type's core defaults.
+fn parse_scoped_options<T: Args + Default>(
+    matches: &clap::ArgMatches,
+    excluded: Option<&str>,
+) -> Result<(T, clap::ArgMatches), clap::Error> {
+    let complete = scoped_matches(
+        T::augment_args(clap::Command::new("options").disable_help_flag(true)),
+        matches,
+        excluded,
+    )?;
+    let mut options = T::default();
+    options.update_from_arg_matches(&complete)?;
+    Ok((options, complete))
+}
+
 /// Export flags parse directly into `ExportOptions`. The supplied-field set is
 /// syntax provenance, so `auto` can use each command's own defaults.
 #[derive(Debug, Clone)]
@@ -388,18 +403,8 @@ impl<const FULL: bool> Args for ExportArgs<FULL> {
 }
 impl<const FULL: bool> FromArgMatches for ExportArgs<FULL> {
     fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        let complete = scoped_matches(
-            ExportOptions::augment_args(clap::Command::new("options").disable_help_flag(true)),
-            matches,
-            (!FULL).then_some("export_only"),
-        )?;
-        let matches = &complete;
-        let mut options = ExportOptions::default();
-        options.update_from_arg_matches(matches)?;
-        Ok(Self {
-            options,
-            matches: complete,
-        })
+        let (options, matches) = parse_scoped_options(matches, (!FULL).then_some("export_only"))?;
+        Ok(Self { options, matches })
     }
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
         *self = Self::from_arg_matches(matches)?;
@@ -450,13 +455,7 @@ impl<T: Args + Default> Args for FacadeArgs<T> {
 }
 impl<T: Args + Default> FromArgMatches for FacadeArgs<T> {
     fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        let complete = scoped_matches(
-            T::augment_args(clap::Command::new("options").disable_help_flag(true)),
-            matches,
-            None,
-        )?;
-        let mut options = T::default();
-        options.update_from_arg_matches(&complete)?;
+        let (options, _) = parse_scoped_options(matches, None)?;
         Ok(Self { options })
     }
     fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {

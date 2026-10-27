@@ -1928,10 +1928,6 @@ struct Pass2Run {
     single_read: bool,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "#779: F1 merges the engine report and writer stages next"
-)]
 fn export_pmtiles_run(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -1943,6 +1939,10 @@ fn export_pmtiles_run(
     export_pmtiles_validated(input_path, output_path, &validated, partition_target, knobs)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "#779: F1 merges the engine report and writer stages next"
+)]
 fn export_pmtiles_validated(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,

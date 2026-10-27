@@ -400,3 +400,11 @@ cannot honour.
 
 
 _defaults = _tylertoo._defaults
+
+
+# doctest does not discover native callables.
+# Use their original examples.
+__test__ = {
+    function.__name__: function.__doc__ or ""
+    for function in (convert, decode, export_pmtiles, overview, pyramid, validate)
+}
