@@ -1,0 +1,16 @@
+# gate: cargo build --release --locked --package tylertoo && python3 benchmarks/e2e/run_e2e.py --invariants --only ftw-moldova-z10 --settings defaults
+# expect: FAIL +polygon_valid +z\d+ +\d+ / \d+ polygon features invalid
+# issue: #779 F6, #748: every polygonal MVT feature passes the tile-space validity owner (mvt::tile_polygon::finalize_polygons) in encode_tile_polygons; bypass it and snapped polygons with pinches, overlapping parts and stray holes reach the tiles
+diff --git a/crates/core/src/mvt.rs b/crates/core/src/mvt.rs
+index 30d296d..dc291c4 100644
+--- a/crates/core/src/mvt.rs
++++ b/crates/core/src/mvt.rs
+@@ -1305,7 +1305,7 @@ fn encode_tile_ring(
+ /// coverage fill, placeholder squares, `--verbatim`), what leaves is a valid
+ /// OGC MultiPolygon in tile space, or a counted failure (#748).
+ fn encode_tile_polygons(polys: Vec<Vec<TileRing>>) -> Vec<u32> {
+-    let polys = tile_polygon::finalize_polygons(polys);
++    let polys = polys; // canary: the validity owner is bypassed
+     let total: usize = polys.iter().flatten().map(|r| 4 + r.len() * 2).sum();
+     let mut out = Vec::with_capacity(total);
+     let mut cursor = (0i32, 0i32);

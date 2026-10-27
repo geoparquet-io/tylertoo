@@ -152,7 +152,7 @@ PER_ZOOM_INVARIANTS = frozenset({"tile_size", "polygon_valid", "monotone"})
 # The pinned size of benchmarks/e2e/invariant_exemptions.toml. A row added
 # without raising this, or removed without lowering it, fails
 # `--check-exemptions` (run by e2e.yml): the list can only change on purpose.
-EXPECTED_EXEMPTION_ROWS = 21
+EXPECTED_EXEMPTION_ROWS = 6
 
 # Placeholder-square decay (#749). Under the dither, a square standing in for
 # a polygon of area A at a level of side s survives with probability A / s^2,
