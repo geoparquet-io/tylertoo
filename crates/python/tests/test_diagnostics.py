@@ -20,9 +20,9 @@ def test_second_conversion_warns_again_with_its_own_counts(tmp_path, caplog):
             str(tmp_path / f"overview-{index}.parquet"),
             max_zoom=4,
         )
-        events = [
-            d for d in report["diagnostics"] if d["kind"] == "non_finite_geometry"
-        ]
-        assert events == [{"kind": "non_finite_geometry", "count": 2}]
+        assert (
+            report["diagnostics"].count({"kind": "non_finite_geometry", "count": 2})
+            == 1
+        )
         assert len(report["source_losses"]) == 2
-        assert any("NaN or infinite" in record.message for record in caplog.records)
+        assert "NaN or infinite" in caplog.text

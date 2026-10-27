@@ -51,6 +51,8 @@ OVERVIEW_GROUPS = {
 # Report types, outermost first.
 TYPE_ORDER = [
     "OverviewReport",
+    "Diagnostic",
+    "SourceLoss",
     "LevelReport",
     "SkippedLevel",
     "OutOfRangeExemplar",
@@ -235,9 +237,15 @@ def _render_type(name: str) -> str:
     cls = getattr(tylertoo, name)
     doc = parse(inspect.getdoc(cls) or "")
     # TypedDict wraps each annotation in a ForwardRef; print its source.
-    fields = [
-        f"    {key}: {getattr(value, '__forward_arg__', value)}"
+    annotations = {
+        key: getattr(value, "__forward_arg__", value)
         for key, value in cls.__annotations__.items()
+    }
+    fields = [
+        f"    {key}: NotRequired[{value}]"
+        if key in cls.__optional_keys__
+        else f"    {key}: {value}"
+        for key, value in annotations.items()
     ]
     lines = [f"### `{name}`", "", _flat(doc.short_description), ""]
     lines += ["```python", f"class {name}(TypedDict):", *fields, "```", ""]

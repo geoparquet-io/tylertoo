@@ -600,6 +600,9 @@ Overview output counts, sizes, and input diagnostics.
 
 ```python
 class OverviewReport(TypedDict):
+    diagnostics: list[Diagnostic]
+    source_losses: list[SourceLoss]
+    input_rows: int
     mode: Literal['duplicating', 'partitioning']
     levels: list[LevelReport]
     skipped_empty_levels: list[SkippedLevel]
@@ -628,6 +631,44 @@ class OverviewReport(TypedDict):
 * `wrapped_features`: Features past ±180° longitude but within ±540°, drawn wrapped across the antimeridian. Expected for 0..360 data; otherwise the declared CRS may be wrong. Not a loss.
 * `crs_assumed_wgs84`: True when the input declared no CRS and lon/lat WGS84 was assumed. If the coordinates are not lon/lat degrees, the output is misplaced.
 * `effective_max_row_group_size`: The row-group cap actually used, when it had to be raised above `row_group_size` to keep the file under Parquet's row-group limit. None otherwise.
+
+### `Diagnostic`
+
+One typed diagnostic aggregated by the core operation.
+
+```python
+class Diagnostic(TypedDict):
+    exemplars: NotRequired[list[OutOfRangeExemplar]]
+    context: NotRequired[dict[str, Any] | None]
+    repair_kind: NotRequired[str]
+    cap: NotRequired[int]
+    name: NotRequired[str]
+    data_type: NotRequired[str]
+    reason: NotRequired[dict[str, Any]]
+    machine: NotRequired[int | None]
+    limit: NotRequired[int]
+    input: NotRequired[str]
+    total: NotRequired[int]
+    levels: NotRequired[list[int]]
+    gsd_min: NotRequired[float]
+    gsd_max: NotRequired[float]
+    input_features: NotRequired[int]
+    first_written_gsd: NotRequired[float]
+    first_written_zoom: NotRequired[int | None]
+    kind: str
+    count: int
+```
+
+### `SourceLoss`
+
+An absent source row or exported feature ID.
+
+```python
+class SourceLoss(TypedDict):
+    id: int
+    zoom: int | None
+    cause: str
+```
 
 ### `LevelReport`
 
@@ -687,6 +728,8 @@ Exported tile counts and encoding diagnostics.
 
 ```python
 class ExportReport(TypedDict):
+    diagnostics: list[Diagnostic]
+    source_losses: list[SourceLoss]
     mode: str
     min_zoom: int
     max_zoom: int
@@ -748,6 +791,7 @@ What `pyramid()` merged.
 
 ```python
 class PyramidReport(TypedDict):
+    diagnostics: list[Diagnostic]
     total_tiles: int
     bands: list[PyramidBandReport]
     skipped_tiles: int
