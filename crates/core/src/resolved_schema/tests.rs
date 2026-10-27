@@ -2,6 +2,29 @@ use super::*;
 use tylertoo_io::test_support::FileMetaData;
 use tylertoo_io::KeyValue;
 
+#[test]
+fn transformed_schema_preserves_crs_and_only_records_this_conversions_renames() {
+    let mut descriptor =
+        ResolvedSchema::from_metadata(&native_metadata(Some("EPSG:3857"))).unwrap();
+    descriptor
+        .facts
+        .renames
+        .insert("SHAPE".into(), "old_shape".into());
+    let schema = Arc::new(Schema::new(vec![descriptor
+        .schema
+        .field(0)
+        .clone()
+        .with_name("geom")]));
+    let transformed = descriptor.transformed(schema, &[("SHAPE".into(), "geom".into())]);
+    assert_eq!(transformed.crs(), Some(Crs::Epsg3857));
+    assert_eq!(transformed.geometry_name(), Some("geom"));
+    assert_eq!(transformed.geometry_index(), Some(0));
+    assert_eq!(
+        transformed.renames(),
+        &BTreeMap::from([("geom".into(), "SHAPE".into())])
+    );
+}
+
 fn native_metadata(crs: Option<&str>) -> ParquetMetaData {
     use tylertoo_io::test_support::{SchemaDescriptor, Type};
     use tylertoo_io::PhysicalType;

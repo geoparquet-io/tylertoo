@@ -1,71 +1,14 @@
-//! Two-pass bounded-memory streaming overview conversion (task V4 / H3).
+//! Shared conversion stages for Parquet and cached in-memory batch sources.
 //!
-//! The in-memory pipeline in [`super::convert`] materializes the entire input
-//! table, every decoded geometry, and a cloned geometry set per level — `O(N)`
-//! memory (Moldova, 632k polygons: 5.44 GB peak RSS). This module implements
-//! the same conversion in bounded memory:
+//! `run_stages` and the plan-only entry point share preflight, the immutable
+//! `Pass1Ctx` scan, assignment and carrier construction. Writer setup and the
+//! final report have one owner here. Storage differences are implementations
+//! of `super::source::BatchSource`; they do not select a second algorithm.
 //!
-//! - **Pass 1** streams the input once (row batches of
-//!   [`ConvertOptions::read_batch_size`] rows, geometry + ranking columns
-//!   only): per feature it keeps only the bbox *center*, its squared
-//!   diagonal, [`FeatureKind`], and the sort key — one row of the
-//!   column-major [`FeatureTable`] — plus the incremental state for Q1
-//!   ranking auto-detection. [`assign_levels_bounded`] and [`apply_density_budget`] then run
-//!   over those (the assign engine's own state is `O(occupied cells)` per
-//!   level), producing the **winner table**: one `min_level` byte per feature.
-//! - **Pass 2** re-reads the (seekable) input once **per level**, coarse →
-//!   fine: each batch is filtered against the winner table, simplified for the
-//!   level (non-canonical duplicating levels only), and handed straight to the
-//!   [`OverviewWriter`]. Nothing is retained across batches.
-//!
-//! Peak memory is `O(read batch + winner tables)`: the winner table is 1 byte
-//! per feature; pass 1 additionally holds the [`FeatureTable`] from the scan
-//! through the assignment, plus transient per-row vectors during the scan
-//! (ranking-key candidates at 16 bytes/row each, and — when those options are
-//! on — accumulate/ladder values, polygon areas, coalesce line geometries),
-//! all freed before pass 2. The table costs **33 bytes/feature**, plus 8 if
-//! the job has a sort key and 1 if it has an entry-zoom ladder — 42 with
-//! both, the worst case [`super::convert::PASS1_BYTES_PER_ROW`] preflights
-//! against. (It was 64
-//! before #543 item 2, when it was an array of `AssignFeature` structs
-//! holding the raw bbox and two `Option`s; see [`FeatureTable`] for what
-//! changed and for why the four `f64` columns stayed `f64`.) Residual `O(N)`
-//! state is therefore ≥ 33 bytes per input feature (typically ~42–80) — for
-//! 632k features, a few tens of MB, far below the geometry payload the
-//! in-memory path holds, but tens of GiB at billion-row scale (#543:
-//! preflighted from the footers before pass 1).
-//!
-//! **Line coalescing is the one exception to "42–80 bytes per feature"**: it
-//! retains each line's full geometry, not a fixed-size record, because
-//! chaining needs the coordinate runs it merges. That buffer is capped by
-//! both limbs of [`ConvertOptions::coalesce_max_level_rows`] (rows AND the
-//! geometry bytes they imply), and the cap is enforced as pass 1 fills —
-//! crossing it frees the buffer on the spot and leaves the rest of the pass
-//! merely counting (#449), rather than paying for a buffer the post-scan
-//! guard discards.
-//!
-//! Hilbert order: input order is preserved within each level (the documented
-//! gpio-sorted input contract, spec §4.3), exactly as in the in-memory path —
-//! no in-memory per-level sort exists in either path.
-//!
-//! # Behavior parity with the in-memory path
-//!
-//! Level assignments, density-budget cuts, ranking resolution (explicit /
-//! auto-detected / fallback), footer metadata, and per-level row values are
-//! identical (tested in `convert::tests`). One documented divergence: the
-//! in-memory path omits (and renumbers past) a level whose *simplified*
-//! output is empty, whereas this path decides level omission from the winner
-//! table before simplification. The two only differ when **every** winner of
-//! a level degenerates during simplification — rare under the default knobs
-//! (the assign visibility gates, 2 × GSD, are stricter than the simplify
-//! drop gate at 1 × GSD) but real on dirty data (#211: a sliver with a huge
-//! bbox passes the gate, then collapses). When it happens the writer skips
-//! the level ([`LevelWriteOutcome::SkippedEmpty`]) and this driver records it
-//! in [`ConvertReport::skipped_empty_levels`], exactly like a plan-time
-//! omission — the two pipelines converge on the same output pyramid.
-//!
-//! [`LevelWriteOutcome::SkippedEmpty`]: super::writer::LevelWriteOutcome::SkippedEmpty
-//! [`ConvertReport::skipped_empty_levels`]: super::convert::ConvertReport::skipped_empty_levels
+//! Pass 1 keeps the columnar `FeatureTable`, ranking/ladder/cluster scratch,
+//! and bounded coalescing geometry. Pass 2 consumes the row-indexed winner
+//! table and streams or spills generalized batches using `super::pipeline`.
+//! The per-run `MemoryBudget` supplies every phase's memory snapshot.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -79,7 +22,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take;
 use geo::{Area, Geometry};
 use geo_traits::to_geo::ToGeoGeometry;
@@ -98,6 +41,7 @@ use super::assign::{
 };
 use super::cluster::{ClusterEntry, ClusterTables};
 use super::coalesce::{collected_line_bytes, CoalesceInput};
+use super::config::ValidatedConfig;
 use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
@@ -111,9 +55,12 @@ use super::convert::{
     PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
+use super::memory::MemoryBudget;
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
-use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
+#[cfg(test)]
+use super::pipeline::read_in_order;
+use super::pipeline::{ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
     cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
@@ -124,7 +71,9 @@ use super::simplify::{
     carrier_square, simplify_cascade, simplify_step_at, CascadeFold, CascadeStep, FoldStep,
     Representation, Simplified, SimplifyOptions,
 };
+use super::source::{BatchSource, MemorySource};
 use super::writer::{LevelSpec, LevelWriteOutcome, OverviewWriter, OverviewWriterOptions};
+use crate::resolved_schema::ResolvedSchema;
 
 /// Row-indexed winner-table sentinel for rows with no feature (null, empty,
 /// or non-finite geometry — skipped in pass 1). It matches no level in either
@@ -171,6 +120,7 @@ fn stage_input_pass0(
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
     row_groups_read: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     if !source.is_remote() {
         return;
@@ -182,10 +132,10 @@ fn stage_input_pass0(
              disk in {:.1}s",
             t_stage.elapsed().as_secs_f64()
         ),
-        Err(e) => log::warn!(
+        Err(e) => diagnostics.warn(format!(
             "[convert] input staging failed ({e}); passes will read over the \
              network (uncoalesced)"
-        ),
+        )),
     }
 }
 
@@ -652,12 +602,17 @@ fn levels_at_or_above_ceiling(planned: &[EmitLevel], ceiling: Option<u8>) -> usi
 /// (+ `coalesced_count` when coalescing, Q3). All three are needed downstream,
 /// so they are returned together.
 pub(super) fn build_level_schemas(
-    input_schema: &Schema,
-    geom_idx: usize,
-    geom_name: &str,
-    crs: Crs,
+    descriptor: &ResolvedSchema,
     options: &ConvertOptions,
 ) -> (Schema, Schema, Schema) {
+    let input_schema = descriptor.schema();
+    let geom_name = descriptor
+        .geometry_name()
+        .expect("preflight checked geometry");
+    let geom_idx = input_schema
+        .index_of(geom_name)
+        .expect("projection retains geometry");
+    let crs = descriptor.crs().expect("preflight checked CRS");
     // The output geometry field must inherit the INPUT field's geoarrow
     // extension metadata — above all its CRS. Dropping it made the overview
     // claim the GeoParquet default (OGC:CRS84) for a metre file (#519).
@@ -665,7 +620,7 @@ pub(super) fn build_level_schemas(
         geom_name,
         super::convert::geometry_field_metadata(input_schema, geom_idx, crs),
     );
-    let source_schema = build_source_schema(input_schema, geom_idx, geom_out_field);
+    let source_schema = build_source_schema(descriptor, geom_out_field);
     let cluster_schema = if options.cluster {
         append_point_count_field(&source_schema)
     } else {
@@ -689,20 +644,26 @@ pub(super) fn build_writer_options(
     writer_levels: Vec<LevelSpec>,
     emitted_gsds: &[f64],
     level_row_counts: &[usize],
-    crs: Crs,
+    descriptor: &ResolvedSchema,
     ranking_provenance: RankingProvenance,
-    renames: &[(String, String)],
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<OverviewWriterOptions, ConvertError> {
+    let renames: Vec<_> = descriptor
+        .renames()
+        .iter()
+        .map(|(to, from)| (from.clone(), to.clone()))
+        .collect();
     build_writer_options_with_ceiling(
         writer_levels,
         emitted_gsds,
         level_row_counts,
-        crs,
+        descriptor.crs().expect("preflight checked CRS"),
         ranking_provenance,
-        renames,
+        &renames,
         options,
         super::writer::SAFE_ROW_GROUP_CEILING,
+        diagnostics,
     )
 }
 
@@ -721,6 +682,7 @@ fn build_writer_options_with_ceiling(
     renames: &[(String, String)],
     options: &ConvertOptions,
     ceiling: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<OverviewWriterOptions, ConvertError> {
     let mut writer_opts = OverviewWriterOptions::new(options.mode, writer_levels);
     writer_opts.max_row_group_size = options.max_row_group_size;
@@ -763,7 +725,7 @@ fn build_writer_options_with_ceiling(
                 &level_zooms,
                 finest_zoom,
             );
-            log::warn!(
+            diagnostics.warn(format!(
                 "[convert] projected output needs up to {projected} row groups at \
                  --row-group-size {old} — over the {ceiling}-row-group preflight ceiling \
                  (parquet's hard limit is 32,768 row groups per file); auto-scaling \
@@ -771,7 +733,7 @@ fn build_writer_options_with_ceiling(
                  more memory held per row group while writing. Pass --row-group-size {cap} \
                  explicitly to silence this warning.",
                 old = writer_opts.max_row_group_size,
-            );
+            ));
             writer_opts.max_row_group_size = cap;
         }
         Some(_) => {}
@@ -849,7 +811,7 @@ fn polygon_area_f32(g: &Geometry<f64>) -> f32 {
 /// Run the tiny-polygon accumulator (#384) for the streaming path: per
 /// planned level, the sorted row indices of its carriers; empty per level
 /// unless the accumulator applies there.
-fn streaming_carriers(
+fn build_carriers(
     options: &ConvertOptions,
     features: &FeatureTable,
     feat_min_levels: &[u8],
@@ -1073,10 +1035,11 @@ type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 /// because every candidate collapsed during simplification (#211).
 #[allow(clippy::too_many_arguments)]
 fn run_pass2_levels(
+    budget: MemoryBudget,
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
-    source: &ConvertSource,
+    source: &dyn BatchSource,
     options: &ConvertOptions,
     selected_row_groups: Option<&RowGroupSelection>,
     in_flight_batches: usize,
@@ -1095,6 +1058,7 @@ fn run_pass2_levels(
     // geometry weight pass 1 reports (#717), which is what sizes the
     // read-ahead against the memory budget.
     let read_tuning = ReadTuning {
+        budget,
         batch_size: options.read_batch_size.max(1),
         workers: resolve_read_workers(options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
@@ -1142,6 +1106,7 @@ fn run_pass2_levels(
             // pass 1 has always completed by this point (the assign barrier).
             let avg_geom_bytes = (num_rows > 0).then(|| geom_bytes / num_rows as u64);
             let backing = pipeline::resolve_backing(
+                budget,
                 options.profile,
                 options.mode,
                 buffered_rows,
@@ -1211,6 +1176,7 @@ fn build_level_reports(
     emitted: &[EmitLevel],
     level_stats: Vec<LevelStat>,
     skipped: &mut Vec<SkippedLevelReport>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<LevelReport>, Vec<u64>) {
     let mut level_reports = Vec::with_capacity(emitted.len());
     let mut level_spill_bytes: Vec<u64> = Vec::with_capacity(emitted.len());
@@ -1223,11 +1189,10 @@ fn build_level_reports(
                 gsd: e.gsd,
                 zoom: e.zoom,
             },
-            e.hint,
-            rows,
-            vertices,
+            (e.hint, rows, vertices),
             &mut level_reports,
             skipped,
+            diagnostics,
         );
         if level_reports.len() > reports_before {
             level_spill_bytes.push(spill_bytes);
@@ -1536,22 +1501,23 @@ fn coalesce_merged_anywhere(
 #[allow(clippy::too_many_arguments)]
 fn create_level_writer(
     output_path: &Path,
-    input_schema: &Schema,
-    geom_idx: usize,
-    geom_field: &Field,
+    descriptor: &ResolvedSchema,
     emitted: &[EmitLevel],
-    crs: Crs,
     ranking_provenance: RankingProvenance,
-    renames: &[(String, String)],
     options: &ConvertOptions,
     facts: FooterFacts,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<LevelWriter, ConvertError> {
+    let input_schema = descriptor.schema();
     // --- Writer setup (identical to the in-memory path). ---------------------
     // Writer schemas: base + point_count when clustering (Q4) + coalesced_count
     // when coalescing (Q3).
-    let geom_name = geom_field.name().clone();
-    let (source_schema, cluster_schema, out_schema) =
-        build_level_schemas(input_schema, geom_idx, &geom_name, crs, options);
+    let geom_name = descriptor
+        .geometry_name()
+        .expect("preflight checked geometry")
+        .to_owned();
+    let geom_idx = input_schema.index_of(&geom_name)?;
+    let (source_schema, cluster_schema, out_schema) = build_level_schemas(descriptor, options);
 
     let writer_levels: Vec<LevelSpec> = emitted
         .iter()
@@ -1563,10 +1529,10 @@ fn create_level_writer(
         writer_levels,
         &emitted_gsds,
         &level_row_counts,
-        crs,
+        descriptor,
         ranking_provenance,
-        renames,
         options,
+        diagnostics,
     )?;
     writer_opts.primary_column = Some(geom_name.clone());
     record_coalesce_merged(writer_opts.generalization.as_mut(), facts.coalesce_merged);
@@ -1682,16 +1648,17 @@ fn level_within_ceiling(zoom: Option<u8>, ceiling: Option<u8>) -> bool {
 /// bound a run whose coarse levels are empty peaks higher than it did when
 /// only pass 2 built tables (#579 review).
 fn coalesce_level_counts(
+    memory: MemoryBudget,
     scratch: &CoalesceScratch,
     level_specs: &[(f64, Option<u8>)],
-    finest: usize,
     crs: Crs,
     options: &ConvertOptions,
     prebuild: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (Vec<usize>, Option<CoalesceBuild>) {
+    let finest = level_specs.len().saturating_sub(1);
     let line_bytes: u64 = scratch.geoms.iter().map(collected_line_bytes).sum();
-    let budget = super::pipeline::pass1_grid_budget_bytes(options.profile);
+    let budget = memory.allowance(options.profile);
     let wave = chain_stage_wave(level_specs.len(), line_bytes, budget);
     coalesce_level_counts_in_waves(
         scratch,
@@ -1806,6 +1773,7 @@ fn coalesce_level_counts_in_waves(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_winner_tables(
+    memory: MemoryBudget,
     features: &mut FeatureTable,
     acc_values: Vec<Vec<Option<f64>>>,
     areas: Vec<f32>,
@@ -1833,7 +1801,13 @@ fn resolve_winner_tables(
         &level_gsds,
         &options.assign,
         crs,
-        super::pipeline::pass1_grid_budget_bytes(options.profile),
+        memory
+            .allowance(options.profile)
+            .saturating_sub(memory.estimate(
+                super::memory::MemoryPhase::Assign,
+                features.len() as u64,
+                None,
+            )),
         &level_reprs,
     );
     let assign_secs = t_assign.elapsed().as_secs_f64();
@@ -1873,7 +1847,7 @@ fn resolve_winner_tables(
     // #384: tiny-polygon accumulator — per level, the carriers that stand in
     // for the sub-visible polygons the level dropped. Row-indexed like the
     // winner table; empty per level unless the accumulator applies there.
-    let carriers = streaming_carriers(
+    let carriers = build_carriers(
         options,
         features,
         &feat_min_levels,
@@ -1916,7 +1890,7 @@ fn resolve_winner_tables(
     // reaches the same verdict (and logs the same numbers) as it did when
     // the whole buffer survived to be measured here.
     let (tally_lines, tally_bytes) = line_tally;
-    let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes);
+    let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes, diagnostics);
     let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
         let mut k = vec![FeatureKind::Point; num_rows];
         for (pos, &row) in features.indices().iter().enumerate() {
@@ -1976,9 +1950,9 @@ fn resolve_winner_tables(
     if let Some(scratch) = &coalesce_scratch {
         // Duplicating only (partitioning + coalescing is rejected upstream).
         let (chain_counts, build) = coalesce_level_counts(
+            memory,
             scratch,
             &level_specs,
-            finest,
             crs,
             options,
             prebuild_chain_tables,
@@ -2013,14 +1987,13 @@ fn resolve_winner_tables(
 /// binding (#315), row-group pruning (#102 / #315), and the pass-0 staging of
 /// the selected groups to local disk (#286/#287).
 struct Preflight {
+    descriptor: ResolvedSchema,
+    budget: MemoryBudget,
     /// `options` with reserved-column renames applied; the driver borrows this
     /// for the rest of the conversion.
     options: ConvertOptions,
-    input_schema: SchemaRef,
     crs: Crs,
-    renames: Vec<(String, String)>,
     geom_idx: usize,
-    geom_field: Field,
     /// Schema indices of the accumulate columns (Q4).
     acc_cols: Vec<usize>,
     bbox_query: Option<BboxQuery>,
@@ -2036,26 +2009,24 @@ struct Preflight {
     pass1_memory: super::convert::Pass1MemoryReport,
 }
 
-fn convert_preflight(
+fn preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
-    // The UNCACHED probe: `pipeline::available_memory_bytes` must not be
-    // touched before pass 1 — its first call freezes a headroom figure every
-    // later `auto` decision reuses (#485).
-    convert_preflight_with_memory_limit(
+    // Probe once for this conversion; every phase borrows the resulting budget.
+    preflight_with_memory_limit(
         source,
         options,
-        super::pipeline::probe_preflight_memory_limit(),
+        MemoryBudget::probe().limit,
         super::convert::skip_memory_preflight_from_env(),
         diagnostics,
     )
 }
 
-/// [`convert_preflight`] with an explicit pass-1 memory-floor limit and
+/// [`preflight`] with an explicit pass-1 memory-floor limit and
 /// escape-hatch decision for the #543 memory-policy tests.
-fn convert_preflight_with_memory_limit(
+fn preflight_with_memory_limit(
     source: &ConvertSource,
     options: &ConvertOptions,
     memory_limit: Option<super::pipeline::MemoryLimit>,
@@ -2067,12 +2038,10 @@ fn convert_preflight_with_memory_limit(
     // cached across the passes below. For a multi-partition source the
     // schema is the validated union schema and the key-value metadata is
     // partition 0's — construction proved all parts agree.)
-    let input_schema: SchemaRef = source.schema()?;
-
     // CRS detection + rejection (spec Q3) — footer metadata only.
-    let descriptor = source.resolved_schema()?;
+    let descriptor = source.resolved_schema()?.transformed(source.schema()?, &[]);
     let (crs, crs_assumed_wgs84) =
-        super::convert::crs_from_resolved(descriptor, &source.display_name(), diagnostics)?;
+        super::convert::crs_from_resolved(&descriptor, &source.display_name(), diagnostics)?;
     if crs_assumed_wgs84 {
         super::convert::warn_assumed_wgs84(&source.display_name(), diagnostics);
     }
@@ -2083,7 +2052,10 @@ fn convert_preflight_with_memory_limit(
     // affects the footer statistics either pruning path reads. See the
     // full #288 rationale on the block below.
     let mut resolved = options.clone();
-    let (input_schema, renames) = resolve_reserved_column_collisions(&input_schema, &mut resolved);
+    let (input_schema, renames) =
+        resolve_reserved_column_collisions(&descriptor, &mut resolved, diagnostics);
+    let descriptor = descriptor.transformed(input_schema, &renames);
+    let input_schema = descriptor.schema();
     let options = &resolved;
 
     // Found early (#563) so the oversized-geometry-column preflight below
@@ -2096,12 +2068,11 @@ fn convert_preflight_with_memory_limit(
         .ok_or_else(|| ConvertError::NoGeometryColumn {
             input: source.display_name(),
         })?;
-    let geom_field = input_schema.field(geom_idx).clone();
 
     // Attribute filter (#315): parse + bind against the input schema.
     // Syntax was already validated in `validate_options`; binding resolves
     // column names to indices and type-checks literals.
-    let bound_filter = super::convert::bind_attribute_filter(options, &input_schema, &renames)?;
+    let bound_filter = super::convert::bind_attribute_filter(options, input_schema, &renames)?;
 
     // Regional extract (#102) + attribute filter (#315): prune input row
     // groups by footer statistics — bbox covering stats for `--bbox`,
@@ -2159,13 +2130,14 @@ fn convert_preflight_with_memory_limit(
             memory_limit,
             skip_memory_preflight,
             bbox_query.is_some() || bound_filter.is_some(),
+            diagnostics,
         )?
     } else {
         super::convert::Pass1MemoryReport::default()
     };
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
-    super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total);
+    super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total, diagnostics);
     // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
     // selected input bytes — known exactly here, the first moment after
     // row-group selection (summed per part for a multi source) — so compare
@@ -2176,11 +2148,17 @@ fn convert_preflight_with_memory_limit(
         source,
         source.selected_input_bytes(selected_row_groups.as_ref())?,
         options.spill_dir.as_deref(),
+        diagnostics,
     );
 
     // Pass 0 (#286/#287): stage the selected row groups to local disk so both
     // passes below read from the spill, not the network.
-    stage_input_pass0(source, selected_row_groups.as_ref(), row_groups_read);
+    stage_input_pass0(
+        source,
+        selected_row_groups.as_ref(),
+        row_groups_read,
+        diagnostics,
+    );
 
     // (Reserved-column collisions, #288, were resolved above, before the
     // row-group selection: any input column named `level` / `point_count` /
@@ -2195,19 +2173,20 @@ fn convert_preflight_with_memory_limit(
     // selection, for the #563 preflight.)
 
     // Clustering schema checks + accumulate column resolution (Q4).
-    let acc_cols = validate_cluster_schema(&input_schema, options)?;
+    let acc_cols = validate_cluster_schema(&descriptor, options)?;
     // Coalescing schema check (Q3).
-    validate_coalesce_schema(&input_schema, options)?;
+    validate_coalesce_schema(&descriptor, options)?;
 
     let mut options = resolved.clone();
     options.read_batch_size = read_batch_rows;
     Ok(Preflight {
+        descriptor,
+        budget: MemoryBudget {
+            limit: memory_limit,
+        },
         options,
-        input_schema,
         crs,
-        renames,
         geom_idx,
-        geom_field,
         acc_cols,
         bbox_query,
         bound_filter,
@@ -2219,13 +2198,36 @@ fn convert_preflight_with_memory_limit(
     })
 }
 
+#[cfg(test)]
+pub(super) fn memory_source_for_test(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    limit: u64,
+) -> Result<(MemorySource, usize), ConvertError> {
+    let diagnostics = crate::diagnostics::Diagnostics::silent();
+    let pre = preflight(source, options, &diagnostics)?;
+    let memory = MemorySource::load(
+        source,
+        pre.selected_row_groups.as_ref(),
+        pass1_read_tuning(pre.budget, &pre.options, 0, 0),
+        limit,
+    )?;
+    Ok((memory, pre.row_groups_read))
+}
+
 /// How pass 1 reads its input (#717): pass 2's batch size, reader count and
 /// memory profile, with the read-ahead priced at `geom_bytes / rows`, the
 /// footers' geometry weight over the selected rows. Unlike pass 2's, this
 /// weight is not a pass-1 measurement, so it is known before the first batch.
 /// The fallback applies only when no rows are selected.
-fn pass1_read_tuning(options: &ConvertOptions, geom_bytes: u64, rows: u64) -> ReadTuning {
+fn pass1_read_tuning(
+    budget: MemoryBudget,
+    options: &ConvertOptions,
+    geom_bytes: u64,
+    rows: u64,
+) -> ReadTuning {
     ReadTuning {
+        budget,
         batch_size: options.read_batch_size.max(1),
         workers: resolve_read_workers(options.read_workers),
         avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
@@ -2235,10 +2237,13 @@ fn pass1_read_tuning(options: &ConvertOptions, geom_bytes: u64, rows: u64) -> Re
 
 /// The preflight-derived inputs pass 1 reads. Grouped so
 /// [`resolve_plan_state`] can take them as one argument.
-struct Pass1Inputs<'a> {
+struct Pass1Ctx<'a> {
+    descriptor: &'a ResolvedSchema,
+    config: &'a ValidatedConfig<'a, ConvertOptions>,
+    budget: &'a MemoryBudget,
+    diagnostics: &'a crate::diagnostics::Diagnostics,
+    reader: &'a dyn BatchSource,
     source: &'a ConvertSource,
-    input_schema: &'a Schema,
-    geom_idx: usize,
     acc_cols: &'a [usize],
     selected_row_groups: Option<&'a RowGroupSelection>,
     bbox_query: Option<&'a BboxQuery>,
@@ -2290,6 +2295,7 @@ struct PlanState {
 /// The front half of a streaming convert: the preflight, and pass 1 + the
 /// level assignment (or the `--plan` artifact that replaces them).
 struct FrontHalf {
+    memory: Option<MemorySource>,
     preflight: Preflight,
     plan: PlanState,
 }
@@ -2312,22 +2318,36 @@ fn run_front_half(
     rss: &mut RssTracker,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<FrontHalf, ConvertError> {
-    pipeline::memory_diagnostic(diagnostics);
     // A numeric sort key and a categorical class ranking would both drive
     // `AssignFeature::sort_key` (Q1); refused before the input is opened.
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
     }
-    let preflight = convert_preflight(source, options, diagnostics)?;
+    let preflight = preflight(source, options, diagnostics)?;
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
     let options = &preflight.options;
-    let plan = resolve_plan_state(
-        &Pass1Inputs {
+    let config = options.validate()?;
+    let memory = if options.streaming {
+        None
+    } else {
+        Some(MemorySource::load(
             source,
-            input_schema: &preflight.input_schema,
-            geom_idx: preflight.geom_idx,
+            preflight.selected_row_groups.as_ref(),
+            pass1_read_tuning(preflight.budget, options, 0, 0),
+            tylertoo_io::byte_array_limit(),
+        )?)
+    };
+    let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
+    let plan = resolve_plan_state(
+        &Pass1Ctx {
+            descriptor: &preflight.descriptor,
+            config: &config,
+            budget: &preflight.budget,
+            diagnostics,
+            reader,
+            source,
             acc_cols: &preflight.acc_cols,
             selected_row_groups: preflight.selected_row_groups.as_ref(),
             bbox_query: preflight.bbox_query.as_ref(),
@@ -2335,11 +2355,13 @@ fn run_front_half(
             crs: preflight.crs,
             prebuild_chain_tables,
         },
-        options,
         rss,
-        diagnostics,
     )?;
-    Ok(FrontHalf { preflight, plan })
+    Ok(FrontHalf {
+        preflight,
+        plan,
+        memory,
+    })
 }
 
 /// `--plan-only` (#560): run the front half, which writes the `--save-plan`
@@ -2353,12 +2375,16 @@ pub(crate) fn write_plan_streaming(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanReport, ConvertError> {
     let options = config.options();
+    preflight_profile_json_path(diagnostics);
     let start = Instant::now();
     // Boundary sampling only: a plan-only run writes no profile JSON dump,
     // so the #571 background sampler would have no reader.
     let mut rss = RssTracker::new(false, "preflight");
-    let FrontHalf { preflight, plan } =
-        run_front_half(source, options, false, &mut rss, diagnostics)?;
+    let FrontHalf {
+        preflight,
+        plan,
+        memory: _,
+    } = run_front_half(source, options, false, &mut rss, diagnostics)?;
     let options = &preflight.options;
     let path = options
         .save_plan
@@ -2381,10 +2407,10 @@ pub(crate) fn write_plan_streaming(
         // worth reporting either way.
         if let Err(e) = std::fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!(
+                diagnostics.warn(format!(
                     "could not remove the empty convert plan {}: {e}",
                     path.display()
-                );
+                ));
             }
         }
         return Err(ConvertError::NoData);
@@ -2439,11 +2465,11 @@ pub(crate) fn write_plan_streaming(
 /// Run pass 1 + the level assignment, or load the artifact that stands in for
 /// both (`--plan`), saving one on the way out when `--save-plan` asks.
 fn resolve_plan_state(
-    inputs: &Pass1Inputs<'_>,
-    options: &ConvertOptions,
+    inputs: &Pass1Ctx<'_>,
     rss: &mut RssTracker,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
+    let options = inputs.config.options();
+    let diagnostics = inputs.diagnostics;
     // Captured before either branch: the load path compares the saved
     // fingerprint against it, the save path stores it.
     let flag = if options.plan.is_some() {
@@ -2468,19 +2494,19 @@ fn resolve_plan_state(
                 diagnostics,
             )
         }
-        None => run_pass1_and_assign(inputs, options, fingerprint, rss, diagnostics),
+        None => run_pass1_and_assign(inputs, fingerprint, rss),
     }
 }
 
 /// The ordinary path: stream the input, assign levels, and (when asked)
 /// persist the result before pass 2 starts.
 fn run_pass1_and_assign(
-    inputs: &Pass1Inputs<'_>,
-    options: &ConvertOptions,
+    inputs: &Pass1Ctx<'_>,
     fingerprint: Option<Fingerprint>,
     rss: &mut RssTracker,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
+    let options = inputs.config.options();
+    let diagnostics = inputs.diagnostics;
     rss.enter_phase("pass1 scan"); // #571: the preflight ends here
     let t_pass1 = Instant::now();
     let Pass1Output {
@@ -2496,18 +2522,7 @@ fn run_pass1_and_assign(
         skipped_rows,
         geom_bytes,
         pass1_stage_secs,
-    } = run_pass1(
-        inputs.source,
-        inputs.input_schema,
-        inputs.geom_idx,
-        options,
-        inputs.acc_cols,
-        inputs.selected_row_groups,
-        inputs.bbox_query,
-        inputs.bound_filter,
-        inputs.crs,
-        diagnostics,
-    )?;
+    } = run_pass1_with_chunk_rows(inputs, adaptive_pass1_chunk_rows(options.read_batch_size))?;
     diagnostics.once(crate::diagnostics::Diagnostic::UnusableGeometry {
         count: skipped_rows,
         total: num_rows,
@@ -2554,6 +2569,7 @@ fn run_pass1_and_assign(
 
     let t_assign = Instant::now();
     let tables = resolve_winner_tables(
+        *inputs.budget,
         &mut features,
         acc_values,
         areas,
@@ -2802,7 +2818,7 @@ fn load_plan_state(
 /// Log the continuous sampler's true peak against the boundary-sampled one
 /// (#571), but only when the gap is worth a line — i.e. when boundary
 /// sampling actually missed something. Pulled out of
-/// [`convert_streaming_strategy`] purely to stay under clippy's
+/// [`run_stages`] purely to stay under clippy's
 /// function-length ceiling; it has no effect on the profile JSON (that
 /// happens later, in [`emit_profile_json`]).
 fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<RssSamplerReport>) {
@@ -2822,7 +2838,7 @@ fn log_rss_true_peak_if_notable(boundary_peak_mib: Option<f64>, report: &Option<
 /// The end of convert's RSS tracking (#295/#571): log `[rss] convert peak`,
 /// stop the background sampler (a no-op if profiling was off), log the
 /// true-peak comparison when it's notable, and return both for the profile
-/// JSON. Pulled out of [`convert_streaming_strategy`] for clippy's
+/// JSON. Pulled out of [`run_stages`] for clippy's
 /// function-length ceiling; called once, right after the last `log_phase`.
 fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerReport>) {
     let peak_rss_mib = rss.boundary_peak_mib;
@@ -2837,9 +2853,9 @@ fn finish_convert_rss(mut rss: RssTracker) -> (Option<f64>, Option<RssSamplerRep
 
 #[expect(
     clippy::too_many_lines,
-    reason = "#779: F1 merges the engine report and writer stages next"
+    reason = "#779: shared orchestration keeps stage lifetimes and cleanup order explicit"
 )]
-pub(crate) fn convert_streaming_strategy(
+pub(crate) fn run_stages(
     source: &ConvertSource,
     output_path: &Path,
     config: &super::config::ValidatedConfig<'_, ConvertOptions>,
@@ -2847,6 +2863,7 @@ pub(crate) fn convert_streaming_strategy(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
     let options = config.options();
+    preflight_profile_json_path(diagnostics);
     let start = Instant::now();
     // #295/#571 peak-RSS tracking: boundary samples + a continuous
     // background sampler when profiling is on (see `RssTracker`/`RssSampler`).
@@ -2856,15 +2873,18 @@ pub(crate) fn convert_streaming_strategy(
 
     // --- Preflight, then pass 1 + assignment (or the saved plan that ---------
     // --- replaces them). Shared verbatim with `--plan-only` (#560). ----------
-    let FrontHalf { preflight, plan } =
-        run_front_half(source, options, true, &mut rss, diagnostics)?;
+    let FrontHalf {
+        preflight,
+        plan,
+        memory,
+    } = run_front_half(source, options, true, &mut rss, diagnostics)?;
+    let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     let Preflight {
+        descriptor,
+        budget,
         options: resolved_options,
-        input_schema,
         crs,
-        renames,
         geom_idx,
-        geom_field,
         acc_cols,
         // Pass-1 inputs only: pass 2 reads the assignment's `min_levels`,
         // where a row the bbox or the filter dropped is already UNASSIGNED.
@@ -2954,19 +2974,16 @@ pub(crate) fn convert_streaming_strategy(
         effective_max_row_group_size,
     } = create_level_writer(
         output_path,
-        &input_schema,
-        geom_idx,
-        &geom_field,
+        &descriptor,
         emitted,
-        crs,
         ranking_provenance,
-        &renames,
         options,
         FooterFacts {
             coalesce_merged,
             zoom_ceiling: truncated_at,
             entry_zoom,
         },
+        diagnostics,
     )?;
 
     // --- Pass 2: single-read pipelined engine + canonical streamed last. -----
@@ -3014,10 +3031,11 @@ pub(crate) fn convert_streaming_strategy(
     let in_flight_batches = resolve_and_log_in_flight_batches("pass 2", options.in_flight_batches);
 
     let (level_stats, pass2_engine_timers, sink_measurement) = run_pass2_levels(
+        budget,
         &mut writer,
         &ctxs,
         &hints,
-        source,
+        reader,
         options,
         selected_row_groups.as_ref(),
         in_flight_batches,
@@ -3028,7 +3046,7 @@ pub(crate) fn convert_streaming_strategy(
     )?;
 
     let (mut level_reports, level_spill_bytes) =
-        build_level_reports(emitted, level_stats, &mut skipped);
+        build_level_reports(emitted, level_stats, &mut skipped, diagnostics);
     skipped.sort_by_key(|s| s.planned_level);
     if level_reports.is_empty() {
         // Every emitted level collapsed at write time: no valid overview file
@@ -3066,27 +3084,30 @@ pub(crate) fn convert_streaming_strategy(
     // throughput, checkpoint work): a machine-readable dump of everything the
     // `[profile]`/`[rss]` logs above report by hand, gated behind an env var.
     // Zero effect on output bytes.
-    emit_profile_json(ProfileJsonContext {
-        options,
-        pass1_wall,
-        pass1_rows: num_rows,
-        pass1_stage_secs,
-        assign_wall,
-        pass2_wall,
-        pass2_rows: total_rows,
-        pass2_engine_timers: &pass2_engine_timers,
-        writer_finish_wall,
-        start,
-        level_reports: &level_reports,
-        level_spill_bytes: &level_spill_bytes,
-        peak_rss_mib,
-        rss_sampler_report,
-        in_flight_batches,
-        sink_measurement,
-        pass1_memory: preflight_report,
-    });
+    emit_profile_json(
+        ProfileJsonContext {
+            options,
+            pass1_wall,
+            pass1_rows: num_rows,
+            pass1_stage_secs,
+            assign_wall,
+            pass2_wall,
+            pass2_rows: total_rows,
+            pass2_engine_timers: &pass2_engine_timers,
+            writer_finish_wall,
+            start,
+            level_reports: &level_reports,
+            level_spill_bytes: &level_spill_bytes,
+            peak_rss_mib,
+            rss_sampler_report,
+            in_flight_batches,
+            sink_measurement,
+            pass1_memory: preflight_report,
+        },
+        diagnostics,
+    );
 
-    Ok(build_streaming_report(ConvertReportInputs {
+    Ok(build_report(ConvertReportInputs {
         options,
         source,
         level_reports,
@@ -3106,7 +3127,7 @@ pub(crate) fn convert_streaming_strategy(
     .with_diagnostics(diagnostics))
 }
 
-/// [`convert_streaming_strategy`]'s locals the final [`ConvertReport`]
+/// [`run_stages`]'s locals the final [`ConvertReport`]
 /// assembly needs, grouped for the same reason as [`ProfileJsonContext`]:
 /// keeps the caller under clippy's function-length ceiling.
 struct ConvertReportInputs<'a> {
@@ -3128,7 +3149,7 @@ struct ConvertReportInputs<'a> {
     crs_assumed_wgs84: bool,
 }
 
-fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
+fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
     ConvertReport {
         diagnostics: Vec::new(),
         source_losses: Vec::new(),
@@ -3154,7 +3175,7 @@ fn build_streaming_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
     }
 }
 
-/// [`convert_streaming_strategy`]'s locals the `TYLERTOO_PROFILE_JSON` dump
+/// [`run_stages`]'s locals the `TYLERTOO_PROFILE_JSON` dump
 /// needs, grouped into a struct so [`emit_profile_json`] can be a single call
 /// there (clippy's function-length ceiling leaves no room for inlining this
 /// many field computations).
@@ -3191,32 +3212,35 @@ struct ProfileJsonContext<'a> {
 /// [`write_profile_json`]. Every phase wall arrives already captured at its
 /// own boundary (#533); only `total` is elapsed here, and it is the only
 /// window that legitimately ends now.
-fn emit_profile_json(ctx: ProfileJsonContext<'_>) {
-    write_profile_json(ProfileJsonInputs {
-        options: ctx.options,
-        pass1_wall_secs: ctx.pass1_wall.as_secs_f64(),
-        pass1_rows: ctx.pass1_rows,
-        pass1_stage_secs: ctx.pass1_stage_secs,
-        assign_wall_secs: ctx.assign_wall.as_secs_f64(),
-        pass2_wall_secs: ctx.pass2_wall.as_secs_f64(),
-        pass2_rows: ctx.pass2_rows,
-        pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
-        pass2_cascade_step_counts: ctx.pass2_engine_timers.cascade_step_counts(),
-        pass2_windows: ctx.pass2_engine_timers.window_stats(),
-        writer_finish_secs: ctx.writer_finish_wall.as_secs_f64(),
-        total_secs: ctx.start.elapsed().as_secs_f64(),
-        levels: ctx
-            .level_reports
-            .iter()
-            .zip(ctx.level_spill_bytes.iter())
-            .map(|(l, &spill_bytes)| (l.feature_count, spill_bytes))
-            .collect(),
-        peak_rss_mib: ctx.peak_rss_mib,
-        rss_sampler_report: ctx.rss_sampler_report,
-        in_flight_batches: ctx.in_flight_batches,
-        sink_measurement: ctx.sink_measurement,
-        pass1_memory: ctx.pass1_memory,
-    });
+fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnostics::Diagnostics) {
+    write_profile_json(
+        ProfileJsonInputs {
+            options: ctx.options,
+            pass1_wall_secs: ctx.pass1_wall.as_secs_f64(),
+            pass1_rows: ctx.pass1_rows,
+            pass1_stage_secs: ctx.pass1_stage_secs,
+            assign_wall_secs: ctx.assign_wall.as_secs_f64(),
+            pass2_wall_secs: ctx.pass2_wall.as_secs_f64(),
+            pass2_rows: ctx.pass2_rows,
+            pass2_stage_secs: ctx.pass2_engine_timers.stage_secs(),
+            pass2_cascade_step_counts: ctx.pass2_engine_timers.cascade_step_counts(),
+            pass2_windows: ctx.pass2_engine_timers.window_stats(),
+            writer_finish_secs: ctx.writer_finish_wall.as_secs_f64(),
+            total_secs: ctx.start.elapsed().as_secs_f64(),
+            levels: ctx
+                .level_reports
+                .iter()
+                .zip(ctx.level_spill_bytes.iter())
+                .map(|(l, &spill_bytes)| (l.feature_count, spill_bytes))
+                .collect(),
+            peak_rss_mib: ctx.peak_rss_mib,
+            rss_sampler_report: ctx.rss_sampler_report,
+            in_flight_batches: ctx.in_flight_batches,
+            sink_measurement: ctx.sink_measurement,
+            pass1_memory: ctx.pass1_memory,
+        },
+        diagnostics,
+    );
 }
 
 /// Inputs to [`write_profile_json`], grouped into a struct since the
@@ -3294,7 +3318,7 @@ struct ProfileJsonInputs<'a> {
 /// (or the pipeline never reached the dump at all) — a preflight must observe
 /// the filesystem, not change it.
 #[allow(clippy::disallowed_methods)] // #779: writability probe, removed at once; migrate to atomic_output
-pub(super) fn preflight_profile_json_path() {
+pub(super) fn preflight_profile_json_path(diagnostics: &crate::diagnostics::Diagnostics) {
     let Some(path) = profile_json_target() else {
         return;
     };
@@ -3324,26 +3348,15 @@ pub(super) fn preflight_profile_json_path() {
         })
     };
     if let Err(e) = probed {
-        // #535 review: a `tiles` run preflights twice (convert's
-        // `validate_options`, then `export_pmtiles`), and the banner must not
-        // print twice for the same bad path. Remembered per path, not as a
-        // bare once-per-process flag, so a long-lived host (the Python
-        // bindings) that points the var somewhere else still gets warned.
-        static WARNED: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
-        if let Ok(mut warned) = WARNED.lock() {
-            if warned.as_deref() == Some(path) {
-                return;
-            }
-            *warned = Some(path.to_path_buf());
-        }
-        let path = path.display();
-        log::warn!(
+        // The sink deduplicates warnings within this operation. A later run
+        // gets a fresh sink and reports its own profile failure.
+        diagnostics.warn(format!(
             "[profile] ################################################\n\
-             [profile] TYLERTOO_PROFILE_JSON={path} is NOT WRITABLE: {e}\n\
+             [profile] TYLERTOO_PROFILE_JSON={path:?} is NOT WRITABLE: {e}\n\
              [profile] Profiling data for THIS RUN will be LOST — the \
              conversion will still proceed and complete normally.\n\
              [profile] ################################################"
-        );
+        ));
     }
 }
 
@@ -3361,7 +3374,10 @@ pub(super) fn preflight_profile_json_path() {
 /// conversion, so an unset/blank env var is a no-op and an open/write error is
 /// only logged. Reads exactly one already-computed number per field (no
 /// re-derivation), so this has zero effect on conversion output bytes.
-fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
+fn write_profile_json(
+    inputs: ProfileJsonInputs<'_>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     let Some(path) = profile_json_target() else {
         return;
     };
@@ -3464,7 +3480,7 @@ fn write_profile_json(inputs: ProfileJsonInputs<'_>) {
         "in_flight": inputs.in_flight_batches,
         "memory_profile": inputs.options.profile,
     });
-    append_profile_line(&path, &value);
+    append_profile_line(&path, &value, diagnostics);
 }
 
 /// Build the `pass2.sink` object (#626): the measured retained cost of a
@@ -3561,7 +3577,11 @@ pub(super) fn profile_json_target() -> Option<String> {
 /// appending to the same file (concurrent sweep jobs, or shards) could
 /// interleave fragments of each other's lines. A single append-mode write of
 /// a line this size lands contiguously on local filesystems.
-fn append_profile_line(path: &str, value: &serde_json::Value) {
+fn append_profile_line(
+    path: &str,
+    value: &serde_json::Value,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     use std::io::Write;
     let mut line = value.to_string();
     line.push('\n');
@@ -3572,11 +3592,15 @@ fn append_profile_line(path: &str, value: &serde_json::Value) {
     {
         Ok(mut f) => {
             if let Err(e) = f.write_all(line.as_bytes()) {
-                log::warn!("[profile] TYLERTOO_PROFILE_JSON write to {path:?} failed: {e}");
+                diagnostics.warn(format!(
+                    "[profile] TYLERTOO_PROFILE_JSON write to {path:?} failed: {e}"
+                ));
             }
         }
         Err(e) => {
-            log::warn!("[profile] TYLERTOO_PROFILE_JSON open {path:?} failed: {e}");
+            diagnostics.warn(format!(
+                "[profile] TYLERTOO_PROFILE_JSON open {path:?} failed: {e}"
+            ));
         }
     }
 }
@@ -3863,7 +3887,10 @@ pub(super) struct ExportProfileJsonInputs<'a> {
 /// [`write_profile_json`]: an unset/blank env var is a no-op, an open/write
 /// error is only logged, and this can never fail (or otherwise affect the
 /// bytes of) an export. Only a SUCCESSFUL export reaches this.
-pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
+pub(super) fn write_export_profile_json(
+    inputs: ExportProfileJsonInputs<'_>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) {
     let Some(path) = profile_json_target() else {
         return;
     };
@@ -3927,7 +3954,7 @@ pub(super) fn write_export_profile_json(inputs: ExportProfileJsonInputs<'_>) {
             "threads": rayon::current_num_threads(),
         },
     });
-    append_profile_line(&path, &value);
+    append_profile_line(&path, &value, diagnostics);
 }
 
 // ============================================================================
@@ -3969,7 +3996,11 @@ enum RankPlan {
 
 /// Build the [`RankPlan`] from the schema, validating explicit columns eagerly
 /// (same error variants as the in-memory path).
-fn build_rank_plan(schema: &Schema, options: &ConvertOptions) -> Result<RankPlan, ConvertError> {
+fn build_rank_plan(
+    descriptor: &ResolvedSchema,
+    options: &ConvertOptions,
+) -> Result<RankPlan, ConvertError> {
+    let schema = descriptor.schema();
     if let Some(name) = &options.sort_key {
         let idx = schema
             .index_of(name)
@@ -4298,13 +4329,15 @@ fn apply_entry_levels(
     ladder_values: &[Option<f64>],
     num_rows: usize,
     features: &mut FeatureTable,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<EntryZoomProvenance>, ConvertError> {
     if options.entry_zoom.is_none() {
         return Ok(None);
     }
     debug_assert_eq!(ladder_values.len(), num_rows);
     let level_specs = options.levels.resolve(options.gsd_base)?;
-    let Some(entry) = super::convert::resolve_entry_levels(options, ladder_values, &level_specs)?
+    let Some(entry) =
+        super::convert::resolve_entry_levels(options, ladder_values, &level_specs, diagnostics)?
     else {
         return Ok(None);
     };
@@ -4561,17 +4594,18 @@ impl GeoArrowVisitor for ScanRows<'_> {
 /// structurally impossible (see [`ChunkScan`]).
 #[allow(clippy::too_many_arguments)]
 fn scan_chunk(
+    ctx: &Pass1Ctx<'_>,
     geom_field: &Field,
     gcol: &dyn Array,
     diag_row_base: usize,
     filter_mask: Option<&[Option<bool>]>,
-    bbox_query: Option<&BboxQuery>,
-    crs: Crs,
     collect_lines: LineCollect,
     want_areas: bool,
     timers: &Pass1Timers,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ChunkScan, ConvertError> {
+    let bbox_query = ctx.bbox_query;
+    let crs = ctx.crs;
+    let diagnostics = ctx.diagnostics;
     let chunk_len = gcol.len();
     let t_decode = Instant::now();
     let garr = from_arrow_array(gcol, geom_field).map_err(|e| {
@@ -4689,34 +4723,6 @@ fn scan_chunk(
         point_count,
         skipped_rows,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_pass1(
-    source: &ConvertSource,
-    input_schema: &Schema,
-    geom_idx: usize,
-    options: &ConvertOptions,
-    acc_cols: &[usize],
-    row_groups: Option<&RowGroupSelection>,
-    bbox_query: Option<&BboxQuery>,
-    filter: Option<&super::filter::BoundFilter>,
-    crs: Crs,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) -> Result<Pass1Output, ConvertError> {
-    run_pass1_with_chunk_rows(
-        source,
-        input_schema,
-        geom_idx,
-        options,
-        acc_cols,
-        row_groups,
-        bbox_query,
-        filter,
-        crs,
-        adaptive_pass1_chunk_rows(options.read_batch_size),
-        diagnostics,
-    )
 }
 
 /// Per-batch columnar key extraction for pass 1: ranking keys (explicit
@@ -5024,20 +5030,26 @@ fn merge_pass1_chunks(
 /// read/compute overlap knob pass 2 already used.
 #[allow(clippy::too_many_arguments)]
 fn run_pass1_with_chunk_rows(
-    source: &ConvertSource,
-    input_schema: &Schema,
-    geom_idx: usize,
-    options: &ConvertOptions,
-    acc_cols: &[usize],
-    row_groups: Option<&RowGroupSelection>,
-    bbox_query: Option<&BboxQuery>,
-    filter: Option<&super::filter::BoundFilter>,
-    crs: Crs,
+    ctx: &Pass1Ctx<'_>,
     chunk_rows: usize,
-    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Pass1Output, ConvertError> {
+    let source = ctx.source;
+    let input_schema = ctx.descriptor.schema();
+    let geom_idx = ctx
+        .descriptor
+        .geometry_name()
+        .and_then(|n| input_schema.index_of(n).ok())
+        .ok_or_else(|| ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        })?;
+    let options = ctx.config.options();
+    let diagnostics = ctx.diagnostics;
+    let acc_cols = ctx.acc_cols;
+    let row_groups = ctx.selected_row_groups;
+    let filter = ctx.bound_filter;
+    let bbox_query = ctx.bbox_query;
     let chunk_rows = chunk_rows.max(1);
-    let mut plan = build_rank_plan(input_schema, options)?;
+    let mut plan = build_rank_plan(ctx.descriptor, options)?;
 
     // Entry-zoom ladder column (#364), resolved by name against the (already
     // #288-renamed) schema so a `--magnitude-ladder level` on a source that
@@ -5075,7 +5087,7 @@ fn run_pass1_with_chunk_rows(
     // prices pass 1's own read-ahead.
     let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
     let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
-    let read_tuning = pass1_read_tuning(options, geom_bytes, selected_rows);
+    let read_tuning = pass1_read_tuning(*ctx.budget, options, geom_bytes, selected_rows);
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -5125,12 +5137,11 @@ fn run_pass1_with_chunk_rows(
         // `SendError` means the consumer stopped — a clean `Stop`, per
         // `scoped_pipe`'s contract.
         |tx: &Sender<Pass1ReadMsg>| -> Result<(), ConvertError> {
-            read_in_order(
-                source,
+            ctx.reader.read(
                 row_groups,
                 Some(&cols),
                 read_tuning,
-                |batch, _offset, read_dur| {
+                &mut |batch, _offset, read_dur| {
                     Ok(if tx.send(Pass1ReadMsg { batch, read_dur }).is_err() {
                         ReadFlow::Stop
                     } else {
@@ -5185,6 +5196,7 @@ fn run_pass1_with_chunk_rows(
                         let gcol = batch.column(gcol_idx).slice(start, len);
                         let mask_slice = filter_mask.as_deref().map(|m| &m[start..start + len]);
                         scan_chunk(
+                            ctx,
                             &gfield,
                             gcol.as_ref(),
                             // Diagnostics only (see `scan_chunk`): the chunk's
@@ -5194,12 +5206,9 @@ fn run_pass1_with_chunk_rows(
                             // index itself.
                             base + start,
                             mask_slice,
-                            bbox_query,
-                            crs,
                             collect_lines,
                             want_areas,
                             timers_ref,
-                            diagnostics,
                         )
                     })
                     .collect();
@@ -5277,7 +5286,13 @@ fn run_pass1_with_chunk_rows(
         }
     }
 
-    let entry_zoom = apply_entry_levels(options, &ladder_values, num_rows, &mut features)?;
+    let entry_zoom = apply_entry_levels(
+        options,
+        &ladder_values,
+        num_rows,
+        &mut features,
+        diagnostics,
+    )?;
 
     // Coalescing scratch (Q3): line sort keys + per-line groups. `rows` and
     // `groups` are row-indexed; sort keys live on the features. `None` when
@@ -5501,7 +5516,7 @@ impl Pass2Timers {
 
 /// Immutable context for one level's pass-2 stream.
 pub(super) struct LevelStreamCtx<'a> {
-    diagnostics: &'a crate::diagnostics::Diagnostics,
+    pub(super) diagnostics: &'a crate::diagnostics::Diagnostics,
     source_schema: &'a Schema,
     /// `source_schema` + trailing `point_count` when clustering, otherwise
     /// identical (the schema [`apply_cluster_columns`] produces).
@@ -5606,7 +5621,7 @@ fn write_level_streaming(
     writer: &mut OverviewWriter<File>,
     level_idx: usize,
     hint: usize,
-    source: &ConvertSource,
+    source: &dyn BatchSource,
     read_tuning: ReadTuning,
     in_flight: usize,
     row_groups: Option<&RowGroupSelection>,
@@ -5664,6 +5679,13 @@ fn write_level_streaming(
     // the borrow and leave `level_timers` owned here for the post-scope read
     // and the return value below.
     let (read_depth, window) = split_in_flight(in_flight);
+    let window = read_tuning.budget.compute_window(
+        read_tuning.profile,
+        window,
+        read_tuning.batch_size,
+        1,
+        read_tuning.avg_geom_bytes,
+    );
     let outcome = scoped_pipe(
         window.min(STREAMED_OUTPUT_DEPTH),
         // Producer: read + process, in order, until EOF or the writer
@@ -5686,12 +5708,11 @@ fn write_level_streaming(
                     // several merged back into the identical batch sequence
                     // (#494) — `read_tuning` decides, and the decision never
                     // reaches the output.
-                    read_in_order(
-                        source,
+                    source.read(
                         row_groups,
                         None,
                         read_tuning,
-                        |batch, offset, read_dur| {
+                        &mut |batch, offset, read_dur| {
                             if last_progress.elapsed().as_secs() >= 10 {
                                 last_progress = Instant::now();
                                 log::info!(
@@ -6330,13 +6351,7 @@ mod tests {
         total
     }
 
-    /// #543: the pass-1 memory-floor preflight fires from footer-derived row
-    /// counts alone, before pass 1 (or even `stage_input_pass0`) touches a
-    /// single data page — proven with a real fixture file and a mocked limit
-    /// (the #509-style `_with_memory_limit` test seam), the way #509's own
-    /// `build_writer_options_with_ceiling` proved its ceiling preflight.
-    #[test]
-    fn convert_preflight_fails_fast_under_a_tiny_memory_limit() {
+    fn preflight_fixture() -> (tempfile::NamedTempFile, ConvertSource, ConvertOptions) {
         let geoms: Vec<Option<Geometry<f64>>> =
             mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
         let values: Vec<f64> = vec![1.0; geoms.len()];
@@ -6351,9 +6366,20 @@ mod tests {
             ..Default::default()
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
+        (tin, source, options)
+    }
+
+    /// #543: the pass-1 memory-floor preflight fires from footer-derived row
+    /// counts alone, before pass 1 (or even `stage_input_pass0`) touches a
+    /// single data page — proven with a real fixture file and a mocked limit
+    /// (the #509-style `_with_memory_limit` test seam), the way #509's own
+    /// `build_writer_options_with_ceiling` proved its ceiling preflight.
+    #[test]
+    fn preflight_fails_fast_under_a_tiny_memory_limit() {
+        let (_input, source, options) = preflight_fixture();
 
         // A generous mocked limit fits comfortably.
-        convert_preflight_with_memory_limit(
+        preflight_with_memory_limit(
             &source,
             &options,
             hard_limit(1 << 40),
@@ -6366,7 +6392,7 @@ mod tests {
         // table — this must fail from the footer row count alone, never
         // having opened a data page (the fixture is tiny; if this reached
         // pass 1 it would simply succeed, silently defeating the test).
-        match convert_preflight_with_memory_limit(
+        match preflight_with_memory_limit(
             &source,
             &options,
             hard_limit(1),
@@ -6374,16 +6400,16 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         ) {
             Err(
-                err @ ConvertError::Pass1MemoryFloorExceeded {
-                    rows: 10,
-                    estimated_bytes: 420,
-                    limit_bytes: 1,
+                err @ ConvertError::BudgetExceeded {
+                    phase: "pass-1 scan",
+                    needed: 420,
+                    available: 1,
                 },
             ) => {
                 let msg = err.to_string();
                 for want in [
-                    "10 input row(s)",
-                    "cgroup hard memory limit (memory.max)",
+                    "pass-1 scan needs 420 bytes",
+                    "only 1 bytes are available",
                     "TYLERTOO_SKIP_MEMORY_PREFLIGHT=1",
                 ] {
                     assert!(msg.contains(want), "missing {want:?}: {msg}");
@@ -6394,7 +6420,7 @@ mod tests {
         }
 
         // The escape hatch downgrades it to a warning.
-        convert_preflight_with_memory_limit(
+        preflight_with_memory_limit(
             &source,
             &options,
             hard_limit(1),
@@ -6409,7 +6435,7 @@ mod tests {
             bbox: Some([-180.0, -90.0, 180.0, 90.0]),
             ..options.clone()
         };
-        convert_preflight_with_memory_limit(
+        preflight_with_memory_limit(
             &source,
             &bbox_options,
             hard_limit(1),
@@ -6434,23 +6460,11 @@ mod tests {
     /// near-empty-cgroup figure for every later `auto` decision. Counted
     /// per thread, so parallel tests warming the cache cannot race this.
     #[test]
-    fn convert_preflight_does_not_touch_the_available_memory_cache() {
-        let geoms: Vec<Option<Geometry<f64>>> =
-            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
-        let values: Vec<f64> = vec![1.0; geoms.len()];
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input_with_f64(tin.path(), &geoms, "rank", &values);
-        let options = ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 1,
-                max_zoom: 5,
-            },
-            ..Default::default()
-        };
-        let source = ConvertSource::resolve_path(tin.path()).unwrap();
+    fn preflight_does_not_touch_the_available_memory_cache() {
+        let (_input, source, options) = preflight_fixture();
 
         let before = super::super::pipeline::available_memory_bytes_calls_on_this_thread();
-        convert_preflight(
+        preflight(
             &source,
             &options,
             &crate::diagnostics::Diagnostics::default(),
@@ -6459,7 +6473,7 @@ mod tests {
         assert_eq!(
             super::super::pipeline::available_memory_bytes_calls_on_this_thread(),
             before,
-            "convert_preflight must use the uncached probe"
+            "preflight must use the uncached probe"
         );
     }
 
@@ -6469,24 +6483,11 @@ mod tests {
     /// it — checked here against an impossibly small mocked limit that would
     /// otherwise certainly fail.
     #[test]
-    fn convert_preflight_skips_memory_check_for_plan_replay() {
-        let geoms: Vec<Option<Geometry<f64>>> =
-            mixed_geometries(10, 0, 0).into_iter().map(Some).collect();
-        let values: Vec<f64> = vec![1.0; geoms.len()];
-        let tin = tempfile::NamedTempFile::new().unwrap();
-        write_input_with_f64(tin.path(), &geoms, "rank", &values);
+    fn preflight_skips_memory_check_for_plan_replay() {
+        let (_input, source, mut options) = preflight_fixture();
+        options.plan = Some(std::path::PathBuf::from("/nonexistent/convert.plan"));
 
-        let options = ConvertOptions {
-            levels: LevelPlan::ZoomRange {
-                min_zoom: 1,
-                max_zoom: 5,
-            },
-            plan: Some(std::path::PathBuf::from("/nonexistent/convert.plan")),
-            ..Default::default()
-        };
-        let source = ConvertSource::resolve_path(tin.path()).unwrap();
-
-        convert_preflight_with_memory_limit(
+        preflight_with_memory_limit(
             &source,
             &options,
             hard_limit(1),
@@ -6496,31 +6497,71 @@ mod tests {
         .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
-    /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
-    /// [`convert_preflight`] each time (mirrors how `convert_streaming_strategy`
-    /// prepares its inputs).
     fn run_pass1_for_test(path: &Path, options: &ConvertOptions, chunk_rows: usize) -> Pass1Output {
         let source = ConvertSource::resolve_path(path).unwrap();
-        let pre = convert_preflight(
-            &source,
-            options,
-            &crate::diagnostics::Diagnostics::default(),
-        )
-        .unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let pre = preflight(&source, options, &diagnostics).unwrap();
+        scan_fixture(&source, &pre, chunk_rows, &diagnostics).unwrap()
+    }
+
+    #[test]
+    fn pass1_context_filters_bbox_for_both_sources() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let geoms = [
+            Some(Geometry::Point(geo::Point::new(0.0, 0.0))),
+            Some(Geometry::Point(geo::Point::new(40.0, 40.0))),
+        ];
+        write_input_with_f64(file.path(), &geoms, "rank", &[1.0, 2.0]);
+        for streaming in [false, true] {
+            let options = ConvertOptions {
+                streaming,
+                bbox: Some([-1.0, -1.0, 1.0, 1.0]),
+                ..Default::default()
+            };
+            let scan = run_pass1_for_test(file.path(), &options, 1);
+            assert_eq!(
+                scan.num_rows, 2,
+                "both rows in the retained row group are scanned"
+            );
+            assert_eq!(scan.features.len(), 1);
+            assert_eq!(scan.features.indices(), &[0]);
+        }
+    }
+
+    fn scan_fixture(
+        source: &ConvertSource,
+        pre: &Preflight,
+        chunk_rows: usize,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Result<Pass1Output, ConvertError> {
+        let config = pre.options.validate()?;
+        let memory = if pre.options.streaming {
+            None
+        } else {
+            Some(MemorySource::load(
+                source,
+                pre.selected_row_groups.as_ref(),
+                pass1_read_tuning(pre.budget, &pre.options, 0, 0),
+                tylertoo_io::byte_array_limit(),
+            )?)
+        };
         run_pass1_with_chunk_rows(
-            &source,
-            &pre.input_schema,
-            pre.geom_idx,
-            &pre.options,
-            &pre.acc_cols,
-            pre.selected_row_groups.as_ref(),
-            pre.bbox_query.as_ref(),
-            pre.bound_filter.as_ref(),
-            pre.crs,
+            &Pass1Ctx {
+                source,
+                reader: memory.as_ref().map_or(source as &dyn BatchSource, |m| m),
+                descriptor: &pre.descriptor,
+                config: &config,
+                budget: &pre.budget,
+                diagnostics,
+                acc_cols: &pre.acc_cols,
+                selected_row_groups: pre.selected_row_groups.as_ref(),
+                bbox_query: pre.bbox_query.as_ref(),
+                bound_filter: pre.bound_filter.as_ref(),
+                crs: pre.crs,
+                prebuild_chain_tables: false,
+            },
             chunk_rows,
-            &crate::diagnostics::Diagnostics::default(),
         )
-        .unwrap()
     }
 
     /// Column-by-column [`FeatureTable`] comparison ([`FeatureTable`] has no
@@ -6681,6 +6722,7 @@ mod tests {
             &source,
             None,
             ReadTuning {
+                budget: MemoryBudget::with_available(None),
                 batch_size: READ_BATCH_SIZE,
                 workers: 4,
                 avg_geom_bytes: None,
@@ -6718,13 +6760,16 @@ mod tests {
             profile: MemoryProfile::Bounded,
             ..Default::default()
         };
-        let tuning = pass1_read_tuning(&options, 40_000 * 9, 9);
+        let tuning = pass1_read_tuning(MemoryBudget::with_available(None), &options, 40_000 * 9, 9);
         assert_eq!(tuning.avg_geom_bytes, Some(40_000));
         assert_eq!(tuning.batch_size, 64);
         assert_eq!(tuning.workers, 3);
         assert!(matches!(tuning.profile, MemoryProfile::Bounded));
         // Nothing selected: no average to take, so the fallback applies.
-        assert_eq!(pass1_read_tuning(&options, 0, 0).avg_geom_bytes, None);
+        assert_eq!(
+            pass1_read_tuning(MemoryBudget::with_available(None), &options, 0, 0).avg_geom_bytes,
+            None
+        );
     }
 
     /// #449: pass 1 must stop collecting line geometries the moment the
@@ -7666,22 +7711,15 @@ mod tests {
             ..Default::default()
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let pre = convert_preflight(
+        let pre = preflight(
             &source,
             &options,
             &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
-        let res = run_pass1_with_chunk_rows(
+        let res = scan_fixture(
             &source,
-            &pre.input_schema,
-            pre.geom_idx,
-            &pre.options,
-            &pre.acc_cols,
-            pre.selected_row_groups.as_ref(),
-            pre.bbox_query.as_ref(),
-            pre.bound_filter.as_ref(),
-            pre.crs,
+            &pre,
             CHUNK_ROWS,
             &crate::diagnostics::Diagnostics::default(),
         );
@@ -7743,6 +7781,7 @@ mod tests {
             &[],
             &options,
             32_000,
+            &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert_eq!(opts.max_row_group_size, options.max_row_group_size);
@@ -7768,6 +7807,7 @@ mod tests {
             &[],
             &options,
             ceiling,
+            &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         assert!(
@@ -7808,6 +7848,7 @@ mod tests {
             &[],
             &options,
             ceiling,
+            &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -8033,14 +8074,21 @@ mod tests {
         // As the production driver does before any schema index is derived
         // (#386): narrow the source to the selected property columns, which
         // drops the input's own bbox covering from the read.
-        super::super::convert::apply_property_selection(&source, &options).unwrap();
+        super::super::convert::apply_property_selection(
+            &source,
+            &options,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         let input_schema = source.schema().unwrap();
-        let geom_idx = crate::overview::convert::find_geometry_column(&input_schema)
+        let geom_idx = source
+            .resolved_schema()
+            .unwrap()
+            .geometry_index()
             .expect("fixture has a geometry column");
-        let geom_name = input_schema.field(geom_idx).name().clone();
         let crs = Crs::Epsg4326;
         let (source_schema, cluster_schema, out_schema) =
-            build_level_schemas(&input_schema, geom_idx, &geom_name, crs, &options);
+            build_level_schemas(source.resolved_schema().unwrap(), &options);
 
         // Tiny row groups + concurrency 2: the first row-group encode is
         // submitted after 4 rows and drained (surfacing the injected panic)
@@ -8049,10 +8097,10 @@ mod tests {
             vec![LevelSpec::new(10.0, Some(10))],
             &[10.0],
             &[ROWS],
-            crs,
+            source.resolved_schema().unwrap(),
             ranking_provenance(),
-            &[],
             &options,
+            &crate::diagnostics::Diagnostics::default(),
         )
         .unwrap();
         writer_opts.max_row_group_size = 4;
@@ -8092,6 +8140,7 @@ mod tests {
             carriers: &[],
         };
         let tuning = ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 8, // 50 read batches for the producer to push
             workers: 1,
             avg_geom_bytes: None,
@@ -8150,7 +8199,7 @@ mod tests {
     }
 
     /// The same guarantee end to end through the production driver
-    /// (`convert_streaming_strategy`, pipelined engine): a sink that rejects
+    /// (`run_stages`, pipelined engine): a sink that rejects
     /// every write (`/dev/full`, ENOSPC) fails the conversion with the
     /// writer's typed error instead of hanging a producer on a full channel
     /// or reporting a truncated file as success. Linux only: no other CI
@@ -8221,6 +8270,7 @@ mod tests {
             selection,
             None,
             ReadTuning {
+                budget: MemoryBudget::with_available(None),
                 batch_size: 1,
                 workers,
                 avg_geom_bytes: None,
@@ -8418,7 +8468,7 @@ mod tests {
 
     /// Ten 400 m fields (160,000 m² each) in one accumulation patch, all
     /// non-members of level 0 — the `accumulate::tests` shape, driven through
-    /// the streaming path's own carrier resolution (`streaming_carriers`) so
+    /// the streaming path's own carrier resolution (`build_carriers`) so
     /// the options → threshold wiring is what is under test.
     fn ten_dropped_fields() -> (Vec<AssignFeature>, Vec<u8>, Vec<f32>) {
         let feats: Vec<AssignFeature> = (0..10)
@@ -8452,7 +8502,7 @@ mod tests {
             },
             ..ConvertOptions::default()
         };
-        streaming_carriers(
+        build_carriers(
             &options,
             &table(&feats),
             &min_levels,
@@ -8468,7 +8518,7 @@ mod tests {
     /// 7th field crosses the threshold — so the harness is live and any "no
     /// carriers" result below is the guard, not a dead accumulator.
     #[test]
-    fn streaming_carriers_emit_one_placeholder_per_threshold() {
+    fn build_carriers_emit_one_placeholder_per_threshold() {
         let carriers = carriers_for_factor(1.0);
         assert_eq!(carriers[0], vec![6]);
         assert!(
@@ -8485,7 +8535,7 @@ mod tests {
     /// square no size), so lowering the factor to close slivers emptied
     /// dense areas at middle zooms.
     #[test]
-    fn streaming_carriers_ignore_the_simplify_factor() {
+    fn build_carriers_ignore_the_simplify_factor() {
         let at_default = carriers_for_factor(1.0);
         assert_eq!(at_default[0].len(), 1, "the control carrier");
         for factor in [0.0, 1e-6, 0.1, 0.25, 3.7] {
@@ -8561,18 +8611,18 @@ mod tests {
         let finest = level_specs.len() - 1;
         let options = ConvertOptions::default();
         let (full_counts, full_build) = coalesce_level_counts(
+            MemoryBudget::with_available(None),
             &scratch,
             &level_specs,
-            finest,
             Crs::Epsg4326,
             &options,
             true,
             &crate::diagnostics::Diagnostics::default(),
         );
         let (plan_counts, plan_build) = coalesce_level_counts(
+            MemoryBudget::with_available(None),
             &scratch,
             &level_specs,
-            finest,
             Crs::Epsg4326,
             &options,
             false,
@@ -8790,6 +8840,48 @@ mod tests {
     /// Assert `scan_chunk` over `gcol` matches [`pre_650_scan_chunk`] in
     /// every output, for every coalescing mode, with and without areas,
     /// the attribute filter (`mask`) and the regional extract (`region`).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_chunk_for_test(
+        field: &Field,
+        col: &dyn Array,
+        base: usize,
+        mask: Option<&[Option<bool>]>,
+        bbox: Option<&BboxQuery>,
+        crs: Crs,
+        collect: LineCollect,
+        areas: bool,
+        timers: &Pass1Timers,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Result<ChunkScan, ConvertError> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_input_with_f64(
+            file.path(),
+            &[Some(Geometry::Point(geo::Point::new(0.0, 0.0)))],
+            "rank",
+            &[1.0],
+        );
+        let source = ConvertSource::resolve_path(file.path()).unwrap();
+        let options = ConvertOptions::default();
+        let config = options.validate().unwrap();
+        let descriptor = source.resolved_schema().unwrap();
+        let budget = MemoryBudget::with_available(None);
+        let ctx = Pass1Ctx {
+            source: &source,
+            reader: &source,
+            descriptor,
+            config: &config,
+            budget: &budget,
+            diagnostics,
+            acc_cols: &[],
+            selected_row_groups: None,
+            bbox_query: bbox,
+            bound_filter: None,
+            crs,
+            prebuild_chain_tables: false,
+        };
+        scan_chunk(&ctx, field, col, base, mask, collect, areas, timers)
+    }
+
     fn assert_scan_chunk_matches_pre_650(
         what: &str,
         field: &Field,
@@ -8802,7 +8894,7 @@ mod tests {
             for want_areas in [false, true] {
                 for m in [None, Some(mask)] {
                     for bb in [None, Some(&region)] {
-                        let got = scan_chunk(
+                        let got = scan_chunk_for_test(
                             field,
                             gcol,
                             0,
@@ -9029,7 +9121,7 @@ mod tests {
         let drop_row_1 = [Some(true), Some(false), Some(true)];
         for mask in [None, Some(&drop_row_1[..])] {
             for (collect, want_areas) in [(LineCollect::Off, false), (LineCollect::Collect, true)] {
-                let got = match scan_chunk(
+                let got = match scan_chunk_for_test(
                     &field,
                     &gcol,
                     40,

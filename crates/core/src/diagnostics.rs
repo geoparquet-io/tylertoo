@@ -40,6 +40,12 @@ pub struct RangeContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Diagnostic {
+    /// Advice or an I/O warning from the shared pipeline. Kept per run and
+    /// deduplicated by its complete message; never persisted in a plan.
+    Advisory {
+        count: usize,
+        message: String,
+    },
     OutOfRange {
         context: Option<RangeContext>,
         count: usize,
@@ -201,6 +207,7 @@ impl Diagnostic {
             | Self::CrsAssumed { count, .. }
             | Self::EmptyLevels { count, .. }
             | Self::MemoryBudget { count, .. }
+            | Self::Advisory { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -232,6 +239,7 @@ impl Diagnostic {
             | Self::CrsAssumed { count, .. }
             | Self::EmptyLevels { count, .. }
             | Self::MemoryBudget { count, .. }
+            | Self::Advisory { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -264,6 +272,7 @@ impl Diagnostic {
 
     fn same_kind(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Advisory { message: a, .. }, Self::Advisory { message: b, .. }) => a == b,
             (Self::PolygonRepaired { kind: a, .. }, Self::PolygonRepaired { kind: b, .. }) => {
                 a == b
             }
@@ -314,6 +323,7 @@ impl fmt::Display for Diagnostic {
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
                 write!(f, "omitting {n} empty level(s) [{ids}] spanning GSD {gsd_max:.2}–{gsd_min:.2} m: none of the {input_features} input feature(s) are visible at those scales (visibility gates / density budget); the output pyramid starts at GSD {first_written_gsd:.2} m{zoom}. To populate coarse levels, lower --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD polygons as representative points (see docs/OVERVIEW_TUNING.md)")
             }
+            Self::Advisory {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
             Self::PyramidSkippedTiles {..} => write!(f, "{n} tile(s) outside their band's declared zoom range skipped"),
@@ -371,6 +381,10 @@ impl Default for Diagnostics {
 }
 
 impl Diagnostics {
+    pub(crate) fn warn(&self, message: String) {
+        self.once(Diagnostic::Advisory { count: 1, message });
+    }
+
     /// Defer metadata warnings until the input is used by an operation.
     pub(crate) fn silent() -> Self {
         Self {
@@ -464,7 +478,12 @@ impl Diagnostics {
     pub(crate) fn snapshot_for_plan(&self) -> Vec<Diagnostic> {
         self.snapshot()
             .into_iter()
-            .filter(|event| !matches!(event, Diagnostic::MemoryBudget { .. }))
+            .filter(|event| {
+                !matches!(
+                    event,
+                    Diagnostic::MemoryBudget { .. } | Diagnostic::Advisory { .. }
+                )
+            })
             .collect()
     }
 

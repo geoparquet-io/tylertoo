@@ -70,6 +70,42 @@ impl ResolvedSchema {
         Self::resolve_with(schema, None)
     }
 
+    /// Carry resolved footer facts through an order-preserving rename or
+    /// property projection. In particular, native Parquet CRS declarations
+    /// must not be re-inferred from the transformed Arrow schema alone.
+    pub(crate) fn transformed(&self, schema: SchemaRef, renames: &[(String, String)]) -> Self {
+        let mut result = self.clone();
+        let name = |old: &str| {
+            renames
+                .iter()
+                .find(|(from, _)| from == old)
+                .map_or_else(|| old.to_owned(), |(_, to)| to.clone())
+        };
+        result.facts.fields = schema.fields().iter().map(|f| f.name().clone()).collect();
+        result.facts.geometry_name = self.geometry_name().map(name);
+        result.facts.geometry_index = result.geometry_name().and_then(|n| schema.index_of(n).ok());
+        result.facts.primary_column = self.primary_column().map(name);
+        result.facts.geometry_columns = self
+            .geometry_columns()
+            .iter()
+            .map(|n| name(n))
+            .filter(|n| schema.index_of(n).is_ok())
+            .collect();
+        result.facts.properties = self
+            .properties()
+            .iter()
+            .filter_map(|&i| schema.index_of(&name(self.schema.field(i).name())).ok())
+            .collect();
+        // The new overview records this conversion's renames, as the writer
+        // did before descriptors were threaded through its stages.
+        result.facts.renames = renames
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect();
+        result.schema = schema;
+        result
+    }
+
     fn resolve_with(schema: &Schema, metadata: Option<&ParquetMetaData>) -> Result<Self> {
         let diagnostics = &Diagnostics::silent();
         let geo_json = schema

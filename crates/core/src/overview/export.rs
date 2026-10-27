@@ -1956,7 +1956,7 @@ fn export_pmtiles_validated(
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
     // for the standalone `export-pmtiles` path (which never runs convert's
     // own preflight); redundant but harmless in the `tiles` path.
-    preflight_profile_json_path();
+    preflight_profile_json_path(diagnostics);
     // #433: the knobs that need no file (`extent`, `tile_buffer`) are checked
     // before any I/O, so a bad value fails here rather than after the open.
     // #452: and the output, before the input is opened.
@@ -2265,13 +2265,16 @@ fn export_pmtiles_validated(
     progress.finish_rss_sampler();
 
     let mode = format!("{:?}", reader.mode()).to_lowercase();
-    progress.profile.emit(&ExportProfileTarget {
-        output: output_path.as_ref(),
-        layer_name: &options.layer_name,
-        mode: &mode,
-        partition_wave_width: ceiling_wave,
-        start,
-    });
+    progress.profile.emit(
+        &ExportProfileTarget {
+            output: output_path.as_ref(),
+            layer_name: &options.layer_name,
+            mode: &mode,
+            partition_wave_width: ceiling_wave,
+            start,
+        },
+        diagnostics,
+    );
 
     Ok(Pass2Run {
         report: ExportReport::from_zooms(
@@ -2578,21 +2581,28 @@ impl ExportProfile {
     /// Write the export's `TYLERTOO_PROFILE_JSON` line (a no-op when the var
     /// is unset). See [`write_export_profile_json`] for why this is a SECOND
     /// JSONL line rather than merged into convert's object.
-    fn emit(&self, target: &ExportProfileTarget<'_>) {
-        write_export_profile_json(ExportProfileJsonInputs {
-            output: target.output,
-            layer_name: target.layer_name,
-            mode: target.mode,
-            phase_walls: self.walls,
-            total_secs: target.start.elapsed().as_secs_f64(),
-            stage_secs: self.timers.stage_secs(),
-            per_zoom: &self.per_zoom,
-            waves_total: self.waves_total,
-            partition_wave_width: target.partition_wave_width,
-            checkpoints: self.checkpoints,
-            peak_rss_mib: self.peak_rss_mib,
-            rss_sampler_report: &self.rss_sampler_report,
-        });
+    fn emit(
+        &self,
+        target: &ExportProfileTarget<'_>,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) {
+        write_export_profile_json(
+            ExportProfileJsonInputs {
+                output: target.output,
+                layer_name: target.layer_name,
+                mode: target.mode,
+                phase_walls: self.walls,
+                total_secs: target.start.elapsed().as_secs_f64(),
+                stage_secs: self.timers.stage_secs(),
+                per_zoom: &self.per_zoom,
+                waves_total: self.waves_total,
+                partition_wave_width: target.partition_wave_width,
+                checkpoints: self.checkpoints,
+                peak_rss_mib: self.peak_rss_mib,
+                rss_sampler_report: &self.rss_sampler_report,
+            },
+            diagnostics,
+        );
     }
 }
 

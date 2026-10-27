@@ -115,7 +115,7 @@ fn convert_error_to_py(e: ConvertError) -> PyErr {
     }
     match e {
         // The box is too small for this input (#543).
-        ConvertError::Pass1MemoryFloorExceeded { .. } => PyMemoryError::new_err(e.to_string()),
+        ConvertError::BudgetExceeded { .. } => PyMemoryError::new_err(e.to_string()),
         // The input itself is the problem, not the run (#429).
         ConvertError::AllFeaturesOutOfRange { .. }
         | ConvertError::UnsupportedCrs { .. }

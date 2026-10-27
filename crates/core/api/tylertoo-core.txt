@@ -352,6 +352,9 @@ impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::CrsWarning
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::CrsWarning
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::CrsWarning
 pub enum tylertoo_core::diagnostics::Diagnostic
+pub tylertoo_core::diagnostics::Diagnostic::Advisory
+pub tylertoo_core::diagnostics::Diagnostic::Advisory::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Advisory::message: alloc::string::String
 pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect
 pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect::count: usize
 pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped
@@ -1694,6 +1697,10 @@ pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::min
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::sampled: usize
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::available: u64
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::needed: u64
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::phase: &'static str
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString
@@ -1720,10 +1727,6 @@ pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling
 pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling::ceiling: u8
 pub tylertoo_core::overview::convert::ConvertError::Output(tylertoo_core::atomic_output::OutputNotWritable)
 pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::ParquetError)
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::estimated_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::limit_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::PointCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Properties(tylertoo_core::overview::properties::PropertySelectionError)
 pub tylertoo_core::overview::convert::ConvertError::RankingConflict

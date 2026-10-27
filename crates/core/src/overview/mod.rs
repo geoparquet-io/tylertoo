@@ -25,6 +25,7 @@ pub mod filter;
 mod hostile;
 pub mod ladder;
 pub mod level;
+mod memory;
 mod pipe;
 mod pipeline;
 mod plan_state;
@@ -35,6 +36,7 @@ mod procmem;
 pub mod properties;
 pub mod reader;
 pub mod simplify;
+mod source;
 mod stream;
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -58,6 +58,7 @@ use tempfile::NamedTempFile;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
 
+use super::memory::{MemoryBudget, MemoryPhase, SINK_ROW_ALLOC_OVERHEAD_BYTES};
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
 use super::convert::ConvertError;
@@ -75,154 +76,12 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
-/// FALLBACK estimated in-RAM bytes per buffered output ROW, by mode, used when
-/// pass 1 could not measure the input's geometry sizes (empty input). `Auto`
-/// multiplies the per-row estimate by `buffered_rows` (the count the pass-2
-/// engine holds — every level but the streamed finest) to size the RAM-vs-spill
-/// choice against available RAM.
-///
-/// A buffered row is a whole retained feature (geometry + properties as Arrow
-/// arrays), NOT a coordinate — so the cost is dominated by geometry vertex
-/// count. Measured pass-2 sink cost per buffered row (2026-07, RSS delta of the
-/// pass2 sink phase ÷ `buffered_rows`): germany-segments lines ≈ 9.6 KiB,
-/// fieldmaps-adm4 polygons ≈ 6.3 KiB, moldova polygons ≈ 16 KiB. An earlier
-/// 256 B/row guess undercounted the real cost ~25× and let `auto` keep a
-/// 3.4 GiB sink in RAM on a simulated 2 GiB box (issue #294's exact failure).
-/// These constants are set to ~8 KiB (duplicating) / ~16 KiB (partitioning,
-/// full-resolution geometry) — biased high so `auto` prefers the (near-free on
-/// nvme) spill path over OOM. They steer only the backing choice, never output.
-const DUPLICATING_BYTES_PER_ROW: u64 = 8_192;
-const PARTITIONING_BYTES_PER_ROW: u64 = 16_384;
-
-/// Measured-path per-row model (#305): `per_row =
-/// SINK_ROW_ALLOC_OVERHEAD_BYTES + factor(mode) × avg_geom_bytes`, where
-/// `avg_geom_bytes` is the average encoded size of the geometry column per
-/// input row, from the footers' uncompressed column sizes over the selected
-/// row groups (#717; until then, the Arrow memory of pass 1's batches, which
-/// depended on how the rows were read). It costs no I/O
-/// and replaces the one-size-fits-all constants
-/// above with the input's actual geometry weight — the dominant, wildly
-/// dataset-dependent term (corpus range: ~30 B/row for points to ~11.5 KiB/row
-/// for fieldmaps-adm4 boundary polygons).
-///
-/// This is the UP-FRONT estimate only. It knows the geometry weight and
-/// nothing about how wide the retained property columns are, so #626 stopped
-/// pretending: [`SINK_ROW_ALLOC_OVERHEAD_BYTES`] is now an honest
-/// allocator/`Vec` floor, and the property term is **measured at run time**
-/// from every buffered output batch ([`SinkAutoTuner`]), which can flip an
-/// `auto` run from RAM to spill mid-pass.
-///
-/// Calibration (against the #294 RSS measurements above and corpus footers):
-///
-/// - `DUPLICATING_GEOM_FACTOR` (×2): buffered duplicating rows hold
-///   *simplified* copies (≤ input size, near-full-resolution only at the
-///   finest buffered level), so ×2 over the encoded input size is the
-///   deliberate high-bias margin (spills are near-free; OOM is not). Known
-///   under-count: line coalescing (Q3) merges many input rows into fewer,
-///   larger buffered rows — the per-row term misses the merge factor, but the
-///   row COUNT shrinks far more (germany-segments: ~19 M input rows → ~123 K
-///   buffered rows), so the product stays small in absolute terms.
-/// - `PARTITIONING_GEOM_FACTOR` (×4): partitioning buffers full-resolution
-///   geometry at every buffered level; keep the historical 2× ratio over
-///   duplicating from the fallback constants.
-///
-/// Sanity vs the #294 measurements: fieldmaps-adm4 duplicating estimates
-/// ~27 KiB/row vs 6.3 KiB measured (bias high — safe); moldova partitioning
-/// ~8 KiB/row vs 16 KiB RSS-measured (RSS deltas overcount true need via
-/// allocator slack; content is ~1 KiB/row). Like the fallback constants, the
-/// model steers only the backing choice, never output bytes.
-const DUPLICATING_GEOM_FACTOR: u64 = 2;
-const PARTITIONING_GEOM_FACTOR: u64 = 4;
-
-/// Per-buffered-row cost that is neither geometry nor property DATA: the
-/// `Vec<RecordBatch>` slot amortized over a batch's rows, Arrow's per-array
-/// offset/validity bookkeeping, and the allocator's rounding of each buffer up
-/// to a size class.
-///
-/// It is not a property allowance. Property bytes are unbounded by any
-/// constant — `gpio process aggregate --breakdown` outputs carry dozens to
-/// hundreds of `count_<value>` columns — so they are measured instead, per
-/// run, by [`SinkAutoTuner`], and a fixed stand-in for them would be wrong in
-/// one direction or the other on most inputs.
-///
-/// **Why 256 B is not #294 again.** #294's 256 B/row (the note on
-/// [`DUPLICATING_BYTES_PER_ROW`]) was the *whole* per-row estimate — no
-/// geometry term, no property term — and it was the only guard: once the
-/// up-front choice said RAM, nothing looked again. Here 256 B sits on top of
-/// terms that are measured (the footers' geometry weight up front; the Arrow
-/// bytes of every buffered batch at run time), and the run-time check runs
-/// for the whole pass with the bytes already buffered as a term of its
-/// projection. An up-front estimate that is too low therefore costs a late
-/// downgrade, not an unbounded sink: the flip happens no later than the
-/// moment the RAM sinks reach the budget. On a 1 M-point input with a light
-/// head and a 1.5 KB-string tail (1.2 GB limit), `auto` started in RAM on an
-/// up-front 447 MiB, downgraded as the tail arrived, and peaked at 606 MiB
-/// RSS against 601 MiB for `bounded`. Under `speed` the same input peaked at
-/// 2306 MiB, ~1.7 GiB over the ~600 MiB the run holds without a RAM sink,
-/// while the measurement (floor included) said 2280 MiB — so on that input
-/// the measurement over-counts what the sink adds to RSS, the safe
-/// direction.
-const SINK_ROW_ALLOC_OVERHEAD_BYTES: u64 = 256;
-
-/// Fraction of *available* system RAM the estimated buffered-output set may
-/// occupy before `Auto` spills to a temp file instead of holding it in RAM.
-///
-/// **Headroom.** This budget is charged twice over. The pass-2 sink is what it
-/// is for, but the pass-2 read-ahead ([`READ_BUDGET_FRACTION`]) takes a slice
-/// of the same number *on top* of the sink — 10% of it, half that under an
-/// explicit `bounded` profile. The two slices are sized differently. The
-/// sink's is chosen up front from a model ([`estimate_buffered_bytes`]) and
-/// then checked against the Arrow bytes actually buffered for the whole pass
-/// ([`SinkAutoTuner`]); the read-ahead's is a model only, priced per row by
-/// [`READ_ROW_NON_GEOM_BYTES`] plus the geometry weight
-/// ([`resolve_read_shape`]). The 0.4 of available RAM this fraction leaves
-/// unclaimed absorbs the read-ahead's model error, the gap between Arrow
-/// bytes and RSS, the in-flight batches, and the rayon pool's transients.
-const AUTO_RAM_FRACTION: f64 = 0.6;
-
-/// Budget used when available RAM cannot be probed (non-Linux, or
-/// `/proc/meminfo` unreadable): a fixed, conservative ceiling so `Auto` still
-/// spills very large buffered sets rather than assuming unlimited RAM.
-const AUTO_FALLBACK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
 /// Buffered-row count above which `Auto` always spills partitioning's
 /// full-resolution geometry, regardless of the RAM estimate. Preserves the
 /// pre-#294 partitioning safety floor as a strict lower bound (partitioning
 /// spills at least as often as before; the RAM gate can only make it spill
 /// sooner).
 const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
-
-/// Estimated peak RAM (bytes) the pass-2 sink would hold if `buffered_rows`
-/// output rows of `mode` were kept in RAM. `avg_geom_bytes` is the average
-/// encoded-geometry size per input row, from the footers (#305, #717); `None` (or a
-/// degenerate 0) falls back to the calibrated per-mode constants. Saturating,
-/// so absurd counts never overflow (they simply clamp to a "definitely spill"
-/// value).
-fn estimate_buffered_bytes(mode: Mode, buffered_rows: usize, avg_geom_bytes: Option<u64>) -> u64 {
-    let per_row = match avg_geom_bytes {
-        Some(avg) if avg > 0 => {
-            let factor = match mode {
-                Mode::Duplicating => DUPLICATING_GEOM_FACTOR,
-                Mode::Partitioning => PARTITIONING_GEOM_FACTOR,
-            };
-            SINK_ROW_ALLOC_OVERHEAD_BYTES.saturating_add(factor.saturating_mul(avg))
-        }
-        _ => match mode {
-            Mode::Duplicating => DUPLICATING_BYTES_PER_ROW,
-            Mode::Partitioning => PARTITIONING_BYTES_PER_ROW,
-        },
-    };
-    (buffered_rows as u64).saturating_mul(per_row)
-}
-
-/// The RAM budget `Auto` compares the estimate against: a fraction of available
-/// system RAM, or a fixed fallback when RAM cannot be determined.
-fn auto_budget_bytes(available_ram_bytes: Option<u64>) -> u64 {
-    match available_ram_bytes {
-        Some(ram) => ((ram as f64) * AUTO_RAM_FRACTION) as u64,
-        None => AUTO_FALLBACK_BUDGET_BYTES,
-    }
-}
 
 /// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
 ///
@@ -237,8 +96,12 @@ pub(super) fn auto_backing(
     available_ram_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = estimate_buffered_bytes(mode, buffered_rows, avg_geom_bytes);
-    let budget = auto_budget_bytes(available_ram_bytes);
+    let estimate = MemoryBudget::with_available(available_ram_bytes).sink_estimate(
+        mode,
+        buffered_rows,
+        avg_geom_bytes,
+    );
+    let budget = MemoryBudget::with_available(available_ram_bytes).allowance(MemoryProfile::Auto);
     let ram_gate_spill = estimate > budget;
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
@@ -246,22 +109,6 @@ pub(super) fn auto_backing(
         SinkBacking::Spill
     } else {
         SinkBacking::Ram
-    }
-}
-
-/// RAM budget for the pass-1 winner-grid waves (#306), by memory profile.
-///
-/// `bounded` and `auto` cap the concurrently-live per-level grids at the same
-/// fraction-of-available-RAM budget the pass-2 sink decision uses (#294) —
-/// honouring the `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override and the conservative
-/// fallback when RAM cannot be probed. `speed` opts out (unbounded, the
-/// pre-#306 behavior): by contract it trades RAM for wall time, and any wave
-/// split can serialize grid builds. The budget steers scheduling only — the
-/// assignment is identical for every value.
-pub(super) fn pass1_grid_budget_bytes(profile: MemoryProfile) -> u64 {
-    match profile {
-        MemoryProfile::Speed => u64::MAX,
-        MemoryProfile::Bounded | MemoryProfile::Auto => auto_budget_bytes(available_memory_bytes()),
     }
 }
 
@@ -730,6 +577,7 @@ fn read_proc_mem_available() -> Option<u64> {
 /// bounded spill path instead of the old unconditional RAM buffering. An
 /// explicit profile always wins.
 pub(super) fn resolve_backing(
+    memory: MemoryBudget,
     profile: MemoryProfile,
     mode: Mode,
     buffered_rows: usize,
@@ -749,10 +597,10 @@ pub(super) fn resolve_backing(
             SinkBacking::Spill
         }
         MemoryProfile::Auto => {
-            let available = available_memory_bytes();
+            let available = memory.available();
             let backing = auto_backing(mode, buffered_rows, available, avg_geom_bytes);
-            let estimate = estimate_buffered_bytes(mode, buffered_rows, avg_geom_bytes);
-            let budget = auto_budget_bytes(available);
+            let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+            let budget = memory.allowance(MemoryProfile::Auto);
             let avail_mib = available.map_or_else(
                 || "unknown".to_string(),
                 |b| format!("{} MiB", b / (1024 * 1024)),
@@ -800,7 +648,7 @@ pub(super) struct SinkMeasurement {
     /// of the pass it is the bytes actually buffered.
     pub(super) projected_bytes: u64,
     /// The RAM budget the projection was compared against
-    /// ([`AUTO_RAM_FRACTION`] × available RAM).
+    /// (the `MemoryBudget` allowance).
     pub(super) budget_bytes: u64,
     /// A one-way Ram→Spill downgrade fired mid-pass.
     pub(super) downgraded: bool,
@@ -845,7 +693,7 @@ struct SinkAutoTuner {
     bytes: u64,
     /// Output rows the plan expects the buffered levels to hold in total.
     planned_rows: usize,
-    /// [`AUTO_RAM_FRACTION`] × available RAM, captured once.
+    /// the `MemoryBudget` allowance, captured once.
     budget_bytes: u64,
     /// A downgrade is still possible: `auto`, and the sinks are still Ram.
     armed: bool,
@@ -859,10 +707,15 @@ impl SinkAutoTuner {
     /// The probe is skipped outright otherwise: `available_memory_bytes`
     /// caches process-wide on its first call, and a `bounded`/`speed` run must
     /// not have that call moved here (#485).
-    fn new(profile: MemoryProfile, backing: SinkBacking, planned_rows: usize) -> Self {
+    fn new(
+        profile: MemoryProfile,
+        backing: SinkBacking,
+        planned_rows: usize,
+        memory: MemoryBudget,
+    ) -> Self {
         let armed = matches!(profile, MemoryProfile::Auto) && matches!(backing, SinkBacking::Ram);
         let budget_bytes = if armed {
-            auto_budget_bytes(available_memory_bytes())
+            memory.allowance(MemoryProfile::Auto)
         } else {
             0
         };
@@ -964,6 +817,7 @@ fn downgrade_sinks_to_spill(
 /// rows it is about to read.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReadTuning {
+    pub(super) budget: MemoryBudget,
     /// Rows per delivered batch. The merge reproduces this chunking exactly,
     /// however many workers actually read.
     pub(super) batch_size: usize,
@@ -1022,27 +876,6 @@ const READ_AHEAD_MIN_BATCHES: usize = 4;
 /// tolerance for longer consumer stalls, and the cost is resident Arrow data.
 const READ_AHEAD_MAX_BATCHES: usize = 32;
 
-/// Assumed decoded GEOMETRY bytes per input row when there is no geometry
-/// weight to price with (no rows selected). Deliberately generous:
-/// over-estimating costs reader workers, under-estimating costs RAM. The
-/// non-geometry per-row term ([`READ_ROW_NON_GEOM_BYTES`]) is added on top,
-/// measured or not.
-const READ_ROW_BYTES_FALLBACK: u64 = 1024;
-
-/// Assumed NON-geometry bytes per resident read-batch row: every projected
-/// property column, its offsets, dictionaries and validity buffers.
-///
-/// This is the 4 KiB the sink estimate used to charge as
-/// `SINK_ROW_OVERHEAD_BYTES`, kept here at its calibrated value and renamed to
-/// say what it is for. #626 replaced the sink's copy with a measured figure,
-/// but the read-ahead cannot do the same: its size is chosen **before the
-/// first batch is read**, so there is nothing to sample. It stays a
-/// deliberately generous wide-schema proxy — pricing a read row at
-/// `2 × avg_geom` alone under-charged wide schemas by 17-232× against
-/// `get_array_memory_size()` (see [`resolve_read_shape`]) — and over-charging
-/// here costs reader workers, not correctness.
-const READ_ROW_NON_GEOM_BYTES: u64 = 4_096;
-
 /// A resolved parallel-read shape: how many workers, how deep each one's
 /// queue is, and how large a segment may be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1069,10 +902,10 @@ struct ReadShape {
 fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let batch_size = tuning.batch_size.max(1);
     // Per-row cost of a RESIDENT decoded batch, priced exactly like the sink's
-    // measured-path model (`estimate_buffered_bytes`): a fixed non-geometry
+    // measured-path model (`MemoryBudget::estimate`): a fixed non-geometry
     // term plus the measured encoded geometry, doubled.
     //
-    // `READ_ROW_NON_GEOM_BYTES` is not decoration. The weight covers ONLY the
+    // the non-geometry row allowance is not decoration. The weight covers ONLY the
     // geometry column, and a read batch carries every projected column — a
     // 58-column schema's properties, offsets, dictionaries and validity
     // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
@@ -1083,13 +916,12 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     // #626 note: the sink's own non-geometry term is now MEASURED, so the two
     // models no longer share a constant. That is deliberate — the read-ahead
     // is sized before a single batch exists, so this one stays a proxy.
-    let geom_per_row = tuning
-        .avg_geom_bytes
-        .filter(|&b| b > 0)
-        .map_or(READ_ROW_BYTES_FALLBACK, |b| b.saturating_mul(2));
-    let per_row = READ_ROW_NON_GEOM_BYTES.saturating_add(geom_per_row).max(1);
-    let per_batch = (batch_size as u64).saturating_mul(per_row).max(1);
-    let budget = (auto_budget_bytes(available_memory_bytes()) as f64 * READ_BUDGET_FRACTION) as u64;
+    let per_batch = tuning
+        .budget
+        .estimate(MemoryPhase::Read, batch_size as u64, tuning.avg_geom_bytes)
+        .max(1);
+    let budget =
+        (tuning.budget.allowance(MemoryProfile::Auto) as f64 * READ_BUDGET_FRACTION) as u64;
     let affordable = (budget / per_batch).max(1) as usize;
     let max_depth = match tuning.profile {
         MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
@@ -1630,6 +1462,7 @@ mod read_tests {
             None,
             None,
             ReadTuning {
+                budget: MemoryBudget::with_available(None),
                 batch_size,
                 workers,
                 // Tiny rows: the read-ahead sizing must not silently collapse
@@ -1676,6 +1509,7 @@ mod read_tests {
         // Guard the guard: if the read-ahead sizing ever leaves this fixture
         // with a single segment, the comparison below is vacuous.
         let shape = resolve_read_shape(ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1728,6 +1562,7 @@ mod read_tests {
         write_input(&path, 6300, 700);
         let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
         let tuning = ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1788,6 +1623,7 @@ mod read_tests {
         w.close().unwrap();
         let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
         let tuning = ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 96,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1805,6 +1641,7 @@ mod read_tests {
                 None,
                 Some(&[1]),
                 ReadTuning {
+                    budget: MemoryBudget::with_available(None),
                     batch_size: 96,
                     workers,
                     avg_geom_bytes: Some(8),
@@ -1926,6 +1763,7 @@ mod read_tests {
                 None,
                 None,
                 ReadTuning {
+                    budget: MemoryBudget::with_available(None),
                     batch_size: 64,
                     workers: 4,
                     avg_geom_bytes: Some(8),
@@ -1955,6 +1793,7 @@ mod read_tests {
     #[test]
     fn read_shape_keeps_segments_inside_the_queue() {
         let shape = resolve_read_shape(ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(64),
@@ -1976,6 +1815,7 @@ mod read_tests {
     #[test]
     fn read_shape_degrades_to_one_worker_under_memory_pressure() {
         let shape = resolve_read_shape(ReadTuning {
+            budget: MemoryBudget::with_available(None),
             batch_size: 8192,
             // 512 MiB per row: nothing is affordable.
             workers: 4,
@@ -2283,7 +2123,7 @@ pub(super) fn run_pass2_buffered(
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
-    source: &ConvertSource,
+    source: &dyn super::source::BatchSource,
     read_tuning: ReadTuning,
     selected_row_groups: Option<&RowGroupSelection>,
     in_flight: usize,
@@ -2309,7 +2149,7 @@ pub(super) fn run_pass2_buffered(
     let mut spill_bytes = vec![0u64; num_levels];
     // #626: measures what a buffered row really costs and, for `auto`, flips
     // the sinks to spill once if the measured rate projects past the budget.
-    let mut tuner = SinkAutoTuner::new(profile, backing, hints.iter().sum());
+    let mut tuner = SinkAutoTuner::new(profile, backing, hints.iter().sum(), read_tuning.budget);
 
     // Consumer state borrowed mutably by the consumer closure below.
     let (rows_ref, verts_ref, sinks_ref, spill_bytes_ref) =
@@ -2321,6 +2161,13 @@ pub(super) fn run_pass2_buffered(
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
     let (read_depth, window) = split_in_flight(in_flight);
+    let window = read_tuning.budget.compute_window(
+        profile,
+        window,
+        read_tuning.batch_size,
+        num_levels,
+        read_tuning.avg_geom_bytes,
+    );
     scoped_pipe(
         read_depth,
         // Producer: the input, in read order, over the per-part bbox-selected
@@ -2331,12 +2178,11 @@ pub(super) fn run_pass2_buffered(
         // (#494); either way the reader lives off the rayon pool, so reads are
         // never head-of-line blocked behind compute work.
         |tx: &Sender<ReadMsg>| -> Result<(), ConvertError> {
-            read_in_order(
-                source,
+            source.read(
                 selected_row_groups,
                 None,
                 read_tuning,
-                |batch, row_offset, read_dur| {
+                &mut |batch, row_offset, read_dur| {
                     Ok(
                         if tx
                             .send(ReadMsg {
@@ -2402,7 +2248,7 @@ pub(super) fn run_pass2_buffered(
                         }
                     }
                     if tuner_ref.should_downgrade() {
-                        log::warn!(
+                        ctxs[0].diagnostics.warn(format!(
                             "[convert] pass2 auto: measured {} B per buffered row over {} \
                              buffered row(s) projects {:.1} GiB for the buffered set — past the \
                              {:.1} GiB budget; downgrading {num_levels} RAM sink(s) to spill \
@@ -2411,7 +2257,7 @@ pub(super) fn run_pass2_buffered(
                             tuner_ref.rows,
                             gib(tuner_ref.projected_bytes()),
                             gib(tuner_ref.budget_bytes),
-                        );
+                        ));
                         downgrade_sinks_to_spill(
                             sinks_ref,
                             spill_bytes_ref,
@@ -2738,6 +2584,7 @@ mod backing_tests {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.
         assert!(matches!(
             resolve_backing(
+                MemoryBudget::with_available(None),
                 MemoryProfile::Speed,
                 Mode::Duplicating,
                 10_000_000_000,
@@ -2746,7 +2593,13 @@ mod backing_tests {
             SinkBacking::Ram
         ));
         assert!(matches!(
-            resolve_backing(MemoryProfile::Bounded, Mode::Duplicating, 1, None),
+            resolve_backing(
+                MemoryBudget::with_available(None),
+                MemoryProfile::Bounded,
+                Mode::Duplicating,
+                1,
+                None
+            ),
             SinkBacking::Spill
         ));
     }
@@ -2820,16 +2673,16 @@ mod backing_tests {
     #[test]
     fn estimate_scales_with_mode_and_rows() {
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, 1_000, None),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Duplicating, 1_000, None),
             8_192_000
         );
         assert_eq!(
-            estimate_buffered_bytes(Mode::Partitioning, 1_000, None),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Partitioning, 1_000, None),
             16_384_000
         );
         // Saturating: no overflow panic on absurd counts.
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, usize::MAX, None),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Duplicating, usize::MAX, None),
             u64::MAX
         );
     }
@@ -2843,16 +2696,24 @@ mod backing_tests {
         // cut the floor from 4 KiB to 256 B: it no longer stands in for the
         // property columns, which are measured during pass 2 instead.
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, 1_000, Some(1_000)),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Duplicating, 1_000, Some(1_000)),
             2_256_000 // (256 + 2*1000) * 1000
         );
         assert_eq!(
-            estimate_buffered_bytes(Mode::Partitioning, 1_000, Some(1_000)),
+            MemoryBudget::with_available(None).sink_estimate(
+                Mode::Partitioning,
+                1_000,
+                Some(1_000)
+            ),
             4_256_000 // (256 + 4*1000) * 1000
         );
         // Saturating with a measurement too.
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, usize::MAX, Some(1)),
+            MemoryBudget::with_available(None).sink_estimate(
+                Mode::Duplicating,
+                usize::MAX,
+                Some(1)
+            ),
             u64::MAX
         );
     }
@@ -2861,11 +2722,11 @@ mod backing_tests {
     fn measured_zero_falls_back_to_constants() {
         // A degenerate measurement (0 bytes/row) is treated as unmeasured.
         assert_eq!(
-            estimate_buffered_bytes(Mode::Duplicating, 1_000, Some(0)),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Duplicating, 1_000, Some(0)),
             8_192_000
         );
         assert_eq!(
-            estimate_buffered_bytes(Mode::Partitioning, 1_000, Some(0)),
+            MemoryBudget::with_available(None).sink_estimate(Mode::Partitioning, 1_000, Some(0)),
             16_384_000
         );
     }
@@ -2993,7 +2854,8 @@ mod sink_sample_tests {
     /// far past it.
     #[test]
     fn wide_properties_trip_the_downgrade_under_a_small_limit() {
-        let budget = auto_budget_bytes(Some(2_000_000_000));
+        let budget =
+            MemoryBudget::with_available(Some(2_000_000_000)).allowance(MemoryProfile::Auto);
         let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
         assert!(
             !tuner.should_downgrade(),
@@ -3014,7 +2876,8 @@ mod sink_sample_tests {
     /// modelled ~191 GiB and spilled; measured, they are ~1 GiB.
     #[test]
     fn two_properties_stay_in_ram_under_a_generous_limit() {
-        let budget = auto_budget_bytes(Some(64 * 1024 * 1024 * 1024));
+        let budget = MemoryBudget::with_available(Some(64 * 1024 * 1024 * 1024))
+            .allowance(MemoryProfile::Auto);
         let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
         tuner.observe(&sample_batch(2));
         assert!(
@@ -3036,7 +2899,12 @@ mod sink_sample_tests {
             (MemoryProfile::Speed, SinkBacking::Ram),
             (MemoryProfile::Bounded, SinkBacking::Spill),
         ] {
-            let mut tuner = SinkAutoTuner::new(profile, backing, usize::MAX);
+            let mut tuner = SinkAutoTuner::new(
+                profile,
+                backing,
+                usize::MAX,
+                MemoryBudget::with_available(None),
+            );
             tuner.observe(&sample_batch(200));
             assert!(
                 tuner.bytes_per_row().is_some(),
@@ -3183,7 +3051,8 @@ mod sink_sample_tests {
     /// The reported figure is what the profile dump publishes.
     #[test]
     fn the_report_carries_the_measurement_and_the_verdict() {
-        let budget = auto_budget_bytes(Some(2_000_000_000));
+        let budget =
+            MemoryBudget::with_available(Some(2_000_000_000)).allowance(MemoryProfile::Auto);
         let mut tuner = SinkAutoTuner::with_budget(true, 50_000_000, budget);
         assert_eq!(
             tuner.report(),
