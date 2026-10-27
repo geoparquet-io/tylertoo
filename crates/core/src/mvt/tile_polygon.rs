@@ -14,15 +14,9 @@
 //! `IsValidOp` (and so `shapely.is_valid`) applies to the decoded tile. The
 //! usual outcome is "valid", and the parts go out untouched: a valid polygon
 //! pays one check and nothing else. A feature that fails is repaired in two
-//! tiers:
-//!
-//! 1. the parts that fail on their own have their rings noded and split at
-//!    pinch vertices, and the pieces regrouped ([`super::regroup_pinched`],
-//!    #393): the neck that snapped shut and the spike that folded back, the
-//!    commonest snapping defects, settle without an overlay;
-//! 2. what still fails is rebuilt by one `i_overlay` union on the tile's own
-//!    integer grid ([`repair_polygons`]), whose OGC extraction cannot produce
-//!    the defects the check looks for.
+//! by one `i_overlay` union on the tile's own integer grid
+//! ([`repair_polygons`]). The overlay receives the original rings: splitting
+//! pinches first can discard recoverable fill in crossings and zero-area rings.
 //!
 //! The result is checked again, and one that still fails is counted
 //! ([`invalid_after_encode_count`]) and logged, never passed over in silence.
@@ -164,31 +158,14 @@ pub(crate) fn finalize_polygons(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>>
         return parts;
     };
     REPAIRED[defect.index()].fetch_add(1, Ordering::Relaxed);
-    // Tier 1: split the pinches of the parts that fail on their own.
-    let single = parts.len() == 1;
-    let pieces: Vec<Vec<TileRing>> = parts
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .flat_map(|p| {
-            if !single && check_polygons(std::slice::from_ref(&p)).is_ok() {
-                vec![p]
-            } else {
-                super::regroup_pinched(p)
-            }
-        })
-        .collect();
-    if check_polygons(&pieces).is_ok() {
-        return pieces;
-    }
-    // Tier 2: one union on the grid.
-    let repaired = repair_polygons(&pieces);
+    let repaired = repair_polygons(&parts);
     if let Err(left) = check_polygons(&repaired) {
         count_invalid_after_encode(left);
     }
     repaired
 }
 
-/// Rebuild `parts` as a valid MultiPolygon on the same integer grid: one
+/// Rebuild `parts` as a valid MultiPolygon on the same integer grid: a
 /// `i_overlay` union of every ring, exteriors counting +1 and holes -1 under
 /// `FillRule::Positive` (tippecanoe's `fill_type_positive`), extracted with
 /// the engine's OGC option so rings touch only where OGC allows.
@@ -199,6 +176,19 @@ pub(crate) fn finalize_polygons(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>>
 /// stay within the input's bounding box, which [`super::TILE_COORD_CLAMP`]
 /// keeps well inside the i32 engine's ±2^30 range.
 pub(crate) fn repair_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Vec<Vec<TileRing>> {
+    // i_overlay snaps intersections within one engine unit to endpoints.
+    // A half-unit grid preserves small lobes (Madagascar ADM4, #779) until
+    // extraction. Rounding those nodes can introduce fresh grid defects;
+    // resolve those through the same kernel on the final grid when needed.
+    let snapped = overlay_polygons(parts, 2);
+    if check_polygons(&snapped).is_ok() {
+        snapped
+    } else {
+        overlay_polygons(&snapped, 1)
+    }
+}
+
+fn overlay_polygons<P: AsRef<[TileRing]>>(parts: &[P], scale: i32) -> Vec<Vec<TileRing>> {
     let edges: usize = parts.iter().flat_map(|p| p.as_ref()).map(|r| r.len()).sum();
     let mut overlay: Overlay<i32> =
         Overlay::new_custom(edges, IntOverlayOptions::ogc(), Solver::default());
@@ -213,15 +203,30 @@ pub(crate) fn repair_polygons<P: AsRef<[TileRing]>>(parts: &[P]) -> Vec<Vec<Tile
             let open = &ring[..ring.len() - 1];
             contour.clear();
             if (ring_area2(ring) > 0) == want_positive {
-                contour.extend(open.iter().map(|&(x, y)| IntPoint::new(x, y)));
+                contour.extend(
+                    open.iter()
+                        .map(|&(x, y)| IntPoint::new(x * scale, y * scale)),
+                );
             } else {
-                contour.extend(open.iter().rev().map(|&(x, y)| IntPoint::new(x, y)));
+                contour.extend(
+                    open.iter()
+                        .rev()
+                        .map(|&(x, y)| IntPoint::new(x * scale, y * scale)),
+                );
             }
             overlay.add_contour(&contour, ShapeType::Subject);
         }
     }
     let close = |c: Vec<IntPoint<i32>>| -> Option<TileRing> {
-        let mut r: TileRing = c.into_iter().map(|p| (p.x, p.y)).collect();
+        let mut r: TileRing = c
+            .into_iter()
+            .map(|p| {
+                (
+                    (f64::from(p.x) / f64::from(scale)).round() as i32,
+                    (f64::from(p.y) / f64::from(scale)).round() as i32,
+                )
+            })
+            .collect();
         if r.len() < 3 {
             return None;
         }
@@ -1012,6 +1017,58 @@ mod tests {
     /// anywhere, parts overlapping) always repair to a feature that passes
     /// the check, and the check passes valid input through untouched.
     #[test]
+    fn madagascar_small_crossings_keep_fill() {
+        for points in [
+            &[(2043, 1132), (2045, 1131), (2044, 1130), (2044, 1132)][..],
+            &[
+                (2275, 667),
+                (2276, 666),
+                (2274, 665),
+                (2275, 665),
+                (2275, 666),
+            ][..],
+        ] {
+            let fixed = finalize_polygons(vec![vec![ring(points)]]);
+            assert_eq!(check_polygons(&fixed), Ok(()));
+            assert!(filled_area2(&fixed) > 0, "lost {points:?}");
+        }
+    }
+
+    #[test]
+    fn thin_snapped_bowtie_keeps_recoverable_fill() {
+        let parts = vec![vec![ring(&[
+            (100, 100),
+            (110, 101),
+            (100, 101),
+            (110, 100),
+        ])]];
+        let fixed = finalize_polygons(parts);
+        assert_eq!(check_polygons(&fixed), Ok(()));
+        assert_eq!(filled_area2(&fixed), 10);
+    }
+
+    fn filled_area2(parts: &[Vec<TileRing>]) -> i64 {
+        parts
+            .iter()
+            .flat_map(|p| p.iter().enumerate())
+            .map(|(i, r)| {
+                if i == 0 {
+                    ring_area2(r).abs()
+                } else {
+                    -ring_area2(r).abs()
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn crossing_hole_keeps_positive_fill() {
+        let fixed = finalize_polygons(vec![vec![square(0, 0, 10, 10), square(5, 5, 15, 15)]]);
+        assert_eq!(check_polygons(&fixed), Ok(()));
+        assert_eq!(filled_area2(&fixed), 150);
+    }
+
+    #[test]
     fn repair_always_passes_the_check_on_random_input() {
         let mut seed = 0x748_u64;
         let mut next = move || {
@@ -1035,6 +1092,11 @@ mod tests {
                 .collect();
             let out = finalize_polygons(parts.clone());
             assert_eq!(check_polygons(&out), Ok(()), "{parts:?} -> {out:?}");
+            assert_eq!(
+                filled_area2(&out),
+                filled_area2(&repair_polygons(&parts)),
+                "repair lost positive fill: {parts:?} -> {out:?}"
+            );
             if out == parts {
                 kept += 1;
             } else {

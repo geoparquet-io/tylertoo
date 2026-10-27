@@ -310,8 +310,7 @@ pub fn clip_multipolygon_ioverlay(
 /// What the refusal means depends on the entry point: the clippers
 /// ([`clip_polygon_ioverlay`], [`clip_multipolygon_ioverlay`],
 /// [`clip_multilinestring_ioverlay`], and `clip.rs`'s polygon paths) drop the
-/// feature from that tile; [`union_polygons_ioverlay`] and
-/// [`repair_polygon_ioverlay`] hand their input back unmerged or unrepaired.
+/// feature from that tile; [`repair_polygon_ioverlay`] hand their input back unmerged or unrepaired.
 /// Either way the input never reached the engine, and before #707 nothing
 /// said so: the feature vanished from every tile at every zoom with exit 0.
 /// The first refusal in a process warns; [`clip_guard_drop_count`] has the
@@ -339,8 +338,7 @@ pub(crate) fn count_guard_drop() {
 /// `FloatPointAdapter::new` and panics beyond it; the margin keeps the
 /// extent's centre/radius arithmetic finite too.
 ///
-/// The margin must specifically leave a factor of two: `repair_polygon_ioverlay`
-/// and `union_polygons_ioverlay` pad the bounding rect by half its longest
+/// The margin must specifically leave a factor of two: `repair_polygon_ioverlay` pad the bounding rect by half its longest
 /// extent, so a shape spanning the full +/- this limit produces clip-box corners
 /// at +/- twice it -- and those corners are themselves adapter input points,
 /// validated against the same 2^500. Raising this constant past 2^499 would
@@ -437,56 +435,6 @@ pub fn clip_multilinestring_ioverlay(
     )
 }
 
-/// Union several polygons into non-overlapping polygons.
-///
-/// The exteriors must all wind the same way and the holes the other. The
-/// union intersects the set with a strict-superset box under
-/// `FillRule::NonZero` (#383).
-///
-/// `NonZero` is the rule that makes overlapping parts *add*: `EvenOdd` would
-/// cut the overlap out as a hole. It relies on consistent winding, which is
-/// why the caller orients the parts first.
-pub fn union_polygons_ioverlay(polys: &[Polygon<f64>]) -> Option<Geometry<f64>> {
-    // Input guard (#692): a non-finite or over-limit vertex would panic the
-    // adapter (and an infinity poisons the padded-box arithmetic below).
-    // `None` is the "could not trace" result the caller (mvt.rs merge)
-    // already handles by emitting the parts as they are.
-    if !polys.iter().all(polygon_representable) {
-        count_guard_drop();
-        return None;
-    }
-
-    let mut rect: Option<geo::Rect<f64>> = None;
-    for p in polys {
-        let r = p.bounding_rect()?;
-        rect = Some(match rect {
-            None => r,
-            Some(acc) => geo::Rect::new(
-                geo::coord! { x: acc.min().x.min(r.min().x), y: acc.min().y.min(r.min().y) },
-                geo::coord! { x: acc.max().x.max(r.max().x), y: acc.max().y.max(r.max().y) },
-            ),
-        });
-    }
-    let rect = rect?;
-    let pad = rect.width().max(rect.height()).max(f64::MIN_POSITIVE) * 0.5;
-    let bounds = TileBounds::new(
-        rect.min().x - pad,
-        rect.min().y - pad,
-        rect.max().x + pad,
-        rect.max().y + pad,
-    );
-    let subj_shapes: Vec<IOverlayShape> = polys.iter().map(polygon_to_ioverlay).collect();
-    let clip = bounds_to_clip_box(&bounds);
-    let mut overlay = FloatOverlay::with_subj_and_clip_custom(
-        &subj_shapes,
-        &[clip],
-        Default::default(),
-        Default::default(),
-    );
-    let result: IOverlayShapes = overlay.overlay(OverlayRule::Intersect, FillRule::NonZero);
-    ioverlay_to_geometry(result)
-}
-
 /// Repair a self-intersecting polygon by re-tracing it through a boolean
 /// intersection with its own (padded) bounding box.
 ///
@@ -576,7 +524,6 @@ mod tests {
         counted(&|| {
             clip_multipolygon_ioverlay(&MultiPolygon::new(vec![hostile.clone()]), &bounds).is_none()
         });
-        counted(&|| union_polygons_ioverlay(std::slice::from_ref(&hostile)).is_none());
         counted(&|| repair_polygon_ioverlay(&hostile).is_none());
         counted(&|| {
             let line =
@@ -888,7 +835,7 @@ mod tests {
     fn ioverlay_max_abs_coord_is_under_the_adapter_limit() {
         assert!(IOVERLAY_MAX_ABS_COORD < 2f64.powi(500));
         assert!(IOVERLAY_MAX_ABS_COORD > 2f64.powi(498));
-        // `repair_polygon_ioverlay` / `union_polygons_ioverlay` pad the
+        // `repair_polygon_ioverlay` pad the
         // bounding rect by half its longest extent, so a shape spanning
         // +/-IOVERLAY_MAX_ABS_COORD puts the clip box's corners at twice
         // that -- and the adapter validates those corners too. Without this
@@ -988,27 +935,6 @@ mod tests {
         ]);
         let result = clip_multipolygon_ioverlay(&multi, &bounds);
         assert!(result.is_some(), "{result:?}");
-    }
-
-    #[test]
-    fn test_union_polygons_hostile_coordinate_yields_none() {
-        for bad in HOSTILE_COORDS {
-            let polys = [make_square(0.0, 0.0, 2.0, 2.0), poisoned_square(bad)];
-            let result = union_polygons_ioverlay(&polys);
-            assert!(result.is_none(), "{bad}: {result:?}");
-        }
-    }
-
-    #[test]
-    fn test_union_polygons_valid_input_still_unions() {
-        let polys = [
-            make_square(0.0, 0.0, 2.0, 2.0),
-            make_square(1.0, 1.0, 3.0, 3.0),
-        ];
-        match union_polygons_ioverlay(&polys) {
-            Some(Geometry::Polygon(p)) => assert!(p.exterior().0.len() >= 4),
-            other => panic!("expected Polygon, got {other:?}"),
-        }
     }
 
     #[test]

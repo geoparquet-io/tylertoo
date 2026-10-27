@@ -160,7 +160,7 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 ///
 /// * a coordinate difference `|a - b|` is at most 2^25;
 /// * a cross or dot product of two differences (the cleaner's
-///   `segments_meet`, `node_insert`, `point_in_ring` tests) is at most
+///   `segments_meet` tests) is at most
 ///   2^25 · 2^25 + 2^25 · 2^25 = 2^51, and the validity owner's
 ///   (`tile_polygon`) doubled-coordinate point location at most 2^53;
 /// * a shoelace term `x0·y1 - x1·y0` in `ring_area2` is at most
@@ -445,7 +445,7 @@ fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
 /// saturated into `±i64::MAX` — which only matters for a ring of more than
 /// 2^14 vertices all near the clamp, and even then keeps the sign and the
 /// ordering the callers use. The negative bound is `-i64::MAX`, not
-/// `i64::MIN`, because [`regroup_pinched`] takes `.abs()` of the result and
+/// `i64::MIN`, because callers take `.abs()` of the result and
 /// `i64::MIN.abs()` overflows.
 fn ring_area2(ring: &[(i32, i32)]) -> i64 {
     let sum: i128 = ring
@@ -457,194 +457,6 @@ fn ring_area2(ring: &[(i32, i32)]) -> i64 {
         })
         .sum();
     sum.clamp(-i128::from(i64::MAX), i128::from(i64::MAX)) as i64
-}
-
-/// Split a closed ring at every vertex it visits twice (a "pinch": a neck
-/// that snapped shut, or a spike that folded back). Each loop between two
-/// visits of the same vertex becomes its own closed ring; zero-area loops
-/// (spikes) are dropped. The returned rings visit no vertex twice.
-///
-/// One pass, `O(n)`: walk the ring keeping the path so far with every
-/// closed loop cut out, and each path vertex's index. A vertex already on
-/// the path closes the loop from its earlier visit, which is cut out and
-/// emitted, leaving the vertex once. Until #759 this re-sorted the
-/// remaining ring after every split, `O(pinches × n log n)`: a coastline
-/// snapped to a coarse tile has pinches by the thousand, and one 316k-vertex
-/// Antarctica tile took ~7 s. The output is identical (rings, vertices and
-/// order; `split_pinches_matches_the_resorting_reference`).
-fn split_pinches(mut ring: TileRing) -> Vec<TileRing> {
-    ring.pop(); // work on the open ring
-    let mut out = Vec::new();
-    let mut path: Vec<(i32, i32)> = Vec::with_capacity(ring.len());
-    let mut at: HashMap<(i32, i32), usize> = HashMap::with_capacity(ring.len());
-    for v in ring {
-        if let Some(&i) = at.get(&v) {
-            // `path[i..]` plus the return to `v` is a loop entered at `v`.
-            let mut piece = Vec::with_capacity(path.len() - i);
-            piece.push(v);
-            for u in path.drain(i + 1..) {
-                at.remove(&u);
-                piece.push(u);
-            }
-            push_closed_loop(&mut out, piece);
-        } else {
-            at.insert(v, path.len());
-            path.push(v);
-        }
-    }
-    push_closed_loop(&mut out, path);
-    out
-}
-
-/// Close an open loop from [`split_pinches`] and keep it if it is a ring
-/// with area (a two-vertex spike or a zero-area fold is dropped).
-fn push_closed_loop(out: &mut Vec<TileRing>, mut open: Vec<(i32, i32)>) {
-    if open.len() >= 3 {
-        let first = open[0];
-        open.push(first);
-        if ring_area2(&open) != 0 {
-            out.push(open);
-        }
-    }
-}
-
-/// Insert every vertex that lies strictly inside a non-adjacent edge into
-/// that edge, so a ring that touches itself vertex-on-edge (a "T-touch")
-/// becomes one that visits the vertex twice, which [`split_pinches`] then
-/// resolves. Exact integer arithmetic; only exact coincidences qualify,
-/// which after snapping to the grid they frequently do.
-fn node_ring(ring: TileRing) -> TileRing {
-    let n = ring.len() - 1;
-    if n > NODE_MAX_EDGES {
-        return ring;
-    }
-    let inserts = if n <= NODE_SWEEP_MIN_EDGES {
-        node_inserts_all_pairs(&ring, n)
-    } else {
-        node_inserts_sweep(&ring, n)
-    };
-    apply_node_inserts(ring, inserts)
-}
-
-/// Every vertex against every edge — `O(n²)` [`node_insert`] calls, all in
-/// registers and without allocating beyond the result.
-///
-/// The whole of [`node_ring`] until #535, and still the cheapest thing to do
-/// for a short ring. It is also the oracle [`node_inserts_sweep`] is tested
-/// against, which is why it stays here rather than being inlined.
-fn node_inserts_all_pairs(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
-    // (edge index, position along the edge, vertex) for every insertion.
-    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    for k in 0..n {
-        for i in 0..n {
-            if let Some(ins) = node_insert(ring, n, k, i) {
-                inserts.push(ins);
-            }
-        }
-    }
-    inserts
-}
-
-/// [`node_inserts_all_pairs`] by x-sorted sweep (#535).
-///
-/// The all-pairs scan is `O(n²)`, and on a 3.07 M-feature z0–13 export it was
-/// the single hottest thing in the whole encode stage (32 core-seconds, 15e9
-/// inner iterations) — the coalesced overview polygons carry exterior rings of
-/// thousands of edges, and those few rings dominate the `n²` sum.
-///
-/// An insertion needs the vertex inside the edge's bounding box, so a vertex
-/// can only match edges whose x-span covers it. Sorting the vertices by x once
-/// makes each edge's candidate vertices a contiguous slice, cutting the scan to
-/// `O(n log n + Σ candidates)`.
-///
-/// The result is the same **multiset** as the all-pairs scan: the per-pair test
-/// is the same [`node_insert`] and every box-overlapping pair is still visited,
-/// so only the order of discovery differs — which [`apply_node_inserts`]'s sort
-/// normalizes.
-fn node_inserts_sweep(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
-    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_unstable_by_key(|&k| ring[k as usize].0);
-    let xs: Vec<i32> = order.iter().map(|&k| ring[k as usize].0).collect();
-    for i in 0..n {
-        let bx = edge_box(ring[i], ring[i + 1]);
-        let lo = xs.partition_point(|&x| x < bx.0);
-        let hi = xs.partition_point(|&x| x <= bx.2);
-        for &k in &order[lo..hi] {
-            if let Some(ins) = node_insert(ring, n, k as usize, i) {
-                inserts.push(ins);
-            }
-        }
-    }
-    inserts
-}
-
-/// Splice [`node_insert`] results into `ring`: each `(edge index, position
-/// along the edge, vertex)` lands inside the edge it was found on, in order
-/// along that edge, with a vertex already present not repeated.
-///
-/// The sort is what makes the enumeration order in [`node_ring`] irrelevant:
-/// the tuples carry their own position, and equal tuples (the same vertex
-/// value found from two ring positions) are indistinguishable, so any
-/// discovery order splices to the same ring.
-fn apply_node_inserts(ring: TileRing, mut inserts: Vec<(usize, i64, (i32, i32))>) -> TileRing {
-    if inserts.is_empty() {
-        return ring;
-    }
-    inserts.sort_unstable();
-    let n = ring.len() - 1;
-    let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
-    let mut next = 0;
-    for (i, &v0) in ring[..n].iter().enumerate() {
-        out.push(v0);
-        while next < inserts.len() && inserts[next].0 == i {
-            let v = inserts[next].2;
-            if out.last() != Some(&v) {
-                out.push(v);
-            }
-            next += 1;
-        }
-    }
-    let first = out[0];
-    out.push(first);
-    out
-}
-
-/// Ring sizes at or below this keep [`node_ring`]'s all-pairs scan: `n²`
-/// register-only tests beat an x-sort plus two heap allocations until the ring
-/// is a few dozen edges long.
-const NODE_SWEEP_MIN_EDGES: usize = 32;
-
-/// [`node_ring`]'s per-pair test: the insertion of vertex `ring[k]` into edge
-/// `i`, if the vertex lies exactly on that edge's interior.
-///
-/// `None` when the edge is one of the two meeting at the vertex (which contain
-/// it trivially), when the vertex is outside the edge's bounding box or is one
-/// of its endpoints, or when it is not exactly collinear with it.
-#[inline]
-fn node_insert(
-    ring: &[(i32, i32)],
-    n: usize,
-    k: usize,
-    i: usize,
-) -> Option<(usize, i64, (i32, i32))> {
-    // Edges that end or start at v contain it trivially.
-    if i == k || (i + 1) % n == k {
-        return None;
-    }
-    let v = ring[k];
-    let (a, b) = (ring[i], ring[i + 1]);
-    let bx = edge_box(a, b);
-    if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
-        return None;
-    }
-    let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
-        - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
-    if cross != 0 {
-        return None;
-    }
-    let along = (i64::from(v.0) - i64::from(a.0)).abs() + (i64::from(v.1) - i64::from(a.1)).abs();
-    Some((i, along, v))
 }
 
 /// Exact integer test: do closed segments `a` and `b` share any point
@@ -677,17 +489,6 @@ fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bo
 fn edge_box(p: (i32, i32), q: (i32, i32)) -> (i32, i32, i32, i32) {
     (p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1))
 }
-
-/// Rings with more edges than this skip noding ([`node_ring`], which is
-/// quadratic in the vertex count). The simplicity and ring-meeting checks
-/// are plane sweeps ([`any_box_pair`]) and have no cap: a smooth 10k-edge
-/// ring (coastline-like, short edges) checks in ~0.4 ms release, a 4k-edge
-/// one in ~0.1 ms; only a saw of long edges that all overlap in x costs
-/// milliseconds. A ring over the cap that fails the checks still goes
-/// through pinch-splitting and the overlay; it only misses the vertex-on-
-/// edge noding, so a T-touch on such a ring reaches the overlay instead of
-/// the cheap split — the result is the same, it just costs more.
-const NODE_MAX_EDGES: usize = 4096;
 
 /// Visit every pair of boxes that meet, once, and stop at the first pair
 /// `hit` accepts. A plane sweep over x: boxes are sorted by their min x and
@@ -746,118 +547,11 @@ fn segments_cross_or_overlap(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, 
     false
 }
 
-/// Is `p` inside a closed integer ring? Exact crossing-number test; a point
-/// on the boundary (on an edge or at a vertex) counts as inside.
-fn point_in_ring(p: (i32, i32), ring: &TileRing) -> bool {
-    let (px, py) = (i64::from(p.0), i64::from(p.1));
-    let mut inside = false;
-    for w in ring.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let (ax, ay, bx, by) = (
-            i64::from(a.0),
-            i64::from(a.1),
-            i64::from(b.0),
-            i64::from(b.1),
-        );
-        let eb = edge_box(a, b);
-        if p.0 >= eb.0
-            && p.0 <= eb.2
-            && p.1 >= eb.1
-            && p.1 <= eb.3
-            && (bx - ax) * (py - ay) - (by - ay) * (px - ax) == 0
-        {
-            return true;
-        }
-        // Half-open in y so a ray through a vertex counts once; the x of the
-        // edge at y = py is compared without dividing.
-        if (ay > py) != (by > py) {
-            let num = (py - ay) * (bx - ax);
-            let den = by - ay;
-            let lhs = (px - ax) * den;
-            if (den > 0 && lhs < num) || (den < 0 && lhs > num) {
-                inside = !inside;
-            }
-        }
-    }
-    inside
-}
-
 fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
     ring.iter()
         .fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |b, &(x, y)| {
             (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y))
         })
-}
-
-/// Split every ring at its pinches and regroup the pieces into polygons.
-///
-/// Orientation is judged against each ring's *own* original sense, not a
-/// global convention, because source rings carry no guaranteed winding: a
-/// piece of the exterior that keeps the exterior's sense is another
-/// exterior (an island the neck used to join); one that reverses it is a
-/// hole touching the boundary. For a hole ring the roles swap. A ring whose
-/// lobes cancel exactly (a bowtie with equal lobes, net area zero) has no
-/// sense of its own; its largest piece stands in for it. Holes are then
-/// attached to the smallest exterior that geometrically contains them
-/// (falling back to the first whose box does).
-fn regroup_pinched(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
-    let mut exteriors: Vec<TileRing> = Vec::new();
-    let mut holes: Vec<TileRing> = Vec::new();
-    for (k, ring) in rings.into_iter().enumerate() {
-        let mut own_sign = ring_area2(&ring).signum();
-        let pieces = split_pinches(node_ring(ring));
-        if own_sign == 0 {
-            own_sign = pieces
-                .iter()
-                .max_by_key(|p| ring_area2(p).abs())
-                .map_or(0, |p| ring_area2(p).signum());
-        }
-        for piece in pieces {
-            let same_sense = ring_area2(&piece).signum() == own_sign;
-            let is_exterior = (k == 0) == same_sense;
-            if is_exterior {
-                exteriors.push(piece);
-            } else {
-                holes.push(piece);
-            }
-        }
-    }
-    let boxes: Vec<_> = exteriors.iter().map(ring_box).collect();
-    let areas: Vec<i64> = exteriors.iter().map(|e| ring_area2(e).abs()).collect();
-    let mut polys: Vec<Vec<TileRing>> = exteriors.into_iter().map(|e| vec![e]).collect();
-    for hole in holes {
-        let hb = ring_box(&hole);
-        // Box containment is only a filter: after a pinch split an L-shaped
-        // lobe's box often contains an island in its concavity, and the
-        // island's hole must land on the island.
-        let mut by_box = boxes
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.0 <= hb.0 && b.1 <= hb.1 && b.2 >= hb.2 && b.3 >= hb.3)
-            .map(|(i, _)| i);
-        let Some(first) = by_box.next() else {
-            continue;
-        };
-        // PERF (#535): with a single box-containing exterior the answer is
-        // `first` whichever way the point-in-ring test goes — it either
-        // survives the filter as the only candidate, or the filter empties and
-        // `unwrap_or(first)` lands on it anyway — so the O(ring) crossing
-        // count is pure waste. That is the overwhelmingly common shape (one
-        // exterior, its own holes): the test was 5 % of all active CPU on a
-        // 3.07 M-feature export, ~3.5 M calls, essentially all of them
-        // single-candidate.
-        let target = match by_box.next() {
-            None => first,
-            Some(second) => [first, second]
-                .into_iter()
-                .chain(by_box)
-                .filter(|&i| point_in_ring(hole[0], &polys[i][0]))
-                .min_by_key(|&i| areas[i])
-                .unwrap_or(first),
-        };
-        polys[target].push(hole);
-    }
-    polys
 }
 
 /// Do two polygons (exterior first) interact: would they fail the owner's
@@ -3370,153 +3064,6 @@ mod tests {
         );
     }
 
-    /// The x-sorted sweep must find exactly the insertions the all-pairs scan
-    /// found, and node the ring to exactly the same vertices — on rings big
-    /// enough to take the sweep branch in production and on rings small enough
-    /// to take the direct one, including the T-touch-heavy ones a tiny
-    /// coordinate grid manufactures.
-    ///
-    /// Both enumerations are run explicitly, so the check does not depend on
-    /// which branch [`node_ring`] happens to pick at a given size.
-    #[test]
-    fn node_ring_sweep_matches_all_pairs_reference() {
-        let mut seed = 0x0d0d_1234_5678_u64;
-        let mut touched = 0usize;
-        let mut swept = 0usize;
-        for case in 0..784 {
-            // Alternate a tiny grid (frequent exact collinearity → T-touches)
-            // with a wider one, and walk EVERY ring size 3..=100 (eight rings
-            // each), both sides of the sweep threshold.
-            let grid = if case % 2 == 0 { 8 } else { 40 } as u32;
-            let n = 3 + (case / 2) % 98;
-            let mut pts: Vec<(i32, i32)> = Vec::new();
-            let mut guard = 0;
-            while pts.len() < n && guard < 4000 {
-                guard += 1;
-                let p = (
-                    (lcg(&mut seed) % grid) as i32,
-                    (lcg(&mut seed) % grid) as i32,
-                );
-                if pts.last() != Some(&p) {
-                    pts.push(p);
-                }
-            }
-            if pts.len() < 3 || pts.first() == pts.last() {
-                continue;
-            }
-            let ring = closed(&pts);
-            let n = ring.len() - 1;
-
-            // The insertion multisets must agree (sorted, because the sweep
-            // discovers them edge-major and the scan vertex-major).
-            let mut all_pairs = node_inserts_all_pairs(&ring, n);
-            let mut sweep = node_inserts_sweep(&ring, n);
-            all_pairs.sort_unstable();
-            sweep.sort_unstable();
-            assert_eq!(sweep, all_pairs, "insertions diverged, ring={ring:?}");
-
-            // ...and so must the noded rings, including via the branch
-            // `node_ring` actually takes at this size.
-            let expected = apply_node_inserts(ring.clone(), all_pairs);
-            if expected.len() != ring.len() {
-                touched += 1;
-                swept += usize::from(n > NODE_SWEEP_MIN_EDGES);
-            }
-            assert_eq!(node_ring(ring.clone()), expected, "ring={ring:?}");
-        }
-        assert!(
-            touched > 20 && swept > 10,
-            "too few noded rings to be meaningful: {touched} ({swept} past the sweep threshold)"
-        );
-    }
-
-    /// The pre-#759 [`split_pinches`]: re-sort the remaining ring after every
-    /// split, `O(pinches × n log n)`. Kept as the oracle the single pass is
-    /// tested against, with one fix: ties are broken by index. The original
-    /// sorted by vertex alone with `sort_unstable`, so for a vertex visited
-    /// three or more times the adjacent pairs it compared were arbitrary and
-    /// it could miss the earliest second visit its own comment promises.
-    ///
-    /// Split a closed ring at every vertex it visits twice (a "pinch": a neck
-    /// that snapped shut, or a spike that folded back). Each loop between two
-    /// visits of the same vertex becomes its own closed ring; zero-area loops
-    /// (spikes) are dropped. The returned rings visit no vertex twice.
-    fn split_pinches_reference(mut ring: TileRing) -> Vec<TileRing> {
-        ring.pop(); // work on the open ring
-        let mut out = Vec::new();
-        let mut stack = vec![ring];
-        while let Some(mut cur) = stack.pop() {
-            // Find the first repeated vertex: sort (index, vertex) by vertex and
-            // look for an equal neighbour. No hashing, and n is small.
-            let mut order: Vec<usize> = (0..cur.len()).collect();
-            order.sort_unstable_by_key(|&i| (cur[i], i));
-            let mut pinch: Option<(usize, usize)> = None;
-            for w in order.windows(2) {
-                if cur[w[0]] == cur[w[1]] {
-                    let (i, j) = (w[0].min(w[1]), w[0].max(w[1]));
-                    // Take the earliest second visit so loops nest predictably.
-                    if pinch.is_none_or(|(_, pj)| j < pj) {
-                        pinch = Some((i, j));
-                    }
-                }
-            }
-            match pinch {
-                None => {
-                    if cur.len() >= 3 {
-                        let first = cur[0];
-                        cur.push(first);
-                        if ring_area2(&cur) != 0 {
-                            out.push(cur);
-                        }
-                    }
-                }
-                Some((i, j)) => {
-                    // `cur[i..j]` is the loop entered at the pinch vertex; removing
-                    // it leaves the vertex once, at index i, in the remainder.
-                    let sub: Vec<(i32, i32)> = cur.drain(i..j).collect();
-                    stack.push(cur);
-                    stack.push(sub);
-                }
-            }
-        }
-        out
-    }
-
-    /// The single-pass [`split_pinches`] returns exactly what the re-sorting
-    /// reference does: the same rings, vertices and order. Rings on tiny
-    /// grids revisit vertices constantly, including three and more times,
-    /// which is where the original's arbitrary tie order parted ways.
-    #[test]
-    fn split_pinches_matches_the_resorting_reference() {
-        let mut seed = 0x5eed_0f9a_u64;
-        let mut pinched = 0usize;
-        for case in 0..2000 {
-            let grid = [3u32, 5, 8, 16][case % 4];
-            let n = 3 + (case / 4) % 120;
-            let mut pts: Vec<(i32, i32)> = Vec::new();
-            while pts.len() < n {
-                let p = (
-                    (lcg(&mut seed) % grid) as i32,
-                    (lcg(&mut seed) % grid) as i32,
-                );
-                if pts.last() != Some(&p) {
-                    pts.push(p);
-                }
-            }
-            if pts.first() == pts.last() {
-                continue;
-            }
-            let ring = closed(&pts);
-            let expected = split_pinches_reference(ring.clone());
-            pinched += usize::from(expected.len() > 1);
-            assert_eq!(split_pinches(ring.clone()), expected, "ring={ring:?}");
-        }
-        assert!(
-            pinched > 500,
-            "too few pinched rings to be meaningful: {pinched}"
-        );
-    }
-
     /// The tile projector is a hoisted-constant refactor of the
     /// per-coordinate transform, so every projected coordinate must come out
     /// BIT-identical (not merely close) to the pre-#535 formula.
@@ -3778,94 +3325,6 @@ mod tests {
             Ok(())
         );
         assert!(tile_polygon::check_polygons(&[vec![a, b]]).is_err());
-    }
-
-    /// An L-shaped lobe whose box contains an island in its concavity: a
-    /// hole inside the island must attach to the island, not to the first
-    /// exterior whose box contains it.
-    #[test]
-    fn pinched_hole_attaches_to_the_exterior_that_contains_it() {
-        let ext = closed(&[
-            (60, 30),
-            (60, 80),
-            (30, 80),
-            (20, 20),
-            (20, 100),
-            (0, 100),
-            (0, 0),
-            (100, 0),
-            (100, 20),
-            (20, 20),
-        ]);
-        let hole = closed(&[(35, 45), (50, 45), (50, 60), (35, 60)]);
-        let polys = regroup_pinched(vec![ext, hole]);
-        assert_eq!(polys.len(), 2, "{polys:?}");
-        let with_hole = polys
-            .iter()
-            .find(|p| p.len() == 2)
-            .unwrap_or_else(|| panic!("hole dropped: {polys:?}"));
-        assert!(
-            with_hole[0].contains(&(60, 30)),
-            "hole must land on the island: {polys:?}"
-        );
-        assert_eq!(tile_polygon::check_polygons(&polys), Ok(()), "{polys:?}");
-    }
-
-    /// The single-candidate short-circuit (#535) must not change where a hole
-    /// lands, including in the case that makes it sound risky: exactly one
-    /// exterior box contains the hole's box, but the hole's first vertex is
-    /// NOT inside that exterior's ring. The containment filter then empties
-    /// and the pre-#535 code fell back to that same exterior via
-    /// `unwrap_or(first)`, so skipping the test has to agree.
-    #[test]
-    fn hole_with_one_box_candidate_attaches_without_the_containment_test() {
-        // A C: the hole's box sits in the notch, inside the C's bbox but
-        // outside its fill, and the hole's first vertex is in the notch too.
-        let ext = closed(&[
-            (0, 0),
-            (100, 0),
-            (100, 20),
-            (20, 20),
-            (20, 80),
-            (100, 80),
-            (100, 100),
-            (0, 100),
-        ]);
-        let hole = closed(&[(40, 40), (60, 40), (60, 60), (40, 60)]);
-        assert!(
-            !point_in_ring(hole[0], &ext),
-            "fixture must have the hole vertex OUTSIDE the exterior's fill"
-        );
-        let polys = regroup_pinched(vec![ext.clone(), hole.clone()]);
-        assert_eq!(polys.len(), 1, "{polys:?}");
-        assert_eq!(polys[0], vec![ext, hole], "hole must still attach to it");
-    }
-
-    /// Point-in-ring: inside, outside, on an edge and on a vertex.
-    #[test]
-    fn point_in_ring_counts_boundary_as_inside() {
-        let sq = closed(&[(0, 0), (10, 0), (10, 10), (0, 10)]);
-        assert!(point_in_ring((5, 5), &sq));
-        assert!(!point_in_ring((15, 5), &sq));
-        assert!(!point_in_ring((5, -1), &sq));
-        assert!(point_in_ring((10, 5), &sq), "on an edge");
-        assert!(point_in_ring((0, 0), &sq), "on a vertex");
-        // Concave: the notch of a C is outside.
-        let c = closed(&[
-            (0, 0),
-            (30, 0),
-            (30, 10),
-            (10, 10),
-            (10, 20),
-            (30, 20),
-            (30, 30),
-            (0, 30),
-        ]);
-        assert!(!point_in_ring((20, 15), &c));
-        assert!(point_in_ring((5, 15), &c));
-        // A vertex-level ray (y equal to a vertex's y) is not double-counted.
-        assert!(point_in_ring((5, 10), &c));
-        assert!(point_in_ring((20, 10), &c), "on the notch edge");
     }
 
     /// A bowtie whose lobes cancel exactly has zero net area; that must not
@@ -4456,6 +3915,38 @@ mod tile_space_validity_748 {
         );
         assert!(mp.is_valid(), "geo: {:?}", mp.validation_errors());
         assert_eq!(tile_polygon::check_polygons(&parts), Ok(()), "{parts:?}");
+    }
+
+    #[test]
+    fn valid_thin_source_survives_bowtie_rounding() {
+        let b = unit_bounds();
+        let to_geo = |(x, y): (f64, f64)| {
+            let top = mercator_y_fraction(b.lat_max);
+            let bottom = mercator_y_fraction(b.lat_min);
+            let f = top + y / 4096.0 * (bottom - top);
+            geo::Coord {
+                x: b.lng_min + x / 4096.0 * (b.lng_max - b.lng_min),
+                y: (std::f64::consts::PI * (1.0 - 2.0 * f))
+                    .sinh()
+                    .atan()
+                    .to_degrees(),
+            }
+        };
+        let mut vertices: Vec<_> = [
+            (99.51, 99.51),
+            (109.51, 100.51),
+            (99.51, 101.49),
+            (110.49, 100.49),
+        ]
+        .into_iter()
+        .map(to_geo)
+        .collect();
+        vertices.push(vertices[0]);
+        let polygon = Polygon::new(LineString::new(vertices), vec![]);
+        assert!(polygon.is_valid(), "the source must be valid");
+        let (commands, kind) = encode_geometry(&Geometry::Polygon(polygon), &b, 4096);
+        assert_eq!(kind, GeomType::Polygon);
+        assert_valid(&commands);
     }
 
     /// Madagascar adm4 feature 7844, default export, z4 tile 4/10/8: two
