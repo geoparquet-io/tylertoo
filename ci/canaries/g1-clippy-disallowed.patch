@@ -1,7 +1,7 @@
-Gate: clippy disallowed-methods (clippy.toml)
-Expect-fail: cargo clippy --locked -p tylertoo-core --example g1_canary --all-features -- -D warnings
-Catches: #577 -> #606/#607: a parquet reader built outside untrusted::open_parquet skips the batch-size cap
-
+# gate: uv run scripts/ci/canary.py ci-step ci.yml check "Run clippy"
+# expect: disallowed method.*ArrowReaderBuilder::try_new
+# issue: #779 (clippy.toml disallowed-methods)
+# catches: #577 -> #606/#607: a parquet reader built outside untrusted::open_parquet skips the batch-size cap
 diff --git a/crates/core/examples/g1_canary.rs b/crates/core/examples/g1_canary.rs
 new file mode 100644
 index 0000000..6cfe8c9

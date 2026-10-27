@@ -1,7 +1,7 @@
-Gate: cargo-deny multiple-versions = deny (deny.toml)
-Expect-fail: cargo deny check bans
-Catches: #649: a second version of a crate (Dependabot #624 undid #435's dedupe)
-
+# gate: { command -v cargo-deny >/dev/null || cargo install cargo-deny --version 0.20.2 --locked; } && cargo deny check bans
+# expect: duplicate entries for crate 'base64'
+# issue: #779 (deny.toml multiple-versions = deny)
+# catches: #649: a second version of a crate (Dependabot #624 undid #435's dedupe)
 diff --git a/deny.toml b/deny.toml
 index fa95d68..5518538 100644
 --- a/deny.toml

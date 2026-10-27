@@ -1,7 +1,7 @@
-Gate: similarity ratchet (scripts/ci/similarity_ratchet.py)
-Expect-fail: uv run --no-project --python 3.12 python scripts/ci/similarity_ratchet.py
-Catches: near-duplicate functions: the twin-function pattern of #507/8576c61
-
+# gate: uv run scripts/ci/canary.py ci-step ci.yml check "Install similarity-rs" && uv run scripts/ci/canary.py ci-step ci.yml check "Check for duplicated code (similarity ratchet)"
+# expect: new near-duplicate pair(?s:.*)g1_canary_similarity\.rs
+# issue: #779 (scripts/ci/similarity_ratchet.py, ci/similarity_baseline.txt)
+# catches: near-duplicate functions: the twin-function pattern of #507/8576c61
 diff --git a/crates/core/src/g1_canary_similarity.rs b/crates/core/src/g1_canary_similarity.rs
 new file mode 100644
 index 0000000..d553fe1
