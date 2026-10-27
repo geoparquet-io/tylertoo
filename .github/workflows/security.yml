@@ -126,9 +126,10 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/security.yml. It is
-          updated (not duplicated) on every failing weekly run; close it once
-          the advisories are resolved or explicitly ignored in deny.toml with
-          a reason._"
+          updated (not duplicated) on every failing weekly run. Close it only
+          after a full green scheduled (or dispatched) run on main, once the
+          advisories are resolved or explicitly ignored in deny.toml with a
+          reason. gate-canary.yml fails while it stays open past 7 days._"
 
           EXISTING=$(gh issue list --label security-audit --state open \
             --json number --jq '.[0].number // empty')

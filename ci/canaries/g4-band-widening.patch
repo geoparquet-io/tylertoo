@@ -1,0 +1,17 @@
+# gate: python3 scripts/ci/baseline_ratchet.py --base HEAD~1 --head HEAD
+# expect: madagascar-adm4 z14 features: .* widened
+# commit: test(e2e): widen a parity band with no evidence
+# issue: #779 (09673f5 widened bands in the PR that moved them)
+diff --git a/benchmarks/e2e/tippecanoe_tolerances.toml b/benchmarks/e2e/tippecanoe_tolerances.toml
+index 1769ca5..de6212e 100644
+--- a/benchmarks/e2e/tippecanoe_tolerances.toml
++++ b/benchmarks/e2e/tippecanoe_tolerances.toml
+@@ -146,7 +146,7 @@ tile_features_median = [0.98, 1.02]  # measured 1.003 (z8), 1.000 (z9-z13)
+ [[datasets."madagascar-adm4".zoom_bands]]
+ zooms = [14, 14]
+ tiles = [0.99, 1.01]          # measured 1.000 (113,993 / 113,991)
+-features = [0.99, 1.01]       # measured 1.001
++features = [0.90, 1.10]       # measured 1.001
+ distinct_ids = [0.999, 1.001] # measured 1.000 (17,465 / 17,465): every feature
+ vertices = [1.03, 1.13]       # measured 1.084
+ bytes = [0.97, 1.05]          # measured 1.014

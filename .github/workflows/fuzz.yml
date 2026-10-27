@@ -40,6 +40,27 @@ env:
   # cargo-fuzz needs nightly (-Z sanitizer). Pinned to the same nightly the
   # public-api gate in ci.yml uses, so there is one nightly to bump.
   NIGHTLY: nightly-2026-09-15
+  # Targets held out of the matrix below until the upstream panics they
+  # find are fixed, so they don't keep the run red (a crashing target finds
+  # nothing else). Their seeds still replay on every PR
+  # (crates/core/tests/fuzz_seeds.rs). Machine-read, as JSON, by
+  # scripts/ci/staleness.py (gate-canary.yml, nightly), which fails when an
+  # issue a hold-out links is closed (drop it from the entry; with none left,
+  # re-enable the target: add it to the matrix, or as
+  # `include: [{target: remote_footer, features: remote}]` when it names a
+  # fuzz-crate feature), and when a target in
+  # fuzz/fuzz_targets/ is in neither the matrix nor this list (#779).
+  FUZZ_HOLDOUTS: >-
+    [
+    {"target": "overview_file", "issues": [683],
+     "why": "arrow-ipc panics on a crafted ARROW:schema footer key; fixed in arrow 60"},
+    {"target": "remote_footer", "issues": [683, 687], "features": "remote",
+     "why": "#683, and parquet-rs panics on a crafted page's definition levels"},
+    {"target": "plan_file", "issues": [684],
+     "why": "arrow-ipc panics on a crafted IPC buffer"},
+    {"target": "parquet_footer", "issues": [690],
+     "why": "parquet-rs reserves ~12 GB for a crafted schema's child count; libFuzzer's malloc limit calls it an OOM"}
+    ]
 
 jobs:
   fuzz:
@@ -64,20 +85,12 @@ jobs:
           - shard_plan
           - decompress
           - cli_args
-          # Held out until the upstream panics they find are fixed, so they
-          # don't keep the run red (a crashing target finds nothing else):
-          #   overview_file, remote_footer - #683 (arrow-ipc panics on a
-          #     crafted ARROW:schema footer key; fixed in arrow 60)
-          #   remote_footer - also #687 (parquet-rs panics on a crafted
-          #     page's definition levels)
-          #   plan_file - #684 (arrow-ipc panics on a crafted IPC buffer)
-          #   parquet_footer - #690 (parquet-rs reserves ~12 GB for a crafted
-          #     schema's child count; libFuzzer's malloc limit calls it an OOM)
-          # Their seeds still replay on every PR (crates/core/tests/fuzz_seeds.rs).
-          # remote_footer needs a fuzz-crate feature; re-add it as
-          #   include:
-          #     - target: remote_footer
-          #       features: remote
+          # Targets held out of this list live in FUZZ_HOLDOUTS above, not
+          # here: gate-canary.yml's staleness job reads that list.
+        # No fuzz-crate feature by default; an `include:` entry for a target
+        # that needs one (remote_footer: remote) sets it. Declared so
+        # `matrix.features` below is a known key (actionlint).
+        features: [""]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -228,8 +241,10 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/fuzz.yml. It is updated
-          (not duplicated) on every failing nightly run; close it once a run
-          completes green._"
+          (not duplicated) on every failing nightly run. Close it only after
+          a full green nightly run of every target in the matrix, never after
+          a run of one target. gate-canary.yml fails while it stays open past
+          7 days._"
 
           # Match on the title this job opens with, not the label alone:
           # people file fuzz-found bugs and fuzz work under the `fuzz` label

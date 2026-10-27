@@ -1,0 +1,16 @@
+# gate: cargo build --locked --release --package tylertoo && python3 benchmarks/overview/ci_guard.py --check
+# expect: CONVERT/EXPORT REGRESSION
+# issue: #425 (the e2e structural guard must notice a baseline that disagrees with the output)
+diff --git a/benchmarks/overview/ci_baseline.json b/benchmarks/overview/ci_baseline.json
+index ce6446f..1d4cae2 100644
+--- a/benchmarks/overview/ci_baseline.json
++++ b/benchmarks/overview/ci_baseline.json
+@@ -4,7 +4,7 @@
+       "input_features": 17465,
+       "levels": [
+         {
+-          "feature_count": 410,
++          "feature_count": 411,
+           "level": 0,
+           "vertex_count": 2050
+         },
