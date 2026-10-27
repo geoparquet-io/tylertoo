@@ -110,4 +110,30 @@ owner = "dependency bumps that collapse each duplicate (#779; geo -> i_overlay 9
 catches = "#649: Dependabot #624 undid #435's brotli/zstd dedupe while multiple-versions was warn"
 scope = "entries in deny.toml [bans] skip"
 
+# Measured on origin/main a49932b (production code, test items stripped):
+#   threshold      0.95  0.90  0.85  0.80
+#   in-file pairs     0    14    60   307
+#   convert<->stream  0     0     2    25
+# In-file pins at 0.85: at 0.80 most of the 307 are unrelated functions in
+# the large files (export.rs alone holds 100+), so a new function would trip
+# the gate by chance. convert<->stream pins at 0.80, the level that holds the
+# known twins: in_memory_carriers/streaming_carriers (0.837, #407 drift),
+# select_input_row_groups_combined/select_row_groups_streaming (0.815), the
+# two strategy entry points (0.802) and the two preflights (0.859, 0.800).
+[similarity_pairs]
+checked_by = "scripts/ci/similarity_ratchet.py"
+threshold = 0.85
+pin = 60
+target = 0
+owner = "the refactor that shares each pair's code (#779); F1 for overview/, F3 for the CLI parsers and Python error mappers"
+catches = "near-duplicate functions inside one file; the gate sat at 0.95, where the workspace has zero pairs, so it caught nothing"
+scope = "similarity-rs 0.5.0 pairs >= 0.85, --min-lines 10, --skip-test, over crates/{core,cli,python}/src minus top-level #[cfg(test)] items, keyed by file and function names in ci/similarity_baseline.txt"
 
+[similarity_convert_stream]
+checked_by = "scripts/ci/similarity_ratchet.py"
+threshold = 0.80
+pin = 25
+target = 0
+owner = "one staged pipeline both engines call (#779 F1)"
+catches = "the twin engines: 15 of 23 convert.rs fix PRs also edited stream.rs; #507/8576c61, #407/ab5214d (in_memory_carriers vs streaming_carriers)"
+scope = "similarity-rs pairs >= 0.80 with one side in overview/convert.rs and the other in overview/stream.rs, both minus test items, concatenated into one file since similarity-rs never compares across files"
