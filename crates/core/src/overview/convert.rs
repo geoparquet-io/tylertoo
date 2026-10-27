@@ -308,17 +308,12 @@ impl ClassRanking {
         ranks: Vec<(String, f64)>,
         unknown_rank: Option<f64>,
     ) -> Result<Self, String> {
-        const NOT_FINITE: &str =
-            "must be a finite number (NaN and infinity cannot be ordered against other classes)";
         if ranks.is_empty() {
             return Err("at least one class rank is required".to_string());
         }
-        if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-            return Err(format!("rank {rank} for class {value:?} {NOT_FINITE}"));
-        }
-        if let Some(unknown) = unknown_rank.filter(|u| !u.is_finite()) {
-            return Err(format!("unknown-class rank {unknown} {NOT_FINITE}"));
-        }
+        // The one finiteness rule and message (#428), shared with a
+        // struct-literal ranking's check in `validate_options`.
+        super::config::check_ranks_finite(&ranks, unknown_rank).map_err(|e| e.to_string())?;
         let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
         Ok(Self {
             column: column.into(),
@@ -872,6 +867,20 @@ pub fn resolve_read_workers(requested: usize) -> usize {
 }
 
 impl ConvertOptions {
+    /// Check every option rule that needs no input file (#779): numeric
+    /// ranges, the level plan, mutually exclusive and mode-incompatible
+    /// options, the spill and plan paths. Every conversion entry point runs
+    /// this first; a front end that does work before converting (the `tiles`
+    /// facade, `--max-zoom auto`) calls it up front and fails in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken. [`ConvertError::is_config`] is true for every
+    /// error this returns.
+    pub fn validate(&self) -> Result<(), ConvertError> {
+        validate_options(self)
+    }
+
     /// Turn off the whole generalization ladder: tile this input **exactly as
     /// given** at every level (#345 / #360).
     ///
@@ -947,6 +956,12 @@ impl ConvertOptions {
     ) -> Result<Self, ConvertError> {
         if verbatim && matches!(self.mode, Mode::Partitioning) {
             return Err(ConvertError::VerbatimPartitioningUnsupported);
+        }
+        // Q3: coalescing is on by default and silently inert in partitioning
+        // mode (core logs it), but an EXPLICIT request is an error the
+        // caller should hear about. Formerly a CLI-only check (#779).
+        if overrides.coalesce_lines == Some(true) && matches!(self.mode, Mode::Partitioning) {
+            return Err(super::config::ConfigError::CoalescePartitioningUnsupported.into());
         }
         let defaults = AssignConfig::default();
         let tuned = |explicit: Option<f64>, default: f64| {
@@ -1647,6 +1662,10 @@ pub enum ConvertError {
     /// non-positive where a positive finite value is required).
     #[error("invalid option: {0}")]
     InvalidConfig(String),
+    /// An option rule shared with the other frontends' options (#779),
+    /// refused before any input is read.
+    #[error(transparent)]
+    Config(#[from] super::config::ConfigError),
     /// The attribute filter (#315) failed to parse or bind against the input
     /// schema (unknown column, type mismatch, unsupported column type).
     #[error(transparent)]
@@ -1888,6 +1907,28 @@ fn byte_array_row_too_large_message(
     )
 }
 
+impl ConvertError {
+    /// Whether this is an option the caller must fix, refused before any
+    /// input was read ([`ConvertOptions::validate`]'s errors), as opposed to
+    /// a problem with the data or the run. The Python bindings raise these
+    /// as `tylertoo.ConfigError`.
+    pub fn is_config(&self) -> bool {
+        matches!(
+            self,
+            ConvertError::Config(_)
+                | ConvertError::InvalidConfig(_)
+                | ConvertError::InvalidLevels(_)
+                | ConvertError::ZoomAboveCeiling { .. }
+                | ConvertError::RankingConflict
+                | ConvertError::ClusterPartitioningUnsupported
+                | ConvertError::VerbatimPartitioningUnsupported
+                | ConvertError::AccumulateWithoutCluster
+                | ConvertError::AutoZoomMinAboveCeiling { .. }
+                | ConvertError::Filter(super::filter::FilterError::Parse(_))
+        )
+    }
+}
+
 /// #541: [`ConvertOptions::zoom_ceiling`]'s up-front checks, split out of
 /// [`validate_options`].
 fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
@@ -1975,6 +2016,22 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // #371: the zoom ceiling is checked FIRST, before the input is opened or
     // any pass runs — `--max-zoom 33` used to be accepted and spin forever.
     options.levels.check_zoom_ceiling()?;
+    // Q1: a numeric sort key and a categorical class ranking would both drive
+    // `AssignFeature::sort_key`. Formerly also checked by the CLI and the
+    // Python bindings (#779); this is the one copy.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+    // #428 (b8fa58a): `ClassRanking::new` refuses a NaN rank, but the fields
+    // are public, so a struct literal could still carry one.
+    if let Some(ranking) = &options.class_ranking {
+        super::config::check_class_ranking(ranking)?;
+    }
+    // Option combinations no pipeline can honour (cluster or verbatim in
+    // partitioning mode, accumulation without clustering): checked here, with
+    // the other option rules, so every entry point refuses them before any
+    // input is read (#779).
+    check_mode_combinations(options)?;
     positive("gsd-base", options.gsd_base)?;
     // Thinning factors accept 0 as the documented OFF switch (#345/#360):
     // every feature is its own cell, so nothing is thinned. Negative and
@@ -1996,16 +2053,9 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
             "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
         ));
     }
-    if let Some(bb) = &options.bbox {
-        if bb.iter().any(|v| !v.is_finite()) {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must contain only finite values"
-            )));
-        }
-        if bb[0] > bb[2] || bb[1] > bb[3] {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must satisfy xmin <= xmax and ymin <= ymax"
-            )));
+    if let Some(bb) = options.bbox {
+        if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
+            return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
         }
     }
     // Attribute filter (#315): fail fast on a syntactically invalid
@@ -2018,12 +2068,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // of the same run, and both need the streaming pipeline (the in-memory
     // reference path has no separable pass 1 to skip).
     if options.save_plan.is_some() && options.plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--save-plan and --plan are mutually exclusive: one writes the \
-             pass-1/assignment artifact, the other replaces pass 1 with a \
-             saved one"
-                .to_string(),
-        ));
+        return Err(super::config::ConfigError::SavePlanWithPlan.into());
     }
     if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
         return Err(ConvertError::InvalidConfig(
@@ -2167,14 +2212,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // #272: fail fast on a bad spill dir — the spill is best-effort, so a
     // mid-convert creation failure would only surface as a silent degrade
     // to network re-fetch.
-    if let Some(dir) = &options.spill_dir {
-        if !dir.is_dir() {
-            return Err(ConvertError::InvalidConfig(format!(
-                "spill-dir {} is not an existing directory",
-                dir.display()
-            )));
-        }
-    }
+    super::config::check_spill_dir(options.spill_dir.as_deref())?;
     Ok(())
 }
 
@@ -2401,17 +2439,17 @@ pub fn parse_entry_zoom(spec: &str) -> Result<crate::overview::ladder::EntryZoom
         let (value, zoom) = pair
             .split_once('=')
             .ok_or_else(|| format!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}"))?;
-        let value: f64 = value
-            .trim()
+        let raw = value.trim();
+        let value: f64 = raw
             .parse()
-            .map_err(|_| format!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+            .map_err(|_| format!("--entry-zoom {spec:?}: {raw:?} is not a number"))?;
         // #428, same rule as `parse_class_rank`: `f64::from_str` accepts
         // `nan` and `inf`. A NaN rung is not ordered against any column
         // value, and an `inf` rung snaps the match to the SMALLEST observed
         // value — the exact inverse of the ladder this flag documents.
         if !value.is_finite() {
             return Err(format!(
-                "--entry-zoom {spec:?}: {value:?} is not a finite number (NaN and infinity \
+                "--entry-zoom {spec:?}: {raw:?} is not a finite number (NaN and infinity \
                  cannot be ordered against the column's values)"
             ));
         }
@@ -2475,12 +2513,6 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
             .trim()
             .parse()
             .map_err(|e| format!("invalid rank in '{pair}': {e}"))?;
-        if !rank.is_finite() {
-            return Err(format!(
-                "invalid rank in '{pair}': ranks must be finite numbers \
-                 (NaN and infinity cannot be ordered against other classes)"
-            ));
-        }
         ranks.push((value.to_string(), rank));
     }
     if ranks.is_empty() {
@@ -2489,8 +2521,8 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
         ));
     }
 
-    // The shared rules (unknown values lose to every named class but beat
-    // nulls); the per-entry messages above already named any offender.
+    // The shared rules: finite ranks (#428), and unknown values losing to
+    // every named class but beating nulls.
     ClassRanking::new(column, ranks, None)
 }
 
@@ -4052,7 +4084,6 @@ fn normalize_convert_options(
     // #272: place the remote-input disk spill (#219) where the caller asked
     // (no-op for local inputs, which never spill).
     source.set_spill_dir(options.spill_dir.as_deref());
-    check_mode_combinations(options)?;
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
@@ -11639,6 +11670,12 @@ mod tests {
                 "{bad:?} must be rejected as non-finite, got: {err}"
             );
         }
+        // #709 item 3: the message quotes the value as typed, not as parsed
+        // (`"infinity"`, not `inf`), so the user can find it in their spec.
+        let err = parse_entry_zoom("density:infinity=4").unwrap_err();
+        assert!(err.contains("\"infinity\" is not a finite number"), "{err}");
+        let err = parse_entry_zoom("density: NaN =4").unwrap_err();
+        assert!(err.contains("\"NaN\" is not a finite number"), "{err}");
     }
 
     /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one

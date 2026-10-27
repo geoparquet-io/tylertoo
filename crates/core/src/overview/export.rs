@@ -98,6 +98,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::config::ConfigError;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
@@ -158,11 +159,11 @@ use feature_id::{
 pub use feature_id::{FeatureIdColumnProblem, InvalidFeatureIdReason};
 
 /// Default MVT tile extent (matches [`crate::mvt::DEFAULT_EXTENT`]).
-const DEFAULT_EXTENT: u32 = 4096;
+pub(crate) const DEFAULT_EXTENT: u32 = 4096;
 
 /// Default per-tile edge buffer, in tile pixels (tippecanoe default is 5; we
 /// use 8 to match the tile pipeline's historical default).
-const DEFAULT_TILE_BUFFER_PX: u32 = 8;
+pub(crate) const DEFAULT_TILE_BUFFER_PX: u32 = 8;
 
 /// The widest `--tile-buffer` any export accepts, in tile pixels (#433).
 ///
@@ -257,6 +258,12 @@ impl SizeValve {
     }
 }
 
+impl std::fmt::Display for SizeValve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for SizeValve {
     type Err = String;
 
@@ -282,10 +289,10 @@ pub struct ExportOptions {
     /// per tile (`buffer_deg = tile_width * buffer_px / 256`) and applied as
     /// the clip margin, so features spanning a seam render continuously.
     /// At most [`MAX_TILE_BUFFER_PX`] (one tile width); wider is
-    /// [`ExportError::TileBufferTooWide`] (#433).
+    /// [`ConfigError::TileBufferTooWide`] (#433).
     pub tile_buffer: u32,
     /// MVT tile extent (integer tile-local resolution). Default 4096. Must be
-    /// positive ([`ExportError::InvalidExtent`] otherwise); a value that is
+    /// positive ([`ConfigError::InvalidExtent`] otherwise); a value that is
     /// not a power of two is accepted with a warning, since the MVT spec only
     /// recommends one (#433).
     pub extent: u32,
@@ -310,7 +317,9 @@ pub struct ExportOptions {
     /// Experimental (#750): draw, under each tile's own features below the
     /// finest zoom, the area its child tiles cover, built from the finest
     /// level before the export starts (`export/coverage_fill.rs`). Default
-    /// `false`. Ignored for sharded jobs.
+    /// `false`. A coarse job ([`Self::zoom_ceiling`]) builds it from the
+    /// file's finest level (#771); a data shard ([`Self::tile_range`]) does
+    /// not build it.
     pub coverage_fill: bool,
     /// Skip the `i_overlay` boundary-bridge fallback for features whose rings are
     /// already proven simple (issue #239). On a simple ring, Sutherland–Hodgman's
@@ -436,7 +445,7 @@ pub struct ExportOptions {
     /// the buffered members would not fit the memory budget. Same name and
     /// semantics as [`ConvertOptions::spill_dir`](super::convert::ConvertOptions::spill_dir):
     /// the one scratch-disk knob, checked up front (it must be an existing
-    /// directory, [`ExportError::SpillDirNotDirectory`] otherwise). `None`
+    /// directory, [`ConfigError::SpillDirNotDirectory`] otherwise). `None`
     /// uses the process temp directory (`$TMPDIR`).
     ///
     /// The PMTiles archive itself is never spilled here: it is assembled in
@@ -475,6 +484,18 @@ impl Default for ExportOptions {
 }
 
 impl ExportOptions {
+    /// The export half of a verbatim run (#761): no per-tile size cap, raw
+    /// or compressed, since a valve that sheds features to fit a byte budget
+    /// is not verbatim either. Everything else is left alone, so an explicit
+    /// cap set afterwards still applies. The defaults of `tiles --verbatim`
+    /// and of every `pyramid` band.
+    #[must_use]
+    pub fn verbatim(mut self) -> Self {
+        self.tile_size_limit = None;
+        self.compressed_tile_size_limit = None;
+        self
+    }
+
     /// Check the option values that need no input file (#433): `extent`
     /// must be positive, `tile_buffer` at most [`MAX_TILE_BUFFER_PX`], and
     /// `metadata` small enough for an archive.
@@ -491,47 +512,42 @@ impl ExportOptions {
     ///
     /// # Errors
     ///
-    /// Returns [`ExportError::InvalidExtent`] if `extent` is 0,
-    /// [`ExportError::TileBufferTooWide`] if `tile_buffer` is above
-    /// [`MAX_TILE_BUFFER_PX`], [`ExportError::SpillDirNotDirectory`] for a
-    /// missing spill directory, or [`ExportError::MetadataTooLarge`] if
+    /// Returns [`ConfigError::InvalidExtent`] if `extent` is 0,
+    /// [`ConfigError::TileBufferTooWide`] if `tile_buffer` is above
+    /// [`MAX_TILE_BUFFER_PX`], [`ConfigError::SpillDirNotDirectory`] for a
+    /// missing spill directory, or [`ConfigError::MetadataTooLarge`] if
     /// `metadata` is too large for an archive's metadata.
-    pub fn validate(&self) -> Result<(), ExportError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.extent == 0 {
-            return Err(ExportError::InvalidExtent {
+            return Err(ConfigError::InvalidExtent {
                 extent: self.extent,
             });
         }
         if !self.extent.is_power_of_two() {
             log::warn!(
                 "[export] extent {} is not a power of two; the MVT spec recommends one \
-                 (4096 is the default) and decoders assume one when reasoning about \
-                 coordinate precision",
+                 ({DEFAULT_EXTENT} is the default) and decoders assume one when reasoning \
+                 about coordinate precision",
                 self.extent
             );
         }
         if self.tile_buffer > MAX_TILE_BUFFER_PX {
-            return Err(ExportError::TileBufferTooWide {
+            return Err(ConfigError::TileBufferTooWide {
                 buffer: self.tile_buffer,
                 max: MAX_TILE_BUFFER_PX,
             });
         }
-        // #427: fail fast on a bad spill dir, like the convert side does.
-        if let Some(dir) = &self.spill_dir {
-            if !dir.is_dir() {
-                return Err(ExportError::SpillDirNotDirectory(dir.clone()));
-            }
-        }
+        // #427: fail fast on a bad spill dir, the convert side's rule.
+        super::config::check_spill_dir(self.spill_dir.as_deref())?;
         // Publication strings that cannot fit an archive's metadata would
         // otherwise fail only when the first checkpoint is assembled.
         check_metadata_size(&self.metadata)
     }
 }
 
-/// [`TilesetMetadata`] too large for any archive's metadata, as an
-/// [`ExportError`].
-fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ExportError> {
-    metadata.check_size().map_err(ExportError::MetadataTooLarge)
+/// [`TilesetMetadata`] too large for any archive's metadata.
+fn check_metadata_size(metadata: &TilesetMetadata) -> Result<(), ConfigError> {
+    metadata.check_size().map_err(ConfigError::MetadataTooLarge)
 }
 
 /// Per-zoom statistics in an [`ExportReport`].
@@ -733,39 +749,17 @@ pub enum ExportError {
         gsd: f64,
     },
 
-    /// `extent` is zero (#433).
-    ///
-    /// Zero quantizes every coordinate to `(0, 0)`: every polygon and line
-    /// degenerates and is dropped, the points all land on one corner, and
-    /// the layer is still written with `extent: 0`, which every consumer
-    /// then divides by. There is no archive to write.
-    #[error(
-        "extent {extent} is not a valid MVT tile extent: the extent is the tile-local \
-         coordinate resolution and must be positive (the default is 4096)"
-    )]
-    InvalidExtent {
-        /// The rejected extent.
-        extent: u32,
-    },
-
-    /// `--tile-buffer` is wider than [`MAX_TILE_BUFFER_PX`] (#433).
-    #[error(
-        "--tile-buffer {buffer} is wider than the {max} tile pixel cap (one full tile width): \
-         past it a tile duplicates geometry from tiles it does not border and every feature \
-         belongs to O(buffer²) tiles. Lower --tile-buffer to {max} or less (the default is 8)."
-    )]
-    TileBufferTooWide {
-        /// The requested buffer, in tile pixels.
-        buffer: u32,
-        /// [`MAX_TILE_BUFFER_PX`].
-        max: u32,
-    },
+    /// An option value refused before the overview file is opened
+    /// ([`ExportOptions::validate`], #433, #779): the extent, the tile
+    /// buffer, the spill directory, the publication metadata.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 
     /// `--tile-buffer` is wider than a shard's read-pruning margin (#498).
     ///
     /// No longer raised since #433: the universal cap
     /// ([`MAX_TILE_BUFFER_PX`], enforced as
-    /// [`TileBufferTooWide`](ExportError::TileBufferTooWide)) is at most the
+    /// [`ConfigError::TileBufferTooWide`]) is at most the
     /// shard margin, so a buffer that would trip this trips that first. Kept
     /// so code matching on it keeps compiling.
     #[error(
@@ -938,18 +932,6 @@ pub enum ExportError {
         reason: InvalidFeatureIdReason,
     },
 
-    /// [`ExportOptions::spill_dir`] is not an existing directory (#427).
-    /// Checked before any work, like the convert side's `--spill-dir`: the
-    /// spill is opened lazily, so an unusable directory would otherwise
-    /// only surface deep into the export.
-    #[error("spill-dir {} is not an existing directory", .0.display())]
-    SpillDirNotDirectory(PathBuf),
-
-    /// [`ExportOptions::metadata`] cannot fit an archive's metadata section
-    /// on its own. Checked before any work, like the other option values.
-    #[error("{0}")]
-    MetadataTooLarge(String),
-
     /// A level's densest tile is estimated to need more memory than the
     /// machine has, even exported on its own (#665). Raised after the scan,
     /// before any tile is written, against `MemAvailable` or a cgroup
@@ -987,6 +969,19 @@ pub enum ExportError {
         /// Where that figure came from, as messages name it.
         limit_source: &'static str,
     },
+}
+
+impl ExportError {
+    /// Whether this is an option the caller must fix, refused before the
+    /// overview file is read ([`ExportOptions::validate`], #779), as opposed
+    /// to a problem with the file or the run. The Python bindings raise these
+    /// as `tylertoo.ConfigError`.
+    pub fn is_config(&self) -> bool {
+        matches!(
+            self,
+            ExportError::Config(_) | ExportError::DeclaredMinZoomAboveCeiling { .. }
+        )
+    }
 }
 
 /// One source feature: its (possibly reprojected-to-4326) geometry and the MVT
@@ -2660,8 +2655,10 @@ fn export_level(
 
 /// The #750 coverage fill for this export, when [`ExportOptions::coverage_fill`]
 /// asks for it: built from the finest of `levels` for every coarser zoom,
-/// before any level is written. Not for a sharded job, whose finest level
-/// lives in other jobs' archives.
+/// before any level is written. Not for a data shard (a tile range), which
+/// owns zooms at and past the pivot, where the fill matters least; a coarse
+/// job (a zoom ceiling) builds it from the file's finest level, which it
+/// reads but does not emit (#771 option 1).
 fn build_fills_if_asked(
     levels: &[ExportLevelCtx<'_>],
     timers: &ExportTimers,
@@ -2673,10 +2670,10 @@ fn build_fills_if_asked(
     if !options.coverage_fill {
         return Ok(None);
     }
-    if options.tile_range.is_some() || options.zoom_ceiling.is_some() {
+    if options.tile_range.is_some() {
         log::warn!(
-            "[export] --coverage-fill is ignored with --tile-range or --zoom-ceiling: \
-             a sharded job does not build the fill yet"
+            "[export] --coverage-fill is ignored with --tile-range: a data shard does not \
+             build the fill; the coarse job (--zoom-ceiling) does"
         );
         return Ok(None);
     }
@@ -5653,6 +5650,24 @@ pub enum FeatureOrder {
         /// Sort high → low instead of low → high.
         descending: bool,
     },
+}
+
+/// The spelling [`FeatureOrder::from_str`](std::str::FromStr) parses:
+/// `input`, or `COLUMN` / `COLUMN:desc`.
+impl std::fmt::Display for FeatureOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input => f.write_str("input"),
+            Self::Column {
+                name,
+                descending: false,
+            } => f.write_str(name),
+            Self::Column {
+                name,
+                descending: true,
+            } => write!(f, "{name}:desc"),
+        }
+    }
 }
 
 impl std::str::FromStr for FeatureOrder {
@@ -13494,7 +13509,13 @@ mod tests {
             ..ExportOptions::default()
         };
         let err = export_pmtiles(&input, &out, &opts).unwrap_err();
-        assert!(matches!(err, ExportError::SpillDirNotDirectory(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                ExportError::Config(ConfigError::SpillDirNotDirectory(_))
+            ),
+            "{err}"
+        );
         assert!(
             err.to_string().contains("not an existing directory"),
             "{err}"
@@ -14458,7 +14479,10 @@ mod tests {
         };
         let err = export_pmtiles(tin.path(), tout.path(), &opts).unwrap_err();
         assert!(
-            matches!(err, ExportError::InvalidExtent { extent: 0 }),
+            matches!(
+                err,
+                ExportError::Config(ConfigError::InvalidExtent { extent: 0 })
+            ),
             "got: {err}"
         );
         let msg = err.to_string();
@@ -14487,7 +14511,7 @@ mod tests {
         with_extent(1000).validate().unwrap();
         let err = with_extent(0).validate().unwrap_err();
         assert!(
-            matches!(err, ExportError::InvalidExtent { extent: 0 }),
+            matches!(err, ConfigError::InvalidExtent { extent: 0 }),
             "got: {err}"
         );
     }
@@ -14517,7 +14541,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    ExportError::TileBufferTooWide { buffer: b, max }
+                    ExportError::Config(ConfigError::TileBufferTooWide { buffer: b, max })
                         if b == buffer && max == MAX_TILE_BUFFER_PX
                 ),
                 "buffer {buffer}: got {err}"
@@ -14546,7 +14570,7 @@ mod tests {
         };
         let err = opts.validate().unwrap_err();
         assert!(
-            matches!(err, ExportError::TileBufferTooWide { .. }),
+            matches!(err, ConfigError::TileBufferTooWide { .. }),
             "got: {err}"
         );
         // At the universal cap a sharded export is fine too.

@@ -250,7 +250,7 @@ fn not_writable(target: &Path, reason: String) -> Result<(), OutputNotWritable> 
 
 /// Create and remove a uniquely named file in `dir`. Not `tempfile`: its
 /// errors append the random probe name, which means nothing to a user.
-fn probe_directory(dir: &Path) -> io::Result<()> {
+pub(crate) fn probe_directory(dir: &Path) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {

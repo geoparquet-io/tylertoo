@@ -103,301 +103,15 @@ issue = 445
 
 [[parsed_unused]]
 command = "pyramid"
+flag = "report"
+reason = "Output path for the JSON report; no core option."
+issue = 779
+
+[[parsed_unused]]
+command = "pyramid"
 flag = "force"
 reason = "Overwrite guard checked before any work; no core option."
 issue = 427
-
-
-# --- (c) parsed but unused: xfail, no callable builder ----------------------
-
-[[parsed_unused]]
-command = "tiles"
-flag = "layer-name"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "name"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "description"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "attribution"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "max-tile-size"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "max-compressed-tile-size"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "size-valve"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "coverage-fill"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "no-simple-clip-fastpath"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "tile-buffer"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "partition-wave"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "feature-order"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "feature-id"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "tiles"
-flag = "keep-overview"
-reason = "F3: mapped into TilesOptions inline in run_tiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "mode"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "min-zoom"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "max-zoom"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "gsd"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "bbox"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "overview"
-flag = "cogp-compat"
-reason = "F3: mapped inline in run_overview; only the shared tuning flags go through build_convert_options."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "layer-name"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "name"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "description"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "attribution"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "min-zoom"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "include-property"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "exclude-property"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "exclude-all-properties"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "tile-buffer"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "tile-size-limit"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "max-compressed-tile-size"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "size-valve"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "coverage-fill"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "no-simple-clip-fastpath"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "partition-wave"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "feature-order"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "feature-id"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "tile-range"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "zoom-ceiling"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-[[parsed_unused]]
-command = "export-pmtiles"
-flag = "spill-dir"
-reason = "F3: ExportOptions is built inline in run_export_pmtiles; no builder a test can call."
-issue = 779
-xfail = true
-
-
-# --- (b) defaults -----------------------------------------------------------
-
-[[defaults]]
-command = "tiles"
-field = "levels"
-reason = "tiles defaults to --max-zoom 14, the web-map depth tippecanoe's -z also defaults to; overview and ConvertOptions::default() keep z6."
-issue = 779
 
 
 # --- (d) pyramid vs tiles ---------------------------------------------------
@@ -458,12 +172,6 @@ reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default 
 issue = 458
 
 [[pyramid_vs_tiles]]
-flag = "coverage-fill"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
 flag = "drop-gamma"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
@@ -487,24 +195,6 @@ issue = 458
 flag = "entry-zoom"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
-
-[[pyramid_vs_tiles]]
-flag = "exclude-all-properties"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
-flag = "exclude-property"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
-flag = "feature-id"
-reason = "pyramid lacks --feature-id: the pyramid half of #443."
-issue = 443
-xfail = true
 
 [[pyramid_vs_tiles]]
 flag = "files-from"
@@ -542,12 +232,6 @@ reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default 
 issue = 458
 
 [[pyramid_vs_tiles]]
-flag = "include-property"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
 flag = "keep-overview"
 reason = "The per-band intermediates are temporary by design."
 issue = 345
@@ -576,12 +260,6 @@ issue = 458
 flag = "magnitude-ladder"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
-
-[[pyramid_vs_tiles]]
-flag = "max-compressed-tile-size"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
 
 [[pyramid_vs_tiles]]
 flag = "max-zoom"
@@ -619,21 +297,9 @@ reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default 
 issue = 458
 
 [[pyramid_vs_tiles]]
-flag = "no-simple-clip-fastpath"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
 flag = "no-streaming"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
-
-[[pyramid_vs_tiles]]
-flag = "partition-wave"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
 
 [[pyramid_vs_tiles]]
 flag = "plan"
@@ -676,12 +342,6 @@ reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default 
 issue = 458
 
 [[pyramid_vs_tiles]]
-flag = "report"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
-
-[[pyramid_vs_tiles]]
 flag = "representation"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
@@ -717,10 +377,9 @@ reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default 
 issue = 458
 
 [[pyramid_vs_tiles]]
-flag = "size-valve"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
+flag = "sort-direction"
+reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
-xfail = true
 
 [[pyramid_vs_tiles]]
 flag = "sort-key"
@@ -731,12 +390,6 @@ issue = 458
 flag = "spill-dir"
 reason = "Convert tuning: a pyramid band is tiled verbatim, or with the default ladder under --generalize. Per-band tuning is out of scope; #458 asks for export-flag parity."
 issue = 458
-
-[[pyramid_vs_tiles]]
-flag = "tile-buffer"
-reason = "Export knob that tiles and export-pmtiles take and pyramid does not."
-issue = 458
-xfail = true
 
 [[pyramid_vs_tiles]]
 flag = "tile-range"

@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 from tylertoo import _tylertoo
 
 __all__ = [
+    "ConfigError",
     "ConvertReport",
     "DecodeReport",
     "ExportReport",
@@ -293,62 +294,91 @@ class ValidationReport(TypedDict):
     checks: list[ValidationCheck]
 
 
+ConfigError = _tylertoo.ConfigError
+"""An option value or combination refused before any input is read.
+
+A subclass of `ValueError`. The rules are the core library's, the same
+ones the CLI enforces: conflicting options, out-of-range values, an
+existing directory or missing spill directory, an option a function
+cannot honour.
+"""
+
+_defaults = _tylertoo._defaults
+"""Every keyword default, as `{function: {keyword: default}}`.
+
+Built from the core library's defaults; the signatures below read
+theirs from it, and the CLI's are checked against it.
+"""
+
+_DEFAULTS: dict[str, dict[str, Any]] = _defaults()
+_OVERVIEW = _DEFAULTS["overview"]
+_EXPORT = _DEFAULTS["export_pmtiles"]
+_PYRAMID = _DEFAULTS["pyramid"]
+_DECODE = _DEFAULTS["decode"]
+_CONVERT = _DEFAULTS["convert"]
+
+
 def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     input: str | Sequence[str],  # noqa: A002 - public keyword name
     output: str,
     *,
-    mode: Literal["duplicating", "partitioning"] = "duplicating",
-    min_zoom: int = 0,
-    max_zoom: int | Literal["auto"] = 6,
-    gsds: Sequence[float] | None = None,
-    gsd_base: float = 1024.0,
-    sort_key: str | None = None,
-    magnitude_ladder: str | None = None,
-    ladder_step: int = 1,
-    entry_zoom: str | None = None,
-    sort_direction: Literal["desc", "asc"] = "desc",
-    class_rank_column: str | None = None,
-    class_ranks: dict[str, float] | None = None,
-    class_rank_unknown: float | None = None,
-    no_auto_rank: bool = False,
-    verbatim: bool = False,
-    simplify_factor: float | None = None,
-    collapse: bool = False,
-    collapse_square: bool = False,
-    no_collapse: bool = False,
-    representation: str | None = None,
-    cascade: bool = True,
-    point_thinning: float | None = None,
-    line_thinning: float | None = None,
-    polygon_thinning: float | None = None,
-    line_visibility: float | None = None,
-    polygon_visibility: float | None = None,
-    drop_rate: float = 1.65,
-    drop_gamma: float = 1.5,
-    density_drop: bool | None = None,
-    drop_lines: bool = False,
-    drop_polygons: bool = False,
-    cluster: bool = False,
+    mode: Literal["duplicating", "partitioning"] = _OVERVIEW["mode"],
+    min_zoom: int = _OVERVIEW["min_zoom"],
+    max_zoom: int | Literal["auto"] = _OVERVIEW["max_zoom"],
+    gsds: Sequence[float] | None = _OVERVIEW["gsds"],
+    gsd_base: float = _OVERVIEW["gsd_base"],
+    sort_key: str | None = _OVERVIEW["sort_key"],
+    magnitude_ladder: str | None = _OVERVIEW["magnitude_ladder"],
+    ladder_step: int = _OVERVIEW["ladder_step"],
+    entry_zoom: str | None = _OVERVIEW["entry_zoom"],
+    sort_direction: Literal["desc", "asc"] = _OVERVIEW["sort_direction"],
+    class_rank_column: str | None = _OVERVIEW["class_rank_column"],
+    class_ranks: dict[str, float] | None = _OVERVIEW["class_ranks"],
+    class_rank_unknown: float | None = _OVERVIEW["class_rank_unknown"],
+    no_auto_rank: bool = _OVERVIEW["no_auto_rank"],
+    verbatim: bool = _OVERVIEW["verbatim"],
+    simplify_factor: float | None = _OVERVIEW["simplify_factor"],
+    collapse: bool = _OVERVIEW["collapse"],
+    collapse_square: bool = _OVERVIEW["collapse_square"],
+    no_collapse: bool = _OVERVIEW["no_collapse"],
+    representation: str | None = _OVERVIEW["representation"],
+    cascade: bool = _OVERVIEW["cascade"],
+    point_thinning: float | None = _OVERVIEW["point_thinning"],
+    line_thinning: float | None = _OVERVIEW["line_thinning"],
+    polygon_thinning: float | None = _OVERVIEW["polygon_thinning"],
+    line_visibility: float | None = _OVERVIEW["line_visibility"],
+    polygon_visibility: float | None = _OVERVIEW["polygon_visibility"],
+    drop_rate: float = _OVERVIEW["drop_rate"],
+    drop_gamma: float = _OVERVIEW["drop_gamma"],
+    density_drop: bool | None = _OVERVIEW["density_drop"],
+    drop_lines: bool = _OVERVIEW["drop_lines"],
+    drop_polygons: bool = _OVERVIEW["drop_polygons"],
+    cluster: bool = _OVERVIEW["cluster"],
     accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
-    | None = None,
-    coalesce_lines: bool | None = None,
-    coalesce_snap: float = 1.0,
-    coalesce_junction_angle: float = 0.0,
-    coalesce_max_level_rows: int = 2_000_000,
-    include_properties: Sequence[str] | None = None,
-    exclude_properties: Sequence[str] | None = None,
-    exclude_all_properties: bool = False,
-    cogp_compat: bool = False,
-    row_group_size: int = 10_000,
-    full_column_stats: bool = False,
-    streaming: bool = True,
-    read_batch_size: int = 8192,
-    bbox: tuple[float, float, float, float] | None = None,
-    filter: str | None = None,  # noqa: A002 - public keyword name
-    profile: Literal["auto", "speed", "bounded"] = "auto",
-    in_flight_batches: int = 0,
-    read_workers: int = 0,
-    spill_dir: str | os.PathLike[str] | None = None,
+    | None = _OVERVIEW["accumulate_attributes"],
+    coalesce_lines: bool | None = _OVERVIEW["coalesce_lines"],
+    coalesce_snap: float = _OVERVIEW["coalesce_snap"],
+    coalesce_junction_angle: float = _OVERVIEW["coalesce_junction_angle"],
+    coalesce_max_level_rows: int = _OVERVIEW["coalesce_max_level_rows"],
+    include_properties: Sequence[str] | None = _OVERVIEW["include_properties"],
+    exclude_properties: Sequence[str] | None = _OVERVIEW["exclude_properties"],
+    exclude_all_properties: bool = _OVERVIEW["exclude_all_properties"],
+    cogp_compat: bool = _OVERVIEW["cogp_compat"],
+    row_group_size: int = _OVERVIEW["row_group_size"],
+    row_group_size_policy: Literal["constant", "zoom-scaled"] = _OVERVIEW[
+        "row_group_size_policy"
+    ],
+    full_column_stats: bool = _OVERVIEW["full_column_stats"],
+    streaming: bool = _OVERVIEW["streaming"],
+    read_batch_size: int = _OVERVIEW["read_batch_size"],
+    bbox: tuple[float, float, float, float] | None = _OVERVIEW["bbox"],
+    filter: str | None = _OVERVIEW["filter"],  # noqa: A002 - public keyword name
+    profile: Literal["auto", "speed", "bounded"] = _OVERVIEW["profile"],
+    in_flight_batches: int = _OVERVIEW["in_flight_batches"],
+    read_workers: int = _OVERVIEW["read_workers"],
+    spill_dir: str | os.PathLike[str] | None = _OVERVIEW["spill_dir"],
+    save_plan: str | os.PathLike[str] | None = _OVERVIEW["save_plan"],
+    plan: str | os.PathLike[str] | None = _OVERVIEW["plan"],
 ) -> OverviewReport:
     """Build a GeoParquet overview file: one generalized level per zoom.
 
@@ -420,7 +450,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         accumulate_attributes: Aggregation method for each column in
             a cluster.
         coalesce_lines: Join touching same-class lines at coarse levels,
-            or `None` for on (off with `verbatim`).
+            or `None` for on (off with `verbatim`). `True` is refused in
+            partitioning mode.
         coalesce_snap: Largest gap between joined line ends, in GSDs.
         coalesce_junction_angle: Largest turn through a junction, in
             degrees. Set `0` to stop at every junction.
@@ -436,6 +467,8 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         cogp_compat: Write the third-party `cogp` footer key for readers
             of that overview format.
         row_group_size: Maximum rows per output row group.
+        row_group_size_policy: `"constant"`, or `"zoom-scaled"` to
+            double the row-group cap per zoom coarser than the finest.
         full_column_stats: Keep Parquet statistics for every column.
         streaming: Read the input in
             [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
@@ -453,15 +486,21 @@ def overview(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             or `0` to size from the CPU count.
         spill_dir: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
             for remote input.
+        save_plan: Save the convert plan (pass 1 and the level
+            assignment) here and continue converting.
+        plan: Reuse a saved convert plan, skipping pass 1. Its
+            fingerprint must match this run's version, options and
+            inputs.
 
     Returns:
         Counts and sizes for each level written, with input diagnostics.
 
     Raises:
-        ValueError: Invalid or conflicting options, a missing or
-            mistyped column, a property selection the input cannot
-            satisfy, an unsupported projection, or almost nothing to
-            tile.
+        ConfigError: Invalid or conflicting options, refused before any
+            input is read.
+        ValueError: A missing or mistyped column, a property selection
+            the input cannot satisfy, an unsupported projection, or
+            almost nothing to tile.
         MemoryError: Too little memory for this input.
         RuntimeError: Reading or writing failed.
 
@@ -480,25 +519,29 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     input: str,  # noqa: A002 - public keyword name
     output: str,
     *,
-    layer_name: str = "overview",
-    tile_buffer: int = 8,
-    extent: int = 4096,
-    tile_size_limit: int | None = 2097152,
-    simple_clip_fastpath: bool = True,
-    partition_wave: int = 0,
-    feature_order: Literal["input"] | str = "input",
-    min_zoom: int | None = None,
-    include_properties: Sequence[str] | None = None,
-    exclude_properties: Sequence[str] | None = None,
-    exclude_all_properties: bool = False,
-    feature_id: str | None = None,
-    spill_dir: str | os.PathLike[str] | None = None,
-    name: str | None = None,
-    description: str | None = None,
-    attribution: str | None = None,
-    size_valve: Literal["merge", "drop"] = "merge",
-    max_compressed_tile_size: int = 512000,
-    coverage_fill: bool = False,
+    layer_name: str = _EXPORT["layer_name"],
+    tile_buffer: int = _EXPORT["tile_buffer"],
+    extent: int = _EXPORT["extent"],
+    tile_size_limit: int | Literal["auto"] | None = _EXPORT["tile_size_limit"],
+    simple_clip_fastpath: bool = _EXPORT["simple_clip_fastpath"],
+    partition_wave: int = _EXPORT["partition_wave"],
+    feature_order: Literal["input"] | str = _EXPORT["feature_order"],
+    min_zoom: int | None = _EXPORT["min_zoom"],
+    include_properties: Sequence[str] | None = _EXPORT["include_properties"],
+    exclude_properties: Sequence[str] | None = _EXPORT["exclude_properties"],
+    exclude_all_properties: bool = _EXPORT["exclude_all_properties"],
+    feature_id: str | None = _EXPORT["feature_id"],
+    spill_dir: str | os.PathLike[str] | None = _EXPORT["spill_dir"],
+    name: str | None = _EXPORT["name"],
+    description: str | None = _EXPORT["description"],
+    attribution: str | None = _EXPORT["attribution"],
+    size_valve: Literal["merge", "drop"] = _EXPORT["size_valve"],
+    max_compressed_tile_size: int | Literal["auto"] | None = _EXPORT[
+        "max_compressed_tile_size"
+    ],
+    coverage_fill: bool = _EXPORT["coverage_fill"],
+    tile_range: str | None = _EXPORT["tile_range"],
+    zoom_ceiling: int | None = _EXPORT["zoom_ceiling"],
 ) -> ExportReport:
     """Export an overview file to a PMTiles archive, one zoom per level.
 
@@ -509,8 +552,8 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         tile_buffer: Tile edge buffer in pixels, at most 256.
         extent: Tile resolution in MVT units.
         tile_size_limit: Maximum raw (uncompressed) tile size in
-            bytes, a backstop behind `max_compressed_tile_size`
-            (default 2 MiB), or `0` or `None` for no limit.
+            bytes, a backstop behind `max_compressed_tile_size`;
+            `"auto"` is 2 MiB, and `0` or `None` is no limit.
         simple_clip_fastpath: Use faster clipping for simple polygons.
             `False` gives byte-stable output.
         partition_wave: [Partitions in memory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves)
@@ -540,22 +583,28 @@ def export_pmtiles(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
             features, leaving holes. Point tiles use feature dropping in
             both modes.
         max_compressed_tile_size: Maximum gzip-compressed tile size
-            in bytes, like tippecanoe's `-M` (default 500 KiB), or `0`
-            for no limit.
+            in bytes, like tippecanoe's `-M`; `"auto"` is 500 KiB, and
+            `0` or `None` is no limit.
         coverage_fill: Experimental: under each tile's features, draw
             the area its child tiles cover, so a polygon coverage shows
             no holes at coarse zooms. Holds the finest level's geometry
             in memory. See `docs/OVERVIEW_TUNING.md`.
+        tile_range: Export only the tiles in this tile-id range,
+            `"LO..HI"`: one shard of a sharded build.
+        zoom_ceiling: Export only the tiles at or below this zoom: the
+            coarse job of a sharded build.
 
     Returns:
         Tile counts for each zoom written, with encoding diagnostics.
 
     Raises:
-        ValueError: Invalid `feature_order` syntax, a property selection
-            the overview file cannot satisfy, or a `name`, `description`
-            and `attribution` too large for the 16 MiB archive metadata.
-        RuntimeError: Not an overview file, an option is out of range,
-            or reading or writing failed.
+        ConfigError: An option out of range or refused, such as
+            `tile_buffer` past 256, `extent=0`, a missing `spill_dir`,
+            or metadata too large for the 16 MiB archive metadata.
+        ValueError: A property selection the overview file cannot
+            satisfy.
+        RuntimeError: Not an overview file, or reading or writing
+            failed.
 
     Example:
         >>> report = export_pmtiles("overview.parquet", "out.pmtiles")
@@ -577,14 +626,27 @@ def pyramid(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     bands: Sequence[str],
     output: str,
     *,
-    generalize: bool = False,
-    tile_size_limit: int | None = None,
-    feature_order: Literal["input"] | str = "input",
-    work_dir: str | os.PathLike[str] | None = None,
-    allow_missing_zooms: bool = False,
-    name: str | None = None,
-    description: str | None = None,
-    attribution: str | None = None,
+    generalize: bool = _PYRAMID["generalize"],
+    tile_size_limit: int | Literal["auto"] | None = _PYRAMID["tile_size_limit"],
+    feature_order: Literal["input"] | str = _PYRAMID["feature_order"],
+    work_dir: str | os.PathLike[str] | None = _PYRAMID["work_dir"],
+    allow_missing_zooms: bool = _PYRAMID["allow_missing_zooms"],
+    name: str | None = _PYRAMID["name"],
+    description: str | None = _PYRAMID["description"],
+    attribution: str | None = _PYRAMID["attribution"],
+    max_compressed_tile_size: int | Literal["auto"] | None = _PYRAMID[
+        "max_compressed_tile_size"
+    ],
+    size_valve: Literal["merge", "drop"] = _PYRAMID["size_valve"],
+    coverage_fill: bool = _PYRAMID["coverage_fill"],
+    simple_clip_fastpath: bool = _PYRAMID["simple_clip_fastpath"],
+    tile_buffer: int = _PYRAMID["tile_buffer"],
+    extent: int = _PYRAMID["extent"],
+    partition_wave: int = _PYRAMID["partition_wave"],
+    feature_id: str | None = _PYRAMID["feature_id"],
+    include_properties: Sequence[str] | None = _PYRAMID["include_properties"],
+    exclude_properties: Sequence[str] | None = _PYRAMID["exclude_properties"],
+    exclude_all_properties: bool = _PYRAMID["exclude_all_properties"],
 ) -> PyramidReport:
     """Build one PMTiles archive from per-zoom-band inputs.
 
@@ -604,8 +666,9 @@ def pyramid(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         generalize: Generalize each GeoParquet band, as `overview()`
             does. By default each band is tiled verbatim, keeping every
             feature, for input already made for its zooms.
-        tile_size_limit: Maximum tile size in bytes for bands tiled
-            here, or `0` or `None` for no limit.
+        tile_size_limit: Maximum raw tile size in bytes for bands tiled
+            here; `"auto"`, `0` and `None` are no limit, so every
+            feature is kept.
         feature_order: Paint order within a tile for GeoParquet bands;
             see `export_pmtiles()`. A band without that column keeps
             input order, with a warning.
@@ -619,17 +682,33 @@ def pyramid(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
         attribution: Attribution text or HTML for the output, `""`
             included. Unset, every PMTiles band's credit is kept, joined
             with `" | "`; GeoParquet bands carry none.
+        max_compressed_tile_size: Maximum gzip-compressed tile size in
+            bytes for bands tiled here; `"auto"`, `0` and `None` are no
+            limit.
+        size_valve: See `export_pmtiles()`.
+        coverage_fill: See `export_pmtiles()`.
+        simple_clip_fastpath: See `export_pmtiles()`.
+        tile_buffer: See `export_pmtiles()`.
+        extent: See `export_pmtiles()`.
+        partition_wave: See `export_pmtiles()`.
+        feature_id: See `export_pmtiles()`. Every GeoParquet band must
+            have the column.
+        include_properties: Keep only these properties in the tiles of
+            GeoParquet bands. `[]` keeps none.
+        exclude_properties: Drop these properties from the tiles of
+            GeoParquet bands. `include_properties` overrides it.
+        exclude_all_properties: Drop every property from the tiles of
+            GeoParquet bands. `include_properties` overrides it.
 
     Returns:
         Tile counts per band, with merge diagnostics and the metadata
         written.
 
     Raises:
+        ConfigError: An option out of range or refused.
         ValueError: A malformed band spec, overlapping bands of one
-            layer, a missing band input, or invalid `feature_order`
-            syntax.
-        RuntimeError: A band failed to convert, export, or merge, or
-            the metadata is too large for an archive.
+            layer, or a missing band input.
+        RuntimeError: A band failed to convert, export, or merge.
 
     Example:
         >>> report = pyramid(
@@ -650,9 +729,9 @@ def decode(
     input: str,  # noqa: A002 - public keyword name
     output: str,
     *,
-    min_zoom: int | None = None,
-    max_zoom: int | None = None,
-    layer: str | None = None,
+    min_zoom: int | None = _DECODE["min_zoom"],
+    max_zoom: int | None = _DECODE["max_zoom"],
+    layer: str | None = _DECODE["layer"],
 ) -> DecodeReport:
     """Decode a PMTiles archive of vector tiles back to GeoParquet.
 
@@ -712,31 +791,92 @@ def validate(file: str) -> ValidationReport:
     return cast("ValidationReport", _tylertoo.validate(file))
 
 
-def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
+def convert(  # noqa: PLR0913 - one keyword per CLI flag, on purpose
     input: str,  # noqa: A002 - public keyword name
     output: str,
-    min_zoom: int = 0,
-    max_zoom: int | Literal["auto"] = 14,
-    layer_name: str | None = None,
-    tile_size_limit: int | None = 2097152,
-    simple_clip_fastpath: bool = True,
-    feature_order: Literal["input"] | str = "input",
-    spill_dir: str | os.PathLike[str] | None = None,
+    min_zoom: int = _CONVERT["min_zoom"],
+    max_zoom: int | Literal["auto"] = _CONVERT["max_zoom"],
+    layer_name: str | None = _CONVERT["layer_name"],
+    tile_size_limit: int | Literal["auto"] | None = _CONVERT["tile_size_limit"],
+    simple_clip_fastpath: bool = _CONVERT["simple_clip_fastpath"],
+    feature_order: Literal["input"] | str = _CONVERT["feature_order"],
+    spill_dir: str | os.PathLike[str] | None = _CONVERT["spill_dir"],
     *,
-    include_properties: Sequence[str] | None = None,
-    exclude_properties: Sequence[str] | None = None,
-    exclude_all_properties: bool = False,
-    size_valve: Literal["merge", "drop"] = "merge",
-    max_compressed_tile_size: int = 512000,
-    coverage_fill: bool = False,
+    include_properties: Sequence[str] | None = _CONVERT["include_properties"],
+    exclude_properties: Sequence[str] | None = _CONVERT["exclude_properties"],
+    exclude_all_properties: bool = _CONVERT["exclude_all_properties"],
+    size_valve: Literal["merge", "drop"] = _CONVERT["size_valve"],
+    max_compressed_tile_size: int | Literal["auto"] | None = _CONVERT[
+        "max_compressed_tile_size"
+    ],
+    coverage_fill: bool = _CONVERT["coverage_fill"],
+    gsds: Sequence[float] | None = _CONVERT["gsds"],
+    bbox: tuple[float, float, float, float] | None = _CONVERT["bbox"],
+    name: str | None = _CONVERT["name"],
+    description: str | None = _CONVERT["description"],
+    attribution: str | None = _CONVERT["attribution"],
+    tile_buffer: int = _CONVERT["tile_buffer"],
+    extent: int = _CONVERT["extent"],
+    partition_wave: int = _CONVERT["partition_wave"],
+    feature_id: str | None = _CONVERT["feature_id"],
+    keep_overview: str | os.PathLike[str] | None = _CONVERT["keep_overview"],
+    tile_range: str | None = _CONVERT["tile_range"],
+    gsd_base: float = _CONVERT["gsd_base"],
+    sort_key: str | None = _CONVERT["sort_key"],
+    magnitude_ladder: str | None = _CONVERT["magnitude_ladder"],
+    ladder_step: int = _CONVERT["ladder_step"],
+    entry_zoom: str | None = _CONVERT["entry_zoom"],
+    sort_direction: Literal["desc", "asc"] = _CONVERT["sort_direction"],
+    class_rank_column: str | None = _CONVERT["class_rank_column"],
+    class_ranks: dict[str, float] | None = _CONVERT["class_ranks"],
+    class_rank_unknown: float | None = _CONVERT["class_rank_unknown"],
+    no_auto_rank: bool = _CONVERT["no_auto_rank"],
+    verbatim: bool = _CONVERT["verbatim"],
+    simplify_factor: float | None = _CONVERT["simplify_factor"],
+    collapse: bool = _CONVERT["collapse"],
+    collapse_square: bool = _CONVERT["collapse_square"],
+    no_collapse: bool = _CONVERT["no_collapse"],
+    representation: str | None = _CONVERT["representation"],
+    cascade: bool = _CONVERT["cascade"],
+    point_thinning: float | None = _CONVERT["point_thinning"],
+    line_thinning: float | None = _CONVERT["line_thinning"],
+    polygon_thinning: float | None = _CONVERT["polygon_thinning"],
+    line_visibility: float | None = _CONVERT["line_visibility"],
+    polygon_visibility: float | None = _CONVERT["polygon_visibility"],
+    drop_rate: float = _CONVERT["drop_rate"],
+    drop_gamma: float = _CONVERT["drop_gamma"],
+    density_drop: bool | None = _CONVERT["density_drop"],
+    drop_lines: bool = _CONVERT["drop_lines"],
+    drop_polygons: bool = _CONVERT["drop_polygons"],
+    cluster: bool = _CONVERT["cluster"],
+    accumulate_attributes: dict[str, Literal["sum", "max", "min", "mean"]]
+    | None = _CONVERT["accumulate_attributes"],
+    coalesce_lines: bool | None = _CONVERT["coalesce_lines"],
+    coalesce_snap: float = _CONVERT["coalesce_snap"],
+    coalesce_junction_angle: float = _CONVERT["coalesce_junction_angle"],
+    coalesce_max_level_rows: int = _CONVERT["coalesce_max_level_rows"],
+    row_group_size: int = _CONVERT["row_group_size"],
+    row_group_size_policy: Literal["constant", "zoom-scaled"] = _CONVERT[
+        "row_group_size_policy"
+    ],
+    full_column_stats: bool = _CONVERT["full_column_stats"],
+    streaming: bool = _CONVERT["streaming"],
+    read_batch_size: int = _CONVERT["read_batch_size"],
+    filter: str | None = _CONVERT["filter"],  # noqa: A002 - public keyword name
+    profile: Literal["auto", "speed", "bounded"] = _CONVERT["profile"],
+    in_flight_batches: int = _CONVERT["in_flight_batches"],
+    read_workers: int = _CONVERT["read_workers"],
+    save_plan: str | os.PathLike[str] | None = _CONVERT["save_plan"],
+    plan: str | os.PathLike[str] | None = _CONVERT["plan"],
 ) -> ConvertReport:
-    """Convert GeoParquet to PMTiles in one call (deprecated).
+    """Convert GeoParquet to PMTiles in one call, like `tylertoo tiles`.
 
-    Use `overview()` followed by `export_pmtiles()` for all options,
-    including the `name`, `description` and `attribution` metadata.
-    Runs the same core facade as `tylertoo tiles`, so the chain — the
-    removed-after-export intermediate overview, its free-space
-    preflight, and the declared zoom range — matches the CLI.
+    Runs the same core facade as `tylertoo tiles`, with the same
+    options and defaults, so the chain — the removed-after-export
+    intermediate overview, its free-space preflight, the option rules,
+    and the declared zoom range — matches the CLI. `overview()`
+    followed by `export_pmtiles()` is the same chain in two steps.
+    Sharded builds (`--shard`, `--plan-only`) stay CLI-only.
 
     Args:
         input: See `overview()`.
@@ -744,7 +884,8 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
         min_zoom: See `overview()`.
         max_zoom: See `overview()`.
         layer_name: MVT layer name, or `None` for the input's file stem.
-        tile_size_limit: See `export_pmtiles()`.
+        tile_size_limit: See `export_pmtiles()`. `"auto"` is no limit
+            with `verbatim`.
         simple_clip_fastpath: See `export_pmtiles()`.
         feature_order: See `export_pmtiles()`.
         spill_dir: Scratch directory for the intermediate overview and
@@ -752,20 +893,82 @@ def convert(  # noqa: PLR0913 - mirrors the CLI's one-shot flags
             intermediate is at least input-sized; without this it goes
             to `$TMPDIR`, then the output's directory. Set it when
             `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
-            when the chosen volume looks too small.
+            when the chosen volume looks too small, whether or not the
+            run then fails.
         include_properties: See `overview()`.
         exclude_properties: See `overview()`.
         exclude_all_properties: See `overview()`.
         size_valve: See `export_pmtiles()`.
-        max_compressed_tile_size: See `export_pmtiles()`.
+        max_compressed_tile_size: See `export_pmtiles()`. `"auto"` is no
+            limit with `verbatim`.
         coverage_fill: See `export_pmtiles()`.
+        gsds: See `overview()`.
+        bbox: See `overview()`.
+        name: See `export_pmtiles()`.
+        description: See `export_pmtiles()`.
+        attribution: See `export_pmtiles()`.
+        tile_buffer: See `export_pmtiles()`.
+        extent: See `export_pmtiles()`.
+        partition_wave: See `export_pmtiles()`.
+        feature_id: See `export_pmtiles()`.
+        keep_overview: Keep the intermediate overview file at this path
+            instead of removing it. Its directory must exist.
+        tile_range: See `export_pmtiles()`.
+        gsd_base: See `overview()`.
+        sort_key: See `overview()`.
+        magnitude_ladder: See `overview()`.
+        ladder_step: See `overview()`.
+        entry_zoom: See `overview()`.
+        sort_direction: See `overview()`.
+        class_rank_column: See `overview()`.
+        class_ranks: See `overview()`.
+        class_rank_unknown: See `overview()`.
+        no_auto_rank: See `overview()`.
+        verbatim: See `overview()`. Also turns both tile size limits
+            off unless you pass them.
+        simplify_factor: See `overview()`.
+        collapse: See `overview()`.
+        collapse_square: See `overview()`.
+        no_collapse: See `overview()`.
+        representation: See `overview()`.
+        cascade: See `overview()`.
+        point_thinning: See `overview()`.
+        line_thinning: See `overview()`.
+        polygon_thinning: See `overview()`.
+        line_visibility: See `overview()`.
+        polygon_visibility: See `overview()`.
+        drop_rate: See `overview()`.
+        drop_gamma: See `overview()`.
+        density_drop: See `overview()`.
+        drop_lines: See `overview()`.
+        drop_polygons: See `overview()`.
+        cluster: See `overview()`.
+        accumulate_attributes: See `overview()`.
+        coalesce_lines: See `overview()`.
+        coalesce_snap: See `overview()`.
+        coalesce_junction_angle: See `overview()`.
+        coalesce_max_level_rows: See `overview()`.
+        row_group_size: See `overview()`.
+        row_group_size_policy: See `overview()`.
+        full_column_stats: See `overview()`.
+        streaming: See `overview()`.
+        read_batch_size: See `overview()`.
+        filter: See `overview()`.
+        profile: See `overview()`.
+        in_flight_batches: See `overview()`.
+        read_workers: See `overview()`.
+        save_plan: See `overview()`.
+        plan: See `overview()`.
 
     Returns:
         Both halves' reports, keyed `"convert"` and `"export"` like the
         CLI's `tiles --report` JSON.
 
     Raises:
-        ValueError: Invalid zoom range, options, or property selection.
+        ConfigError: Invalid or conflicting options, refused before any
+            input is read.
+        ValueError: A missing or mistyped column, or a property
+            selection the input cannot satisfy.
         MemoryError: Too little memory for this input.
         RuntimeError: Conversion or export failed.
 

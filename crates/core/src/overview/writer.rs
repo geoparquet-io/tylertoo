@@ -152,6 +152,16 @@ pub enum RowGroupSizePolicy {
     ZoomScaled,
 }
 
+impl RowGroupSizePolicy {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowGroupSizePolicy::Constant => "constant",
+            RowGroupSizePolicy::ZoomScaled => "zoom-scaled",
+        }
+    }
+}
+
 impl std::str::FromStr for RowGroupSizePolicy {
     type Err = String;
 

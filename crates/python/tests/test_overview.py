@@ -180,7 +180,8 @@ class TestOverviewApi:
             )
 
     def test_overview_empty_class_ranks(self):
-        with pytest.raises(ValueError, match="class_ranks"):
+        # One message for every spelling of a class ranking (#779).
+        with pytest.raises(tylertoo.ConfigError, match="at least one class rank"):
             tylertoo.overview(
                 "/nonexistent.parquet",
                 "/tmp/out.parquet",
@@ -253,7 +254,7 @@ class TestExportPmtilesApi:
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = Path(tmpdir) / "no-such-dir"
             pattern = r"spill-dir .* not an existing directory"
-            with pytest.raises(RuntimeError, match=pattern):
+            with pytest.raises(tylertoo.ConfigError, match=pattern):
                 tylertoo.export_pmtiles(
                     "/nonexistent.parquet",
                     str(Path(tmpdir) / "out.pmtiles"),
@@ -934,10 +935,12 @@ class TestPublicationMetadata:
                 str(overview_file), str(tmp_path / "pm.pmtiles"), "x"
             )
 
-    @needs_buildings
-    def test_deprecated_convert_signature_is_unchanged(self):
+    def test_convert_takes_them_keyword_only(self):
+        # #779: convert() takes every `tiles` flag, these included; the
+        # positional prefix it has always had stays unchanged.
         params = inspect.signature(tylertoo.convert).parameters
-        assert not set(self.KEYS) & params.keys()
+        for key in self.KEYS:
+            assert params[key].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 @needs_buildings

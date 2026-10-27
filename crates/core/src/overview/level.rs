@@ -115,6 +115,16 @@ pub enum Mode {
     Partitioning,
 }
 
+impl Mode {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Duplicating => "duplicating",
+            Mode::Partitioning => "partitioning",
+        }
+    }
+}
+
 impl std::str::FromStr for Mode {
     type Err = String;
 
@@ -153,6 +163,17 @@ pub enum MemoryProfile {
     /// Spill each output level's rows to a temporary Arrow IPC file and stream
     /// them back at write time, capping peak RAM.
     Bounded,
+}
+
+impl MemoryProfile {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryProfile::Auto => "auto",
+            MemoryProfile::Speed => "speed",
+            MemoryProfile::Bounded => "bounded",
+        }
+    }
 }
 
 impl std::str::FromStr for MemoryProfile {

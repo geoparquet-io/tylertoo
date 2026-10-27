@@ -5,16 +5,18 @@
 //! on disk" — so the CLI and the Python bindings are thin callers that can
 //! never drift:
 //!
+//! - the whole configuration, [`TilesOptions`] (the convert half's
+//!   [`ConvertOptions`] and the export half's [`ExportOptions`]), validated
+//!   once and before any input is read ([`TilesOptions::validate`], #779);
 //! - the intermediate overview's lifecycle (#314): retained at
 //!   [`TilesOptions::keep_overview`], otherwise a temp file in the spill
 //!   dir / `$TMPDIR` / the output directory (in that order), removed on
 //!   drop — success or failure alike;
 //! - the free-space preflight on the volume holding that intermediate (#314);
-//! - the export-knob preflight that needs no file (#433) and the
-//!   feature-order / feature-id vs property-selection guard (#386/#443);
 //! - the declared-minimum-zoom rule (#380) and a data shard's narrower
 //!   declaration (#498);
 //! - the empty-shard (#498) and empty-coarse (#541) archive handling;
+//! - the plan-only run of a fleet's coarse job ([`write_plan`], #560);
 //! - the combined convert + export report the one-step run captures.
 //!
 //! The chain is `overview` convert → `export-pmtiles` through a materialized
@@ -25,18 +27,22 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::config::ConfigError;
 use super::convert::{
-    convert_to_overviews, convert_to_overviews_sources, ConvertError, ConvertOptions,
-    ConvertReport, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, write_convert_plan_sources, ConvertError,
+    ConvertOptions, ConvertReport, LevelPlan, PlanReport,
 };
 use super::export::{
     export_pmtiles, write_empty_archive, ExportError, ExportOptions, ExportReport, FeatureOrder,
-    SizeValve,
 };
 use super::writer::WriterError;
 use crate::input_set::ConvertSource;
 use crate::shard::{ShardRole, TileRange};
-use crate::TilesetMetadata;
+
+/// `tylertoo tiles`'s default finest zoom, and [`TilesOptions::default`]'s.
+/// (`overview` keeps [`ConvertOptions::default`]'s z6: an overview file is
+/// a level ladder, not a full tile pyramid.)
+pub const TILES_DEFAULT_MAX_ZOOM: u8 = 14;
 
 /// What the facade reads: a path (file/dir/glob/URL/prefix, resolved by
 /// core's input resolution) or a manifest of explicit files/URLs (the CLI's
@@ -62,6 +68,20 @@ impl TilesInput {
         crate::input_set::derive_layer_name(&p.to_string_lossy())
     }
 
+    /// Resolve this input to the core's [`ConvertSource`], the one way: a
+    /// path through [`ConvertSource::resolve_path`], a manifest through
+    /// [`ConvertSource::from_manifest`].
+    ///
+    /// # Errors
+    ///
+    /// The input's resolution errors.
+    pub fn source(&self) -> Result<ConvertSource, ConvertError> {
+        match self {
+            TilesInput::Path(p) => Ok(ConvertSource::resolve_path(p)?),
+            TilesInput::Manifest(m) => Ok(ConvertSource::from_manifest(m)?),
+        }
+    }
+
     /// Run the convert half against this input, dispatching on the input
     /// shape and keeping the typed [`ConvertError`] — the facade's
     /// empty-shard handling (and any caller that routes both shapes) has to
@@ -79,9 +99,9 @@ impl TilesInput {
     ) -> Result<ConvertReport, ConvertError> {
         match self {
             TilesInput::Path(p) => convert_to_overviews(p, output, options),
-            TilesInput::Manifest(m) => ConvertSource::from_manifest(m)
-                .map_err(ConvertError::from)
-                .and_then(|source| convert_to_overviews_sources(&source, output, options)),
+            TilesInput::Manifest(_) => {
+                convert_to_overviews_sources(&self.source()?, output, options)
+            }
         }
     }
 }
@@ -118,10 +138,11 @@ impl TilesShard {
     /// the fleet's cut digest. The digest is fingerprinted and the range is
     /// not — the cut is fleet-wide, this job's slice of it is not.
     ///
-    /// Separate from [`TilesShard::apply_to_convert`] because a `--plan-only`
+    /// Separate from the coarse job's build ceiling because a `--plan-only`
     /// run (#560) applies exactly this much: it materializes no level, so it
     /// must not carry a ceiling core would refuse for having no pass 2 to
-    /// apply it to.
+    /// apply it to. Public for a caller that resolves `--max-zoom auto`
+    /// against the shard's own reads before handing the facade its options.
     pub fn apply_selection(&self, convert: &mut ConvertOptions) {
         convert.shard = self.range;
         convert.shard_plan_digest = Some(self.cut_digest.clone());
@@ -134,13 +155,17 @@ impl TilesShard {
     /// plan is byte-identical to a full run's; `--no-streaming` builds every
     /// level and the export ceiling alone bounds the tiles).
     ///
-    /// [`convert_to_pmtiles`] applies this to its own copy of
-    /// [`TilesOptions::convert`], so a caller never hand-syncs the two.
-    /// Idempotent, so a caller that has already applied it (the CLI, which
-    /// shares one options builder with its `--plan-only` path) is unaffected.
-    pub fn apply_to_convert(&self, convert: &mut ConvertOptions) {
+    /// `keep_finest_level` skips that ceiling: the coverage fill (#771)
+    /// draws each coarse tile from the finest level, so a coarse job that
+    /// builds the fill needs every level in its intermediate.
+    ///
+    /// The facade's own (#709): it applies this to its copy of
+    /// [`TilesOptions::convert`], so no caller hand-syncs the two.
+    /// Idempotent.
+    pub(crate) fn apply_to_convert(&self, convert: &mut ConvertOptions, keep_finest_level: bool) {
         self.apply_selection(convert);
         if self.range.is_none()
+            && !keep_finest_level
             && matches!(convert.levels, LevelPlan::ZoomRange { .. })
             && convert.streaming
         {
@@ -149,8 +174,8 @@ impl TilesShard {
     }
 }
 
-/// Options for [`convert_to_pmtiles`]: the convert half's options plus the
-/// export knobs and the facade's own policy inputs.
+/// The whole `tiles` configuration: the convert half, the export half, and
+/// the facade's own policy inputs (#779: one config, validated once).
 ///
 /// The declared zoom range (#380) is read from `convert.levels`: a
 /// [`LevelPlan::ZoomRange`]'s requested minimum is declared even when the
@@ -159,6 +184,16 @@ impl TilesShard {
 /// [`super::auto_zoom::MaxZoom::resolve`], which writes the chosen zoom back
 /// into the plan) maximum declares an empty data shard's archive. A GSD
 /// ladder declares no requested range.
+///
+/// The facade derives a few export fields itself, so they must be left at
+/// their defaults ([`TilesOptions::validate`] refuses them otherwise):
+/// `export.layer_name` (set [`TilesOptions::layer_name`]), `export.min_zoom`
+/// (from the level plan), `export.properties` (the selection is applied at
+/// convert: set `convert.properties`), `export.zoom_ceiling` (from the
+/// shard) and `export.spill_dir` (the one scratch knob is
+/// `convert.spill_dir`). `export.tile_range` is the hand-written export
+/// range; a data shard's own range replaces it, and the two together are
+/// refused.
 ///
 /// Note: #436 will freeze this shape (`#[non_exhaustive]` + a builder);
 /// construct it with `..TilesOptions::default()` so that lands as a
@@ -174,6 +209,11 @@ pub struct TilesOptions {
     /// `shard_plan_digest`, the coarse `zoom_ceiling`) to its own copy, so
     /// leave those fields alone.
     pub convert: ConvertOptions,
+    /// The export half ([`super::export::export_pmtiles`]): the size caps
+    /// and valve, the tile buffer and extent, the feature order and id, the
+    /// publication metadata, the hand-written tile range. See the type docs
+    /// for the fields the facade derives itself.
+    pub export: ExportOptions,
     /// MVT layer name; `None` derives it from the input
     /// ([`TilesInput::derive_layer_name`]).
     pub layer_name: Option<String>,
@@ -182,73 +222,233 @@ pub struct TilesOptions {
     pub keep_overview: Option<PathBuf>,
     /// The sharded-fleet job, if any (#498).
     pub shard: Option<TilesShard>,
-    /// A hand-written export tile range, restricting the export only (a
-    /// data shard's range prunes the convert's reads too).
-    ///
-    /// A [`TilesShard::range`] takes precedence where it is set, which is
-    /// data shards only; a coarse shard has none, so this applies there.
-    /// The CLI and the Python bindings keep the two mutually exclusive, so
-    /// in practice at most one is ever set.
-    pub tile_range: Option<TileRange>,
-    /// Per-tile edge buffer in tile pixels ([`ExportOptions::tile_buffer`]).
-    pub tile_buffer: u32,
-    /// Per-tile MVT size limit in bytes ([`ExportOptions::tile_size_limit`]).
-    pub tile_size_limit: Option<usize>,
-    /// Per-tile compressed size limit in bytes
-    /// ([`ExportOptions::compressed_tile_size_limit`], #745).
-    pub compressed_tile_size_limit: Option<usize>,
-    /// How an oversized tile is brought under its limit
-    /// ([`ExportOptions::size_valve`], #745).
-    pub size_valve: SizeValve,
-    /// Draw the coverage fill under coarse tiles
-    /// ([`ExportOptions::coverage_fill`], #750).
-    pub coverage_fill: bool,
-    /// See [`ExportOptions::simple_clip_fastpath`].
-    pub simple_clip_fastpath: bool,
-    /// See [`ExportOptions::partition_wave`].
-    pub partition_wave: usize,
-    /// Within-tile feature order (#361).
-    pub feature_order: FeatureOrder,
-    /// Promote this property to the MVT feature id (#443).
-    pub feature_id: Option<String>,
-    /// Publication `name`, `description` and `attribution`
-    /// ([`ExportOptions::metadata`]), written to the archive, including the
-    /// empty archive of a shard or coarse job that owns no rows.
-    pub metadata: TilesetMetadata,
 }
 
 impl Default for TilesOptions {
     fn default() -> Self {
-        let export = ExportOptions::default();
         Self {
-            convert: ConvertOptions::default(),
+            convert: ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: TILES_DEFAULT_MAX_ZOOM,
+                },
+                ..ConvertOptions::default()
+            },
+            export: ExportOptions::default(),
             layer_name: None,
             keep_overview: None,
             shard: None,
-            tile_range: None,
-            tile_buffer: export.tile_buffer,
-            tile_size_limit: export.tile_size_limit,
-            compressed_tile_size_limit: export.compressed_tile_size_limit,
-            size_valve: export.size_valve,
-            coverage_fill: export.coverage_fill,
-            simple_clip_fastpath: export.simple_clip_fastpath,
-            partition_wave: export.partition_wave,
-            feature_order: FeatureOrder::default(),
-            feature_id: None,
-            metadata: TilesetMetadata::default(),
         }
     }
 }
 
+/// Export fields the facade derives itself, by the name the
+/// [`ConfigError::OptionIgnored`] message gives them, with what to set
+/// instead. Kept beside [`TilesOptions`]'s docs, which list the same five.
+const FACADE_OWNED_EXPORT_FIELDS: [(&str, &str); 5] = [
+    (
+        "export.layer_name",
+        "the facade names the layer; set TilesOptions::layer_name",
+    ),
+    (
+        "export.min_zoom",
+        "the facade declares the level plan's minimum zoom",
+    ),
+    (
+        "export.properties",
+        "the property selection is applied at convert; set convert.properties",
+    ),
+    (
+        "export.zoom_ceiling",
+        "a coarse shard job's ceiling comes from TilesOptions::shard",
+    ),
+    (
+        "export.spill_dir",
+        "the one scratch directory is convert.spill_dir",
+    ),
+];
+
+impl TilesOptions {
+    /// The export defaults of a `tiles` run (#761): [`ExportOptions::default`],
+    /// or with `verbatim` [`ExportOptions::verbatim`] — no size cap, since a
+    /// valve that sheds features to fit a byte budget is not verbatim
+    /// either. An explicit cap set on the result still applies. The CLI's
+    /// `tiles --verbatim` and the Python `convert(verbatim=True)` both start
+    /// here.
+    pub fn export_defaults(verbatim: bool) -> ExportOptions {
+        let export = ExportOptions::default();
+        if verbatim {
+            export.verbatim()
+        } else {
+            export
+        }
+    }
+
+    /// Check the whole configuration before any input is read (#779): the
+    /// convert half ([`ConvertOptions::validate`]), the export half
+    /// ([`ExportOptions::validate`]), and the facade's own rules — the
+    /// export fields it derives itself, the `keep_overview` directory
+    /// (#433), the feature-order / feature-id columns against the property
+    /// selection (#386/#443), a hand-written tile range beside a data
+    /// shard's, and a coarse shard job that owns no zoom (#498).
+    ///
+    /// [`convert_to_pmtiles`] runs this first. A caller with expensive work
+    /// of its own before the facade (resolving `--max-zoom auto`, binding a
+    /// shard plan) calls it up front too.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken; [`TilesError::is_config`] is true for each.
+    pub fn validate(&self) -> Result<(), TilesError> {
+        self.validate_for(Run::Tiles)
+    }
+
+    /// [`TilesOptions::validate`] for a plan-only run ([`write_plan`],
+    /// #560): the same rules, except that a coarse shard's pivot may sit at
+    /// the minimum zoom (nothing is built), and a data shard and a missing
+    /// `convert.save_plan` are refused.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken.
+    pub fn validate_plan_only(&self) -> Result<(), TilesError> {
+        self.validate_for(Run::PlanOnly)
+    }
+
+    /// The export options a plan-only run (#560) ignores: every field of
+    /// [`TilesOptions::export`] that differs from `defaults` (the
+    /// [`TilesOptions::export_defaults`] the caller started from, which a
+    /// value equal to is the same run as no value), plus the layer name and
+    /// the kept overview. Named by their CLI flags, in `--help` order.
+    ///
+    /// None of these is a convert option, and the plan's fingerprint is an
+    /// allowlist of convert options, so a plan-only run writes the plan the
+    /// full coarse job writes with them.
+    pub fn ignored_by_plan_only(&self, defaults: &ExportOptions) -> Vec<&'static str> {
+        let e = &self.export;
+        let m = &e.metadata;
+        [
+            ("--layer-name", self.layer_name.is_some()),
+            ("--name", m.name.is_some()),
+            ("--description", m.description.is_some()),
+            ("--attribution", m.attribution.is_some()),
+            (
+                "--max-tile-size",
+                e.tile_size_limit != defaults.tile_size_limit,
+            ),
+            (
+                "--max-compressed-tile-size",
+                e.compressed_tile_size_limit != defaults.compressed_tile_size_limit,
+            ),
+            ("--size-valve", e.size_valve != defaults.size_valve),
+            ("--coverage-fill", e.coverage_fill != defaults.coverage_fill),
+            (
+                "--no-simple-clip-fastpath",
+                e.simple_clip_fastpath != defaults.simple_clip_fastpath,
+            ),
+            ("--tile-buffer", e.tile_buffer != defaults.tile_buffer),
+            ("--extent", e.extent != defaults.extent),
+            (
+                "--partition-wave",
+                e.partition_wave != defaults.partition_wave,
+            ),
+            ("--feature-order", e.feature_order != defaults.feature_order),
+            ("--feature-id", e.feature_id.is_some()),
+            ("--keep-overview", self.keep_overview.is_some()),
+            ("--tile-range", e.tile_range.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, set)| set.then_some(flag))
+        .collect()
+    }
+
+    fn validate_for(&self, run: Run) -> Result<(), TilesError> {
+        // The shard rules first: they name the precise misuse (a plan-only
+        // data shard), where convert's own check would only say `--shard`
+        // and `--save-plan` exclude each other.
+        if let Some(job) = &self.shard {
+            if let Some(range) = job.range.filter(|r| r.pivot_zoom() != job.pivot_zoom) {
+                return Err(ConfigError::ShardPivotMismatch {
+                    pivot: job.pivot_zoom,
+                    range_pivot: range.pivot_zoom(),
+                }
+                .into());
+            }
+            if self.export.tile_range.is_some() {
+                return Err(ConfigError::TileRangeWithShard.into());
+            }
+            if job.range.is_some() && run == Run::PlanOnly {
+                return Err(ConfigError::PlanOnlyDataShard.into());
+            }
+            // The coarse job owns [min_zoom, pivot - 1]. #560: not under
+            // plan-only, which builds no zoom at all — a pivot AT the minimum
+            // is exactly the handover shape (an external archive owns every
+            // zoom below the pivot), the one build plan-only exists for.
+            if let (None, Run::Tiles, LevelPlan::ZoomRange { min_zoom, .. }) =
+                (job.range, run, &self.convert.levels)
+            {
+                if job.pivot_zoom <= *min_zoom {
+                    return Err(ConfigError::CoarseShardHasNoZoom {
+                        pivot: job.pivot_zoom,
+                        min_zoom: *min_zoom,
+                    }
+                    .into());
+                }
+            }
+        }
+        self.convert.validate().map_err(TilesError::Convert)?;
+        self.export.validate()?;
+        let defaults = ExportOptions::default();
+        let set = [
+            self.export.layer_name != defaults.layer_name,
+            self.export.min_zoom.is_some(),
+            self.export.properties != defaults.properties,
+            self.export.zoom_ceiling.is_some(),
+            self.export.spill_dir.is_some(),
+        ];
+        if let Some(((option, reason), _)) = FACADE_OWNED_EXPORT_FIELDS
+            .iter()
+            .zip(set)
+            .find(|(_, set)| *set)
+        {
+            return Err(ConfigError::OptionIgnored {
+                option,
+                command: "tiles",
+                reason,
+            }
+            .into());
+        }
+        check_keep_overview(self.keep_overview.as_deref())?;
+        // #386/#443: the property selection is applied at convert, so an
+        // excluded column is already gone from the intermediate before export
+        // would sort or id by it.
+        check_knob_columns(
+            &self.convert,
+            &self.export.feature_order,
+            self.export.feature_id.as_deref(),
+        )?;
+        if run == Run::PlanOnly && self.convert.save_plan.is_none() {
+            return Err(ConfigError::PlanOnlyWithoutSavePlan.into());
+        }
+        Ok(())
+    }
+}
+
+/// Which run [`TilesOptions::validate_for`] checks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// A full convert + export.
+    Tiles,
+    /// [`write_plan`]: pass 1 and the assignment only.
+    PlanOnly,
+}
+
 /// The export tile range for a run: a shard's own range where it has one,
-/// otherwise the caller's hand-written [`TilesOptions::tile_range`].
+/// otherwise the caller's hand-written `export.tile_range`.
 ///
-/// A data shard's range prunes the convert's reads as well as the export, so
-/// it wins. A *coarse* shard has `range: None`, so matching on the shard
-/// alone discarded an explicitly-set `tile_range` for every coarse job —
-/// the "accepts a parameter and ignores it" shape this facade exists to
-/// remove. Unreachable from the CLI (clap `conflicts_with`) and from Python
-/// (both always `None`), but `TilesOptions` is public API.
+/// A data shard's range prunes the convert's reads as well as the export;
+/// the two together are refused by [`TilesOptions::validate`]. A *coarse*
+/// shard has `range: None`, so the caller's range applies there.
 fn resolve_tile_range(
     shard: Option<&TilesShard>,
     tile_range: Option<TileRange>,
@@ -275,10 +475,10 @@ pub struct IntermediateOverview {
     /// temp file removed after the export.
     pub retained: bool,
     /// The #314 free-space preflight's warning, when the volume holding the
-    /// intermediate looked too small for it. Already logged (`log::warn`);
-    /// carried here so a caller can surface it more loudly than a log line
-    /// (the Python `convert()` also raises it as a `UserWarning`). `None` when the
-    /// volume fits or either side of the comparison is unknowable.
+    /// intermediate looked too small for it. Already logged (`log::warn`)
+    /// before the convert started; carried here too. `None` when the volume
+    /// fits or either side of the comparison is unknowable. A caller that
+    /// must surface it before the run calls [`intermediate_space_preflight`].
     pub space_warning: Option<String>,
 }
 
@@ -359,7 +559,7 @@ pub trait TilesObserver {
 /// The no-op observer [`convert_to_pmtiles`] runs with.
 impl TilesObserver for () {}
 
-/// Errors from [`convert_to_pmtiles`].
+/// Errors from [`convert_to_pmtiles`] and [`write_plan`].
 ///
 /// `#[non_exhaustive]`: new failure modes are added without a breaking
 /// change; match with a wildcard arm.
@@ -368,21 +568,19 @@ impl TilesObserver for () {}
 pub enum TilesError {
     /// The convert half failed. Not a `#[source]` chain: the message *is*
     /// the convert error's, prefixed, the way the CLI has always printed it.
-    #[error("overview conversion failed: {0}")]
+    /// A refused option ([`ConvertError::is_config`]) is not prefixed: it is
+    /// refused before any conversion starts (#779).
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "overview conversion failed: "))]
     Convert(ConvertError),
-    /// The export half (or its #433 preflight) failed.
-    #[error("export failed: {0}")]
+    /// The export half failed; prefixed like [`TilesError::Convert`].
+    #[error("{prefix}{0}", prefix = failed_prefix(.0.is_config(), "export failed: "))]
     Export(ExportError),
+    /// An option refused before any work ([`TilesOptions::validate`], #779).
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] crate::atomic_output::OutputNotWritable),
-    /// [`TilesOptions::keep_overview`] names a directory that does not
-    /// exist (#433 — checked before any work).
-    #[error("--keep-overview directory {} does not exist", dir.display())]
-    KeepOverviewDirMissing {
-        /// The missing parent directory.
-        dir: PathBuf,
-    },
     /// Creating the removed-after-export intermediate overview failed.
     #[error(
         "failed to create the intermediate overview file in {} (location precedence: \
@@ -402,63 +600,39 @@ pub enum TilesError {
     /// Writing an empty coarse job's archive failed (#541).
     #[error("failed to write the empty coarse archive: {0}")]
     EmptyCoarseArchive(ExportError),
-    /// [`TilesOptions::feature_order`] reads a property the convert's
-    /// selection excludes (#386): the column would be gone from the
-    /// intermediate before export ever saw it, so this is refused before
-    /// any work rather than quietly falling back after the whole convert.
-    #[error(
-        "property {name:?} is excluded but --feature-order reads it; keep it in the \
-         selection or drop the knob"
-    )]
-    FeatureOrderColumnExcluded {
-        /// The excluded property.
-        name: String,
-    },
-    /// [`TilesOptions::feature_id`] reads a property the convert's
-    /// selection excludes (#443). Same timing as
-    /// [`TilesError::FeatureOrderColumnExcluded`].
-    #[error(
-        "property {name:?} is excluded but --feature-id reads it; keep it in the \
-         selection or drop the flag"
-    )]
-    FeatureIdColumnExcluded {
-        /// The excluded property.
-        name: String,
-    },
-    /// [`TilesOptions::feature_id`] names an accumulated column: a
-    /// clustered point's accumulated value is a sum/min/max/mean of several
-    /// ids — the id of no feature (#443). Export rejects it from the file's
-    /// clustering provenance too; checking here saves the convert.
-    #[error(
-        "--feature-id column {name:?} is also --accumulate-attribute {name}:{op}; a \
-         cluster's aggregated value identifies no single feature, so accumulate a \
-         different column"
-    )]
-    FeatureIdAccumulated {
-        /// The offending column.
-        name: String,
-        /// The accumulate op it carries.
-        op: String,
-    },
+}
+
+/// `prefix`, unless the error is a refused option, which names no step.
+fn failed_prefix(is_config: bool, prefix: &'static str) -> &'static str {
+    if is_config {
+        ""
+    } else {
+        prefix
+    }
+}
+
+impl TilesError {
+    /// Whether this is an option the caller must fix, refused before any
+    /// input was read, as opposed to a problem with the data or the run.
+    /// The Python bindings raise these as `tylertoo.ConfigError`.
+    pub fn is_config(&self) -> bool {
+        match self {
+            TilesError::Config(_) => true,
+            TilesError::Convert(e) => e.is_config(),
+            TilesError::Export(e) => e.is_config(),
+            _ => false,
+        }
+    }
 }
 
 /// The `keep_overview` directory preflight (#433): a retained intermediate
 /// into a missing directory is refused before any work, not after a
 /// minutes-long convert.
-///
-/// Shared by [`convert_to_pmtiles`] and the CLI's own early preflight (which
-/// runs it before the output path is even resolved), so the wording exists
-/// once.
-///
-/// # Errors
-///
-/// Returns [`TilesError::KeepOverviewDirMissing`] when `keep_overview` names
-/// a path whose parent directory does not exist.
-pub fn check_keep_overview(keep_overview: Option<&Path>) -> Result<(), TilesError> {
+fn check_keep_overview(keep_overview: Option<&Path>) -> Result<(), ConfigError> {
     if let Some(path) = keep_overview {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if !parent.is_dir() {
-                return Err(TilesError::KeepOverviewDirMissing {
+                return Err(ConfigError::KeepOverviewDirMissing {
                     dir: parent.to_path_buf(),
                 });
             }
@@ -468,24 +642,14 @@ pub fn check_keep_overview(keep_overview: Option<&Path>) -> Result<(), TilesErro
 }
 
 /// The feature-order / feature-id vs property-selection guard (#386/#443).
-///
-/// Shared by [`convert_to_pmtiles`] and the CLI's `--plan-only` preflight
-/// (#600: plan-only exports nothing, but it is the fleet's preflight, and
-/// the coarse job and every data shard refuse these pairings).
-///
-/// # Errors
-///
-/// Returns [`TilesError::FeatureOrderColumnExcluded`],
-/// [`TilesError::FeatureIdColumnExcluded`] or
-/// [`TilesError::FeatureIdAccumulated`] on the refused pairings.
-pub fn check_knob_columns(
+fn check_knob_columns(
     options: &ConvertOptions,
     feature_order: &FeatureOrder,
     feature_id: Option<&str>,
-) -> Result<(), TilesError> {
+) -> Result<(), ConfigError> {
     if let FeatureOrder::Column { name, .. } = feature_order {
         if !options.properties.keeps(name) {
-            return Err(TilesError::FeatureOrderColumnExcluded { name: name.clone() });
+            return Err(ConfigError::FeatureOrderColumnExcluded { name: name.clone() });
         }
     }
     // #443: convert-time-only. This does not apply to export-pmtiles's OWN
@@ -493,18 +657,48 @@ pub fn check_knob_columns(
     // regardless (the column already exists in the intermediate either way).
     if let Some(name) = feature_id {
         if !options.properties.keeps(name) {
-            return Err(TilesError::FeatureIdColumnExcluded {
+            return Err(ConfigError::FeatureIdColumnExcluded {
                 name: name.to_string(),
             });
         }
         if let Some(spec) = options.accumulate.iter().find(|a| a.column == *name) {
-            return Err(TilesError::FeatureIdAccumulated {
+            return Err(ConfigError::FeatureIdAccumulated {
                 name: name.to_string(),
                 op: spec.op.as_str().to_string(),
             });
         }
     }
     Ok(())
+}
+
+/// The plan-only run of a fleet's coarse job (#560): pass 1 and the level
+/// assignment, written to `convert.save_plan`; no intermediate overview, no
+/// export, no archive.
+///
+/// Takes the same [`TilesOptions`] the full coarse job runs with, so the
+/// plan is byte-identical to the one that job writes. The export options
+/// are ignored but not unchecked: a value the full job would refuse before
+/// reading anything is refused here too, so the plan-only run stays the
+/// fleet's preflight. [`TilesOptions::ignored_by_plan_only`] names them.
+/// A coarse shard's pivot may sit at the minimum zoom here (the handover
+/// shape), since nothing is built.
+///
+/// # Errors
+///
+/// [`TilesOptions::validate`]'s, plus [`ConfigError::PlanOnlyDataShard`]
+/// and [`ConfigError::PlanOnlyWithoutSavePlan`], then the convert's.
+pub fn write_plan(input: &TilesInput, options: &TilesOptions) -> Result<PlanReport, TilesError> {
+    options.validate_for(Run::PlanOnly)?;
+    let convert = match &options.shard {
+        Some(job) => {
+            let mut convert = options.convert.clone();
+            job.apply_selection(&mut convert);
+            Cow::Owned(convert)
+        }
+        None => Cow::Borrowed(&options.convert),
+    };
+    let source = input.source().map_err(TilesError::Convert)?;
+    write_convert_plan_sources(&source, &convert).map_err(TilesError::Convert)
 }
 
 /// Convert GeoParquet to a PMTiles archive in one call, with the default
@@ -542,26 +736,10 @@ pub fn convert_to_pmtiles_observed(
     options: &TilesOptions,
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
-    // #433: the export knobs that need no file are checked before the
-    // convert, which on a large input runs for minutes before the export
-    // would otherwise refuse them. The full `ExportOptions` are built after
-    // the convert; this is the same check on the values already known.
-    ExportOptions {
-        tile_buffer: options.tile_buffer,
-        metadata: options.metadata.clone(),
-        ..ExportOptions::default()
-    }
-    .validate()
-    .map_err(TilesError::Export)?;
-    check_keep_overview(options.keep_overview.as_deref())?;
-    // #386/#443: the property selection is applied at convert, so an
-    // excluded column is already gone from the intermediate before export
-    // would sort or id by it — refused before any work is done.
-    check_knob_columns(
-        &options.convert,
-        &options.feature_order,
-        options.feature_id.as_deref(),
-    )?;
+    // #779: the whole configuration, before the convert — which on a large
+    // input runs for minutes before the export would otherwise refuse a bad
+    // export knob (#433).
+    options.validate()?;
     // #452: before the intermediate is created — which would otherwise be
     // the first thing to trip over a missing output directory, with a
     // message about the intermediate — and long before the export.
@@ -571,12 +749,12 @@ pub fn convert_to_pmtiles_observed(
     // facade's, not the caller's. Applied to our own copy, so a Rust caller
     // that sets only `TilesOptions::shard` still gets the data shard's row
     // pruning, the fleet digest the merge binding needs, and the coarse
-    // job's ceiling — and the CLI, which applies the same rules to build its
-    // `--plan-only` options, is unaffected (the application is idempotent).
+    // job's ceiling. #771: a coarse job that draws the coverage fill keeps
+    // every level, since the fill is built from the finest.
     let convert_options = match &options.shard {
         Some(job) => {
             let mut convert = options.convert.clone();
-            job.apply_to_convert(&mut convert);
+            job.apply_to_convert(&mut convert, options.export.coverage_fill);
             Cow::Owned(convert)
         }
         None => Cow::Borrowed(&options.convert),
@@ -598,13 +776,14 @@ pub fn convert_to_pmtiles_observed(
         .unwrap_or_else(|| input.derive_layer_name());
 
     // A data shard's range prunes the convert's reads as well as the export;
-    // a hand-written range restricts the export only (callers keep the two
-    // flags mutually exclusive, so at most one is set).
-    let tile_range = resolve_tile_range(options.shard.as_ref(), options.tile_range);
+    // a hand-written range restricts the export only (validate refuses the
+    // two together).
+    let tile_range = resolve_tile_range(options.shard.as_ref(), options.export.tile_range);
 
     // The data shard's own range, kept past `tile_range`'s move into
     // `ExportOptions`: the empty-shard branch below needs the pivot zoom.
     let shard_range = options.shard.as_ref().and_then(|job| job.range);
+    let metadata = &options.export.metadata;
 
     // Intermediate overview file (#314): retained at `keep_overview` when
     // given; otherwise a temp file in the spill dir / $TMPDIR / the output
@@ -616,11 +795,7 @@ pub fn convert_to_pmtiles_observed(
             // Its directory was checked above.
             Some(path) => (path.clone(), None),
             None => {
-                let dir = resolve_intermediate_dir(
-                    options.convert.spill_dir.as_deref(),
-                    std::env::var_os("TMPDIR").as_deref(),
-                    output,
-                );
+                let dir = intermediate_dir(options, output);
                 let tmp = tempfile::Builder::new()
                     .prefix(".tylertoo-overview-")
                     .suffix(".parquet")
@@ -635,15 +810,13 @@ pub fn convert_to_pmtiles_observed(
         };
 
     // #314 free-space preflight: the intermediate is at least input-sized,
-    // so warn up front when the chosen volume looks too small. The message
-    // is also carried on the report's `IntermediateOverview` for callers
-    // without a log bridge.
-    let overview_dir = overview_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let space_warning = warn_intermediate_space(input, &overview_dir);
+    // so warn up front when the chosen volume looks too small. Logged here
+    // and carried in the report; a caller that must surface it before the
+    // run (#709: Python's `UserWarning`) calls `intermediate_space_preflight`.
+    let space_warning = intermediate_space_preflight(input, output, options, CLI_REMEDIES);
+    if let Some(msg) = &space_warning {
+        log::warn!("{msg}");
+    }
 
     let convert_report = match input.convert(&overview_path, &convert_options) {
         Ok(report) => report,
@@ -667,7 +840,7 @@ pub fn convert_to_pmtiles_observed(
                         &layer_name,
                         range.pivot_zoom(),
                         max_zoom,
-                        &options.metadata,
+                        metadata,
                     )
                     .map_err(TilesError::EmptyShardArchive)?;
                     log::info!(
@@ -695,7 +868,7 @@ pub fn convert_to_pmtiles_observed(
                     // ladder), so the fallback is unreachable in practice.
                     let min_zoom = zoom_plan.map_or(0, |(min, _)| min);
                     let max_zoom = job.pivot_zoom.saturating_sub(1);
-                    write_empty_archive(output, &layer_name, min_zoom, max_zoom, &options.metadata)
+                    write_empty_archive(output, &layer_name, min_zoom, max_zoom, metadata)
                         .map_err(TilesError::EmptyCoarseArchive)?;
                     log::info!(
                         "[tiles] shard job {} has nothing to write ({e}); wrote an empty archive",
@@ -730,15 +903,6 @@ pub fn convert_to_pmtiles_observed(
 
     let export_opts = ExportOptions {
         layer_name,
-        tile_buffer: options.tile_buffer,
-        extent: ExportOptions::default().extent,
-        tile_size_limit: options.tile_size_limit,
-        compressed_tile_size_limit: options.compressed_tile_size_limit,
-        size_valve: options.size_valve,
-        coverage_fill: options.coverage_fill,
-        simple_clip_fastpath: options.simple_clip_fastpath,
-        partition_wave: options.partition_wave,
-        feature_order: options.feature_order.clone(),
         // #380: the archive's `vector_layers` declares the zoom range that
         // was asked for, even when the coarsest levels generalized to
         // nothing and were omitted from the overview (the header stays the
@@ -752,11 +916,9 @@ pub fn convert_to_pmtiles_observed(
             Some(r) => r.pivot_zoom(),
             None => min,
         }),
-
         // The property selection was applied on convert (#386): the
         // intermediate overview already carries only the kept columns.
         properties: Default::default(),
-
         // #498: the two complementary halves of a sharded build. A data
         // shard (or a hand-written tile range) takes its range; the coarse
         // job takes everything below the pivot.
@@ -766,11 +928,10 @@ pub fn convert_to_pmtiles_observed(
                 .is_none()
                 .then(|| job.pivot_zoom.saturating_sub(1))
         }),
-        feature_id: options.feature_id.clone(),
         // #427: one scratch knob — the export's member spill goes where the
         // convert's spill (and the intermediate overview) go.
         spill_dir: options.convert.spill_dir.clone(),
-        metadata: options.metadata.clone(),
+        ..options.export.clone()
     };
     let export_report =
         export_pmtiles(&overview_path, output, &export_opts).map_err(TilesError::Export)?;
@@ -801,6 +962,60 @@ fn convert_produced_nothing(e: &ConvertError) -> bool {
 /// the output (same filesystem as the final artifact), else the process
 /// temp dir. Pure — the env value is injected — so the precedence is
 /// unit-testable.
+/// Where the facade puts the intermediate overview: `keep_overview`'s
+/// directory when retained, else [`resolve_intermediate_dir`]'s choice.
+fn intermediate_dir(options: &TilesOptions, output: &Path) -> PathBuf {
+    match &options.keep_overview {
+        Some(path) => path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+        None => resolve_intermediate_dir(
+            options.convert.spill_dir.as_deref(),
+            std::env::var_os("TMPDIR").as_deref(),
+            output,
+        ),
+    }
+}
+
+/// The CLI's names for the #314 remedies, which the facade's log uses.
+const CLI_REMEDIES: SpaceRemedies = SpaceRemedies {
+    spill_dir: "--spill-dir",
+    keep_overview: "--keep-overview",
+};
+
+/// How a caller spells the two #314 remedies in
+/// [`intermediate_space_preflight`]'s warning: `--spill-dir` on the CLI,
+/// `spill_dir` in Python.
+#[derive(Debug, Clone, Copy)]
+pub struct SpaceRemedies<'a> {
+    /// The spill-directory option.
+    pub spill_dir: &'a str,
+    /// The keep-the-overview option.
+    pub keep_overview: &'a str,
+}
+
+/// The #314 intermediate free-space preflight on its own (#709).
+///
+/// The warning [`convert_to_pmtiles`] logs, for a caller that must surface
+/// it before the run, as Python's `UserWarning` does, in its own spelling
+/// of the remedies. Probes the volume that will hold the intermediate.
+///
+/// `None` when the volume fits, or when either side of the comparison is
+/// unknowable (a remote input, an exotic filesystem) rather than crying
+/// wolf.
+pub fn intermediate_space_preflight(
+    input: &TilesInput,
+    output: &Path,
+    options: &TilesOptions,
+    remedies: SpaceRemedies<'_>,
+) -> Option<String> {
+    let dir = intermediate_dir(options, output);
+    let estimated = estimate_local_input_bytes(input)?;
+    let available = super::convert::probe_available_space(&dir)?;
+    intermediate_space_warning(estimated, available, &dir, remedies)
+}
+
 fn resolve_intermediate_dir(
     spill_dir: Option<&Path>,
     tmpdir_env: Option<&std::ffi::OsStr>,
@@ -876,6 +1091,7 @@ fn intermediate_space_warning(
     estimated_bytes: u64,
     available_bytes: u64,
     dir: &Path,
+    remedies: SpaceRemedies<'_>,
 ) -> Option<String> {
     if estimated_bytes == 0 {
         return None;
@@ -891,33 +1107,22 @@ fn intermediate_space_warning(
         "the intermediate overview `tiles` materializes (≥ ~{:.1} GiB — a \
          duplicating overview is at least as large as the input, whose local \
          size is the estimate) may not fit: {} has {:.1} GiB free ({:.1} GiB \
-         short, including a 5% margin). Point --spill-dir (or --keep-overview) \
-         at a roomier volume, or free up space first.",
+         short, including a 5% margin). Point {} (or {}) at a roomier volume, \
+         or free up space first.",
         gib(estimated_bytes),
         dir.display(),
         gib(available_bytes),
         gib(need.saturating_sub(available_bytes)),
+        remedies.spill_dir,
+        remedies.keep_overview,
     ))
-}
-
-/// Emit the #314 intermediate free-space preflight warning, if warranted,
-/// and return it for the report: probe the volume holding `dir`
-/// ([`crate::overview::convert`]'s shared `fs4` probe, the one the #272
-/// remote-spill preflight uses) and compare against the local-input-bytes
-/// estimate. Quiet (`None`) when either side is unknowable (remote input,
-/// exotic filesystem) rather than crying wolf.
-fn warn_intermediate_space(input: &TilesInput, dir: &Path) -> Option<String> {
-    let estimated = estimate_local_input_bytes(input)?;
-    let available = super::convert::probe_available_space(dir)?;
-    let msg = intermediate_space_warning(estimated, available, dir)?;
-    log::warn!("{msg}");
-    Some(msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::overview::testutil::write_input;
+    use crate::TilesetMetadata;
     use geo::{Geometry, LineString, Point, Polygon};
 
     fn points_input(path: &Path) {
@@ -1021,7 +1226,10 @@ mod tests {
                 pivot_zoom: 4,
                 cut_digest: digest,
             }),
-            metadata: grid_metadata(),
+            export: ExportOptions {
+                metadata: grid_metadata(),
+                ..ExportOptions::default()
+            },
             ..TilesOptions::default()
         };
 
@@ -1090,7 +1298,10 @@ mod tests {
                 pivot_zoom: 3,
                 cut_digest: "0123456789abcdef".to_string(),
             }),
-            metadata: grid_metadata(),
+            export: ExportOptions {
+                metadata: grid_metadata(),
+                ..ExportOptions::default()
+            },
             ..zoomed_options(0, 14)
         };
 
@@ -1158,6 +1369,27 @@ mod tests {
     /// ceiling — the three fields callers used to hand-sync.
     #[test]
     fn the_facade_applies_the_shards_convert_side_consequences() {
+        // #771: a coarse job that draws the coverage fill keeps every level.
+        let mut filled = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: 8,
+            },
+            ..ConvertOptions::default()
+        };
+        TilesShard {
+            role: ShardRole::Coarse,
+            range: None,
+            pivot_zoom: 5,
+            cut_digest: "deadbeef".to_string(),
+        }
+        .apply_to_convert(&mut filled, true);
+        assert_eq!(
+            filled.zoom_ceiling, None,
+            "#771: the fill needs the finest level"
+        );
+        assert_eq!(filled.shard_plan_digest.as_deref(), Some("deadbeef"));
+
         let mut convert = ConvertOptions {
             levels: LevelPlan::ZoomRange {
                 min_zoom: 0,
@@ -1173,7 +1405,7 @@ mod tests {
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
         };
-        coarse.apply_to_convert(&mut convert);
+        coarse.apply_to_convert(&mut convert, false);
         assert_eq!(convert.shard, None, "the coarse job prunes no rows");
         assert_eq!(convert.shard_plan_digest.as_deref(), Some("deadbeef"));
         assert_eq!(
@@ -1201,7 +1433,7 @@ mod tests {
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
         }
-        .apply_to_convert(&mut convert);
+        .apply_to_convert(&mut convert, false);
         assert_eq!(convert.shard, Some(range));
         assert_eq!(convert.zoom_ceiling, None, "only the coarse job is capped");
 
@@ -1329,7 +1561,8 @@ mod tests {
     }
 
     /// #433: a tile buffer past the cap fails before the convert reads a
-    /// byte, as `export failed: ...`.
+    /// byte, as a typed config error (#779), not after the convert as an
+    /// export failure.
     #[test]
     fn too_wide_tile_buffer_fails_before_converting() {
         let dir = tempfile::tempdir().unwrap();
@@ -1339,13 +1572,25 @@ mod tests {
         let output = dir.path().join("out.pmtiles");
 
         let options = TilesOptions {
-            tile_buffer: 100_000,
+            export: ExportOptions {
+                tile_buffer: 100_000,
+                ..ExportOptions::default()
+            },
             ..zoomed_options(0, 2)
         };
         let err = convert_to_pmtiles(&TilesInput::Path(input), &output, &options).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.starts_with("export failed: "), "{msg}");
-        assert!(matches!(err, TilesError::Export(_)), "{err:?}");
+        assert!(err.to_string().contains("--tile-buffer 100000"), "{err}");
+        assert!(
+            matches!(
+                err,
+                TilesError::Config(ConfigError::TileBufferTooWide {
+                    buffer: 100_000,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_config());
     }
 
     /// #386/#443: the knob-column guard fires before any work, with the
@@ -1423,12 +1668,18 @@ mod tests {
                 },
                 ..ConvertOptions::default()
             },
-            feature_id: Some("name".to_string()),
+            export: ExportOptions {
+                feature_id: Some("name".to_string()),
+                ..ExportOptions::default()
+            },
             ..TilesOptions::default()
         };
         let err = convert_to_pmtiles(&TilesInput::Path(input), &output, &options).unwrap_err();
         assert!(
-            matches!(err, TilesError::FeatureIdColumnExcluded { .. }),
+            matches!(
+                err,
+                TilesError::Config(ConfigError::FeatureIdColumnExcluded { .. })
+            ),
             "{err:?}"
         );
     }
@@ -1490,18 +1741,26 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
 
         // Fits comfortably: no warning.
-        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir).is_none());
+        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir, CLI_REMEDIES).is_none());
         // Exactly the estimate + 5% margin still fits.
         let est = 20 * gib;
-        assert!(intermediate_space_warning(est, est + est / 20, dir).is_none());
+        assert!(intermediate_space_warning(est, est + est / 20, dir, CLI_REMEDIES).is_none());
         // One byte short of the margin: warn, naming dir and remedies.
-        let msg =
-            intermediate_space_warning(est, est + est / 20 - 1, dir).expect("shortfall must warn");
+        let msg = intermediate_space_warning(est, est + est / 20 - 1, dir, CLI_REMEDIES)
+            .expect("shortfall must warn");
         assert!(msg.contains("/some/volume"), "names the directory: {msg}");
         assert!(msg.contains("--spill-dir"), "names the remedy: {msg}");
         assert!(msg.contains("--keep-overview"), "names the remedy: {msg}");
+        // #709: the remedies in the caller's spelling (Python's kwargs).
+        let py = SpaceRemedies {
+            spill_dir: "spill_dir",
+            keep_overview: "keep_overview",
+        };
+        let msg = intermediate_space_warning(est, 0, dir, py).expect("shortfall must warn");
+        assert!(msg.contains("Point spill_dir (or keep_overview)"), "{msg}");
+        assert!(!msg.contains("--"), "no CLI spelling: {msg}");
         // Zero estimate (unknown/empty input): never warns.
-        assert!(intermediate_space_warning(0, 0, dir).is_none());
+        assert!(intermediate_space_warning(0, 0, dir, CLI_REMEDIES).is_none());
     }
 
     /// The intermediate size estimate is the local input bytes: file size
@@ -1545,6 +1804,356 @@ mod tests {
         assert_eq!(
             estimate_local_input_bytes(&TilesInput::Manifest(manifest)),
             Some(150)
+        );
+    }
+
+    /// A shard job for the validation tests below.
+    fn shard_job(range: Option<TileRange>, pivot_zoom: u8) -> TilesShard {
+        TilesShard {
+            role: if range.is_some() {
+                ShardRole::Shard {
+                    index: 0,
+                    shards: 2,
+                }
+            } else {
+                ShardRole::Coarse
+            },
+            range,
+            pivot_zoom,
+            cut_digest: "deadbeef".to_string(),
+        }
+    }
+
+    /// #779: every rule the CLI and the Python bindings used to hold their
+    /// own copy of is `TilesOptions::validate`'s, typed, and runs before any
+    /// input is read — the input below does not exist, and the facade
+    /// refuses each configuration without reaching it.
+    #[test]
+    fn validate_owns_every_frontend_rule_before_any_read() {
+        use crate::overview::cluster::{AccumulateOp, AccumulateSpec};
+        use crate::overview::properties::PropertySelection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = TilesInput::Path(dir.path().join("never-read.parquet"));
+        let output = dir.path().join("out.pmtiles");
+        let base = || zoomed_options(0, 8);
+        let refused = |options: TilesOptions| -> TilesError {
+            let early = options.validate().expect_err("validate must refuse");
+            let late =
+                convert_to_pmtiles(&input, &output, &options).expect_err("the facade must refuse");
+            assert_eq!(early.to_string(), late.to_string());
+            assert!(early.is_config(), "{early:?}");
+            assert!(!output.exists());
+            early
+        };
+        let base5 = crate::tile::hilbert_zoom_base(5);
+        let range = TileRange::new(5, base5, base5 + 7).unwrap();
+
+        type Case = (TilesOptions, fn(&TilesError) -> bool);
+        let cases: Vec<Case> = vec![
+            // #433 (1e37cbe): the export knobs that need no file, formerly
+            // re-checked through a throwaway ExportOptions in the CLI.
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        extent: 0,
+                        ..ExportOptions::default()
+                    },
+                    ..base()
+                },
+                |e| matches!(e, TilesError::Config(ConfigError::InvalidExtent { .. })),
+            ),
+            // #427 (492502f): the spill directory, formerly the CLI's
+            // `check_spill_dir`.
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        spill_dir: Some(PathBuf::from("/nonexistent/tylertoo-779")),
+                        ..base().convert
+                    },
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Convert(ConvertError::Config(
+                            ConfigError::SpillDirNotDirectory(_)
+                        ))
+                    )
+                },
+            ),
+            // #428 (b8fa58a): a NaN class rank, formerly refused only by
+            // the CLI's and Python's parsers.
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        class_ranking: Some(crate::overview::convert::ClassRanking {
+                            column: "class".into(),
+                            ranks: vec![("a".into(), f64::NAN)],
+                            unknown_rank: 0.0,
+                        }),
+                        ..base().convert
+                    },
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Convert(ConvertError::Config(
+                            ConfigError::ClassRankNotFinite { .. }
+                        ))
+                    )
+                },
+            ),
+            // Q1: --class-rank with --sort-key, formerly a CLI bail and a
+            // Python check ("also enforced in core" — now only there).
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        sort_key: Some("pop".into()),
+                        class_ranking: Some(
+                            crate::overview::convert::parse_class_rank("class:a=1").unwrap(),
+                        ),
+                        ..base().convert
+                    },
+                    ..base()
+                },
+                |e| matches!(e, TilesError::Convert(ConvertError::RankingConflict)),
+            ),
+            // Q4: accumulate without cluster, formerly a CLI bail and a
+            // Python check; now refused before the input is opened.
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        accumulate: vec![AccumulateSpec {
+                            column: "pop".into(),
+                            op: AccumulateOp::Sum,
+                        }],
+                        ..base().convert
+                    },
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Convert(ConvertError::AccumulateWithoutCluster)
+                    )
+                },
+            ),
+            // #386/#443: the knob columns against the convert's selection.
+            (
+                TilesOptions {
+                    convert: ConvertOptions {
+                        properties: PropertySelection {
+                            exclude: vec!["rank".into()],
+                            ..PropertySelection::default()
+                        },
+                        ..base().convert
+                    },
+                    export: ExportOptions {
+                        feature_order: FeatureOrder::Column {
+                            name: "rank".into(),
+                            descending: true,
+                        },
+                        ..ExportOptions::default()
+                    },
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Config(ConfigError::FeatureOrderColumnExcluded { .. })
+                    )
+                },
+            ),
+            // #600: an export field the facade derives itself would be
+            // silently overwritten; it is refused instead.
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        spill_dir: Some(dir.path().to_path_buf()),
+                        ..ExportOptions::default()
+                    },
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Config(ConfigError::OptionIgnored {
+                            option: "export.spill_dir",
+                            ..
+                        })
+                    )
+                },
+            ),
+            // #498: a hand-written range beside a shard job, formerly a clap
+            // `conflicts_with` only, silently resolved in core. A data shard
+            // and the coarse job alike.
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        tile_range: Some(range),
+                        ..ExportOptions::default()
+                    },
+                    shard: Some(shard_job(Some(range), 5)),
+                    ..base()
+                },
+                |e| matches!(e, TilesError::Config(ConfigError::TileRangeWithShard)),
+            ),
+            (
+                TilesOptions {
+                    export: ExportOptions {
+                        tile_range: Some(range),
+                        ..ExportOptions::default()
+                    },
+                    shard: Some(shard_job(None, 5)),
+                    ..base()
+                },
+                |e| matches!(e, TilesError::Config(ConfigError::TileRangeWithShard)),
+            ),
+            // #709: a data shard whose range disagrees with its pivot.
+            (
+                TilesOptions {
+                    shard: Some(shard_job(Some(range), 4)),
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Config(ConfigError::ShardPivotMismatch {
+                            pivot: 4,
+                            range_pivot: 5
+                        })
+                    )
+                },
+            ),
+            // #498/#709: a coarse job whose pivot sits at its minimum zoom
+            // owns nothing, formerly the CLI's `resolve_shard_job` only.
+            (
+                TilesOptions {
+                    shard: Some(shard_job(None, 0)),
+                    ..base()
+                },
+                |e| {
+                    matches!(
+                        e,
+                        TilesError::Config(ConfigError::CoarseShardHasNoZoom {
+                            pivot: 0,
+                            min_zoom: 0
+                        })
+                    )
+                },
+            ),
+        ];
+        for (options, expected) in cases {
+            let err = refused(options);
+            assert!(expected(&err), "unexpected error: {err:?}");
+        }
+    }
+
+    /// #560/#600: a plan-only run validates the same configuration (the
+    /// export options are ignored, not unchecked), refuses a data shard and a
+    /// missing `--save-plan`, and lets a coarse pivot sit at the minimum
+    /// zoom (the handover shape). It names what it ignores.
+    #[test]
+    fn write_plan_checks_what_it_ignores() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = TilesInput::Path(dir.path().join("never-read.parquet"));
+        let plan = dir.path().join("convert.plan");
+        let planned = |options: TilesOptions| TilesOptions {
+            convert: ConvertOptions {
+                save_plan: Some(plan.clone()),
+                ..options.convert
+            },
+            ..options
+        };
+
+        let err = write_plan(&input, &zoomed_options(0, 4)).unwrap_err();
+        assert!(matches!(
+            err,
+            TilesError::Config(ConfigError::PlanOnlyWithoutSavePlan)
+        ));
+
+        let base5 = crate::tile::hilbert_zoom_base(5);
+        let range = TileRange::new(5, base5, base5 + 7).unwrap();
+        // As a frontend builds it: the selection applied to convert too, so
+        // convert's own `shard` + `save_plan` refusal is also in play and
+        // must not mask the precise plan-only one.
+        let job = shard_job(Some(range), 5);
+        let mut options = planned(TilesOptions {
+            shard: Some(job.clone()),
+            ..zoomed_options(0, 8)
+        });
+        job.apply_selection(&mut options.convert);
+        let err = write_plan(&input, &options).unwrap_err();
+        assert!(
+            matches!(err, TilesError::Config(ConfigError::PlanOnlyDataShard)),
+            "{err:?}"
+        );
+
+        let err = write_plan(
+            &input,
+            &planned(TilesOptions {
+                export: ExportOptions {
+                    tile_buffer: 999,
+                    ..ExportOptions::default()
+                },
+                ..zoomed_options(0, 4)
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--tile-buffer 999"), "{err}");
+
+        // The handover shape: pivot at the minimum. Validation passes; the
+        // missing input is what fails, so validation did not refuse it.
+        let err = write_plan(
+            &input,
+            &planned(TilesOptions {
+                shard: Some(shard_job(None, 0)),
+                ..zoomed_options(0, 4)
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TilesError::Convert(_)), "{err:?}");
+
+        let ignored = TilesOptions {
+            layer_name: Some("x".into()),
+            export: ExportOptions {
+                tile_buffer: 16,
+                feature_id: Some("id".into()),
+                ..ExportOptions::default()
+            },
+            ..TilesOptions::default()
+        };
+        assert_eq!(
+            ignored.ignored_by_plan_only(&ExportOptions::default()),
+            ["--layer-name", "--tile-buffer", "--feature-id"]
+        );
+        // A value equal to the run's own default is no value at all.
+        let verbatim = TilesOptions {
+            export: TilesOptions::export_defaults(true),
+            ..TilesOptions::default()
+        };
+        assert!(verbatim
+            .ignored_by_plan_only(&TilesOptions::export_defaults(true))
+            .is_empty());
+    }
+
+    /// #761: a verbatim `tiles` run has no size cap unless one is asked for;
+    /// the default run has both.
+    #[test]
+    fn export_defaults_follow_verbatim() {
+        let capped = TilesOptions::export_defaults(false);
+        assert!(capped.tile_size_limit.is_some() && capped.compressed_tile_size_limit.is_some());
+        let verbatim = TilesOptions::export_defaults(true);
+        assert_eq!(verbatim.tile_size_limit, None);
+        assert_eq!(verbatim.compressed_tile_size_limit, None);
+        assert_eq!(
+            TilesOptions::default().convert.levels,
+            LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: TILES_DEFAULT_MAX_ZOOM
+            }
         );
     }
 

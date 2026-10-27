@@ -294,9 +294,10 @@ class TestConvertIntegration:
         input_file = REALDATA_DIR / "open-buildings.parquet"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Output path inside a nonexistent subdirectory: the temp file
-            # then targets that missing directory and creation fails early;
-            # nothing may leak into tmpdir either way.
+            # Output path inside a nonexistent subdirectory: core's output
+            # preflight refuses it before the intermediate is created,
+            # whatever $TMPDIR is (#452, #709); nothing may leak into
+            # tmpdir either way.
             output = Path(tmpdir) / "missing-subdir" / "output.pmtiles"
 
             with pytest.raises(Exception):

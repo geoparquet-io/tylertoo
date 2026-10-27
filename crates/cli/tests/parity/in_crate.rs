@@ -38,12 +38,12 @@ const BUILT: [&str; 4] = ["tiles", "overview", "export-pmtiles", "pyramid"];
 /// Entries per exemption table and kind. A new entry, or one removed, needs
 /// this pin changed in the same PR, so a reviewer sees every exemption.
 const PINNED: &[(&str, &str, usize)] = &[
-    ("parsed_unused", "exempt", 14),
-    ("parsed_unused", "xfail", 40),
-    ("defaults", "exempt", 1),
+    ("parsed_unused", "exempt", 15),
+    ("parsed_unused", "xfail", 0),
+    ("defaults", "exempt", 0),
     ("defaults", "xfail", 0),
-    ("pyramid_vs_tiles", "exempt", 58),
-    ("pyramid_vs_tiles", "xfail", 11),
+    ("pyramid_vs_tiles", "exempt", 59),
+    ("pyramid_vs_tiles", "xfail", 0),
 ];
 
 const SNAPSHOT: &str = "tests/parity/clap_surface.json";
@@ -280,36 +280,24 @@ fn parse(command: &str, flags: &[String]) -> Result<Command> {
 /// The core options a subcommand's builder makes from `flags`, as `{:#?}`
 /// text, or `None` where no builder can be called from a test.
 ///
-/// - `tiles`: [`tiles_convert_options`] and [`preflight_export_flags`]. The
-///   `TilesOptions` export fields are built inline in `run_tiles`.
-/// - `overview`: [`ConvertTuningArgs::build_convert_options`]. `mode`, the
-///   levels, `bbox` and `cogp_compat` are mapped inline in `run_overview`.
-/// - `pyramid`: [`pyramid_options`].
-/// - `export-pmtiles`: none; `ExportOptions` is built inline in
-///   `run_export_pmtiles`.
+/// Each command has one builder since #779 F3, and each builder is pure
+/// translation from the clap structs to the core options:
 ///
-/// Flags a builder does not see are `xfail` entries of `[[parsed_unused]]`
-/// (#779 F3 gives each command one builder). When F3 lands a builder, add
-/// it here and the stale entries fail until they are removed.
+/// - `tiles`: [`tiles_options`] (the whole [`TilesOptions`]; the shard job
+///   and `--max-zoom auto` read the input, so `resolve_tiles_job` adds them
+///   at run time).
+/// - `overview`: [`overview_options`].
+/// - `export-pmtiles`: [`export_options`].
+/// - `pyramid`: [`pyramid_options`].
 fn build(command: &str, flags: &[String]) -> Option<Result<String>> {
     let parsed = match parse(command, flags) {
         Ok(c) => c,
         Err(e) => return Some(Err(e)),
     };
     let built = match parsed {
-        Command::Tiles(args) => (|| {
-            let spec = InputSpec::Path(PathBuf::from("in.parquet"));
-            let (convert, shard) = tiles_convert_options(&args, &spec)?;
-            let tile_range = preflight_export_flags(&args)?;
-            Ok(format!("{convert:#?}\n{shard:#?}\n{tile_range:#?}"))
-        })(),
-        Command::Overview(args) => (|| {
-            let defaults = tylertoo_core::overview::convert::ConvertOptions::default();
-            let options =
-                args.tuning
-                    .build_convert_options(defaults.mode, defaults.levels, None, false)?;
-            Ok(format!("{options:#?}"))
-        })(),
+        Command::Tiles(args) => tiles_options(&args).map(|o| format!("{o:#?}")),
+        Command::Overview(args) => overview_options(&args).map(|o| format!("{o:#?}")),
+        Command::ExportPmtiles(args) => export_options(&args).map(|o| format!("{o:#?}")),
         Command::Pyramid(args) => Ok(format!("{:#?}", pyramid_options(&args))),
         _ => return None,
     };
@@ -365,129 +353,20 @@ fn differing_fields(built: &str, core: &str) -> BTreeSet<String> {
 /// `{:?}` text.
 type HandCheck = (&'static str, String, String);
 
-fn hand_checks(command: &str) -> Vec<HandCheck> {
-    use tylertoo_core::overview::convert::{ConvertOptions, LevelPlan};
-    use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::overview::tiles::TilesOptions;
-    let dbg = |v: &dyn std::fmt::Debug| format!("{v:?}");
-    match parse(command, &[]).expect("a bare invocation parses") {
-        // #779: the export half of `tiles` is built inline in `run_tiles`.
-        Command::Tiles(a) => {
-            let d = TilesOptions::default();
-            vec![
-                (
-                    "max-tile-size",
-                    dbg(&resolve_tiles_size_limit(
-                        a.max_tile_size,
-                        a.tuning.verbatim,
-                        DEFAULT_TILE_SIZE_LIMIT,
-                    )),
-                    dbg(&d.tile_size_limit),
-                ),
-                (
-                    "max-compressed-tile-size",
-                    dbg(&resolve_tiles_size_limit(
-                        a.max_compressed_tile_size,
-                        a.tuning.verbatim,
-                        DEFAULT_COMPRESSED_TILE_SIZE_LIMIT,
-                    )),
-                    dbg(&d.compressed_tile_size_limit),
-                ),
-                ("size-valve", dbg(&a.size_valve), dbg(&d.size_valve)),
-                (
-                    "coverage-fill",
-                    dbg(&a.coverage_fill),
-                    dbg(&d.coverage_fill),
-                ),
-                (
-                    "no-simple-clip-fastpath",
-                    dbg(&!a.no_simple_clip_fastpath),
-                    dbg(&d.simple_clip_fastpath),
-                ),
-                ("tile-buffer", dbg(&a.tile_buffer), dbg(&d.tile_buffer)),
-                (
-                    "partition-wave",
-                    dbg(&a.partition_wave),
-                    dbg(&d.partition_wave),
-                ),
-                (
-                    "feature-order",
-                    dbg(&a.feature_order),
-                    dbg(&d.feature_order),
-                ),
-            ]
-        }
-        // #779: `run_overview` maps these inline.
-        Command::Overview(a) => {
-            let d = ConvertOptions::default();
-            let (min, max) = match d.levels {
-                LevelPlan::ZoomRange { min_zoom, max_zoom } => (min_zoom, max_zoom),
-                LevelPlan::Gsds(_) => panic!("the core default is a zoom range"),
-            };
-            let mode: tylertoo_core::overview::level::Mode =
-                a.mode.parse().expect("the default mode parses");
-            vec![
-                ("mode", dbg(&mode), dbg(&d.mode)),
-                ("min-zoom", dbg(&a.min_zoom), dbg(&min)),
-                ("max-zoom", dbg(&a.max_zoom.plan_zoom()), dbg(&max)),
-                ("cogp-compat", dbg(&a.cogp_compat), dbg(&d.cogp_compat_key)),
-            ]
-        }
-        // #779: `ExportOptions` is built inline in `run_export_pmtiles`.
-        Command::ExportPmtiles(a) => {
-            let d = ExportOptions::default();
-            vec![
-                ("layer-name", dbg(&a.layer_name), dbg(&d.layer_name)),
-                ("tile-buffer", dbg(&a.tile_buffer), dbg(&d.tile_buffer)),
-                (
-                    "tile-size-limit",
-                    dbg(&size_limit_opt(a.tile_size_limit)),
-                    dbg(&d.tile_size_limit),
-                ),
-                (
-                    "max-compressed-tile-size",
-                    dbg(&size_limit_opt(a.max_compressed_tile_size)),
-                    dbg(&d.compressed_tile_size_limit),
-                ),
-                ("size-valve", dbg(&a.size_valve), dbg(&d.size_valve)),
-                (
-                    "coverage-fill",
-                    dbg(&a.coverage_fill),
-                    dbg(&d.coverage_fill),
-                ),
-                (
-                    "no-simple-clip-fastpath",
-                    dbg(&!a.no_simple_clip_fastpath),
-                    dbg(&d.simple_clip_fastpath),
-                ),
-                (
-                    "partition-wave",
-                    dbg(&a.partition_wave),
-                    dbg(&d.partition_wave),
-                ),
-                (
-                    "feature-order",
-                    dbg(&a.feature_order),
-                    dbg(&d.feature_order),
-                ),
-                ("min-zoom", dbg(&a.min_zoom), dbg(&d.min_zoom)),
-            ]
-        }
-        _ => Vec::new(),
-    }
+/// Since #779 F3 every command's builder reaches every flag, so nothing is
+/// checked by hand. A flag mapped outside its builder again needs a check
+/// here.
+fn hand_checks(_command: &str) -> Vec<HandCheck> {
+    Vec::new()
 }
 
 /// The core value each builder's bare-invocation output is compared to.
 fn core_default(command: &str) -> Option<String> {
     use tylertoo_core::overview::convert::ConvertOptions;
     match command {
-        "tiles" => Some(format!(
-            "{:#?}\n{:#?}\n{:#?}",
-            ConvertOptions::default(),
-            None::<ShardJob>,
-            None::<tylertoo_core::shard::TileRange>
-        )),
+        "tiles" => Some(format!("{:#?}", TilesOptions::default())),
         "overview" => Some(format!("{:#?}", ConvertOptions::default())),
+        "export-pmtiles" => Some(format!("{:#?}", ExportOptions::default())),
         "pyramid" => Some(format!(
             "{:#?}",
             tylertoo_core::pyramid::PyramidOptions::default()
@@ -588,6 +467,7 @@ fn sample_value(flag: &str) -> Option<&'static str> {
         "max-compressed-tile-size" => "100K",
         "feature-id" => "id",
         "keep-overview" => "o.parquet",
+        "extent" => "8192",
         "tile-range" => "21..40",
         "min-zoom" => "2",
         "zoom-ceiling" => "3",

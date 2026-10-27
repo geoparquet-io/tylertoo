@@ -17,6 +17,7 @@ pub mod auto_zoom;
 pub mod check;
 pub mod cluster;
 pub mod coalesce;
+pub mod config;
 pub mod convert;
 pub mod export;
 pub mod filter;

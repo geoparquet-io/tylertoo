@@ -193,30 +193,20 @@
       "possible_values": []
     },
     {
-      "aliases": [],
-      "default": "8",
-      "hidden": false,
-      "id": "tile_buffer",
-      "kind": "value",
-      "long": "tile-buffer",
-      "positional": false,
-      "possible_values": []
-    },
-    {
       "aliases": [
-        "max-tile-size"
+        "tile-size-limit"
       ],
-      "default": "2M",
+      "default": "auto",
       "hidden": false,
-      "id": "tile_size_limit",
+      "id": "max_tile_size",
       "kind": "value",
-      "long": "tile-size-limit",
+      "long": "max-tile-size",
       "positional": false,
       "possible_values": []
     },
     {
       "aliases": [],
-      "default": "500K",
+      "default": "auto",
       "hidden": false,
       "id": "max_compressed_tile_size",
       "kind": "value",
@@ -246,21 +236,31 @@
     },
     {
       "aliases": [],
-      "default": null,
-      "hidden": false,
-      "id": "report",
-      "kind": "value",
-      "long": "report",
-      "positional": false,
-      "possible_values": []
-    },
-    {
-      "aliases": [],
       "default": "false",
       "hidden": false,
       "id": "no_simple_clip_fastpath",
       "kind": "flag",
       "long": "no-simple-clip-fastpath",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8",
+      "hidden": false,
+      "id": "tile_buffer",
+      "kind": "value",
+      "long": "tile-buffer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "4096",
+      "hidden": false,
+      "id": "extent",
+      "kind": "value",
+      "long": "extent",
       "positional": false,
       "possible_values": []
     },
@@ -291,6 +291,16 @@
       "id": "feature_id",
       "kind": "value",
       "long": "feature-id",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
       "positional": false,
       "possible_values": []
     },
@@ -481,6 +491,19 @@
     },
     {
       "aliases": [],
+      "default": "desc",
+      "hidden": false,
+      "id": "sort_direction",
+      "kind": "value",
+      "long": "sort-direction",
+      "positional": false,
+      "possible_values": [
+        "desc",
+        "asc"
+      ]
+    },
+    {
+      "aliases": [],
       "default": null,
       "hidden": false,
       "id": "magnitude_ladder",
@@ -573,7 +596,7 @@
     },
     {
       "aliases": [],
-      "default": "1024.0",
+      "default": "1024",
       "hidden": false,
       "id": "gsd_base",
       "kind": "value",
@@ -783,7 +806,7 @@
     },
     {
       "aliases": [],
-      "default": "0.0",
+      "default": "0",
       "hidden": false,
       "id": "coalesce_junction_angle",
       "kind": "value",
@@ -793,7 +816,7 @@
     },
     {
       "aliases": [],
-      "default": "1.0",
+      "default": "1",
       "hidden": false,
       "id": "coalesce_snap",
       "kind": "value",
@@ -991,12 +1014,84 @@
       "possible_values": []
     },
     {
-      "aliases": [],
-      "default": null,
+      "aliases": [
+        "tile-size-limit"
+      ],
+      "default": "auto",
       "hidden": false,
       "id": "max_tile_size",
       "kind": "value",
       "long": "max-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "max_compressed_tile_size",
+      "kind": "value",
+      "long": "max-compressed-tile-size",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "merge",
+      "hidden": false,
+      "id": "size_valve",
+      "kind": "value",
+      "long": "size-valve",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "coverage_fill",
+      "kind": "flag",
+      "long": "coverage-fill",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "no_simple_clip_fastpath",
+      "kind": "flag",
+      "long": "no-simple-clip-fastpath",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "8",
+      "hidden": false,
+      "id": "tile_buffer",
+      "kind": "value",
+      "long": "tile-buffer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "4096",
+      "hidden": false,
+      "id": "extent",
+      "kind": "value",
+      "long": "extent",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "auto",
+      "hidden": false,
+      "id": "partition_wave",
+      "kind": "value",
+      "long": "partition-wave",
       "positional": false,
       "possible_values": []
     },
@@ -1007,6 +1102,46 @@
       "id": "feature_order",
       "kind": "value",
       "long": "feature-order",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "feature_id",
+      "kind": "value",
+      "long": "feature-id",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "include_property",
+      "kind": "append",
+      "long": "include-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "exclude_property",
+      "kind": "append",
+      "long": "exclude-property",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "false",
+      "hidden": false,
+      "id": "exclude_all_properties",
+      "kind": "flag",
+      "long": "exclude-all-properties",
       "positional": false,
       "possible_values": []
     },
@@ -1027,6 +1162,16 @@
       "id": "allow_missing_zooms",
       "kind": "flag",
       "long": "allow-missing-zooms",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "hidden": false,
+      "id": "report",
+      "kind": "value",
+      "long": "report",
       "positional": false,
       "possible_values": []
     },
@@ -1156,7 +1301,7 @@
       "aliases": [
         "tile-size-limit"
       ],
-      "default": null,
+      "default": "auto",
       "hidden": false,
       "id": "max_tile_size",
       "kind": "value",
@@ -1166,7 +1311,7 @@
     },
     {
       "aliases": [],
-      "default": null,
+      "default": "auto",
       "hidden": false,
       "id": "max_compressed_tile_size",
       "kind": "value",
@@ -1211,6 +1356,16 @@
       "id": "tile_buffer",
       "kind": "value",
       "long": "tile-buffer",
+      "positional": false,
+      "possible_values": []
+    },
+    {
+      "aliases": [],
+      "default": "4096",
+      "hidden": false,
+      "id": "extent",
+      "kind": "value",
+      "long": "extent",
       "positional": false,
       "possible_values": []
     },
@@ -1346,6 +1501,19 @@
     },
     {
       "aliases": [],
+      "default": "desc",
+      "hidden": false,
+      "id": "sort_direction",
+      "kind": "value",
+      "long": "sort-direction",
+      "positional": false,
+      "possible_values": [
+        "desc",
+        "asc"
+      ]
+    },
+    {
+      "aliases": [],
       "default": null,
       "hidden": false,
       "id": "magnitude_ladder",
@@ -1438,7 +1606,7 @@
     },
     {
       "aliases": [],
-      "default": "1024.0",
+      "default": "1024",
       "hidden": false,
       "id": "gsd_base",
       "kind": "value",
@@ -1648,7 +1816,7 @@
     },
     {
       "aliases": [],
-      "default": "0.0",
+      "default": "0",
       "hidden": false,
       "id": "coalesce_junction_angle",
       "kind": "value",
@@ -1658,7 +1826,7 @@
     },
     {
       "aliases": [],
-      "default": "1.0",
+      "default": "1",
       "hidden": false,
       "id": "coalesce_snap",
       "kind": "value",

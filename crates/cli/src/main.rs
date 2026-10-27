@@ -31,10 +31,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tylertoo_core::overview::assign::BudgetKinds;
 use tylertoo_core::overview::auto_zoom::MaxZoom;
-use tylertoo_core::overview::export::{
-    FeatureOrder, SizeValve, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT, DEFAULT_TILE_SIZE_LIMIT,
-};
-use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
+use tylertoo_core::overview::config::{self, OutputKind};
+use tylertoo_core::overview::convert::ConvertOptions;
+use tylertoo_core::overview::export::{ExportOptions, FeatureOrder, SizeValve};
+use tylertoo_core::overview::tiles::{TilesOptions, TILES_DEFAULT_MAX_ZOOM};
 
 /// `-q/--quiet` (#452), set once in `main` before dispatch.
 static QUIET: AtomicBool = AtomicBool::new(false);
@@ -109,25 +109,28 @@ fn parse_size_bytes(s: &str) -> Result<usize, String> {
     })
 }
 
-/// Resolve one of the `tiles` per-tile size caps (raw or gzip-compressed).
-///
-/// An explicit value always wins. Otherwise `--verbatim` means no cap — a
-/// valve that sheds features to fit a byte budget is not verbatim either —
-/// and the cap is `default` ([`DEFAULT_TILE_SIZE_LIMIT`] or
-/// [`DEFAULT_COMPRESSED_TILE_SIZE_LIMIT`]).
-fn resolve_tiles_size_limit(
-    explicit: Option<usize>,
-    verbatim: bool,
-    default: usize,
-) -> Option<usize> {
-    size_limit_opt(explicit.unwrap_or(if verbatim { 0 } else { default }))
+/// A per-tile size cap as typed: `auto` (`None`, the command's core
+/// default), or a byte count where 0 is no cap (#280, #761).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SizeCap(Option<usize>);
+
+/// Parse `--max-tile-size` / `--max-compressed-tile-size`: `auto` or a size.
+fn parse_size_cap(s: &str) -> Result<SizeCap, String> {
+    if s.trim().eq_ignore_ascii_case("auto") {
+        return Ok(SizeCap(None));
+    }
+    parse_size_bytes(s).map(|n| SizeCap(Some(n)))
 }
 
-/// Map a per-tile size-cap CLI value to an [`ExportOptions`] limit: `0` (the
-/// off switch, e.g. `--max-tile-size 0`) becomes `None` (cap disabled); any
-/// positive byte count becomes `Some(n)`. See issues #280 and #761.
-fn size_limit_opt(n: usize) -> Option<usize> {
-    (n > 0).then_some(n)
+impl SizeCap {
+    /// This cap over `default` (the command's own, from core): `auto` keeps
+    /// it, `0` turns the cap off, any other size replaces it.
+    fn or(self, default: Option<usize>) -> Option<usize> {
+        match self.0 {
+            None => default,
+            Some(n) => (n > 0).then_some(n),
+        }
+    }
 }
 
 /// Parse `--in-flight-batches`: `auto` (→ the core-sized sentinel 0) or an
@@ -219,23 +222,20 @@ fn parse_bbox(s: &str) -> Result<[f64; 4]> {
                 .map_err(|e| anyhow::anyhow!("invalid number in --bbox: {e}"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let bbox = [vals[0], vals[1], vals[2], vals[3]];
-    if bbox[0] > bbox[2] || bbox[1] > bbox[3] {
-        anyhow::bail!("--bbox must satisfy xmin <= xmax and ymin <= ymax");
-    }
-    Ok(bbox)
+    // xmin <= xmax and ymin <= ymax is core's rule (`ConvertOptions::validate`).
+    Ok([vals[0], vals[1], vals[2], vals[3]])
 }
 
 /// Exit-status contract (#452), shown under `tylertoo --help` and in the
 /// generated CLI reference. Exit 1 is `main` returning `Err` (anyhow
-/// prints it); exit 2 is clap's for a parse error, and `--quiet` with
-/// `tiles --verbose` reuses it.
+/// prints it); exit 2 is clap's for a parse error, which core's option refusals
+/// (`is_usage_error`) and `--quiet` with `tiles --verbose` reuse.
 const EXIT_STATUS_HELP: &str = "\
 Exit status:
 
 - 0: success.
 - 1: the run failed, with the error on stderr. `validate` also exits 1 when a check fails.
-- 2: the command line was rejected while it was parsed.
+- 2: the command line was rejected: while it was parsed, or by an option or output-path rule checked before any input is read.
 - 101: a panic, from an internal bug or an output pipe closed early.";
 
 /// Convert GeoParquet to PMTiles vector tiles and multi-resolution
@@ -324,6 +324,166 @@ impl TilesetMetadataArgs {
     }
 }
 
+/// The export knobs every command that writes tiles shares (#779), flattened
+/// into `tiles`, `export-pmtiles` and `pyramid` the way [`ConvertTuningArgs`]
+/// is into `tiles` and `overview`. [`ExportArgs::apply`] lays them over the
+/// command's core defaults; validation is core's.
+#[derive(Args, Debug, Clone)]
+struct ExportArgs {
+    /// Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap: a
+    /// backstop behind `--max-compressed-tile-size`. `auto` is 2M, or no cap
+    /// with `tiles --verbatim` and for `pyramid` bands. A tile over a cap is
+    /// merged or thinned until it fits; see `--size-valve`.
+    #[arg(
+        long,
+        value_name = "SIZE|auto",
+        visible_alias = "tile-size-limit",
+        default_value = "auto",
+        value_parser = parse_size_cap
+    )]
+    max_tile_size: SizeCap,
+
+    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
+    /// `-M`, such as `500K`, or 0 for no cap. `auto` is 500K, or no cap with
+    /// `tiles --verbatim` and for `pyramid` bands. A tile must fit both caps.
+    #[arg(
+        long,
+        value_name = "SIZE|auto",
+        default_value = "auto",
+        value_parser = parse_size_cap
+    )]
+    max_compressed_tile_size: SizeCap,
+
+    /// How to reduce a tile that exceeds its cap: `merge` merges the
+    /// densest lines and polygons into a neighbor, which keeps its own
+    /// attributes; `drop` removes features, leaving holes while preserving
+    /// each retained feature's attributes. Point tiles use feature dropping
+    /// in both modes.
+    #[arg(
+        long,
+        value_name = "merge|drop",
+        default_value_t = ExportOptions::default().size_valve
+    )]
+    size_valve: SizeValve,
+
+    /// Fill the holes that dense small polygons (parcels, fields, small
+    /// admin units) leave at coarse zooms: under each tile's features, also
+    /// draw the area its child tiles cover, with the attributes of one feature
+    /// it sits under, in the room the tile's own features leave. Adds 10–17%
+    /// to build time on dense coverages, about 1.5x on scattered sub-pixel
+    /// fields (which it may also over-draw), and holds the finest level's
+    /// geometry in memory. A sharded build's coarse job draws it; data
+    /// shards (`--tile-range`) do not.
+    #[arg(long)]
+    coverage_fill: bool,
+
+    /// Clip all polygons with the full overlay for byte-stable tiles. The
+    /// simple-ring fast path renders identically but can change a ring's
+    /// starting vertex.
+    #[arg(long)]
+    no_simple_clip_fastpath: bool,
+
+    /// Edge buffer around each tile, in tile pixels, so features continue
+    /// across tile seams. At most 256 (one tile width).
+    #[arg(long, default_value_t = ExportOptions::default().tile_buffer)]
+    tile_buffer: u32,
+
+    /// MVT tile extent: the tile-local coordinate resolution. A power of two
+    /// is recommended.
+    #[arg(long, default_value_t = ExportOptions::default().extent)]
+    extent: u32,
+
+    /// Partitions to export at once, or `auto` to size the wave to the cores
+    /// and free memory. See
+    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
+    #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
+    partition_wave: usize,
+
+    /// Feature order within each tile: `input` preserves source row order;
+    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
+    /// order unless the style overrides it. A `pyramid` band without that
+    /// column keeps input order with a warning.
+    #[arg(
+        long,
+        value_name = "input|COLUMN[:asc|:desc]",
+        default_value_t = ExportOptions::default().feature_order
+    )]
+    feature_order: FeatureOrder,
+
+    /// Use this integer column as the MVT feature id for `setFeatureState`
+    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
+    /// Defaults to tile-local ids.
+    #[arg(long, value_name = "COLUMN")]
+    feature_id: Option<String>,
+}
+
+impl ExportArgs {
+    /// These flags over `export`, the command's core defaults: pure
+    /// translation, so every command maps them the same way.
+    fn apply(&self, export: ExportOptions) -> ExportOptions {
+        ExportOptions {
+            tile_size_limit: self.max_tile_size.or(export.tile_size_limit),
+            compressed_tile_size_limit: self
+                .max_compressed_tile_size
+                .or(export.compressed_tile_size_limit),
+            size_valve: self.size_valve,
+            coverage_fill: self.coverage_fill,
+            simple_clip_fastpath: !self.no_simple_clip_fastpath,
+            tile_buffer: self.tile_buffer,
+            extent: self.extent,
+            partition_wave: self.partition_wave,
+            feature_order: self.feature_order.clone(),
+            feature_id: self.feature_id.clone(),
+            ..export
+        }
+    }
+}
+
+/// The export-side property selection (#386): which properties the tiles
+/// carry. `tiles` applies its selection at convert instead
+/// ([`ConvertTuningArgs`]).
+#[derive(Args, Debug, Clone, Default)]
+struct ExportPropertyArgs {
+    /// Keep only these properties in the tiles (repeatable). The input
+    /// keeps every column, and the `--feature-order` column must stay.
+    #[arg(long, value_name = "NAME")]
+    include_property: Vec<String>,
+
+    /// Drop these properties from the tiles (repeatable).
+    /// `--include-property` overrides it.
+    #[arg(long, value_name = "NAME")]
+    exclude_property: Vec<String>,
+
+    /// Drop every property, writing geometry-only tiles.
+    /// `--include-property` overrides it.
+    #[arg(long)]
+    exclude_all_properties: bool,
+}
+
+impl ExportPropertyArgs {
+    fn selection(&self) -> tylertoo_core::overview::properties::PropertySelection {
+        property_selection(
+            &self.include_property,
+            &self.exclude_property,
+            self.exclude_all_properties,
+        )
+    }
+}
+
+/// The include/exclude choice (#386) as core's selection: an empty include
+/// list is no include list on the command line.
+fn property_selection(
+    include: &[String],
+    exclude: &[String],
+    exclude_all: bool,
+) -> tylertoo_core::overview::properties::PropertySelection {
+    tylertoo_core::overview::properties::PropertySelection {
+        include: (!include.is_empty()).then(|| include.to_vec()),
+        exclude: exclude.to_vec(),
+        exclude_all,
+    }
+}
+
 /// Print a composed archive's publication metadata (`merge`, `pyramid`).
 ///
 /// The values written, since an inherited attribution is HTML the map will
@@ -396,16 +556,11 @@ pub struct PyramidArgs {
     #[arg(long)]
     pub generalize: bool,
 
-    /// Per-tile MVT size cap for bands tiled here, such as `500K`. Unset
-    /// means no cap, preserving every cell in the band.
-    #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
-    pub max_tile_size: Option<usize>,
+    #[command(flatten)]
+    export: ExportArgs,
 
-    /// Within-tile feature order for GeoParquet bands: `input`, or a
-    /// property name with optional `:asc` or `:desc`. A band without that
-    /// column keeps input order with a warning.
-    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
-    pub feature_order: FeatureOrder,
+    #[command(flatten)]
+    properties: ExportPropertyArgs,
 
     /// Directory for temporary per-band files, deleted after the build.
     /// Defaults to the system temp directory.
@@ -416,6 +571,11 @@ pub struct PyramidArgs {
     /// zooms render empty; use only for a sparse pyramid.
     #[arg(long)]
     pub allow_missing_zooms: bool,
+
+    /// Write the JSON pyramid report, with per-band tile counts, to this
+    /// path.
+    #[arg(long, value_name = "PATH")]
+    pub report: Option<PathBuf>,
 
     /// Overwrite the output if it exists.
     #[arg(short, long)]
@@ -569,7 +729,7 @@ struct ExportPmtilesArgs {
     output: PathBuf,
 
     /// MVT layer name written into every tile.
-    #[arg(long, default_value = "overview")]
+    #[arg(long, default_value_t = ExportOptions::default().layer_name)]
     layer_name: String,
 
     #[command(flatten)]
@@ -580,83 +740,16 @@ struct ExportPmtilesArgs {
     #[arg(long, value_name = "ZOOM")]
     min_zoom: Option<u8>,
 
-    /// Keep only these properties in the tiles (repeatable). The overview
-    /// file keeps every column, and the `--feature-order` column must stay.
-    #[arg(long, value_name = "NAME")]
-    include_property: Vec<String>,
+    #[command(flatten)]
+    properties: ExportPropertyArgs,
 
-    /// Drop these properties from the tiles (repeatable).
-    /// `--include-property` overrides it.
-    #[arg(long, value_name = "NAME")]
-    exclude_property: Vec<String>,
-
-    /// Drop every property, writing geometry-only tiles.
-    /// `--include-property` overrides it.
-    #[arg(long)]
-    exclude_all_properties: bool,
-
-    /// Edge buffer around each tile, in tile pixels, so features continue
-    /// across tile seams. At most 256 (one tile width).
-    #[arg(long, default_value = "8")]
-    tile_buffer: u32,
-
-    /// Per-tile cap on the raw MVT size, such as `2M` or a byte count, or 0
-    /// for no cap: a backstop behind `--max-compressed-tile-size`. A tile
-    /// over a cap is merged or thinned until it fits; see `--size-valve`.
-    #[arg(long, value_name = "SIZE", visible_alias = "max-tile-size", default_value = "2M", value_parser = parse_size_bytes)]
-    tile_size_limit: usize,
-
-    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
-    /// `-M`, such as `500K`, or 0 for no cap. A tile must fit both caps.
-    #[arg(long, value_name = "SIZE", default_value = "500K", value_parser = parse_size_bytes)]
-    max_compressed_tile_size: usize,
-
-    /// How to reduce a tile that exceeds its cap: `merge` merges the
-    /// densest lines and polygons into a neighbor, which keeps its own
-    /// attributes; `drop` removes features, leaving holes while preserving
-    /// each retained feature's attributes. Point tiles use feature dropping
-    /// in both modes.
-    #[arg(long, value_name = "merge|drop", default_value = "merge")]
-    size_valve: SizeValve,
-
-    /// Fill the holes that dense small polygons (parcels, fields, small
-    /// admin units) leave at coarse zooms: under each tile's features, also
-    /// draw the area its child tiles cover, with the attributes of one feature
-    /// it sits under, in the room the tile's own features leave. Adds 10–17%
-    /// to build time on dense coverages, about 1.5x on scattered sub-pixel
-    /// fields (which it may also over-draw), and holds the finest level's
-    /// geometry in memory. Ignored with --tile-range or --zoom-ceiling.
-    #[arg(long)]
-    coverage_fill: bool,
+    #[command(flatten)]
+    export: ExportArgs,
 
     /// Write the JSON export report, with per-zoom tile and feature counts,
     /// to this path.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
-
-    /// Clip all polygons with the full overlay for byte-stable tiles. The
-    /// simple-ring fast path renders identically but can change a ring's
-    /// starting vertex.
-    #[arg(long)]
-    no_simple_clip_fastpath: bool,
-
-    /// Partitions to export at once, or `auto` to size the wave to the cores
-    /// and free memory. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
-    #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
-    partition_wave: usize,
-
-    /// Feature order within each tile: `input` preserves source row order;
-    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
-    /// order unless the style overrides it.
-    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
-    feature_order: FeatureOrder,
-
-    /// Use this integer column as the MVT feature id for `setFeatureState`
-    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
-    /// Defaults to tile-local ids.
-    #[arg(long, value_name = "COLUMN")]
-    feature_id: Option<String>,
 
     /// Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at
     /// one zoom, plus their descendants. Ranges that partition a zoom give
@@ -707,16 +800,16 @@ struct OverviewArgs {
 
     /// Level layout: `duplicating` writes each level in full,
     /// and `partitioning` writes each feature once, at its coarsest level.
-    #[arg(long, default_value = "duplicating", value_parser = ["duplicating", "partitioning"])]
+    #[arg(long, default_value = ConvertOptions::default().mode.as_str(), value_parser = ["duplicating", "partitioning"])]
     mode: String,
 
     /// Minimum (coarsest) Web Mercator zoom.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = default_zooms(&ConvertOptions::default()).0)]
     min_zoom: u8,
 
     /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
     /// sample of the input. Ignored with `--gsd`.
-    #[arg(long, default_value = "6")]
+    #[arg(long, default_value_t = MaxZoom::Fixed(default_zooms(&ConvertOptions::default()).1))]
     max_zoom: MaxZoom,
 
     /// Comma-separated ground sample distances (GSDs) in meters, each
@@ -764,6 +857,16 @@ struct ConvertTuningArgs {
     #[arg(long, value_name = "COL", help_heading = "Ranking")]
     sort_key: Option<String>,
 
+    /// Whether the larger (`desc`) or the smaller (`asc`) `--sort-key`
+    /// value wins a cell.
+    #[arg(
+        long,
+        default_value = ConvertOptions::default().assign.sort_direction.as_str(),
+        value_parser = ["desc", "asc"],
+        help_heading = "Ranking"
+    )]
+    sort_direction: String,
+
     /// Rank `COL` values from highest to lowest, assigning entry zooms
     /// from `--min-zoom` in `--ladder-step` increments. Features appear at
     /// their entry zoom and finer zooms, exempt from thinning.
@@ -774,7 +877,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "N",
-        default_value = "1",
+        default_value_t = config::DEFAULT_LADDER_STEP,
         help_heading = "Ranking",
         requires = "magnitude_ladder"
     )]
@@ -782,12 +885,9 @@ struct ConvertTuningArgs {
 
     /// Assign entry zooms: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...`, for example
     /// `density:5000=4,1000=6`. Unlisted values use the normal visibility gate.
-    #[arg(
-        long,
-        value_name = "SPEC",
-        help_heading = "Ranking",
-        conflicts_with = "magnitude_ladder"
-    )]
+    // Exclusive with --magnitude-ladder: core's rule
+    // (`config::entry_zoom`), not clap's, so Python refuses it alike (#779).
+    #[arg(long, value_name = "SPEC", help_heading = "Ranking")]
     entry_zoom: Option<String>,
 
     /// Rank categorical classes for cell winners: `COLUMN:VALUE=RANK,...`,
@@ -833,7 +933,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "F",
-        default_value = "1024.0",
+        default_value_t = ConvertOptions::default().gsd_base,
         help_heading = "Generalization"
     )]
     gsd_base: f64,
@@ -846,13 +946,14 @@ struct ConvertTuningArgs {
     /// Replace polygons too small for a level with a point instead of the
     /// default placeholder square. Fill styles ignore points; add a circle
     /// layer.
-    #[arg(long, conflicts_with_all = ["collapse_square", "no_collapse"], help_heading = "Generalization")]
+    // The collapse trio's exclusivity is core's (`config::collapse_mode`).
+    #[arg(long, help_heading = "Generalization")]
     collapse: bool,
 
     /// Replace polygons too small for a level, and those thinned out at
     /// coarse levels, with small placeholder squares marking their area.
     /// This is the default in duplicating mode; output remains Polygon.
-    #[arg(long, conflicts_with = "no_collapse", help_heading = "Generalization")]
+    #[arg(long, help_heading = "Generalization")]
     collapse_square: bool,
 
     /// Drop polygons too small for a level instead of replacing them with
@@ -905,7 +1006,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "F",
-        default_value = "1.65",
+        default_value_t = ConvertOptions::default().density.drop_rate,
         help_heading = "Density budget"
     )]
     drop_rate: f64,
@@ -915,7 +1016,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "F",
-        default_value = "1.5",
+        default_value_t = ConvertOptions::default().density.gamma,
         help_heading = "Density budget"
     )]
     drop_gamma: f64,
@@ -968,7 +1069,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "DEG",
-        default_value = "0.0",
+        default_value_t = ConvertOptions::default().coalesce_junction_angle,
         help_heading = "Line coalescing"
     )]
     coalesce_junction_angle: f64,
@@ -978,7 +1079,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "F",
-        default_value = "1.0",
+        default_value_t = ConvertOptions::default().coalesce_snap,
         help_heading = "Line coalescing"
     )]
     coalesce_snap: f64,
@@ -988,21 +1089,25 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "ROWS",
-        default_value = "2000000",
+        default_value_t = ConvertOptions::default().coalesce_max_level_rows,
         help_heading = "Line coalescing"
     )]
     coalesce_max_level_rows: usize,
 
     /// Maximum rows per output row group at each level. The cap increases
     /// if a level would exceed Parquet's row-group limit.
-    #[arg(long, default_value = "10000", help_heading = "Output layout")]
+    #[arg(
+        long,
+        default_value_t = ConvertOptions::default().max_row_group_size,
+        help_heading = "Output layout"
+    )]
     row_group_size: usize,
 
     /// How the row-group cap varies by level: `constant`, or `zoom-scaled`,
     /// which doubles it per zoom step coarser than the finest level.
     #[arg(
         long,
-        default_value = "constant",
+        default_value = ConvertOptions::default().row_group_size_policy.as_str(),
         value_parser = ["constant", "zoom-scaled"],
         help_heading = "Output layout"
     )]
@@ -1025,7 +1130,7 @@ struct ConvertTuningArgs {
     #[arg(
         long,
         value_name = "ROWS",
-        default_value = "8192",
+        default_value_t = ConvertOptions::default().read_batch_size,
         value_parser = parse_read_batch_size,
         help_heading = "Memory & performance"
     )]
@@ -1036,7 +1141,7 @@ struct ConvertTuningArgs {
     /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>.
     #[arg(
         long,
-        default_value = "auto",
+        default_value = ConvertOptions::default().profile.as_str(),
         value_parser = ["auto", "speed", "bounded"],
         help_heading = "Memory & performance"
     )]
@@ -1074,22 +1179,13 @@ struct ConvertTuningArgs {
 
     /// Save the convert plan to PATH and continue converting. Reuse it
     /// with `--plan`; sharded builds share one plan.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "plan",
-        help_heading = "Memory & performance"
-    )]
+    // Exclusive with --plan: core's rule (`ConfigError::SavePlanWithPlan`).
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     save_plan: Option<PathBuf>,
 
     /// Reuse a convert plan, skipping the first pass and level assignment.
     /// Its fingerprint must match this run's version, flags, and inputs.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "save_plan",
-        help_heading = "Memory & performance"
-    )]
+    #[arg(long, value_name = "PATH", help_heading = "Memory & performance")]
     plan: Option<PathBuf>,
 }
 
@@ -1102,43 +1198,25 @@ impl ConvertTuningArgs {
             .chain(self.plan.as_deref())
     }
 
-    /// Build [`ConvertOptions`] from the shared tuning flags, applying the same
-    /// validation both `overview` and `tiles` rely on. The parent command owns
-    /// `mode`, the `levels` plan, `bbox`, and `cogp_compat` and passes them in.
-    /// The property include/exclude choice (#386).
-    fn property_selection(&self) -> tylertoo_core::overview::properties::PropertySelection {
-        tylertoo_core::overview::properties::PropertySelection {
-            include: (!self.include_property.is_empty()).then(|| self.include_property.clone()),
-            exclude: self.exclude_property.clone(),
-            exclude_all: self.exclude_all_properties,
-        }
-    }
-
+    /// Build [`ConvertOptions`] from the shared tuning flags: pure
+    /// translation onto core (#779). The parent command owns `mode`, the
+    /// `levels` plan, `bbox`, and `cogp_compat` and passes them in. Every
+    /// rule — which flags conflict, what an unset knob defaults to under
+    /// `--verbatim` — is core's ([`ConvertOptions::validate`],
+    /// [`ConvertOptions::with_generalization`] and the `config` helpers);
+    /// the errors here are core's, surfaced as they are.
     fn build_convert_options(
         &self,
         mode: tylertoo_core::overview::level::Mode,
         levels: tylertoo_core::overview::convert::LevelPlan,
         bbox: Option<[f64; 4]>,
         cogp_compat: bool,
-    ) -> Result<tylertoo_core::overview::convert::ConvertOptions> {
-        use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig, SortDirection};
-        use tylertoo_core::overview::convert::{
-            parse_representation_spec, ConvertOptions, GeneralizationOverrides,
-        };
-        use tylertoo_core::overview::level::{MemoryProfile, Mode};
-        use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
-        use tylertoo_core::overview::writer::RowGroupSizePolicy;
+    ) -> Result<ConvertOptions> {
+        use tylertoo_core::overview::assign::{AssignConfig, DensityBudgetConfig};
+        use tylertoo_core::overview::convert::GeneralizationOverrides;
+        use tylertoo_core::overview::simplify::SimplifyOptions;
 
-        let profile: MemoryProfile = self.profile.parse().map_err(anyhow::Error::msg)?;
-        let row_group_size_policy: RowGroupSizePolicy = self
-            .row_group_size_policy
-            .parse()
-            .map_err(anyhow::Error::msg)?;
-
-        // `--verbatim` supplies DEFAULTS, it does not override: an explicitly
-        // passed knob always wins, so `--verbatim --simplify-factor 0.5`
-        // means what the docs say it means. Core owns the rule (#445) and
-        // applies it once the options are complete, below.
+        let defaults = ConvertOptions::default();
         let overrides = GeneralizationOverrides {
             point_thinning: self.point_thinning,
             line_thinning: self.line_thinning,
@@ -1146,121 +1224,42 @@ impl ConvertTuningArgs {
             line_visibility: self.line_visibility,
             polygon_visibility: self.polygon_visibility,
             simplify_factor: self.simplify_factor,
-            // No positive spelling exists for either, so `--verbatim`
-            // cannot be overriding an explicit request here.
+            // No positive spelling exists for density drop, so `--verbatim`
+            // cannot be overriding an explicit request; `--coalesce-lines`
+            // is the deprecated positive spelling of the default.
             density_drop: self.no_density_drop.then_some(false),
-            coalesce_lines: self.no_coalesce_lines.then_some(false),
+            coalesce_lines: if self.no_coalesce_lines {
+                Some(false)
+            } else {
+                self.coalesce_lines.then_some(true)
+            },
         };
-        let assign = AssignConfig {
-            sort_direction: SortDirection::Desc,
-            ..AssignConfig::default()
-        };
-
-        // --class-rank and --sort-key are mutually exclusive (also enforced in core).
-        if self.class_rank.is_some() && self.sort_key.is_some() {
-            anyhow::bail!("--class-rank and --sort-key are mutually exclusive");
-        }
-        let class_ranking = match &self.class_rank {
-            Some(spec) => Some(parse_class_rank(spec)?),
-            None => None,
-        };
-
-        // Entry-zoom ladder (#364): derived from a column, or spelled out.
-        // clap enforces that the two are mutually exclusive.
-        let entry_zoom = match (&self.magnitude_ladder, &self.entry_zoom) {
-            (Some(col), _) => Some(EntryZoomSpec {
-                column: col.clone(),
-                kind: EntryZoomKind::DenseRank {
-                    step: self.ladder_step,
-                },
-            }),
-            (None, Some(spec)) => Some(parse_entry_zoom(spec)?),
-            (None, None) => None,
-        };
-
-        // Clustering flags (Q4; also enforced in core).
-        if !self.accumulate_attribute.is_empty() && !self.cluster {
-            anyhow::bail!("--accumulate-attribute requires --cluster");
-        }
-        if self.verbatim && mode == Mode::Partitioning {
-            anyhow::bail!(
-                "--verbatim requires --mode duplicating: partitioning places each \
-                 feature at exactly one level, so with thinning off every feature \
-                 lands in the coarsest level and every finer level is empty"
-            );
-        }
-        if self.cluster && mode == Mode::Partitioning {
-            anyhow::bail!(
-                "--cluster requires --mode duplicating: a partitioning-mode feature has \
-                 one row read across many zoom prefixes, so a per-level point_count \
-                 cannot be represented without double counting"
-            );
-        }
-        let accumulate = self
-            .accumulate_attribute
-            .iter()
-            .map(|s| parse_accumulate(s))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Coalescing flags (Q3). Coalescing is ON by default (opt out with
-        // --no-coalesce-lines); with partitioning mode the default is silently
-        // inert (core logs it), but an EXPLICIT --coalesce-lines request is an
-        // error the user should hear about.
-        if self.coalesce_lines && mode == Mode::Partitioning {
-            anyhow::bail!(
-                "--coalesce-lines requires --mode duplicating: partitioning places \
-                 each feature exactly once with geometry verbatim, which a merged \
-                 chain cannot satisfy"
-            );
-        }
-        // Zoom-band representation selector (#317 / #279); structural
-        // validity against the plan is enforced by core convert validation.
-        let representation = match &self.representation {
-            Some(spec) => parse_representation_spec(spec)
-                .map_err(|e| anyhow::anyhow!("--representation: {e}"))?,
-            None => Vec::new(),
-        };
-
         let options = ConvertOptions {
             mode,
             levels,
-            assign,
+            assign: AssignConfig {
+                sort_direction: self.sort_direction.parse().map_err(anyhow::Error::msg)?,
+                ..defaults.assign
+            },
             sort_key: self.sort_key.clone(),
-            entry_zoom: entry_zoom.clone(),
-            class_ranking,
+            entry_zoom: config::entry_zoom(
+                self.magnitude_ladder.as_deref(),
+                self.ladder_step,
+                self.entry_zoom.as_deref(),
+            )?,
+            class_ranking: config::class_ranking(self.class_rank.as_deref(), None, None, None)?,
             no_auto_rank: self.no_auto_rank,
             simplify: SimplifyOptions {
-                // Set with the other generalization knobs, below.
-                factor: tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR,
-                // --collapse and --collapse-square are mutually exclusive
-                // (clap conflicts_with); both default off = drop (#279).
-                //
-                // A magnitude ladder implies --collapse (#364): the ladder
-                // admits a small-but-strong feature to a coarse level, and the
-                // drop default would then delete it there for simplifying
-                // below that level's tolerance — undoing the promotion the
-                // caller asked for. An explicit --collapse-square still wins.
-                // A ladder implies --collapse, but that is applied in core
-                // (`convert_to_overviews_source_strategy`) so every caller
-                // gets it — the Python bindings and direct library users
-                // included, where the drop default silently deletes the
-                // promoted features and can empty the coarsest level outright.
-                collapse: if self.collapse {
-                    CollapseMode::Point
-                } else if self.no_collapse {
-                    CollapseMode::Drop
-                } else if self.collapse_square {
-                    CollapseMode::Square
-                } else {
-                    // #745: squares, or points under an entry-zoom ladder.
-                    CollapseMode::Auto
-                },
+                collapse: config::collapse_mode(
+                    self.collapse,
+                    self.collapse_square,
+                    self.no_collapse,
+                )?,
                 cascade: !self.no_cascade,
+                ..defaults.simplify
             },
-            representation,
+            representation: config::representation(self.representation.as_deref())?,
             density: DensityBudgetConfig {
-                // Set with the other generalization knobs, below.
-                enabled: true,
                 drop_rate: self.drop_rate,
                 gamma: self.drop_gamma,
                 kinds: BudgetKinds {
@@ -1268,40 +1267,45 @@ impl ConvertTuningArgs {
                     lines: self.drop_lines,
                     polygons: self.drop_polygons,
                 },
+                ..defaults.density
             },
             gsd_base: self.gsd_base,
             cogp_compat_key: cogp_compat,
             max_row_group_size: self.row_group_size,
-            row_group_size_policy,
+            row_group_size_policy: self
+                .row_group_size_policy
+                .parse()
+                .map_err(anyhow::Error::msg)?,
             full_column_stats: self.full_column_stats,
             streaming: !self.no_streaming,
             read_batch_size: self.read_batch_size,
-            profile,
+            profile: self.profile.parse().map_err(anyhow::Error::msg)?,
             in_flight_batches: self.in_flight_batches,
             read_workers: self.read_workers,
             cluster: self.cluster,
-            accumulate,
-            coalesce_lines: true,
+            accumulate: self
+                .accumulate_attribute
+                .iter()
+                .map(|s| parse_accumulate(s))
+                .collect::<Result<Vec<_>>>()?,
             coalesce_snap: self.coalesce_snap,
             coalesce_max_level_rows: self.coalesce_max_level_rows,
             coalesce_junction_angle: self.coalesce_junction_angle,
             bbox,
             filter: self.filter.clone(),
-            properties: self.property_selection(),
+            properties: property_selection(
+                &self.include_property,
+                &self.exclude_property,
+                self.exclude_all_properties,
+            ),
             spill_dir: self.spill_dir.clone(),
             save_plan: self.save_plan.clone(),
             plan: self.plan.clone(),
-            // Set by `tiles` from --shard / --shard-plan (#498); the shared
-            // tuning set does not own it, since `overview` has no export to
-            // restrict and so no shard to be.
-            shard: None,
-            shard_plan_digest: None,
-            // Likewise #541's convert-side level ceiling: it exists to make
-            // `tiles --shard coarse` stop at the pivot, and `overview` has
-            // no shard role to derive one from.
-            zoom_ceiling: None,
+            // `tiles` sets the shard from --shard / --shard-plan (#498) and
+            // the convert-side ceiling (#541) through the facade; `overview`
+            // has no shard role.
+            ..defaults
         };
-
         // Last, because the defaults read `cluster` and the logged summary
         // reads `entry_zoom`.
         Ok(options.with_generalization(&overrides, self.verbatim)?)
@@ -1362,12 +1366,12 @@ struct TilesArgs {
     files_from: Option<PathBuf>,
 
     /// Minimum (coarsest) Web Mercator zoom.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value_t = default_zooms(&TilesOptions::default().convert).0)]
     min_zoom: u8,
 
     /// Maximum (finest) Web Mercator zoom, or `auto` to estimate it from a
     /// sample of the input. Ignored with `--gsd`.
-    #[arg(long, default_value = "14")]
+    #[arg(long, default_value_t = MaxZoom::Fixed(TILES_DEFAULT_MAX_ZOOM))]
     max_zoom: MaxZoom,
 
     /// Comma-separated ground sample distances (GSDs) in meters, each
@@ -1387,68 +1391,8 @@ struct TilesArgs {
     #[command(flatten)]
     publication: TilesetMetadataArgs,
 
-    /// Per-tile cap on the raw MVT size, such as `2M`, or 0 for no cap
-    /// (default 2M, or no cap with `--verbatim`): a backstop behind
-    /// `--max-compressed-tile-size`. A tile over a cap is merged or thinned
-    /// until it fits; see `--size-valve`.
-    #[arg(long, value_name = "SIZE", visible_alias = "tile-size-limit", value_parser = parse_size_bytes)]
-    max_tile_size: Option<usize>,
-
-    /// Per-tile cap on the gzip-compressed tile size, like tippecanoe's
-    /// `-M`, such as `500K`, or 0 for no cap (default 500K, or no cap with
-    /// `--verbatim`). A tile must fit both caps.
-    #[arg(long, value_name = "SIZE", value_parser = parse_size_bytes)]
-    max_compressed_tile_size: Option<usize>,
-
-    /// How to reduce a tile that exceeds its cap: `merge` merges the
-    /// densest lines and polygons into a neighbor, which keeps its own
-    /// attributes; `drop` removes features, leaving holes while preserving
-    /// each retained feature's attributes. Point tiles use feature dropping
-    /// in both modes.
-    #[arg(long, value_name = "merge|drop", default_value = "merge")]
-    size_valve: SizeValve,
-
-    /// Fill the holes that dense small polygons (parcels, fields, small
-    /// admin units) leave at coarse zooms: under each tile's features, also
-    /// draw the area its child tiles cover, with the attributes of one feature
-    /// it sits under, in the room the tile's own features leave. Adds 10–17%
-    /// to build time on dense coverages, about 1.5x on scattered sub-pixel
-    /// fields (which it may also over-draw), and holds the finest level's
-    /// geometry in memory. Ignored with --tile-range or --zoom-ceiling.
-    #[arg(long)]
-    coverage_fill: bool,
-
-    /// Clip all polygons with the full overlay for byte-stable tiles. The
-    /// simple-ring fast path renders identically but can change a ring's
-    /// starting vertex.
-    #[arg(long)]
-    no_simple_clip_fastpath: bool,
-
-    /// Edge buffer around each tile, in tile pixels, so features continue
-    /// across tile seams. At most 256 (one tile width).
-    #[arg(
-        long,
-        default_value_t = tylertoo_core::overview::export::ExportOptions::default().tile_buffer
-    )]
-    tile_buffer: u32,
-
-    /// Partitions to export at once, or `auto` to size the wave to the cores
-    /// and free memory. See
-    /// <https://geoparquet-io.github.io/tylertoo/guides/scaling/#export-waves>.
-    #[arg(long, value_name = "N|auto", default_value = "auto", value_parser = parse_partition_wave)]
-    partition_wave: usize,
-
-    /// Feature order within each tile: `input` preserves source row order;
-    /// `COLUMN[:asc|:desc]` sorts by a property. Most renderers paint in this
-    /// order unless the style overrides it.
-    #[arg(long, value_name = "input|COLUMN[:asc|:desc]", default_value = "input")]
-    feature_order: FeatureOrder,
-
-    /// Use this integer column as the MVT feature id for `setFeatureState`
-    /// across tiles and zooms. Every row must contain 0 to 2^64-1.
-    /// Defaults to tile-local ids.
-    #[arg(long, value_name = "COLUMN")]
-    feature_id: Option<String>,
+    #[command(flatten)]
+    export: ExportArgs,
 
     /// Write a JSON report with `convert` and `export` sections, matching
     /// the reports of `overview` and `export-pmtiles`.
@@ -1479,17 +1423,14 @@ struct TilesArgs {
     /// Emit only the tiles in this tile-id range, `LO..HI`: two tile ids at
     /// one zoom, plus their descendants. Prefer `--shard`, which also skips
     /// input the range cannot reach.
-    #[arg(
-        long,
-        value_name = "LO..HI",
-        conflicts_with = "shard",
-        help_heading = "Sharded builds"
-    )]
+    // Exclusive with --shard: core's rule (`ConfigError::TileRangeWithShard`).
+    #[arg(long, value_name = "LO..HI", help_heading = "Sharded builds")]
     tile_range: Option<String>,
 
     /// Write the convert plan (`--save-plan`) and stop, with no export and
     /// no OUTPUT. Use it for a coarse job whose tiles the fleet discards.
-    #[arg(long, requires = "save_plan", help_heading = "Sharded builds")]
+    // Needs --save-plan: core's rule (`ConfigError::PlanOnlyWithoutSavePlan`).
+    #[arg(long, help_heading = "Sharded builds")]
     plan_only: bool,
 
     /// Print per-level and per-zoom breakdowns.
@@ -1504,7 +1445,7 @@ struct TilesArgs {
     tuning: ConvertTuningArgs,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     // Initialize dhat profiler if feature is enabled
     // This must be at the very start of main() - the profiler outputs
     // dhat-heap.json on Drop (program exit). TYLERTOO_DHAT=off skips it:
@@ -1529,7 +1470,7 @@ fn main() -> Result<()> {
         log::set_max_level(log::max_level().min(log::LevelFilter::Warn));
     }
 
-    match cli.command {
+    let result = match cli.command {
         Command::Overview(args) => run_overview(*args),
         Command::Validate(args) => run_validate(args),
         Command::ExportPmtiles(args) => run_export_pmtiles(args),
@@ -1544,6 +1485,50 @@ fn main() -> Result<()> {
             print!("{}", gen_reference_markdown());
             Ok(())
         }
+    };
+    match result {
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
+        // #779: an option core refused before any work is a usage error,
+        // like clap's: exit 2, the message alone (it names no failed step).
+        Err(e) if is_usage_error(&e) => {
+            eprintln!("Error: {e:#}");
+            Ok(std::process::ExitCode::from(2))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `e` is one of core's option refusals (#779), wherever it sits in
+/// the chain: a [`config::ConfigError`], or an error its type classes as
+/// config (`is_config`). These exit 2, the code clap gives its own usage
+/// errors, so a script can tell "fix the command" from "the run failed".
+fn is_usage_error(e: &anyhow::Error) -> bool {
+    use tylertoo_core::overview::convert::ConvertError;
+    use tylertoo_core::overview::export::ExportError;
+    use tylertoo_core::overview::tiles::TilesError;
+    e.chain().any(|c| {
+        c.is::<config::ConfigError>()
+            || c.downcast_ref::<ConvertError>()
+                .is_some_and(ConvertError::is_config)
+            || c.downcast_ref::<ExportError>()
+                .is_some_and(ExportError::is_config)
+            || c.downcast_ref::<TilesError>()
+                .is_some_and(TilesError::is_config)
+            || c.downcast_ref::<tylertoo_core::Error>()
+                .is_some_and(tylertoo_core::Error::is_config)
+    })
+}
+
+/// `what failed: e`, or `e` alone (keeping its type, for
+/// [`is_usage_error`]) when `e` is an option refused before any work.
+fn step_failed<E>(what: &str, e: E, is_config: fn(&E) -> bool) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if is_config(&e) {
+        anyhow::Error::new(e)
+    } else {
+        anyhow::anyhow!("{what} failed: {e}")
     }
 }
 
@@ -1725,9 +1710,13 @@ fn run_convert(
     output: &std::path::Path,
     options: &tylertoo_core::overview::convert::ConvertOptions,
 ) -> Result<tylertoo_core::overview::convert::ConvertReport> {
-    tiles_input(spec)
-        .convert(output, options)
-        .map_err(|e| anyhow::anyhow!("overview conversion failed: {e}"))
+    tiles_input(spec).convert(output, options).map_err(|e| {
+        step_failed(
+            "overview conversion",
+            e,
+            tylertoo_core::overview::convert::ConvertError::is_config,
+        )
+    })
 }
 
 /// The core-side view of a resolved input shape.
@@ -1766,7 +1755,7 @@ fn resolve_max_zoom(
         return Ok(max_zoom.plan_zoom());
     }
     let source = resolve_convert_source(spec)?;
-    // `None`: `check_output_path` has already checked the output.
+    // `None`: the caller ran `config::check_output` on the output first.
     Ok(max_zoom.resolve(&source, options, None)?)
 }
 
@@ -1834,9 +1823,7 @@ fn resolve_shard_job(
     spec: &InputSpec,
     shard: Option<&str>,
     shard_plan: Option<&Path>,
-    min_zoom: u8,
     max_zoom: u8,
-    plan_only: bool,
 ) -> Result<Option<ShardJob>> {
     use tylertoo_core::shard::ShardRole;
 
@@ -1865,28 +1852,10 @@ fn resolve_shard_job(
     // leaves every shard exactly one zoom, which is legal), so the Rust API
     // gets the same guard and the CLI only surfaces it.
     plan.check_max_zoom(max_zoom, plan_path)?;
-    // The coarse job's own half, checked with the same "before a byte is
-    // read" discipline. It owns [min_zoom, pivot - 1]; a pivot at or below
-    // the requested minimum leaves it nothing, and without this the whole
-    // convert runs — potentially for hours — before the export refuses an
-    // empty zoom restriction.
-    //
-    // #560: not under --plan-only, which builds no zoom at all — the coarse
-    // job there is only the plan's writer. A pivot AT --min-zoom is exactly
-    // the handover shape (an external archive owns every zoom below the
-    // pivot, and the fleet runs --min-zoom = pivot), so refusing it would
-    // refuse the one build plan-only exists for.
-    if matches!(role, ShardRole::Coarse) && !plan_only {
-        anyhow::ensure!(
-            plan.pivot_zoom > min_zoom,
-            "--shard coarse with --shard-plan {} has no zoom to build: the coarse job owns \
-             z{min_zoom}..z{}, and the plan's pivot is z{}. Lower --min-zoom, or re-cut the \
-             plan with a finer --pivot.",
-            plan_path.display(),
-            plan.pivot_zoom.saturating_sub(1),
-            plan.pivot_zoom,
-        );
-    }
+    // The coarse job's own half (a pivot at or below --min-zoom leaves it
+    // nothing to build, unless --plan-only) is core's rule
+    // (`ConfigError::CoarseShardHasNoZoom`, #779), checked by the
+    // `TilesOptions::validate` that runs right after this.
     Ok(Some(ShardJob {
         role,
         range,
@@ -1913,148 +1882,104 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
-/// Output gate for every subcommand that writes a file (#551 for `tiles`,
-/// #427 for `overview`, `export-pmtiles` and `decode`): an existing file is
-/// refused unless `force`. A directory can never be replaced by the final
-/// rename, `--force` or not, so it is refused up front instead of after a
-/// whole convert + export. So is a missing or read-only directory (#452);
-/// core checks that again, but only after auto-zoom and shard resolution
-/// have read the input.
-fn check_output_path(output: &Path, kind: OutputKind, force: bool) -> Result<()> {
-    if output.is_dir() {
-        anyhow::bail!(
-            "{} is a directory; the output must be a {kind} file path",
-            output.display()
-        );
-    }
-    if output.exists() && !force {
-        anyhow::bail!("{} exists (use --force to overwrite)", output.display());
-    }
-    preflight_writable(output)
-}
-
-/// What a subcommand's output is, for [`check_output_path`]'s message.
-#[derive(Clone, Copy, Debug)]
-enum OutputKind {
-    Pmtiles,
-    GeoParquet,
-}
-
-impl std::fmt::Display for OutputKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            OutputKind::Pmtiles => "PMTiles",
-            OutputKind::GeoParquet => "GeoParquet",
-        })
-    }
-}
-
-/// `--spill-dir` preflight (#427), shared wording with the convert side
-/// (`ConvertOptions` validation) so the two subcommands fail the same way.
-/// Core checks it again inside `export_pmtiles`; this runs first so a bad
-/// directory is reported before the input is even looked at.
-fn check_spill_dir(spill_dir: Option<&Path>) -> Result<()> {
-    if let Some(dir) = spill_dir {
-        if !dir.is_dir() {
-            anyhow::bail!("spill-dir {} is not an existing directory", dir.display());
+/// The `(min_zoom, max_zoom)` of a core default's zoom plan, for the clap
+/// defaults (#779: one copy of each default, in core).
+fn default_zooms(options: &ConvertOptions) -> (u8, u8) {
+    match options.levels {
+        tylertoo_core::overview::convert::LevelPlan::ZoomRange { min_zoom, max_zoom } => {
+            (min_zoom, max_zoom)
+        }
+        tylertoo_core::overview::convert::LevelPlan::Gsds(_) => {
+            unreachable!("a core default is a zoom range")
         }
     }
-    Ok(())
 }
 
-/// `--feature-order`'s and `--feature-id`'s (#443) columns are read at
-/// export, after `tiles`' own convert step has already applied the property
-/// selection — so this is checked before any work is done. The rule lives in
-/// core ([`tylertoo_core::overview::tiles::check_knob_columns`], #439), and
-/// `convert_to_pmtiles` checks it again; this early call keeps the
-/// milliseconds-not-hours timing for `--plan-only` too (#600).
-fn reject_excluded_knob_columns(
-    options: &tylertoo_core::overview::convert::ConvertOptions,
-    feature_order: &FeatureOrder,
-    feature_id: Option<&String>,
-) -> Result<()> {
-    tylertoo_core::overview::tiles::check_knob_columns(
-        options,
-        feature_order,
-        feature_id.map(String::as_str),
-    )
-    .map_err(anyhow::Error::from)
-}
-
-/// The convert half of `tiles`: the [`ConvertOptions`] the facade runs, the
-/// sharded-fleet job they were derived from, and the finest zoom (`--max-zoom`,
-/// with `auto` resolved, #444).
+/// The [`TilesOptions`] a `tiles` command line describes: pure translation
+/// (#779), with `--max-zoom auto`'s placeholder and no shard job yet —
+/// [`resolve_tiles_job`] adds both, and reads the input to do it.
 ///
 /// Shared by the full facade and `--plan-only` (#560). The convert plan is
 /// fingerprinted over these options, so the plan a plan-only run writes is
-/// byte-identical to a full run's only if both build the options the same way
-/// — which is guaranteed here by construction rather than by review.
-///
-/// [`ConvertOptions`]: tylertoo_core::overview::convert::ConvertOptions
-fn tiles_convert_options(
-    args: &TilesArgs,
-    spec: &InputSpec,
-) -> Result<(
-    tylertoo_core::overview::convert::ConvertOptions,
-    Option<ShardJob>,
-)> {
+/// byte-identical to a full run's only if both build the options the same
+/// way — guaranteed here by construction rather than by review.
+fn tiles_options(args: &TilesArgs) -> Result<TilesOptions> {
     use tylertoo_core::overview::level::Mode;
 
+    // #444: until `--max-zoom auto` is resolved — after every check that
+    // does not need its value, so a typo or a stale shard plan still fails
+    // in milliseconds (#371) — the plan carries `auto`'s placeholder.
+    let levels = resolve_level_plan(
+        args.gsd.as_deref(),
+        args.min_zoom,
+        args.max_zoom.plan_zoom(),
+    )?;
     let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
-
-    // #444: until `--max-zoom auto` is resolved below — after every check that
-    // does not need its value, so a typo or a stale shard plan still fails in
-    // milliseconds (#371) — the plan carries `auto`'s placeholder (its
-    // ceiling, the most permissive value it can resolve to). A fixed zoom is
-    // its own placeholder, so that path is unchanged.
-    let max_zoom = args.max_zoom.plan_zoom();
-
     // Overviews for PMTiles are always duplicating (partitioning can't be
-    // exported to per-tile MVT). Every other convert knob comes from the
-    // shared tuning set, so `tiles` matches the two-step overview → export.
-    let levels = resolve_level_plan(args.gsd.as_deref(), args.min_zoom, max_zoom)?;
-    let mut options = args
+    // exported to per-tile MVT).
+    let convert = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)?;
+    let export = args
+        .export
+        .apply(TilesOptions::export_defaults(args.tuning.verbatim));
+    Ok(TilesOptions {
+        convert,
+        export: ExportOptions {
+            metadata: args.publication.to_metadata(),
+            tile_range: parse_tile_range(args.tile_range.as_deref())?,
+            ..export
+        },
+        // `None` lets core derive the layer name from the input.
+        layer_name: args.layer_name.clone(),
+        keep_overview: args.keep_overview.clone(),
+        shard: None,
+    })
+}
 
-    // #498: which job of a sharded fleet this is, and the slice of the tile
-    // space it owns. Resolved before any work, against the plan every job of
-    // the fleet shares, so a mis-specified `--shard 4/8` against a 16-way plan
-    // fails in milliseconds rather than after an hour of tiling.
+/// `--tile-range`, parsed by core.
+fn parse_tile_range(range: Option<&str>) -> Result<Option<tylertoo_core::shard::TileRange>> {
+    Ok(range
+        .map(tylertoo_core::shard::TileRange::parse)
+        .transpose()?)
+}
+
+/// The run-time half of a `tiles` configuration, which reads the input:
+/// the sharded-fleet job (#498) and `--max-zoom auto` (#444). Each step
+/// re-runs core's validation first, so everything that can fail without
+/// reading fails before the next read.
+fn resolve_tiles_job(
+    args: &TilesArgs,
+    spec: &InputSpec,
+    options: &mut TilesOptions,
+) -> Result<Option<ShardJob>> {
+    let validate = |options: &TilesOptions| {
+        if args.plan_only {
+            options.validate_plan_only()
+        } else {
+            options.validate()
+        }
+    };
+    validate(options)?;
+    let max_zoom = args.max_zoom.plan_zoom();
     let shard = resolve_shard_job(
         spec,
         args.shard.as_deref(),
         args.shard_plan.as_deref(),
-        args.min_zoom,
         max_zoom,
-        args.plan_only,
     )?;
     if let Some(job) = &shard {
-        // #498/#541: core owns what a sharded job does to its convert
-        // (#439). Only the fleet-wide selection here — the row-pruning range
-        // and the fingerprinted cut digest — because this builder is shared
-        // with `--plan-only` (#560), which materializes no level and so must
-        // carry no ceiling core would refuse for having no pass 2.
-        // `convert_to_pmtiles` applies the coarse job's ceiling itself for
-        // the runs that do build tiles.
-        job.as_tiles_shard().apply_selection(&mut options);
+        // The fleet-wide selection now, so `--max-zoom auto` estimates over
+        // the rows this job reads; the facade applies the rest (#439).
+        let tiles_shard = job.as_tiles_shard();
+        tiles_shard.apply_selection(&mut options.convert);
+        options.shard = Some(tiles_shard);
+        validate(options)?;
     }
-
-    // #386/#443: the property selection is applied at convert, so an excluded
-    // column is already gone from the intermediate before export would sort
-    // or id by it — export-pmtiles rejects that pairing outright, and so must
-    // the facade, before any work is done, rather than run the whole convert
-    // and then quietly fall back. Also under --plan-only (#600): it exports
-    // nothing, but it is the fleet's preflight, and the coarse job and every
-    // data shard refuse this pairing.
-    reject_excluded_knob_columns(&options, &args.feature_order, args.feature_id.as_ref())?;
-
     // #444: every cheap check has passed; now estimate `auto` (a fixed zoom
-    // comes back verbatim, no I/O). Here, not in the callers, so a plan-only
-    // run and the full coarse job resolve — and fingerprint — the same zoom.
-    // A shard plan was bound against the placeholder, so its pivot is
-    // re-checked against the real value.
-    let max_zoom = resolve_max_zoom(args.max_zoom, spec, &mut options)?;
+    // comes back verbatim, no I/O). A shard plan was bound against the
+    // placeholder, so its pivot is re-checked against the real value.
+    let max_zoom = resolve_max_zoom(args.max_zoom, spec, &mut options.convert)?;
     if let (Some(job), Some(plan_path)) = (&shard, args.shard_plan.as_deref()) {
         job.plan.check_max_zoom(max_zoom, plan_path)?;
     }
@@ -2072,99 +1997,21 @@ fn tiles_convert_options(
             log_shard_job(job, args.min_zoom, max_zoom);
         }
     }
-    Ok((options, shard))
+    Ok(shard)
 }
 
-/// The export knobs `tiles` can check without reading anything (#433): the
-/// `--tile-buffer` cap, the size of the publication metadata, the
-/// `--tile-range` syntax, and the `--keep-overview` directory. Returns the
-/// parsed `--tile-range`.
-///
-/// Shared by the full run and `--plan-only` (#600): plan-only ignores these
-/// flags, but it is the fleet's preflight, so a value the coarse job would
-/// refuse in milliseconds is refused there too, not after the plan is
-/// written and the data shards are queued.
-fn preflight_export_flags(args: &TilesArgs) -> Result<Option<tylertoo_core::shard::TileRange>> {
-    use tylertoo_core::overview::export::ExportOptions;
-
-    // The full `ExportOptions` are built after the convert (the layer name
-    // and shard range come out of it), so this is the same check on the
-    // values that are already known.
-    ExportOptions {
-        tile_buffer: args.tile_buffer,
-        metadata: args.publication.to_metadata(),
-        ..ExportOptions::default()
-    }
-    .validate()
-    .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
-
-    let tile_range = args
-        .tile_range
-        .as_deref()
-        .map(tylertoo_core::shard::TileRange::parse)
-        .transpose()?;
-
-    // Core's guard, not a second copy of it (#439): the facade re-checks
-    // this anyway, and two hand-synced copies of one message is the drift
-    // this refactor exists to end. Here so a `--plan-only` run — which
-    // never reaches the facade — still refuses it in milliseconds.
-    tylertoo_core::overview::tiles::check_keep_overview(args.keep_overview.as_deref())?;
-    Ok(tile_range)
-}
-
-/// The export-only flags set on a `--plan-only` run, by their CLI names in
-/// `--help` order (#600).
-///
-/// None of these is a convert option: `tiles_convert_options` builds the
-/// `ConvertOptions` from the shared tuning set, the zoom range, `--gsd`,
-/// `--bbox` and the shard job, and `options_digest` (the plan fingerprint) is
-/// an allowlist over those. So a plan-only run ignores them and the plan is
-/// the one the full coarse job writes with them. `--force` included: the
-/// plan file is overwritten regardless, as on a full run.
-///
-/// A flag with a default counts as set when its value differs from the
-/// default; typing the default value explicitly is the same run as omitting
-/// it, so there is nothing to report.
-fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
-    use tylertoo_core::overview::export::{ExportOptions, FeatureOrder, PARTITION_WAVE_AUTO};
-
-    [
-        ("--layer-name", args.layer_name.is_some()),
-        ("--name", args.publication.name.is_some()),
-        ("--description", args.publication.description.is_some()),
-        ("--attribution", args.publication.attribution.is_some()),
-        ("--max-tile-size", args.max_tile_size.is_some()),
-        (
-            "--max-compressed-tile-size",
-            args.max_compressed_tile_size.is_some(),
-        ),
-        (
-            "--size-valve",
-            args.size_valve != ExportOptions::default().size_valve,
-        ),
-        ("--coverage-fill", args.coverage_fill),
-        ("--no-simple-clip-fastpath", args.no_simple_clip_fastpath),
-        (
-            "--tile-buffer",
-            args.tile_buffer != ExportOptions::default().tile_buffer,
-        ),
-        (
-            "--partition-wave",
-            args.partition_wave != PARTITION_WAVE_AUTO,
-        ),
-        (
-            "--feature-order",
-            args.feature_order != FeatureOrder::default(),
-        ),
-        ("--feature-id", args.feature_id.is_some()),
-        ("--report", args.report.is_some()),
-        ("--keep-overview", args.keep_overview.is_some()),
-        ("--tile-range", args.tile_range.is_some()),
-        ("--force", args.force),
-    ]
-    .into_iter()
-    .filter_map(|(flag, set)| set.then_some(flag))
-    .collect()
+/// The flags a `--plan-only` run ignores (#600): the export options core
+/// names ([`TilesOptions::ignored_by_plan_only`]), then this CLI's own
+/// `--report` and `--force`.
+fn plan_only_ignored(args: &TilesArgs, options: &TilesOptions) -> Vec<&'static str> {
+    let mut ignored =
+        options.ignored_by_plan_only(&TilesOptions::export_defaults(args.tuning.verbatim));
+    ignored.extend(
+        [("--report", args.report.is_some()), ("--force", args.force)]
+            .into_iter()
+            .filter_map(|(flag, set)| set.then_some(flag)),
+    );
+    ignored
 }
 
 /// `tiles --plan-only` (#560): pass 1 + the level assignment, `--save-plan`,
@@ -2175,8 +2022,6 @@ fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
 /// zooms (an aggregate-into-fields handover build) the tiles are thrown away,
 /// and this is the job without them.
 fn run_plan_only(args: TilesArgs) -> Result<()> {
-    use tylertoo_core::overview::convert::{write_convert_plan, write_convert_plan_sources};
-
     // No OUTPUT is written, so none is accepted: a path on the command line
     // that nothing would ever create is a misunderstanding worth failing on,
     // not a silently ignored argument. (With --files-from the lone positional
@@ -2189,28 +2034,15 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     );
     let spec = resolve_io_for_planning(args.input.clone(), args.files_from.clone())?;
 
-    // #600: export flags are ignored here, but not unchecked.
-    preflight_export_flags(&args)?;
-
-    let (options, shard) = tiles_convert_options(&args, &spec)?;
-    // A data shard reads a subset of the input, so a plan it wrote would
-    // describe only that subset. Core refuses the pairing too (--shard with
-    // --save-plan); named here against the flag the user actually typed.
-    if let Some(job) = &shard {
-        anyhow::ensure!(
-            job.range.is_none(),
-            "--plan-only cannot be combined with a data shard (--shard I/N): the shard reads \
-             only the row groups its range reaches, so the plan it wrote would cover that \
-             subset and be useless to the rest of the fleet. The plan comes from the job that \
-             reads everything: `--shard coarse --shard-plan <the fleet's shard plan> \
-             --plan-only`"
-        );
-    }
+    // #600: export flags are ignored here, but not unchecked: core validates
+    // the same `TilesOptions` the full coarse job runs with.
+    let mut options = tiles_options(&args)?;
+    let shard = resolve_tiles_job(&args, &spec, &mut options)?;
     // #600: the fleet recipe is the coarse job's line plus this flag, and that
-    // line carries export-only flags. They cannot move the plan (see
-    // `ignored_export_options`), so they are tolerated, and said so once,
-    // now that every refusal has run.
-    let ignored = ignored_export_options(&args);
+    // line carries export-only flags. They cannot move the plan, so they are
+    // tolerated, and said so once, now that every refusal has run. Core names
+    // the ignored export options; `--report` and `--force` are this CLI's.
+    let ignored = plan_only_ignored(&args, &options);
     if !ignored.is_empty() {
         log::info!(
             "--plan-only: ignoring export options {}",
@@ -2225,14 +2057,13 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
         .expect("clap requires --save-plan alongside --plan-only");
 
     let start = std::time::Instant::now();
-    let report = match &spec {
-        InputSpec::Path(p) => write_convert_plan(p, &options),
-        InputSpec::Manifest(m) => {
-            let source = tylertoo_core::input_set::ConvertSource::from_manifest(m)?;
-            write_convert_plan_sources(&source, &options)
-        }
-    }
-    .context("writing the convert plan failed")?;
+    let report = tylertoo_core::overview::tiles::write_plan(&tiles_input(&spec), &options)
+        .map_err(|e| match e {
+            tylertoo_core::overview::tiles::TilesError::Convert(e) => {
+                anyhow::Error::new(e).context("writing the convert plan failed")
+            }
+            other => other.into(),
+        })?;
 
     say!("✓ Wrote the convert plan (no tiles: --plan-only)");
     say!("  input:  {}", spec.display());
@@ -2348,9 +2179,7 @@ fn makes_placeholder_squares(options: &tylertoo_core::overview::convert::Convert
 
 fn run_tiles(args: TilesArgs) -> Result<()> {
     use tylertoo_core::overview::convert::ConvertReport;
-    use tylertoo_core::overview::tiles::{
-        self, IntermediateOverview, TilesObserver, TilesOptions, TilesOutcome,
-    };
+    use tylertoo_core::overview::tiles::{self, IntermediateOverview, TilesObserver, TilesOutcome};
 
     // Checked here, not with clap's `conflicts_with`: `quiet` is a global
     // arg that only `tiles` has a `verbose` to conflict with, and clap's
@@ -2380,7 +2209,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         args.files_from.clone(),
     )?;
 
-    check_output_path(&output, OutputKind::Pmtiles, args.force)?;
+    config::check_output(&output, OutputKind::Pmtiles, args.force)?;
     let named: Vec<&Path> = [output.as_path(), spec.path()]
         .into_iter()
         .chain(args.keep_overview.as_deref())
@@ -2389,47 +2218,12 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    // #433: the export knobs that need no file are checked before the
-    // convert, which on a large input runs for minutes before the export
-    // would otherwise refuse them. Core re-checks inside the facade; this
-    // early call also parses `--tile-range`, which is argument mapping.
-    let manual_range = preflight_export_flags(&args)?;
-
-    let (options, shard) = tiles_convert_options(&args, &spec)?;
-    let squares = makes_placeholder_squares(&options);
-
-    let tiles_options = TilesOptions {
-        convert: options,
-        // `None` lets core derive the layer name from the input: file stem
-        // for a single file, last path segment for a directory or
-        // `s3://`/`gs://` prefix, last literal segment for a glob, manifest
-        // stem for --files-from (core owns the rules).
-        layer_name: args.layer_name.clone(),
-        keep_overview: args.keep_overview.clone(),
-        // The declared zoom range comes from `convert.levels`, which
-        // `tiles_convert_options` has already resolved (`--max-zoom auto`
-        // included); core reads it there rather than from a second copy.
-        shard: shard.as_ref().map(ShardJob::as_tiles_shard),
-        tile_range: manual_range,
-        tile_buffer: args.tile_buffer,
-        tile_size_limit: resolve_tiles_size_limit(
-            args.max_tile_size,
-            args.tuning.verbatim,
-            DEFAULT_TILE_SIZE_LIMIT,
-        ),
-        compressed_tile_size_limit: resolve_tiles_size_limit(
-            args.max_compressed_tile_size,
-            args.tuning.verbatim,
-            DEFAULT_COMPRESSED_TILE_SIZE_LIMIT,
-        ),
-        size_valve: args.size_valve,
-        coverage_fill: args.coverage_fill,
-        simple_clip_fastpath: !args.no_simple_clip_fastpath,
-        partition_wave: args.partition_wave,
-        feature_order: args.feature_order.clone(),
-        feature_id: args.feature_id.clone(),
-        metadata: args.publication.to_metadata(),
-    };
+    // #433/#779: the whole configuration is checked before the convert,
+    // which on a large input runs for minutes before the export would
+    // otherwise refuse a knob; core re-checks inside the facade.
+    let mut tiles_options = tiles_options(&args)?;
+    resolve_tiles_job(&args, &spec, &mut tiles_options)?;
+    let squares = makes_placeholder_squares(&tiles_options.convert);
     let input = tiles_input(&spec);
 
     // #314: the disk cost of the one-shot facade must not be silent — name
@@ -2809,37 +2603,42 @@ fn bands_split_one_archive(bands: &[tylertoo_core::pyramid::Band]) -> bool {
         .any(|b| !seen.insert(canonical_key(&b.input)))
 }
 
+/// The [`ConvertOptions`] an `overview` command line describes: pure
+/// translation (#779), with `--max-zoom auto`'s placeholder (#444).
+fn overview_options(args: &OverviewArgs) -> Result<ConvertOptions> {
+    let mode = args.mode.parse().map_err(anyhow::Error::msg)?;
+    let levels = resolve_level_plan(
+        args.gsd.as_deref(),
+        args.min_zoom,
+        args.max_zoom.plan_zoom(),
+    )?;
+    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
+    args.tuning
+        .build_convert_options(mode, levels, bbox, args.cogp_compat)
+}
+
 /// Run `tylertoo overview`: build a multi-resolution overview GeoParquet file.
 fn run_overview(args: OverviewArgs) -> Result<()> {
-    use tylertoo_core::overview::level::Mode;
-
-    let (spec, output) = resolve_io(args.input, args.output, args.files_from)?;
+    let (spec, output) = resolve_io(
+        args.input.clone(),
+        args.output.clone(),
+        args.files_from.clone(),
+    )?;
 
     // #427: refuse an existing output (without --force) before any work. The
     // overview itself is written to a sibling and renamed over OUTPUT at the
     // end, so an interrupted run leaves a previous file intact either way.
-    check_output_path(&output, OutputKind::GeoParquet, args.force)?;
+    config::check_output(&output, OutputKind::GeoParquet, args.force)?;
     let named: Vec<&Path> = [output.as_path(), spec.path()]
         .into_iter()
         .chain(args.tuning.plan_paths())
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    let mode: Mode = args.mode.parse().map_err(anyhow::Error::msg)?;
-
-    // #444: the plan is built with `auto`'s placeholder so every cheap check
-    // runs first; the estimate (which reads the input) comes last.
-    let levels = resolve_level_plan(
-        args.gsd.as_deref(),
-        args.min_zoom,
-        args.max_zoom.plan_zoom(),
-    )?;
-
-    let bbox = args.bbox.as_ref().map(|s| parse_bbox(s)).transpose()?;
-
-    let mut options = args
-        .tuning
-        .build_convert_options(mode, levels, bbox, args.cogp_compat)?;
+    let mut options = overview_options(&args)?;
+    // #444/#779: every rule that needs no input, then the estimate (which
+    // reads the input) last.
+    options.validate()?;
     resolve_max_zoom(args.max_zoom, &spec, &mut options)?;
 
     let report = run_convert(&spec, &output, &options)?;
@@ -2933,22 +2732,6 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parse an `--entry-zoom` spec: `COLUMN:VALUE=ZOOM,VALUE=ZOOM,...` (#364).
-///
-/// Grammar, validation and messages live in core (#439); this adapts the
-/// error for anyhow.
-fn parse_entry_zoom(spec: &str) -> Result<tylertoo_core::overview::ladder::EntryZoomSpec> {
-    tylertoo_core::overview::convert::parse_entry_zoom(spec).map_err(anyhow::Error::msg)
-}
-
-/// Parse a `--class-rank` spec: `COLUMN:VALUE=RANK,VALUE=RANK,...`.
-///
-/// Grammar, validation and messages live in core (#439); this adapts the
-/// error for anyhow.
-fn parse_class_rank(spec: &str) -> Result<tylertoo_core::overview::convert::ClassRanking> {
-    tylertoo_core::overview::convert::parse_class_rank(spec).map_err(anyhow::Error::msg)
-}
-
 /// Parse an `--accumulate-attribute` spec: `COL:OP` with OP one of
 /// `sum`, `max`, `min`, `mean` (case-insensitive).
 ///
@@ -3040,53 +2823,45 @@ fn reject_files_from(files_from: Option<&PathBuf>, subcommand: &str) -> Result<(
     Ok(())
 }
 
-fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
-    use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
-
-    // #427: refuse an existing output (without --force) and a bad --spill-dir
-    // before the input is even looked at.
-    check_output_path(&args.output, OutputKind::Pmtiles, args.force)?;
-    preflight_report(args.report.as_deref(), &[&args.output, &args.input])?;
-    check_spill_dir(args.spill_dir.as_deref())?;
-    reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
-    require_single_local_file(&args.input, "export-pmtiles")?;
-
-    let opts = ExportOptions {
-        layer_name: args.layer_name,
-        tile_buffer: args.tile_buffer,
-        extent: 4096,
-        tile_size_limit: size_limit_opt(args.tile_size_limit),
-        compressed_tile_size_limit: size_limit_opt(args.max_compressed_tile_size),
-        size_valve: args.size_valve,
-        coverage_fill: args.coverage_fill,
-        simple_clip_fastpath: !args.no_simple_clip_fastpath,
-        partition_wave: args.partition_wave,
-        feature_order: args.feature_order.clone(),
+/// The [`ExportOptions`] an `export-pmtiles` command line describes: pure
+/// translation (#779) over [`ExportOptions::default`].
+fn export_options(args: &ExportPmtilesArgs) -> Result<ExportOptions> {
+    Ok(ExportOptions {
+        layer_name: args.layer_name.clone(),
         min_zoom: args.min_zoom,
-
-        properties: tylertoo_core::overview::properties::PropertySelection {
-            include: (!args.include_property.is_empty()).then(|| args.include_property.clone()),
-            exclude: args.exclude_property.clone(),
-            exclude_all: args.exclude_all_properties,
-        },
-        tile_range: args
-            .tile_range
-            .as_deref()
-            .map(tylertoo_core::shard::TileRange::parse)
-            .transpose()?,
+        properties: args.properties.selection(),
+        tile_range: parse_tile_range(args.tile_range.as_deref())?,
         zoom_ceiling: args.zoom_ceiling,
-        feature_id: args.feature_id.clone(),
         spill_dir: args.spill_dir.clone(),
         metadata: args.publication.to_metadata(),
-    };
+        ..args.export.apply(ExportOptions::default())
+    })
+}
+
+fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
+    use tylertoo_core::overview::export::export_pmtiles;
+
+    // #427: refuse an existing output (without --force) and a bad option
+    // before the input is even looked at. The option rules are core's.
+    config::check_output(&args.output, OutputKind::Pmtiles, args.force)?;
+    preflight_report(args.report.as_deref(), &[&args.output, &args.input])?;
+    let opts = export_options(&args)?;
+    opts.validate()?;
+    reject_files_from(args.files_from.as_ref(), "export-pmtiles")?;
+    require_single_local_file(&args.input, "export-pmtiles")?;
 
     say!(
         "Exporting {} → {}",
         args.input.display(),
         args.output.display()
     );
-    let report = export_pmtiles(&args.input, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+    let report = export_pmtiles(&args.input, &args.output, &opts).map_err(|e| {
+        step_failed(
+            "export",
+            e,
+            tylertoo_core::overview::export::ExportError::is_config,
+        )
+    })?;
 
     say!(
         "  mode={} zooms z{}..z{}",
@@ -3176,23 +2951,20 @@ fn print_skipped_property_columns(
 fn run_pyramid(args: PyramidArgs) -> Result<()> {
     use tylertoo_core::pyramid::{build_pyramid, parse_bands};
 
-    if args.output.exists() && !args.force {
-        anyhow::bail!(
-            "{} exists (use --force to overwrite)",
-            args.output.display()
-        );
-    }
     // #452: the archive is created only after every band is tiled.
-    preflight_writable(&args.output)?;
+    config::check_output(&args.output, OutputKind::Pmtiles, args.force)?;
+    preflight_report(args.report.as_deref(), &[&args.output])?;
 
     // Spec parsing, band-set validation and the band-input existence check
     // (with its stripped-`=LAYER` hint) all live in core (#445).
     let bands = parse_bands(&args.bands).map_err(|e| anyhow::anyhow!(e))?;
 
+    // #779: the option rules, before any band is tiled.
     let opts = pyramid_options(&args);
+    opts.validate()?;
 
     let report = build_pyramid(&bands, &args.output, &opts)
-        .map_err(|e| anyhow::anyhow!("pyramid build failed: {e}"))?;
+        .map_err(|e| step_failed("pyramid build", e, tylertoo_core::Error::is_config))?;
 
     for (layer, lo, hi, n) in &report.per_band_tiles {
         say!(
@@ -3223,40 +2995,35 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         args.output.display(),
         format_number(report.total_tiles as u64)
     );
+    if let Some(path) = &args.report {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
+        say!("  report → {}", path.display());
+    }
     Ok(())
 }
 
 /// The `pyramid` flags that apply to every GeoParquet band alike, as the
 /// library options `build_pyramid` substitutes each band's own layer name
-/// and zoom range into. Kept separate from `run_pyramid` so a test can
-/// check a flag actually reaches `PyramidOptions` (#374: `--feature-order`
-/// was documented for `tiles` and `export-pmtiles` but `pyramid` built its
-/// export options from `ExportOptions::default()`).
+/// and zoom range into: pure translation (#779) over
+/// [`PyramidOptions::new`](tylertoo_core::pyramid::PyramidOptions::new).
+/// Kept separate from `run_pyramid` so a test can check a flag actually
+/// reaches `PyramidOptions` (#374).
 fn pyramid_options(args: &PyramidArgs) -> tylertoo_core::pyramid::PyramidOptions {
-    use tylertoo_core::overview::convert::ConvertOptions;
-    use tylertoo_core::overview::export::ExportOptions;
-    use tylertoo_core::pyramid::PyramidOptions;
-
-    let convert = if args.generalize {
-        ConvertOptions::default()
-    } else {
-        ConvertOptions::default().verbatim()
-    };
-    PyramidOptions {
-        convert,
+    let base = tylertoo_core::pyramid::PyramidOptions::new(args.generalize);
+    tylertoo_core::pyramid::PyramidOptions {
         export: ExportOptions {
-            tile_size_limit: args.max_tile_size.and_then(size_limit_opt),
-            // A band keeps every feature unless a cap is asked for; the
-            // compressed default (#761) is not one.
-            compressed_tile_size_limit: None,
-            feature_order: args.feature_order.clone(),
-            ..ExportOptions::default()
+            properties: args.properties.selection(),
+            ..args.export.apply(base.export)
         },
         work_dir: args.work_dir.clone(),
         allow_missing_zooms: args.allow_missing_zooms,
         // The final archive's overrides; the band exports write none, so
         // GeoParquet bands contribute no inherited value.
         metadata: args.publication.to_metadata(),
+        ..base
     }
 }
 
@@ -3286,16 +3053,6 @@ fn canonical_key(path: &Path) -> PathBuf {
         }
         _ => path.to_path_buf(),
     }
-}
-
-/// Fail now if `path` cannot be created, instead of after the work is done.
-///
-/// Core's [`check_writable`](tylertoo_core::atomic_output::check_writable)
-/// probes the directory, so a missing or read-only one is reported with the
-/// path that caused it. An existing file is left strictly alone — `--force`
-/// decides whether it may be overwritten.
-fn preflight_writable(path: &Path) -> Result<()> {
-    Ok(tylertoo_core::atomic_output::check_writable(path)?)
 }
 
 /// `--report` preflight (#452): the report is written when the run ends, so
@@ -3332,14 +3089,9 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
     // `ConvertSource::resolve` names a bad input far better than a bare
     // stat() ever could, and is the same resolution `tiles` performs.
     let spec = resolve_io_for_planning(args.input, args.files_from)?;
-    anyhow::ensure!(
-        args.force || !args.output.exists(),
-        "{} already exists; pass -f/--force to overwrite it. Every job of a fleet must be given \
-         the SAME shard plan, so replacing one mid-build silently re-cuts the tile space.",
-        args.output.display()
-    );
-    // `ShardPlan::save` rewrites the file in place.
-    tylertoo_core::atomic_output::check_writable_in_place(&args.output)?;
+    // Every job of a fleet must be given the SAME shard plan, so replacing
+    // one mid-build silently re-cuts the tile space: --force to overwrite.
+    config::check_output(&args.output, OutputKind::ShardPlan, args.force)?;
 
     let source = resolve_convert_source(&spec)?;
     let plan = ShardPlan::compute(&source, args.pivot, args.shards)?;
@@ -3405,18 +3157,12 @@ fn run_shard_plan(args: ShardPlanArgs) -> Result<()> {
 fn run_merge(args: MergeArgs) -> Result<()> {
     use tylertoo_core::merge::{merge_shards, MergeOptions};
 
-    if args.output.exists() && !args.force {
-        anyhow::bail!(
-            "{} exists (use --force to overwrite)",
-            args.output.display()
-        );
-    }
-    // Preflight the paths the run will write, before it reads gigabytes: a
-    // `--report` in a directory that does not exist, or an output whose parent
-    // is missing or read-only, would otherwise surface only at the end. This
-    // mirrors `--work-dir`, which fails fast because the writer creates its
-    // spool file up front.
-    preflight_writable(&args.output)?;
+    // Preflight the paths the run will write, before it reads gigabytes: an
+    // existing output without --force, a `--report` in a directory that does
+    // not exist, or an output whose parent is missing or read-only, would
+    // otherwise surface only at the end. This mirrors `--work-dir`, which
+    // fails fast because the writer creates its spool file up front.
+    config::check_output(&args.output, OutputKind::Pmtiles, args.force)?;
     let written_or_read: Vec<&Path> = std::iter::once(args.output.as_path())
         .chain(args.inputs.iter().map(PathBuf::as_path))
         .collect();
@@ -3514,7 +3260,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     use tylertoo_core::decode::{decode_pmtiles, DecodeOptions};
 
     // #427: refuse an existing output (without --force) before any work.
-    check_output_path(&args.output, OutputKind::GeoParquet, args.force)?;
+    config::check_output(&args.output, OutputKind::GeoParquet, args.force)?;
     preflight_report(args.report.as_deref(), &[&args.output, &args.input])?;
     reject_files_from(args.files_from.as_ref(), "decode")?;
     require_single_local_file(&args.input, "decode")?;
@@ -3922,8 +3668,14 @@ mod tests {
         })
     }
 
+    /// What a plan-only command line ignores, through the real builder.
+    fn ignored_export_options(args: &TilesArgs) -> Vec<&'static str> {
+        plan_only_ignored(args, &tiles_options(args).expect("the options build"))
+    }
+
     /// #600: every export-only flag parses alongside `--plan-only` and is
-    /// named by `ignored_export_options`; nothing set, nothing named.
+    /// named by core's list (plus the CLI's own two); nothing set, nothing
+    /// named.
     #[test]
     fn plan_only_parses_and_names_every_export_only_flag() {
         let bare = parse_plan_only(&[]).expect("bare --plan-only parses");
@@ -3950,7 +3702,7 @@ mod tests {
             assert_eq!(ignored_export_options(&a), vec![name], "{argv:?}");
         }
 
-        // Several at once: one list, in --help order.
+        // Several at once: one list, core's in --help order, then the CLI's.
         let a = parse_plan_only(&["--force", "--layer-name", "x", "--report", "r.json"]).unwrap();
         assert_eq!(
             ignored_export_options(&a),
@@ -3960,9 +3712,13 @@ mod tests {
         // The clap default IS export's default, so a bare run never names
         // --tile-buffer.
         assert_eq!(
-            bare.tile_buffer,
-            tylertoo_core::overview::export::ExportOptions::default().tile_buffer
+            bare.export.tile_buffer,
+            ExportOptions::default().tile_buffer
         );
+        // Under --verbatim the caps' defaults are off, so the bare caps are
+        // not "set" either.
+        let a = parse_plan_only(&["--verbatim"]).unwrap();
+        assert!(ignored_export_options(&a).is_empty());
 
         // A default typed explicitly is the same run as omitting it.
         let a = parse_plan_only(&[
@@ -3979,13 +3735,29 @@ mod tests {
 
     /// #600 kept these hard errors: `--plan-only` still requires
     /// `--save-plan`, and `--tile-range` still conflicts with `--shard`.
+    /// #779: they are core's rules now, not clap's, so the line parses and
+    /// core refuses it (`tests/config_rules.rs` runs the binary).
     #[test]
-    fn plan_only_still_refuses_contradictions_at_parse_time() {
-        let err = Cli::try_parse_from(["tylertoo", "tiles", "in.parquet", "--plan-only"])
-            .expect_err("--plan-only without --save-plan");
-        assert!(err.to_string().contains("--save-plan"), "{err}");
+    fn plan_only_contradictions_parse_and_are_refused_by_core() {
+        let a = match Cli::try_parse_from(["tylertoo", "tiles", "in.parquet", "--plan-only"])
+            .expect("parses: the rule is core's")
+            .command
+        {
+            Command::Tiles(a) => *a,
+            other => panic!("expected tiles subcommand, got {other:?}"),
+        };
+        let err = tiles_options(&a).unwrap().validate_plan_only().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                tylertoo_core::overview::tiles::TilesError::Config(
+                    config::ConfigError::PlanOnlyWithoutSavePlan
+                )
+            ),
+            "{err:?}"
+        );
 
-        let err = parse_plan_only(&[
+        parse_plan_only(&[
             "--shard",
             "coarse",
             "--shard-plan",
@@ -3993,8 +3765,7 @@ mod tests {
             "--tile-range",
             "21..40",
         ])
-        .expect_err("--tile-range with --shard");
-        assert!(err.to_string().contains("cannot be used with"), "{err}");
+        .expect("parses: core refuses it once the shard plan is read");
     }
 
     fn parse_export(flags: &[&str]) -> ExportPmtilesArgs {
@@ -4038,14 +3809,16 @@ mod tests {
             descending,
         };
 
-        assert_eq!(parse_pyramid(&[]).feature_order, FeatureOrder::Input);
+        assert_eq!(parse_pyramid(&[]).export.feature_order, FeatureOrder::Input);
         assert_eq!(
             pyramid_options(&parse_pyramid(&[])).export.feature_order,
             FeatureOrder::Input
         );
 
         assert_eq!(
-            parse_pyramid(&["--feature-order", "level:desc"]).feature_order,
+            parse_pyramid(&["--feature-order", "level:desc"])
+                .export
+                .feature_order,
             column("level", true)
         );
         let opts = pyramid_options(&parse_pyramid(&["--feature-order", "level:desc"]));
@@ -4083,15 +3856,19 @@ mod tests {
             descending,
         };
 
-        assert_eq!(parse_tiles(&[]).feature_order, FeatureOrder::Input);
-        assert_eq!(parse_export(&[]).feature_order, FeatureOrder::Input);
+        assert_eq!(parse_tiles(&[]).export.feature_order, FeatureOrder::Input);
+        assert_eq!(parse_export(&[]).export.feature_order, FeatureOrder::Input);
 
         assert_eq!(
-            parse_tiles(&["--feature-order", "level:desc"]).feature_order,
+            parse_tiles(&["--feature-order", "level:desc"])
+                .export
+                .feature_order,
             column("level", true)
         );
         assert_eq!(
-            parse_export(&["--feature-order", "level"]).feature_order,
+            parse_export(&["--feature-order", "level"])
+                .export
+                .feature_order,
             column("level", false)
         );
 
@@ -4108,15 +3885,15 @@ mod tests {
     /// tests).
     #[test]
     fn feature_id_flag_parses_on_both_commands() {
-        assert_eq!(parse_tiles(&[]).feature_id, None);
-        assert_eq!(parse_export(&[]).feature_id, None);
+        assert_eq!(parse_tiles(&[]).export.feature_id, None);
+        assert_eq!(parse_export(&[]).export.feature_id, None);
 
         assert_eq!(
-            parse_tiles(&["--feature-id", "osm_id"]).feature_id,
+            parse_tiles(&["--feature-id", "osm_id"]).export.feature_id,
             Some("osm_id".to_string())
         );
         assert_eq!(
-            parse_export(&["--feature-id", "osm_id"]).feature_id,
+            parse_export(&["--feature-id", "osm_id"]).export.feature_id,
             Some("osm_id".to_string())
         );
     }
@@ -4277,16 +4054,25 @@ mod tests {
         let b = parse_tiles(&["--collapse-square"]);
         assert!(b.tuning.collapse_square);
 
-        // --collapse and --collapse-square conflict.
-        assert!(Cli::try_parse_from([
-            "tylertoo",
-            "tiles",
-            "in.parquet",
-            "out.pmtiles",
-            "--collapse",
-            "--collapse-square",
-        ])
-        .is_err());
+        // --collapse and --collapse-square conflict: core's rule (#779).
+        let both = parse_tiles(&["--collapse", "--collapse-square"]);
+        let err = both
+            .tuning
+            .build_convert_options(
+                Mode::Duplicating,
+                LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: 4,
+                },
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<config::ConfigError>()
+                .is_some_and(|e| matches!(e, config::ConfigError::CollapseConflict)),
+            "{err:?}"
+        );
 
         // build_convert_options maps both through to core.
         let opts = b
@@ -4393,87 +4179,87 @@ mod tests {
         // Default is the auto sentinel (0) on the one-shot command.
         let default = parse_tiles(&[]);
         assert_eq!(
-            default.partition_wave,
+            default.export.partition_wave,
             tylertoo_core::overview::export::PARTITION_WAVE_AUTO
         );
         // Explicit override is honoured verbatim.
         let overridden = parse_tiles(&["--partition-wave", "6"]);
-        assert_eq!(overridden.partition_wave, 6);
+        assert_eq!(overridden.export.partition_wave, 6);
     }
 
     #[test]
     fn export_pmtiles_partition_wave_defaults_auto_and_overrides() {
-        let parse_export = |flags: &[&str]| -> ExportPmtilesArgs {
-            let mut argv = vec!["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"];
-            argv.extend_from_slice(flags);
-            match Cli::try_parse_from(argv)
-                .expect("export-pmtiles args should parse")
-                .command
-            {
-                Command::ExportPmtiles(a) => a,
-                other => panic!("expected export-pmtiles subcommand, got {other:?}"),
-            }
-        };
         assert_eq!(
-            parse_export(&[]).partition_wave,
+            parse_export(&[]).export.partition_wave,
             tylertoo_core::overview::export::PARTITION_WAVE_AUTO
         );
-        assert_eq!(parse_export(&["--partition-wave", "12"]).partition_wave, 12);
+        assert_eq!(
+            parse_export(&["--partition-wave", "12"])
+                .export
+                .partition_wave,
+            12
+        );
     }
 
+    /// One `--max-tile-size`, with `--tile-size-limit` as its alias, on every
+    /// command that writes tiles (#779: one `ExportArgs`).
     #[test]
-    fn tiles_size_limit_alias_matches_max_tile_size() {
-        // The two spellings are aliases and both accept human-readable sizes.
+    fn tile_size_limit_is_an_alias_of_max_tile_size_everywhere() {
         let a = parse_tiles(&["--max-tile-size", "500K"]);
         let b = parse_tiles(&["--tile-size-limit", "500K"]);
-        assert_eq!(a.max_tile_size, Some(500 * 1024));
-        assert_eq!(a.max_tile_size, b.max_tile_size);
+        assert_eq!(a.export.max_tile_size, SizeCap(Some(500 * 1024)));
+        assert_eq!(a.export.max_tile_size, b.export.max_tile_size);
+        assert_eq!(
+            parse_export(&["--max-tile-size", "1M"])
+                .export
+                .max_tile_size,
+            parse_export(&["--tile-size-limit", "1M"])
+                .export
+                .max_tile_size,
+        );
+        assert_eq!(
+            parse_pyramid(&["--tile-size-limit", "1M"])
+                .export
+                .max_tile_size,
+            SizeCap(Some(1024 * 1024))
+        );
     }
 
+    /// #761: `auto` is the command's core default — 500K gzip and 2M raw for
+    /// `tiles` and `export-pmtiles`, none under `tiles --verbatim` and for
+    /// `pyramid` bands (#345/#360: verbatim means every feature reaches the
+    /// tile) — `0` turns a cap off, and an explicit size always wins.
     #[test]
-    fn tile_size_caps_default_to_500k_gzip_and_2m_raw_and_zero_disables() {
-        // #761: tippecanoe's `-M` caps the gzip-compressed tile at 500K; a 2M
-        // cap on the raw tile backs it up. Both commands, both caps.
-        assert_eq!(parse_tiles(&[]).max_tile_size, None);
-        assert_eq!(parse_tiles(&[]).max_compressed_tile_size, None);
+    fn size_caps_resolve_against_each_commands_core_default() {
+        let tiles = |flags: &[&str]| tiles_options(&parse_tiles(flags)).unwrap().export;
+        let caps = |e: &ExportOptions| (e.tile_size_limit, e.compressed_tile_size_limit);
+        assert_eq!(caps(&tiles(&[])), (Some(2048 * 1024), Some(500 * 1024)));
+        assert_eq!(caps(&tiles(&["--verbatim"])), (None, None));
         assert_eq!(
-            resolve_tiles_size_limit(None, false, DEFAULT_TILE_SIZE_LIMIT),
-            Some(2048 * 1024)
+            caps(&tiles(&["--verbatim", "--max-tile-size", "1K"])),
+            (Some(1024), None)
         );
         assert_eq!(
-            resolve_tiles_size_limit(None, false, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT),
-            Some(500 * 1024)
+            caps(&tiles(&["--max-compressed-tile-size", "0"])),
+            (Some(2048 * 1024), None)
         );
-        assert_eq!(parse_export(&[]).tile_size_limit, 2048 * 1024);
-        assert_eq!(parse_export(&[]).max_compressed_tile_size, 500 * 1024);
+        assert_eq!(
+            caps(&tiles(&["--max-tile-size", "auto"])),
+            caps(&tiles(&[]))
+        );
 
-        // `0` is the off switch: the CLI value maps to `None` (cap disabled).
-        assert_eq!(
-            parse_tiles(&["--max-tile-size", "0"]).max_tile_size,
-            Some(0)
-        );
-        assert_eq!(size_limit_opt(0), None);
-        assert_eq!(size_limit_opt(500 * 1024), Some(500 * 1024));
-    }
+        let export = export_options(&parse_export(&[])).unwrap();
+        assert_eq!(caps(&export), (Some(2048 * 1024), Some(500 * 1024)));
+        let export = export_options(&parse_export(&["--max-tile-size", "0"])).unwrap();
+        assert_eq!(export.tile_size_limit, None);
 
-    /// #345/#360: verbatim means every feature reaches the tile, so the
-    /// default size valve — which sheds features to fit a byte budget — must
-    /// not quietly apply. An explicit value still wins, so a caller who wants
-    /// a cap with verbatim generalization can say so.
-    #[test]
-    fn verbatim_disables_the_tile_size_cap_unless_asked_otherwise() {
-        for default in [DEFAULT_TILE_SIZE_LIMIT, DEFAULT_COMPRESSED_TILE_SIZE_LIMIT] {
-            assert_eq!(resolve_tiles_size_limit(None, true, default), None);
-            assert_eq!(
-                resolve_tiles_size_limit(None, false, default),
-                Some(default)
-            );
-            assert_eq!(
-                resolve_tiles_size_limit(Some(1024), true, default),
-                Some(1024)
-            );
-            assert_eq!(resolve_tiles_size_limit(Some(0), false, default), None);
-        }
+        let pyramid = pyramid_options(&parse_pyramid(&[])).export;
+        assert_eq!(caps(&pyramid), (None, None));
+        let pyramid = pyramid_options(&parse_pyramid(&["--max-compressed-tile-size", "300K"]));
+        assert_eq!(pyramid.export.compressed_tile_size_limit, Some(300 * 1024));
+
+        assert!(parse_size_cap("banana").is_err());
+        assert_eq!(parse_size_cap("AUTO").unwrap(), SizeCap(None));
     }
 
     /// The flag reaches both commands that build a conversion, and switches
@@ -4642,10 +4428,7 @@ mod tests {
             )
             .expect_err("verbatim + partitioning must be rejected");
         let msg = err.to_string();
-        assert!(
-            msg.contains("--verbatim requires --mode duplicating"),
-            "{msg}"
-        );
+        assert!(msg.contains("verbatim requires duplicating mode"), "{msg}");
 
         // Duplicating is fine, and partitioning without --verbatim is fine.
         assert!(parse_tiles(&["--verbatim"])
@@ -4761,39 +4544,60 @@ mod tests {
     }
 
     #[test]
-    fn build_convert_options_enforces_shared_validation() {
-        use tylertoo_core::overview::convert::LevelPlan;
+    fn build_convert_options_leaves_the_shared_rules_to_core() {
+        use tylertoo_core::overview::convert::{ConvertError, LevelPlan};
         use tylertoo_core::overview::level::Mode;
 
         let levels = || LevelPlan::ZoomRange {
             min_zoom: 0,
             max_zoom: 6,
         };
-
-        // --class-rank and --sort-key are mutually exclusive.
-        let a = parse_tiles(&["--class-rank", "k:a=1", "--sort-key", "height"]);
-        assert!(a
+        // #779: the builder translates; core's `validate` refuses. These
+        // were `bail!`s here, copied in Python, "also enforced in core".
+        let refused = |flags: &[&str], mode: Mode| -> ConvertError {
+            parse_tiles(flags)
+                .tuning
+                .build_convert_options(mode, levels(), None, false)
+                .expect("the builder only translates")
+                .validate()
+                .expect_err("core refuses")
+        };
+        assert!(matches!(
+            refused(
+                &["--class-rank", "k:a=1", "--sort-key", "height"],
+                Mode::Duplicating
+            ),
+            ConvertError::RankingConflict
+        ));
+        assert!(matches!(
+            refused(&["--accumulate-attribute", "pop:sum"], Mode::Duplicating),
+            ConvertError::AccumulateWithoutCluster
+        ));
+        assert!(matches!(
+            refused(&["--cluster"], Mode::Partitioning),
+            ConvertError::ClusterPartitioningUnsupported
+        ));
+        parse_tiles(&["--cluster"])
             .tuning
             .build_convert_options(Mode::Duplicating, levels(), None, false)
-            .is_err());
-
-        // --accumulate-attribute requires --cluster.
-        let a = parse_tiles(&["--accumulate-attribute", "pop:sum"]);
-        assert!(a
-            .tuning
-            .build_convert_options(Mode::Duplicating, levels(), None, false)
-            .is_err());
-
-        // --cluster requires duplicating mode.
-        let a = parse_tiles(&["--cluster"]);
-        assert!(a
+            .unwrap()
+            .validate()
+            .unwrap();
+        // Rules that hold for the flags themselves fire while building.
+        let err = parse_tiles(&["--coalesce-lines"])
             .tuning
             .build_convert_options(Mode::Partitioning, levels(), None, false)
-            .is_err());
-        assert!(a
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--coalesce-lines requires"),
+            "{err}"
+        );
+        // A NaN class rank (b8fa58a): refused by core's parser.
+        let err = parse_tiles(&["--class-rank", "k:a=nan"])
             .tuning
             .build_convert_options(Mode::Duplicating, levels(), None, false)
-            .is_ok());
+            .unwrap_err();
+        assert!(err.to_string().contains("finite"), "{err}");
     }
 
     // --- #316: tuning parity between `tiles` and the two-step chain ----------
@@ -5272,26 +5076,27 @@ mod tests {
         assert_ne!(canonical_key(&missing), canonical_key(&out));
     }
 
-    /// #510 review, S3-6: a `--report` (or output) path in a directory that
-    /// does not exist used to surface only after the merge had read every
-    /// input. It is probed up front, like `--work-dir`.
+    /// #510 review, S3-6: an output path in a directory that does not exist
+    /// used to surface only after the merge had read every input. Core's
+    /// output preflight probes it up front, like `--work-dir`.
     #[test]
-    fn preflight_writable_rejects_a_missing_directory_and_keeps_existing_files() {
+    fn output_preflight_rejects_a_missing_directory_and_keeps_existing_files() {
         let dir = tempfile::tempdir().unwrap();
-        let err = preflight_writable(&dir.path().join("nope").join("report.json"))
+        let check = |p: &Path| config::check_output(p, OutputKind::Pmtiles, true);
+        let err = check(&dir.path().join("nope").join("out.pmtiles"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
 
         // A writable directory passes and leaves nothing behind.
-        let fresh = dir.path().join("report.json");
-        preflight_writable(&fresh).unwrap();
+        let fresh = dir.path().join("out.pmtiles");
+        check(&fresh).unwrap();
         assert!(!fresh.exists(), "the probe must not leave a file behind");
 
         // An existing file is not touched — `--force` owns that decision.
-        let existing = dir.path().join("out.pmtiles");
+        let existing = dir.path().join("kept.pmtiles");
         std::fs::write(&existing, b"keep me").unwrap();
-        preflight_writable(&existing).unwrap();
+        check(&existing).unwrap();
         assert_eq!(std::fs::read(&existing).unwrap(), b"keep me");
     }
 
@@ -5443,12 +5248,18 @@ mod tests {
     #[test]
     fn oversized_publication_values_fail_the_export_preflight() {
         let huge = "\"".repeat(tylertoo_core::compression::MAX_INTERNAL_BYTES as usize / 2);
-        let err = preflight_export_flags(&parse_tiles(&["--attribution", &huge]))
+        let err = tiles_options(&parse_tiles(&["--attribution", &huge]))
+            .unwrap()
+            .validate()
             .unwrap_err()
             .to_string();
         assert!(err.contains("attribution"), "{err}");
         let a = parse_plan_only(&["--description", &huge]).unwrap();
-        let err = preflight_export_flags(&a).unwrap_err().to_string();
+        let err = tiles_options(&a)
+            .unwrap()
+            .validate_plan_only()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("description"), "{err}");
     }
 }
