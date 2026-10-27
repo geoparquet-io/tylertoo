@@ -7,6 +7,7 @@
 //! `Vec<Geometry>` — decode per batch and process immediately.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
@@ -224,6 +225,44 @@ pub fn fuzz_geoparquet_wkb(bytes: &[u8]) -> Result<Option<Geometry<f64>>> {
     Ok(decoded)
 }
 
+// F2: becomes Diagnostic::NonFiniteGeometry
+/// Process-wide count of decoded geometries that carried a NaN or infinite
+/// coordinate (#707) and were replaced by an empty geometry.
+static NON_FINITE_GEOMETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-wide non-finite geometry counter (#707).
+pub fn non_finite_geometry_count() -> u64 {
+    NON_FINITE_GEOMETRIES.load(Ordering::Relaxed)
+}
+
+/// `geometry`, or an empty geometry collection when any coordinate is NaN or
+/// infinite (#707): counted, and warned about once per process.
+///
+/// This is the ingest boundary every decoded geometry crosses (the
+/// in-memory convert, pass 2, the export's reads of an overview file), so a
+/// hostile coordinate is caught once per feature here instead of once per
+/// feature per tile per zoom at the clipper, and cannot take a fast path
+/// that skips the clipper's guard. Empty rather than dropped, so the output
+/// stays row-aligned with the batch's other columns: an empty geometry has
+/// no bounding box, so it lands in no tile, and the convert's usable-geometry
+/// filter skips it exactly as it skipped the non-finite original.
+fn finite_or_empty(geometry: Geometry<f64>) -> Geometry<f64> {
+    use geo::CoordsIter;
+    if geometry
+        .coords_iter()
+        .all(|c| c.x.is_finite() && c.y.is_finite())
+    {
+        return geometry;
+    }
+    if NON_FINITE_GEOMETRIES.fetch_add(1, Ordering::Relaxed) == 0 {
+        log::warn!(
+            "a geometry with a NaN or infinite coordinate was read and left out (#707); \
+             later ones are counted, not logged"
+        );
+    }
+    Geometry::GeometryCollection(geo::GeometryCollection::default())
+}
+
 /// [`extract_geometries_opt_from_array`]'s visitor: one row-aligned
 /// `Option<Geometry>` per slot.
 struct ExtractGeometries<'o> {
@@ -244,7 +283,8 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
                     let geom_trait = geom_result.map_err(|e| {
                         Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
                     })?;
-                    self.output.push(geom_trait.try_to_geometry());
+                    self.output
+                        .push(geom_trait.try_to_geometry().map(finite_or_empty));
                 }
                 None => self.output.push(None),
             }
@@ -256,6 +296,45 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #707: a decoded geometry with a NaN or infinite coordinate becomes an
+    /// empty geometry at the ingest boundary, counted, and the output stays
+    /// row-aligned.
+    #[test]
+    fn a_non_finite_geometry_is_emptied_and_counted_at_ingest() {
+        use arrow_array::BinaryArray;
+        use geoarrow::array::WkbArray;
+        use geoarrow::datatypes::WkbType;
+
+        let point = |x: f64, y: f64| {
+            let mut wkb = vec![1u8, 1, 0, 0, 0];
+            wkb.extend_from_slice(&x.to_le_bytes());
+            wkb.extend_from_slice(&y.to_le_bytes());
+            wkb
+        };
+        let mut line = vec![1u8, 2, 0, 0, 0, 2, 0, 0, 0];
+        for v in [0.0, 0.0, 1.0, f64::INFINITY] {
+            line.extend_from_slice(&f64::to_le_bytes(v));
+        }
+        let rows = [point(1.0, 2.0), line, point(3.0, 4.0)];
+        let array = WkbArray::from((
+            BinaryArray::from_vec(rows.iter().map(Vec::as_slice).collect()),
+            WkbType::default(),
+        ));
+        let before = non_finite_geometry_count();
+        let mut out = Vec::new();
+        extract_geometries_opt_from_array(&array, &mut out).unwrap();
+        assert_eq!(out.len(), 3, "row-aligned");
+        assert_eq!(
+            out[1],
+            Some(Geometry::GeometryCollection(
+                geo::GeometryCollection::default()
+            ))
+        );
+        assert!(matches!(out[0], Some(Geometry::Point(_))));
+        assert!(matches!(out[2], Some(Geometry::Point(_))));
+        assert!(non_finite_geometry_count() > before, "counted");
+    }
 
     /// A valid point, a null, and #632's 9-byte MultiPolygon that claims
     /// 4,294,967,295 polygons.
