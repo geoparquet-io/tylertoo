@@ -140,6 +140,20 @@ DATASETS = {
         "layer": "roads",
         "note": "1,000 LineString road detections, 90 KB",
     },
+    # Dense small fields: the data behind #748 (invalid polygons at coarse
+    # zooms), #750 and #762 (coverage at coarse zooms). No properties.
+    "ftw-moldova-z10": {
+        "path": FIXTURES / "ftw-moldova-z10.parquet",
+        "layer": "fields",
+        "note": "10,931 Polygon field boundaries, one z10 tile of FTW Moldova, 1.9 MB",
+    },
+    # Three huge admin-1 polygons: few features, many vertices, a tile
+    # split at every zoom.
+    "fieldmaps-boundaries": {
+        "path": FIXTURES / "fieldmaps-boundaries.parquet",
+        "layer": "adm1",
+        "note": "3 MultiPolygon admin-1 boundaries, 2.2 MB (FieldMaps)",
+    },
 }
 
 
@@ -463,6 +477,200 @@ def machine_info() -> dict:
     return info
 
 
+# --------------------------------------------------------------------------
+# --invariants: whole-archive invariants under a settings matrix (#779, G3)
+#
+# No tippecanoe here. Each (dataset, settings) cell runs `tylertoo tiles` on
+# a copy of the dataset with one extra column, `g3_fid` (the row index),
+# passed as `--feature-id`, so every MVT feature carries a source-unique id
+# and scripts/verify_archive.py --strict can count distinct features per
+# zoom. verify_archive then decodes EVERY tile and checks tile size, polygon
+# validity, feature and property accounting, monotone counts and the decay
+# of placeholder squares; known failures live in invariant_exemptions.toml,
+# one row per {fixture, settings, zoom, invariant, issue}.
+#
+# The settings are the ones users run that the structural guard
+# (ci_guard.py, defaults + --mode duplicating) never does: #749 needs
+# --polygon-visibility 0, #758 --simplify-factor 0, #750/#762 the coverage
+# fill. `--tier pr` runs defaults plus each dataset's most bug-prone setting;
+# `--tier full` the whole matrix (push to main, nightly).
+# --------------------------------------------------------------------------
+INVARIANT_ID_COLUMN = "g3_fid"
+EXEMPTIONS = HERE / "invariant_exemptions.toml"
+VERIFY_ARCHIVE = REPO / "scripts" / "verify_archive.py"
+
+# name -> (tiles flags, caps the archive is built with as verify_archive
+# flags, whether placeholder squares must decay toward coarse zooms).
+#
+# Decay is checked only with the polygon gate at 0, where every small polygon
+# reaches the coarse levels as a dithered square, so the squares must thin
+# ~4x per zoom (#749). With the gate on, small polygons leave at assignment
+# and the #384 accumulator draws carrier squares at a density-budget rate,
+# which need not halve over three zooms; and the coverage fill draws
+# square child-tile cells by design.
+_DEFAULT_CAPS: list[str] = []
+_NO_CAPS = ["--max-tile-size", "0", "--max-compressed-tile-size", "0"]
+INVARIANT_SETTINGS = {
+    "defaults": ([], _DEFAULT_CAPS, False),
+    # --verbatim turns thinning, simplification and both caps off.
+    "verbatim": (["--verbatim"], _NO_CAPS, False),
+    "pv0": (["--polygon-visibility", "0"], _DEFAULT_CAPS, True),
+    "sf0": (["--simplify-factor", "0"], _DEFAULT_CAPS, False),
+    "fill": (["--coverage-fill"], _DEFAULT_CAPS, False),
+}
+# Datasets only the invariant matrix runs (no tippecanoe benchmark value):
+# committed fixtures under crates/core/tests/fixtures/invariants/, from
+# make_fixtures.py there.
+INVARIANT_FIXTURES = REPO / "crates" / "core" / "tests" / "fixtures" / "invariants"
+INVARIANT_ONLY_DATASETS = {
+    # One NaN and one +inf vertex mid-ring: export drops both features with
+    # no counter (#707), which feature_accounting sees.
+    "nonfinite-vertex": {
+        "path": INVARIANT_FIXTURES / "nonfinite-vertex.parquet",
+        "layer": "buildings",
+        "note": "200 open-buildings rows, two with a non-finite vertex",
+    },
+}
+# --tier pr: defaults plus the setting most likely to break, per dataset.
+INVARIANT_PR_TIER = {
+    "open-buildings": ["defaults", "pv0"],  # #749: squares survive the cascade
+    "road-detections": ["defaults", "sf0"],  # lines only; #758 ran sf0
+    "madagascar-adm4": ["defaults", "fill"],  # #750 coverage fill
+    "ftw-moldova-z10": ["defaults", "fill"],  # #748 validity, #750/#762 fill
+    "fieldmaps-boundaries": ["defaults", "verbatim"],  # uncapped huge rings
+    "nonfinite-vertex": ["defaults"],  # #707 silent drop
+}
+
+
+def _grouped(outcomes: list[dict], status: str) -> list[str]:
+    """`invariant (z4,z5) #748` per invariant with `status`."""
+    by: dict[tuple, list[str]] = {}
+    for o in outcomes:
+        if o["status"] == status:
+            by.setdefault((o["invariant"], o["issue"]), []).append(o["zoom"])
+    out = []
+    for (inv, issue), zooms in sorted(by.items(), key=lambda kv: kv[0][0]):
+        zs = sorted(zooms, key=lambda z: -1 if z == "*" else int(z[1:]))
+        where = "" if zs == ["*"] else f" ({','.join(zs)})"
+        out.append(f"{inv}{where}" + (f" #{issue}" if issue else ""))
+    return out
+
+
+def run_invariants(args, datasets: dict) -> int:
+    """The settings matrix over `datasets`; returns the exit status."""
+    tylertoo = args.tylertoo
+    if not Path(tylertoo).exists():
+        return fail(f"tylertoo binary not found: {tylertoo}\n"
+                    f"  build it: cargo build --release -p tylertoo")
+    uv = shutil.which("uv")
+    if uv is None:
+        return fail("uv not found: verify_archive.py runs under `uv run`")
+    settings_filter = set(args.settings or [])
+    unknown = settings_filter - set(INVARIANT_SETTINGS)
+    if unknown:
+        return fail(f"unknown --settings {sorted(unknown)}; "
+                    f"known: {sorted(INVARIANT_SETTINGS)}")
+    cells = []
+    for did in datasets:
+        # The invariant-only fixtures each target one bug under one setting.
+        full = args.tier == "full" and did not in INVARIANT_ONLY_DATASETS
+        names = (list(INVARIANT_SETTINGS) if full
+                 else INVARIANT_PR_TIER.get(did, ["defaults"]))
+        cells += [(did, s) for s in names
+                  if not settings_filter or s in settings_filter]
+    if not cells:
+        return fail("no (dataset, settings) cell selected")
+
+    workdir = Path(args.work) if args.work else Path(tempfile.mkdtemp(prefix="tt-inv-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    pmtiles_bin = os.environ.get("PMTILES_BIN")
+    rows, outcomes, failed = [], [], []
+    t_all = time.monotonic()
+    try:
+        prepared: dict[str, Path] = {}
+        for did, sname in cells:
+            ds = datasets[did]
+            src = Path(ds["path"])
+            if not src.exists():
+                return fail(f"{did}: missing fixture {src}")
+            if did not in prepared:
+                dst = workdir / f"{did}.ids.parquet"
+                subprocess.run(
+                    [uv, "run", "-q", str(VERIFY_ARCHIVE), "--add-feature-ids",
+                     str(src), str(dst), "--feature-id", INVARIANT_ID_COLUMN],
+                    check=True, stdout=subprocess.DEVNULL)
+                prepared[did] = dst
+            flags, caps, decay = INVARIANT_SETTINGS[sname]
+            tag = f"{did}.{sname}"
+            archive = workdir / f"{tag}.pmtiles"
+            report = workdir / f"{tag}.report.json"
+            argv = [tylertoo, "tiles", str(prepared[did]), str(archive),
+                    "--min-zoom", str(args.min_zoom), "--max-zoom", str(args.max_zoom),
+                    "--layer-name", ds["layer"], "--feature-id", INVARIANT_ID_COLUMN,
+                    "--report", str(report), "--force", "-q", *flags]
+            print(f"\n=== {tag}: {' '.join(argv[1:])}", flush=True)
+            t0 = time.monotonic()
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            t_tiles = time.monotonic() - t0
+            if proc.returncode != 0:
+                print(proc.stderr[-4000:])
+                failed.append(f"{tag}: tiles exited {proc.returncode}")
+                rows.append((did, sname, t_tiles, 0.0, "tiles failed"))
+                continue
+            if pmtiles_bin:
+                pv = subprocess.run([pmtiles_bin, "verify", str(archive)],
+                                    capture_output=True, text=True)
+                if pv.returncode != 0:
+                    print(pv.stdout[-2000:], pv.stderr[-2000:])
+                    failed.append(f"{tag}: pmtiles verify failed")
+            out_json = workdir / f"{tag}.outcomes.json"
+            vargv = [uv, "run", "-q", str(VERIFY_ARCHIVE), str(archive),
+                     "--layer", ds["layer"], "--strict", "--report", str(report),
+                     "--input", str(prepared[did]), "--ids",
+                     "--feature-id", INVARIANT_ID_COLUMN, *caps,
+                     "--exemptions", str(args.exemptions),
+                     "--fixture", did, "--settings", sname,
+                     "--json-out", str(out_json)]
+            if decay:
+                vargv.append("--expect-decay")
+            t1 = time.monotonic()
+            vp = subprocess.run(vargv)
+            t_verify = time.monotonic() - t1
+            cell = json.loads(out_json.read_text()) if out_json.exists() else []
+            outcomes += cell
+            if vp.returncode != 0:
+                failed.append(f"{tag}: strict invariants failed")
+            summary = "; ".join(
+                [f"{st} {g}" for st in ("FAIL", "XPASS")
+                 for g in _grouped(cell, st)]
+                + [f"xfail {g}" for g in _grouped(cell, "XFAIL")]) or "all pass"
+            if vp.returncode != 0 and not any(o["status"] in ("FAIL", "XPASS") for o in cell):
+                summary = "verify_archive failed (see log)"
+            rows.append((did, sname, t_tiles, t_verify, summary))
+            if not args.keep:
+                archive.unlink(missing_ok=True)
+    finally:
+        if not args.keep and not args.work:
+            shutil.rmtree(workdir, ignore_errors=True)
+    wall = time.monotonic() - t_all
+
+    table = ["| fixture | settings | tiles s | verify s | result |",
+             "|---|---|--:|--:|---|"]
+    table += [f"| {d} | {s} | {a:.1f} | {b:.1f} | {r} |" for d, s, a, b, r in rows]
+    table.append(f"\n{len(rows)} cell(s), {wall:.0f} s wall")
+    print("\n" + "\n".join(table))
+    if args.markdown:
+        Path(args.markdown).write_text("\n".join(table) + "\n")
+    if args.invariants_out:
+        Path(args.invariants_out).write_text(json.dumps(outcomes, indent=1) + "\n")
+    if failed:
+        print(f"\n{len(failed)} cell(s) FAILED:")
+        for f in failed:
+            print(f"  - {f}")
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -513,7 +721,35 @@ def main() -> int:
                          "here explicitly")
     ap.add_argument("--markdown", default=None,
                     help="also write a markdown table here")
+    inv = ap.add_argument_group(
+        "whole-archive invariants (#779): no tippecanoe, no timing repeats")
+    inv.add_argument("--invariants", action="store_true",
+                     help="run the strict invariant matrix instead of the "
+                          "benchmark: tiles + verify_archive.py --strict per "
+                          "(dataset, settings) cell")
+    inv.add_argument("--tier", choices=("pr", "full"), default="full",
+                     help="pr: defaults + one bug-prone setting per dataset; "
+                          "full: every setting (default)")
+    inv.add_argument("--settings", action="append", default=None,
+                     help=f"restrict to these settings ({', '.join(INVARIANT_SETTINGS)})")
+    inv.add_argument("--exemptions", default=str(EXEMPTIONS),
+                     help="the exemption file (default: invariant_exemptions.toml)")
+    inv.add_argument("--invariants-out", default=None,
+                     help="write every invariant outcome here as JSON")
     args = ap.parse_args()
+    if args.invariants:
+        datasets = {**DATASETS, **INVARIANT_ONLY_DATASETS}
+        for spec in args.dataset:
+            if "=" not in spec:
+                return fail(f"--dataset expects ID=PATH, got {spec!r}")
+            did, dpath = spec.split("=", 1)
+            datasets[did] = {"path": Path(dpath), "layer": did}
+        if args.only:
+            missing = [d for d in args.only if d not in datasets]
+            if missing:
+                return fail(f"unknown dataset(s): {', '.join(missing)}")
+            datasets = {k: v for k, v in datasets.items() if k in args.only}
+        return run_invariants(args, datasets)
     if args.out is None:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         args.out = str(HERE / f"results-{stamp}.json")
