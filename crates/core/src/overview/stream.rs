@@ -2018,7 +2018,7 @@ fn convert_preflight(
         options,
         super::pipeline::probe_preflight_memory_limit(),
         super::convert::skip_memory_preflight_from_env(),
-        crate::untrusted::byte_array_limit(),
+        None,
     )
 }
 
@@ -2026,8 +2026,8 @@ fn convert_preflight(
 /// escape-hatch decision, and the #563 oversized-geometry-column ceiling
 /// (test seam: mirrors [`build_writer_options_with_ceiling`]'s #509
 /// pattern). Production always calls it via `convert_preflight` with the
-/// real uncached memory probe and the owner's ceiling
-/// ([`crate::untrusted::byte_array_limit`]); tests pass a tiny
+/// real uncached memory probe and no ceiling override, so the ceiling is the
+/// owner's ([`crate::untrusted::byte_array_limit`]); tests pass a tiny
 /// mocked memory limit (#543) or byte-array batch ceiling (#563) to prove
 /// each hard error fires from footer statistics alone — before
 /// `stage_input_pass0` or pass 1 ever runs — without needing an actually
@@ -2037,7 +2037,7 @@ fn convert_preflight_with_memory_limit(
     options: &ConvertOptions,
     memory_limit: Option<super::pipeline::MemoryLimit>,
     skip_memory_preflight: bool,
-    byte_array_limit_bytes: u64,
+    byte_array_limit_bytes: Option<u64>,
 ) -> Result<Preflight, ConvertError> {
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
@@ -2122,7 +2122,7 @@ fn convert_preflight_with_memory_limit(
         source,
         selected_row_groups.as_ref(),
         options.read_batch_size,
-        byte_array_limit_bytes,
+        byte_array_limit_bytes.unwrap_or_else(crate::untrusted::byte_array_limit),
     )?;
     // #543: preflight the pass-1 feature table's memory floor from footer row
     // counts alone — no I/O beyond the footers already read above — BEFORE
@@ -6295,26 +6295,14 @@ mod tests {
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
         // A generous mocked limit fits comfortably.
-        convert_preflight_with_memory_limit(
-            &source,
-            &options,
-            hard_limit(1 << 40),
-            false,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        )
-        .expect("10 rows must fit a 1 TiB mocked limit");
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false, None)
+            .expect("10 rows must fit a 1 TiB mocked limit");
 
         // A 1-byte mocked hard limit cannot possibly fit 10 rows' feature
         // table — this must fail from the footer row count alone, never
         // having opened a data page (the fixture is tiny; if this reached
         // pass 1 it would simply succeed, silently defeating the test).
-        match convert_preflight_with_memory_limit(
-            &source,
-            &options,
-            hard_limit(1),
-            false,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        ) {
+        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false, None) {
             Err(
                 err @ ConvertError::Pass1MemoryFloorExceeded {
                     rows: 10,
@@ -6336,14 +6324,8 @@ mod tests {
         }
 
         // The escape hatch downgrades it to a warning.
-        convert_preflight_with_memory_limit(
-            &source,
-            &options,
-            hard_limit(1),
-            true,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        )
-        .expect("the skip hatch must downgrade the hard error");
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), true, None)
+            .expect("the skip hatch must downgrade the hard error");
 
         // #543 review (S1-2): under a per-feature --bbox the footer count is
         // only an upper bound, so the same tiny hard limit only warns.
@@ -6351,14 +6333,8 @@ mod tests {
             bbox: Some([-180.0, -90.0, 180.0, 90.0]),
             ..options.clone()
         };
-        convert_preflight_with_memory_limit(
-            &source,
-            &bbox_options,
-            hard_limit(1),
-            false,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        )
-        .expect("a --bbox extract must never hard-error on an upper-bound row count");
+        convert_preflight_with_memory_limit(&source, &bbox_options, hard_limit(1), false, None)
+            .expect("a --bbox extract must never hard-error on an upper-bound row count");
     }
 
     /// #563: when the geometry rows alone average more than the (mocked)
@@ -6382,8 +6358,13 @@ mod tests {
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
-        match convert_preflight_with_memory_limit(&source, &options, hard_limit(1 << 40), false, 1)
-        {
+        match convert_preflight_with_memory_limit(
+            &source,
+            &options,
+            hard_limit(1 << 40),
+            false,
+            Some(1),
+        ) {
             Err(err @ ConvertError::ByteArrayRowTooLarge { .. }) => {
                 let msg = err.to_string();
                 for want in ["row group 0", "column 'geometry'", "per row"] {
@@ -6438,7 +6419,7 @@ mod tests {
             &options,
             hard_limit(1 << 40),
             false,
-            limit,
+            Some(limit),
         )
         .expect("small rows in a large row group must not be rejected");
         assert!(
@@ -6454,7 +6435,7 @@ mod tests {
             &options,
             hard_limit(1 << 40),
             false,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6525,14 +6506,8 @@ mod tests {
         };
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
 
-        convert_preflight_with_memory_limit(
-            &source,
-            &options,
-            hard_limit(1),
-            false,
-            crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        )
-        .expect("a --plan replay must skip the pass-1 memory preflight entirely");
+        convert_preflight_with_memory_limit(&source, &options, hard_limit(1), false, None)
+            .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
 
     /// Run [`run_pass1_with_chunk_rows`] over a fixture file with a fresh
