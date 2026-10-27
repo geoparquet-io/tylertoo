@@ -2107,7 +2107,7 @@ fn convert_preflight_with_memory_limit(
     let read_batch_rows = source.read_batch_rows(
         selected_row_groups.as_ref(),
         options.read_batch_size,
-        crate::untrusted::byte_array_limit(),
+        tylertoo_io::byte_array_limit(),
     )?;
     // #543: preflight the pass-1 feature table's memory floor from footer row
     // counts alone — no I/O beyond the footers already read above — BEFORE
@@ -7440,9 +7440,9 @@ mod tests {
     fn write_input_with_corrupt_wkb(path: &Path, n: usize, bad_row: usize) {
         use arrow_array::{BinaryArray, Int64Array};
         use arrow_schema::DataType;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
         use std::sync::Arc;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::KeyValue;
 
         fn point_wkb(x: f64, y: f64) -> Vec<u8> {
             let mut v = Vec::with_capacity(21);

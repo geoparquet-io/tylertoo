@@ -145,10 +145,10 @@ fn every_reader_path_honours_the_scaled_ceilings() {
 fn reader_regressions(dir: &Path) {
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch, StringArray};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
-    use tylertoo_core::untrusted::open_parquet;
+    use tylertoo_io::open_parquet;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     std::env::set_var(BYTE_ARRAY_ENV, "1000");
     let read = |name: &str, array: ArrayRef| {
@@ -194,8 +194,8 @@ fn reader_regressions(dir: &Path) {
     let error = read("nested.parquet", Arc::new(list.finish())).unwrap_err();
     assert!(
         matches!(
-            tylertoo_core::untrusted::input_error(&error),
-            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+            tylertoo_io::input_error(&error),
+            Some(tylertoo_io::Error::ByteArrayRowTooLarge { .. })
         ),
         "{error}"
     );
@@ -206,8 +206,8 @@ fn reader_regressions(dir: &Path) {
     .unwrap_err();
     assert!(
         matches!(
-            tylertoo_core::untrusted::input_error(&error),
-            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+            tylertoo_io::input_error(&error),
+            Some(tylertoo_io::Error::ByteArrayRowTooLarge { .. })
         ),
         "{error}"
     );
@@ -238,8 +238,8 @@ fn reader_regressions(dir: &Path) {
     let error = read("dictionary-too-wide.parquet", dict(1200)).unwrap_err();
     assert!(
         matches!(
-            tylertoo_core::untrusted::input_error(&error),
-            Some(tylertoo_core::input::InputError::ByteArrayRowTooLarge { .. })
+            tylertoo_io::input_error(&error),
+            Some(tylertoo_io::Error::ByteArrayRowTooLarge { .. })
         ),
         "{error}"
     );

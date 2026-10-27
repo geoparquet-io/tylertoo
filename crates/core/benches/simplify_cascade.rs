@@ -21,11 +21,11 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::Geometry;
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::overview::simplify::{
     simplify_cascade, CascadeStep, CollapseMode, Crs, SimplifyOptions,
 };
+use tylertoo_io::open_parquet;
 
 /// Path to the Antarctica polygon fixture (316k coords).
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
@@ -51,7 +51,7 @@ fn load_largest_boundary() -> Option<Geometry<f64>> {
         return None;
     }
     let file = File::open(path).ok()?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let builder = open_parquet(file).ok()?;
     let schema = builder.schema().clone();
     let gidx = schema.index_of("geometry").ok()?;
     let gfield = schema.field(gidx).clone();

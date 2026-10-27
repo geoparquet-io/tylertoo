@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use parquet::file::metadata::{KeyValue, ParquetMetaData};
+use tylertoo_io::ReaderMetadata;
+use tylertoo_io::{KeyValue, ParquetMetaData};
 
 #[cfg(feature = "remote")]
 use crate::input::is_remote_scheme;
@@ -109,7 +109,7 @@ struct PartMeta {
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
     /// reader per segment: a 1084-segment run parsed the footer 1084 times,
     /// twice per conversion.
-    reader: ArrowReaderMetadata,
+    reader: ReaderMetadata,
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
@@ -139,86 +139,6 @@ pub struct MultiSource {
 /// part entirely.
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
-
-/// Most bytes of one byte-array column a single decoded record batch can hold.
-///
-/// arrow-rs decodes a parquet `BYTE_ARRAY` column (WKB geometry, strings)
-/// into a `BinaryArray`/`StringArray` whose offsets are `i32`, so one decoded
-/// record batch holds at most this many bytes of any one such column (#563).
-/// Past it the read fails with the opaque `Parquet error: index overflow
-/// decoding byte array`.
-///
-/// The ceiling applies per BATCH, not per row group: a batch may be a slice
-/// of one row group or straddle several. A row group larger than this reads
-/// fine in batches of fewer rows, and row groups each well under it overflow
-/// when one batch spans enough of them.
-///
-/// The ceiling every read path sizes against is
-/// [`crate::untrusted::byte_array_limit`]: this value, unless a test scaled
-/// it down.
-pub use crate::untrusted::BYTE_ARRAY_BATCH_LIMIT;
-
-/// The byte-array column that holds the most decoded bytes in total over some
-/// row groups (#606): what decides whether one batch can hold all of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LargestByteArrayColumn {
-    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
-    pub column: String,
-    /// Decoded bytes summed over the row groups.
-    pub total_bytes: u64,
-}
-
-/// The byte-array leaf column of `meta` with the most decoded bytes summed
-/// over row groups `row_groups` (`None` = all), counting only leaves under a
-/// root column for which `root_counts` returns true. `None` when no counted
-/// leaf holds any bytes.
-///
-/// Footer-only. A chunk's size is its `unencoded_byte_array_data_bytes` size
-/// statistic when the writer recorded it, the exact length of the values the
-/// decoded array holds. Without it the chunk's `total_uncompressed_size`
-/// stands in. That figure counts a dictionary-encoded chunk's distinct values
-/// once, so the total can then fall short of the decoded size.
-pub(crate) fn largest_byte_array_column(
-    meta: &ParquetMetaData,
-    row_groups: Option<&[usize]>,
-    root_counts: impl Fn(usize) -> bool,
-) -> Option<LargestByteArrayColumn> {
-    let descr = meta.file_metadata().schema_descr();
-    let groups = meta.row_groups();
-    let all: Vec<usize>;
-    let picked: &[usize] = match row_groups {
-        Some(p) => p,
-        None => {
-            all = (0..groups.len()).collect();
-            &all
-        }
-    };
-    let mut totals = vec![0u64; descr.num_columns()];
-    for &gi in picked {
-        let Some(rg) = groups.get(gi) else {
-            continue;
-        };
-        for (leaf, col) in rg.columns().iter().enumerate() {
-            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
-                continue;
-            }
-            let bytes = col
-                .unencoded_byte_array_data_bytes()
-                .unwrap_or_else(|| col.uncompressed_size())
-                .max(0) as u64;
-            totals[leaf] = totals[leaf].saturating_add(bytes);
-        }
-    }
-    totals
-        .iter()
-        .enumerate()
-        .filter(|&(leaf, &bytes)| bytes > 0 && root_counts(descr.get_column_root_idx(leaf)))
-        .max_by_key(|&(_, &bytes)| bytes)
-        .map(|(leaf, &total_bytes)| LargestByteArrayColumn {
-            column: descr.column(leaf).path().string(),
-            total_bytes,
-        })
-}
 
 /// Maps a row's position in a [`ConvertSource`]'s read stream back to the
 /// part and the row within that part's file (#553).
@@ -364,12 +284,12 @@ pub struct SourceStream<'a> {
     parts: &'a [InputSource],
     /// Each part's already-parsed footer, parallel to `parts`, so opening a
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
-    metas: Vec<ArrowReaderMetadata>,
+    metas: Vec<ReaderMetadata>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
     part_idx: usize,
-    current: Option<crate::untrusted::UntrustedBatchReader>,
+    current: Option<tylertoo_io::UntrustedBatchReader>,
     done: bool,
 }
 
@@ -774,11 +694,11 @@ impl ConvertSource {
                     Some(picked) => picked
                         .iter()
                         .filter_map(|&g| groups.get(g))
-                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                        .map(tylertoo_io::RowGroupMetaData::num_rows)
                         .sum::<i64>(),
                     None => groups
                         .iter()
-                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                        .map(tylertoo_io::RowGroupMetaData::num_rows)
                         .sum::<i64>(),
                 }
             })
@@ -789,7 +709,7 @@ impl ConvertSource {
     /// when `selected` is `None`), straight from the footers: every leaf under
     /// the column, each counted as its uncompressed size or, for a byte-array
     /// leaf whose footer records it, its unencoded data bytes if larger (the
-    /// #563 rule in [`crate::untrusted::read_batch_plan`]).
+    /// #563 rule in [`tylertoo_io::read_batch_plan`]).
     ///
     /// `column` indexes the schema this source exposes, as a
     /// [`ReadPlan::projection`] does. Pass 1 reports this as the geometry
@@ -864,7 +784,7 @@ impl ConvertSource {
                 m.parquet
                     .row_groups()
                     .iter()
-                    .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                    .map(tylertoo_io::RowGroupMetaData::num_rows)
                     .collect()
             })
             .collect())
@@ -972,7 +892,7 @@ impl ConvertSource {
             .iter()
             .enumerate()
             .fold(requested, |rows, (pi, m)| {
-                crate::untrusted::read_batch_plan(
+                tylertoo_io::read_batch_plan(
                     &m.parquet,
                     selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
                     rows,
@@ -1444,7 +1364,7 @@ impl SourceStream<'_> {
     /// Open part `i`'s reader with this stream's projection / row-group
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
-    fn open_part(&self, i: usize) -> Result<crate::untrusted::UntrustedBatchReader, InputError> {
+    fn open_part(&self, i: usize) -> Result<tylertoo_io::UntrustedBatchReader, InputError> {
         let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {
             builder = builder.with_projection_roots(cols.iter().copied());
@@ -1722,9 +1642,9 @@ mod tests {
     use super::*;
     use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrow_schema::DataType;
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
     use std::fs::File;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     /// Write a small parquet file with the given fields/columns and row
     /// group size (None = single row group).
@@ -2027,7 +1947,7 @@ mod tests {
             let file = File::create(&path).unwrap();
             let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
             writer.write(&batch).unwrap();
-            writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
                 "geo".to_string(),
                 geo(epsg),
             ));
@@ -2245,7 +2165,7 @@ mod tests {
         let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
 
         // Leaves 1 and 2 (pt.x, pt.y) sit under root column 1.
-        let meta = crate::untrusted::read_parquet_metadata(&File::open(&path).unwrap()).unwrap();
+        let meta = tylertoo_io::read_parquet_metadata(&File::open(&path).unwrap()).unwrap();
         assert_eq!(meta.num_row_groups(), 4);
         let rg_bytes = |g: usize| -> u64 {
             let rg = meta.row_group(g);
@@ -2927,25 +2847,25 @@ b.parquet
             ],
             Some(2),
         );
-        let meta =
-            crate::untrusted::read_parquet_metadata(&std::fs::File::open(&f).unwrap()).unwrap();
+        let meta = tylertoo_io::read_parquet_metadata(&std::fs::File::open(&f).unwrap()).unwrap();
         let meta = meta.as_ref();
 
-        let all = largest_byte_array_column(meta, None, |_| true).unwrap();
+        let all = tylertoo_io::largest_byte_array_column(meta, None, |_| true).unwrap();
         assert_eq!(all.column, "geometry");
         assert!(
             (8224..8224 + 128).contains(&all.total_bytes),
             "the sum over both groups: {all:?}"
         );
 
-        let small = largest_byte_array_column(meta, Some(&[0]), |_| true).unwrap();
+        let small = tylertoo_io::largest_byte_array_column(meta, Some(&[0]), |_| true).unwrap();
         assert_eq!(small.column, "name", "2000 name bytes beat 32: {small:?}");
 
-        let names_only = largest_byte_array_column(meta, None, |root| root == 1).unwrap();
+        let names_only =
+            tylertoo_io::largest_byte_array_column(meta, None, |root| root == 1).unwrap();
         assert_eq!(names_only.column, "name");
-        assert!(largest_byte_array_column(meta, None, |_| false).is_none());
+        assert!(tylertoo_io::largest_byte_array_column(meta, None, |_| false).is_none());
         assert!(
-            largest_byte_array_column(meta, None, |root| root == 2).is_none(),
+            tylertoo_io::largest_byte_array_column(meta, None, |root| root == 2).is_none(),
             "a column holding no bytes is not a largest column"
         );
     }

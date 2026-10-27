@@ -9444,10 +9444,10 @@ mod tests {
     fn rewrite_overview(src: &Path, dst: &Path, bad_row: Option<usize>, strip_covering: bool) {
         use arrow_array::{Array, BinaryArray};
 
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::KeyValue;
 
-        let probe = crate::untrusted::open_parquet(File::open(src).unwrap()).unwrap();
+        let probe = tylertoo_io::open_parquet(File::open(src).unwrap()).unwrap();
         let in_schema = probe.schema().clone();
         let num_rgs = probe.metadata().num_row_groups();
         let strip_geo = |kv: KeyValue| match (strip_covering, kv.key.as_str()) {
@@ -9488,7 +9488,7 @@ mod tests {
             ArrowWriter::try_new(File::create(dst).unwrap(), schema.clone(), None).unwrap();
         let mut row0 = 0usize;
         for rg in 0..num_rgs {
-            let reader = crate::untrusted::open_parquet(File::open(src).unwrap())
+            let reader = tylertoo_io::open_parquet(File::open(src).unwrap())
                 .unwrap()
                 .with_row_groups(vec![rg])
                 .with_batch_rows(usize::MAX >> 1)
@@ -11919,7 +11919,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        crate::untrusted::open_parquet(file)
+        tylertoo_io::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14094,7 +14094,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        crate::untrusted::open_parquet(file)
+        tylertoo_io::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14153,7 +14153,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        let names: Vec<String> = crate::untrusted::open_parquet(file)
+        let names: Vec<String> = tylertoo_io::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14732,7 +14732,7 @@ mod tests {
         )
         .unwrap();
         let file = std::fs::File::open(decoded.path()).unwrap();
-        Ok(crate::untrusted::open_parquet(file)
+        Ok(tylertoo_io::open_parquet(file)
             .unwrap()
             .schema()
             .fields()
@@ -14820,7 +14820,7 @@ mod tests {
         use geoparquet::writer::{
             GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
         };
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
 
         let geoms = [Geometry::Point(Point::new(0.0, 0.0))];
         let arr = match md {

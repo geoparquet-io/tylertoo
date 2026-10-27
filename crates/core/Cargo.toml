@@ -21,7 +21,7 @@ features = ["remote"]
 [features]
 default = []
 # Scaled byte-array ceilings for the isolated integration-test lane only.
-testing = []
+testing = ["tylertoo-io/testing"]
 dhat-heap = ["dhat"]
 # Fuzz hooks (#424): `#[doc(hidden)]` entry points that let the standalone
 # `fuzz/` crate reach parsers which are private on purpose (the MVT tile
@@ -48,11 +48,10 @@ geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
 geo-traits = { workspace = true }
 geoparquet = { workspace = true }
-parquet = { workspace = true }
+tylertoo-io = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true }
-arrow-ipc = { workspace = true }
 arrow-cast = { workspace = true }
 # --filter evaluation kernels (overview/filter.rs).
 arrow-ord = { workspace = true }
@@ -122,6 +121,7 @@ libc = "0.2"
 prost-build = { workspace = true }
 
 [dev-dependencies]
+tylertoo-io = { workspace = true, features = ["test-support"] }
 # CodSpeed's criterion shim (#614): identical API, so the benches still
 # `use criterion::…`. Under `cargo codspeed` it measures instruction counts;
 # under plain `cargo bench` it is ordinary criterion.

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use tylertoo_io::test_support::ArrowWriter;
+use tylertoo_io::test_support::WriterProperties;
 
 const ROWS: usize = 5_000;
 
@@ -77,7 +77,7 @@ fn write_points(path: &Path) {
         }},
     });
     let props = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+        .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]))

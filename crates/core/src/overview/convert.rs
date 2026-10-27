@@ -1553,7 +1553,7 @@ pub enum ConvertError {
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -1840,7 +1840,7 @@ pub enum ConvertError {
     #[error("{}", in_memory_byte_array_too_large_message(.largest, .limit_bytes))]
     InMemoryByteArrayTooLarge {
         /// The column whose total is too large.
-        largest: crate::input_set::LargestByteArrayColumn,
+        largest: tylertoo_io::LargestByteArrayColumn,
         /// The per-batch ceiling checked against.
         limit_bytes: u64,
     },
@@ -1848,7 +1848,7 @@ pub enum ConvertError {
 
 /// The message body of [`ConvertError::InMemoryByteArrayTooLarge`] (#606).
 fn in_memory_byte_array_too_large_message(
-    largest: &crate::input_set::LargestByteArrayColumn,
+    largest: &tylertoo_io::LargestByteArrayColumn,
     limit_bytes: &u64,
 ) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
@@ -3503,20 +3503,18 @@ mod property_selection_tests {
 /// its batches will carry.
 fn project_builder_to_selection(
     source: &ConvertSource,
-    builder: crate::untrusted::ParquetSource<crate::input::InputReader>,
+    builder: tylertoo_io::ParquetSource<crate::input::InputReader>,
 ) -> Result<
     (
-        crate::untrusted::ParquetSource<crate::input::InputReader>,
+        tylertoo_io::ParquetSource<crate::input::InputReader>,
         SchemaRef,
     ),
     ConvertError,
 > {
     match source.column_projection() {
         Some(keep) => {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                keep.iter().copied(),
-            );
+            let mask =
+                tylertoo_io::ProjectionMask::roots(builder.parquet_schema(), keep.iter().copied());
             let projected = Arc::new(builder.schema().project(keep)?);
             Ok((builder.with_projection(mask), projected))
         }
@@ -3536,7 +3534,7 @@ fn project_builder_to_selection(
 /// cannot overflow and are not counted.
 fn check_in_memory_byte_array_total(
     source: &ConvertSource,
-    builder: &crate::untrusted::ParquetSource<crate::input::InputReader>,
+    builder: &tylertoo_io::ParquetSource<crate::input::InputReader>,
     row_groups: Option<&[usize]>,
     limit_bytes: u64,
 ) -> Result<(), ConvertError> {
@@ -3554,7 +3552,7 @@ fn check_in_memory_byte_array_total(
                 )
             })
     };
-    match crate::input_set::largest_byte_array_column(builder.metadata(), row_groups, counts) {
+    match tylertoo_io::largest_byte_array_column(builder.metadata(), row_groups, counts) {
         Some(largest) if largest.total_bytes > limit_bytes => {
             Err(ConvertError::InMemoryByteArrayTooLarge {
                 largest,
@@ -3646,13 +3644,13 @@ fn load_input_table(
         source,
         source_single,
         options,
-        crate::untrusted::byte_array_limit(),
+        tylertoo_io::byte_array_limit(),
     )
 }
 
 /// [`load_input_table`], parameterized on the #606 ceiling for one
 /// byte-array column's bytes across the whole table (test seam). Production
-/// passes the owner's ceiling, [`crate::untrusted::byte_array_limit`]; tests
+/// passes the owner's ceiling, [`tylertoo_io::byte_array_limit`]; tests
 /// pass a tiny one to prove the error fires from footer statistics alone.
 fn load_input_table_with_limit(
     source: &ConvertSource,
@@ -3742,7 +3740,7 @@ fn load_input_table_with_limit(
     // reader checked each batch; batches each under a scaled ceiling can
     // pass it together, so the concatenated table is checked here (#779; a
     // no-op at the real ceiling, which arrow's concat enforces).
-    crate::untrusted::check_byte_array_ceiling(&full)?;
+    tylertoo_io::check_byte_array_ceiling(&full)?;
 
     // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
     // empty, or non-finite geometry cannot participate in level assignment:
@@ -4505,7 +4503,7 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
 /// `input` names the file in the error (#452).
 pub(crate) fn detect_crs_from_kv(
-    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
 ) -> Result<Crs, ConvertError> {
     detect_crs_from_kv_assumed(kv, input).map(|(crs, _)| crs)
@@ -4516,7 +4514,7 @@ pub(crate) fn detect_crs_from_kv(
 /// [`crate::quality::CrsInfo::assumed_wgs84`]), so the convert paths can
 /// warn naming the input and record the assumption on the [`ConvertReport`].
 pub(crate) fn detect_crs_from_kv_assumed(
-    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
 ) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
@@ -4579,7 +4577,7 @@ pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
         [("geo".to_string(), geo_json.to_string())].into(),
     );
     let _ = find_geometry_column(&schema);
-    let kv = vec![parquet::file::metadata::KeyValue::new(
+    let kv = vec![tylertoo_io::KeyValue::new(
         "geo".to_string(),
         geo_json.to_string(),
     )];
@@ -4715,7 +4713,7 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// than one geometry column can never be pruned on an envelope the reader
 /// will not read (#518).
 pub(crate) fn select_input_row_groups_any(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     boxes: &[[f64; 4]],
 ) -> Vec<usize> {
     let bounds = input_row_group_bounds(metadata);
@@ -4746,7 +4744,7 @@ pub(crate) fn select_input_row_groups_any(
 /// [`select_input_row_groups_any`] for a single box.
 #[cfg(test)]
 pub(crate) fn select_input_row_groups(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
     select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
@@ -4764,7 +4762,7 @@ pub(crate) fn select_input_row_groups(
 /// Entry `i` is row group `i`'s bbox, or `None` when neither statistics tier
 /// can supply one.
 pub(crate) fn input_row_group_bounds(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
 ) -> Vec<Option<crate::covering::RowGroupBounds>> {
     let geom_column = crate::covering::resolve_geometry_column_name(metadata);
     // The error is discarded (it falls back below), so its name is moot.
@@ -4874,7 +4872,7 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
 /// pruning (#102) intersected with attribute-filter statistics pushdown
 /// (#315). `None` when neither pruning is active (read everything).
 fn select_input_row_groups_combined(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     bbox_query: Option<&BboxQuery>,
     filter: Option<&super::filter::BoundFilter>,
 ) -> Option<Vec<usize>> {
@@ -7832,7 +7830,7 @@ pub(super) fn fill_level_bytes(
     reports: &mut [LevelReport],
 ) -> Result<(), ConvertError> {
     let file = std::fs::File::open(output_path)?;
-    let pmeta = crate::untrusted::read_parquet_metadata(&file)?;
+    let pmeta = tylertoo_io::read_parquet_metadata(&file)?;
 
     let mut start = 0usize;
     for (level, report) in meta.levels.iter().zip(reports.iter_mut()) {
@@ -8721,7 +8719,7 @@ mod tests {
     use geoparquet::writer::{
         GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
     };
-    use parquet::arrow::ArrowWriter;
+    use tylertoo_io::test_support::ArrowWriter;
 
     use crate::batch_processor::extract_geometries_from_array;
 
@@ -9752,7 +9750,7 @@ mod tests {
     /// Field names of an overview output file, in schema order.
     fn output_column_names(path: &Path) -> Vec<String> {
         let file = std::fs::File::open(path).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         builder
             .schema()
             .fields()
@@ -9971,7 +9969,7 @@ mod tests {
         range: std::ops::Range<usize>,
         row_group_rows: Option<usize>,
     ) {
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::WriterProperties;
         let total = geoms.len();
         let idx: Vec<usize> = range.collect();
         let id = Int64Array::from(idx.iter().map(|&i| i as i64).collect::<Vec<_>>());
@@ -10234,14 +10232,12 @@ mod tests {
     /// #606: the message reports both sizes in GiB.
     #[test]
     fn in_memory_byte_array_message_reports_sizes_in_gib() {
-        let largest = crate::input_set::LargestByteArrayColumn {
+        let largest = tylertoo_io::LargestByteArrayColumn {
             column: "geometry".into(),
             total_bytes: 5 << 29,
         };
-        let msg = in_memory_byte_array_too_large_message(
-            &largest,
-            &crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        );
+        let msg =
+            in_memory_byte_array_too_large_message(&largest, &tylertoo_io::BYTE_ARRAY_BATCH_LIMIT);
         assert!(msg.contains("'geometry' holds 2.50 GiB"), "{msg}");
         assert!(msg.contains("beyond the 2.00 GiB"), "{msg}");
     }
@@ -10251,7 +10247,7 @@ mod tests {
     /// projection leaves out, cannot overflow the concat.
     #[test]
     fn in_memory_byte_array_check_skips_large_and_unprojected_columns() {
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
@@ -11935,13 +11931,13 @@ mod tests {
 
     /// Build the "geo" key-value metadata for a single WKB geometry column
     /// with the given `crs` value (a PROJJSON object or a string).
-    fn kv_geo_with_crs(crs: serde_json::Value) -> Vec<parquet::file::metadata::KeyValue> {
+    fn kv_geo_with_crs(crs: serde_json::Value) -> Vec<tylertoo_io::KeyValue> {
         let geo = serde_json::json!({
             "version": "1.1.0",
             "primary_column": "geometry",
             "columns": { "geometry": { "encoding": "WKB", "crs": crs } }
         });
-        vec![parquet::file::metadata::KeyValue::new(
+        vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]
@@ -12027,8 +12023,7 @@ mod tests {
 
         // Sanity: the file really does declare 3857.
         let meta =
-            crate::untrusted::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap())
-                .unwrap();
+            tylertoo_io::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap()).unwrap();
         let kv = meta.file_metadata().key_value_metadata().cloned();
         assert_eq!(
             detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
@@ -12201,7 +12196,7 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         let file = std::fs::File::open(tin.path()).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let schema = builder.schema();
         assert!(
             schema.metadata().contains_key("geo"),
@@ -12901,7 +12896,7 @@ mod tests {
     /// Raw `geo:overviews` footer JSON of an overview file.
     fn overviews_footer_json(path: &Path) -> String {
         let file = std::fs::File::open(path).unwrap();
-        let b = crate::untrusted::open_parquet(file).unwrap();
+        let b = tylertoo_io::open_parquet(file).unwrap();
         b.metadata()
             .file_metadata()
             .key_value_metadata()
@@ -12987,8 +12982,7 @@ mod tests {
     fn assert_outputs_equivalent(a: &Path, b: &Path, ctx: &str) {
         // Row-group layout (num groups, rows per group, column count).
         let layout = |p: &Path| -> Vec<(i64, usize)> {
-            let md =
-                crate::untrusted::read_parquet_metadata(&std::fs::File::open(p).unwrap()).unwrap();
+            let md = tylertoo_io::read_parquet_metadata(&std::fs::File::open(p).unwrap()).unwrap();
             (0..md.num_row_groups())
                 .map(|i| (md.row_group(i).num_rows(), md.row_group(i).columns().len()))
                 .collect()
@@ -15274,8 +15268,7 @@ mod tests {
 
         /// Byte span `[start, end)` of each row group's data pages.
         fn row_group_spans(bytes: &[u8]) -> Vec<std::ops::Range<u64>> {
-            let builder =
-                crate::untrusted::open_parquet(bytes::Bytes::from(bytes.to_vec())).unwrap();
+            let builder = tylertoo_io::open_parquet(bytes::Bytes::from(bytes.to_vec())).unwrap();
             builder
                 .metadata()
                 .row_groups()

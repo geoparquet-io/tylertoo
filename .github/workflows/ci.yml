@@ -1241,7 +1241,7 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: cargo "+$MSRV" check --locked --workspace --all-targets --all-features
 
-      # Public API surface: fail when tylertoo-core's exported API drifts from
+      # Public API surface: fail when core's or io's exported API drifts from
       # the committed baseline. This is a REVIEW gate, not a ban on growth —
       # an intentional change is landed by regenerating the baseline in the
       # same PR:
@@ -1264,16 +1264,20 @@ jobs:
 
       - name: Diff the public API against the baseline
         if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
-        working-directory: crates/core
         run: |
-          cargo "+$NIGHTLY" public-api --simplified > api-current.txt
-          if ! diff -u api/tylertoo-core.txt api-current.txt; then
-            echo "::error::tylertoo-core public API changed."
-            echo "Regenerate the baseline in this PR if the change is intended:"
-            echo "  cd crates/core && cargo +$NIGHTLY public-api \\"
-            echo "    --simplified > api/tylertoo-core.txt"
-            exit 1
-          fi
+          for crate in core io; do
+            (
+              cd "crates/$crate"
+              cargo "+$NIGHTLY" public-api --simplified > api-current.txt
+              if ! diff -u "api/tylertoo-$crate.txt" api-current.txt; then
+                echo "::error::tylertoo-$crate public API changed."
+                echo "Regenerate the baseline in this PR if the change is intended:"
+                echo "  cd crates/$crate && cargo +$NIGHTLY public-api \\"
+                echo "    --simplified > api/tylertoo-$crate.txt"
+                exit 1
+              fi
+            ) || exit 1
+          done
 
   # Independent archive-verifier regression tests; one scripts/ci pytest step.
   gate-scripts:

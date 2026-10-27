@@ -1,8 +1,8 @@
 use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType, Field};
-use parquet::arrow::{ArrowWriter, ProjectionMask};
 use std::sync::Arc;
-use tylertoo_core::untrusted::open_parquet;
+use tylertoo_io::open_parquet;
+use tylertoo_io::{test_support::ArrowWriter, ProjectionMask};
 
 #[test]
 fn byte_array_widening_preserves_partial_nested_projection() {

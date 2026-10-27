@@ -50,13 +50,13 @@ use std::io::{BufReader, BufWriter};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::Schema;
 use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
+use tylertoo_io::IpcStreamReader as StreamReader;
+use tylertoo_io::IpcStreamWriter as StreamWriter;
 
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
@@ -1593,9 +1593,9 @@ mod read_tests {
     use super::*;
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))

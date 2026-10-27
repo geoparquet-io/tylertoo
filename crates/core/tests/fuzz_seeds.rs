@@ -154,8 +154,8 @@ fn parquet_footer_seeds() {
     let err = tylertoo_core::overview::check::fuzz_parquet_footer(&bytes).unwrap_err();
     assert!(
         matches!(
-            tylertoo_core::untrusted::input_error(&err),
-            Some(tylertoo_core::input::InputError::HostileFooter(_))
+            tylertoo_io::input_error(&err),
+            Some(tylertoo_io::Error::HostileFooter(_))
         ),
         "#690's seed must be refused by the footer pre-check: {err:?}"
     );

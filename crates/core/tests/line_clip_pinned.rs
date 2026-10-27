@@ -37,7 +37,7 @@ use std::path::PathBuf;
 
 use geo::{CoordsIter, Geometry, LineString, MultiLineString};
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tylertoo_io::open_parquet;
 
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::clip::{buffer_pixels_to_degrees, clip_geometry};
@@ -311,7 +311,7 @@ fn fixture_path() -> PathBuf {
 
 fn read_geometries(path: &PathBuf) -> Vec<Geometry<f64>> {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let mut geoms = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();

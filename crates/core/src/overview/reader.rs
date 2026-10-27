@@ -23,12 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use parquet::file::metadata::ParquetMetaData;
+use tylertoo_io::ParquetMetaData;
+use tylertoo_io::ReaderMetadata;
 
 use crate::covering::extract_row_group_bounds_from_metadata;
 use crate::tile::TileBounds;
-use crate::untrusted::{ParquetSource, UntrustedBatchReader};
+use tylertoo_io::{ParquetSource, UntrustedBatchReader};
 
 use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
@@ -40,7 +40,7 @@ pub enum ReaderError {
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// The overview file could not be opened (#452: the bare [`Self::Io`]
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not
     /// repeat the reason.
@@ -60,7 +60,7 @@ pub enum ReaderError {
         /// The file as given.
         path: String,
         /// The underlying Parquet error.
-        error: parquet::errors::ParquetError,
+        error: tylertoo_io::ParquetError,
     },
     /// The `geo:overviews` footer key is absent — not an overview file.
     #[error(
@@ -101,12 +101,12 @@ pub struct OverviewReader {
     schema: SchemaRef,
     meta: OverviewsMeta,
     /// The footer and schema [`Self::open`] checked and decoded
-    /// ([`crate::untrusted`]): every read reopens the file with them rather
+    /// ([`tylertoo_io`]): every read reopens the file with them rather
     /// than parsing the footer again. Each read's batch is capped there for
     /// its row groups' widest byte-array column (#563): an overview level
     /// keeps its source geometries, so a batch of very large ones would pass
     /// arrow's i32 byte-array offset ceiling.
-    reader_metadata: ArrowReaderMetadata,
+    reader_metadata: ReaderMetadata,
 }
 
 impl OverviewReader {
@@ -128,11 +128,10 @@ impl OverviewReader {
             path: shown(),
             error,
         })?;
-        let builder =
-            crate::untrusted::open_parquet(file).map_err(|error| ReaderError::Footer {
-                path: shown(),
-                error,
-            })?;
+        let builder = tylertoo_io::open_parquet(file).map_err(|error| ReaderError::Footer {
+            path: shown(),
+            error,
+        })?;
         let metadata = builder.metadata().clone();
         let schema = builder.schema().clone();
 
@@ -246,8 +245,8 @@ impl OverviewReader {
     ///   recorded null count) may hold `{1, null}`: its max is 1, but the
     ///   null/1 distinction is information the tiles would lose.
     pub fn int_column_max(&self, name: &str) -> Option<i64> {
-        use parquet::basic::{ConvertedType, IntType, LogicalType};
-        use parquet::file::statistics::Statistics;
+        use tylertoo_io::Statistics;
+        use tylertoo_io::{ConvertedType, IntType, LogicalType};
 
         let descr = self.metadata.file_metadata().schema_descr();
         let col_idx =
@@ -456,7 +455,7 @@ impl OverviewReader {
         level_idx: usize,
         bbox: Option<[f64; 4]>,
     ) -> Result<UntrustedBatchReader, ReaderError> {
-        self.read_level_batched(level_idx, bbox, crate::untrusted::DEFAULT_BATCH_ROWS)
+        self.read_level_batched(level_idx, bbox, tylertoo_io::DEFAULT_BATCH_ROWS)
     }
 
     /// [`Self::read_level`] with an explicit Arrow batch size (the builder
@@ -588,7 +587,7 @@ impl OverviewReader {
     ) -> Result<ParquetSource<File>, ReaderError> {
         let file = File::open(&self.path)?;
         Ok(
-            crate::untrusted::open_parquet_with_metadata(file, self.reader_metadata.clone())
+            tylertoo_io::open_parquet_with_metadata(file, self.reader_metadata.clone())
                 .with_row_groups(row_groups)
                 .with_batch_rows(batch_size),
         )
@@ -627,9 +626,7 @@ pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
         let _ = reader.row_groups_for_level(k)?;
         let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
         for batch in reader.read_band_batched(k, 256)? {
-            rows += batch
-                .map_err(parquet::errors::ParquetError::from)?
-                .num_rows();
+            rows += batch.map_err(tylertoo_io::ParquetError::from)?.num_rows();
         }
     }
     Ok(rows)
@@ -738,7 +735,7 @@ mod tests {
     }
 
     /// Read the `id` column across a level reader.
-    fn read_ids(reader: crate::untrusted::UntrustedBatchReader) -> Vec<i64> {
+    fn read_ids(reader: tylertoo_io::UntrustedBatchReader) -> Vec<i64> {
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
@@ -812,7 +809,7 @@ mod tests {
     #[test]
     fn open_missing_key_errors() {
         // A plain (non-overview) parquet file: write with parquet directly.
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -1164,9 +1161,9 @@ mod tests {
     #[test]
     fn int_column_max_is_none_without_statistics() {
         use arrow_array::Int32Array;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
-        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
+        use tylertoo_io::KeyValue;
 
         // Borrow a valid one-level footer from the converter's own writer...
         let donor = tempfile::NamedTempFile::new().unwrap();

@@ -316,7 +316,7 @@ pub fn extract_crs(path: &Path) -> Result<CrsInfo> {
     let file = std::fs::File::open(first_file)
         .map_err(|e| Error::GeoParquetRead(format!("cannot open {}: {e}", first_file.display())))?;
 
-    let metadata = crate::untrusted::read_parquet_metadata(&file).map_err(|e| {
+    let metadata = tylertoo_io::read_parquet_metadata(&file).map_err(|e| {
         Error::GeoParquetRead(format!(
             "cannot read the Parquet footer of {}: {}",
             first_file.display(),
@@ -438,7 +438,7 @@ fn warn_geo_version(geo_json: &Value) {
 ///
 /// Returns [`Error::GeoParquetRead`] if the geo metadata JSON is malformed.
 pub fn crs_info_from_kv_metadata(
-    kv_metadata: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    kv_metadata: Option<&Vec<tylertoo_io::KeyValue>>,
 ) -> Result<CrsInfo> {
     // Look for the "geo" key in key-value metadata
     let Some(kv_metadata) = kv_metadata else {
@@ -649,8 +649,8 @@ mod tests {
         assert!(!msg.to_lowercase().contains("parquet error"), "{msg}");
     }
 
-    fn kv_with_geo(geo: &Value) -> Vec<parquet::file::metadata::KeyValue> {
-        vec![parquet::file::metadata::KeyValue::new(
+    fn kv_with_geo(geo: &Value) -> Vec<tylertoo_io::KeyValue> {
+        vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]
@@ -1075,7 +1075,7 @@ mod tests {
         assert!(info.is_wgs84 && info.assumed_wgs84, "no kv metadata");
 
         // (2) Key-value metadata without a "geo" key.
-        let kv = vec![parquet::file::metadata::KeyValue::new(
+        let kv = vec![tylertoo_io::KeyValue::new(
             "writer".to_string(),
             "something".to_string(),
         )];

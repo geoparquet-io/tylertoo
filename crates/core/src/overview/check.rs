@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use parquet::basic::Type as PhysicalType;
-use parquet::file::metadata::ParquetMetaData;
-use parquet::file::statistics::Statistics;
+use tylertoo_io::ParquetMetaData;
+use tylertoo_io::PhysicalType;
+use tylertoo_io::Statistics;
 
 use crate::covering::{find_bbox_column_indices, get_geo_metadata, parse_covering_metadata};
 
@@ -93,7 +93,7 @@ pub enum CheckError {
         "cannot read the Parquet footer: {}",
         crate::input::parquet_error_detail(.0)
     )]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
 }
 
 /// Minimal view of the GeoParquet `geo` metadata for structural checks.
@@ -119,13 +119,13 @@ struct GeoDoc {
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
     let path = path.as_ref();
     let file = File::open(path)?;
-    let metadata = crate::untrusted::read_parquet_metadata(&file)?;
+    let metadata = tylertoo_io::read_parquet_metadata(&file)?;
     let mut report = validate_metadata(&metadata);
     // Every reader decodes the footer's ARROW:schema before a row, so a file
     // whose schema cannot be decoded (#683) is one `export` refuses; it must
     // not validate. Reported only on failure, so a valid file's checklist is
     // unchanged.
-    if let Err(e) = crate::untrusted::reader_metadata(std::sync::Arc::clone(&metadata)) {
+    if let Err(e) = tylertoo_io::reader_metadata(std::sync::Arc::clone(&metadata)) {
         report.fail(
             "arrow_schema_decodes",
             format!("the footer's ARROW:schema cannot be decoded: {e}"),
@@ -713,7 +713,7 @@ fn cluster_sum_by_level(
     use geoarrow::array::from_arrow_array;
 
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let builder = crate::untrusted::open_parquet(file).map_err(|e| e.to_string())?;
+    let builder = tylertoo_io::open_parquet(file).map_err(|e| e.to_string())?;
     let schema = builder.schema().clone();
 
     let Some(geom_idx) = find_geometry_column(&schema) else {
@@ -933,21 +933,19 @@ fn parse_semver_major(v: &str) -> Option<u64> {
 /// spill-size and batch-size heuristics, and `--filter` pushdown over the
 /// footer's column statistics, with a few filters bound to the footer's own
 /// columns. The footer goes through the owner's decode
-/// ([`crate::untrusted::decode_footer`]: the #690 pre-check, then parquet-rs
+/// ([`tylertoo_io::decode_footer`]: the #690 pre-check, then parquet-rs
 /// inside the panic boundary), and the embedded `ARROW:schema` is left to
 /// the whole-file targets. Only the `fuzz/` crate calls this; the `fuzzing`
 /// feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_parquet_footer(
-    thrift: &[u8],
-) -> Result<ValidationReport, parquet::errors::ParquetError> {
+pub fn fuzz_parquet_footer(thrift: &[u8]) -> Result<ValidationReport, tylertoo_io::ParquetError> {
     use super::filter::{BoundFilter, CmpOp, FilterExpr, Literal};
     use super::level::Crs;
 
     // The owner's decode (#779): the #690 pre-check, then parquet-rs's
     // decode inside the panic boundary.
-    let md = crate::untrusted::decode_footer(thrift)?;
+    let md = tylertoo_io::decode_footer(thrift)?;
     let report = validate_metadata(&md);
 
     let n = md.num_row_groups();
@@ -971,22 +969,15 @@ pub fn fuzz_parquet_footer(
     let some: Vec<usize> = (0..n).step_by(2).collect();
     for selected in [None, Some(some.as_slice())] {
         let _ = crate::input::selected_compressed_bytes(&md, selected);
-        let _ = crate::untrusted::read_batch_plan(
-            &md,
-            selected,
-            8192,
-            crate::untrusted::byte_array_limit(),
-        );
-        let _ = crate::input_set::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
+        let _ = tylertoo_io::read_batch_plan(&md, selected, 8192, tylertoo_io::byte_array_limit());
+        let _ = tylertoo_io::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
     }
 
     // Without the key-value metadata: the embedded `ARROW:schema` hint is
     // arrow-ipc's to decode (guarded by the owner since #779, #683);
     // `overview_file` and `remote_footer` reach that through the real open.
     // Here the filters only need column names and types.
-    if let Ok(schema) =
-        parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), None)
-    {
+    if let Ok(schema) = tylertoo_io::schema_without_metadata(&md) {
         for field in schema.fields() {
             let column = field.name().clone();
             let filters = [
@@ -1141,7 +1132,7 @@ mod tests {
 
     fn meta_of(path: &std::path::Path) -> ParquetMetaData {
         let file = File::open(path).unwrap();
-        crate::untrusted::read_parquet_metadata(&file)
+        tylertoo_io::read_parquet_metadata(&file)
             .unwrap()
             .as_ref()
             .clone()
@@ -1192,7 +1183,7 @@ mod tests {
 
     #[test]
     fn plain_parquet_missing_key_fails() {
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -1757,7 +1748,7 @@ mod tests {
     #[test]
     fn validate_metadata_reports_all_failures_not_fail_fast() {
         // Plain parquet: multiple independent checks should each be recorded.
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -1783,7 +1774,7 @@ mod tests {
     /// in a binary column, and returns its footer.
     fn wide_rows_meta(rows: usize, row_bytes: usize) -> ParquetMetaData {
         use arrow_array::BinaryArray;
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "geometry",
@@ -1809,12 +1800,7 @@ mod tests {
         // offsets. The owner's cap, which the cluster read now goes
         // through, keeps a batch near 1 GiB: 256 rows.
         let md = wide_rows_meta(4, 4 << 20);
-        let rows = crate::untrusted::read_batch_plan(
-            &md,
-            None,
-            1024,
-            crate::untrusted::byte_array_limit(),
-        );
+        let rows = tylertoo_io::read_batch_plan(&md, None, 1024, tylertoo_io::byte_array_limit());
         assert!(rows < 1024, "{rows}");
         assert!((rows as u64) * (4 << 20) <= 1 << 31, "{rows}");
     }
@@ -1823,12 +1809,7 @@ mod tests {
     fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
         let md = wide_rows_meta(16, 100);
         assert_eq!(
-            crate::untrusted::read_batch_plan(
-                &md,
-                None,
-                1024,
-                crate::untrusted::byte_array_limit()
-            ),
+            tylertoo_io::read_batch_plan(&md, None, 1024, tylertoo_io::byte_array_limit()),
             1024
         );
     }

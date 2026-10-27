@@ -1,8 +1,8 @@
 //! Level-banded GeoParquet overview writer (spec §4, §6.1).
 //!
-//! [`OverviewWriter`] drives a low-level [`parquet::file::writer::SerializedFileWriter`]
-//! (obtained from a [`parquet::arrow::ArrowWriter`] via
-//! [`ArrowWriter::into_serialized_writer`]) and a
+//! [`OverviewWriter`] drives a low-level [`tylertoo_io::SerializedFileWriter`]
+//! (obtained from a [`tylertoo_io::BatchWriter`] via
+//! [`tylertoo_io::BatchWriter::into_serialized_writer`]) and a
 //! [`geoparquet::writer::GeoParquetRecordBatchEncoder`]. The caller drives it
 //! **coarse → fine**, one level at a time; the writer:
 //!
@@ -64,16 +64,12 @@ use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_channel::{bounded, Receiver, RecvError, RecvTimeoutError};
-use parquet::arrow::arrow_writer::{
+use tylertoo_io::KeyValue;
+use tylertoo_io::ParquetError;
+use tylertoo_io::SerializedFileWriter;
+use tylertoo_io::{
     compute_leaves, ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::errors::ParquetError;
-use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::ColumnPath;
 
 use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
@@ -269,7 +265,7 @@ impl OverviewWriterOptions {
 pub enum WriterError {
     /// Underlying parquet error.
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// Arrow error (e.g. building a record batch).
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -347,7 +343,7 @@ pub struct OverviewWriter<W: Write + Send> {
     /// itself runs on the Rayon pool (#296).
     writer: SerializedFileWriter<W>,
     /// Factory for a new row group's per-column Arrow writers, derived from the
-    /// same target schema + properties the [`ArrowWriter`] would have used.
+    /// same target schema + properties the serial batch writer would have used.
     rg_factory: ArrowRowGroupWriterFactory,
     /// The GeoParquet-encoded target schema (WKB geometry + generated covering).
     /// Held so the parallel encode tasks can map columns to leaves via
@@ -581,13 +577,21 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
         let target_schema = encoder.target_schema();
 
-        let props = build_writer_properties(&options, &geometry_columns, &augmented_schema)?;
-        // Build an ArrowWriter exactly as before (so the parquet schema, writer
-        // properties, and embedded `ARROW:schema` footer key are byte-for-byte
-        // what a serial ArrowWriter would produce), then lower it to a
-        // `SerializedFileWriter` + `ArrowRowGroupWriterFactory` so we can encode
-        // row groups off-thread and append them ourselves (#296).
-        let arrow_writer = ArrowWriter::try_new(sink, target_schema.clone(), Some(props))?;
+        let io_options = tylertoo_io::OverviewWriteOptions {
+            zstd_level: options.zstd_level,
+            full_column_stats: options.full_column_stats,
+            geometry_columns: geometry_columns.clone(),
+            covering_columns: geometry_columns
+                .iter()
+                .map(|g| covering_name_for(g))
+                .collect(),
+        };
+        let arrow_writer = tylertoo_io::overview_writer(
+            sink,
+            target_schema.clone(),
+            &augmented_schema,
+            &io_options,
+        )?;
         let (writer, rg_factory) = arrow_writer.into_serialized_writer()?;
 
         Ok(Self {
@@ -1592,76 +1596,6 @@ fn round_up_clean(n: usize) -> usize {
     n.div_ceil(STEP).saturating_mul(STEP)
 }
 
-/// Build [`WriterProperties`]: ZSTD, no dictionary on geometry + bbox columns
-/// (§4.5), manual per-level row-group control, and statistics tuned so the
-/// footer stays small (H1) while the pruning index survives.
-///
-/// - `set_max_row_group_row_count(Some(usize::MAX))`: the writer never splits row groups on
-///   its own; [`OverviewWriter::write_level`] drives every boundary so each
-///   level is sized independently and ends on a row-group boundary (§4.2).
-/// - Statistics: the bbox covering children and `level` column keep full stats
-///   (the spatial-pruning index, §4.4). Unless `full_column_stats` is set, the
-///   WKB geometry column and every Utf8/Binary property column have their stats
-///   suppressed — their per-row-group min/max are never used by a reader but
-///   dominate the footer on high-cardinality data (e.g. Overture ULID `id`).
-fn build_writer_properties(
-    options: &OverviewWriterOptions,
-    geometry_columns: &[String],
-    augmented_schema: &Schema,
-) -> Result<WriterProperties, WriterError> {
-    let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?))
-        // Manual per-level row-group control (see write_level): disable the
-        // writer's own row-count splitting.
-        .set_max_row_group_row_count(Some(usize::MAX))
-        // Per-row-group (chunk) statistics are the spatial-pruning index (§4.4);
-        // Page-level also carries chunk-level min/max.
-        .set_statistics_enabled(EnabledStatistics::Page);
-
-    let geom_set: std::collections::HashSet<&str> =
-        geometry_columns.iter().map(|s| s.as_str()).collect();
-
-    for geom in geometry_columns {
-        // Geometry (WKB) column: no dictionary (§4.5).
-        builder = builder.set_column_dictionary_enabled(ColumnPath::from(geom.clone()), false);
-
-        // bbox covering struct children: no dictionary (§4.5).
-        let covering = covering_name_for(geom);
-        for child in ["xmin", "ymin", "xmax", "ymax"] {
-            let path = ColumnPath::from(vec![covering.clone(), child.to_string()]);
-            builder = builder.set_column_dictionary_enabled(path, false);
-        }
-    }
-
-    // Statistics suppression on high-cardinality columns (H1). Suppress the WKB
-    // geometry column and every string/binary property column; keep everything
-    // else (covering children — a generated `bbox` struct not present in this
-    // schema — and the `level` column both keep the default Page stats).
-    if !options.full_column_stats {
-        for field in augmented_schema.fields() {
-            let name = field.name();
-            let is_geometry = geom_set.contains(name.as_str());
-            let is_string_or_binary = matches!(
-                field.data_type(),
-                DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-                    | DataType::Binary
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-            );
-            if is_geometry || is_string_or_binary {
-                builder = builder.set_column_statistics_enabled(
-                    ColumnPath::from(name.clone()),
-                    EnabledStatistics::None,
-                );
-            }
-        }
-    }
-
-    Ok(builder.build())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1672,7 +1606,7 @@ mod tests {
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
 
-    use parquet::file::statistics::Statistics;
+    use tylertoo_io::Statistics;
 
     /// Deterministic geometry for a feature id: even ids are points, odd ids are
     /// square polygons. Keeps a mix of Point + Polygon in the column.
@@ -1747,7 +1681,7 @@ mod tests {
     /// Read the `level` column values for a single row group.
     fn read_level_column(path: &std::path::Path, rg: usize) -> Vec<i32> {
         let file = File::open(path).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let reader = builder.with_row_groups(vec![rg]).build().unwrap();
         let mut out = Vec::new();
         for batch in reader {
@@ -1769,7 +1703,7 @@ mod tests {
     /// byte compare is invalid; #296).
     fn layout_and_rows(path: &std::path::Path) -> (Vec<i64>, Vec<(i32, i64)>) {
         let file = File::open(path).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let md = builder.metadata().clone();
         let rows_per_rg: Vec<i64> = (0..md.num_row_groups())
             .map(|i| md.row_group(i).num_rows())
@@ -1876,10 +1810,7 @@ mod tests {
     /// faithful to exactly what is written.
     fn geo_footer(path: &std::path::Path) -> serde_json::Value {
         let file = File::open(path).unwrap();
-        let md = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let md = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         let kv = md
             .file_metadata()
             .key_value_metadata()
@@ -1895,10 +1826,7 @@ mod tests {
     /// determinism checks (#508).
     fn geo_footer_raw(path: &std::path::Path) -> String {
         let file = File::open(path).unwrap();
-        let md = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let md = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         md.file_metadata()
             .key_value_metadata()
             .unwrap()
@@ -2528,10 +2456,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let parquet_meta = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let parquet_meta = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
 
         // Exactly ONE physical `bbox.xmin` column — no `bbox`/`bbox_1`
         // duplication from passing the input covering through.
@@ -2618,7 +2543,7 @@ mod tests {
 
         // Re-open and inspect the physical file.
         let file = File::open(tmp.path()).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let parquet_meta = builder.metadata().clone();
         assert_eq!(parquet_meta.num_row_groups(), 3);
 
@@ -2702,7 +2627,7 @@ mod tests {
 
         // Canonical-level rows (RG 2) re-read value-identical to the input.
         let file = File::open(tmp.path()).unwrap();
-        let reader = crate::untrusted::open_parquet(file)
+        let reader = tylertoo_io::open_parquet(file)
             .unwrap()
             .with_row_groups(vec![2])
             .build()
@@ -2783,7 +2708,7 @@ mod tests {
         assert_eq!(written_meta.canonical_level, None);
 
         let file = File::open(tmp.path()).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let kvs = builder
             .metadata()
             .file_metadata()
@@ -2896,10 +2821,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), 4);
         // Level 0 is a single row group of all 3 rows.
         assert_eq!(pm.row_group(0).num_rows(), 3);
@@ -2970,10 +2892,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), projected);
     }
 
@@ -3012,10 +2931,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), projected);
     }
 
@@ -3122,10 +3038,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert!(
             pm.num_row_groups() <= ceiling,
             "row groups {} exceed the mocked ceiling {ceiling}",
@@ -3182,10 +3095,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), 4);
         assert_eq!(pm.row_group(0).num_rows(), 10);
         let l1: Vec<i64> = (1..=3).map(|r| pm.row_group(r).num_rows()).collect();
@@ -3205,10 +3115,7 @@ mod tests {
     /// `path`? Helper for the stats-suppression tests.
     fn rg_has_stats(path: &std::path::Path, rg: usize, col_path: &str) -> bool {
         let file = File::open(path).unwrap();
-        let pm = crate::untrusted::open_parquet(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         pm.row_group(rg)
             .columns()
             .iter()

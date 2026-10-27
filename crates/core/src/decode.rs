@@ -81,11 +81,11 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::KeyValue;
 use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
+use tylertoo_io::BatchWriter as ArrowWriter;
+use tylertoo_io::KeyValue;
 
 use crate::archive_index::FileBytes;
 use crate::compression::{decompress_capped, MAX_TILE_BYTES};
@@ -231,7 +231,7 @@ pub enum DecodeError {
     Arrow(#[from] arrow_schema::ArrowError),
 
     #[error("Parquet error")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
 
     #[error("GeoParquet write failed: {0}")]
     Write(String),
@@ -327,7 +327,7 @@ pub fn decode_pmtiles(
     // only once it is complete, so an interrupted decode leaves a previous
     // output intact.
     let (file, pending) = crate::atomic_output::create(output_path.as_ref())?;
-    let mut writer = ArrowWriter::try_new(file, encoder.target_schema(), None)?;
+    let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
     // ---- Pass B: decode again, batch rows, stream to the writer. ----------
     let mut report = DecodeReport {

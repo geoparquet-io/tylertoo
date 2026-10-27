@@ -4,7 +4,7 @@
 //! [`std::fs::File`]. This module generalizes that to an [`InputSource`]
 //! that can also point at an object in remote storage (`s3://`, `https://`,
 //! `http://`, `gs://`), served to the existing *synchronous* parquet reader
-//! plumbing through the [`parquet::file::reader::ChunkReader`] trait:
+//! plumbing through the [`tylertoo_io::ChunkReader`] trait:
 //!
 //! - the parquet footer is fetched with range requests,
 //! - each column chunk of each *selected* row group is fetched as ONE byte
@@ -49,12 +49,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use parquet::errors::ParquetError;
-use parquet::file::reader::{ChunkReader, Length};
 use serde::Serialize;
+use tylertoo_io::ParquetError;
+use tylertoo_io::ReaderMetadata;
+use tylertoo_io::{ChunkReader, Length};
 
-use crate::untrusted::ParquetSource;
+use tylertoo_io::ParquetSource;
 
 /// Schemes recognized as remote inputs (when the `remote` feature is on).
 const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
@@ -62,16 +62,9 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
-    /// At least one row's byte-array values cannot fit any decoded batch.
-    #[error("column '{column}' holds {bytes} bytes in one row, past the {limit_bytes}-byte byte-array ceiling (i32 offsets). Split or simplify those features before tiling.")]
-    ByteArrayRowTooLarge {
-        /// The offending leaf column.
-        column: String,
-        /// Bytes addressed by one row.
-        bytes: u64,
-        /// The per-array byte ceiling.
-        limit_bytes: u64,
-    },
+    /// A checked-I/O boundary refused the input.
+    #[error(transparent)]
+    Decode(#[from] tylertoo_io::Error),
     /// Local I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -190,26 +183,6 @@ pub enum InputError {
         /// The glob crate's error message.
         message: String,
     },
-    /// Something panicked inside [`crate::untrusted`]'s boundary while
-    /// decoding: usually an upstream decoder (parquet-rs, arrow-ipc) on
-    /// malformed input (#683, #684, #687). Our own reader code also runs
-    /// inside it, so the message and location say which. The input is
-    /// refused and the process carries on.
-    #[error("panicked while decoding the {what}: {message}")]
-    DecoderPanic {
-        /// What was being decoded (`parquet footer`, `parquet page`, ...).
-        what: &'static str,
-        /// The panic message and its `file:line` location.
-        message: String,
-    },
-    /// A Parquet footer declares a count no honest footer could hold, and
-    /// was refused before parquet-rs sized an allocation from it (#690).
-    #[error("refusing a malformed Parquet footer: {0}")]
-    HostileFooter(String),
-    /// An Arrow IPC footer points a block outside the file, and was refused
-    /// before arrow-ipc sized an allocation from the block's declared length.
-    #[error("refusing a malformed Arrow IPC footer: {0}")]
-    HostileIpcFooter(String),
 }
 
 /// A [`ParquetError`]'s message without the `Parquet error: ` prefix its
@@ -343,7 +316,7 @@ impl InputSource {
                     input: self.display_name(),
                     error,
                 })?;
-                crate::untrusted::open_parquet(InputReader::Local(file)).map_err(|error| {
+                tylertoo_io::open_parquet(InputReader::Local(file)).map_err(|error| {
                     InputError::Footer {
                         input: self.display_name(),
                         error,
@@ -367,11 +340,11 @@ impl InputSource {
     /// (`input_set::PartMeta`), so hand it over instead.
     ///
     /// Remote inputs ignore `meta` and take [`Self::open`]'s path: it already
-    /// caches its `ArrowReaderMetadata`, and opening also re-sizes the chunk
+    /// caches its `ReaderMetadata`, and opening also re-sizes the chunk
     /// cache from the footer, which is load-bearing (#261).
     pub(crate) fn open_with_metadata(
         &self,
-        meta: &ArrowReaderMetadata,
+        meta: &ReaderMetadata,
     ) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
@@ -379,7 +352,7 @@ impl InputSource {
                     input: self.display_name(),
                     error,
                 })?;
-                Ok(crate::untrusted::open_parquet_with_metadata(
+                Ok(tylertoo_io::open_parquet_with_metadata(
                     InputReader::Local(file),
                     meta.clone(),
                 ))
@@ -466,7 +439,7 @@ impl InputSource {
 /// out of range are ignored. Single-file shape on purpose (metadata +
 /// selection → bytes): a multi-partition source sums it across parts.
 pub fn selected_compressed_bytes(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     selected_row_groups: Option<&[usize]>,
 ) -> u64 {
     let group_bytes = |i: usize| -> u64 {
@@ -491,7 +464,7 @@ pub fn selected_compressed_bytes(
 /// Not parquet-rs's `RowGroupMetaData::compressed_size`: that sums the
 /// chunks' `i64` sizes unchecked, and a footer can declare any size (#686).
 /// A negative chunk size counts as nothing.
-pub(crate) fn row_group_compressed_bytes(rg: &parquet::file::metadata::RowGroupMetaData) -> u64 {
+pub(crate) fn row_group_compressed_bytes(rg: &tylertoo_io::RowGroupMetaData) -> u64 {
     rg.columns()
         .iter()
         .map(|col| col.compressed_size().max(0) as u64)
@@ -587,14 +560,14 @@ pub(crate) mod remote {
         ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
         ObjectStoreScheme,
     };
-    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-    use parquet::errors::ParquetError;
+    use tylertoo_io::ParquetError;
+    use tylertoo_io::ReaderMetadata;
     use url::Url;
 
     use super::{FetchStats, InputError, InputReader};
 
     /// Readahead for the *sequential* read path
-    /// ([`parquet::file::reader::ChunkReader::get_read`]). The page reader
+    /// ([`tylertoo_io::ChunkReader::get_read`]). The page reader
     /// uses `get_read` only to thrift-decode page *headers* (tens of bytes;
     /// page data goes through exact-range `get_bytes`), so keep this small —
     /// and always clamp it to the surrounding column chunk (see
@@ -664,7 +637,7 @@ pub(crate) mod remote {
         location: ObjectPath,
         size: u64,
         shared: Arc<SharedState>,
-        metadata: OnceLock<ArrowReaderMetadata>,
+        metadata: OnceLock<ReaderMetadata>,
         cache: Arc<Mutex<ChunkCache>>,
         /// On-disk overflow for fetched column chunks (issue #219), shared by
         /// every reader clone across the pipeline's passes so a chunk fetched
@@ -896,7 +869,7 @@ pub(crate) mod remote {
         /// opens so multi-pass pipelines fetch it once.
         pub(crate) fn open_builder(
             &self,
-        ) -> Result<crate::untrusted::ParquetSource<InputReader>, InputError> {
+        ) -> Result<tylertoo_io::ParquetSource<InputReader>, InputError> {
             let reader = InputReader::Remote(self.reader());
             let metadata = self.load_footer()?;
             // Column-chunk byte ranges (sorted) for readahead clamping.
@@ -943,9 +916,7 @@ pub(crate) mod remote {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cache.cap = self.cap_base.max(max_row_group);
             }
-            Ok(crate::untrusted::open_parquet_with_metadata(
-                reader, metadata,
-            ))
+            Ok(tylertoo_io::open_parquet_with_metadata(reader, metadata))
         }
 
         /// A cheap handle for issuing counted range requests.
@@ -975,7 +946,7 @@ pub(crate) mod remote {
         /// Mirrors the load in [`Self::open_builder`] so staging (pass 0) does
         /// not depend on a builder open; the header phase has usually loaded
         /// it already, in which case this is a cheap clone with no fetch.
-        fn load_footer(&self) -> Result<ArrowReaderMetadata, InputError> {
+        fn load_footer(&self) -> Result<ReaderMetadata, InputError> {
             if let Some(md) = self.metadata.get() {
                 return Ok(md.clone());
             }
@@ -983,12 +954,11 @@ pub(crate) mod remote {
             // The owner (#779) runs the footer pre-check, the #430 chunk-range
             // check against the object size and the guarded schema decode,
             // exactly as it does for a local file.
-            let md = crate::untrusted::load_reader_metadata(&reader).map_err(|error| {
-                InputError::Footer {
+            let md =
+                tylertoo_io::load_reader_metadata(&reader).map_err(|error| InputError::Footer {
                     input: self.url.clone(),
                     error,
-                }
-            })?;
+                })?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
             let _ = self.metadata.set(md.clone());
@@ -1957,7 +1927,7 @@ pub(crate) mod remote {
     }
 
     impl RemoteReader {
-        /// Total object size (the [`parquet::file::reader::Length`] answer).
+        /// Total object size (the [`tylertoo_io::Length`] answer).
         pub(crate) fn object_size(&self) -> u64 {
             self.size
         }
@@ -2055,7 +2025,7 @@ pub(crate) mod remote {
             }
         }
 
-        /// Exact-range read for [`parquet::file::reader::ChunkReader::get_bytes`].
+        /// Exact-range read for [`tylertoo_io::ChunkReader::get_bytes`].
         pub(crate) fn get_bytes_range(
             &self,
             start: u64,
@@ -2104,7 +2074,7 @@ pub(crate) mod remote {
         }
 
         /// Chunked sequential reader for
-        /// [`parquet::file::reader::ChunkReader::get_read`] (not used by the
+        /// [`tylertoo_io::ChunkReader::get_read`] (not used by the
         /// arrow reader path, provided for trait completeness).
         pub(crate) fn sequential_reader(&self, start: u64) -> SequentialRemoteRead {
             SequentialRemoteRead {
@@ -2535,8 +2505,8 @@ pub(crate) mod remote {
         /// `groups` row groups of `rows` rows each.
         fn multi_rg_parquet(rows: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let props = WriterProperties::builder()
                 .set_max_row_group_row_count(Some(rows))
@@ -2546,8 +2516,12 @@ pub(crate) mod remote {
                 RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(values)) as _)])
                     .unwrap();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
@@ -2619,8 +2593,8 @@ pub(crate) mod remote {
         #[test]
         fn a_large_window_never_fetches_a_pruned_row_group() {
             let bytes = multi_rg_parquet(1000, 5);
-            let md = crate::untrusted::read_parquet_metadata(&bytes::Bytes::from(bytes.clone()))
-                .unwrap();
+            let md =
+                tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone())).unwrap();
             let pruned = md.row_group(2);
             let lo = pruned
                 .columns()
@@ -3222,13 +3196,13 @@ mod tests {
 
     /// A footer whose row groups declare `sizes` compressed bytes per
     /// column chunk, two `INT64` columns each, and nothing else.
-    fn footer_with_chunk_sizes(sizes: &[[i64; 2]]) -> parquet::file::metadata::ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+    fn footer_with_chunk_sizes(sizes: &[[i64; 2]]) -> tylertoo_io::ParquetMetaData {
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData,
         };
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
 
         let fields = ["a", "b"]
             .map(|n| {
@@ -3296,8 +3270,8 @@ mod tests {
         /// Minimal single-column parquet bytes for reader plumbing tests.
         fn tiny_parquet() -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch};
-            use parquet::arrow::ArrowWriter;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::ArrowWriter;
 
             let batch = RecordBatch::try_from_iter([(
                 "v",
@@ -3349,8 +3323,8 @@ mod tests {
 
         #[test]
         fn sequential_read_matches_object_bytes() {
-            use parquet::file::reader::ChunkReader;
             use std::io::Read;
+            use tylertoo_io::ChunkReader;
 
             let bytes = tiny_parquet();
             let source = memory_source(bytes.clone(), "tiny.parquet");
@@ -3408,8 +3382,8 @@ mod tests {
         /// distinct so the wide column stays genuinely wide.
         fn two_column_multipage_parquet(rows: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch, StringArray};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let wide: Vec<String> = (0..rows)
                 .map(|i| format!("feature-{i:08}-{:-<48}", i % 7))
@@ -3425,8 +3399,12 @@ mod tests {
                 .set_data_page_row_count_limit(128)
                 .build();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
@@ -3607,8 +3585,8 @@ mod tests {
         /// the previous group's chunks, not accumulate them).
         fn multi_row_group_wide_parquet(rows_per_group: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch, StringArray};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let props = WriterProperties::builder()
                 .set_dictionary_enabled(false)
@@ -3626,8 +3604,12 @@ mod tests {
             ])
             .unwrap();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
@@ -3710,12 +3692,12 @@ mod tests {
         fn with_hostile_chunks(
             bytes: &[u8],
             mutate: impl Fn(
-                parquet::file::metadata::ColumnChunkMetaDataBuilder,
-            ) -> parquet::file::metadata::ColumnChunkMetaDataBuilder,
+                tylertoo_io::test_support::ColumnChunkMetaDataBuilder,
+            ) -> tylertoo_io::test_support::ColumnChunkMetaDataBuilder,
         ) -> Vec<u8> {
-            use parquet::file::metadata::ParquetMetaDataWriter;
+            use tylertoo_io::test_support::ParquetMetaDataWriter;
 
-            let md = crate::untrusted::read_parquet_metadata(&Bytes::from(bytes.to_vec())).unwrap();
+            let md = tylertoo_io::read_parquet_metadata(&Bytes::from(bytes.to_vec())).unwrap();
             let row_groups: Vec<_> = md
                 .row_groups()
                 .iter()
@@ -3938,8 +3920,8 @@ mod tests {
         /// also fail cleanly.
         #[test]
         fn truncated_chunk_sequential_read_is_error_not_panic() {
-            use parquet::file::reader::ChunkReader;
             use std::io::Read;
+            use tylertoo_io::ChunkReader;
 
             let bytes = tiny_parquet();
             let source = truncating_source(bytes, 3);

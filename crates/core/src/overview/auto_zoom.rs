@@ -885,9 +885,9 @@ mod tests {
         use geoparquet::writer::{
             GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
         };
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
         use std::sync::Arc;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::KeyValue;
 
         let n = geoms.len();
         let id = Int64Array::from((0..n as i64).collect::<Vec<_>>());
@@ -1194,9 +1194,9 @@ mod tests {
     /// not move the pinned zoom (z14), and the covering path must be taken.
     #[test]
     fn declared_covering_on_a_real_fixture_keeps_the_pinned_zoom() {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
         use std::sync::Arc;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::KeyValue;
 
         let src = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
         if !src.exists() {
@@ -1207,7 +1207,7 @@ mod tests {
         let dst = dir.path().join("ob-covered.parquet");
 
         let file = std::fs::File::open(src).unwrap();
-        let builder = crate::untrusted::open_parquet(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let kv = builder
             .metadata()
             .file_metadata()

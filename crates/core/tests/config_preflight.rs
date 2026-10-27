@@ -54,9 +54,6 @@ fn shard_plan_existing_output_explains_fleet_identity() {
 #[test]
 fn production_ignores_scaled_limit_environment() {
     std::env::set_var("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES", "1");
-    assert_eq!(
-        tylertoo_core::untrusted::byte_array_limit(),
-        i32::MAX as u64
-    );
+    assert_eq!(tylertoo_io::byte_array_limit(), i32::MAX as u64);
     std::env::remove_var("TYLERTOO_BYTE_ARRAY_LIMIT_BYTES");
 }

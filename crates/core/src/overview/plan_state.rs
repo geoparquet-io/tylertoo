@@ -89,9 +89,9 @@ use arrow_array::{
     Array, BinaryArray, Float64Array, Int64Array, LargeListArray, RecordBatch, UInt32Array,
     UInt64Array, UInt8Array,
 };
-use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
+use tylertoo_io::IpcFileWriter as FileWriter;
 
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
@@ -1405,7 +1405,7 @@ impl ConvertPlan {
                 ),
             ));
         }
-        let mut reader = crate::untrusted::open_ipc(ipc_view(file))
+        let mut reader = tylertoo_io::open_ipc(ipc_view(file))
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
@@ -2225,11 +2225,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let path = dir.path().join("parts.parquet");
         let file = File::create(&path).expect("create");
-        let props = parquet::file::properties::WriterProperties::builder()
+        let props = tylertoo_io::test_support::WriterProperties::builder()
             .set_max_row_group_row_count(Some(rows_per_group[0].max(1)))
             .build();
-        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))
-            .expect("writer");
+        let mut w =
+            tylertoo_io::test_support::ArrowWriter::try_new(file, schema.clone(), Some(props))
+                .expect("writer");
         for &n in rows_per_group {
             let batch = RecordBatch::try_new(
                 schema.clone(),
@@ -2319,7 +2320,7 @@ mod tests {
     /// Re-open a saved plan's IPC payload, so a test can forge a hostile
     /// variant of a *real* artifact.
     fn reopen(path: &Path) -> (Arc<Schema>, RecordBatch) {
-        let mut r = crate::untrusted::open_ipc(ipc_view(File::open(path).unwrap())).unwrap();
+        let mut r = tylertoo_io::open_ipc(ipc_view(File::open(path).unwrap())).unwrap();
         let schema = r.schema();
         let batch = r.next().unwrap().unwrap();
         (schema, batch)

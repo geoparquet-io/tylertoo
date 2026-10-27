@@ -38,7 +38,7 @@ use arrow_array::types::{
 };
 use arrow_array::Array;
 use arrow_schema::{DataType, Schema};
-use parquet::file::statistics::Statistics;
+use tylertoo_io::Statistics;
 
 #[cfg(test)]
 use crate::mvt::PropertyValue;

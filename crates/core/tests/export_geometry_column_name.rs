@@ -30,8 +30,8 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
 
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 
@@ -117,11 +117,7 @@ fn write_input(path: &Path, geom_name: &str, centroid: Option<&str>, geoms: &[Ge
 fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
     let file = std::fs::File::open(path).unwrap();
     let mut rows = Vec::new();
-    for batch in ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap()
-    {
+    for batch in open_parquet(file).unwrap().build().unwrap() {
         let batch = batch.unwrap();
         let schema = batch.schema();
         let zoom = batch

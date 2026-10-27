@@ -36,8 +36,8 @@
 //! - **One place to set the projection, row groups and batch size**:
 //!   [`ParquetSource`].
 //!
-//! clippy's `disallowed-methods` (clippy.toml) forbids the raw builders
-//! everywhere else; this module is their one permitted caller.
+//! The workspace dependency policy keeps these builders out of core.
+//! This private module is the reader construction owner.
 #![allow(clippy::disallowed_methods)] // #779: the owner of the raw builders
 
 use std::cell::{Cell, RefCell};
@@ -59,7 +59,7 @@ use parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::schema::types::SchemaDescriptor;
 
-use crate::input::InputError;
+use crate::Error as InputError;
 
 // ============================================================================
 // Panic boundary
@@ -192,7 +192,7 @@ fn guard_parquet<T>(
 }
 
 /// [`guard_parquet`] for an Arrow decode.
-fn guard_arrow<T>(
+pub(super) fn guard_arrow<T>(
     what: &'static str,
     f: impl FnOnce() -> Result<T, ArrowError>,
 ) -> Result<T, ArrowError> {
@@ -641,6 +641,40 @@ pub fn read_parquet_metadata<R: ChunkReader>(
     Ok(Arc::new(metadata))
 }
 
+/// A checked footer and its decoded Arrow schema, reusable across read passes.
+#[derive(Debug, Clone)]
+pub struct ReaderMetadata(ArrowReaderMetadata);
+
+impl ReaderMetadata {
+    /// The checked footer, for row-group statistics and key-value metadata.
+    pub fn metadata(&self) -> &Arc<ParquetMetaData> {
+        self.0.metadata()
+    }
+
+    /// The decoded Arrow schema.
+    pub fn schema(&self) -> &SchemaRef {
+        self.0.schema()
+    }
+
+    /// The physical schema, for nested-column projection.
+    pub fn parquet_schema(&self) -> &SchemaDescriptor {
+        self.0.parquet_schema()
+    }
+}
+
+/// Derive an Arrow schema from physical columns, ignoring embedded Arrow metadata.
+///
+/// # Errors
+///
+/// Returns an error if physical schema conversion fails or panics.
+pub fn schema_without_metadata(
+    metadata: &ParquetMetaData,
+) -> Result<arrow_schema::Schema, ParquetError> {
+    guard_parquet("physical Arrow schema", || {
+        parquet::arrow::parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+    })
+}
+
 /// [`read_parquet_metadata`], plus the Arrow schema (decoded from the
 /// footer's `ARROW:schema` key when present) inside the panic boundary.
 ///
@@ -648,9 +682,7 @@ pub fn read_parquet_metadata<R: ChunkReader>(
 ///
 /// As [`read_parquet_metadata`], plus a schema the decoder rejects or
 /// panics on (#683).
-pub fn load_reader_metadata<R: ChunkReader>(
-    reader: &R,
-) -> Result<ArrowReaderMetadata, ParquetError> {
+pub fn load_reader_metadata<R: ChunkReader>(reader: &R) -> Result<ReaderMetadata, ParquetError> {
     reader_metadata(read_parquet_metadata(reader)?)
 }
 
@@ -661,11 +693,9 @@ pub fn load_reader_metadata<R: ChunkReader>(
 ///
 /// Returns a [`ParquetError`] if the schema cannot be derived or the
 /// decoder panics.
-pub fn reader_metadata(
-    metadata: Arc<ParquetMetaData>,
-) -> Result<ArrowReaderMetadata, ParquetError> {
+pub fn reader_metadata(metadata: Arc<ParquetMetaData>) -> Result<ReaderMetadata, ParquetError> {
     guard_parquet("Arrow schema", || {
-        ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+        ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map(ReaderMetadata)
     })
 }
 
@@ -694,10 +724,11 @@ fn scaled_ceiling() -> Option<u64> {
     (limit < BYTE_ARRAY_BATCH_LIMIT).then_some(limit)
 }
 
-/// Fails `batch` the way arrow fails a batch past its i32 offset ceiling
-/// when one of its `Binary`/`Utf8` columns holds more than a scaled
-/// [`byte_array_limit`] (#563, #779). A no-op at the real ceiling, which
-/// arrow enforces itself.
+/// Check a concatenated batch against the scaled byte-offset ceiling.
+///
+/// Fails `batch` when one of its `Binary`/`Utf8` columns holds more than a
+/// scaled [`byte_array_limit`] (#563, #779). A no-op at the real ceiling,
+/// which arrow enforces itself.
 ///
 /// Every batch an [`UntrustedBatchReader`] yields is already checked. Call
 /// this only on a batch built after the read, such as the in-memory
@@ -707,7 +738,7 @@ fn scaled_ceiling() -> Option<u64> {
 /// # Errors
 ///
 /// An [`ArrowError`] naming the column, its bytes and the ceiling.
-pub(crate) fn check_byte_array_ceiling(batch: &RecordBatch) -> Result<(), ArrowError> {
+pub fn check_byte_array_ceiling(batch: &RecordBatch) -> Result<(), ArrowError> {
     match scaled_ceiling() {
         Some(limit) => check_batch_under(batch, limit),
         None => Ok(()),
@@ -883,11 +914,13 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
     }
 }
 
-/// The read-plan owner. Statistics choose an initial decode size only;
+/// Choose the initial decode size from selected row-group statistics.
+///
+/// Statistics choose an initial decode size only;
 /// [`UntrustedBatchReader`] splits wide-offset batches before narrowing, so
 /// skewed widths cannot defeat the estimate. Both engines and every reader
 /// use this plan. A single oversized row is refused by the decoder.
-pub(crate) fn read_batch_plan(
+pub fn read_batch_plan(
     metadata: &ParquetMetaData,
     row_groups: Option<&[usize]>,
     requested: usize,
@@ -923,12 +956,75 @@ pub(crate) fn read_batch_plan(
     )
 }
 
+/// The byte-array column that holds the most decoded bytes in total over some
+/// row groups (#606): what decides whether one batch can hold all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargestByteArrayColumn {
+    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
+    pub column: String,
+    /// Decoded bytes summed over the row groups.
+    pub total_bytes: u64,
+}
+
+/// Find the byte-array leaf with the most decoded bytes in selected groups.
+///
+/// Sums over `row_groups` (`None` = all), counting only leaves under a root
+/// for which `root_counts` returns true. Returns `None` when no counted leaf
+/// holds any bytes.
+///
+/// Footer-only. A chunk's size is its `unencoded_byte_array_data_bytes` size
+/// statistic when the writer recorded it, the exact length of the values the
+/// decoded array holds. Without it the chunk's `total_uncompressed_size`
+/// stands in. That figure counts a dictionary-encoded chunk's distinct values
+/// once, so the total can then fall short of the decoded size.
+pub fn largest_byte_array_column(
+    meta: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    root_counts: impl Fn(usize) -> bool,
+) -> Option<LargestByteArrayColumn> {
+    let descr = meta.file_metadata().schema_descr();
+    let groups = meta.row_groups();
+    let all: Vec<usize>;
+    let picked: &[usize] = match row_groups {
+        Some(p) => p,
+        None => {
+            all = (0..groups.len()).collect();
+            &all
+        }
+    };
+    let mut totals = vec![0u64; descr.num_columns()];
+    for &gi in picked {
+        let Some(rg) = groups.get(gi) else {
+            continue;
+        };
+        for (leaf, col) in rg.columns().iter().enumerate() {
+            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
+                continue;
+            }
+            let bytes = col
+                .unencoded_byte_array_data_bytes()
+                .unwrap_or_else(|| col.uncompressed_size())
+                .max(0) as u64;
+            totals[leaf] = totals[leaf].saturating_add(bytes);
+        }
+    }
+    totals
+        .iter()
+        .enumerate()
+        .filter(|&(leaf, &bytes)| bytes > 0 && root_counts(descr.get_column_root_idx(leaf)))
+        .max_by_key(|&(_, &bytes)| bytes)
+        .map(|(leaf, &total_bytes)| LargestByteArrayColumn {
+            column: descr.column(leaf).path().string(),
+            total_bytes,
+        })
+}
+
 // ============================================================================
 // Parquet
 // ============================================================================
 
 /// The parquet reader's default batch size, used when a caller sets none.
-pub(crate) const DEFAULT_BATCH_ROWS: usize = 1024;
+pub const DEFAULT_BATCH_ROWS: usize = 1024;
 
 /// A checked Parquet file, ready to read: the footer has passed the
 /// pre-check and the chunk-range check, and the Arrow schema decoded inside
@@ -940,9 +1036,10 @@ pub(crate) const DEFAULT_BATCH_ROWS: usize = 1024;
 pub struct ParquetSource<R: ChunkReader + 'static> {
     reader: R,
     projection: Option<ProjectionMask>,
-    metadata: ArrowReaderMetadata,
+    metadata: ReaderMetadata,
     row_groups: Option<Vec<usize>>,
     batch_rows: usize,
+    limit: Option<usize>,
 }
 
 impl<R: ChunkReader + 'static> std::fmt::Debug for ParquetSource<R> {
@@ -971,7 +1068,7 @@ pub fn open_parquet<R: ChunkReader + 'static>(reader: R) -> Result<ParquetSource
 /// same file many times parses its footer once.
 pub fn open_parquet_with_metadata<R: ChunkReader + 'static>(
     reader: R,
-    metadata: ArrowReaderMetadata,
+    metadata: ReaderMetadata,
 ) -> ParquetSource<R> {
     ParquetSource {
         reader,
@@ -979,6 +1076,7 @@ pub fn open_parquet_with_metadata<R: ChunkReader + 'static>(
         metadata,
         row_groups: None,
         batch_rows: DEFAULT_BATCH_ROWS,
+        limit: None,
     }
 }
 
@@ -1000,7 +1098,7 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
 
     /// The checked footer and schema, to open this file again with
     /// [`open_parquet_with_metadata`] without re-parsing.
-    pub fn reader_metadata(&self) -> &ArrowReaderMetadata {
+    pub fn reader_metadata(&self) -> &ReaderMetadata {
         &self.metadata
     }
 
@@ -1032,6 +1130,13 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
     #[must_use]
     pub fn with_batch_rows(mut self, rows: usize) -> Self {
         self.batch_rows = rows;
+        self
+    }
+
+    /// Read at most `rows` rows, without decoding the remaining data pages.
+    #[must_use]
+    pub fn with_limit(mut self, rows: usize) -> Self {
+        self.limit = Some(rows);
         self
     }
 
@@ -1067,6 +1172,9 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         }
         if let Some(row_groups) = self.row_groups {
             builder = builder.with_row_groups(row_groups);
+        }
+        if let Some(limit) = self.limit {
+            builder = builder.with_limit(limit);
         }
         let inner = guard_parquet("parquet reader", || builder.build())?;
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -1108,7 +1216,7 @@ pub struct UntrustedBatchReader {
 
 /// One batch from `next`, decoded inside the panic boundary. After an error
 /// or the end, `done` is set and every later call yields `None`.
-fn guarded_next(
+pub(super) fn guarded_next(
     done: &mut bool,
     what: &'static str,
     next: impl FnOnce() -> Option<Result<RecordBatch, ArrowError>>,
@@ -1311,78 +1419,6 @@ mod tests {
             .join("../../fuzz/corpus")
             .join(target)
             .join(name)
-    }
-
-    /// Every row of every column of the input at `path`, read the way a
-    /// convert reads it.
-    fn read_all(path: &Path) -> Result<usize, String> {
-        let source = crate::input::InputSource::Local(path.to_path_buf());
-        let reader = source
-            .open()
-            .map_err(|e| e.to_string())?
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut rows = 0;
-        for batch in reader {
-            rows += batch.map_err(|e| e.to_string())?.num_rows();
-        }
-        Ok(rows)
-    }
-
-    /// #683: a crafted `ARROW:schema` footer key panicked arrow-ipc's schema
-    /// conversion on every open.
-    #[test]
-    fn issue_683_crafted_arrow_schema_is_an_error_on_every_open() {
-        let path = corpus("overview_file", "seed-issue-683-arrow-schema.parquet");
-        let err = read_all(&path).unwrap_err();
-        assert!(err.contains("panicked"), "input open: {err}");
-        let err = crate::overview::reader::OverviewReader::open(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("panicked"), "overview reader: {err}");
-        // `validate` must not pass a file export refuses: the schema decode
-        // is one of its checks.
-        let report = crate::overview::check::validate_file(&path).unwrap();
-        let failed = report
-            .checks
-            .iter()
-            .find(|c| c.name == "arrow_schema_decodes" && !c.passed)
-            .unwrap_or_else(|| panic!("validate passed #683's file: {:?}", report.checks));
-        assert!(failed.message.contains("panicked"), "{}", failed.message);
-    }
-
-    /// #687: a crafted data page panicked parquet-rs's definition-level
-    /// decoder mid-read.
-    #[test]
-    fn issue_687_crafted_def_levels_are_an_error_not_a_panic() {
-        let path = corpus("remote_footer", "seed-issue-687-def-levels.parquet");
-        let err = read_all(&path).unwrap_err();
-        assert!(err.contains("panicked"), "{err}");
-    }
-
-    /// #690: a footer whose schema element declares billions of children
-    /// made parquet-rs reserve ~12 GB before it read any of them. The
-    /// pre-check refuses it, naming the count, before parquet sees it.
-    #[test]
-    fn issue_690_huge_num_children_is_refused_before_the_decode() {
-        let thrift = std::fs::read(corpus(
-            "parquet_footer",
-            "seed-issue-690-num-children.thrift",
-        ))
-        .unwrap();
-        let mut file = b"PAR1".to_vec();
-        file.extend_from_slice(&thrift);
-        file.extend_from_slice(&(thrift.len() as u32).to_le_bytes());
-        file.extend_from_slice(b"PAR1");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("oom.parquet");
-        std::fs::write(&path, &file).unwrap();
-        let err = crate::overview::check::validate_file(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("children"), "{err}");
-        let err = read_all(&path).unwrap_err();
-        assert!(err.contains("children"), "{err}");
     }
 
     /// A caught panic names where it happened and does not claim the input

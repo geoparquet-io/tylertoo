@@ -1,0 +1,211 @@
+pub mod tylertoo_io
+pub use tylertoo_io::ArrowColumnChunk
+pub use tylertoo_io::ArrowColumnWriter
+pub use tylertoo_io::ArrowRowGroupWriterFactory
+pub use tylertoo_io::ChunkReader
+pub use tylertoo_io::ConvertedType
+pub use tylertoo_io::IntType
+pub use tylertoo_io::KeyValue
+pub use tylertoo_io::Length
+pub use tylertoo_io::LogicalType
+pub use tylertoo_io::ParquetError
+pub use tylertoo_io::ParquetMetaData
+pub use tylertoo_io::PhysicalType
+pub use tylertoo_io::ProjectionMask
+pub use tylertoo_io::RowGroupMetaData
+pub use tylertoo_io::SerializedFileWriter
+pub use tylertoo_io::Statistics
+pub use tylertoo_io::compute_leaves
+pub enum tylertoo_io::Error
+pub tylertoo_io::Error::ByteArrayRowTooLarge
+pub tylertoo_io::Error::ByteArrayRowTooLarge::bytes: u64
+pub tylertoo_io::Error::ByteArrayRowTooLarge::column: alloc::string::String
+pub tylertoo_io::Error::ByteArrayRowTooLarge::limit_bytes: u64
+pub tylertoo_io::Error::DecoderPanic
+pub tylertoo_io::Error::DecoderPanic::message: alloc::string::String
+pub tylertoo_io::Error::DecoderPanic::what: &'static str
+pub tylertoo_io::Error::HostileFooter(alloc::string::String)
+pub tylertoo_io::Error::HostileIpcFooter(alloc::string::String)
+impl core::error::Error for tylertoo_io::Error
+impl core::fmt::Debug for tylertoo_io::Error
+pub fn tylertoo_io::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_io::Error
+pub fn tylertoo_io::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_io::Error
+impl core::marker::Send for tylertoo_io::Error
+impl core::marker::Sync for tylertoo_io::Error
+impl core::marker::Unpin for tylertoo_io::Error
+impl core::marker::UnsafeUnpin for tylertoo_io::Error
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::Error
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::Error
+pub struct tylertoo_io::BatchWriter<W: core::io::write::Write + core::marker::Send>(_)
+impl<W: core::io::write::Write + core::marker::Send> tylertoo_io::BatchWriter<W>
+pub fn tylertoo_io::BatchWriter<W>::append_key_value_metadata(&mut self, parquet::file::metadata::KeyValue)
+pub fn tylertoo_io::BatchWriter<W>::close(self) -> core::result::Result<(), parquet::errors::ParquetError>
+pub fn tylertoo_io::BatchWriter<W>::into_serialized_writer(self) -> core::result::Result<(parquet::file::writer::SerializedFileWriter<W>, parquet::arrow::arrow_writer::ArrowRowGroupWriterFactory), parquet::errors::ParquetError>
+pub fn tylertoo_io::BatchWriter<W>::write(&mut self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), parquet::errors::ParquetError>
+impl<W> core::marker::Freeze for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::Freeze
+impl<W> core::marker::Send for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::Send
+impl<W> !core::marker::Sync for tylertoo_io::BatchWriter<W>
+impl<W> core::marker::Unpin for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::Unpin
+impl<W> core::marker::UnsafeUnpin for tylertoo_io::BatchWriter<W> where parquet::arrow::arrow_writer::ArrowWriter<W>: core::marker::UnsafeUnpin
+impl<W> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::BatchWriter<W>
+impl<W> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::BatchWriter<W>
+pub struct tylertoo_io::IpcFileWriter<W: core::io::write::Write>(_)
+impl<W: core::io::write::Write> tylertoo_io::IpcFileWriter<W>
+pub fn tylertoo_io::IpcFileWriter<W>::finish(&mut self) -> core::result::Result<(), arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcFileWriter<W>::into_inner(self) -> core::result::Result<W, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcFileWriter<W>::try_new(W, &arrow_schema::schema::Schema) -> core::result::Result<Self, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcFileWriter<W>::write(&mut self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
+impl<W> core::marker::Freeze for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::Freeze
+impl<W> core::marker::Send for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::Send
+impl<W> core::marker::Sync for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::Sync
+impl<W> core::marker::Unpin for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::Unpin
+impl<W> core::marker::UnsafeUnpin for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::marker::UnsafeUnpin
+impl<W> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::panic::unwind_safe::RefUnwindSafe
+impl<W> core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcFileWriter<W> where arrow_ipc::writer::FileWriter<W>: core::panic::unwind_safe::UnwindSafe
+pub struct tylertoo_io::IpcStreamReader<R: alloc::io::read::Read>
+impl<R: alloc::io::read::Read> tylertoo_io::IpcStreamReader<R>
+pub fn tylertoo_io::IpcStreamReader<R>::schema(&self) -> arrow_schema::schema::SchemaRef
+pub fn tylertoo_io::IpcStreamReader<R>::try_new(R, core::option::Option<alloc::vec::Vec<usize>>) -> core::result::Result<Self, arrow_schema::error::ArrowError>
+impl<R: alloc::io::read::Read> core::iter::traits::iterator::Iterator for tylertoo_io::IpcStreamReader<R>
+pub type tylertoo_io::IpcStreamReader<R>::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcStreamReader<R>::next(&mut self) -> core::option::Option<Self::Item>
+impl<R: core::fmt::Debug + alloc::io::read::Read> core::fmt::Debug for tylertoo_io::IpcStreamReader<R>
+pub fn tylertoo_io::IpcStreamReader<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R> core::marker::Freeze for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Send
+impl<R> core::marker::Sync for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Sync
+impl<R> core::marker::Unpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::UnsafeUnpin
+impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamReader<R>
+impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamReader<R>
+pub struct tylertoo_io::IpcStreamWriter<W: core::io::write::Write>(_)
+impl<W: core::io::write::Write> tylertoo_io::IpcStreamWriter<W>
+pub fn tylertoo_io::IpcStreamWriter<W>::finish(&mut self) -> core::result::Result<(), arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcStreamWriter<W>::try_new(W, &arrow_schema::schema::Schema) -> core::result::Result<Self, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcStreamWriter<W>::write(&mut self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
+impl<W> core::marker::Freeze for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Freeze
+impl<W> core::marker::Send for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Send
+impl<W> core::marker::Sync for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Sync
+impl<W> core::marker::Unpin for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Unpin
+impl<W> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::UnsafeUnpin
+impl<W> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::panic::unwind_safe::RefUnwindSafe
+impl<W> core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::panic::unwind_safe::UnwindSafe
+pub struct tylertoo_io::LargestByteArrayColumn
+pub tylertoo_io::LargestByteArrayColumn::column: alloc::string::String
+pub tylertoo_io::LargestByteArrayColumn::total_bytes: u64
+impl core::clone::Clone for tylertoo_io::LargestByteArrayColumn
+pub fn tylertoo_io::LargestByteArrayColumn::clone(&self) -> tylertoo_io::LargestByteArrayColumn
+impl core::cmp::Eq for tylertoo_io::LargestByteArrayColumn
+impl core::cmp::PartialEq for tylertoo_io::LargestByteArrayColumn
+pub fn tylertoo_io::LargestByteArrayColumn::eq(&self, &tylertoo_io::LargestByteArrayColumn) -> bool
+impl core::fmt::Debug for tylertoo_io::LargestByteArrayColumn
+pub fn tylertoo_io::LargestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_io::LargestByteArrayColumn
+impl core::marker::Freeze for tylertoo_io::LargestByteArrayColumn
+impl core::marker::Send for tylertoo_io::LargestByteArrayColumn
+impl core::marker::Sync for tylertoo_io::LargestByteArrayColumn
+impl core::marker::Unpin for tylertoo_io::LargestByteArrayColumn
+impl core::marker::UnsafeUnpin for tylertoo_io::LargestByteArrayColumn
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::LargestByteArrayColumn
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::LargestByteArrayColumn
+pub struct tylertoo_io::OverviewWriteOptions
+pub tylertoo_io::OverviewWriteOptions::covering_columns: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_io::OverviewWriteOptions::full_column_stats: bool
+pub tylertoo_io::OverviewWriteOptions::geometry_columns: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_io::OverviewWriteOptions::zstd_level: i32
+impl core::clone::Clone for tylertoo_io::OverviewWriteOptions
+pub fn tylertoo_io::OverviewWriteOptions::clone(&self) -> tylertoo_io::OverviewWriteOptions
+impl core::fmt::Debug for tylertoo_io::OverviewWriteOptions
+pub fn tylertoo_io::OverviewWriteOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_io::OverviewWriteOptions
+impl core::marker::Send for tylertoo_io::OverviewWriteOptions
+impl core::marker::Sync for tylertoo_io::OverviewWriteOptions
+impl core::marker::Unpin for tylertoo_io::OverviewWriteOptions
+impl core::marker::UnsafeUnpin for tylertoo_io::OverviewWriteOptions
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::OverviewWriteOptions
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::OverviewWriteOptions
+pub struct tylertoo_io::ParquetSource<R: parquet::file::reader::ChunkReader + 'static>
+impl<R: parquet::file::reader::ChunkReader + 'static> tylertoo_io::ParquetSource<R>
+pub fn tylertoo_io::ParquetSource<R>::build(self) -> core::result::Result<tylertoo_io::UntrustedBatchReader, parquet::errors::ParquetError>
+pub fn tylertoo_io::ParquetSource<R>::metadata(&self) -> &alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>
+pub fn tylertoo_io::ParquetSource<R>::parquet_schema(&self) -> &parquet::schema::types::SchemaDescriptor
+pub fn tylertoo_io::ParquetSource<R>::reader_metadata(&self) -> &tylertoo_io::ReaderMetadata
+pub fn tylertoo_io::ParquetSource<R>::schema(&self) -> &arrow_schema::schema::SchemaRef
+pub fn tylertoo_io::ParquetSource<R>::with_batch_rows(self, usize) -> Self
+pub fn tylertoo_io::ParquetSource<R>::with_limit(self, usize) -> Self
+pub fn tylertoo_io::ParquetSource<R>::with_projection(self, parquet::arrow::ProjectionMask) -> Self
+pub fn tylertoo_io::ParquetSource<R>::with_projection_roots(self, impl core::iter::traits::collect::IntoIterator<Item = usize>) -> Self
+pub fn tylertoo_io::ParquetSource<R>::with_row_groups(self, alloc::vec::Vec<usize>) -> Self
+impl<R: parquet::file::reader::ChunkReader + 'static> core::fmt::Debug for tylertoo_io::ParquetSource<R>
+pub fn tylertoo_io::ParquetSource<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<R> core::marker::Freeze for tylertoo_io::ParquetSource<R> where R: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_io::ParquetSource<R>
+impl<R> core::marker::Sync for tylertoo_io::ParquetSource<R>
+impl<R> core::marker::Unpin for tylertoo_io::ParquetSource<R> where R: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_io::ParquetSource<R> where R: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::ParquetSource<R> where R: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for tylertoo_io::ParquetSource<R> where R: core::panic::unwind_safe::UnwindSafe
+pub struct tylertoo_io::ReaderMetadata(_)
+impl tylertoo_io::ReaderMetadata
+pub fn tylertoo_io::ReaderMetadata::metadata(&self) -> &alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>
+pub fn tylertoo_io::ReaderMetadata::parquet_schema(&self) -> &parquet::schema::types::SchemaDescriptor
+pub fn tylertoo_io::ReaderMetadata::schema(&self) -> &arrow_schema::schema::SchemaRef
+impl core::clone::Clone for tylertoo_io::ReaderMetadata
+pub fn tylertoo_io::ReaderMetadata::clone(&self) -> tylertoo_io::ReaderMetadata
+impl core::fmt::Debug for tylertoo_io::ReaderMetadata
+pub fn tylertoo_io::ReaderMetadata::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_io::ReaderMetadata
+impl core::marker::Send for tylertoo_io::ReaderMetadata
+impl core::marker::Sync for tylertoo_io::ReaderMetadata
+impl core::marker::Unpin for tylertoo_io::ReaderMetadata
+impl core::marker::UnsafeUnpin for tylertoo_io::ReaderMetadata
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::ReaderMetadata
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::ReaderMetadata
+pub struct tylertoo_io::UntrustedBatchReader
+impl arrow_array::record_batch::RecordBatchReader for tylertoo_io::UntrustedBatchReader
+pub fn tylertoo_io::UntrustedBatchReader::schema(&self) -> arrow_schema::schema::SchemaRef
+impl core::fmt::Debug for tylertoo_io::UntrustedBatchReader
+pub fn tylertoo_io::UntrustedBatchReader::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::iter::traits::iterator::Iterator for tylertoo_io::UntrustedBatchReader
+pub type tylertoo_io::UntrustedBatchReader::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::UntrustedBatchReader::next(&mut self) -> core::option::Option<Self::Item>
+impl core::marker::Freeze for tylertoo_io::UntrustedBatchReader
+impl core::marker::Send for tylertoo_io::UntrustedBatchReader
+impl !core::marker::Sync for tylertoo_io::UntrustedBatchReader
+impl core::marker::Unpin for tylertoo_io::UntrustedBatchReader
+impl core::marker::UnsafeUnpin for tylertoo_io::UntrustedBatchReader
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::UntrustedBatchReader
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_io::UntrustedBatchReader
+pub struct tylertoo_io::UntrustedIpcReader<R: alloc::io::read::Read + core::io::seek::Seek>
+impl<R: alloc::io::read::Read + core::io::seek::Seek> tylertoo_io::UntrustedIpcReader<R>
+pub fn tylertoo_io::UntrustedIpcReader<R>::schema(&self) -> arrow_schema::schema::SchemaRef
+impl<R: alloc::io::read::Read + core::io::seek::Seek> core::iter::traits::iterator::Iterator for tylertoo_io::UntrustedIpcReader<R>
+pub type tylertoo_io::UntrustedIpcReader<R>::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::UntrustedIpcReader<R>::next(&mut self) -> core::option::Option<Self::Item>
+impl<R> core::marker::Freeze for tylertoo_io::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_io::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Send
+impl<R> core::marker::Sync for tylertoo_io::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Sync
+impl<R> core::marker::Unpin for tylertoo_io::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_io::UntrustedIpcReader<R> where arrow_ipc::reader::FileReader<R>: core::marker::UnsafeUnpin
+impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::UntrustedIpcReader<R>
+impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::UntrustedIpcReader<R>
+pub const tylertoo_io::BYTE_ARRAY_BATCH_LIMIT: u64
+pub const tylertoo_io::DEFAULT_BATCH_ROWS: usize
+pub fn tylertoo_io::batch_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
+pub fn tylertoo_io::byte_array_limit() -> u64
+pub fn tylertoo_io::check_byte_array_ceiling(&arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
+pub fn tylertoo_io::decode_footer(&[u8]) -> core::result::Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError>
+pub fn tylertoo_io::input_error<'a>(&'a (dyn core::error::Error + 'static)) -> core::option::Option<&'a tylertoo_io::Error>
+pub fn tylertoo_io::largest_byte_array_column(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, impl core::ops::function::Fn(usize) -> bool) -> core::option::Option<tylertoo_io::LargestByteArrayColumn>
+pub fn tylertoo_io::load_reader_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<tylertoo_io::ReaderMetadata, parquet::errors::ParquetError>
+pub fn tylertoo_io::open_ipc<R: alloc::io::read::Read + core::io::seek::Seek>(R) -> core::result::Result<tylertoo_io::UntrustedIpcReader<R>, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::open_parquet<R: parquet::file::reader::ChunkReader + 'static>(R) -> core::result::Result<tylertoo_io::ParquetSource<R>, parquet::errors::ParquetError>
+pub fn tylertoo_io::open_parquet_with_metadata<R: parquet::file::reader::ChunkReader + 'static>(R, tylertoo_io::ReaderMetadata) -> tylertoo_io::ParquetSource<R>
+pub fn tylertoo_io::overview_writer<W: core::io::write::Write + core::marker::Send>(W, arrow_schema::schema::SchemaRef, &arrow_schema::schema::Schema, &tylertoo_io::OverviewWriteOptions) -> core::result::Result<tylertoo_io::BatchWriter<W>, parquet::errors::ParquetError>
+pub fn tylertoo_io::precheck_footer(&[u8]) -> core::result::Result<(), tylertoo_io::Error>
+pub fn tylertoo_io::read_batch_plan(&parquet::file::metadata::ParquetMetaData, core::option::Option<&[usize]>, usize, u64) -> usize
+pub fn tylertoo_io::read_parquet_metadata<R: parquet::file::reader::ChunkReader>(&R) -> core::result::Result<alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>, parquet::errors::ParquetError>
+pub fn tylertoo_io::reader_metadata(alloc::sync::Arc<parquet::file::metadata::ParquetMetaData>) -> core::result::Result<tylertoo_io::ReaderMetadata, parquet::errors::ParquetError>
+pub fn tylertoo_io::schema_without_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<arrow_schema::schema::Schema, parquet::errors::ParquetError>

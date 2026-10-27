@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/io",
     "crates/core",
     "crates/cli",
     "crates/python",
@@ -27,6 +28,7 @@ categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
+tylertoo-io = { path = "crates/io", version = "0.8.0" }
 tylertoo-core = { path = "crates/core", version = "0.8.0" }
 
 # Core geospatial dependencies

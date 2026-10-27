@@ -24,10 +24,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
 use tylertoo_core::overview::export::{export_pmtiles, ExportOptions};
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
 
 const FIXTURE: &str = "../../tests/fixtures/realdata/ftw-moldova-z10.parquet";
 const FIELDS: usize = 1_500;
@@ -35,7 +35,7 @@ const FIELDS: usize = 1_500;
 /// The fixture's first [`FIELDS`] rows, schema and GeoParquet metadata
 /// kept, written to `out`.
 fn write_prefix(out: &Path) -> Option<()> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(FIXTURE).ok()?).ok()?;
+    let builder = open_parquet(File::open(FIXTURE).ok()?).ok()?;
     let schema = builder.schema().clone();
     let reader = builder.with_limit(FIELDS).build().ok()?;
     let mut writer = ArrowWriter::try_new(File::create(out).ok()?, schema, None).ok()?;

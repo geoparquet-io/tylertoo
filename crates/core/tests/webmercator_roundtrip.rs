@@ -27,7 +27,7 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::ArrowWriter;
+use tylertoo_io::test_support::ArrowWriter;
 
 /// Half the Web Mercator world extent, in metres.
 const WEBMERC_HALF_M: f64 = 20_037_508.342_789_244;
@@ -113,8 +113,8 @@ fn write_pseudo_mercator_input(path: &Path, geoms: &[Geometry<f64>]) {
 /// silent lie this test exists to catch.
 fn overview_declared_crs(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).unwrap();
-    let reader = parquet::file::serialized_reader::SerializedFileReader::new(file).unwrap();
-    let kv = parquet::file::reader::FileReader::metadata(&reader)
+    let reader = tylertoo_io::read_parquet_metadata(&file).unwrap();
+    let kv = reader
         .file_metadata()
         .key_value_metadata()?
         .iter()
@@ -212,11 +212,11 @@ fn webmercator_input_round_trips_through_convert_and_export() {
 fn decoded_bounds(path: &Path) -> (f64, f64, f64, f64) {
     use geo::BoundingRect;
     use geoarrow::array::from_arrow_array;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tylertoo_core::batch_processor::extract_geometries_from_array;
+    use tylertoo_io::open_parquet;
 
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let schema = builder.schema().clone();
     let gidx = schema.index_of("geometry").unwrap();
     let gfield = schema.field(gidx).clone();

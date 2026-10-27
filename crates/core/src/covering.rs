@@ -42,12 +42,12 @@ use crate::overview::level::Crs;
 use crate::tile::{TileBounds, TileCoord};
 use crate::Error;
 use arrow_schema::{DataType, Schema};
-use parquet::basic::LogicalType;
-use parquet::file::metadata::ParquetMetaData;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use tylertoo_io::LogicalType;
+use tylertoo_io::ParquetMetaData;
 
 /// Specification for bbox covering columns parsed from GeoParquet metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -410,7 +410,7 @@ pub fn find_bbox_column_indices(
 /// Extract a statistic value from column metadata.
 ///
 /// Reads FLOAT and DOUBLE statistics through parquet's typed
-/// [`Statistics`](parquet::file::statistics::Statistics), converting to f64.
+/// [`Statistics`](tylertoo_io::Statistics), converting to f64.
 /// Any other physical type is `None`: decoding raw stat bytes by width would
 /// read an INT64 column's 10 as about 5e-323, a bogus bound. A **NaN**
 /// statistic reads as *missing* (`None`, #428): it cannot bound anything, and
@@ -425,11 +425,11 @@ pub fn find_bbox_column_indices(
 /// sentinel (`xmin = +inf`, `xmax = -inf`) stays a real, empty bbox and goes
 /// on being pruned.
 fn extract_stat_value(
-    row_group: &parquet::file::metadata::RowGroupMetaData,
+    row_group: &tylertoo_io::RowGroupMetaData,
     col_idx: usize,
     use_min: bool,
 ) -> Option<f64> {
-    use parquet::file::statistics::Statistics;
+    use tylertoo_io::Statistics;
 
     let value = match row_group.column(col_idx).statistics()? {
         Statistics::Float(s) => f64::from(*if use_min { s.min_opt() } else { s.max_opt() }?),
@@ -460,7 +460,7 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
     let file = File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open {}: {}", path.display(), e)))?;
 
-    let metadata = crate::untrusted::read_parquet_metadata(&file)
+    let metadata = tylertoo_io::read_parquet_metadata(&file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to read {}: {}", path.display(), e)))?;
 
     extract_row_group_bounds_from_metadata(&metadata)
@@ -469,7 +469,7 @@ pub fn extract_row_group_bounds(path: &Path) -> Result<Vec<Option<RowGroupBounds
 /// Extract per-row-group bounding boxes directly from parsed Parquet metadata.
 ///
 /// Callers that already hold a [`ParquetMetaData`] (e.g. from
-/// [`crate::untrusted::read_parquet_metadata`] or a `ParquetSource`) can
+/// [`tylertoo_io::read_parquet_metadata`] or a `ParquetSource`) can
 /// prune without re-opening the file.
 /// Returns `None` for row groups whose covering statistics are unavailable —
 /// including a bbox with a NaN corner, which cannot bound anything (#428) —
@@ -710,7 +710,7 @@ pub(crate) fn native_geo_crs_matches(logical_type: &LogicalType, session_crs: Cr
 /// statistics must read as missing, never as an impossible/empty box that
 /// would prune the row group).
 fn row_group_native_bounds(
-    rg: &parquet::file::metadata::RowGroupMetaData,
+    rg: &tylertoo_io::RowGroupMetaData,
     rg_idx: usize,
     geom_leaf_idx: usize,
 ) -> Option<RowGroupBounds> {
@@ -1280,13 +1280,13 @@ mod tests {
     /// NaN when it computes float statistics, so a NaN min/max can only reach
     /// us from *another* writer — which is exactly the case under test.
     fn metadata_with_bbox_stats(stats: [(f64, f64); 4], num_rows: i64) -> ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
         };
-        use parquet::file::statistics::Statistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
+        use tylertoo_io::Statistics;
 
         let names = ["xmin", "ymin", "xmax", "ymax"];
         let fields = names
@@ -1345,13 +1345,13 @@ mod tests {
     /// "read it".
     #[test]
     fn integer_covering_statistics_are_not_read_as_floats() {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
         };
-        use parquet::file::statistics::Statistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
+        use tylertoo_io::Statistics;
 
         for physical in [PhysicalType::INT64, PhysicalType::INT32] {
             let fields = ["xmin", "ymin", "xmax", "ymax"]
@@ -1619,7 +1619,7 @@ mod tests {
         /// Tier-1 covering-column bbox, `(xmin, ymin, xmax, ymax)`.
         covering: Option<(f64, f64, f64, f64)>,
         /// Tier-2 native `geo_statistics` bbox, `(xmin, xmax, ymin, ymax)`
-        /// — [`parquet::geospatial::bounding_box::BoundingBox::new`]'s own
+        /// — [`tylertoo_io::test_support::BoundingBox::new`]'s own
         /// (unusual) parameter order.
         native: Option<(f64, f64, f64, f64)>,
         num_rows: i64,
@@ -1648,15 +1648,15 @@ mod tests {
         with_geo_json: bool,
         row_groups: &[TieredRowGroupSpec],
     ) -> ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+        use std::sync::Arc;
+        use tylertoo_io::test_support::BoundingBox;
+        use tylertoo_io::test_support::GeospatialStatistics;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
         };
-        use parquet::file::statistics::Statistics;
-        use parquet::geospatial::bounding_box::BoundingBox;
-        use parquet::geospatial::statistics::GeospatialStatistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
+        use tylertoo_io::Statistics;
 
         let mut fields: Vec<Arc<Type>> = ["xmin", "ymin", "xmax", "ymax"]
             .iter()
@@ -2036,12 +2036,12 @@ mod tests {
     /// test the way a `Geometry` column's straight edges are.
     #[test]
     fn native_stats_geography_never_prunes() {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
-        use parquet::geospatial::bounding_box::BoundingBox;
-        use parquet::geospatial::statistics::GeospatialStatistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
         use std::sync::Arc;
+        use tylertoo_io::test_support::BoundingBox;
+        use tylertoo_io::test_support::GeospatialStatistics;
+        use tylertoo_io::test_support::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
 
         let geometry_field = Arc::new(
             Type::primitive_type_builder("geometry", PhysicalType::BYTE_ARRAY)
@@ -2133,13 +2133,13 @@ mod tests {
     /// `primary_column`, the shape that made tier 1 fall back to "whichever
     /// column declares a covering".
     fn metadata_with_centroid_covering(bbox: (f64, f64, f64, f64)) -> ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
         };
-        use parquet::file::statistics::Statistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
+        use tylertoo_io::Statistics;
 
         let mut fields: Vec<Arc<Type>> = ["c_xmin", "c_ymin", "c_xmax", "c_ymax"]
             .iter()
@@ -2232,7 +2232,7 @@ mod tests {
     /// Synthetic GeoParquet 2.0 footer with TWO annotated geometry columns —
     /// `centroid` at leaf 0 and `geom_shape` at leaf 1 — each carrying its
     /// own native `geo_statistics` bbox, in
-    /// [`parquet::geospatial::bounding_box::BoundingBox::new`]'s
+    /// [`tylertoo_io::test_support::BoundingBox::new`]'s
     /// `(xmin, xmax, ymin, ymax)` order. `geo_json` optionally attaches a
     /// "geo" key declaring a `primary_column`.
     fn metadata_with_two_geometry_columns(
@@ -2240,14 +2240,14 @@ mod tests {
         shape: Option<(f64, f64, f64, f64)>,
         geo_json: Option<&str>,
     ) -> ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+        use std::sync::Arc;
+        use tylertoo_io::test_support::BoundingBox;
+        use tylertoo_io::test_support::GeospatialStatistics;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, KeyValue, RowGroupMetaData,
         };
-        use parquet::geospatial::bounding_box::BoundingBox;
-        use parquet::geospatial::statistics::GeospatialStatistics;
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
 
         let fields: Vec<Arc<Type>> = ["centroid", "geom_shape"]
             .iter()

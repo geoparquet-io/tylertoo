@@ -1,9 +1,9 @@
 //! Real coarse-zoom footprints lost by the pre-overlay pinch splitter (#779).
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use parquet::arrow::ArrowWriter;
 use std::process::Command;
-use tylertoo_core::untrusted::open_parquet;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;

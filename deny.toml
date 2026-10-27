@@ -89,7 +89,10 @@ confidence-threshold = 0.8
 # no better one).
 multiple-versions = "deny"
 wildcards = "deny"
-deny = []
+deny = [
+    { crate = "parquet", wrappers = ["tylertoo-io"] },
+    { crate = "arrow-ipc", wrappers = ["tylertoo-io"] },
+]
 skip = [
     # hyper-util 0.1 is still on base64 0.22; arrow/parquet/object_store use 0.23.
     { crate = "base64@0.22.1", reason = "#779: hyper-util 0.1.20 pins base64 0.22" },

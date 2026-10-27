@@ -31,9 +31,9 @@ use std::sync::Arc;
 use arrow_array::{BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use geo::{Geometry, GeometryCollection, LineString, Point, Polygon};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::KeyValue;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
+use tylertoo_io::KeyValue;
 
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::convert::{
@@ -122,7 +122,7 @@ fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> 
 /// footers).
 fn rewrite_with_tampered_footer(src: &Path, dst: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let file = std::fs::File::open(src).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let schema = builder.schema().clone();
     let kvs = builder
         .metadata()
@@ -272,7 +272,7 @@ fn export_counts_a_non_finite_overview_vertex() {
         hostile_wkb.extend_from_slice(&y.to_le_bytes());
     }
     let hostile = dir.path().join("hostile.parquet");
-    let open = || ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&valid).unwrap());
+    let open = || open_parquet(std::fs::File::open(&valid).unwrap());
     let probe = open().unwrap();
     let schema = probe.schema().clone();
     let kvs = probe
@@ -816,7 +816,7 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
     use tylertoo_core::batch_processor::extract_geometries_from_array;
 
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let mut out = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
@@ -1154,7 +1154,7 @@ fn coalesce_nan_knobs_rejected() {
 /// Field names of an overview output file, in schema order.
 fn output_column_names(path: &Path) -> Vec<String> {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     builder
         .schema()
         .fields()
@@ -2170,9 +2170,7 @@ fn empty_coarse_levels_omitted_with_clustering() {
 fn export_names_an_overview_file_without_geometry() {
     let tovr = tempfile::NamedTempFile::new().unwrap();
     make_valid_overview(tovr.path());
-    let open = || {
-        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(tovr.path()).unwrap()).unwrap()
-    };
+    let open = || open_parquet(std::fs::File::open(tovr.path()).unwrap()).unwrap();
     let source = open();
     let kvs = source
         .metadata()

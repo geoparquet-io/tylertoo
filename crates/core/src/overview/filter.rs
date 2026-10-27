@@ -67,8 +67,8 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_ord::cmp;
 use arrow_schema::{DataType, Schema, TimeUnit};
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
-use parquet::file::statistics::Statistics;
+use tylertoo_io::Statistics;
+use tylertoo_io::{ParquetMetaData, RowGroupMetaData};
 
 /// Errors from parsing or binding a `--filter` expression.
 #[derive(Debug, thiserror::Error)]
@@ -1394,7 +1394,7 @@ mod tests {
     /// absent, which is the branch that keeps the row group.
     #[test]
     fn nan_numeric_statistics_never_prune() {
-        use parquet::file::statistics::Statistics;
+        use tylertoo_io::Statistics;
 
         let nan = Statistics::double(Some(f64::NAN), Some(f64::NAN), None, Some(0), false);
         assert_eq!(
@@ -2056,8 +2056,8 @@ mod tests {
     fn stats_file(
         rows: &[(Option<f64>, Option<&str>)],
     ) -> (tempfile::NamedTempFile, ParquetMetaData) {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::WriterProperties;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("confidence", DataType::Float64, true),
@@ -2080,7 +2080,7 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let meta = crate::untrusted::read_parquet_metadata(&f)
+        let meta = tylertoo_io::read_parquet_metadata(&f)
             .unwrap()
             .as_ref()
             .clone();
@@ -2271,8 +2271,8 @@ mod tests {
 
     /// Parquet file with a Timestamp(micros) column, one row group per value.
     fn ts_stats_file(rows: &[Option<i64>]) -> (tempfile::NamedTempFile, ParquetMetaData) {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::WriterProperties;
 
         let dt = DataType::Timestamp(TimeUnit::Microsecond, None);
         let schema = Arc::new(Schema::new(vec![Field::new("time", dt.clone(), true)]));
@@ -2289,7 +2289,7 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let meta = crate::untrusted::read_parquet_metadata(&f)
+        let meta = tylertoo_io::read_parquet_metadata(&f)
             .unwrap()
             .as_ref()
             .clone();
