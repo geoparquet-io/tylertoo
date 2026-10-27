@@ -1515,7 +1515,7 @@ pub struct PyramidOptions {
     ///
     /// This is the only publication metadata `build_pyramid` writes:
     /// [`PyramidOptions::validate`] refuses a set `export.metadata`
-    /// ([`ConfigError::OptionIgnored`](crate::overview::config::ConfigError::OptionIgnored)),
+    /// ([`ConfigError::OptionIgnored`]),
     /// so a GeoParquet band's intermediate archive carries none and passes
     /// none on.
     pub metadata: TilesetMetadata,

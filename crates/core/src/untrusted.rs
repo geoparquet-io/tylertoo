@@ -24,7 +24,7 @@
 //! - **A panic boundary** around every upstream decode — the footer, the
 //!   embedded `ARROW:schema` (#683), each data page (#687) and each IPC
 //!   message (#684). A panic becomes [`InputError::DecoderPanic`], carrying
-//!   the upstream message and location. See [`guard`] for why that is sound.
+//!   the upstream message and location. See `guard` for why that is sound.
 //! - **One batch-size ceiling** (#563): [`ParquetSource::build`] lowers the
 //!   requested batch so no decoded byte-array column can reach arrow's i32
 //!   offset limit, from footer statistics alone. [`byte_array_limit`] is the
@@ -439,7 +439,7 @@ impl Skim<'_> {
 /// reports its own error: the pre-check only ever refuses a count.
 ///
 /// Each declared count is floored at its element type's smallest wire size
-/// ([`min_wire_bytes`]), not its decoded size. A struct element can be one
+/// (`min_wire_bytes`), not its decoded size. A struct element can be one
 /// byte on the wire (its stop byte) yet decode into a struct of a few
 /// hundred bytes, so a footer of F bytes can still make parquet-rs reserve
 /// about F × `size_of::<T>()`. That is linear in a footer the file actually
@@ -684,11 +684,11 @@ pub(crate) const BYTE_ARRAY_LIMIT_ENV: &str = "TYLERTOO_BYTE_ARRAY_LIMIT_BYTES";
 /// [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`], unless it is scaled down.
 ///
 /// The one source of the ceiling. Every read path sizes its batches from
-/// it, and [`check_byte_array_ceiling`] fails a batch past it, so scaling
+/// it, and `check_byte_array_ceiling` fails a batch past it, so scaling
 /// it exercises every path's cap at a size a fixture can reach. Two things
 /// scale it, and either can only lower it:
 ///
-/// - [`BYTE_ARRAY_LIMIT_ENV`], a positive integer (anything else is
+/// - `TYLERTOO_BYTE_ARRAY_LIMIT_BYTES`, a positive integer (anything else is
 ///   ignored);
 /// - in unit tests, `scale_byte_array_limit`.
 ///
