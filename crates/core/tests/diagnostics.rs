@@ -1,6 +1,61 @@
 use tylertoo_core::diagnostics::{Diagnostic, Diagnostics};
 
 #[test]
+fn schema_resolution_defers_warning_logs_until_an_operation() {
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Mutex;
+    use tylertoo_core::diagnostics::CrsWarning;
+    use tylertoo_core::resolved_schema::ResolvedSchema;
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    struct Capture;
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            let message = record.args().to_string();
+            if message.contains("GeoParquet 'geo' metadata has no 'version'") {
+                LINES.lock().unwrap().push(message);
+            }
+        }
+        fn flush(&self) {}
+    }
+    log::set_logger(&Capture).expect("the only logger in this test binary");
+    log::set_max_level(log::LevelFilter::Warn);
+
+    let schema = Schema::new_with_metadata(
+        vec![Field::new("geometry", DataType::Binary, true)],
+        [(
+            "geo".into(),
+            serde_json::json!({
+                "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB"}}
+            })
+            .to_string(),
+        )]
+        .into(),
+    );
+    let resolved = ResolvedSchema::resolve(&schema).unwrap();
+    assert_eq!(resolved.geometry_name(), Some("geometry"));
+    assert_eq!(resolved.version(), None);
+    assert!(
+        LINES.lock().unwrap().is_empty(),
+        "resolving facts must defer warnings"
+    );
+
+    let warning = Diagnostic::CrsMetadata {
+        count: 1,
+        reason: CrsWarning::MissingVersion,
+    };
+    let operation = Diagnostics::default();
+    operation.once(warning.clone());
+    operation.once(warning.clone());
+    assert_eq!(*LINES.lock().unwrap(), vec![warning.to_string()]);
+    assert_eq!(operation.snapshot(), vec![warning]);
+}
+
+#[test]
 fn diagnostics_are_aggregated_and_isolated_between_runs() {
     let first = Diagnostics::default();
     let second = Diagnostics::default();
@@ -192,6 +247,51 @@ fn advisory_counts_are_queried_by_complete_message() {
         0
     );
     assert_eq!(sink.snapshot().len(), 2);
+}
+
+#[test]
+fn metadata_and_property_counters_preserve_the_query_key() {
+    use tylertoo_core::diagnostics::{CoveringWarning, CrsWarning};
+
+    for (first, second) in [
+        (
+            Diagnostic::CrsMetadata {
+                count: 2,
+                reason: CrsWarning::MissingColumn("geometry".into()),
+            },
+            Diagnostic::CrsMetadata {
+                count: 3,
+                reason: CrsWarning::MissingColumn("shape".into()),
+            },
+        ),
+        (
+            Diagnostic::CoveringRejected {
+                count: 2,
+                reason: CoveringWarning::MissingStatistics(0),
+            },
+            Diagnostic::CoveringRejected {
+                count: 3,
+                reason: CoveringWarning::MissingStatistics(1),
+            },
+        ),
+        (
+            Diagnostic::PropertySkipped {
+                count: 2,
+                name: "population".into(),
+                data_type: "List(Int64)".into(),
+            },
+            Diagnostic::PropertySkipped {
+                count: 3,
+                name: "labels".into(),
+                data_type: "List(Utf8)".into(),
+            },
+        ),
+    ] {
+        let sink = Diagnostics::default();
+        sink.extend([first.clone(), second.clone()]);
+        assert_eq!(sink.count(&first), 2, "{first:?}");
+        assert_eq!(sink.count(&second), 3, "{second:?}");
+    }
 }
 
 #[test]

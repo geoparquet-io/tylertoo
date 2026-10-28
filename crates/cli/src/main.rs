@@ -1885,6 +1885,15 @@ mod tests {
     use tylertoo_core::overview::export::FeatureOrder;
     use tylertoo_core::overview::level::MemoryProfile;
 
+    #[cfg(feature = "gen-docs")]
+    #[test]
+    fn generated_reference_matches_committed_documentation() {
+        assert!(
+            gen_reference_markdown() == include_str!("../../../docs/reference/cli.md"),
+            "regenerate docs/reference/cli.md with the gen-reference-docs command"
+        );
+    }
+
     #[test]
     fn usage_errors_retain_their_classification_through_context() {
         use tylertoo_core::overview::convert::ConvertError;
@@ -1927,6 +1936,44 @@ mod tests {
         ] {
             assert!(!is_usage_error(&error.context("caller")));
         }
+    }
+
+    #[test]
+    fn shard_jobs_retain_the_bound_plan_and_role() {
+        use tylertoo_core::input_set::ConvertSource;
+        use tylertoo_core::shard::{ShardPlan, ShardRole};
+
+        let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/streaming/sharding-grid.parquet");
+        let source = ConvertSource::resolve_path(&input).unwrap();
+        let plan = ShardPlan::compute(&source, 3, 2).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shards.json");
+        plan.save(&path).unwrap();
+        let spec = InputSpec::Path(input);
+        assert!(resolve_shard_job(&spec, None, None, 6).unwrap().is_none());
+        assert!(resolve_shard_job(&spec, None, Some(&path), 6).is_err());
+        for (selector, role, range) in [
+            ("coarse", ShardRole::Coarse, None),
+            (
+                "0/2",
+                ShardRole::Shard {
+                    index: 0,
+                    shards: 2,
+                },
+                Some((plan.ranges[0].lo, plan.ranges[0].hi)),
+            ),
+        ] {
+            let job = resolve_shard_job(&spec, Some(selector), Some(&path), 6)
+                .unwrap()
+                .expect("a requested shard must not become an unsharded run");
+            assert_eq!(job.role, role);
+            assert_eq!(job.pivot, 3);
+            assert_eq!(job.range.map(|r| (r.lo(), r.hi())), range);
+            assert_eq!(job.cut_digest, plan.cut_digest_hex());
+            assert_eq!(job.plan.cut_digest_hex(), plan.cut_digest_hex());
+        }
+        assert!(resolve_shard_job(&spec, Some("0/2"), Some(&path), 2).is_err());
     }
 
     /// Every subcommand clap knows is left alone by the bare-form rewrite,
@@ -2810,6 +2857,16 @@ mod tests {
             "--no-collapse",
             "--representation",
             "0-3:square,4-6:geom"
+        ])));
+        assert!(makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse",
+            "--representation",
+            "0-6:square"
+        ])));
+        assert!(!makes_placeholder_squares(&verbatim_opts(&[
+            "--no-collapse",
+            "--representation",
+            "0-3:point,4-6:geom"
         ])));
         let partitioning = tylertoo_core::overview::convert::ConvertOptions {
             mode: tylertoo_core::overview::level::Mode::Partitioning,

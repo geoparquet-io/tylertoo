@@ -223,6 +223,7 @@ fn merge_inherits_and_overrides() {
     let out = dir.path().join("out.pmtiles");
     let (ok, log) = run(&["merge", s(&out), s(&fine), s(&coarse)]);
     assert!(ok, "{log}");
+    assert!(!log.contains("merging a single archive"), "{log}");
     assert_eq!(
         publication(&out),
         [Some(json!("Grid")), None, Some(json!("NPS | USGS"))]
@@ -234,6 +235,15 @@ fn merge_inherits_and_overrides() {
         publication(&out),
         [Some(json!("Grid")), None, Some(json!(""))]
     );
+
+    let copy = dir.path().join("copy.pmtiles");
+    let (ok, log) = run(&["merge", s(&copy), s(&coarse)]);
+    assert!(ok, "{log}");
+    assert!(
+        log.contains("merging a single archive just rewrites it"),
+        "{log}"
+    );
+    assert_eq!(tiles(&copy), tiles(&coarse));
 }
 
 /// Differing inherited names are left out, on both composing commands, and
