@@ -111,9 +111,11 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// v2 wrapped the Arrow IPC payload in the [`PLAN_MAGIC`] + checksum header
 /// (#512) and added the per-part row count to the fingerprint (#511). v3
 /// added the resolved entry-zoom ladder (`entry_zoom`) to the JSON block
-/// (#446). v4 replaces the independent diagnostic counters with the typed
-/// channel and exact source losses (#779).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 4;
+/// (#446). v4 added remote-object provenance. v5 replaces the independent
+/// diagnostic counters with the typed channel and exact source losses (#779).
+/// The optional ETag/last-modified fields alone were backwards readable, but
+/// older plans cannot provide the required typed totals.
+pub(super) const PLAN_FORMAT_VERSION: u32 = 5;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -122,7 +124,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 4;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x04";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x05";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -2179,6 +2181,20 @@ mod tests {
                 source_losses: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn v4_plan_is_refused_with_version_message() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let mut bytes = std::fs::read(f.path()).unwrap();
+        bytes[PLAN_MAGIC_PREFIX.len()] = 4;
+        std::fs::write(f.path(), bytes).unwrap();
+        let err = load_err(f.path());
+        assert!(
+            err.contains("format v4") && err.contains("Re-create it with --save-plan"),
+            "{err}"
+        );
     }
 
     /// The oracle for the artifact itself: every field survives a save/load
