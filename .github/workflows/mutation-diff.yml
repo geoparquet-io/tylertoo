@@ -9,6 +9,8 @@ permissions:
 
 env:
   MUTATION_TOOL: cargo-mutants@27.1.0
+  # Runner budget: see the plan step.
+  MAX_SHARDS: 4
 
 jobs:
   plan:
@@ -17,6 +19,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
+      shard_total: ${{ steps.plan.outputs.shard_total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,10 +41,25 @@ jobs:
           # A single shard lists the whole set; --sharding requires --shard.
           # No changed Rust files produces no JSON; slurp treats that as [].
           count=$(scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard 0/1 -j 2 --list --json | jq -s 'add // [] | length')
-          # Nonempty diffs get ceil(count / 40) shards, capped at 64.
-          shards=$(jq -cn --argjson n "$count" 'if $n == 0 then [] else [range(0; ([($n / 40 | ceil), 64] | min))] end')
-          echo "$count mutants in this diff; shards=$shards"
+          # The diff is cut into ceil(count / 40) round-robin slices, and at
+          # most MAX_SHARDS of them run: the org runs 20 jobs at once across
+          # every PR and a core PR's CI already holds ~13. Up to 160 mutants
+          # that is the whole diff; past it, slices 0..3 are a fixed sample
+          # spread across the whole diff (round-robin), the same on every run.
+          # The weekly mutation-tests.yml sweep covers the rest.
+          total=$(jq -n --argjson n "$count" 'if $n == 0 then 0 else ($n / 40 | ceil) end')
+          shards=$(jq -cn --argjson t "$total" --argjson m "$MAX_SHARDS" '[range(0; ([$t, $m] | min))]')
+          run=$(jq -n --argjson n "$count" --argjson t "$total" --argjson m "$MAX_SHARDS" 'if $t <= $m then $n else ([range(0; $m)] | map(($n - . + $t - 1) / $t | floor) | add) end')
+          echo "$count mutants in this diff; running slices $shards of $total ($run mutants)"
+          {
+            echo "### Mutation plan"
+            echo "$count mutants in this diff. Running slices \`$shards\` of $total: $run mutants."
+            if [ "$total" -gt "$MAX_SHARDS" ]; then
+              echo "Diff exceeds $((MAX_SHARDS * 40)) mutants: this is a fixed round-robin sample."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shard_total=$total" >> "$GITHUB_OUTPUT"
 
   mutants:
     name: Mutants (workspace diff, shard ${{ matrix.shard }})
@@ -53,13 +71,14 @@ jobs:
     # Run every slice; one survivor must not cancel the others' evidence.
     strategy:
       fail-fast: false
-      max-parallel: 16
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
       SHARD: ${{ matrix.shard }}
-      # Derive the denominator from the matrix so slices cannot drift.
-      SHARD_COUNT: ${{ strategy.job-total }}
+      # The slice count comes from the plan, not the matrix: a sampled
+      # diff runs fewer jobs than it has slices.
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

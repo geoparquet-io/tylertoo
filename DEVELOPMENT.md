@@ -822,16 +822,18 @@ reaches the tests instead of failing on the repository's strict lints.
 The ordinary clippy gate still denies warnings.
 
 The plan job lists that set with `scripts/mutants-diff.sh HEAD^1 --list --json`
-and the gate's flags, without compiling. For a nonempty set it chooses
-`min(ceil(mutants / 40), 64)` native cargo-mutants shards. The matrix uses
-`--sharding round-robin --shard k/N`, with zero-based indices, `N` from the
-matrix's job total, and two workers per shard. `cargo-mutants` is pinned to 27.1.0
-in both planning and testing so every shard enumerates the same set.
-Up to 16 shards run at once. Each job has a
-90-minute limit, including setup and the baseline. All mutants are
-assigned; there is no sampling. Fail-fast is disabled so one failed
-shard does not cancel the others. A 2,765-mutant diff has 43–44 mutants
-per shard; actual completion time depends on build and test costs.
+and the gate's flags, without compiling. It cuts a nonempty set into
+`N = ceil(mutants / 40)` round-robin slices (`--sharding round-robin
+--shard k/N`, zero-based) and runs at most four of them, two workers
+each: the organization runs 20 jobs at once across every PR, and a core
+PR's CI already holds about 13. Up to 160 mutants, that is the whole
+diff. Past 160, slices 0–3 run: a fixed sample spread across the whole
+diff by the round-robin split, identical on every run, which the plan
+job's summary reports as "running slices [0,1,2,3] of N". The weekly
+`mutation-tests.yml` sweep covers the rest. `cargo-mutants` is pinned to
+27.1.0 in both planning and testing so every shard enumerates the same
+set. Each job has a 90-minute limit, including setup and the baseline.
+Fail-fast is disabled so one failed shard does not cancel the others.
 
 The direct cargo-mutants exit status gates every code PR through
 "CI passed", regardless of title. Missed mutants, timeouts, baseline
