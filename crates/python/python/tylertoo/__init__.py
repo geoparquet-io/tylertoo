@@ -157,7 +157,10 @@ class SpilledSourceLosses(TypedDict):
     `count` is the number of losses. `path` names a JSON Lines file with
     one SourceLoss per line, in zoom and source-row order. It uses
     `spill_dir` when supplied and survives the call. The caller owns
-    the file and must delete it after reading. Small reports retain
+    the file and must delete it after reading. The path is a native
+    filesystem string, preserving non-UTF-8 bytes with surrogate escapes
+    on Linux.
+    Failed calls clean up undelivered report files. Small reports retain
     list[SourceLoss].
     """
 

@@ -372,7 +372,12 @@ exact counts require no report scan, and JSON writers stream bounded chunks
 from spill. Loss cardinality never triggers a memory-budget failure. Python
 uses `MemoryBudget` only to choose between a small list and `{count, path}`:
 the latter names a persistent JSON Lines file of exact losses. The Python
-caller owns that file and deletes it after reading. Empty fleet jobs retain
+caller owns that file and deletes it after reading. The Python binding converts
+its path through PyO3's native filesystem conversion, preserving non-UTF-8
+bytes, and transfers ownership only after constructing the complete report.
+Until then, temporary-file guards remove undelivered reports on errors.
+Serde renders a prepared spill path as a lossy display string for JSON;
+ordinary CLI reports stream their loss arrays directly. Empty fleet jobs retain
 their diagnostics and write fresh zero-output reports. Shard replay recounts
 geometry kinds from saved row tables and labels aggregate scan warnings as
 `saved_plan` facts about the whole input. Plan format v6 keeps exact losses

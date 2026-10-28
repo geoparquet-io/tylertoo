@@ -790,6 +790,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_python_losses_are_cleaned_up_until_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Diagnostics::default();
+        sink.set_accounting_spill_dir(Some(dir.path()));
+        sink.set_python_loss_budget(1);
+        sink.source_loss(0, None, SourceLossCause::Filtered)
+            .unwrap();
+        let prepared = sink.source_losses().unwrap().for_python().unwrap();
+        let json = serde_json::to_value(&prepared).unwrap();
+        let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+        assert!(path.exists());
+        drop(prepared);
+        assert!(
+            !path.exists(),
+            "an undelivered report must clean up {path:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn spilled_report_json_displays_non_utf8_paths_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join(std::ffi::OsStr::from_bytes(b"spill-\xff"));
+        std::fs::create_dir(&spill).unwrap();
+        let sink = Diagnostics::default();
+        sink.set_accounting_spill_dir(Some(&spill));
+        sink.set_python_loss_budget(1);
+        sink.source_loss(0, None, SourceLossCause::Filtered)
+            .unwrap();
+        let prepared = sink.source_losses().unwrap().for_python().unwrap();
+        let report = dir.path().join("report.json");
+        write_report(&report, &prepared).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(json["count"], 1);
+        assert!(json["path"].as_str().unwrap().contains("spill-\u{fffd}"));
+    }
+
+    #[test]
     fn source_accounting_residency_is_bounded() {
         let sink = Diagnostics::default();
         for id in 0..100_000 {
@@ -818,6 +858,7 @@ mod tests {
         let python = snapshot.for_python().unwrap();
         let json = serde_json::to_value(&python).unwrap();
         let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+        python.publish_python();
         drop((sink, snapshot, python));
         assert_eq!(json["count"], 2);
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);

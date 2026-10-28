@@ -197,6 +197,32 @@ fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<P
         .unbind())
 }
 
+/// Replace display-only JSON filenames with `PyO3`'s native filesystem paths.
+/// Keep every spill cleanup-managed until the entire result is ready.
+fn report_dict_with_losses(
+    py: Python<'_>,
+    report: &impl serde::Serialize,
+    losses: &[(&tylertoo_core::diagnostics::SourceLosses, Option<&str>)],
+) -> PyResult<Py<PyDict>> {
+    let dict = report_dict(py, report)?;
+    for (losses, section) in losses {
+        if let Some(path) = losses.python_path() {
+            let parent = if let Some(section) = section {
+                dict.bind(py)
+                    .get_item(section)?
+                    .ok_or_else(|| PyRuntimeError::new_err("missing report section"))?
+            } else {
+                dict.bind(py).clone().into_any()
+            };
+            parent.get_item("source_losses")?.set_item("path", path)?;
+        }
+    }
+    for (losses, _) in losses {
+        losses.publish_python();
+    }
+    Ok(dict)
+}
+
 fn check_keywords(
     command: &str,
     values: &serde_json::Map<String, serde_json::Value>,
@@ -340,7 +366,10 @@ fn convert(
             report.export.source_losses = report.export.source_losses
                 .for_python()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            report_dict(py, &*report)
+            report_dict_with_losses(py, &*report, &[
+                (&report.convert.source_losses, Some("convert")),
+                (&report.export.source_losses, Some("export")),
+            ])
         },
         // Unreachable without a shard job, which this facade never sets.
         other => Err(PyRuntimeError::new_err(format!(
@@ -407,7 +436,7 @@ fn overview(
     report.source_losses = report.source_losses
                 .for_python()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    report_dict(py, &report)
+    report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
 }
 }
 
@@ -430,7 +459,7 @@ fn export_pmtiles(
     report.source_losses = report.source_losses
                 .for_python()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    report_dict(py, &report)
+    report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
 }
 }
 

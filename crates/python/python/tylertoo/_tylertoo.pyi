@@ -1,5 +1,8 @@
 # source_losses is a list for small reports. Large reports return
 # {count, path}: an exact JSON Lines file. The caller must remove it.
+# path is a native filesystem str; non-UTF-8 bytes use surrogate escapes
+# on Linux.
+# Failed calls remove undelivered report files.
 # Full keyword signatures are checked by mypy.stubtest against runtime
 # signatures generated from the core option structs in build.rs.
 import os

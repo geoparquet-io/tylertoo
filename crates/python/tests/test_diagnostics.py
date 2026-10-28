@@ -2,7 +2,9 @@
 
 import json
 import logging
+import os
 import struct
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,10 +34,19 @@ def test_second_conversion_warns_again_with_its_own_counts(tmp_path, caplog):
         assert "NaN or infinite" in caplog.text
 
 
-def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch):
+@pytest.mark.parametrize("non_utf8", [False, True])
+def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch, non_utf8):
     """The Python dict stays bounded and its spilled rows outlive the call."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
+    spill = tmp_path / "spill"
+    if non_utf8:
+        if sys.platform != "linux":
+            pytest.skip("non-UTF-8 paths are tested on Linux")
+        spill = Path(os.fsdecode(os.fsencode(spill) + b"-\xff"))
+    spill.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spill))
+    spill_options = {} if non_utf8 else {"spill_dir": str(spill)}
     rows = 4096
     source = tmp_path / "losses.parquet"
     metadata = {
@@ -58,7 +69,7 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch):
             min_zoom=0,
             max_zoom=0,
             filter="id = 0",
-            spill_dir=str(tmp_path),
+            **spill_options,
         )
         losses = (
             report["convert"]["source_losses"]
@@ -68,7 +79,8 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch):
         assert losses["count"] == rows - 1
         path = Path(losses["path"])
         del report, losses
-        assert path.parent == tmp_path
+        assert path.parent == spill
+        assert path.exists()
         with path.open() as stream:
             for row, line in enumerate(stream, 1):
                 loss = json.loads(line)
@@ -90,7 +102,7 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch):
         str(overview),
         str(tmp_path / "quantized.pmtiles"),
         feature_id="id",
-        spill_dir=str(tmp_path),
+        **spill_options,
     )
     losses = report["source_losses"]
     assert losses["count"] == rows - 1
@@ -98,3 +110,18 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch):
     with path.open() as stream:
         assert all(json.loads(line)["cause"] == "quantized" for line in stream)
     path.unlink()
+    assert list(spill.iterdir()) == []
+
+    # Export fails after the convert stage has recorded thousands of losses.
+    # None of the temporary ledgers or report files may survive that error.
+    with pytest.raises(RuntimeError, match="feature"):
+        tylertoo.convert(
+            str(source),
+            str(tmp_path / "failed.pmtiles"),
+            min_zoom=0,
+            max_zoom=0,
+            filter="id = 0",
+            feature_id="geometry",
+            **spill_options,
+        )
+    assert list(spill.iterdir()) == []

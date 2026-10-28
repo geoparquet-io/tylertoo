@@ -179,7 +179,7 @@ impl Accounting {
             budget: self.report_budget,
             spill_dir: self.spill_dir.clone(),
             input_rows: None,
-            python_path: None,
+            python_file: None,
         })
     }
 

@@ -657,6 +657,8 @@ pub fn tylertoo_core::diagnostics::SourceLosses::for_python(&self) -> core::resu
 pub fn tylertoo_core::diagnostics::SourceLosses::is_empty(&self) -> bool
 pub fn tylertoo_core::diagnostics::SourceLosses::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = core::result::Result<tylertoo_core::diagnostics::SourceLoss, tylertoo_core::diagnostics::AccountingError>> + '_
 pub fn tylertoo_core::diagnostics::SourceLosses::len(&self) -> usize
+pub fn tylertoo_core::diagnostics::SourceLosses::publish_python(&self)
+pub fn tylertoo_core::diagnostics::SourceLosses::python_path(&self) -> core::option::Option<std::path::PathBuf>
 impl core::clone::Clone for tylertoo_core::diagnostics::SourceLosses
 pub fn tylertoo_core::diagnostics::SourceLosses::clone(&self) -> tylertoo_core::diagnostics::SourceLosses
 impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLosses

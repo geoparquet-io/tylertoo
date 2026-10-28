@@ -18,7 +18,7 @@ pub struct SourceLosses {
     pub(super) budget: usize,
     pub(super) spill_dir: Option<PathBuf>,
     pub(super) input_rows: Option<crate::input_set::StreamRowLocator>,
-    pub(super) python_path: Option<PathBuf>,
+    pub(super) python_file: Option<Arc<Mutex<tempfile::NamedTempFile>>>,
 }
 
 impl Default for SourceLosses {
@@ -142,15 +142,17 @@ impl SourceLosses {
         }
         Ok(())
     }
-    /// Prepare a bounded Python dict. Large lists become `{count, path}`;
-    /// `path` names an exact JSON Lines file owned by the caller, who removes it.
+    /// Prepare a bounded Python dict. Large lists become `{count, path}`.
+    /// The file is removed on drop until [`Self::publish_python`] transfers
+    /// ownership to the caller. Use [`Self::python_path`] for native Python
+    /// path conversion; serde uses a lossy display string for JSON reports.
     ///
     /// # Errors
-    /// Returns an error if the spill cannot be read, written, or persisted.
+    /// Returns an error if the spill cannot be read or written.
     pub fn for_python(&self) -> Result<Self, AccountingError> {
         let mut out = self.clone();
         // Conservative allowance for Python dicts, strings, ints and list slots.
-        if self.len() > self.budget / 1024 && out.python_path.is_none() {
+        if self.len() > self.budget / 1024 && out.python_file.is_none() {
             let mut file = self.spill_dir.as_ref().map_or_else(
                 tempfile::NamedTempFile::new,
                 tempfile::NamedTempFile::new_in,
@@ -160,25 +162,47 @@ impl SourceLosses {
                 self.write_json_lines(&mut writer)?;
                 writer.flush()?;
             }
-            let (_, path) = file.keep().map_err(|e| e.error)?;
-            out.python_path = Some(path);
+            out.python_file = Some(Arc::new(Mutex::new(file)));
         }
         Ok(out)
+    }
+
+    /// Native filename of a prepared Python report, preserving non-UTF-8 bytes.
+    pub fn python_path(&self) -> Option<PathBuf> {
+        self.python_file.as_ref().map(|file| {
+            file.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .path()
+                .to_owned()
+        })
+    }
+
+    /// Transfer a prepared report file to its caller after the complete Python
+    /// result has been constructed successfully. The caller must remove it.
+    /// This is infallible, so publishing several report partitions is atomic
+    /// with respect to report construction errors.
+    pub fn publish_python(&self) {
+        if let Some(file) = &self.python_file {
+            file.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .disable_cleanup(true);
+        }
     }
 }
 
 impl Serialize for SourceLosses {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error;
-        if let Some(path) = &self.python_path {
+        if let Some(path) = self.python_path() {
             #[derive(Serialize)]
             struct Spilled<'a> {
                 count: u64,
-                path: &'a std::path::Path,
+                /// Lossy display form: JSON strings cannot preserve non-UTF-8 bytes.
+                path: std::borrow::Cow<'a, str>,
             }
             return Spilled {
                 count: self.count,
-                path,
+                path: path.to_string_lossy(),
             }
             .serialize(serializer);
         }
