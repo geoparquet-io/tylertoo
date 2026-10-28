@@ -26,9 +26,9 @@
 //!   message (#684). A panic becomes [`InputError::DecoderPanic`], carrying
 //!   the upstream message and location. See `guard` for why that is sound.
 //! - **One batch-size ceiling** (#563): [`ParquetSource::build`] plans the
-//!   initial decode size from footer statistics, decodes with wide byte
-//!   offsets, and splits before narrowing to i32. Skewed row widths cannot
-//!   overflow a batch. [`byte_array_limit`] is fixed in production; the
+//!   initial decode size from footer statistics, decodes byte views, and
+//!   splits before expanding payloads. Both total decoded bytes and i32
+//!   offsets are bounded. [`byte_array_limit`] is fixed in production; the
 //!   `testing` feature enables the isolated scaled-limit lane.
 //! - **IPC blocks inside the file**: [`open_ipc`] refuses a footer whose
 //!   dictionary or record-batch block ends past the file, before arrow-ipc
@@ -730,6 +730,37 @@ pub fn byte_array_limit() -> u64 {
     BYTE_ARRAY_BATCH_LIMIT
 }
 
+/// Maximum expanded Arrow bytes in one read batch. Leave room for decode,
+/// casts and queued batches; i32 offset safety alone is not a memory budget.
+pub fn decoded_batch_limit() -> u64 {
+    decoded_limit(byte_array_limit())
+}
+
+fn decoded_limit(offset_limit: u64) -> u64 {
+    (64 << 20).min(offset_limit.saturating_mul(2))
+}
+
+/// Rows that can be joined without undoing a reader's memory/offset split.
+///
+/// Buffer sizes deliberately overestimate slices and dictionaries. Returning
+/// the first batch unchanged always preserves the reader's existing bound.
+pub fn concat_prefix_rows<'a>(
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+    limit: u64,
+) -> usize {
+    let mut bytes = 0u64;
+    let mut rows = 0usize;
+    for batch in batches {
+        let next = bytes.saturating_add(batch.get_array_memory_size() as u64);
+        if rows > 0 && next > limit.min(decoded_limit(limit)) {
+            break;
+        }
+        bytes = next;
+        rows = rows.saturating_add(batch.num_rows());
+    }
+    rows
+}
+
 fn scaled_ceiling() -> Option<u64> {
     let limit = byte_array_limit();
     (limit < BYTE_ARRAY_BATCH_LIMIT).then_some(limit)
@@ -756,9 +787,8 @@ pub fn check_byte_array_ceiling(batch: &RecordBatch) -> Result<(), ArrowError> {
     }
 }
 
-/// Decode 32-bit byte arrays using 64-bit offsets. Dictionary columns decode
-/// to their values and are re-encoded after splitting, so an unused dictionary
-/// entry cannot force an otherwise small slice over the ceiling.
+/// Decode byte arrays as views, so repeated dictionary entries remain shared
+/// until a bounded prefix is converted back to the input schema.
 fn wide_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
     Arc::new(
         field
@@ -805,8 +835,8 @@ fn projected_field(
 fn wide_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
     use arrow_schema::DataType;
     match data_type {
-        DataType::Utf8 => DataType::LargeUtf8,
-        DataType::Binary => DataType::LargeBinary,
+        DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+        DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
         DataType::Dictionary(_, value) => wide_type(value),
         DataType::List(f) => DataType::List(wide_field(f)),
         DataType::LargeList(f) => DataType::LargeList(wide_field(f)),
@@ -857,6 +887,18 @@ fn array_overflow(
                     let o = array.as_binary::<i64>().value_offsets();
                     (*o.last().unwrap() - o[0]) as u64
                 }
+                DataType::Utf8View => array
+                    .as_string_view()
+                    .views()
+                    .iter()
+                    .map(|v| u64::from(*v as u32))
+                    .sum(),
+                DataType::BinaryView => array
+                    .as_binary_view()
+                    .views()
+                    .iter()
+                    .map(|v| u64::from(*v as u32))
+                    .sum(),
                 _ => return None,
             };
             over(bytes)
@@ -915,6 +957,77 @@ fn array_overflow(
     }
 }
 
+// Charge the expanded values, not just the views' shared backing buffers.
+// Slicing child data first also avoids charging unused list/dictionary data.
+fn expanded_bytes(array: &dyn arrow_array::Array) -> u64 {
+    use arrow_array::cast::AsArray;
+    use arrow_schema::DataType;
+    let own = (array.len() as u64).saturating_add(1);
+    match array.data_type() {
+        DataType::Utf8View => array
+            .as_string_view()
+            .views()
+            .iter()
+            .fold(own.saturating_mul(17), |n, v| {
+                n.saturating_add(u64::from(*v as u32))
+            }),
+        DataType::BinaryView => array
+            .as_binary_view()
+            .views()
+            .iter()
+            .fold(own.saturating_mul(17), |n, v| {
+                n.saturating_add(u64::from(*v as u32))
+            }),
+        DataType::List(_) => {
+            let a = array.as_list::<i32>();
+            let o = a.value_offsets();
+            own.saturating_mul(5).saturating_add(expanded_bytes(
+                a.values()
+                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize)
+                    .as_ref(),
+            ))
+        }
+        DataType::LargeList(_) => {
+            let a = array.as_list::<i64>();
+            let o = a.value_offsets();
+            own.saturating_mul(9).saturating_add(expanded_bytes(
+                a.values()
+                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize)
+                    .as_ref(),
+            ))
+        }
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .fold(own, |n, a| n.saturating_add(expanded_bytes(a.as_ref()))),
+        DataType::Map(_, _) => {
+            let a = array.as_map();
+            let o = a.value_offsets();
+            own.saturating_mul(5).saturating_add(expanded_bytes(
+                &a.entries()
+                    .slice(o[0] as usize, (*o.last().unwrap() - o[0]) as usize),
+            ))
+        }
+        DataType::FixedSizeList(_, _) => {
+            own.saturating_add(expanded_bytes(array.as_fixed_size_list().values().as_ref()))
+        }
+        _ => (array
+            .to_data()
+            .get_slice_memory_size()
+            .unwrap_or(usize::MAX) as u64)
+            // A dictionary cast may additionally allocate 64-bit keys.
+            .saturating_add((array.len() as u64).saturating_mul(9)),
+    }
+}
+
+fn expanded_batch_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .fold(0u64, |n, a| n.saturating_add(expanded_bytes(a.as_ref())))
+}
+
 fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> {
     match batch_overflow(batch, &batch.schema(), limit) {
         Some((column, bytes)) => Err(ArrowError::ParquetError(format!(
@@ -927,10 +1040,10 @@ fn check_batch_under(batch: &RecordBatch, limit: u64) -> Result<(), ArrowError> 
 
 /// Choose the initial decode size from selected row-group statistics.
 ///
-/// Statistics choose an initial decode size only;
-/// [`UntrustedBatchReader`] splits wide-offset batches before narrowing, so
-/// skewed widths cannot defeat the estimate. Both engines and every reader
-/// use this plan. A single oversized row is refused by the decoder.
+/// Fixed-width values and byte views are bounded before decode. Statistics
+/// refine the size; [`UntrustedBatchReader`] checks actual expanded bytes
+/// before casting views, so dictionary expansion and skew cannot defeat it.
+/// Both engines and every reader use this plan. An oversized row is refused.
 pub fn read_batch_plan(
     metadata: &ParquetMetaData,
     row_groups: Option<&[usize]>,
@@ -960,11 +1073,48 @@ pub fn read_batch_plan(
         })
         .max()
         .unwrap_or(0);
-    requested.max(1).min(
-        usize::try_from((limit / 2) / avg.max(1))
-            .unwrap_or(usize::MAX)
-            .max(1),
-    )
+    let fixed = metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| row_groups.is_none_or(|picked| picked.contains(i)))
+        .map(|(_, group)| {
+            group
+                .columns()
+                .iter()
+                .map(|column| {
+                    use parquet::basic::Type;
+                    let width = match column.column_descr().physical_type() {
+                        Type::BOOLEAN => 1,
+                        Type::INT32 | Type::FLOAT => 4,
+                        Type::INT64 | Type::DOUBLE => 8,
+                        Type::INT96 => 16,
+                        Type::BYTE_ARRAY => 16, // one view, before bounded expansion
+                        Type::FIXED_LEN_BYTE_ARRAY => {
+                            column.column_descr().type_length().max(0) as u64
+                        }
+                    };
+                    let values = if column.column_descr().max_rep_level() > 0 {
+                        // A repeated leaf can put all its values in a single row.
+                        column.num_values().max(0) as u64
+                    } else {
+                        1
+                    };
+                    width.saturating_add(1).saturating_mul(values)
+                })
+                .fold(0u64, u64::saturating_add)
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    requested
+        .max(1)
+        .min((decoded_limit(limit) / fixed).max(1) as usize)
+        .min(
+            usize::try_from((limit / 2) / avg.max(1))
+                .unwrap_or(usize::MAX)
+                .max(1),
+        )
 }
 
 /// The byte-array column that holds the most decoded bytes in total over some
@@ -1028,6 +1178,42 @@ pub fn largest_byte_array_column(
             column: descr.column(leaf).path().string(),
             total_bytes,
         })
+}
+
+/// Conservative expanded input bytes, before reading any pages.
+///
+/// Missing dictionary size statistics are bounded by repeating the entire chunk for
+/// each value rather than treating dictionary storage as decoded storage.
+pub fn decoded_input_bytes(
+    metadata: &ParquetMetaData,
+    row_groups: Option<&[usize]>,
+    root_counts: impl Fn(usize) -> bool,
+) -> u64 {
+    let schema = metadata.file_metadata().schema_descr();
+    metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| row_groups.is_none_or(|picked| picked.contains(i)))
+        .flat_map(|(_, group)| group.columns().iter().enumerate())
+        .filter(|(leaf, _)| root_counts(schema.get_column_root_idx(*leaf)))
+        .map(|(_, column)| {
+            use parquet::basic::Type;
+            let values = column.num_values().max(0) as u64;
+            let payload = match column.column_descr().physical_type() {
+                Type::BYTE_ARRAY => column.unencoded_byte_array_data_bytes().map_or_else(
+                    || (column.uncompressed_size().max(0) as u64).saturating_mul(values),
+                    |bytes| bytes.max(0) as u64,
+                ),
+                Type::FIXED_LEN_BYTE_ARRAY => {
+                    values.saturating_mul(column.column_descr().type_length().max(0) as u64)
+                }
+                _ => values.saturating_mul(16),
+            };
+            // Offsets, validity and nested containers, including empty lists.
+            payload.saturating_add(values.saturating_add(1).saturating_mul(24))
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 // ============================================================================
@@ -1151,8 +1337,8 @@ impl<R: ChunkReader + 'static> ParquetSource<R> {
         self
     }
 
-    /// Build a reader that decodes byte arrays with wide offsets, splits
-    /// batches against the ceiling, then restores the projected input schema.
+    /// Build a reader that decodes shared byte views, splits against both
+    /// memory and offset ceilings, then restores the projected input schema.
     ///
     /// # Errors
     ///
@@ -1263,7 +1449,11 @@ impl Iterator for UntrustedBatchReader {
                     Err(e) => return Some(Err(e)),
                 },
             };
-            let fits = |rows| batch_overflow(&batch.slice(0, rows), &schema, limit).is_none();
+            let fits = |rows| {
+                let prefix = batch.slice(0, rows);
+                batch_overflow(&prefix, &schema, limit).is_none()
+                    && expanded_batch_bytes(&prefix) <= decoded_limit(limit)
+            };
             let rows = if fits(batch.num_rows()) {
                 batch.num_rows()
             } else {
@@ -1273,6 +1463,15 @@ impl Iterator for UntrustedBatchReader {
                             column,
                             bytes,
                             limit_bytes: limit,
+                        },
+                    ))));
+                }
+                let bytes = expanded_batch_bytes(&batch.slice(0, 1));
+                if bytes > decoded_limit(limit) {
+                    return Some(Err(ArrowError::ExternalError(Box::new(
+                        InputError::DecodedRowTooLarge {
+                            bytes,
+                            limit_bytes: decoded_limit(limit),
                         },
                     ))));
                 }
@@ -1293,9 +1492,8 @@ impl Iterator for UntrustedBatchReader {
                 self.pending = Some(batch.slice(rows, batch.num_rows() - rows));
             }
             let batch = batch.slice(0, rows);
-            // Arrow's cast narrows absolute offsets. Compact split slices
-            // first, including nested children, so a small suffix of a >2 GiB
-            // buffer does not retain offsets above i32::MAX.
+            // Compact addressed nested children before the bounded cast.
+            // Views still share dictionary/page payloads at this point.
             let indices =
                 compact.then(|| arrow_array::UInt64Array::from_iter_values(0..rows as u64));
             Some(
@@ -1431,7 +1629,119 @@ impl<R: Read + Seek> Iterator for UntrustedIpcReader<R> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn dictionary_decode_does_not_expand_repeated_payload_before_splitting() {
+        use arrow_array::{Array, StringArray};
+        use parquet::arrow::ArrowWriter;
+        let batch = RecordBatch::try_from_iter(vec![(
+            "name",
+            Arc::new(StringArray::from(vec!["x".repeat(600); 100])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = open_parquet(file.try_clone().unwrap()).unwrap();
+        let group = source.metadata().row_group(0).clone();
+        let columns = group
+            .columns()
+            .iter()
+            .cloned()
+            .map(|c| {
+                c.into_builder()
+                    .set_unencoded_byte_array_data_bytes(None)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let group = group
+            .into_builder()
+            .set_column_metadata(columns)
+            .build()
+            .unwrap();
+        let metadata = source
+            .metadata()
+            .as_ref()
+            .clone()
+            .into_builder()
+            .set_row_groups(vec![group])
+            .build();
+        assert!(metadata
+            .row_group(0)
+            .column(0)
+            .unencoded_byte_array_data_bytes()
+            .is_none());
+        let mut reader =
+            open_parquet_with_metadata(file, reader_metadata(Arc::new(metadata)).unwrap())
+                .with_batch_rows(100)
+                .build()
+                .unwrap();
+        // Inspect the allocation BEFORE the owner's splitter/casts can run.
+        let decoded = reader.inner.next().unwrap().unwrap();
+        assert!(
+            decoded.column(0).get_buffer_memory_size() < 10_000,
+            "dictionary payload expanded before splitting: {} bytes",
+            decoded.column(0).get_buffer_memory_size()
+        );
+    }
+
+    #[test]
+    fn read_plan_bounds_fixed_width_batches() {
+        use arrow_array::{ArrayRef, Float64Array};
+        use parquet::arrow::ArrowWriter;
+        let batch = RecordBatch::try_from_iter((0..100).map(|i| {
+            (
+                format!("property_{i}"),
+                Arc::new(Float64Array::from(vec![0.; 100])) as ArrayRef,
+            )
+        }))
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = open_parquet(file).unwrap();
+        let rows = read_batch_plan(source.metadata(), None, 100, 1000);
+        assert!(rows * 100 * 8 <= 2000, "planned {rows} wide numeric rows");
+    }
+
+    #[test]
+    fn decoded_bound_counts_all_columns_before_expanding_views() {
+        use arrow_array::{ArrayRef, StringArray};
+        use parquet::arrow::ArrowWriter;
+        let batch = RecordBatch::try_from_iter((0..3).map(|i| {
+            (
+                format!("p{i}"),
+                Arc::new(StringArray::from(vec!["x".repeat(400); 2])) as ArrayRef,
+            )
+        }))
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut reader = open_parquet(file)
+            .unwrap()
+            .with_batch_rows(2)
+            .build()
+            .unwrap();
+        reader.limit = 1000;
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        for batch in batches {
+            assert!(expanded_batch_bytes(&batch) <= 2000);
+        }
+    }
 
     fn corpus(target: &str, name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -12,12 +12,12 @@ mod writer;
 pub use input::RemoteObjectMeta;
 pub use ipc::{IpcFileWriter, IpcStreamReader, IpcStreamWriter};
 pub use untrusted::{
-    byte_array_limit, check_byte_array_ceiling, decode_footer, input_error,
-    largest_byte_array_column, load_reader_metadata, open_ipc, open_parquet,
-    open_parquet_with_metadata, precheck_footer, read_batch_plan, read_parquet_metadata,
-    reader_metadata, schema_without_metadata, LargestByteArrayColumn, ParquetSource,
-    ReaderMetadata, UntrustedBatchReader, UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT,
-    DEFAULT_BATCH_ROWS,
+    byte_array_limit, check_byte_array_ceiling, concat_prefix_rows, decode_footer,
+    decoded_batch_limit, decoded_input_bytes, input_error, largest_byte_array_column,
+    load_reader_metadata, open_ipc, open_parquet, open_parquet_with_metadata, precheck_footer,
+    read_batch_plan, read_parquet_metadata, reader_metadata, schema_without_metadata,
+    LargestByteArrayColumn, ParquetSource, ReaderMetadata, UntrustedBatchReader,
+    UntrustedIpcReader, BYTE_ARRAY_BATCH_LIMIT, DEFAULT_BATCH_ROWS,
 };
 pub use writer::{batch_writer, overview_writer, BatchWriter, OverviewWriteOptions};
 
@@ -59,6 +59,14 @@ pub use parquet::file::writer::SerializedFileWriter;
 /// Errors refused by the input boundary before or during upstream decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// One row cannot fit the decoded batch memory bound.
+    #[error("one decoded row needs {bytes} bytes, past the {limit_bytes}-byte read batch memory limit; reduce the property columns or simplify the geometry")]
+    DecodedRowTooLarge {
+        /// Expanded Arrow buffer bytes.
+        bytes: u64,
+        /// The read owner's decoded batch bound.
+        limit_bytes: u64,
+    },
     /// A row cannot fit the byte-offset ceiling even after batch splitting.
     #[error("column '{column}' holds {bytes} bytes in one row, past the {limit_bytes}-byte byte-array ceiling (i32 offsets). Split or simplify those features before tiling.")]
     ByteArrayRowTooLarge {

@@ -111,6 +111,7 @@ fn every_reader_path_honours_the_scaled_ceilings() {
     // cap their batches; any one that did not would fail its decode check.
     std::env::set_var(BYTE_ARRAY_ENV, SCALED_LIMIT.to_string());
     let scaled = run(&input, dir.path(), "scaled");
+    eprintln!("reference/scaled tile signature: {reference:?} / {scaled:?}");
     assert_eq!(
         scaled, reference,
         "a {SCALED_LIMIT}-byte byte-array ceiling changed the output"
@@ -235,6 +236,63 @@ fn reader_regressions(dir: &Path) {
     };
     let batches = read("dictionary.parquet", dict(600)).unwrap();
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    // No optional decoded-size statistics: repeated payloads must remain
+    // shared through the first decode, not expand before the splitter runs.
+    let path = dir.join("dictionary-no-size-stats.parquet");
+    let batch = RecordBatch::try_from_iter(vec![(
+        "name",
+        Arc::new(StringArray::from(vec!["x".repeat(600); 100])) as ArrayRef,
+    )])
+    .unwrap();
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let source = open_parquet(std::fs::File::open(&path).unwrap()).unwrap();
+    let group = source.metadata().row_group(0).clone();
+    let columns = group
+        .columns()
+        .iter()
+        .cloned()
+        .map(|c| {
+            c.into_builder()
+                .set_unencoded_byte_array_data_bytes(None)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let group = group
+        .into_builder()
+        .set_column_metadata(columns)
+        .build()
+        .unwrap();
+    let metadata = source
+        .metadata()
+        .as_ref()
+        .clone()
+        .into_builder()
+        .set_row_groups(vec![group])
+        .build();
+    let before = memory_stats::memory_stats().map(|s| s.physical_mem);
+    let reader = tylertoo_io::open_parquet_with_metadata(
+        std::fs::File::open(&path).unwrap(),
+        tylertoo_io::reader_metadata(Arc::new(metadata)).unwrap(),
+    )
+    .with_batch_rows(100)
+    .build()
+    .unwrap();
+    let mut rows = 0;
+    let mut peak = before;
+    for batch in reader {
+        let batch = batch.unwrap();
+        tylertoo_io::check_byte_array_ceiling(&batch).unwrap();
+        rows += batch.num_rows();
+        if let Some(stats) = memory_stats::memory_stats() {
+            peak = Some(peak.unwrap_or(0).max(stats.physical_mem));
+        }
+    }
+    assert_eq!(rows, 100);
+    eprintln!("dictionary without size stats: RSS before={before:?}, sampled peak={peak:?}");
     let error = read("dictionary-too-wide.parquet", dict(1200)).unwrap_err();
     assert!(
         matches!(
