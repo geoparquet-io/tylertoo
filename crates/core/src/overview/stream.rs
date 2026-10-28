@@ -2128,11 +2128,11 @@ fn preflight_with_memory_limit(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
     diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
-    diagnostics.set_accounting_budget(
+    diagnostics.set_python_loss_budget(
         MemoryBudget {
             limit: memory_limit,
         }
-        .accounting_allowance(),
+        .python_loss_allowance(),
     );
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
@@ -2764,7 +2764,7 @@ fn load_plan_state(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<PlanState, ConvertError> {
     let t_pass1 = Instant::now();
-    let mut plan = ConvertPlan::load(path)?;
+    let mut plan = ConvertPlan::load_with_spill_dir(path, options.spill_dir.as_deref())?;
     // #498: a data shard narrows the plan's row-group selection and nothing
     // else, so that one fingerprint term is compared as a subset relation
     // instead of an equality. Every other term — the tylertoo version, every
@@ -2784,11 +2784,9 @@ fn load_plan_state(
             plan.totals.n_rows,
         )));
     }
-    let source_losses_valid = plan
-        .totals
-        .source_losses
-        .iter()
-        .all(|loss| loss.id < plan.totals.n_rows as u64 && loss.zoom.is_none());
+    let source_losses_valid = plan.totals.source_losses.iter().all(|loss| {
+        loss.is_ok_and(|loss| loss.id < plan.totals.n_rows as u64 && loss.zoom.is_none())
+    });
     // #511/#512: the winner table is addressed by row position, so the plan's
     // row domain must equal what THIS run will actually stream. The per-part
     // footer row counts are already compared field by field above; this
@@ -2847,7 +2845,8 @@ fn load_plan_state(
             path.display()
         )));
     }
-    for loss in &totals.source_losses {
+    for loss in totals.source_losses.iter() {
+        let loss = loss?;
         diagnostics.source_loss(loss.id, loss.zoom, loss.cause)?;
     }
     // #512: bound the cluster aggregate arity by this run's accumulate specs,
@@ -2994,9 +2993,6 @@ pub(crate) fn run_stages(
         plan,
         memory,
     } = run_front_half(source, options, true, &mut rss, diagnostics)?;
-    // All convert losses are known before pass 2; refuse an unaffordable
-    // report before publishing the overview or spending time building it.
-    diagnostics.source_losses()?;
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     let Preflight {
         descriptor,
@@ -3275,7 +3271,7 @@ struct ConvertReportInputs<'a> {
 fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
     ConvertReport {
         diagnostics: Vec::new(),
-        source_losses: Vec::new(),
+        source_losses: Default::default(),
         source_row_ranges: Vec::new(),
         mode: inputs.options.mode,
         levels: inputs.level_reports,

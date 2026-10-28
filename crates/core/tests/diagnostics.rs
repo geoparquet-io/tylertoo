@@ -192,8 +192,11 @@ fn tile_losses_are_disjoint_and_cancelled_by_any_surviving_member() {
     sink.source_emitted(3, 4).unwrap();
     let losses = sink.source_losses().unwrap();
     assert_eq!(losses.len(), 1);
-    assert_eq!(losses[0].id, 9);
-    assert_eq!(losses[0].cause, SourceLossCause::ValveDropped);
+    assert_eq!(losses.iter().next().unwrap().unwrap().id, 9);
+    assert_eq!(
+        losses.iter().next().unwrap().unwrap().cause,
+        SourceLossCause::ValveDropped
+    );
     sink.source_emitted(9, 4).unwrap();
     sink.source_loss(9, Some(4), SourceLossCause::EncodeDropped)
         .unwrap();
@@ -430,4 +433,21 @@ fn range_aggregation_preserves_crs_and_combines_only_matching_contexts() {
             }
         }
     }
+}
+
+#[test]
+fn streamed_reports_preserve_the_previous_output_on_serialization_error() {
+    struct Broken;
+    impl serde::Serialize for Broken {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("unreadable spill"))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.json");
+    std::fs::write(&path, "previous report").unwrap();
+    let error = tylertoo_core::diagnostics::write_report(&path, &Broken).unwrap_err();
+    assert!(error.to_string().contains("unreadable spill"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous report");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }

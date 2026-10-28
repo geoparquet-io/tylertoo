@@ -95,6 +95,9 @@ fn run(input: &Path, dir: &Path, tag: &str) -> Signature {
 fn every_reader_path_honours_the_scaled_ceilings() {
     let regression_dir = tempfile::tempdir().unwrap();
     reader_regressions(regression_dir.path());
+    std::env::remove_var(BYTE_ARRAY_ENV);
+    std::env::set_var(MEMORY_ENV, (1u64 << 20).to_string());
+    loss_reports_exceeding_the_memory_allowance(regression_dir.path());
     let Some(input) = fixture::realdata("open-buildings.parquet") else {
         return;
     };
@@ -325,4 +328,169 @@ fn reader_regressions(dir: &Path) {
     map.append(true).unwrap();
     assert!(read("map.parquet", Arc::new(map.finish())).is_err());
     std::env::remove_var(BYTE_ARRAY_ENV);
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "#779: writes a trusted regression fixture"
+)]
+fn loss_reports_exceeding_the_memory_allowance(dir: &Path) {
+    use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use tylertoo_io::test_support::ArrowWriter;
+    const ROWS: usize = 4096;
+    let mut point = vec![1u8, 1, 0, 0, 0];
+    point.extend_from_slice(&0f64.to_le_bytes());
+    point.extend_from_slice(&0f64.to_le_bytes());
+    let schema = Arc::new(Schema::new(vec![Field::new("geometry", DataType::Binary, false), Field::new("id", DataType::Int64, false)]).with_metadata(std::collections::HashMap::from([("geo".into(),r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point","Polygon"]}}}"#.into())])));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(BinaryArray::from_iter_values(
+                (0..ROWS).map(|_| point.as_slice()),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
+        ],
+    )
+    .unwrap();
+    let input = dir.join("losses.parquet");
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(&input).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let plan = dir.join("losses.plan");
+    let options = ConvertOptions {
+        save_plan: Some(plan.clone()),
+        filter: Some("id = 0".into()),
+        levels: LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom: 0,
+        },
+        ..Default::default()
+    };
+    assert!(
+        (ROWS - 1) * std::mem::size_of::<tylertoo_core::diagnostics::SourceLoss>() > (1 << 20) / 10
+    );
+    for report_requested in [false, true] {
+        let report = convert_to_overviews(
+            &input,
+            dir.join(format!("loss-{report_requested}.parquet")),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(report.input_features, 1);
+        if report_requested {
+            let path = dir.join("loss-report.json");
+            serde_json::to_writer(std::fs::File::create(&path).unwrap(), &report).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+            let losses = json["source_losses"].as_array().unwrap();
+            assert_eq!(losses.len(), ROWS - 1);
+            for (index, loss) in losses.iter().enumerate() {
+                assert_eq!(loss["id"], index + 1);
+                assert_eq!(loss["cause"], "filtered");
+            }
+        }
+    }
+    let replay = convert_to_overviews(
+        &input,
+        dir.join("loss-replay.parquet"),
+        &ConvertOptions {
+            plan: Some(plan),
+            save_plan: None,
+            ..options.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(replay.source_losses.len(), ROWS - 1);
+    assert_eq!(
+        replay.source_losses.iter().last().unwrap().unwrap().id,
+        (ROWS - 1) as u64
+    );
+    let tiles = tylertoo_core::overview::tiles::convert_to_pmtiles(
+        &tylertoo_core::overview::tiles::TilesInput::Path(input.clone()),
+        &dir.join("losses.pmtiles"),
+        &tylertoo_core::overview::tiles::TilesOptions {
+            convert: ConvertOptions {
+                save_plan: None,
+                ..options.clone()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let tylertoo_core::overview::tiles::TilesOutcome::Converted(tiles) = tiles else {
+        panic!("{tiles:?}");
+    };
+    assert_eq!(tiles.convert.source_losses.len(), ROWS - 1);
+    tylertoo_core::diagnostics::write_report(&dir.join("tiles-losses.json"), &tiles).unwrap();
+    // The eager engine consumes the same bounded loss owner.
+    std::env::set_var(MEMORY_ENV, (4u64 << 20).to_string());
+    let eager = convert_to_overviews(
+        &input,
+        dir.join("loss-eager.parquet"),
+        &ConvertOptions {
+            streaming: false,
+            save_plan: None,
+            ..options.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(eager.source_losses.len(), ROWS - 1);
+    std::env::set_var(MEMORY_ENV, (1u64 << 20).to_string());
+    // Export losses: tiny polygons collapse at z0 while row zero survives.
+    let mut polygon = vec![1, 3, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0];
+    for coord in [0f64, 0., 0.000001, 0., 0.000001, 0.000001, 0., 0.] {
+        polygon.extend_from_slice(&coord.to_le_bytes());
+    }
+    let batch = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(BinaryArray::from_iter_values((0..ROWS).map(|row| {
+                if row == 0 {
+                    point.as_slice()
+                } else {
+                    polygon.as_slice()
+                }
+            }))),
+            batch.column(1).clone(),
+        ],
+    )
+    .unwrap();
+    let polygons = dir.join("quantized.parquet");
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&polygons).unwrap(),
+        batch.schema(),
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let overview = dir.join("quantized-overview.parquet");
+    convert_to_overviews(
+        &polygons,
+        &overview,
+        &ConvertOptions {
+            filter: None,
+            save_plan: None,
+            ..options
+        },
+    )
+    .unwrap();
+    let exported = tylertoo_core::overview::export::export_pmtiles(
+        &overview,
+        dir.join("quantized.pmtiles"),
+        &tylertoo_core::overview::export::ExportOptions {
+            feature_id: Some("id".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(exported.source_losses.len(), ROWS - 1);
+    assert!(exported
+        .source_losses
+        .iter()
+        .all(|loss| loss.unwrap().cause == tylertoo_core::diagnostics::SourceLossCause::Quantized));
+    tylertoo_core::diagnostics::write_report(&dir.join("export-losses.json"), &exported).unwrap();
 }

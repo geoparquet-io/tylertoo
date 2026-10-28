@@ -35,6 +35,7 @@ __all__ = [
     "SkippedLevel",
     "SkippedPropertyColumn",
     "SourceLoss",
+    "SpilledSourceLosses",
     "ValidationCheck",
     "ValidationReport",
     "ZoomReport",
@@ -150,11 +151,25 @@ SourceLoss = TypedDict(  # noqa: UP013 - serialized report fields
 SourceLoss.__doc__ = "An absent source row, with its optional exported MVT feature ID."
 
 
+class SpilledSourceLosses(TypedDict):
+    """An exact loss report that exceeds the Python memory allowance.
+
+    `count` is the number of losses. `path` names a JSON Lines file with
+    one SourceLoss per line, in zoom and source-row order. It uses
+    `spill_dir` when supplied and survives the call. The caller owns
+    the file and must delete it after reading. Small reports retain
+    list[SourceLoss].
+    """
+
+    count: int
+    path: str
+
+
 OverviewReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
     "OverviewReport",
     {
         "diagnostics": "list[Diagnostic]",
-        "source_losses": "list[SourceLoss]",
+        "source_losses": "list[SourceLoss] | SpilledSourceLosses",
         "input_rows": "int",
         "source_row_ranges": "list[tuple[int, int]]",
         "mode": "Literal['duplicating', 'partitioning']",
@@ -240,7 +255,7 @@ ExportReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
     "ExportReport",
     {
         "diagnostics": "list[Diagnostic]",
-        "source_losses": "list[SourceLoss]",
+        "source_losses": "list[SourceLoss] | SpilledSourceLosses",
         "mode": "str",
         "min_zoom": "int",
         "max_zoom": "int",

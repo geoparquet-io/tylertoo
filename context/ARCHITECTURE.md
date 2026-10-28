@@ -367,13 +367,19 @@ Export accounts for each original overview row at each zoom, cancelling a loss
 only when that same row survives in another tile.
 
 The row ledger spills through `tempfile::SpooledTempFile` (16 KiB per zoom),
-using `--spill-dir` when supplied. `MemoryBudget` limits the materialized loss
-report to 10% of available memory, capped at 64 MiB; excess losses return a
-typed budget error instead of truncating the partition. Empty fleet jobs
-retain their diagnostics and write fresh zero-output reports. Shard replay
-recounts geometry kinds from saved row tables and labels aggregate scan
-warnings as `saved_plan` facts about the whole input. Plan format v5 carries
-these typed totals; v4 plans must be recreated with `--save-plan`.
+using `--spill-dir` when supplied. Reports share immutable ledger snapshots;
+exact counts require no report scan, and JSON writers stream bounded chunks
+from spill. Loss cardinality never triggers a memory-budget failure. Python
+uses `MemoryBudget` only to choose between a small list and `{count, path}`:
+the latter names a persistent JSON Lines file of exact losses. The Python
+caller owns that file and deletes it after reading. Empty fleet jobs retain
+their diagnostics and write fresh zero-output reports. Shard replay recounts
+geometry kinds from saved row tables and labels aggregate scan warnings as
+`saved_plan` facts about the whole input. Plan format v6 keeps exact losses
+in a length-prefixed JSON Lines partition
+before IPC, streamed in both directions and covered by the payload checksum.
+The metadata holds only scalar totals and bounded diagnostics. Earlier plans
+must be recreated with `--save-plan`.
 
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
 38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine

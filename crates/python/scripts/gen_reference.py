@@ -53,6 +53,7 @@ TYPE_ORDER = [
     "OverviewReport",
     "Diagnostic",
     "SourceLoss",
+    "SpilledSourceLosses",
     "LevelReport",
     "SkippedLevel",
     "OutOfRangeExemplar",
@@ -248,6 +249,8 @@ def _render_type(name: str) -> str:
         for key, value in annotations.items()
     ]
     lines = [f"### `{name}`", "", _flat(doc.short_description), ""]
+    if doc.long_description:
+        lines += [_flat(doc.long_description), ""]
     lines += ["```python", f"class {name}(TypedDict):", *fields, "```", ""]
     if doc.params:
         lines += [f"* `{p.arg_name}`: {_flat(p.description)}" for p in doc.params]

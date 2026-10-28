@@ -324,9 +324,6 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::TileHashe
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::TileHasher
 pub mod tylertoo_core::diagnostics
 pub enum tylertoo_core::diagnostics::AccountingError
-pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded
-pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded::available: usize
-pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded::needed: usize
 pub tylertoo_core::diagnostics::AccountingError::Io(core::io::error::Error)
 impl core::convert::From<core::io::error::Error> for tylertoo_core::diagnostics::AccountingError
 pub fn tylertoo_core::diagnostics::AccountingError::from(core::io::error::Error) -> Self
@@ -595,7 +592,7 @@ pub fn tylertoo_core::diagnostics::Diagnostics::record(&self, tylertoo_core::dia
 pub fn tylertoo_core::diagnostics::Diagnostics::snapshot(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub fn tylertoo_core::diagnostics::Diagnostics::source_emitted(&self, u64, u8) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
 pub fn tylertoo_core::diagnostics::Diagnostics::source_loss(&self, u64, core::option::Option<u8>, tylertoo_core::diagnostics::SourceLossCause) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
-pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> core::result::Result<alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>, tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> core::result::Result<tylertoo_core::diagnostics::SourceLosses, tylertoo_core::diagnostics::AccountingError>
 impl core::default::Default for tylertoo_core::diagnostics::Diagnostics
 pub fn tylertoo_core::diagnostics::Diagnostics::default() -> Self
 impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostics
@@ -654,6 +651,33 @@ impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLoss
 impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLoss
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLoss
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLoss
+pub struct tylertoo_core::diagnostics::SourceLosses
+impl tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::for_python(&self) -> core::result::Result<Self, tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::SourceLosses::is_empty(&self) -> bool
+pub fn tylertoo_core::diagnostics::SourceLosses::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = core::result::Result<tylertoo_core::diagnostics::SourceLoss, tylertoo_core::diagnostics::AccountingError>> + '_
+pub fn tylertoo_core::diagnostics::SourceLosses::len(&self) -> usize
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::clone(&self) -> tylertoo_core::diagnostics::SourceLosses
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLosses
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::eq(&self, &Self) -> bool
+impl core::default::Default for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::default() -> Self
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLosses
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLosses
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::write_report(&std::path::Path, &impl serde_core::ser::Serialize) -> core::result::Result<(), core::io::error::Error>
 pub mod tylertoo_core::fs_probe
 pub fn tylertoo_core::fs_probe::is_ram_backed(&std::path::Path) -> core::option::Option<bool>
 pub mod tylertoo_core::input
@@ -1980,7 +2004,7 @@ pub tylertoo_core::overview::convert::ConvertReport::remote_fetch: core::option:
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_total: usize
 pub tylertoo_core::overview::convert::ConvertReport::skipped_empty_levels: alloc::vec::Vec<tylertoo_core::overview::convert::SkippedLevelReport>
-pub tylertoo_core::overview::convert::ConvertReport::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub tylertoo_core::overview::convert::ConvertReport::source_losses: tylertoo_core::diagnostics::SourceLosses
 pub tylertoo_core::overview::convert::ConvertReport::source_row_ranges: alloc::vec::Vec<(u64, u64)>
 pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
@@ -2453,7 +2477,7 @@ pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
 pub tylertoo_core::overview::export::ExportReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::skipped_property_columns: alloc::vec::Vec<tylertoo_core::overview::export::SkippedPropertyColumn>
-pub tylertoo_core::overview::export::ExportReport::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub tylertoo_core::overview::export::ExportReport::source_losses: tylertoo_core::diagnostics::SourceLosses
 pub tylertoo_core::overview::export::ExportReport::total_tile_features: usize
 pub tylertoo_core::overview::export::ExportReport::total_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::valve_dropped_features: usize
@@ -3528,7 +3552,7 @@ pub tylertoo_core::overview::tiles::EmptyArchive::max_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::min_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::pivot_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::role: tylertoo_core::shard::ShardRole
-pub tylertoo_core::overview::tiles::EmptyArchive::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub tylertoo_core::overview::tiles::EmptyArchive::source_losses: tylertoo_core::diagnostics::SourceLosses
 pub tylertoo_core::overview::tiles::EmptyArchive::source_row_ranges: alloc::vec::Vec<(u64, u64)>
 pub tylertoo_core::overview::tiles::EmptyArchive::total_tile_features: usize
 pub tylertoo_core::overview::tiles::EmptyArchive::total_tiles: usize

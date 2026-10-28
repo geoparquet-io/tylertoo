@@ -33,7 +33,8 @@
 //! # Format
 //!
 //! An 8-byte magic ([`PLAN_MAGIC`]) and an xxh3-64 checksum of everything
-//! after it, then one Arrow IPC **file** holding a single record batch whose
+//! after it, then a length-prefixed JSONL loss partition and one Arrow IPC
+//! **file** holding a single record batch whose
 //! every column is
 //! a `LargeList` carrying one whole side table as a single list value (`null`
 //! when the section does not apply). Scalars, the fingerprint, and the
@@ -114,8 +115,9 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// (#446). v4 added remote-object provenance. v5 replaces the independent
 /// diagnostic counters with the typed channel and exact source losses (#779).
 /// The optional ETag/last-modified fields alone were backwards readable, but
-/// older plans cannot provide the required typed totals.
-pub(super) const PLAN_FORMAT_VERSION: u32 = 5;
+/// older plans cannot provide the required typed totals. v6 streams losses in
+/// a length-prefixed JSONL partition before IPC, outside resident metadata.
+pub(super) const PLAN_FORMAT_VERSION: u32 = 6;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -124,7 +126,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 5;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x05";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x06";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -143,7 +145,7 @@ const _: () = assert!(
     "PLAN_MAGIC's version byte must track PLAN_FORMAT_VERSION"
 );
 
-/// Bytes ahead of the IPC payload: [`PLAN_MAGIC`] (8) + the payload's
+/// Bytes ahead of the checksummed payload: [`PLAN_MAGIC`] (8) + the payload's
 /// xxh3-64 checksum, little-endian (8).
 const PLAN_HEADER_LEN: usize = 16;
 
@@ -193,10 +195,10 @@ impl<R: Seek> Seek for Offset<R> {
 
 /// The plan's IPC payload as arrow wants to see it: byte 0 = the first IPC
 /// byte, with the header hidden.
-fn ipc_view(file: File) -> Offset<BufReader<File>> {
+fn ipc_view(file: File, offset: u64) -> Offset<BufReader<File>> {
     Offset {
         inner: BufReader::new(file),
-        offset: PLAN_HEADER_LEN as u64,
+        offset,
     }
 }
 
@@ -677,18 +679,24 @@ pub(super) fn rebase_plan_for_shard(
         )?);
     }
 
-    plan.totals.source_losses = plan
-        .totals
-        .source_losses
-        .iter()
-        .filter_map(|loss| {
-            let row = usize::try_from(loss.id).ok()?;
-            shard_row(&runs, row).map(|row| crate::diagnostics::SourceLoss {
-                id: row as u64,
-                ..loss.clone()
-            })
-        })
-        .collect();
+    plan.totals.source_losses = crate::diagnostics::SourceLosses::try_from_iter(
+        plan.totals
+            .source_losses
+            .iter()
+            .filter_map(|loss| match loss {
+                Err(e) => Some(Err(e)),
+                Ok(loss) => usize::try_from(loss.id)
+                    .ok()
+                    .and_then(|row| shard_row(&runs, row))
+                    .map(|row| {
+                        Ok(crate::diagnostics::SourceLoss {
+                            id: row as u64,
+                            ..loss
+                        })
+                    }),
+            }),
+    )
+    .map_err(|e| ConvertError::InvalidConfig(format!("--plan: source accounting: {e}")))?;
     // Side tables are keyed by the same row index, so they move with it.
     // A key outside the shard's runs belongs to a row the shard does not
     // read and is dropped.
@@ -968,7 +976,8 @@ pub(super) struct PlanTotals {
     /// Pass-1 diagnostics, replayed through the run's sink when loading a plan.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Exact pre-assignment source losses.
-    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    #[serde(skip)]
+    pub source_losses: crate::diagnostics::SourceLosses,
 }
 
 impl PlanTotals {
@@ -1389,7 +1398,7 @@ impl ConvertPlan {
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        write_plan_file(path, &schema, &batch)
+        write_plan_file(path, &schema, &batch, &self.totals.source_losses)
     }
 
     /// Read a plan back from `path`.
@@ -1399,7 +1408,15 @@ impl ConvertPlan {
     /// reach an arrow decoder, and every structural check past that point
     /// reports through [`plan_err`] — a hostile or damaged plan is an error
     /// naming `--plan` and the path, never a panic (#512).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(super) fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
+        Self::load_with_spill_dir(path, None)
+    }
+
+    pub(super) fn load_with_spill_dir(
+        path: &Path,
+        spill_dir: Option<&Path>,
+    ) -> Result<ConvertPlan, ConvertError> {
         let mut file = File::open(path).map_err(|e| plan_err(path, &format!("{e}")))?;
         let mut header = [0u8; PLAN_HEADER_LEN];
         file.read_exact(&mut header).map_err(|_| {
@@ -1455,7 +1472,23 @@ impl ConvertPlan {
                 ),
             ));
         }
-        let mut reader = tylertoo_io::open_ipc(ipc_view(file))
+        // v6 keeps the loss partition out of resident Arrow schema metadata.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))?;
+        let mut length = [0u8; 8];
+        file.read_exact(&mut length)
+            .map_err(|e| plan_err(path, &format!("loss partition length: {e}")))?;
+        let length = u64::from_le_bytes(length);
+        let offset = (PLAN_HEADER_LEN as u64 + 8)
+            .checked_add(length)
+            .filter(|&n| n <= file.metadata().map_or(0, |m| m.len()).saturating_sub(8))
+            .ok_or_else(|| plan_err(path, "loss partition extends past the IPC payload"))?;
+        let stream =
+            serde_json::Deserializer::from_reader(BufReader::new((&mut file).take(length)))
+                .into_iter::<crate::diagnostics::SourceLoss>()
+                .map(|loss| loss.map_err(|e| std::io::Error::other(e).into()));
+        let losses = crate::diagnostics::SourceLosses::try_from_iter_in(stream, spill_dir)
+            .map_err(|e| plan_err(path, &format!("loss partition: {e}")))?;
+        let mut reader = tylertoo_io::open_ipc(ipc_view(file, offset))
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
@@ -1464,7 +1497,7 @@ impl ConvertPlan {
                 &format!("is not a tylertoo convert plan (no {PLAN_META_KEY} metadata)"),
             )
         })?;
-        let meta: PlanMeta = serde_json::from_str(meta_json)
+        let mut meta: PlanMeta = serde_json::from_str(meta_json)
             .map_err(|e| plan_err(path, &format!("its metadata block is unreadable: {e}")))?;
         if meta.version != PLAN_FORMAT_VERSION {
             return Err(plan_err(
@@ -1476,6 +1509,7 @@ impl ConvertPlan {
                 ),
             ));
         }
+        meta.totals.source_losses = losses;
         // The JSON block is user-reachable input too: `num_levels` sizes an
         // allocation and `finest`/`counts` index it, so bound them here
         // rather than trusting them into a `vec![_; n]`.
@@ -1601,14 +1635,19 @@ fn kind_code(k: FeatureKind) -> u8 {
     }
 }
 
-/// Write one record batch to `path` as a plan artifact: the [`PLAN_MAGIC`]
-/// header, the Arrow IPC payload, then the payload's checksum patched back
+/// Write a loss partition and record batch to `path`: the [`PLAN_MAGIC`]
+/// header, length-prefixed JSONL, Arrow IPC, then the checksum patched back
 /// into the header.
 ///
 /// Two-pass rather than buffering the payload in RAM: the artifact is
 /// O(input rows) and `save` runs at pass 1's memory peak, so an extra whole
 /// copy of it is exactly what a planet-scale run cannot afford.
-fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<(), ConvertError> {
+fn write_plan_file(
+    path: &Path,
+    schema: &Schema,
+    batch: &RecordBatch,
+    losses: &crate::diagnostics::SourceLosses,
+) -> Result<(), ConvertError> {
     #[expect(
         clippy::disallowed_methods,
         reason = "#521: saved plans intentionally overwrite in place after preflight"
@@ -1618,6 +1657,18 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
     w.write_all(PLAN_MAGIC)
         .and_then(|()| w.write_all(&0u64.to_le_bytes()))
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    // Length-prefixed JSONL is streamed in both directions. Its bytes and
+    // length are included in the payload checksum, before any decoding.
+    w.write_all(&0u64.to_le_bytes())
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    losses
+        .write_json_lines(&mut w)
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    let length = w
+        .stream_position()
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?
+        - PLAN_HEADER_LEN as u64
+        - 8;
     // Arrow's own errors carry no path: `--save-plan /mnt/full/x.plan` used to
     // fail with a bare "No space left on device" naming neither the flag nor
     // the file. Every arrow step is prefixed the same way the io steps are.
@@ -1628,7 +1679,13 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
     let mut w = ipc.into_inner().map_err(arrow)?;
     w.flush()
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    drop(w);
+    let mut file = w
+        .into_inner()
+        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
+    file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))
+        .and_then(|_| file.write_all(&length.to_le_bytes()))
+        .map_err(|e| save_plan_err(path, &format!("writing loss partition length: {e}")))?;
+    drop(file);
 
     let checksum = (|| -> std::io::Result<u64> {
         let mut f = File::open(path)?;
@@ -1663,7 +1720,11 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
 pub fn fuzz_convert_plan(ipc_payload: &[u8]) -> Result<(), ConvertError> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(PLAN_MAGIC)?;
-    file.write_all(&xxhash_rust::xxh3::xxh3_64(ipc_payload).to_le_bytes())?;
+    let mut checksum = xxhash_rust::xxh3::Xxh3::new();
+    checksum.update(&0u64.to_le_bytes());
+    checksum.update(ipc_payload);
+    file.write_all(&checksum.digest().to_le_bytes())?;
+    file.write_all(&0u64.to_le_bytes())?;
     file.write_all(ipc_payload)?;
     file.flush()?;
     ConvertPlan::load(file.path())?.into_winner_tables()?;
@@ -2206,7 +2267,7 @@ mod tests {
                         count: 3,
                     },
                 ],
-                source_losses: Vec::new(),
+                source_losses: Default::default(),
             },
         }
     }
@@ -2603,10 +2664,40 @@ mod tests {
     // an ERROR naming the flag and the path, never a panic.
     // ------------------------------------------------------------------
 
+    #[test]
+    fn plan_loss_partition_stays_outside_schema_metadata() {
+        let mut plan = tiny_plan();
+        let sink = crate::diagnostics::Diagnostics::default();
+        for row in 0..4096 {
+            sink.source_loss(row, None, crate::diagnostics::SourceLossCause::Filtered)
+                .unwrap();
+        }
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        plan.save(file.path()).unwrap();
+        let (schema, _) = reopen(file.path());
+        assert!(
+            schema.metadata()[PLAN_META_KEY].len() < 16 << 10,
+            "losses must stream separately from resident IPC metadata"
+        );
+        assert_eq!(
+            ConvertPlan::load(file.path()).unwrap().totals.source_losses,
+            plan.totals.source_losses
+        );
+    }
+
     /// Re-open a saved plan's IPC payload, so a test can forge a hostile
     /// variant of a *real* artifact.
     fn reopen(path: &Path) -> (Arc<Schema>, RecordBatch) {
-        let mut r = tylertoo_io::open_ipc(ipc_view(File::open(path).unwrap())).unwrap();
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64)).unwrap();
+        let mut length = [0; 8];
+        file.read_exact(&mut length).unwrap();
+        let mut r = tylertoo_io::open_ipc(ipc_view(
+            file,
+            PLAN_HEADER_LEN as u64 + 8 + u64::from_le_bytes(length),
+        ))
+        .unwrap();
         let schema = r.schema();
         let batch = r.next().unwrap().unwrap();
         (schema, batch)
@@ -2618,7 +2709,7 @@ mod tests {
     fn forge(path: &Path, meta_json: &str, columns: Vec<arrow_array::ArrayRef>) {
         let schema = Arc::new(plan_schema(meta_json.to_string()));
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-        write_plan_file(path, &schema, &batch).unwrap();
+        write_plan_file(path, &schema, &batch, &Default::default()).unwrap();
     }
 
     /// The saved plan's metadata JSON, as a mutable value.
@@ -2645,7 +2736,7 @@ mod tests {
         plan.save(f.path()).unwrap();
         let (schema, _) = reopen(f.path());
         let empty = RecordBatch::new_empty(schema.clone());
-        write_plan_file(f.path(), &schema, &empty).unwrap();
+        write_plan_file(f.path(), &schema, &empty, &Default::default()).unwrap();
         let err = load_err(f.path());
         assert!(err.contains("0-row"), "{err}");
     }
@@ -2726,7 +2817,11 @@ mod tests {
         }
         let f = tempfile::NamedTempFile::new().unwrap();
         let mut bytes = PLAN_MAGIC.to_vec();
-        bytes.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&payload).to_le_bytes());
+        let mut checksum = xxhash_rust::xxh3::Xxh3::new();
+        checksum.update(&0u64.to_le_bytes());
+        checksum.update(&payload);
+        bytes.extend_from_slice(&checksum.digest().to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&payload);
         std::fs::write(f.path(), &bytes).unwrap();
         let err = ConvertPlan::load(f.path())

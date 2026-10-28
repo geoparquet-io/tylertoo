@@ -710,7 +710,7 @@ pub struct ZoomReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExportReport {
     /// Exact source losses, disjoint from any source emitted at that zoom.
-    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    pub source_losses: crate::diagnostics::SourceLosses,
     /// Aggregated diagnostics for this export only.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Level materialization mode of the source overview file.
@@ -1983,7 +1983,8 @@ fn export_pmtiles_validated(
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
-    diagnostics.set_accounting_budget(super::memory::MemoryBudget::probe().accounting_allowance());
+    diagnostics
+        .set_python_loss_budget(super::memory::MemoryBudget::probe().python_loss_allowance());
     let options = config.options();
     diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
@@ -2286,7 +2287,6 @@ fn export_pmtiles_validated(
     progress.enter_phase("finalize");
 
     let t_finalize = Instant::now();
-    diagnostics.source_losses()?;
     writer.finalize(output_path.as_ref())?;
     progress.end_finalize(t_finalize);
     log::info!(
@@ -2374,7 +2374,7 @@ impl ExportReport {
     ) -> Self {
         Self {
             diagnostics: Vec::new(),
-            source_losses: Vec::new(),
+            source_losses: Default::default(),
             mode,
             min_zoom,
             max_zoom,
@@ -15859,6 +15859,7 @@ mod tests {
         let losses: Vec<_> = report
             .source_losses
             .iter()
+            .map(Result::unwrap)
             .filter(|loss| loss.zoom == Some(4))
             .collect();
         assert_eq!(losses.len(), 1);
@@ -16237,10 +16238,10 @@ mod diagnostic_row_alignment {
         assert_eq!(tiles[0].feature_count, 1);
         let losses = diagnostics.source_losses().unwrap();
         assert_eq!(losses.len(), 1);
-        assert_eq!(losses[0].id, 1);
-        assert_eq!(losses[0].feature_id, Some(7));
+        assert_eq!(losses.iter().next().unwrap().unwrap().id, 1);
+        assert_eq!(losses.iter().next().unwrap().unwrap().feature_id, Some(7));
         assert_eq!(
-            losses[0].cause,
+            losses.iter().next().unwrap().unwrap().cause,
             crate::diagnostics::SourceLossCause::Quantized
         );
     }

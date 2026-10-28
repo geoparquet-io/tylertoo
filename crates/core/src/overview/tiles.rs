@@ -526,7 +526,7 @@ pub struct EmptyArchive {
     /// Diagnostics from this conversion, including when pass 2 emptied it.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Losses before the empty outcome, in original input row coordinates.
-    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    pub source_losses: crate::diagnostics::SourceLosses,
     /// Which job of the fleet this was.
     pub role: ShardRole,
     /// The fleet's pivot zoom.
@@ -1422,7 +1422,7 @@ mod tests {
             crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 }
         )));
         assert_eq!(report.source_losses.len(), 1);
-        assert_eq!(report.source_losses[0].id, 1);
+        assert_eq!(report.source_losses.iter().next().unwrap().unwrap().id, 1);
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()

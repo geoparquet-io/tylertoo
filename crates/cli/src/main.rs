@@ -1187,8 +1187,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
 }
 
 fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {
-    let json = serde_json::to_string_pretty(report).context("failed to serialize tiles report")?;
-    std::fs::write(path, json)
+    tylertoo_core::diagnostics::write_report(path, report)
         .with_context(|| format!("failed to write report to {}", path.display()))?;
     say!("  report written to {}", path.display());
     Ok(())
@@ -1265,11 +1264,7 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
     print_diagnostics(report.diagnostics.iter());
 
     if let Some(report_path) = &args.report {
-        let json =
-            serde_json::to_string_pretty(&report).context("failed to serialize overview report")?;
-        std::fs::write(report_path, json)
-            .with_context(|| format!("failed to write report to {}", report_path.display()))?;
-        say!("  report written to {}", report_path.display());
+        write_report(report_path, &report)?;
     }
 
     Ok(())
@@ -1407,11 +1402,7 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     print_diagnostics(report.diagnostics.iter());
 
     if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        say!("  report → {}", path.display());
+        write_report(path, &report)?;
     }
     Ok(())
 }
@@ -1459,11 +1450,7 @@ fn run_pyramid(args: PyramidArgs) -> Result<()> {
         format_number(report.total_tiles as u64)
     );
     if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        say!("  report → {}", path.display());
+        write_report(path, &report)?;
     }
     Ok(())
 }
@@ -1686,11 +1673,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
     );
 
     if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        say!("  report → {}", path.display());
+        write_report(path, &report)?;
     }
     Ok(())
 }
@@ -1745,11 +1728,7 @@ fn run_decode(args: DecodeArgs) -> Result<()> {
     );
 
     if let Some(path) = &args.report {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| anyhow::anyhow!("serialize report: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| anyhow::anyhow!("write report {}: {e}", path.display()))?;
-        say!("  report → {}", path.display());
+        write_report(path, &report)?;
     }
     Ok(())
 }

@@ -333,7 +333,15 @@ fn convert(
     match outcome.map_err(tiles_error_to_py)? {
         // The combined report (#439): the two halves the two-step chain's own
         // reports would carry, keyed like the CLI's `tiles --report` JSON.
-        TilesOutcome::Converted(report) => report_dict(py, &*report),
+        TilesOutcome::Converted(mut report) => {
+            report.convert.source_losses = report.convert.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            report.export.source_losses = report.export.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            report_dict(py, &*report)
+        },
         // Unreachable without a shard job, which this facade never sets.
         other => Err(PyRuntimeError::new_err(format!(
             "unexpected tiles outcome: {other:?}"
@@ -384,7 +392,7 @@ fn overview(
     })?;
 
     // Release the GIL while the Rust pipeline runs.
-    let report = py
+    let mut report = py
         .detach(|| match &parsed {
             OverviewInput::Path(input_path) => {
                 convert_to_overviews(input_path, &output_path, &options)
@@ -396,6 +404,9 @@ fn overview(
         })
         .map_err(convert_error_to_py)?;
 
+    report.source_losses = report.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     report_dict(py, &report)
 }
 }
@@ -412,10 +423,13 @@ fn export_pmtiles(
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
 
-    let report = py
+    let mut report = py
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(export_error_to_py)?;
 
+    report.source_losses = report.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     report_dict(py, &report)
 }
 }

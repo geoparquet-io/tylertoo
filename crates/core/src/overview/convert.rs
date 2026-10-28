@@ -1586,7 +1586,7 @@ pub struct ConvertReport {
     /// Input rows read before filtering unusable geometries.
     pub input_rows: usize,
     /// Exact source losses, disjoint from any source emitted at that zoom.
-    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    pub source_losses: crate::diagnostics::SourceLosses,
     /// Half-open original input row ranges read by this run. Footer-pruned
     /// groups are outside the accounting domain; exact gates record losses.
     pub source_row_ranges: Vec<(u64, u64)>,
@@ -13725,7 +13725,7 @@ mod tests {
         assert_eq!(fresh.row_groups_read, 1);
         assert_eq!(fresh.source_row_ranges, vec![(2, 4)]);
         assert_eq!(fresh.source_losses.len(), 1);
-        assert_eq!(fresh.source_losses[0].id, 2);
+        assert_eq!(fresh.source_losses.iter().next().unwrap().unwrap().id, 2);
         assert_eq!(fresh.source_losses, replay.source_losses);
         assert_eq!(fresh.source_row_ranges, replay.source_row_ranges);
     }
@@ -13760,9 +13760,9 @@ mod tests {
         assert_eq!(report.input_rows, 3);
         assert_eq!(report.input_features, 2);
         assert_eq!(report.source_losses.len(), 1);
-        assert_eq!(report.source_losses[0].id, 1);
+        assert_eq!(report.source_losses.iter().next().unwrap().unwrap().id, 1);
         assert_eq!(
-            report.source_losses[0].cause,
+            report.source_losses.iter().next().unwrap().unwrap().cause,
             crate::diagnostics::SourceLossCause::OutsideBbox
         );
     }
@@ -13796,7 +13796,7 @@ mod tests {
             report
                 .source_losses
                 .iter()
-                .map(|l| l.id)
+                .map(|l| l.unwrap().id)
                 .collect::<Vec<_>>(),
             vec![0, 2, 3]
         );

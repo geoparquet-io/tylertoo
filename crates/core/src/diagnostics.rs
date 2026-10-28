@@ -3,8 +3,10 @@
 //! A sink belongs to one operation. Workers borrow it; reports take a sorted,
 //! aggregated snapshot. No warning or count survives into another operation.
 mod accounting;
+mod losses;
+pub use losses::SourceLosses;
 
-pub(crate) const MAX_LOSS_REPORT_BYTES: usize = 64 << 20;
+pub(crate) const MAX_PYTHON_LOSS_BYTES: usize = 64 << 20;
 use std::fmt;
 use std::sync::Mutex;
 
@@ -442,10 +444,6 @@ pub enum SourceLossCause {
 pub enum AccountingError {
     #[error("source accounting spill: {0}")]
     Io(#[from] std::io::Error),
-    #[error(
-        "source loss report needs {needed} bytes, exceeding its {available} byte memory budget"
-    )]
-    BudgetExceeded { needed: usize, available: usize },
 }
 
 /// A thread-safe sink borrowed by all stages of one operation.
@@ -522,24 +520,18 @@ impl Diagnostics {
     /// Disjoint losses, with convert rows restored to original input ordinals.
     ///
     /// # Errors
-    /// Returns a spill I/O error, an invalid row address, or a typed budget
-    /// error when materializing the complete loss report would exceed its limit.
-    pub fn source_losses(&self) -> Result<Vec<SourceLoss>, AccountingError> {
+    /// Returns a spill I/O error if the snapshot cannot be prepared.
+    pub fn source_losses(&self) -> Result<SourceLosses, AccountingError> {
         let mut losses = self.source_losses_for_plan()?;
-        if let Some(locator) = &*self.input_rows.lock().unwrap_or_else(|e| e.into_inner()) {
-            for loss in &mut losses {
-                if loss.zoom.is_none() {
-                    loss.id = locator.global_row(loss.id as usize).ok_or_else(|| {
-                        std::io::Error::other("source loss is outside the selected input rows")
-                    })?;
-                }
-            }
-        }
+        losses.input_rows = self
+            .input_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Ok(losses)
     }
-    /// Plans address their winner tables in the selected stream, before the
-    /// report restores original file positions. Shard replay rebases once.
-    pub(crate) fn source_losses_for_plan(&self) -> Result<Vec<SourceLoss>, AccountingError> {
+    /// Plans retain selected-stream addresses; shard replay rebases once.
+    pub(crate) fn source_losses_for_plan(&self) -> Result<SourceLosses, AccountingError> {
         self.accounting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -568,7 +560,7 @@ impl Diagnostics {
             .unwrap_or_else(|e| e.into_inner())
             .set_spill_dir(path);
     }
-    pub(crate) fn set_accounting_budget(&self, bytes: usize) {
+    pub(crate) fn set_python_loss_budget(&self, bytes: usize) {
         self.accounting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -779,6 +771,20 @@ impl ExemplarEdge {
     }
 }
 
+/// Stream a report to an atomic output using bounded writer storage.
+///
+/// # Errors
+/// Returns serialization or output I/O errors, leaving the previous file intact.
+pub fn write_report(path: &std::path::Path, report: &impl Serialize) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let (file, pending) = crate::atomic_output::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, report).map_err(std::io::Error::other)?;
+    writer.flush()?;
+    drop(writer);
+    pending.publish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,17 +802,26 @@ mod tests {
     }
 
     #[test]
-    fn oversized_loss_reports_return_a_typed_budget_error() {
+    fn oversized_loss_reports_remain_exact_and_snapshots_are_immutable() {
         let sink = Diagnostics::default();
-        sink.set_accounting_budget(std::mem::size_of::<SourceLoss>());
-        sink.source_loss(0, None, SourceLossCause::Filtered)
+        sink.set_python_loss_budget(1);
+        sink.source_loss(0, Some(4), SourceLossCause::Filtered)
             .unwrap();
-        sink.source_loss(1, None, SourceLossCause::Filtered)
+        sink.source_loss(1, Some(4), SourceLossCause::Filtered)
             .unwrap();
-        assert!(matches!(
-            sink.source_losses(),
-            Err(AccountingError::BudgetExceeded { .. })
-        ));
+        let snapshot = sink.source_losses().unwrap();
+        sink.source_emitted(0, 4).unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(sink.source_losses().unwrap().len(), 1);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        let python = snapshot.for_python().unwrap();
+        let json = serde_json::to_value(&python).unwrap();
+        let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+        drop((sink, snapshot, python));
+        assert_eq!(json["count"], 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

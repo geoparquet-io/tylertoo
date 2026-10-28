@@ -1,3 +1,5 @@
+# source_losses is a list for small reports. Large reports return
+# {count, path}: an exact JSON Lines file. The caller must remove it.
 # Full keyword signatures are checked by mypy.stubtest against runtime
 # signatures generated from the core option structs in build.rs.
 import os

@@ -601,7 +601,7 @@ Overview output counts, sizes, and input diagnostics.
 ```python
 class OverviewReport(TypedDict):
     diagnostics: list[Diagnostic]
-    source_losses: list[SourceLoss]
+    source_losses: list[SourceLoss] | SpilledSourceLosses
     input_rows: int
     source_row_ranges: list[tuple[int, int]]
     mode: Literal['duplicating', 'partitioning']
@@ -673,6 +673,18 @@ class SourceLoss(TypedDict):
     cause: str
 ```
 
+### `SpilledSourceLosses`
+
+An exact loss report that exceeds the Python memory allowance.
+
+`count` is the number of losses. `path` names a JSON Lines file with one SourceLoss per line, in zoom and source-row order. It uses `spill_dir` when supplied and survives the call. The caller owns the file and must delete it after reading. Small reports retain list[SourceLoss].
+
+```python
+class SpilledSourceLosses(TypedDict):
+    count: int
+    path: str
+```
+
 ### `LevelReport`
 
 Counts and sizes for one overview level.
@@ -732,7 +744,7 @@ Exported tile counts and encoding diagnostics.
 ```python
 class ExportReport(TypedDict):
     diagnostics: list[Diagnostic]
-    source_losses: list[SourceLoss]
+    source_losses: list[SourceLoss] | SpilledSourceLosses
     mode: str
     min_zoom: int
     max_zoom: int
@@ -885,6 +897,8 @@ class ValidationCheck(TypedDict):
 ### `ConvertReport`
 
 The combined report of a one-shot `convert()` run.
+
+Both halves of the chain, keyed like the CLI's `tiles --report` JSON: the overview conversion and the PMTiles export.
 
 ```python
 class ConvertReport(TypedDict):
