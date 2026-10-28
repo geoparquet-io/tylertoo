@@ -249,15 +249,47 @@ fn finite_or_empty(
     geometry: Geometry<f64>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Geometry<f64> {
-    use geo::CoordsIter;
-    if geometry
-        .coords_iter()
-        .all(|c| c.x.is_finite() && c.y.is_finite())
-    {
+    if geometry_is_finite(&geometry) {
         return geometry;
     }
     diagnostics.record(crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 });
     Geometry::GeometryCollection(geo::GeometryCollection::default())
+}
+
+fn coord_is_finite(coord: geo::Coord<f64>) -> bool {
+    // Shifting discards the sign. Finite IEEE-754 magnitudes sort before
+    // infinity; every NaN payload sorts after it. Integer comparisons avoid
+    // the larger floating-point class expansion on targets such as ARM.
+    const INFINITY: u64 = f64::INFINITY.to_bits() << 1;
+    (coord.x.to_bits().wrapping_shl(1) < INFINITY) & (coord.y.to_bits().wrapping_shl(1) < INFINITY)
+}
+
+/// Resolve the geometry once instead of dispatching through an enum for
+/// every coordinate. Typed ring folds allow vectorization of the #707
+/// predicate; collections recurse without allocating boxed iterators.
+fn geometry_is_finite(geometry: &Geometry<f64>) -> bool {
+    fn finite(geometry: &impl geo::CoordsIter<Scalar = f64>) -> bool {
+        geometry
+            .coords_iter()
+            .fold(true, |finite, c| finite & coord_is_finite(c))
+    }
+
+    fn polygon_is_finite(polygon: &geo::Polygon<f64>) -> bool {
+        finite(polygon.exterior()) && polygon.interiors().iter().all(finite)
+    }
+
+    match geometry {
+        Geometry::Point(g) => finite(g),
+        Geometry::Line(g) => finite(g),
+        Geometry::LineString(g) => finite(g),
+        Geometry::Polygon(g) => polygon_is_finite(g),
+        Geometry::MultiPoint(g) => finite(g),
+        Geometry::MultiLineString(g) => g.0.iter().all(finite),
+        Geometry::MultiPolygon(g) => g.0.iter().all(polygon_is_finite),
+        Geometry::GeometryCollection(g) => g.0.iter().all(geometry_is_finite),
+        Geometry::Rect(g) => finite(g),
+        Geometry::Triangle(g) => finite(g),
+    }
 }
 
 /// [`extract_geometries_opt_from_array`]'s visitor: one row-aligned
@@ -297,6 +329,82 @@ impl GeoArrowVisitor for ExtractGeometries<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinate_finiteness_matches_every_ieee_exponent() {
+        for sign in [0, 1u64 << 63] {
+            for exponent in 0..2048u64 {
+                for fraction in [0, 1, 1u64 << 51, (1u64 << 52) - 1] {
+                    let value = f64::from_bits(sign | (exponent << 52) | fraction);
+                    for coord in [
+                        geo::Coord { x: value, y: 0. },
+                        geo::Coord { x: 0., y: value },
+                        geo::Coord { x: value, y: value },
+                    ] {
+                        assert_eq!(coord_is_finite(coord), value.is_finite(), "{coord:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dispatching outside the coordinate loop must preserve the #707
+    /// predicate, including late coordinates, holes and nested members.
+    #[test]
+    fn typed_finiteness_matches_every_geometry_variant() {
+        use geo::{CoordsIter, MapCoords};
+        use std::cell::Cell;
+
+        let line = geo::LineString::from(vec![(0., 0.), (3., 1.), (2., 4.), (0., 0.)]);
+        let polygon = geo::Polygon::new(line.clone(), vec![line.clone()]);
+        let variants: Vec<Geometry<f64>> = vec![
+            geo::Point::new(1., 2.).into(),
+            geo::Line::new((0., 0.), (1., 2.)).into(),
+            line.clone().into(),
+            geo::LineString::from((0..65).map(|i| (f64::from(i), 0.)).collect::<Vec<_>>()).into(),
+            polygon.clone().into(),
+            geo::MultiPoint::from(vec![(0., 0.), (1., 2.)]).into(),
+            geo::MultiLineString::new(vec![line.clone(), line]).into(),
+            geo::MultiPolygon::new(vec![polygon.clone(), polygon.clone()]).into(),
+            Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+                polygon.into(),
+                Geometry::GeometryCollection(geo::GeometryCollection::new_from(vec![
+                    geo::Point::new(1., 2.).into(),
+                ])),
+            ])),
+            geo::Rect::new((0., 0.), (1., 2.)).into(),
+            geo::Triangle::new((0., 0.).into(), (1., 2.).into(), (3., 0.).into()).into(),
+            geo::LineString::new(vec![]).into(),
+            geo::Polygon::empty().into(),
+            Geometry::GeometryCollection(geo::GeometryCollection::default()),
+        ];
+        for original in variants {
+            assert!(geometry_is_finite(&original));
+            for index in 0..original.coords_count() {
+                for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -0.] {
+                    for x_axis in [false, true] {
+                        let current = Cell::new(0);
+                        let changed = original.map_coords(|mut coord| {
+                            let i = current.get();
+                            current.set(i + 1);
+                            if i == index {
+                                if x_axis {
+                                    coord.x = value;
+                                } else {
+                                    coord.y = value;
+                                }
+                            }
+                            coord
+                        });
+                        let expected = changed
+                            .coords_iter()
+                            .all(|c| c.x.is_finite() && c.y.is_finite());
+                        assert_eq!(geometry_is_finite(&changed), expected, "{changed:?}");
+                    }
+                }
+            }
+        }
+    }
 
     /// #707: a decoded geometry with a NaN or infinite coordinate becomes an
     /// empty geometry at the ingest boundary, counted, and the output stays
