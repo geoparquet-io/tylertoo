@@ -9,20 +9,13 @@ permissions:
 
 jobs:
   mutants:
-    name: Mutants (${{ matrix.package }})
+    name: Mutants (workspace diff)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: tylertoo-core
-            config: .cargo/mutants.toml
-          - package: tylertoo
-            config: .cargo/mutants-cli.toml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          submodules: recursive
           persist-credentials: false
           fetch-depth: 2
       - name: Download test fixtures
@@ -40,18 +33,30 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-      - name: Test mutants in the PR diff
-        env:
-          PACKAGE: ${{ matrix.package }}
-          CONFIG: ${{ matrix.config }}
+          sudo apt-get install -y protobuf-compiler libsqlite3-dev zlib1g-dev
+      - name: Cache tippecanoe
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .tools/tippecanoe-*
+            .tools/src-*
+          key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
         run: |
-          git diff --no-ext-diff --no-renames HEAD^1 HEAD -- crates/ > mutation.diff
-          cargo mutants --cargo-arg=--locked --package "$PACKAGE" --config "$CONFIG" --in-diff mutation.diff
+          benchmarks/e2e/setup_tippecanoe.sh
+          eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
+          dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
+      - name: Test mutants in the PR diff
+        run: scripts/mutants-diff.sh HEAD^1
       - name: Upload mutation results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mutation-diff-${{ matrix.package }}
+          name: mutation-diff
           path: mutants.out/
           if-no-files-found: ignore

@@ -200,6 +200,12 @@ jobs:
           eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
           dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
 
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
+
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
