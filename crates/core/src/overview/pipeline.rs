@@ -946,6 +946,9 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let per_batch = tuning
         .budget
         .estimate(MemoryPhase::Read, batch_size as u64, tuning.avg_geom_bytes)
+        // Property widths and dictionary repetition can fill the owner's
+        // entire decoded batch even when geometries and row counts are tiny.
+        .max(tylertoo_io::decoded_batch_limit())
         .max(1);
     let budget =
         (tuning.budget.allowance(MemoryProfile::Auto) as f64 * READ_BUDGET_FRACTION) as u64;
@@ -984,9 +987,8 @@ enum SegMsg {
 }
 
 /// Deliver every selected input row to `on_batch`, in exact read order, in
-/// batches of exactly `tuning.batch_size` rows (the last batch of each part
-/// short) — reading with one sequential reader or with several concurrent
-/// ones, identically either way.
+/// batches of at most `tuning.batch_size` rows, preserving the I/O owner's
+/// memory and offset bounds with either sequential or concurrent readers.
 ///
 /// **Why this exists (#494).** Pass 2 read the input from a single thread
 /// iterating one `ParquetRecordBatchReader`: 110.6 of the 403 wall seconds of
@@ -1255,7 +1257,7 @@ where
             // A part boundary is a batch boundary: the sequential reader opens
             // a fresh reader per part, so a part's last batch is short.
             if current_part != Some(segment.part) {
-                if let Some(tail) = regroup.take_all()? {
+                while let Some(tail) = regroup.take_all()? {
                     if matches!(
                         deliver(tail, &mut row_offset, &mut pending_read, on_batch)?,
                         ReadFlow::Stop
@@ -1285,8 +1287,8 @@ where
                     Ok(SegMsg::Batch(batch, read_dur)) => {
                         pending_read += read_dur;
                         regroup.push(batch);
-                        while regroup.rows >= batch_size {
-                            let out = regroup.take(batch_size)?;
+                        while regroup.rows >= batch_size || regroup.bounded_rows() < regroup.rows {
+                            let out = regroup.take(batch_size.min(regroup.rows))?;
                             if matches!(
                                 deliver(out, &mut row_offset, &mut pending_read, on_batch)?,
                                 ReadFlow::Stop
@@ -1298,8 +1300,13 @@ where
                 }
             }
         }
-        if let Some(tail) = regroup.take_all()? {
-            deliver(tail, &mut row_offset, &mut pending_read, on_batch)?;
+        while let Some(tail) = regroup.take_all()? {
+            if matches!(
+                deliver(tail, &mut row_offset, &mut pending_read, on_batch)?,
+                ReadFlow::Stop
+            ) {
+                break;
+            }
         }
         Ok(())
     })
@@ -1370,20 +1377,33 @@ where
 }
 
 /// The in-order merge's re-chunker: a FIFO of batch slices that hands back
-/// runs of an exact row count.
+/// runs up to a requested row count within the I/O owner's bounds.
 ///
 /// Batches that already line up cost nothing — [`Regrouper::take`] returns the
 /// queued batch itself when it holds exactly the requested rows — so in the
 /// common case (row groups an exact multiple of the batch size, or a seam that
 /// happens to land on one) nothing is copied at all. Only a run spanning a
 /// worker seam is concatenated.
-#[derive(Default)]
 struct Regrouper {
     queue: std::collections::VecDeque<RecordBatch>,
     rows: usize,
+    limit: u64,
+}
+
+impl Default for Regrouper {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            rows: 0,
+            limit: tylertoo_io::byte_array_limit(),
+        }
+    }
 }
 
 impl Regrouper {
+    fn bounded_rows(&self) -> usize {
+        tylertoo_io::concat_prefix_rows(&self.queue, self.limit)
+    }
     fn push(&mut self, batch: RecordBatch) {
         if batch.num_rows() > 0 {
             self.rows += batch.num_rows();
@@ -1391,14 +1411,15 @@ impl Regrouper {
         }
     }
 
-    /// Remove and return exactly `n` rows from the front. `n` must be `<=
-    /// self.rows`.
+    /// Remove at most `n` rows, without joining past the reader's bound.
+    /// `n` must be positive and `<= self.rows`.
     #[expect(
         clippy::disallowed_methods,
-        reason = "#494: regrouping joins only bounded segment seams to preserve reader batch boundaries"
+        reason = "#779: I/O owner bounds the prefix before a segment seam is concatenated"
     )] // #779: seam joins (#494)
     fn take(&mut self, n: usize) -> Result<RecordBatch, ConvertError> {
         debug_assert!(n > 0 && n <= self.rows);
+        let n = n.min(self.bounded_rows());
         let front = self
             .queue
             .front()
@@ -1432,7 +1453,7 @@ impl Regrouper {
         Ok(arrow_select::concat::concat_batches(&schema, &parts)?)
     }
 
-    /// Remove and return everything queued, or `None` when empty.
+    /// Remove a bounded prefix of the remainder, or `None` when empty.
     fn take_all(&mut self) -> Result<Option<RecordBatch>, ConvertError> {
         if self.rows == 0 {
             return Ok(None);
@@ -1452,6 +1473,48 @@ mod read_tests {
     use std::sync::Arc;
     use tylertoo_io::test_support::ArrowWriter;
     use tylertoo_io::test_support::WriterProperties;
+
+    #[test]
+    fn regrouping_preserves_byte_safe_reader_splits() {
+        use arrow_array::StringArray;
+        let mut regroup = Regrouper {
+            limit: 1000,
+            ..Default::default()
+        };
+        for value in ["x".repeat(600), "y".repeat(600)] {
+            let mut values = vec![String::new(); 50];
+            values[0] = value;
+            regroup.push(
+                RecordBatch::try_from_iter(vec![(
+                    "name",
+                    Arc::new(StringArray::from(values)) as ArrayRef,
+                )])
+                .unwrap(),
+            );
+        }
+        let batch = regroup.take(100).unwrap();
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            *array.value_offsets().last().unwrap() <= 1000,
+            "parallel regrouping reconstructed an oversized column"
+        );
+        assert_eq!(batch.num_rows(), 50);
+        let tail = regroup.take_all().unwrap().unwrap();
+        assert_eq!(tail.num_rows(), 50);
+        assert_eq!(
+            tail.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "y".repeat(600)
+        );
+        assert!(regroup.take_all().unwrap().is_none());
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
@@ -1492,7 +1555,7 @@ mod read_tests {
             None,
             None,
             ReadTuning {
-                budget: MemoryBudget::with_available(None),
+                budget: MemoryBudget::with_available(Some(256 << 30)),
                 batch_size,
                 workers,
                 // Tiny rows: the read-ahead sizing must not silently collapse
@@ -1539,7 +1602,7 @@ mod read_tests {
         // Guard the guard: if the read-ahead sizing ever leaves this fixture
         // with a single segment, the comparison below is vacuous.
         let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(None),
+            budget: MemoryBudget::with_available(Some(256 << 30)),
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1592,7 +1655,7 @@ mod read_tests {
         write_input(&path, 6300, 700);
         let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
         let tuning = ReadTuning {
-            budget: MemoryBudget::with_available(None),
+            budget: MemoryBudget::with_available(Some(256 << 30)),
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1653,7 +1716,7 @@ mod read_tests {
         w.close().unwrap();
         let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
         let tuning = ReadTuning {
-            budget: MemoryBudget::with_available(None),
+            budget: MemoryBudget::with_available(Some(256 << 30)),
             batch_size: 96,
             workers: 4,
             avg_geom_bytes: Some(8),
@@ -1671,7 +1734,7 @@ mod read_tests {
                 None,
                 Some(&[1]),
                 ReadTuning {
-                    budget: MemoryBudget::with_available(None),
+                    budget: MemoryBudget::with_available(Some(256 << 30)),
                     batch_size: 96,
                     workers,
                     avg_geom_bytes: Some(8),
@@ -1793,7 +1856,7 @@ mod read_tests {
                 None,
                 None,
                 ReadTuning {
-                    budget: MemoryBudget::with_available(None),
+                    budget: MemoryBudget::with_available(Some(256 << 30)),
                     batch_size: 64,
                     workers: 4,
                     avg_geom_bytes: Some(8),
@@ -1823,7 +1886,7 @@ mod read_tests {
     #[test]
     fn read_shape_keeps_segments_inside_the_queue() {
         let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(None),
+            budget: MemoryBudget::with_available(Some(256 << 30)),
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(64),
@@ -1845,7 +1908,7 @@ mod read_tests {
     #[test]
     fn read_shape_degrades_to_one_worker_under_memory_pressure() {
         let shape = resolve_read_shape(ReadTuning {
-            budget: MemoryBudget::with_available(None),
+            budget: MemoryBudget::with_available(Some(256 << 30)),
             batch_size: 8192,
             // 512 MiB per row: nothing is affordable.
             workers: 4,
@@ -1854,6 +1917,21 @@ mod read_tests {
         });
         assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
         assert!(shape.segment_target_rows >= 1);
+    }
+
+    #[test]
+    fn read_ahead_prices_the_decoders_maximum_batch_allocation() {
+        let shape = resolve_read_shape(ReadTuning {
+            budget: MemoryBudget::with_available(Some(512 << 20)),
+            batch_size: 100,
+            workers: 8,
+            avg_geom_bytes: Some(8),
+            profile: MemoryProfile::Bounded,
+        });
+        assert_eq!(
+            shape.workers, 1,
+            "tiny geometries do not price wide or dictionary-expanded properties"
+        );
     }
 }
 

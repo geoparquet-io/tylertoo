@@ -6870,7 +6870,7 @@ mod tests {
             &source,
             None,
             ReadTuning {
-                budget: MemoryBudget::with_available(None),
+                budget: MemoryBudget::with_available(Some(64 << 30)),
                 batch_size: READ_BATCH_SIZE,
                 workers: 4,
                 avg_geom_bytes: None,
