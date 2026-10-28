@@ -267,6 +267,58 @@ fn persisted_descriptor_round_trips_and_checks_indices() {
 }
 
 #[test]
+fn persisted_descriptor_round_trips_a_resolved_primary_fallback() {
+    let md = native_metadata(None);
+    let file = md.file_metadata();
+    let geo = serde_json::json!({
+        "version": "1.1.0", "primary_column": "missing",
+        "columns": {"SHAPE": {"encoding": "WKB"}}
+    });
+    let md = ParquetMetaData::new(
+        FileMetaData::new(
+            file.version(),
+            file.num_rows(),
+            None,
+            Some(vec![KeyValue::new("geo".to_owned(), geo.to_string())]),
+            file.schema_descr_ptr(),
+            file.column_orders().cloned(),
+        ),
+        vec![],
+    );
+    let resolved = ResolvedSchema::from_metadata(&md).unwrap();
+    assert_eq!(resolved.primary_column(), Some("missing"));
+    assert_eq!(resolved.geometry_name(), Some("SHAPE"));
+    let json = resolved.footer_json().unwrap();
+    let restored = ResolvedSchema::from_metadata(&with_descriptor(&md, json.clone())).unwrap();
+    assert_eq!(restored.footer_json().unwrap(), json);
+}
+
+#[test]
+fn persisted_descriptor_rejects_each_altered_fact() {
+    let md = native_metadata(None);
+    let resolved = ResolvedSchema::from_metadata(&md).unwrap();
+    let json: Value = serde_json::from_str(&resolved.footer_json().unwrap()).unwrap();
+    for (field, value) in [
+        ("descriptor_version", serde_json::json!(2)),
+        ("fields", serde_json::json!([])),
+        ("geometry_index", serde_json::json!(99)),
+        ("geometry_name", serde_json::json!("other")),
+        ("primary_column", serde_json::json!("other")),
+        ("geometry_columns", serde_json::json!([])),
+        ("properties", serde_json::json!([99])),
+        ("version", serde_json::json!("9.0.0")),
+        ("renames", serde_json::json!({"other": "SHAPE"})),
+        ("geo_json", serde_json::json!("null")),
+        ("source_is_subset", serde_json::json!(true)),
+    ] {
+        let mut altered = json.clone();
+        altered[field] = value;
+        let restored = ResolvedSchema::from_metadata(&with_descriptor(&md, altered.to_string()));
+        assert!(restored.is_err(), "accepted altered {field}");
+    }
+}
+
+#[test]
 fn persisted_descriptor_cannot_hide_properties() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/invariants/shape-column.parquet");

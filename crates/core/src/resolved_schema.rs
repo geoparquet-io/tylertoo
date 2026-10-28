@@ -22,7 +22,7 @@ pub const RESOLVED_SCHEMA_KEY: &str = "tylertoo:resolved_schema";
 /// A spatially cropped shard has no whole-source mass invariant across levels.
 pub(crate) const SOURCE_SUBSET_KEY: &str = "tylertoo:source_subset";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SchemaFacts {
     descriptor_version: u8,
     source_is_subset: bool,
@@ -197,7 +197,6 @@ impl ResolvedSchema {
     /// # Errors
     /// Returns an error for malformed or inconsistent footer facts.
     pub(crate) fn from_parquet(schema: &Schema, metadata: &ParquetMetaData) -> Result<Self> {
-        let diagnostics = &Diagnostics::silent();
         let persisted = metadata
             .file_metadata()
             .key_value_metadata()
@@ -208,102 +207,16 @@ impl ResolvedSchema {
         };
         let facts: SchemaFacts = serde_json::from_str(json)
             .map_err(|e| Error::GeoParquetRead(format!("invalid resolved schema: {e}")))?;
-        let actual: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        let geo = schema
-            .metadata()
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
-            .map(|(_, v)| v);
-        if facts.descriptor_version != 1
-            || facts.geometry_index.is_some_and(|i| i >= actual.len())
-            || facts.source_is_subset
-                != schema
-                    .metadata()
-                    .get(SOURCE_SUBSET_KEY)
-                    .is_some_and(|v| v == "true")
-            || facts.fields.iter().map(String::as_str).collect::<Vec<_>>() != actual
-            || facts.geo_json.as_ref() != geo
-            || facts.geometry_index.and_then(|i| actual.get(i).copied())
-                != facts.geometry_name.as_deref()
-            || facts
-                .primary_column
-                .as_ref()
-                .is_some_and(|n| Some(n) != facts.geometry_name.as_ref())
-            || facts
-                .properties
-                .iter()
-                .any(|i| *i >= actual.len() || Some(*i) == facts.geometry_index)
-        {
+        // The resolver owns every fact, including fallback selection and
+        // physical indices. A cached footer is a claim to verify against it,
+        // never a second path for constructing a descriptor.
+        let resolved = Self::resolve_with(schema, Some(metadata))?;
+        if facts != resolved.facts {
             return Err(Error::GeoParquetRead(
                 "resolved schema disagrees with the Parquet footer".into(),
             ));
         }
-        let declared = facts
-            .geo_json
-            .as_deref()
-            .map(serde_json::from_str::<Value>)
-            .transpose()
-            .map_err(|e| Error::GeoParquetRead(format!("invalid geo metadata: {e}")))?;
-        if let Some(geo) = &declared {
-            warn_geo_version(geo, diagnostics);
-        }
-        let native = facts
-            .geometry_name
-            .as_deref()
-            .and_then(|n| find_native_geometry_leaf_column(metadata, n));
-        let crs = resolve_crs(
-            declared.as_ref(),
-            facts
-                .geometry_name
-                .as_deref()
-                .or(facts.primary_column.as_deref()),
-            native.as_ref().map(|(_, lt)| lt),
-            diagnostics,
-        );
-        let covering = facts
-            .geo_json
-            .as_deref()
-            .map(|j| parse_covering_metadata(j, facts.geometry_name.as_deref()))
-            .transpose()?
-            .flatten();
-        let declared_primary = declared.as_ref().and_then(primary_name);
-        let version = declared
-            .as_ref()
-            .and_then(|g| g.get("version"))
-            .and_then(Value::as_str)
-            .or_else(|| native.as_ref().map(|_| "2.0.0"));
-        let geometry_columns = geometry_columns(schema, declared.as_ref(), Some(metadata));
-        let selected = geometry_choice(&actual, declared_primary, &geometry_columns);
-        let properties = property_indices(
-            schema,
-            facts.geometry_index,
-            &geometry_columns,
-            covering.as_ref(),
-        );
-        if crs != facts.crs
-            || covering != facts.covering
-            || facts.primary_column.as_deref() != declared_primary
-            || version != facts.version.as_deref()
-            || facts.renames != schema_renames(schema)
-            || selected != facts.geometry_name.as_deref()
-            || facts.geometry_index != selected.and_then(|n| actual.iter().position(|f| *f == n))
-            || geometry_columns != facts.geometry_columns
-            || properties != facts.properties
-        {
-            return Err(Error::GeoParquetRead(
-                "resolved schema disagrees with the GeoParquet declarations".into(),
-            ));
-        }
-        let mut result = Self {
-            facts,
-            schema: Arc::new(schema.clone()),
-            bounds: Vec::new(),
-            diagnostics: diagnostics.snapshot(),
-            auto_zoom_covering: Err(CoveringWarning::NoFooterStatistics),
-        };
-        result.auto_zoom_covering = result.validate_auto_zoom_covering(Some(metadata));
-        result.bounds = result.read_bounds(metadata);
-        Ok(result)
+        Ok(resolved)
     }
 
     /// Replay immutable schema warnings once into the current operation.
