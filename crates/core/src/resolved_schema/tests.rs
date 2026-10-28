@@ -2,7 +2,12 @@ use super::*;
 use tylertoo_io::test_support::FileMetaData;
 use tylertoo_io::KeyValue;
 
-fn covering_metadata(values: [f64; 4], statistics: bool, crs: &str) -> ParquetMetaData {
+fn covering_metadata(
+    values: [f64; 4],
+    statistics: bool,
+    crs: &str,
+    covering_first: bool,
+) -> ParquetMetaData {
     use arrow_array::{ArrayRef, BinaryArray, Float64Array, RecordBatch, StructArray};
     use arrow_schema::{Field, Fields};
     use tylertoo_io::test_support::{ArrowWriter, EnabledStatistics, WriterProperties};
@@ -15,11 +20,20 @@ fn covering_metadata(values: [f64; 4], statistics: bool, crs: &str) -> ParquetMe
         .map(|v| Arc::new(Float64Array::from(vec![v])) as ArrayRef)
         .collect();
     let bbox = StructArray::new(children.clone(), arrays, None);
+    let mut fields = vec![
+        Field::new("geometry", DataType::Binary, false),
+        Field::new("bbox", DataType::Struct(children), false),
+    ];
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(BinaryArray::from(vec![b"unused".as_slice()])),
+        Arc::new(bbox),
+    ];
+    if covering_first {
+        fields.swap(0, 1);
+        columns.swap(0, 1);
+    }
     let schema = Arc::new(Schema::new_with_metadata(
-        vec![
-            Field::new("geometry", DataType::Binary, false),
-            Field::new("bbox", DataType::Struct(children), false),
-        ],
+        fields,
         [(
             "geo".into(),
             serde_json::json!({
@@ -34,14 +48,7 @@ fn covering_metadata(values: [f64; 4], statistics: bool, crs: &str) -> ParquetMe
         )]
         .into(),
     ));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(BinaryArray::from(vec![b"unused".as_slice()])),
-            Arc::new(bbox),
-        ],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let props = WriterProperties::builder()
         .set_statistics_enabled(if statistics {
             EnabledStatistics::Chunk
@@ -64,6 +71,8 @@ fn covering_metadata(values: [f64; 4], statistics: bool, crs: &str) -> ParquetMe
 fn covering_fast_path_requires_footer_statistics_in_crs_range() {
     for (values, statistics, crs, accepted) in [
         ([1.0, 2.0, 3.0, 4.0], true, "EPSG:4326", true),
+        ([1.0, 2.0, 540.0, 90.0], true, "EPSG:4326", true),
+        ([-540.0, -90.0, 3.0, 4.0], true, "EPSG:4326", true),
         ([1000.0, 2000.0, 3000.0, 4000.0], true, "EPSG:4326", false),
         ([1000.0, 2000.0, 3000.0, 4000.0], true, "EPSG:3857", true),
         ([1.0, 2.0, 3.0, 4.0], false, "EPSG:4326", false),
@@ -72,7 +81,7 @@ fn covering_fast_path_requires_footer_statistics_in_crs_range() {
         ([179.0, -1.0, -179.0, 1.0], true, "EPSG:4326", true),
         ([359.0, -1.0, 361.0, 1.0], true, "EPSG:4326", true),
     ] {
-        let md = covering_metadata(values, statistics, crs);
+        let md = covering_metadata(values, statistics, crs, false);
         let resolved = ResolvedSchema::from_metadata(&md).unwrap();
         assert_eq!(
             ResolvedSchema::auto_zoom_covering([&resolved], &Diagnostics::silent()).is_some(),
@@ -94,7 +103,7 @@ fn covering_fast_path_requires_footer_statistics_in_crs_range() {
 
 #[test]
 fn rejected_covering_records_a_typed_diagnostic_per_run() {
-    let md = covering_metadata([1000.0, 2000.0, 3000.0, 4000.0], true, "EPSG:4326");
+    let md = covering_metadata([1000.0, 2000.0, 3000.0, 4000.0], true, "EPSG:4326", false);
     let resolved = ResolvedSchema::from_metadata(&md).unwrap();
     for _ in 0..2 {
         let sink = Diagnostics::silent();
@@ -113,9 +122,9 @@ fn rejected_covering_records_a_typed_diagnostic_per_run() {
 
 #[test]
 fn every_row_group_is_checked_including_inverted_endpoints() {
-    let good = covering_metadata([1.0, 2.0, 3.0, 4.0], true, "EPSG:4326");
+    let good = covering_metadata([1.0, 2.0, 3.0, 4.0], true, "EPSG:4326", false);
     // Only checking min(xmin)/max(xmax) would miss this inverted outlier.
-    let bad = covering_metadata([1000.0, 2.0, 3.0, 4.0], true, "EPSG:4326");
+    let bad = covering_metadata([1000.0, 2.0, 3.0, 4.0], true, "EPSG:4326", false);
     let md = ParquetMetaData::new(
         good.file_metadata().clone(),
         vec![good.row_group(0).clone(), bad.row_group(0).clone()],
@@ -135,7 +144,7 @@ fn every_row_group_is_checked_including_inverted_endpoints() {
 #[test]
 fn covering_decline_reasons_are_typed_and_serializable() {
     use crate::diagnostics::CoveringWarning;
-    let md = covering_metadata([1.0, 2.0, 3.0, 4.0], true, "EPSG:4326");
+    let md = covering_metadata([1.0, 2.0, 3.0, 4.0], true, "EPSG:4326", false);
     let base = ResolvedSchema::from_metadata(&md).unwrap();
     for (replacement, expected) in [
         (serde_json::Value::Null, CoveringWarning::NoCovering),
@@ -246,6 +255,74 @@ fn persisted_descriptor_cannot_change_the_declared_crs() {
     json["crs"]["is_wgs84"] = Value::Bool(true);
     let tampered = with_descriptor(&md, json.to_string());
     assert!(ResolvedSchema::from_metadata(&tampered).is_err());
+}
+
+#[test]
+fn multipart_auto_zoom_requires_the_same_usable_covering_in_every_part() {
+    let first = ResolvedSchema::from_metadata(&covering_metadata(
+        [1.0, 2.0, 3.0, 4.0],
+        true,
+        "EPSG:4326",
+        false,
+    ))
+    .unwrap();
+    let reordered = ResolvedSchema::from_metadata(&covering_metadata(
+        [1.0, 2.0, 3.0, 4.0],
+        true,
+        "EPSG:4326",
+        true,
+    ))
+    .unwrap();
+    let sink = Diagnostics::silent();
+    assert!(ResolvedSchema::auto_zoom_covering([&first], &sink).is_some());
+    assert!(ResolvedSchema::auto_zoom_covering([&reordered], &sink).is_some());
+    assert_eq!(
+        ResolvedSchema::auto_zoom_covering([&first, &first], &sink),
+        ResolvedSchema::auto_zoom_covering([&first], &sink),
+    );
+    for parts in [[&first, &reordered], [&reordered, &first]] {
+        let sink = Diagnostics::silent();
+        assert!(ResolvedSchema::auto_zoom_covering(parts, &sink).is_none());
+        assert_eq!(
+            sink.snapshot(),
+            vec![Diagnostic::CoveringRejected {
+                count: 1,
+                reason: CoveringWarning::InconsistentPartitions,
+            }]
+        );
+    }
+}
+
+#[test]
+fn geometry_name_disagreement_identifies_only_an_annotated_alternative() {
+    use arrow_schema::Field;
+    let resolve = |annotated| {
+        let mut alternative = Field::new("geometry", DataType::Binary, true);
+        if annotated {
+            alternative = alternative.with_metadata(
+                [("ARROW:extension:name".to_owned(), "geoarrow.wkb".to_owned())].into(),
+            );
+        }
+        let schema = Schema::new_with_metadata(
+            vec![alternative, Field::new("SHAPE", DataType::Binary, true)],
+            [(
+                "geo".to_owned(),
+                serde_json::json!({
+                    "version": "1.1.0", "primary_column": "SHAPE",
+                    "columns": {"SHAPE": {"encoding": "WKB"}}
+                })
+                .to_string(),
+            )]
+            .into(),
+        );
+        ResolvedSchema::resolve(&schema).unwrap()
+    };
+    let annotated = resolve(true);
+    assert_eq!(annotated.geometry_name(), Some("SHAPE"));
+    assert_eq!(annotated.geometry_name_disagreement(), Some("geometry"));
+    let property = resolve(false);
+    assert_eq!(property.geometry_name(), Some("SHAPE"));
+    assert_eq!(property.geometry_name_disagreement(), None);
 }
 
 #[test]
