@@ -187,15 +187,30 @@ fn overlay_polygons<P: AsRef<[TileRing]>>(parts: &[P], scale: i32) -> Vec<Vec<Ti
 /// one point of a hole settles which exteriors contain it; a hole no
 /// exterior contains has no fill around it and is dropped.
 fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
-    let boxes: Vec<_> = shells.iter().map(|s| ring_box(&s[0])).collect();
+    if holes.is_empty() {
+        return;
+    }
+    let boxes: Vec<_> = holes.iter().map(|h| ring_box(h)).collect();
     let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
-    for hole in holes {
-        let hb = ring_box(&hole);
-        let target = (0..shells.len())
-            .filter(|&i| {
-                box_within(hb, boxes[i]) && locate_ring(&hole, &shells[i][0]) == Loc::Inside
+    let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
+    for (i, shell) in shells.iter().enumerate() {
+        let shell_box = ring_box(&shell[0]);
+        let candidates: Vec<usize> = (0..holes.len())
+            .filter(|&k| {
+                targets[k].is_none_or(|old| areas[i] < areas[old])
+                    && box_within(boxes[k], shell_box)
             })
-            .min_by_key(|&i| areas[i]);
+            .collect();
+        // Share one edge scan across the candidate holes. The exact locator
+        // also retries boundary vertices and midpoints when necessary.
+        let rings: Vec<&TileRing> = candidates.iter().map(|&k| &holes[k]).collect();
+        for (k, location) in candidates.into_iter().zip(locate_rings(&rings, &shell[0])) {
+            if location == Loc::Inside {
+                targets[k] = Some(i);
+            }
+        }
+    }
+    for (hole, target) in holes.into_iter().zip(targets) {
         if let Some(i) = target {
             shells[i].push(hole);
         }
@@ -1033,6 +1048,47 @@ mod tests {
                 .sum()
         };
         assert!(area(&fixed) > 0);
+    }
+
+    #[test]
+    fn hole_binding_keeps_order_and_chooses_first_smallest_shell() {
+        let big = ring(&[(0, 0), (40, 0), (40, 40), (0, 40)]);
+        let small = ring(&[(5, 5), (20, 5), (20, 20), (5, 20)]);
+        let distant = ring(&[(50, 50), (60, 50), (60, 60), (50, 60)]);
+        let big_only = ring(&[(2, 2), (3, 2), (3, 3), (2, 3)]);
+        let small_only = ring(&[(8, 8), (9, 8), (9, 9), (8, 9)]);
+        let touching = ring(&[(0, 10), (2, 11), (2, 9)]);
+        // Every vertex is on the shell: an edge midpoint settles nesting.
+        let diamond = ring(&[(0, 20), (20, 0), (40, 20), (20, 40)]);
+        let far = ring(&[(55, 55), (56, 55), (56, 56), (55, 56)]);
+        let outside = ring(&[(70, 70), (71, 70), (71, 71), (70, 71)]);
+        let mut shells = vec![
+            vec![big.clone()],
+            vec![small.clone()],
+            vec![small.clone()],
+            vec![distant.clone()],
+        ];
+        bind_holes(
+            &mut shells,
+            vec![
+                big_only.clone(),
+                small_only.clone(),
+                touching.clone(),
+                diamond.clone(),
+                far.clone(),
+                outside,
+                big.clone(),
+            ],
+        );
+        assert_eq!(
+            shells,
+            vec![
+                vec![big, big_only, touching, diamond],
+                vec![small.clone(), small_only],
+                vec![small],
+                vec![distant, far],
+            ],
+        );
     }
 
     /// Snapped rings of the two Madagascar ADM4 features from #779.
