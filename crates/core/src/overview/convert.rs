@@ -2731,6 +2731,7 @@ pub fn write_convert_plan_sources(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<PlanReport, ConvertError> {
+    options.validate()?;
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     source.record_diagnostics(diagnostics);
 

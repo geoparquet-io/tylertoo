@@ -1,6 +1,28 @@
 use tylertoo_core::overview::convert::{convert_to_overviews, ConvertOptions};
 
 #[test]
+fn plan_sources_validates_before_opening_input() {
+    use tylertoo_core::input_set::ConvertSource;
+    use tylertoo_core::overview::convert::write_convert_plan_sources;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("corrupt.parquet");
+    std::fs::write(&input, b"corrupt").unwrap();
+    let source = ConvertSource::resolve_path(&input).unwrap();
+    let opts = ConvertOptions {
+        levels: tylertoo_core::overview::convert::LevelPlan::Gsds(vec![]),
+        properties: tylertoo_core::overview::properties::PropertySelection {
+            exclude_all: true,
+            ..Default::default()
+        },
+        save_plan: Some(dir.path().join("plan.arrow")),
+        ..Default::default()
+    };
+    let err = write_convert_plan_sources(&source, &opts).unwrap_err();
+    assert!(err.is_config(), "expected config error before input: {err}");
+    assert!(!opts.save_plan.unwrap().exists());
+}
+
+#[test]
 fn path_validates_before_resolving_partitions() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.parquet"), b"corrupt").unwrap();
