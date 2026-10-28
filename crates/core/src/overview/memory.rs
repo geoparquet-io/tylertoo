@@ -8,6 +8,7 @@ use super::pipeline::{probe_preflight_memory_limit, MemoryLimit};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MemoryPhase {
+    EagerInput,
     Scan,
     Assign,
     Read,
@@ -18,6 +19,7 @@ pub(super) enum MemoryPhase {
 impl MemoryPhase {
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::EagerInput => "eager input",
             Self::Scan => "pass-1 scan",
             Self::Assign => "assignment",
             Self::Read => "read-ahead",
@@ -65,7 +67,7 @@ impl MemoryBudget {
     )]
     pub(super) fn estimate(self, phase: MemoryPhase, rows: u64, geometry: Option<u64>) -> u64 {
         let per_row = match phase {
-            MemoryPhase::Scan => FeatureTable::MAX_BYTES_PER_ROW,
+            MemoryPhase::EagerInput | MemoryPhase::Scan => FeatureTable::MAX_BYTES_PER_ROW,
             MemoryPhase::Assign => FeatureTable::MAX_BYTES_PER_ROW,
             MemoryPhase::Read | MemoryPhase::Compute => 4096u64.saturating_add(
                 geometry
@@ -119,6 +121,16 @@ impl MemoryBudget {
         }
         Ok(())
     }
+
+    /// Retained input stays resident across every subsequent phase. Charge
+    /// it once against this run's snapshot before calculating any allowances.
+    pub(super) fn reserve(&mut self, phase: MemoryPhase, bytes: u64) -> Result<(), ConvertError> {
+        self.require(phase, bytes)?;
+        if let Some(limit) = &mut self.limit {
+            limit.bytes = limit.bytes.saturating_sub(bytes);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +141,7 @@ mod tests {
     fn budget_exceeded_names_each_phase() {
         let budget = MemoryBudget::with_available(Some(100));
         for phase in [
+            MemoryPhase::EagerInput,
             MemoryPhase::Scan,
             MemoryPhase::Assign,
             MemoryPhase::Read,
@@ -143,6 +156,17 @@ mod tests {
             );
             budget.require(phase, 100).unwrap();
         }
+    }
+
+    #[test]
+    fn retained_input_reduces_every_later_allowance() {
+        let mut budget = MemoryBudget::with_available(Some(1000));
+        budget.reserve(MemoryPhase::EagerInput, 600).unwrap();
+        assert_eq!(budget.available(), Some(400));
+        assert_eq!(budget.allowance(MemoryProfile::Bounded), 240);
+        assert!(budget.require(MemoryPhase::Scan, 401).is_err());
+        assert!(budget.reserve(MemoryPhase::EagerInput, 401).is_err());
+        assert_eq!(budget.available(), Some(400));
     }
 
     #[test]

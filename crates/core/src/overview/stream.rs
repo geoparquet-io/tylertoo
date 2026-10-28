@@ -60,7 +60,7 @@ use super::convert::{
     PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
-use super::memory::MemoryBudget;
+use super::memory::{MemoryBudget, MemoryPhase};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
 #[cfg(test)]
@@ -2418,7 +2418,7 @@ fn run_front_half(
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
     }
-    let preflight = preflight(source, options, diagnostics)?;
+    let mut preflight = preflight(source, options, diagnostics)?;
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
@@ -2434,6 +2434,11 @@ fn run_front_half(
             tylertoo_io::byte_array_limit(),
         )?)
     };
+    if let Some(memory) = &memory {
+        preflight
+            .budget
+            .reserve(MemoryPhase::EagerInput, memory.resident_bytes())?;
+    }
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     let plan = resolve_plan_state(
         &Pass1Ctx {
