@@ -9,64 +9,64 @@
           "vertex_count": 2050
         },
         {
-          "feature_count": 1537,
+          "feature_count": 1558,
           "level": 1,
-          "vertex_count": 7723
+          "vertex_count": 7763
         },
         {
-          "feature_count": 4557,
+          "feature_count": 4687,
           "level": 2,
-          "vertex_count": 22579
+          "vertex_count": 22909
         },
         {
-          "feature_count": 9820,
+          "feature_count": 10096,
           "level": 3,
-          "vertex_count": 47970
+          "vertex_count": 48750
         },
         {
-          "feature_count": 14564,
+          "feature_count": 14835,
           "level": 4,
-          "vertex_count": 72808
+          "vertex_count": 73463
         },
         {
-          "feature_count": 16504,
+          "feature_count": 16571,
           "level": 5,
-          "vertex_count": 96366
+          "vertex_count": 96006
         },
         {
-          "feature_count": 17131,
+          "feature_count": 17174,
           "level": 6,
-          "vertex_count": 130448
+          "vertex_count": 130163
         },
         {
-          "feature_count": 17385,
+          "feature_count": 17393,
           "level": 7,
-          "vertex_count": 177775
+          "vertex_count": 177535
         },
         {
-          "feature_count": 17456,
+          "feature_count": 17461,
           "level": 8,
-          "vertex_count": 239502
+          "vertex_count": 239572
         },
         {
           "feature_count": 17465,
           "level": 9,
-          "vertex_count": 322368
+          "vertex_count": 322478
         },
         {
           "feature_count": 17465,
           "level": 10,
-          "vertex_count": 433075
+          "vertex_count": 433185
         },
         {
           "feature_count": 17465,
           "level": 11,
-          "vertex_count": 573337
+          "vertex_count": 573457
         },
         {
           "feature_count": 17465,
           "level": 12,
-          "vertex_count": 729473
+          "vertex_count": 729498
         },
         {
           "feature_count": 17465,
@@ -79,13 +79,13 @@
           "vertex_count": 1749880
         }
       ],
-      "total_rows": 204154,
-      "total_vertices": 5482363
+      "total_rows": 204975,
+      "total_vertices": 5483718
     },
     "export": {
-      "archive_bytes": 125428307,
-      "decoded_features_total": 595209,
-      "total_tile_features": 595209,
+      "archive_bytes": 125449436,
+      "decoded_features_total": 595951,
+      "total_tile_features": 595951,
       "total_tiles": 153053,
       "zooms": [
         {
@@ -95,51 +95,51 @@
           "zoom": 0
         },
         {
-          "decoded_features": 1537,
+          "decoded_features": 1558,
           "tile_count": 1,
-          "tile_feature_count": 1537,
+          "tile_feature_count": 1558,
           "zoom": 1
         },
         {
-          "decoded_features": 4557,
+          "decoded_features": 4687,
           "tile_count": 1,
-          "tile_feature_count": 4557,
+          "tile_feature_count": 4687,
           "zoom": 2
         },
         {
-          "decoded_features": 12830,
+          "decoded_features": 13193,
           "tile_count": 2,
-          "tile_feature_count": 12830,
+          "tile_feature_count": 13193,
           "zoom": 3
         },
         {
-          "decoded_features": 16374,
+          "decoded_features": 16518,
           "tile_count": 4,
-          "tile_feature_count": 16374,
+          "tile_feature_count": 16518,
           "zoom": 4
         },
         {
-          "decoded_features": 15368,
+          "decoded_features": 15392,
           "tile_count": 4,
-          "tile_feature_count": 15368,
+          "tile_feature_count": 15392,
           "zoom": 5
         },
         {
-          "decoded_features": 18830,
+          "decoded_features": 18876,
           "tile_count": 7,
-          "tile_feature_count": 18830,
+          "tile_feature_count": 18876,
           "zoom": 6
         },
         {
-          "decoded_features": 20724,
+          "decoded_features": 20732,
           "tile_count": 16,
-          "tile_feature_count": 20724,
+          "tile_feature_count": 20732,
           "zoom": 7
         },
         {
-          "decoded_features": 21185,
+          "decoded_features": 21191,
           "tile_count": 44,
-          "tile_feature_count": 21185,
+          "tile_feature_count": 21191,
           "zoom": 8
         },
         {
@@ -328,24 +328,24 @@
           "vertex_count": 70
         },
         {
-          "feature_count": 63,
+          "feature_count": 65,
           "level": 3,
-          "vertex_count": 314
+          "vertex_count": 324
         },
         {
-          "feature_count": 212,
+          "feature_count": 226,
           "level": 4,
-          "vertex_count": 1051
+          "vertex_count": 1121
         },
         {
-          "feature_count": 541,
+          "feature_count": 544,
           "level": 5,
-          "vertex_count": 2645
+          "vertex_count": 2660
         },
         {
-          "feature_count": 793,
+          "feature_count": 794,
           "level": 6,
-          "vertex_count": 4016
+          "vertex_count": 4021
         },
         {
           "feature_count": 968,
@@ -358,13 +358,13 @@
           "vertex_count": 6945
         }
       ],
-      "total_rows": 3595,
-      "total_vertices": 20373
+      "total_rows": 3615,
+      "total_vertices": 20473
     },
     "export": {
-      "archive_bytes": 153172,
-      "decoded_features_total": 3911,
-      "total_tile_features": 3911,
+      "archive_bytes": 153908,
+      "decoded_features_total": 3941,
+      "total_tile_features": 3941,
       "total_tiles": 87,
       "zooms": [
         {
@@ -386,27 +386,27 @@
           "zoom": 8
         },
         {
-          "decoded_features": 89,
+          "decoded_features": 93,
           "tile_count": 2,
-          "tile_feature_count": 89,
+          "tile_feature_count": 93,
           "zoom": 9
         },
         {
-          "decoded_features": 247,
+          "decoded_features": 269,
           "tile_count": 2,
-          "tile_feature_count": 247,
+          "tile_feature_count": 269,
           "zoom": 10
         },
         {
-          "decoded_features": 552,
+          "decoded_features": 555,
           "tile_count": 2,
-          "tile_feature_count": 552,
+          "tile_feature_count": 555,
           "zoom": 11
         },
         {
-          "decoded_features": 842,
+          "decoded_features": 843,
           "tile_count": 6,
-          "tile_feature_count": 842,
+          "tile_feature_count": 843,
           "zoom": 12
         },
         {
