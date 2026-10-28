@@ -1385,19 +1385,43 @@ fn run_export_pmtiles(args: ExportPmtilesArgs) -> Result<()> {
     );
     for z in &report.zooms {
         say!(
-            "  z{:<2} (level {}): {:>7} tiles, {:>9} features",
+            "  z{:<2} (level {}): {:>7} tiles, {:>9} features{}{}{}",
             z.zoom,
             z.level,
             z.tile_count,
             z.tile_feature_count,
+            if z.oversized_tiles > 0 {
+                format!(", {} oversized", z.oversized_tiles)
+            } else {
+                String::new()
+            },
+            if z.encode_dropped_features > 0 {
+                format!(", {} unencodable", z.encode_dropped_features)
+            } else {
+                String::new()
+            },
+            if z.encode_quantized_features > 0 {
+                format!(", {} collapsed at extent", z.encode_quantized_features)
+            } else {
+                String::new()
+            }
         );
     }
     say!(
-        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s",
+        "\n✓ {} tiles, {} features, {} oversized tiles in {:.2}s{}",
         report.total_tiles,
         report.total_tile_features,
         report.oversized_tiles,
         report.duration_secs,
+        if report.encode_dropped_features > 0 {
+            // #431: never let the summary read as an unqualified success.
+            format!(
+                " \u{2014} {} tile feature(s) dropped at MVT encode; see below",
+                report.encode_dropped_features
+            )
+        } else {
+            String::new()
+        }
     );
     print_diagnostics(report.diagnostics.iter());
 
