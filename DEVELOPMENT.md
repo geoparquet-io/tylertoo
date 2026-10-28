@@ -814,12 +814,17 @@ of the checked-out PR merge commit. The script selects the whole
 workspace, including the I/O owner and Python bindings, with all features
 and locked dependencies. It uses `.cargo/mutants-cli.toml`, whose build
 arguments have no package-specific test targets, and passes `--workspace`
-to Cargo so the baseline and each mutant build and test all consumers.
+to Cargo so the baseline and each mutant build and run every consumer's
+Rust tests.
 Only mutation sites on changed lines are selected by `--in-diff`.
+CI adds `--cap-lints true` so a mutation that leaves an unused variable
+reaches the tests instead of failing on the repository's strict lints.
+The ordinary clippy gate still denies warnings.
 
 The matrix divides that set into 64 native cargo-mutants shards with
 `--sharding round-robin --shard k/64`, using zero-based indices and
-two workers per shard. Up to 16 shards run at once. Each job has a
+two workers per shard. The mutator is pinned to 27.1.0 so every shard
+enumerates the same set. Up to 16 shards run at once. Each job has a
 90-minute limit, including setup and the baseline. All mutants are
 assigned; there is no sampling. Fail-fast is disabled so one failed
 shard does not cancel the others. A 2,765-mutant diff has 43–44 mutants
@@ -843,7 +848,7 @@ cargo-mutants, whose exit status is preserved (2 for missed mutants,
 ```bash
 scripts/mutants-diff.sh              # vs origin/main
 scripts/mutants-diff.sh main -j 2    # base, extra cargo-mutants args
-scripts/mutants-diff.sh main --sharding round-robin --shard 0/64 -j 2
+scripts/mutants-diff.sh main --cap-lints true --sharding round-robin --shard 0/64 -j 2
 ```
 
 The weekly job (`.github/workflows/mutation-tests.yml`, Sundays) runs

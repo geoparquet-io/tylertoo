@@ -45,7 +45,8 @@ jobs:
       - name: Install mutation tools
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-mutants,cargo-nextest
+          # All shards must enumerate with the same mutator version.
+          tool: cargo-mutants@27.1.0,cargo-nextest
       - name: Install protoc
         run: |
           sudo apt-get update
@@ -68,7 +69,7 @@ jobs:
           eval "$(scripts/setup_go_pmtiles.sh --print-path)"
           echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
       - name: Test mutants in the PR diff
-        run: scripts/mutants-diff.sh HEAD^1 --sharding round-robin --shard "$SHARD/$SHARD_COUNT" -j 2
+        run: scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard "$SHARD/$SHARD_COUNT" -j 2
       - name: Upload mutation results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
