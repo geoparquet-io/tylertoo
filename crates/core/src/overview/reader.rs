@@ -586,6 +586,22 @@ impl OverviewReader {
         &self.metadata
     }
 
+    /// Restore original overview row addresses after spatial pruning.
+    pub(crate) fn row_locator(&self, selected: &[usize]) -> crate::input_set::StreamRowLocator {
+        let counts = self
+            .metadata
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows())
+            .collect();
+        crate::input_set::StreamRowLocator::new(
+            &[counts],
+            Some(&crate::input_set::RowGroupSelection::from_parts(vec![
+                selected.to_vec(),
+            ])),
+        )
+    }
+
     /// `(band, rows)` for each of `row_groups`, in the order given: the level
     /// band each row group belongs to (§3.3) and its row count. The export's
     /// size valve (#745) walks this alongside a read of the same row groups

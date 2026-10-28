@@ -4437,6 +4437,7 @@ dependencies = [
  "indicatif",
  "log",
  "mimalloc",
+ "serde",
  "serde_json",
  "tempfile",
  "trycmd",

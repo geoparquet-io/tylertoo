@@ -356,6 +356,25 @@ magic's last byte is the format version and is matched separately from the
 `TTPLAN\0` prefix, so a plan from a future tylertoo reports its version
 rather than "bad magic bytes".
 
+Diagnostics belong to a run. Loss accounting uses source row addresses, with
+an optional MVT feature ID kept separately because feature IDs may repeat.
+Convert reports restore original row ordinals across parts and publish the
+half-open `source_row_ranges` that define their selected-input domain. Footer-
+pruned groups are outside that domain; exact bbox and attribute gates record
+losses within it. The archive verifier maps those original ordinals through
+`--input` and `--feature-id`, and requires source-unique IDs for conservation.
+Export accounts for each original overview row at each zoom, cancelling a loss
+only when that same row survives in another tile.
+
+The row ledger spills through `tempfile::SpooledTempFile` (16 KiB per zoom),
+using `--spill-dir` when supplied. `MemoryBudget` limits the materialized loss
+report to 10% of available memory, capped at 64 MiB; excess losses return a
+typed budget error instead of truncating the partition. Empty fleet jobs
+retain their diagnostics and write fresh zero-output reports. Shard replay
+recounts geometry kinds from saved row tables and labels aggregate scan
+warnings as `saved_plan` facts about the whole input. Plan format v5 carries
+these typed totals; v4 plans must be recreated with `--save-plan`.
+
 Peak memory is `O(read batch + winner tables)` — Moldova (632k polygons,
 38M vertices) converts to a z0–14 pyramid in ~45 s / ~1.4 GB peak RSS on a 16-core machine
 (a default z0–6 pyramid is ~7 s / ~0.4 GB).

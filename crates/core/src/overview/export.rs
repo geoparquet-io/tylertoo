@@ -772,6 +772,9 @@ pub struct SkippedPropertyColumn {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExportError {
+    /// Source accounting spill or report exceeded its budget.
+    #[error(transparent)]
+    Accounting(#[from] crate::diagnostics::AccountingError),
     /// The output cannot be written (#452: checked before the input is
     /// opened).
     #[error(transparent)]
@@ -1980,7 +1983,9 @@ fn export_pmtiles_validated(
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
+    diagnostics.set_accounting_budget(super::memory::MemoryBudget::probe().accounting_allowance());
     let options = config.options();
+    diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
     // for the standalone `export-pmtiles` path (which never runs convert's
     // own preflight); redundant but harmless in the `tiles` path.
@@ -2281,6 +2286,7 @@ fn export_pmtiles_validated(
     progress.enter_phase("finalize");
 
     let t_finalize = Instant::now();
+    diagnostics.source_losses()?;
     writer.finalize(output_path.as_ref())?;
     progress.end_finalize(t_finalize);
     log::info!(
@@ -2312,7 +2318,7 @@ fn export_pmtiles_validated(
             skipped_property_columns,
             start,
         )
-        .with_diagnostics(diagnostics),
+        .with_diagnostics(diagnostics)?,
         #[cfg(test)]
         level_groups,
         #[cfg(test)]
@@ -2323,7 +2329,10 @@ fn export_pmtiles_validated(
 }
 
 impl ExportReport {
-    fn with_diagnostics(mut self, sink: &crate::diagnostics::Diagnostics) -> Self {
+    fn with_diagnostics(
+        mut self,
+        sink: &crate::diagnostics::Diagnostics,
+    ) -> Result<Self, ExportError> {
         use crate::diagnostics::Diagnostic;
         sink.record(Diagnostic::EncodeDropped {
             count: self.encode_dropped_features,
@@ -2345,12 +2354,12 @@ impl ExportReport {
             });
         }
         self.diagnostics = sink.snapshot();
-        self.source_losses = sink.source_losses();
+        self.source_losses = sink.source_losses()?;
         self.encode_dropped_features = sink.count(&Diagnostic::EncodeDropped { count: 0 });
         self.encode_quantized_features = sink.count(&Diagnostic::EncodeQuantized { count: 0 });
         self.merged_features = sink.count(&Diagnostic::Merged { count: 0 });
         self.valve_dropped_features = sink.count(&Diagnostic::ValveDropped { count: 0 });
-        self
+        Ok(self)
     }
 
     /// The report over the written zooms, with the totals summed from them.
@@ -4229,11 +4238,12 @@ fn route_fanout_rows(
         let (props, id) = attrs.row(row)?;
         if let Some(id) = id {
             for &k in targets {
-                diagnostics.source_loss(
+                diagnostics.source_member_loss(
+                    *seq,
                     id,
-                    Some(plans[k].zoom),
+                    plans[k].zoom,
                     crate::diagnostics::SourceLossCause::ClipDropped,
-                );
+                )?;
             }
         }
         if per_level.iter().all(|rows| rows[row].is_empty()) {
@@ -4890,6 +4900,13 @@ fn process_wave(
     Ok(tiles)
 }
 
+/// The positions and row-group context of a spatially pruned wave read.
+struct WaveRows {
+    read: u64,
+    gaps: RowGapCursor,
+    locator: crate::input_set::StreamRowLocator,
+}
+
 /// The read half of [`process_wave`]: the wave's members, bucketed per
 /// partition.
 struct CollectedWave {
@@ -4934,7 +4951,6 @@ fn collect_wave(
 
     let t_collect = Instant::now();
     let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
-    let mut seq = 0u64;
     // PERF (#535): the read runs on its own thread, one batch ahead of the
     // clip, instead of alternating with it on this one. The read is
     // single-threaded by nature (one Parquet reader, sequential row groups)
@@ -4955,11 +4971,14 @@ fn collect_wave(
     let selected = ctx
         .reader
         .selected_row_groups_any(ctx.level_idx, bboxes.as_ref().map(|b| b.as_slice()))?;
-    let mut gaps =
-        RowGapCursor::new(ctx.reader.row_group_bands(&selected)).measuring(valve_merges(ctx.opts));
+    let mut rows = WaveRows {
+        read: 0,
+        gaps: RowGapCursor::new(ctx.reader.row_group_bands(&selected))
+            .measuring(valve_merges(ctx.opts)),
+        locator: ctx.reader.row_locator(&selected),
+    };
     let buckets_ref = &mut buckets;
-    let seq_ref = &mut seq;
-    let gaps_ref = &mut gaps;
+    let rows_ref = &mut rows;
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
         |tx: &Sender<RecordBatch>| -> Result<(), ExportError> {
@@ -4981,22 +5000,14 @@ fn collect_wave(
         },
         |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
             for batch in rx.iter() {
-                collect_wave_members(
-                    ctx,
-                    wave,
-                    &batch,
-                    seq_ref,
-                    gaps_ref,
-                    buckets_ref,
-                    diagnostics,
-                )?;
+                collect_wave_members(ctx, wave, &batch, rows_ref, buckets_ref, diagnostics)?;
             }
             Ok(())
         },
     )?;
     Ok(CollectedWave {
         buckets,
-        rows_read: seq,
+        rows_read: rows.read,
         collect_secs: t_collect.elapsed().as_secs_f64(),
     })
 }
@@ -5058,15 +5069,14 @@ fn decode_batch_geometries(
 /// Decode one record batch and append its members to the wave's per-partition
 /// buckets: clip every feature (in parallel) into its intersecting tiles across
 /// the wave's whole key range, route each member to its owning partition, then
-/// attach shared per-feature properties in band order. `seq` is the running
-/// band-order counter (advanced for every row, member-producing or not, so
-/// within-tile ordering matches the old whole-band feature indexing).
+/// attach shared per-feature properties in band order. `rows` restores the
+/// original overview addresses after pruning, keeping identity stable between
+/// waves while preserving the relative within-tile feature order.
 fn collect_wave_members(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
     batch: &RecordBatch,
-    seq: &mut u64,
-    gaps: &mut RowGapCursor,
+    rows: &mut WaveRows,
     buckets: &mut [Vec<Member>],
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
@@ -5078,7 +5088,7 @@ fn collect_wave_members(
     let schema = batch.schema();
     let geom_idx = batch_geometry_index(batch, ctx.published.geometry.as_deref())?;
     let geoms = decode_batch_geometries(batch, &schema, geom_idx, ctx.crs, timers, diagnostics)?;
-    let row_gaps = ExportTimers::time(&timers.decode, || gaps.batch(&geoms));
+    let row_gaps = ExportTimers::time(&timers.decode, || rows.gaps.batch(&geoms));
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
     // range. #535: `clip` is timed per geometry inside the closure.
@@ -5099,23 +5109,27 @@ fn collect_wave_members(
     let mut attrs =
         AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
     for (row, items) in row_members.into_iter().enumerate() {
+        let source_row = rows.locator.global_row(rows.read as usize).ok_or_else(|| {
+            crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
+        })?;
         let (props, id) = attrs.row(row)?;
         if let Some(id) = id {
-            diagnostics.source_loss(
+            diagnostics.source_member_loss(
+                source_row,
                 id,
-                Some(ctx.zoom),
+                ctx.zoom,
                 crate::diagnostics::SourceLossCause::ClipDropped,
-            );
+            )?;
         }
         if items.is_empty() {
-            *seq += 1;
+            rows.read += 1;
             continue;
         }
         let (gap, band) = row_gaps[row];
         for (key, geom) in items {
             buckets[route_partition(wave, key)].push(Member {
                 key,
-                seq: *seq,
+                seq: source_row,
                 geom,
                 props: Arc::clone(&props),
                 id,
@@ -5123,7 +5137,7 @@ fn collect_wave_members(
                 band,
             });
         }
-        *seq += 1;
+        rows.read += 1;
     }
     Ok(())
 }
@@ -6188,15 +6202,21 @@ fn encode_members(
                     mvt.source_losses.iter().copied().collect();
                 for member in g {
                     if let Some(id) = member.id {
-                        let cause = losses.get(&id).copied().unwrap_or(cause);
-                        if !surviving.contains(&id) {
-                            diagnostics.source_loss(id, Some(zoom), cause);
+                        let cause = losses.get(&member.seq).copied().unwrap_or(cause);
+                        if !surviving.contains(&member.seq) {
+                            if let Err(error) =
+                                diagnostics.source_member_loss(member.seq, id, zoom, cause)
+                            {
+                                return Some(Err(error.into()));
+                            }
                         }
                     }
                 }
                 if mvt.features > 0 {
                     for &id in &mvt.source_ids {
-                        diagnostics.source_emitted(id, zoom);
+                        if let Err(error) = diagnostics.source_emitted(id, zoom) {
+                            return Some(Err(error.into()));
+                        }
                     }
                 }
             }
@@ -6306,6 +6326,7 @@ struct ValveTally {
 /// ([`with_fill`]).
 struct FillFeature {
     id: Option<u64>,
+    source_row: u64,
     props: SharedProps,
     cmds: Vec<u32>,
     /// Its polygons and their vertices, for the report.
@@ -6318,12 +6339,14 @@ struct FillFeature {
 impl FillFeature {
     fn encode_fill(
         id: Option<u64>,
+        source_row: u64,
         props: SharedProps,
         polys: &[coverage_fill::FillPolygon],
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Self {
         Self {
             id,
+            source_row,
             props,
             cmds: crate::mvt::encode_tile_unit_polygons(polys, diagnostics),
             polygons: polys.len(),
@@ -6394,6 +6417,7 @@ fn fill_features(
         .map(|(host, group)| {
             FillFeature::encode_fill(
                 members[host].id,
+                members[host].seq,
                 members[host].props.clone(),
                 &group,
                 diagnostics,
@@ -6429,6 +6453,7 @@ trait TileFeature: Sync {
     fn geometry(&self) -> &Geometry<f64>;
     fn properties(&self) -> &SharedProps;
     fn feature_id(&self) -> Option<u64>;
+    fn source_row(&self) -> u64;
 }
 
 impl TileFeature for Member {
@@ -6440,6 +6465,9 @@ impl TileFeature for Member {
     }
     fn feature_id(&self) -> Option<u64> {
         self.id
+    }
+    fn source_row(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -6453,6 +6481,9 @@ impl TileFeature for coalesce_valve::Merged<'_> {
     fn feature_id(&self) -> Option<u64> {
         self.target.id
     }
+    fn source_row(&self) -> u64 {
+        self.target.seq
+    }
 }
 
 impl<T: TileFeature + ?Sized> TileFeature for &T {
@@ -6464,6 +6495,9 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
     }
     fn feature_id(&self) -> Option<u64> {
         (**self).feature_id()
+    }
+    fn source_row(&self) -> u64 {
+        (**self).source_row()
     }
 }
 
@@ -6993,19 +7027,19 @@ fn build_mvt_with<M: TileFeature>(
     // tile's own features. Each fill feature carries its host's id and tags.
     for f in fill {
         let geom = EncodedFeatureGeometry::Parts(vec![(f.cmds.clone(), GeomType::Polygon)]);
-        track(f.id, &geom);
+        track(f.id.map(|_| f.source_row), &geom);
         layer.add_encoded_feature(f.id, geom, &f.props);
     }
     if encode_in_parallel(members) {
         let encoded: Vec<EncodedFeatureGeometry> = members.par_iter().map(&encode).collect();
         for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
-            track(m.feature_id(), &geom);
+            track(m.feature_id().map(|_| m.source_row()), &geom);
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     } else {
         for (i, m) in members.iter().enumerate() {
             let geom = encode(m);
-            track(m.feature_id(), &geom);
+            track(m.feature_id().map(|_| m.source_row()), &geom);
             layer.add_encoded_feature(id_of(i, m), geom, m.properties());
         }
     }
@@ -10344,12 +10378,18 @@ mod tests {
         );
         assert_eq!(mvt.features, 0);
         assert!(!mvt.data.is_empty(), "the fill is still encoded");
+        assert_eq!(
+            mvt.source_ids,
+            vec![7],
+            "drawn fill retains its host source identity"
+        );
     }
 
     /// A fill feature of one `side`-unit square at (x, y), hosted by `id`.
     fn fill_square(id: u64, x: i32, y: i32, side: i32) -> FillFeature {
         FillFeature::encode_fill(
             Some(id),
+            id,
             Arc::new(Vec::new()),
             &[vec![vec![
                 (x, y),
@@ -15763,6 +15803,70 @@ mod tests {
     /// partitioning single-read fan-out under both member-store backings
     /// (the spill codec carries them) byte-identically to the legacy path.
     #[test]
+    fn pruned_export_waves_keep_distinct_source_row_addresses() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let tiny = geo::Rect::new(
+            geo::Coord { x: 120.0, y: -40.0 },
+            geo::Coord {
+                x: 120.000001,
+                y: -39.999999,
+            },
+        )
+        .to_polygon();
+        write_mode_fixture(
+            input.path(),
+            &[
+                (
+                    vec![100, 200],
+                    vec![
+                        Geometry::Point(Point::new(-120.0, 40.0)),
+                        Geometry::Polygon(tiny.clone()),
+                    ],
+                ),
+                (
+                    vec![100, 200],
+                    vec![
+                        Geometry::Point(Point::new(-120.0, 40.0)),
+                        Geometry::Polygon(tiny),
+                    ],
+                ),
+            ],
+            Mode::Duplicating,
+            1,
+        );
+        let reader = OverviewReader::open(input.path()).unwrap();
+        assert_eq!(reader.num_row_groups(), 4);
+        assert_eq!(
+            reader
+                .selected_row_groups(1, Some([-157.5, -90.0, -90.0, 156.0]))
+                .unwrap(),
+            vec![2]
+        );
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let report = export_pmtiles_impl(
+            input.path(),
+            output.path(),
+            &ExportOptions {
+                feature_id: Some("id".into()),
+                partition_wave: 1,
+                ..Default::default()
+            },
+            1,
+            true,
+            None,
+        )
+        .unwrap();
+        let losses: Vec<_> = report
+            .source_losses
+            .iter()
+            .filter(|loss| loss.zoom == Some(4))
+            .collect();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].id, 3);
+        assert_eq!(losses[0].feature_id, Some(200));
+    }
+
+    #[test]
     fn feature_id_partitioning_single_read_matches_legacy_under_both_backings() {
         let tin = tempfile::NamedTempFile::new().unwrap();
         partitioning_equivalence_fixture(tin.path());
@@ -16075,6 +16179,71 @@ mod tests {
 #[cfg(test)]
 mod diagnostic_row_alignment {
     use super::*;
+
+    #[test]
+    fn duplicate_feature_ids_do_not_cancel_another_source_rows_loss() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let geoms = vec![
+            Geometry::Point(geo::Point::new(1.0, 1.0)),
+            Geometry::Polygon(geo::Polygon::new(
+                geo::LineString::from(vec![
+                    (0.0, 0.0),
+                    (0.000001, 0.0),
+                    (0.000001, 0.000001),
+                    (0.0, 0.0),
+                ]),
+                vec![],
+            )),
+        ];
+        let members: Vec<Member> = geoms
+            .into_iter()
+            .enumerate()
+            .map(|(row, geom)| {
+                diagnostics
+                    .source_member_loss(
+                        row as u64,
+                        7,
+                        0,
+                        crate::diagnostics::SourceLossCause::ClipDropped,
+                    )
+                    .unwrap();
+                Member {
+                    key: 0,
+                    seq: row as u64,
+                    geom,
+                    id: Some(7),
+                    props: Arc::new(vec![]),
+                    gap: GAP_NONE,
+                    band: 0,
+                }
+            })
+            .collect();
+        assert_eq!(members[0].source_row(), 0);
+        let tiles = encode_members(
+            members,
+            0,
+            &ExportOptions {
+                feature_id: Some("id".into()),
+                tile_size_limit: None,
+                compressed_tile_size_limit: None,
+                ..Default::default()
+            },
+            None,
+            &ExportTimers::default(),
+            &diagnostics,
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].feature_count, 1);
+        let losses = diagnostics.source_losses().unwrap();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].id, 1);
+        assert_eq!(losses[0].feature_id, Some(7));
+        assert_eq!(
+            losses[0].cause,
+            crate::diagnostics::SourceLossCause::Quantized
+        );
+    }
 
     #[test]
     fn export_decode_keeps_null_geometry_rows_aligned_with_feature_ids() {

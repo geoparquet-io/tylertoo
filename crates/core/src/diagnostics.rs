@@ -2,7 +2,9 @@
 //!
 //! A sink belongs to one operation. Workers borrow it; reports take a sorted,
 //! aggregated snapshot. No warning or count survives into another operation.
-use std::collections::{BTreeMap, BTreeSet};
+mod accounting;
+
+pub(crate) const MAX_LOSS_REPORT_BYTES: usize = 64 << 20;
 use std::fmt;
 use std::sync::Mutex;
 
@@ -40,6 +42,11 @@ pub struct RangeContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Diagnostic {
+    /// Facts from the whole saved plan, not counts from this shard's scan.
+    SavedPlan {
+        count: usize,
+        diagnostics: Vec<Diagnostic>,
+    },
     /// Advice or an I/O warning from the shared pipeline. Kept per run and
     /// deduplicated by its complete message; never persisted in a plan.
     Advisory {
@@ -257,6 +264,7 @@ macro_rules! event_count {
             | Self::EmptyLevels { count, .. }
             | Self::MemoryBudget { count, .. }
             | Self::Advisory { count, .. }
+            | Self::SavedPlan { count, .. }
             | Self::PyramidSharedTiles { count }
             | Self::PyramidSkippedTiles { count }
             | Self::PyramidMissingBounds { count }
@@ -297,7 +305,7 @@ impl Diagnostic {
         *self.count_mut() = count;
     }
 
-    fn same_kind(&self, other: &Self) -> bool {
+    fn same_counter_kind(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Advisory { message: a, .. }, Self::Advisory { message: b, .. }) => a == b,
             (Self::PolygonRepaired { kind: a, .. }, Self::PolygonRepaired { kind: b, .. }) => {
@@ -313,6 +321,37 @@ impl Diagnostic {
             }
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
+    }
+
+    fn same_kind(&self, other: &Self) -> bool {
+        if !self.same_counter_kind(other) {
+            return false;
+        }
+        // Counts and denominators aggregate; every other payload belongs to
+        // its own context. Comparing normalized events also covers future
+        // variants, rather than silently keeping their first payload.
+        fn context_key(event: &Diagnostic) -> Diagnostic {
+            let mut event = event.clone();
+            *event.count_mut() = 0;
+            match &mut event {
+                Diagnostic::OutOfRange {
+                    context: Some(c), ..
+                }
+                | Diagnostic::Wrapped {
+                    context: Some(c), ..
+                }
+                | Diagnostic::Unprojectable {
+                    context: Some(c), ..
+                } => {
+                    c.total = 0;
+                    c.max_abs = 0.0;
+                }
+                Diagnostic::UnusableGeometry { total, .. } => *total = 0,
+                _ => {}
+            }
+            event
+        }
+        context_key(self) == context_key(other)
     }
 }
 
@@ -355,6 +394,9 @@ impl fmt::Display for Diagnostic {
                 let zoom = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
                 write!(f, "omitting {n} empty level(s) [{ids}] spanning GSD {gsd_max:.2}–{gsd_min:.2} m: none of the {input_features} input feature(s) are visible at those scales (visibility gates / density budget); the output pyramid starts at GSD {first_written_gsd:.2} m{zoom}. To populate coarse levels, lower --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD polygons as representative points (see docs/OVERVIEW_TUNING.md)")
             }
+            Self::SavedPlan {diagnostics,..} => {
+                write!(f, "saved plan (whole input): {}", diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
+            }
             Self::Advisory {message,..} => f.write_str(message),
             Self::MemoryBudget {machine,limit,..} => write!(f, "memory budget from cgroup limit: {limit} bytes (machine available: {machine:?} bytes)"),
             Self::PyramidSharedTiles {..} => write!(f, "{n} tile(s) shared across bands; counted once in the merged archive"),
@@ -369,8 +411,12 @@ impl fmt::Display for Diagnostic {
 /// A disjoint source-feature loss, rather than a (feature, tile) counter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLoss {
-    /// Source row index in read order (or the explicit MVT feature id at export).
+    /// Row index: selected input stream before assignment, or original overview file at export.
+    /// Convert reports restore this to the original input row index.
     pub id: u64,
+    /// Caller-provided MVT ID at export. It may repeat; `id` remains unique.
+    #[serde(default)]
+    pub feature_id: Option<u64>,
     /// Export zoom; absent for losses before level assignment.
     pub zoom: Option<u8>,
     /// Stage that removed the source feature.
@@ -392,13 +438,24 @@ pub enum SourceLossCause {
     ClipDropped,
 }
 
+/// Accounting must fail explicitly rather than truncate the loss partition.
+#[derive(Debug, thiserror::Error)]
+pub enum AccountingError {
+    #[error("source accounting spill: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(
+        "source loss report needs {needed} bytes, exceeding its {available} byte memory budget"
+    )]
+    BudgetExceeded { needed: usize, available: usize },
+}
+
 /// A thread-safe sink borrowed by all stages of one operation.
 #[derive(Debug)]
 pub struct Diagnostics {
     emit_logs: bool,
     events: Mutex<Vec<Diagnostic>>,
-    losses: Mutex<BTreeMap<(Option<u8>, u64), SourceLossCause>>,
-    emitted: Mutex<BTreeSet<(Option<u8>, u64)>>,
+    accounting: Mutex<accounting::Accounting>,
+    input_rows: Mutex<Option<crate::input_set::StreamRowLocator>>,
 }
 
 impl Default for Diagnostics {
@@ -406,8 +463,8 @@ impl Default for Diagnostics {
         Self {
             emit_logs: true,
             events: Mutex::default(),
-            losses: Mutex::default(),
-            emitted: Mutex::default(),
+            accounting: Mutex::default(),
+            input_rows: Mutex::default(),
         }
     }
 }
@@ -425,30 +482,102 @@ impl Diagnostics {
         }
     }
 
-    /// Track a candidate loss. A source drawn in any tile is never lost.
-    pub fn source_loss(&self, id: u64, zoom: Option<u8>, cause: SourceLossCause) {
-        let mut losses = self.losses.lock().unwrap_or_else(|e| e.into_inner());
-        losses
-            .entry((zoom, id))
-            .and_modify(|old| *old = (*old).min(cause))
-            .or_insert(cause);
-    }
-    /// A source survives if any of its tile members survives the final valve.
-    pub fn source_emitted(&self, id: u64, zoom: u8) {
-        self.emitted
+    /// Track a loss by source row; a source drawn in any tile is never lost.
+    ///
+    /// # Errors
+    /// Returns a spill I/O error if the row cannot be recorded.
+    pub fn source_loss(
+        &self,
+        row: u64,
+        zoom: Option<u8>,
+        cause: SourceLossCause,
+    ) -> Result<(), AccountingError> {
+        self.accounting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((Some(zoom), id));
+            .record(row, None, zoom, Some(cause))
     }
-    /// Disjoint losses, sorted by zoom and source id, excluding surviving ids.
-    pub fn source_losses(&self) -> Vec<SourceLoss> {
-        let losses = self.losses.lock().unwrap_or_else(|e| e.into_inner());
-        let emitted = self.emitted.lock().unwrap_or_else(|e| e.into_inner());
-        losses
-            .iter()
-            .filter(|(key, _)| !emitted.contains(key))
-            .map(|(&(zoom, id), &cause)| SourceLoss { id, zoom, cause })
-            .collect()
+    /// Track an exported row separately from its possibly duplicated MVT ID.
+    pub(crate) fn source_member_loss(
+        &self,
+        row: u64,
+        id: u64,
+        zoom: u8,
+        cause: SourceLossCause,
+    ) -> Result<(), AccountingError> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(row, Some(id), Some(zoom), Some(cause))
+    }
+    /// A source survives if any tile member survives the final valve.
+    ///
+    /// # Errors
+    /// Returns a spill I/O error if the row cannot be recorded.
+    pub fn source_emitted(&self, row: u64, zoom: u8) -> Result<(), AccountingError> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(row, None, Some(zoom), None)
+    }
+    /// Disjoint losses, with convert rows restored to original input ordinals.
+    ///
+    /// # Errors
+    /// Returns a spill I/O error, an invalid row address, or a typed budget
+    /// error when materializing the complete loss report would exceed its limit.
+    pub fn source_losses(&self) -> Result<Vec<SourceLoss>, AccountingError> {
+        let mut losses = self.source_losses_for_plan()?;
+        if let Some(locator) = &*self.input_rows.lock().unwrap_or_else(|e| e.into_inner()) {
+            for loss in &mut losses {
+                if loss.zoom.is_none() {
+                    loss.id = locator.global_row(loss.id as usize).ok_or_else(|| {
+                        std::io::Error::other("source loss is outside the selected input rows")
+                    })?;
+                }
+            }
+        }
+        Ok(losses)
+    }
+    /// Plans address their winner tables in the selected stream, before the
+    /// report restores original file positions. Shard replay rebases once.
+    pub(crate) fn source_losses_for_plan(&self) -> Result<Vec<SourceLoss>, AccountingError> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .losses()
+    }
+    pub(crate) fn set_input_rows(&self, locator: crate::input_set::StreamRowLocator) {
+        *self.input_rows.lock().unwrap_or_else(|e| e.into_inner()) = Some(locator);
+    }
+    pub(crate) fn source_row_ranges(&self) -> Vec<(u64, u64)> {
+        self.input_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.ranges())
+    }
+    pub(crate) fn input_row_count(&self) -> u64 {
+        self.input_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |r| r.len())
+    }
+    pub(crate) fn set_accounting_spill_dir(&self, path: Option<&std::path::Path>) {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_spill_dir(path);
+    }
+    pub(crate) fn set_accounting_budget(&self, bytes: usize) {
+        self.accounting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_budget(bytes);
+    }
+    #[cfg(test)]
+    fn resident_accounting_bytes(&self) -> usize {
+        self.accounting.lock().unwrap().resident_bytes()
     }
 
     /// Aggregate completed child runs without logging their warnings again.
@@ -533,7 +662,7 @@ impl Diagnostics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|e| e.same_kind(kind))
+            .filter(|e| e.same_counter_kind(kind))
             .map(Diagnostic::count)
             .sum()
     }
@@ -654,6 +783,44 @@ impl ExemplarEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_accounting_residency_is_bounded() {
+        let sink = Diagnostics::default();
+        for id in 0..100_000 {
+            sink.source_loss(id, Some(4), SourceLossCause::ClipDropped)
+                .unwrap();
+            sink.source_emitted(id, 4).unwrap();
+        }
+        assert!(sink.resident_accounting_bytes() <= 1 << 20);
+        assert!(sink.source_losses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_loss_reports_return_a_typed_budget_error() {
+        let sink = Diagnostics::default();
+        sink.set_accounting_budget(std::mem::size_of::<SourceLoss>());
+        sink.source_loss(0, None, SourceLossCause::Filtered)
+            .unwrap();
+        sink.source_loss(1, None, SourceLossCause::Filtered)
+            .unwrap();
+        assert!(matches!(
+            sink.source_losses(),
+            Err(AccountingError::BudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn accounting_spills_to_the_requested_volume_and_reports_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Diagnostics::default();
+        sink.set_accounting_spill_dir(Some(dir.path()));
+        std::fs::remove_dir(dir.path()).unwrap();
+        assert!(matches!(
+            sink.source_loss(10_000, None, SourceLossCause::Filtered),
+            Err(AccountingError::Io(_))
+        ));
+    }
 
     #[test]
     fn child_run_aggregation_combines_context_totals() {

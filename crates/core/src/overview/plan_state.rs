@@ -751,6 +751,34 @@ pub(super) fn rebase_plan_for_shard(
             *c = ((*c as f64 * ratio).round() as usize).max(1);
         }
     }
+    // A saved plan stores global scan facts. Without per-row provenance,
+    // projecting those counts onto a shard would invent local warnings.
+    // Preserve them under an explicit whole-plan scope instead.
+    if shard_cursor != plan_cursor && !plan.totals.diagnostics.is_empty() {
+        plan.totals.diagnostics = vec![crate::diagnostics::Diagnostic::SavedPlan {
+            count: 1,
+            diagnostics: std::mem::take(&mut plan.totals.diagnostics),
+        }];
+    }
+    let kinds = plan.kinds.as_ref().ok_or_else(|| {
+        plan_err(
+            path,
+            "shard replay requires the saved per-row geometry kinds; re-create it with --save-plan",
+        )
+    })?;
+    plan.totals.n_points = 0;
+    plan.totals.n_lines = 0;
+    plan.totals.n_polygons = 0;
+    for (&kind, &level) in kinds.iter().zip(&plan.min_levels) {
+        if level == super::stream::UNASSIGNED_LEVEL {
+            continue;
+        }
+        match kind {
+            FeatureKind::Point => plan.totals.n_points += 1,
+            FeatureKind::Line => plan.totals.n_lines += 1,
+            FeatureKind::Polygon => plan.totals.n_polygons += 1,
+        }
+    }
     plan.totals.n_rows = shard_cursor;
     plan.totals.n_features = assigned;
     log::info!(
@@ -1025,7 +1053,7 @@ pub(super) struct ConvertPlan {
     /// Coarsest level per INPUT ROW; the `UNASSIGNED_LEVEL` sentinel for
     /// skipped rows.
     pub min_levels: Vec<u8>,
-    /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
+    /// Per-row geometry kinds for coalescing and exact shard totals.
     pub kinds: Option<Vec<FeatureKind>>,
     /// Per planned level, the tiny-polygon accumulator's carrier rows (#384).
     pub carriers: Vec<Vec<usize>>,
@@ -2433,6 +2461,42 @@ mod tests {
                 "selection {forged:?} must be refused: {err}"
             );
         }
+    }
+
+    #[test]
+    fn shard_diagnostics_keep_global_scope_and_local_kind_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path) = one_part_source(&dir, &[2, 2]);
+        let mut plan = tiny_plan();
+        plan.fingerprint.inputs[0].row_groups = None;
+        plan.coalesce = None;
+        plan.min_levels = vec![0; 4];
+        plan.kinds = Some(vec![
+            FeatureKind::Point,
+            FeatureKind::Point,
+            FeatureKind::Polygon,
+            FeatureKind::Polygon,
+        ]);
+        plan.totals.n_rows = 4;
+        plan.totals.n_features = 4;
+        plan.totals.n_points = 2;
+        plan.totals.n_lines = 0;
+        plan.totals.n_polygons = 2;
+        plan.totals.diagnostics =
+            vec![crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 }];
+        rebase_plan_for_shard(
+            &mut plan,
+            &source,
+            Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            Path::new("test.plan"),
+        )
+        .unwrap();
+        assert_eq!(plan.totals.point_ratio(), 0.0);
+        assert_eq!(plan.totals.n_polygons, 2);
+        assert!(plan.totals.diagnostics.iter().all(|event| !matches!(
+            event,
+            crate::diagnostics::Diagnostic::NonFiniteGeometry { .. }
+        )));
     }
 
     /// A single-part `ConvertSource` over a parquet file whose row groups hold

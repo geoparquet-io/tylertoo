@@ -104,6 +104,7 @@ RemoteFetch.__doc__ = """Network traffic for a remote input."""
 _DiagnosticDetails = TypedDict(  # noqa: UP013 - serialized report fields
     "_DiagnosticDetails",
     {
+        "diagnostics": "list[Diagnostic]",
         "exemplars": "list[OutOfRangeExemplar]",
         "context": "dict[str, Any] | None",
         "repair_kind": "str",
@@ -141,11 +142,12 @@ SourceLoss = TypedDict(  # noqa: UP013 - serialized report fields
     "SourceLoss",
     {
         "id": "int",
+        "feature_id": "int | None",
         "zoom": "int | None",
         "cause": "str",
     },
 )
-SourceLoss.__doc__ = "An absent source row or exported feature ID."
+SourceLoss.__doc__ = "An absent source row, with its optional exported MVT feature ID."
 
 
 OverviewReport = TypedDict(  # noqa: UP013 - keys describe serialized report data
@@ -154,6 +156,7 @@ OverviewReport = TypedDict(  # noqa: UP013 - keys describe serialized report dat
         "diagnostics": "list[Diagnostic]",
         "source_losses": "list[SourceLoss]",
         "input_rows": "int",
+        "source_row_ranges": "list[tuple[int, int]]",
         "mode": "Literal['duplicating', 'partitioning']",
         "levels": "list[LevelReport]",
         "skipped_empty_levels": "list[SkippedLevel]",

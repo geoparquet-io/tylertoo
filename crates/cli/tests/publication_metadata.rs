@@ -300,6 +300,8 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
     let convert_plan = dir.path().join("convert.plan");
     let input = grid();
     let job = |out: &Path, extra: &[&str]| -> String {
+        let report = out.with_extension("json");
+        std::fs::write(&report, "{\"stale\":true}").unwrap();
         let mut argv = vec![
             "tiles",
             s(&input),
@@ -310,6 +312,8 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
             "4",
             // One corner of the world, so most shards own nothing.
             "--bbox=-175,-70,-120,-20",
+            "--report",
+            s(&report),
             "--no-coalesce-lines",
             "--shard-plan",
             s(&plan),
@@ -321,6 +325,15 @@ fn a_sharded_fleet_carries_the_values_through_empty_shards() {
         argv.extend_from_slice(extra);
         let (ok, log) = run(&argv);
         assert!(ok, "{extra:?}: {log}");
+        let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert!(
+            report.get("stale").is_none(),
+            "success must replace a previous report"
+        );
+        if log.contains("owns no input rows") {
+            assert_eq!(report["total_tiles"], 0);
+            assert!(report["diagnostics"].is_array());
+        }
         log
     };
     let coarse = dir.path().join("coarse.pmtiles");

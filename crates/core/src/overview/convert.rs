@@ -1587,6 +1587,9 @@ pub struct ConvertReport {
     pub input_rows: usize,
     /// Exact source losses, disjoint from any source emitted at that zoom.
     pub source_losses: Vec<crate::diagnostics::SourceLoss>,
+    /// Half-open original input row ranges read by this run. Footer-pruned
+    /// groups are outside the accounting domain; exact gates record losses.
+    pub source_row_ranges: Vec<(u64, u64)>,
     /// Aggregated diagnostics for this conversion only.
     pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Level materialization mode used.
@@ -1684,13 +1687,17 @@ pub struct ConvertReport {
 }
 
 impl ConvertReport {
-    pub(crate) fn with_diagnostics(mut self, sink: &crate::diagnostics::Diagnostics) -> Self {
+    pub(crate) fn with_diagnostics(
+        mut self,
+        sink: &crate::diagnostics::Diagnostics,
+    ) -> Result<Self, ConvertError> {
         use crate::diagnostics::Diagnostic;
         if let Some(cap) = self.effective_max_row_group_size {
             sink.once(Diagnostic::RowGroupAutoscaled { count: 1, cap });
         }
         self.diagnostics = sink.snapshot();
-        self.source_losses = sink.source_losses();
+        self.source_losses = sink.source_losses()?;
+        self.source_row_ranges = sink.source_row_ranges();
         self.antimeridian_suspect_features =
             sink.count(&Diagnostic::AntimeridianSuspect { count: 0 });
         self.out_of_range_features = sink.count(&Diagnostic::OutOfRange {
@@ -1707,7 +1714,7 @@ impl ConvertReport {
             context: None,
             count: 0,
         });
-        self
+        Ok(self)
     }
 }
 
@@ -1718,6 +1725,9 @@ impl ConvertReport {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConvertError {
+    /// Source accounting spill or report exceeded its budget.
+    #[error(transparent)]
+    Accounting(#[from] crate::diagnostics::AccountingError),
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -3657,7 +3667,22 @@ pub(crate) fn convert_to_overviews_source_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
-    let diagnostics = &crate::diagnostics::Diagnostics::default();
+    convert_to_overviews_source_diagnostics(
+        source,
+        output_path,
+        options,
+        strategy,
+        &crate::diagnostics::Diagnostics::default(),
+    )
+}
+
+pub(crate) fn convert_to_overviews_source_diagnostics(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
     let adjusted = normalize_convert_options(source, options, diagnostics)?;
     let options = adjusted.as_ref().unwrap_or(options);
@@ -13635,6 +13660,8 @@ mod tests {
         let report_bbox = convert_to_overviews(tin.path(), tout_bbox.path(), &opts_bbox).unwrap();
         // The bbox intersects only one row group, so pruning should fire.
         assert_eq!(report_bbox.row_groups_total, 4);
+        assert_eq!(report_bbox.source_row_ranges, vec![(1, 2)]);
+        assert!(report_bbox.source_losses.is_empty());
         assert_eq!(
             report_bbox.row_groups_read, 1,
             "bbox pruning did not fire: read {} row groups",
@@ -13653,6 +13680,91 @@ mod tests {
             })
             .collect();
         assert_eq!(ids_bbox, ids_posthoc);
+    }
+
+    #[test]
+    fn loss_row_addresses_survive_footer_pruning_and_saved_plan_replay() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_input_with_f64_row_groups(
+            input.path(),
+            &[
+                Some(Geometry::Point(Point::new(1.0, 1.0))),
+                Some(Geometry::Point(Point::new(2.0, 2.0))),
+                None,
+                Some(Geometry::Point(Point::new(3.0, 3.0))),
+            ],
+            "keep",
+            &[0.0, 0.0, 1.0, 1.0],
+            Some(2),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("convert.plan");
+        let options = ConvertOptions {
+            filter: Some("keep > 0".into()),
+            save_plan: Some(plan.clone()),
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        let fresh =
+            convert_to_overviews(input.path(), dir.path().join("fresh.parquet"), &options).unwrap();
+        let replay = convert_to_overviews(
+            input.path(),
+            dir.path().join("replay.parquet"),
+            &ConvertOptions {
+                save_plan: None,
+                plan: Some(plan),
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.input_rows, 2);
+        assert_eq!(fresh.row_groups_read, 1);
+        assert_eq!(fresh.source_row_ranges, vec![(2, 4)]);
+        assert_eq!(fresh.source_losses.len(), 1);
+        assert_eq!(fresh.source_losses[0].id, 2);
+        assert_eq!(fresh.source_losses, replay.source_losses);
+        assert_eq!(fresh.source_row_ranges, replay.source_row_ranges);
+    }
+
+    #[test]
+    fn bbox_rejections_are_accounted_for_in_scanned_domain() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_input(
+            input.path(),
+            &[
+                Some(Geometry::Point(Point::new(0.0, 0.0))),
+                Some(Geometry::Point(Point::new(30.0, 30.0))),
+                Some(Geometry::Point(Point::new(1.0, 1.0))),
+            ],
+            false,
+            None,
+        );
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let report = convert_to_overviews(
+            input.path(),
+            output.path(),
+            &ConvertOptions {
+                bbox: Some([-2.0, -2.0, 2.0, 2.0]),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.input_rows, 3);
+        assert_eq!(report.input_features, 2);
+        assert_eq!(report.source_losses.len(), 1);
+        assert_eq!(report.source_losses[0].id, 1);
+        assert_eq!(
+            report.source_losses[0].cause,
+            crate::diagnostics::SourceLossCause::OutsideBbox
+        );
     }
 
     #[test]
@@ -13678,6 +13790,15 @@ mod tests {
         assert_eq!(
             report.row_groups_read, 4,
             "stats-free should read all row groups"
+        );
+        assert_eq!(report.input_rows, 4);
+        assert_eq!(
+            report
+                .source_losses
+                .iter()
+                .map(|l| l.id)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
         );
         // Exact per-feature filter still applies: only id=1 survives.
         let reader = OverviewReader::open(tout.path()).unwrap();

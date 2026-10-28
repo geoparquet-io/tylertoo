@@ -169,6 +169,7 @@ pub(crate) struct StreamRowLocator {
     /// One entry per selected, non-empty row group, in read order:
     /// `(first stream row, part, first file row within the part)`.
     starts: Vec<(u64, usize, u64)>,
+    part_bases: Vec<u64>,
     /// Rows in the whole stream: one past the last stream row.
     total: u64,
 }
@@ -180,7 +181,10 @@ impl StreamRowLocator {
     pub(crate) fn new(row_counts: &[Vec<i64>], selected: Option<&RowGroupSelection>) -> Self {
         let mut starts = Vec::new();
         let mut stream_row = 0u64;
+        let mut part_bases = Vec::with_capacity(row_counts.len());
+        let mut part_base = 0u64;
         for (part, counts) in row_counts.iter().enumerate() {
+            part_bases.push(part_base);
             // A row group's first file row: the sum of every earlier group's
             // rows, whether selected or not.
             let mut first_rows = Vec::with_capacity(counts.len());
@@ -189,6 +193,7 @@ impl StreamRowLocator {
                 first_rows.push(acc);
                 acc += n.max(0) as u64;
             }
+            part_base += acc;
             let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(part)) {
                 Some(p) => p.clone(),
                 None => (0..counts.len()).collect(),
@@ -207,8 +212,35 @@ impl StreamRowLocator {
         }
         Self {
             starts,
+            part_bases,
             total: stream_row,
         }
+    }
+
+    /// Original row ordinal across all parts, including pruned groups.
+    pub(crate) fn global_row(&self, stream_row: usize) -> Option<u64> {
+        let (part, row) = self.locate(stream_row)?;
+        Some(self.part_bases[part] + row as u64)
+    }
+
+    /// Half-open original row ranges constituting the selected read stream.
+    pub(crate) fn ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (i, &(stream, part, first)) in self.starts.iter().enumerate() {
+            let end = self.starts.get(i + 1).map_or(self.total, |r| r.0);
+            let first = self.part_bases[part] + first;
+            let end = first + end - stream;
+            if let Some(previous) = ranges.last_mut().filter(|r| r.1 == first) {
+                previous.1 = end;
+            } else {
+                ranges.push((first, end));
+            }
+        }
+        ranges
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.total
     }
 
     /// `(part, row within the part's file)` for stream position

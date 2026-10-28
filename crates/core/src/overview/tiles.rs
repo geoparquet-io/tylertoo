@@ -513,8 +513,20 @@ impl TilesReport {
 ///
 /// Both are legal outcomes of a legal cut, not failures — a fleet with red
 /// squares that mean "correct" would need hand-editing at merge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EmptyArchive {
+    /// Output counts are present on empty outcomes too.
+    pub total_tiles: usize,
+    /// Output feature count.
+    pub total_tile_features: usize,
+    /// Rows in this run's selected input stream.
+    pub input_rows: u64,
+    /// Half-open original input row ranges in this run's accounting domain.
+    pub source_row_ranges: Vec<(u64, u64)>,
+    /// Diagnostics from this conversion, including when pass 2 emptied it.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// Losses before the empty outcome, in original input row coordinates.
+    pub source_losses: Vec<crate::diagnostics::SourceLoss>,
     /// Which job of the fleet this was.
     pub role: ShardRole,
     /// The fleet's pivot zoom.
@@ -821,7 +833,15 @@ fn convert_to_pmtiles_validated(
         log::warn!("{msg}");
     }
 
-    let convert_report = match input.convert(&overview_path, &convert_options) {
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let source = input.source().map_err(TilesError::Convert)?;
+    let convert_report = match super::convert::convert_to_overviews_source_diagnostics(
+        &source,
+        &overview_path,
+        &convert_options,
+        super::stream::Pass2Strategy::Pipelined,
+        &diagnostics,
+    ) {
         Ok(report) => report,
         Err(e) => {
             // #498: a shard whose range owns no input rows is a legal
@@ -851,6 +871,15 @@ fn convert_to_pmtiles_validated(
                         job.role
                     );
                     return Ok(TilesOutcome::EmptyShard(EmptyArchive {
+                        total_tiles: 0,
+                        total_tile_features: 0,
+                        input_rows: diagnostics.input_row_count(),
+                        source_row_ranges: diagnostics.source_row_ranges(),
+                        diagnostics: diagnostics.snapshot(),
+                        source_losses: diagnostics
+                            .source_losses()
+                            .map_err(ConvertError::from)
+                            .map_err(TilesError::Convert)?,
                         role: job.role,
                         pivot_zoom: job.pivot_zoom,
                         min_zoom: range.pivot_zoom(),
@@ -878,6 +907,15 @@ fn convert_to_pmtiles_validated(
                         job.role
                     );
                     return Ok(TilesOutcome::EmptyCoarse(EmptyArchive {
+                        total_tiles: 0,
+                        total_tile_features: 0,
+                        input_rows: diagnostics.input_row_count(),
+                        source_row_ranges: diagnostics.source_row_ranges(),
+                        diagnostics: diagnostics.snapshot(),
+                        source_losses: diagnostics
+                            .source_losses()
+                            .map_err(ConvertError::from)
+                            .map_err(TilesError::Convert)?,
                         role: job.role,
                         pivot_zoom: job.pivot_zoom,
                         min_zoom,
@@ -1256,6 +1294,10 @@ mod tests {
         assert_eq!(empty.min_zoom, 4, "declares the pivot, not the plan's min");
         assert_eq!(empty.max_zoom, 6, "declares the zoom plan's maximum");
         assert!(!empty.why.is_empty(), "carries the convert's own words");
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["total_tiles"], 0);
+        assert!(json["diagnostics"].is_array());
+        assert!(json["source_losses"].is_array());
 
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
@@ -1315,6 +1357,11 @@ mod tests {
             panic!("expected an empty coarse job, got {outcome:?}");
         };
         assert_eq!(empty.role, ShardRole::Coarse);
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["total_tiles"], 0);
+        assert!(json["diagnostics"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
         assert_eq!(empty.pivot_zoom, 3);
         assert_eq!(empty.min_zoom, 0, "declares the zoom plan's minimum");
         assert_eq!(empty.max_zoom, 2, "declares up to just below the pivot");
@@ -1322,6 +1369,65 @@ mod tests {
         let bytes = std::fs::read(&output).unwrap();
         assert_eq!(&bytes[..8], b"PMTiles\x03", "a valid, readable archive");
         assert_grid_metadata(&output);
+    }
+
+    #[test]
+    fn coarse_job_emptied_during_pass2_retains_diagnostics_and_cleans_intermediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let square = |x: f64, y: f64| {
+            geo::Rect::new(
+                geo::Coord { x, y },
+                geo::Coord {
+                    x: x + 0.0001,
+                    y: y + 0.0001,
+                },
+            )
+            .to_polygon()
+        };
+        write_input(
+            &input,
+            &[
+                Some(Geometry::MultiPolygon(geo::MultiPolygon(vec![
+                    square(-80.0, 10.0),
+                    square(80.0, 30.0),
+                ]))),
+                Some(Geometry::Point(Point::new(f64::NAN, 0.0))),
+            ],
+            false,
+            None,
+        );
+        let output = dir.path().join("out.pmtiles");
+        let outcome = convert_to_pmtiles(
+            &TilesInput::Path(input),
+            &output,
+            &TilesOptions {
+                shard: Some(TilesShard {
+                    role: ShardRole::Coarse,
+                    range: None,
+                    pivot_zoom: 3,
+                    cut_digest: "0123456789abcdef".into(),
+                }),
+                ..zoomed_options(0, 3)
+            },
+        )
+        .unwrap();
+        let TilesOutcome::EmptyCoarse(report) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(report.total_tiles, 0);
+        assert_eq!(report.input_rows, 2);
+        assert!(report.diagnostics.iter().any(|event| matches!(
+            event,
+            crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 }
+        )));
+        assert_eq!(report.source_losses.len(), 1);
+        assert_eq!(report.source_losses[0].id, 1);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tylertoo-overview-")));
     }
 
     /// #439/#498: the facade applies the shard's convert-side consequences

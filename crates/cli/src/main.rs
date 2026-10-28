@@ -1075,6 +1075,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
             // legal outcomes — core wrote the valid tile-less archive; this
             // only reports it.
             TilesOutcome::EmptyShard(info) => {
+                if let Some(report_path) = &args.report {
+                    write_report(report_path, &info)?;
+                }
                 say!(
                     "✓ shard {} owns no input rows; wrote an empty archive at {}",
                     info.role,
@@ -1089,6 +1092,9 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
                 return Ok(());
             }
             TilesOutcome::EmptyCoarse(info) => {
+                if let Some(report_path) = &args.report {
+                    write_report(report_path, &info)?;
+                }
                 say!(
                     "✓ coarse job has no features at z{}..z{}; wrote an empty archive at {}",
                     info.min_zoom,
@@ -1174,13 +1180,17 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // two-step chain would write (`overview --report` + `export-pmtiles
     // --report`). Core owns its shape ({"convert", "export"}).
     if let Some(report_path) = &args.report {
-        let json =
-            serde_json::to_string_pretty(&*report).context("failed to serialize tiles report")?;
-        std::fs::write(report_path, json)
-            .with_context(|| format!("failed to write report to {}", report_path.display()))?;
-        say!("  report written to {}", report_path.display());
+        write_report(report_path, &*report)?;
     }
 
+    Ok(())
+}
+
+fn write_report(path: &Path, report: &impl serde::Serialize) -> Result<()> {
+    let json = serde_json::to_string_pretty(report).context("failed to serialize tiles report")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write report to {}", path.display()))?;
+    say!("  report written to {}", path.display());
     Ok(())
 }
 

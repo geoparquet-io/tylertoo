@@ -1986,13 +1986,14 @@ fn resolve_winner_tables(
     // the whole buffer survived to be measured here.
     let (tally_lines, tally_bytes) = line_tally;
     let coalesce_on = coalesce_effective(options, tally_lines, tally_bytes, diagnostics);
-    let kinds: Option<Vec<FeatureKind>> = options.coalesce_lines.then(|| {
-        let mut k = vec![FeatureKind::Point; num_rows];
-        for (pos, &row) in features.indices().iter().enumerate() {
-            k[row] = features.kind(pos);
-        }
-        k
-    });
+    let kinds: Option<Vec<FeatureKind>> = (options.coalesce_lines || options.save_plan.is_some())
+        .then(|| {
+            let mut k = vec![FeatureKind::Point; num_rows];
+            for (pos, &row) in features.indices().iter().enumerate() {
+                k[row] = features.kind(pos);
+            }
+            k
+        });
     let coalesce_scratch = coalesce_scratch.filter(|_| coalesce_on);
 
     let num_levels = level_gsds.len();
@@ -2128,6 +2129,13 @@ fn preflight_with_memory_limit(
     skip_memory_preflight: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
+    diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
+    diagnostics.set_accounting_budget(
+        MemoryBudget {
+            limit: memory_limit,
+        }
+        .accounting_allowance(),
+    );
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
     // cached across the passes below. For a multi-partition source the
@@ -2186,6 +2194,7 @@ fn preflight_with_memory_limit(
         options.shard.as_ref(),
         crs,
     )?;
+    diagnostics.set_input_rows(source.stream_row_locator(selected_row_groups.as_ref())?);
     let row_groups_read = selected_row_groups
         .as_ref()
         .map_or(row_groups_total, RowGroupSelection::total_selected);
@@ -2698,7 +2707,7 @@ fn run_pass1_and_assign(
             n_polygons,
             geom_bytes,
             diagnostics: diagnostics.snapshot_for_plan(),
-            source_losses: diagnostics.source_losses(),
+            source_losses: diagnostics.source_losses_for_plan()?,
         };
         let plan = ConvertPlan::from_winner_tables(
             &tables,
@@ -2777,6 +2786,11 @@ fn load_plan_state(
             plan.totals.n_rows,
         )));
     }
+    let source_losses_valid = plan
+        .totals
+        .source_losses
+        .iter()
+        .all(|loss| loss.id < plan.totals.n_rows as u64 && loss.zoom.is_none());
     // #511/#512: the winner table is addressed by row position, so the plan's
     // row domain must equal what THIS run will actually stream. The per-part
     // footer row counts are already compared field by field above; this
@@ -2819,9 +2833,6 @@ fn load_plan_state(
     for event in &totals.diagnostics {
         diagnostics.once(event.clone());
     }
-    for loss in &totals.source_losses {
-        diagnostics.source_loss(loss.id, loss.zoom, loss.cause);
-    }
     let will_stream = source.selected_row_count(selected_row_groups)?;
     if will_stream != plan.min_levels.len() as i64 {
         return Err(ConvertError::InvalidConfig(format!(
@@ -2831,6 +2842,15 @@ fn load_plan_state(
             path.display(),
             plan.min_levels.len(),
         )));
+    }
+    if !source_losses_valid {
+        return Err(ConvertError::InvalidConfig(format!(
+            "--plan: {} has a source loss outside its input row domain",
+            path.display()
+        )));
+    }
+    for loss in &totals.source_losses {
+        diagnostics.source_loss(loss.id, loss.zoom, loss.cause)?;
     }
     // #512: bound the cluster aggregate arity by this run's accumulate specs,
     // rather than trusting the stride the plan's JSON block declares.
@@ -2976,6 +2996,9 @@ pub(crate) fn run_stages(
         plan,
         memory,
     } = run_front_half(source, options, true, &mut rss, diagnostics)?;
+    // All convert losses are known before pass 2; refuse an unaffordable
+    // report before publishing the overview or spending time building it.
+    diagnostics.source_losses()?;
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     let Preflight {
         descriptor,
@@ -3209,7 +3232,7 @@ pub(crate) fn run_stages(
         diagnostics,
     );
 
-    Ok(build_report(ConvertReportInputs {
+    build_report(ConvertReportInputs {
         options,
         source,
         level_reports,
@@ -3226,7 +3249,7 @@ pub(crate) fn run_stages(
         effective_max_row_group_size,
         crs_assumed_wgs84,
     })
-    .with_diagnostics(diagnostics))
+    .with_diagnostics(diagnostics)
 }
 
 /// [`run_stages`]'s locals the final [`ConvertReport`]
@@ -3255,6 +3278,7 @@ fn build_report(inputs: ConvertReportInputs<'_>) -> ConvertReport {
     ConvertReport {
         diagnostics: Vec::new(),
         source_losses: Vec::new(),
+        source_row_ranges: Vec::new(),
         mode: inputs.options.mode,
         levels: inputs.level_reports,
         skipped_empty_levels: inputs.skipped,
@@ -4596,6 +4620,9 @@ struct ChunkScan {
 ///
 /// Diagnostics only — see [`scan_chunk`]'s `diag_row_base`.
 fn decode_error_at_rows(diag_row_base: usize, chunk_len: usize, e: crate::Error) -> crate::Error {
+    if matches!(&e, crate::Error::Accounting(_)) {
+        return e;
+    }
     let inner = match &e {
         crate::Error::GeoParquetRead(msg) => msg.clone(),
         other => other.to_string(),
@@ -4657,7 +4684,7 @@ impl GeoArrowVisitor for ScanRows<'_> {
                     (self.row_base + i) as u64,
                     None,
                     crate::diagnostics::SourceLossCause::Filtered,
-                );
+                )?;
                 out.push(None);
                 continue;
             }
@@ -4666,7 +4693,7 @@ impl GeoArrowVisitor for ScanRows<'_> {
                     (self.row_base + i) as u64,
                     None,
                     crate::diagnostics::SourceLossCause::MissingGeometry,
-                );
+                )?;
                 out.push(None);
                 continue;
             };
@@ -4684,7 +4711,7 @@ impl GeoArrowVisitor for ScanRows<'_> {
                     crate::diagnostics::SourceLossCause::MissingGeometry
                 };
                 self.diagnostics
-                    .source_loss((self.row_base + i) as u64, None, cause);
+                    .source_loss((self.row_base + i) as u64, None, cause)?;
                 out.push(None);
                 continue;
             };
@@ -4713,12 +4740,10 @@ impl GeoArrowVisitor for ScanRows<'_> {
 /// unchanged in logic, just scoped to `[0, gcol.len())` instead of a whole
 /// batch so it can run as one rayon task among several.
 ///
-/// `diag_row_base` is the chunk's global first-row index and is **DIAGNOSTICS
-/// ONLY**: it is read exactly once, by [`decode_error_at_rows`], to name the
-/// row range in a decode failure. It must never enter index arithmetic —
-/// every index this function produces stays chunk-local and is rebased by the
-/// consumer ([`merge_pass1_chunks`]), which is what makes double-rebasing
-/// structurally impossible (see [`ChunkScan`]).
+/// `diag_row_base` supplies diagnostic row addresses: decode failures and
+/// source losses. Feature-table indices stay chunk-local and are rebased by
+/// the consumer ([`merge_pass1_chunks`]); they never use this diagnostic base
+/// (see [`ChunkScan`]).
 fn scan_chunk(
     ctx: &Pass1Ctx<'_>,
     geom_field: &Field,
@@ -4802,6 +4827,11 @@ fn scan_chunk(
         // still advances (row-keyed tables stay aligned).
         if let Some(q) = bbox_query {
             if !q.intersects(&fbbox) {
+                diagnostics.source_loss(
+                    (diag_row_base + i) as u64,
+                    None,
+                    crate::diagnostics::SourceLossCause::OutsideBbox,
+                )?;
                 continue;
             }
         }

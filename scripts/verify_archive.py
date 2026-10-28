@@ -510,7 +510,7 @@ class Outcome:
         return "*" if self.zoom is None else f"z{self.zoom}"
 
 
-def input_columns(input_path: Path, feature_id: str | None) -> tuple[int, list[str]]:
+def input_columns(input_path: Path, feature_id: str | None) -> tuple[int, list[str], list[int] | None]:
     """Rows and property columns of the source parquet: every top-level
     column except the geometry (the `geo` primary column, or the native
     GEOMETRY/GEOGRAPHY one), its bbox covering column and the feature-id
@@ -557,7 +557,8 @@ def input_columns(input_path: Path, feature_id: str | None) -> tuple[int, list[s
     if feature_id:
         skip.add(feature_id)
     cols = [f.name for f in schema if f.name not in skip]
-    return pf.metadata.num_rows, cols
+    source_ids = pf.read(columns=[feature_id]).column(0).to_pylist() if feature_id else None
+    return pf.metadata.num_rows, cols, source_ids
 
 
 def add_feature_ids(src: Path, dst: Path, column: str) -> int:
@@ -595,7 +596,7 @@ def evaluate(
     caps: tuple[int, int],
     ids: bool,
     expect_decay: bool,
-    input_info: tuple[int, list[str]] | None,
+    input_info: tuple[int, list[str]] | tuple[int, list[str], list[int] | None] | None,
 ) -> list[Outcome]:
     """Turn the scan into per-invariant outcomes."""
     raw_cap, compressed_cap = caps
@@ -645,23 +646,41 @@ def evaluate(
         # final per-source losses can partition the input; pair counters do
         # not participate in conservation.
         losses = [
-            loss for section in (conv, exp)
+            (section_name, loss) for section_name, section in (("convert", conv), ("export", exp))
             for loss in section.get("source_losses", [])
             if loss.get("zoom") in (None, finest)
         ]
-        lost_ids = [loss["id"] for loss in losses]
+        source_ids = input_info[2] if input_info is not None and len(input_info) > 2 else None
+        def input_id(row):
+            if source_ids is None:
+                return row
+            return source_ids[row] if 0 <= row < len(source_ids) else ("invalid input row", row)
+        lost_ids = [
+            input_id(loss["id"]) if section == "convert" else loss.get("feature_id", loss["id"])
+            for section, loss in losses
+        ]
         lost = set(lost_ids)
         seen = scans[finest].ids
         if n_in is None:
             out.append(Outcome("feature_accounting", None, False, "no input count"))
         else:
-            expected = set(range(n_in))
+            # The report partitions the selected read stream. Footer-pruned
+            # groups are outside that domain, and original row addresses
+            # remain stable when an earlier group is pruned.
+            ranges = conv.get("source_row_ranges", [[0, n_in]])
+            rows = [row for start, end in ranges for row in range(start, end)]
+            expected = {input_id(row) for row in rows}
+            ambiguous = len(expected) != len(rows)
+            invalid_domain = any(row < 0 or (input_info is not None and row >= n_in) for row in rows) or len(set(rows)) != len(rows)
+            if "source_row_ranges" in conv:
+                invalid_domain |= len(rows) != conv.get("input_rows")
+                n_in, src = len(rows), "selected input rows"
             missing = expected - seen - lost
             overlap = seen & lost
             foreign = (seen | lost) - expected
             duplicates = len(lost_ids) - len(lost)
             causes: dict[str, int] = defaultdict(int)
-            for loss in losses:
+            for _, loss in losses:
                 causes[loss["cause"]] += 1
             named = ", ".join(f"{k}={v}" for k, v in sorted(causes.items()))
             detail = (
@@ -669,14 +688,18 @@ def evaluate(
                 f"({named or 'no source loss'})"
             )
             if missing:
-                detail += f"; {len(missing)} unexplained source ids: {sorted(missing)[:5]}"
+                detail += f"; {len(missing)} unexplained source ids: {sorted(missing, key=repr)[:5]}"
             if overlap:
-                detail += f"; {len(overlap)} source ids both written and lost: {sorted(overlap)[:5]}"
+                detail += f"; {len(overlap)} source ids both written and lost: {sorted(overlap, key=repr)[:5]}"
             if foreign:
-                detail += f"; {len(foreign)} source ids outside the input: {sorted(foreign)[:5]}"
+                detail += f"; {len(foreign)} source ids outside the input: {sorted(foreign, key=repr)[:5]}"
             if duplicates:
                 detail += f"; {duplicates} duplicate source losses"
-            ok = not (missing or overlap or foreign or duplicates)
+            if ambiguous:
+                detail += "; feature IDs are not source-unique; exact accounting requires unique IDs"
+            if invalid_domain:
+                detail += "; inconsistent source row domain"
+            ok = not (missing or overlap or foreign or duplicates or ambiguous or invalid_domain)
             out.append(Outcome("feature_accounting", None, ok, detail))
 
         # (d) monotone: distinct features never rise toward coarser zooms.
@@ -855,7 +878,7 @@ def verify_strict(path: Path, args) -> tuple[list[Outcome], list[str]]:
         raise VerifyError(f"{args.report}: expected a `tiles --report` JSON")
     input_info = input_columns(args.input, args.feature_id) if args.input else None
     if input_info is not None and args.input_features is not None:
-        input_info = (args.input_features, input_info[1])
+        input_info = (args.input_features, *input_info[1:])
     outcomes = evaluate(
         scans,
         meta,

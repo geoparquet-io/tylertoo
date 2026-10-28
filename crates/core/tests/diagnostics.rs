@@ -60,15 +60,86 @@ fn out_of_range_display_preserves_excess_and_source_identity() {
 fn tile_losses_are_disjoint_and_cancelled_by_any_surviving_member() {
     use tylertoo_core::diagnostics::SourceLossCause;
     let sink = Diagnostics::default();
-    sink.source_loss(3, Some(4), SourceLossCause::EncodeDropped);
-    sink.source_loss(3, Some(4), SourceLossCause::EncodeDropped);
-    sink.source_loss(9, Some(4), SourceLossCause::ValveDropped);
-    sink.source_emitted(3, 4);
-    let losses = sink.source_losses();
+    sink.source_loss(3, Some(4), SourceLossCause::EncodeDropped)
+        .unwrap();
+    sink.source_loss(3, Some(4), SourceLossCause::EncodeDropped)
+        .unwrap();
+    sink.source_loss(9, Some(4), SourceLossCause::ValveDropped)
+        .unwrap();
+    sink.source_emitted(3, 4).unwrap();
+    let losses = sink.source_losses().unwrap();
     assert_eq!(losses.len(), 1);
     assert_eq!(losses[0].id, 9);
     assert_eq!(losses[0].cause, SourceLossCause::ValveDropped);
-    sink.source_emitted(9, 4);
-    sink.source_loss(9, Some(4), SourceLossCause::EncodeDropped);
-    assert!(sink.source_losses().is_empty());
+    sink.source_emitted(9, 4).unwrap();
+    sink.source_loss(9, Some(4), SourceLossCause::EncodeDropped)
+        .unwrap();
+    assert!(sink.source_losses().unwrap().is_empty());
+}
+
+#[test]
+fn child_contexts_are_preserved_independently_of_arrival_order() {
+    let events = vec![
+        Diagnostic::RowGroupAutoscaled {
+            count: 1,
+            cap: 1000,
+        },
+        Diagnostic::RowGroupAutoscaled {
+            count: 1,
+            cap: 4000,
+        },
+        Diagnostic::CrsAssumed {
+            count: 1,
+            input: "a.parquet".into(),
+        },
+        Diagnostic::CrsAssumed {
+            count: 1,
+            input: "b.parquet".into(),
+        },
+        Diagnostic::EmptyLevels {
+            count: 1,
+            levels: vec![0],
+            gsd_min: 1.0,
+            gsd_max: 2.0,
+            input_features: 10,
+            first_written_gsd: 0.5,
+            first_written_zoom: Some(5),
+        },
+        Diagnostic::EmptyLevels {
+            count: 1,
+            levels: vec![1],
+            gsd_min: 1.0,
+            gsd_max: 2.0,
+            input_features: 10,
+            first_written_gsd: 0.5,
+            first_written_zoom: Some(5),
+        },
+    ];
+    let forward = Diagnostics::default();
+    forward.extend(events.clone());
+    let reverse = Diagnostics::default();
+    reverse.extend(events.iter().rev().cloned());
+    assert_eq!(forward.snapshot(), reverse.snapshot());
+    assert_eq!(forward.snapshot().len(), events.len());
+}
+
+#[test]
+fn counter_queries_preserve_diagnostic_subtypes() {
+    use tylertoo_core::diagnostics::PolygonRepairKind;
+    let sink = Diagnostics::default();
+    sink.record(Diagnostic::PolygonRepaired {
+        count: 2,
+        kind: PolygonRepairKind::CollapsedRing,
+    });
+    sink.record(Diagnostic::PolygonRepaired {
+        count: 3,
+        kind: PolygonRepairKind::PartsOverlap,
+    });
+    assert_eq!(
+        sink.count(&Diagnostic::PolygonRepaired {
+            count: 0,
+            kind: PolygonRepairKind::CollapsedRing
+        }),
+        2
+    );
 }

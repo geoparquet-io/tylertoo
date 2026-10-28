@@ -93,6 +93,9 @@ pub use quality::{extract_crs, validate_wgs84, CrsInfo};
 /// Errors that can occur while reading GeoParquet or writing PMTiles.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Source loss accounting failed.
+    #[error(transparent)]
+    Accounting(#[from] crate::diagnostics::AccountingError),
     #[error("Failed to read GeoParquet file: {0}")]
     GeoParquetRead(String),
 

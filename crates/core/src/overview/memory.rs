@@ -53,6 +53,11 @@ impl MemoryBudget {
     pub(super) fn available(self) -> Option<u64> {
         self.limit.map(|l| l.bytes)
     }
+    /// Report materialization is bounded separately from the spilled row ledger.
+    pub(super) fn accounting_allowance(self) -> usize {
+        let cap = crate::diagnostics::MAX_LOSS_REPORT_BYTES as u64;
+        self.available().map_or(cap, |b| (b / 10).min(cap)) as usize
+    }
     pub(super) fn allowance(self, profile: MemoryProfile) -> u64 {
         match profile {
             MemoryProfile::Speed => u64::MAX,
