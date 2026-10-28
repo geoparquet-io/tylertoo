@@ -390,24 +390,31 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
 /// take the fully-inside fast path and never reach the `i_overlay` guard
 /// (#707). The callers refuse a non-finite polygon, counted, instead.
 fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<(Rect<f64>, bool)> {
-    let mut coords = poly
-        .exterior()
-        .0
-        .iter()
-        .chain(poly.interiors().iter().flat_map(|ring| ring.0.iter()));
-    let first = coords.next()?;
+    let rings = std::iter::once(poly.exterior()).chain(poly.interiors());
+    let first = rings.clone().find_map(|ring| ring.0.first())?;
     let (mut min, mut max) = (*first, *first);
-    let mut finite = first.x.is_finite() && first.y.is_finite();
-    for c in coords {
-        finite &= c.x.is_finite() && c.y.is_finite();
-        min = Coord {
-            x: min.x.min(c.x),
-            y: min.y.min(c.y),
-        };
-        max = Coord {
-            x: max.x.max(c.x),
-            y: max.y.max(c.y),
-        };
+    let mut finite = true;
+    // Keep the hot loop on a coordinate slice rather than advancing a
+    // flattened ring iterator per vertex. Finiteness and bounds share this
+    // pass, including singleton rings and holes outside their exterior.
+    for ring in rings {
+        for c in &ring.0 {
+            finite &= c.x.is_finite() & c.y.is_finite();
+            // Only finite bounds are used by callers. Ordered comparisons
+            // avoid NaN-aware min/max work for each accepted coordinate.
+            if c.x < min.x {
+                min.x = c.x;
+            }
+            if c.y < min.y {
+                min.y = c.y;
+            }
+            if c.x > max.x {
+                max.x = c.x;
+            }
+            if c.y > max.y {
+                max.y = c.y;
+            }
+        }
     }
     Some((Rect::new(min, max), finite))
 }
