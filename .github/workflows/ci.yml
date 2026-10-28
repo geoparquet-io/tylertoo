@@ -276,7 +276,7 @@ jobs:
         run: npx --yes jscpd@4.0.5 --config .jscpd.json
 
       - name: Check for duplicated Rust functions (similarity-rs)
-        run: similarity-rs --threshold 0.94 --min-lines 10 --skip-test --fail-on-duplicates crates/io/src crates/core/src crates/cli/src crates/python/src
+        run: similarity-rs --threshold 0.938 --min-lines 10 --skip-test --fail-on-duplicates crates/io/src crates/core/src crates/cli/src crates/python/src
 
       - name: Run unit tests
         run: cargo test --locked --lib --all-features

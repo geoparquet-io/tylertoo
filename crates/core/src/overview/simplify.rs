@@ -610,7 +610,7 @@ pub fn simplify_step(
     repr: Representation,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_step_checked(geom, gsd_meters, None, crs, opts, repr, diagnostics, geom).0
+    simplify_step_at(geom, gsd_meters, None, crs, opts, repr, diagnostics)
 }
 
 /// [`simplify_step`] for a level whose recorded zoom is known: the engines'

@@ -334,20 +334,23 @@ impl InputSource {
     pub fn open(&self) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
-                let file = File::open(p).map_err(|error| InputError::Open {
+                tylertoo_io::open_parquet(self.open_local(p)?).map_err(|error| InputError::Footer {
                     input: self.display_name(),
                     error,
-                })?;
-                tylertoo_io::open_parquet(InputReader::Local(file)).map_err(|error| {
-                    InputError::Footer {
-                        input: self.display_name(),
-                        error,
-                    }
                 })
             }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
         }
+    }
+
+    fn open_local(&self, path: &Path) -> Result<InputReader, InputError> {
+        File::open(path)
+            .map(InputReader::Local)
+            .map_err(|error| InputError::Open {
+                input: self.display_name(),
+                error,
+            })
     }
 
     /// Open a parquet reader builder over this input using ALREADY-PARSED
@@ -369,16 +372,10 @@ impl InputSource {
         meta: &ReaderMetadata,
     ) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
-            InputSource::Local(p) => {
-                let file = File::open(p).map_err(|error| InputError::Open {
-                    input: self.display_name(),
-                    error,
-                })?;
-                Ok(tylertoo_io::open_parquet_with_metadata(
-                    InputReader::Local(file),
-                    meta.clone(),
-                ))
-            }
+            InputSource::Local(p) => Ok(tylertoo_io::open_parquet_with_metadata(
+                self.open_local(p)?,
+                meta.clone(),
+            )),
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
         }
@@ -466,21 +463,21 @@ pub fn selected_compressed_bytes(
     metadata: &tylertoo_io::ParquetMetaData,
     selected_row_groups: Option<&[usize]>,
 ) -> u64 {
-    let group_bytes = |i: usize| -> u64 {
-        metadata
-            .row_groups()
-            .get(i)
-            .map_or(0, row_group_compressed_bytes)
-    };
-    match selected_row_groups {
-        None => (0..metadata.num_row_groups())
-            .map(group_bytes)
-            .fold(0, u64::saturating_add),
-        Some(selected) => selected
-            .iter()
-            .map(|&i| group_bytes(i))
-            .fold(0, u64::saturating_add),
-    }
+    selected_groups(metadata, selected_row_groups)
+        .map(row_group_compressed_bytes)
+        .fold(0, u64::saturating_add)
+}
+
+/// Iterate a footer selection in its supplied order, ignoring invalid indices.
+/// With no selection, visit every row group. Counts and byte estimates share
+/// these semantics for both single-file and multipart inputs.
+pub(crate) fn selected_groups<'a>(
+    metadata: &'a tylertoo_io::ParquetMetaData,
+    selected: Option<&'a [usize]>,
+) -> impl Iterator<Item = &'a tylertoo_io::RowGroupMetaData> {
+    let groups = metadata.row_groups();
+    let len = selected.map_or(groups.len(), <[usize]>::len);
+    (0..len).filter_map(move |i| groups.get(selected.map_or(i, |picked| picked[i])))
 }
 
 /// A row group's compressed bytes as its footer declares them, saturating.
@@ -2550,6 +2547,7 @@ pub(crate) mod remote {
         }
 
         /// `groups` row groups of `rows` rows each.
+        #[cfg(test)]
         fn multi_rg_parquet(rows: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch};
             use std::sync::Arc;
@@ -3669,6 +3667,7 @@ mod tests {
         /// groups, so a full read walks several oversized row groups in
         /// sequence — exercising cross-row-group eviction (the cache must drop
         /// the previous group's chunks, not accumulate them).
+        #[cfg(test)]
         fn multi_row_group_wide_parquet(rows_per_group: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch, StringArray};
             use std::sync::Arc as SArc;

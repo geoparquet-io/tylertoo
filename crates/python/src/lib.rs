@@ -211,25 +211,29 @@ fn check_keywords(
 }
 
 fn overview_config(
-    mut values: serde_json::Map<String, serde_json::Value>,
+    values: serde_json::Map<String, serde_json::Value>,
 ) -> PyResult<(MaxZoom, ConvertOptions)> {
-    check_keywords("overview", &values)?;
-    let max_zoom = config_keywords::max_zoom(&mut values, "overview").map_err(config_err)?;
-    Ok((
-        max_zoom,
-        config_keywords::convert(values, ConvertOptions::default()).map_err(convert_error_to_py)?,
-    ))
+    config_with_max_zoom("overview", values, |values| {
+        config_keywords::convert(values, ConvertOptions::default()).map_err(convert_error_to_py)
+    })
 }
 
 fn tiles_config(
-    mut values: serde_json::Map<String, serde_json::Value>,
+    values: serde_json::Map<String, serde_json::Value>,
 ) -> PyResult<(MaxZoom, TilesOptions)> {
-    check_keywords("convert", &values)?;
-    let max_zoom = config_keywords::max_zoom(&mut values, "convert").map_err(config_err)?;
-    Ok((
-        max_zoom,
-        config_keywords::tiles(values).map_err(tiles_error_to_py)?,
-    ))
+    config_with_max_zoom("convert", values, |values| {
+        config_keywords::tiles(values).map_err(tiles_error_to_py)
+    })
+}
+
+fn config_with_max_zoom<T>(
+    command: &str,
+    mut values: serde_json::Map<String, serde_json::Value>,
+    parse: impl FnOnce(serde_json::Map<String, serde_json::Value>) -> PyResult<T>,
+) -> PyResult<(MaxZoom, T)> {
+    check_keywords(command, &values)?;
+    let max_zoom = config_keywords::max_zoom(&mut values, command).map_err(config_err)?;
+    Ok((max_zoom, parse(values)?))
 }
 
 fn export_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult<ExportOptions> {

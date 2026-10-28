@@ -2079,14 +2079,17 @@ mod tests {
         assert!(err.to_string().contains("OUTPUT"), "names OUTPUT: {err}");
     }
 
+    fn parse_command(base: &[&str], flags: &[&str]) -> Command {
+        let mut argv = base.to_vec();
+        argv.extend_from_slice(flags);
+        Cli::try_parse_from(argv)
+            .expect("command args should parse")
+            .command
+    }
+
     /// Parse a `tiles` invocation and return its args (INPUT/OUTPUT are dummies).
     fn parse_tiles(flags: &[&str]) -> TilesArgs {
-        let mut argv = vec!["tylertoo", "tiles", "in.parquet", "out.pmtiles"];
-        argv.extend_from_slice(flags);
-        match Cli::try_parse_from(argv)
-            .expect("tiles args should parse")
-            .command
-        {
+        match parse_command(&["tylertoo", "tiles", "in.parquet", "out.pmtiles"], flags) {
             Command::Tiles(a) => *a,
             other => panic!("expected tiles subcommand, got {other:?}"),
         }
@@ -2210,30 +2213,26 @@ mod tests {
     }
 
     fn parse_export(flags: &[&str]) -> ExportPmtilesArgs {
-        let mut argv = vec!["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"];
-        argv.extend_from_slice(flags);
-        match Cli::try_parse_from(argv)
-            .expect("export-pmtiles args should parse")
-            .command
-        {
+        match parse_command(
+            &["tylertoo", "export-pmtiles", "in.parquet", "out.pmtiles"],
+            flags,
+        ) {
             Command::ExportPmtiles(a) => *a,
             other => panic!("expected export-pmtiles subcommand, got {other:?}"),
         }
     }
 
     fn parse_pyramid(flags: &[&str]) -> PyramidArgs {
-        let mut argv = vec![
-            "tylertoo",
-            "pyramid",
-            "out.pmtiles",
-            "--band",
-            "0-5:coarse.parquet",
-        ];
-        argv.extend_from_slice(flags);
-        match Cli::try_parse_from(argv)
-            .expect("pyramid args should parse")
-            .command
-        {
+        match parse_command(
+            &[
+                "tylertoo",
+                "pyramid",
+                "out.pmtiles",
+                "--band",
+                "0-5:coarse.parquet",
+            ],
+            flags,
+        ) {
             Command::Pyramid(a) => *a,
             other => panic!("expected pyramid subcommand, got {other:?}"),
         }

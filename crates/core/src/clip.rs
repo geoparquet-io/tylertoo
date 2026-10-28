@@ -824,6 +824,7 @@ mod tests {
 
     /// A one-part MultiPolygon whose part is a U: two vertical prongs
     /// (x ∈ [0,1] and x ∈ [3,4], rising to y=5) joined by a base (y ∈ [0,1]).
+    #[cfg(test)]
     fn u_multipolygon() -> MultiPolygon<f64> {
         MultiPolygon::new(vec![Polygon::new(
             LineString::from(vec![
@@ -1599,6 +1600,7 @@ mod tests {
     /// A polygon with vertices at lng ±179.9 — intended by the data author as
     /// a 0.2°-wide feature crossing the antimeridian, but stored (verbatim)
     /// as a 359.8°-wide rectangle.
+    #[cfg(test)]
     fn antimeridian_polygon() -> Geometry<f64> {
         Geometry::Polygon(Polygon::new(
             LineString::from(vec![
@@ -1888,6 +1890,7 @@ mod tests {
     /// intersection check — not the boundary gate — routes it to `i_overlay`. To
     /// isolate the boundary gate we need a clean simple U: solid base y∈[0,3]
     /// across x∈[0,10], arms x∈[0,3] and x∈[7,10] up to y=10, notch x∈[3,7].
+    #[cfg(test)]
     fn u_shape() -> Polygon<f64> {
         Polygon::new(
             LineString::from(vec![

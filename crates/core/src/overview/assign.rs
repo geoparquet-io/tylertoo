@@ -411,6 +411,27 @@ pub struct FeatureTable {
     entry_level: Vec<u8>,
 }
 
+/// Update a lazily materialized column, retaining its empty representation
+/// until a row has a value and using `missing` for all other rows.
+fn set_optional_column<T: Copy>(
+    column: &mut Vec<T>,
+    rows: usize,
+    i: usize,
+    value: Option<T>,
+    missing: T,
+) {
+    match value {
+        Some(value) => {
+            if column.is_empty() {
+                column.resize(rows, missing);
+            }
+            column[i] = value;
+        }
+        None if !column.is_empty() => column[i] = missing,
+        None => {}
+    }
+}
+
 impl FeatureTable {
     /// Bytes per row the always-present columns cost: `index` (8) +
     /// `center_x` + `center_y` + `diag_sq` (8 each) + `kind` (1) = **33**.
@@ -605,31 +626,25 @@ impl FeatureTable {
     /// first finite key. The streaming engine fills this after the scan, once
     /// the ranking tier resolves.
     pub fn set_sort_key(&mut self, i: usize, key: Option<f64>) {
-        let Some(k) = key.filter(|k| k.is_finite()) else {
-            if !self.sort_key.is_empty() {
-                self.sort_key[i] = f64::NAN;
-            }
-            return;
-        };
-        if self.sort_key.is_empty() {
-            self.sort_key = vec![f64::NAN; self.index.len()];
-        }
-        self.sort_key[i] = k;
+        set_optional_column(
+            &mut self.sort_key,
+            self.index.len(),
+            i,
+            key.filter(|k| k.is_finite()),
+            f64::NAN,
+        );
     }
 
     /// Set (or clear) row `i`'s entry level, materializing the column on the
     /// first ladder value.
     pub fn set_entry_level(&mut self, i: usize, entry: Option<u8>) {
-        let Some(e) = entry else {
-            if !self.entry_level.is_empty() {
-                self.entry_level[i] = NO_ENTRY_LEVEL;
-            }
-            return;
-        };
-        if self.entry_level.is_empty() {
-            self.entry_level = vec![NO_ENTRY_LEVEL; self.index.len()];
-        }
-        self.entry_level[i] = clamp_entry_level(e);
+        set_optional_column(
+            &mut self.entry_level,
+            self.index.len(),
+            i,
+            entry.map(clamp_entry_level),
+            NO_ENTRY_LEVEL,
+        );
     }
 
     /// The `entry_level` column, or an empty slice when no row has one.

@@ -883,6 +883,7 @@ mod tests {
     }
 
     /// Build a valid 3-level duplicating meta matching §9.1 for reuse.
+    #[cfg(test)]
     fn duplicating_example() -> OverviewsMeta {
         OverviewsMeta {
             version: "0.1.0".to_string(),
@@ -909,6 +910,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn partitioning_example() -> OverviewsMeta {
         OverviewsMeta {
             version: "0.1.0".to_string(),

@@ -876,11 +876,7 @@ impl<W: Write + Send> OverviewWriter<W> {
         rx: Receiver<WkbEncodeResult>,
         asm: &mut RgAssembly,
     ) -> Result<(), WriterError> {
-        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
-        // downstream schema/metadata failure) leaves this writer's row groups
-        // in a partially-appended state, so it poisons the writer (defense in
-        // depth, see `Self::failed`) regardless of which step failed.
-        let outcome: Result<(), WriterError> = (|| {
+        self.with_write_failure(|writer| {
             // A disconnect means the task's sender was dropped without
             // sending — it never ran (pool shutdown). A panic inside the task
             // arrives as an ordinary `Err` on the channel instead (#426).
@@ -889,14 +885,11 @@ impl<W: Write + Send> OverviewWriter<W> {
                     WriterError::GeoParquet(format!("{WKB_TASK} did not report a result"))
                 })?
                 .map_err(WriterError::GeoParquet)?;
-            let encoded = align_to_target_schema(encoded, &self.target_schema)?;
-            fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
-            self.slice_into_row_groups(encoded, asm)
-        })();
-        if outcome.is_err() {
-            self.failed = true;
-        }
-        outcome
+            let encoded = align_to_target_schema(encoded, &writer.target_schema)?;
+            fold_geo_metadata(&mut writer.geo_meta_acc, geo_meta)
+                .map_err(WriterError::GeoParquet)?;
+            writer.slice_into_row_groups(encoded, asm)
+        })
     }
 
     /// Dispatch one complete row group's column encoding to the Rayon pool,
@@ -947,12 +940,7 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// Wait for one in-flight row group's encode to finish and append its
     /// column chunks to the file as the next row group (serial, in order).
     fn drain_encoded(&mut self, rx: Receiver<EncodeResult>) -> Result<(), WriterError> {
-        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
-        // failure appending the already-encoded chunks) leaves this writer's
-        // row groups in a partially-appended state, so it poisons the writer
-        // (defense in depth, see `Self::failed`) regardless of which step
-        // failed.
-        let outcome: Result<(), WriterError> = (|| {
+        self.with_write_failure(|writer| {
             // As in `drain_wkb_encoded`: a disconnect means the task never
             // ran; a panic inside it arrives as an `Err` on the channel (#426).
             let chunks = recv_in_pool(&rx).map_err(|_| {
@@ -960,14 +948,23 @@ impl<W: Write + Send> OverviewWriter<W> {
                     "{ROW_GROUP_TASK} did not report a result"
                 )))
             })??;
-            let mut rg_writer = self.writer.next_row_group()?;
+            let mut rg_writer = writer.writer.next_row_group()?;
             for chunk in chunks {
                 chunk.append_to_row_group(&mut rg_writer)?;
             }
             rg_writer.close()?;
-            self.row_groups_written += 1;
+            writer.row_groups_written += 1;
             Ok(())
-        })();
+        })
+    }
+
+    /// Every failed append poisons the writer, including a task disconnect,
+    /// caught encode panic, or downstream schema/metadata failure (#426).
+    fn with_write_failure(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<(), WriterError>,
+    ) -> Result<(), WriterError> {
+        let outcome = write(self);
         if outcome.is_err() {
             self.failed = true;
         }
@@ -1816,17 +1813,7 @@ mod tests {
     /// the `covering` columns; comparing the raw JSON keeps the footer check
     /// faithful to exactly what is written.
     fn geo_footer(path: &std::path::Path) -> serde_json::Value {
-        let file = File::open(path).unwrap();
-        let md = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
-        let kv = md
-            .file_metadata()
-            .key_value_metadata()
-            .unwrap()
-            .iter()
-            .find(|kv| kv.key == "geo")
-            .expect("geo footer key present")
-            .clone();
-        serde_json::from_str(kv.value.as_ref().unwrap()).unwrap()
+        serde_json::from_str(&geo_footer_raw(path)).unwrap()
     }
 
     /// The raw (unparsed) `geo` footer JSON string, for byte-identical
@@ -1849,6 +1836,7 @@ mod tests {
     /// order-independent comparison. `geo_metadata_json_deterministic` (#508,
     /// fixed) already makes the written array order stable run to run, so
     /// this sort is now belt-and-suspenders rather than load-bearing.
+    #[cfg(test)]
     fn footer_geometry_types(footer: &serde_json::Value, column: &str) -> Vec<String> {
         let mut types: Vec<String> = footer["columns"][column]["geometry_types"]
             .as_array()
@@ -1898,6 +1886,7 @@ mod tests {
 
     /// Sorted string forms of a column's geometry types (the set has no
     /// deterministic iteration order).
+    #[cfg(test)]
     fn sorted_geometry_types(meta: &GeoParquetMetadata, column: &str) -> Vec<String> {
         let mut types: Vec<String> = meta.columns[column]
             .geometry_types

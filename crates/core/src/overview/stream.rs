@@ -3471,10 +3471,7 @@ fn write_profile_json(
         return;
     };
     let rate = |rows: usize, secs: f64| if secs > 0.0 { rows as f64 / secs } else { 0.0 };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let timestamp = profile_timestamp();
     let levels_json: Vec<serde_json::Value> = inputs
         .levels
         .iter()
@@ -3643,6 +3640,13 @@ fn rss_sampler_json(report: &Option<RssSamplerReport>) -> serde_json::Value {
         }
         None => serde_json::Value::Null,
     }
+}
+
+fn profile_timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// The `TYLERTOO_PROFILE_JSON` target, or `None` when the var is unset or
@@ -4007,10 +4011,7 @@ pub(super) fn write_export_profile_json(
     let Some(path) = profile_json_target() else {
         return;
     };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let timestamp = profile_timestamp();
     let per_zoom_json: Vec<serde_json::Value> = inputs
         .per_zoom
         .iter()
@@ -5949,6 +5950,24 @@ fn write_level_streaming(
     Ok((outcome, rows.get(), vertices.get(), level_timers))
 }
 
+/// Decode a batch's selected rows in order for either pass-2 execution mode.
+fn decode_selected_geometries(
+    batch: &RecordBatch,
+    selected: &[usize],
+    ctx: &LevelStreamCtx<'_>,
+) -> Result<Vec<Geometry<f64>>, ConvertError> {
+    let mut geoms = Vec::with_capacity(selected.len());
+    if !selected.is_empty() {
+        let take_idx = UInt32Array::from(selected.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let geom_taken = take(batch.column(ctx.geom_idx).as_ref(), &take_idx, None)?;
+        let schema = batch.schema();
+        let garr = from_arrow_array(geom_taken.as_ref(), schema.field(ctx.geom_idx))
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+        extract_geometries_from_array(garr.as_ref(), &mut geoms, ctx.diagnostics)?;
+    }
+    Ok(geoms)
+}
+
 /// Process one input batch for one level: select the level's members from the
 /// winner table, decode only their geometries, simplify (unless verbatim), and
 /// assemble the output batch. Returns `None` when no member row survives.
@@ -5979,14 +5998,7 @@ pub(super) fn process_level_batch(
 
     // Decode only the selected rows' geometries (take → decode, not
     // decode-all → filter).
-    let take_idx = UInt32Array::from(selected.iter().map(|&i| i as u32).collect::<Vec<_>>());
-    let geom_taken = take(batch.column(ctx.geom_idx).as_ref(), &take_idx, None)?;
-    let schema = batch.schema();
-    let gfield = schema.field(ctx.geom_idx);
-    let garr = from_arrow_array(geom_taken.as_ref(), gfield)
-        .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
-    extract_geometries_from_array(garr.as_ref(), &mut geoms, ctx.diagnostics)?;
+    let geoms = decode_selected_geometries(batch, &selected, ctx)?;
     Pass2Timers::add(&timers.decode, t_decode);
 
     let t_simplify = Instant::now();
@@ -6218,16 +6230,7 @@ pub(super) fn process_batch_cascade(
     // in `Arc` immediately (#499): the fold below shares this same
     // allocation via `Arc::clone` for every level a feature survives
     // unchanged, instead of deep-cloning canonical geometry once per level.
-    let mut geoms_owned: Vec<Geometry<f64>> = Vec::with_capacity(selected.len());
-    if !selected.is_empty() {
-        let take_idx = UInt32Array::from(selected.iter().map(|&i| i as u32).collect::<Vec<_>>());
-        let geom_taken = take(batch.column(finest.geom_idx).as_ref(), &take_idx, None)?;
-        let schema = batch.schema();
-        let gfield = schema.field(finest.geom_idx);
-        let garr = from_arrow_array(geom_taken.as_ref(), gfield)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        extract_geometries_from_array(garr.as_ref(), &mut geoms_owned, finest.diagnostics)?;
-    }
+    let geoms_owned = decode_selected_geometries(batch, &selected, finest)?;
     let geoms: Vec<Arc<Geometry<f64>>> = geoms_owned.into_iter().map(Arc::new).collect();
     Pass2Timers::add(&timers.decode, t_decode);
 

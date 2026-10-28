@@ -2033,6 +2033,7 @@ mod tests {
 
     /// Write a parquet file with one row group per (confidence, crop) pair
     /// and return its metadata.
+    #[cfg(test)]
     fn stats_file(
         rows: &[(Option<f64>, Option<&str>)],
     ) -> (tempfile::NamedTempFile, ParquetMetaData) {
@@ -2250,6 +2251,7 @@ mod tests {
     }
 
     /// Parquet file with a Timestamp(micros) column, one row group per value.
+    #[cfg(test)]
     fn ts_stats_file(rows: &[Option<i64>]) -> (tempfile::NamedTempFile, ParquetMetaData) {
         use tylertoo_io::test_support::ArrowWriter;
         use tylertoo_io::test_support::WriterProperties;

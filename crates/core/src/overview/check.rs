@@ -1291,6 +1291,7 @@ mod tests {
     /// Write a 2-level duplicating fixture whose footer carries clustering
     /// provenance. `point_counts` supplies per-level `point_count` values
     /// (parallel to `level_ids`); `None` omits the column entirely.
+    #[cfg(test)]
     fn write_cluster_fixture(
         path: &std::path::Path,
         level_ids: &[Vec<i64>],
@@ -1490,6 +1491,7 @@ mod tests {
     /// Write a duplicating fixture whose footer carries coalescing
     /// provenance. `coalesced_counts` supplies per-level `coalesced_count`
     /// values (parallel to `level_ids`); `None` omits the column entirely.
+    #[cfg(test)]
     fn write_coalesce_fixture(
         path: &std::path::Path,
         level_ids: &[Vec<i64>],

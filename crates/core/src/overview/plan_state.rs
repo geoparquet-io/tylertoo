@@ -2849,6 +2849,7 @@ mod tests {
 
     /// A grid of points: enough for a multi-level pyramid with real
     /// thinning and a non-trivial winner table.
+    #[cfg(test)]
     fn point_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::Point;
 
@@ -2867,6 +2868,7 @@ mod tests {
 
     /// Squares of widely differing size: drives the visibility gate, the
     /// simplify cascade, and the tiny-polygon carrier accumulator (#384).
+    #[cfg(test)]
     fn polygon_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::{Coord, LineString, Polygon};
 
@@ -2908,6 +2910,7 @@ mod tests {
     /// artifact, and excluding it here keeps this test a test of the plan.
     /// Touching lines, so the Q3 coalescing scratch (decoded geometries,
     /// sort keys, class groups) actually has to survive the artifact.
+    #[cfg(test)]
     fn line_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::{Coord, LineString};
 

@@ -4728,19 +4728,11 @@ fn size_bboxes(
 /// a cell stored as `x: 178 … 181` reports `[178, 180]` and `[-180, -179]`,
 /// never lng 181.
 fn wrapped_extents(bbox: &TileBounds) -> impl Iterator<Item = TileBounds> + '_ {
-    [0.0, -360.0, 360.0]
-        .into_iter()
-        .filter_map(move |shift: f64| {
-            let lo = bbox.lng_min + shift;
-            let hi = bbox.lng_max + shift;
-            let inside = if shift == 0.0 {
-                lo <= 180.0 && hi >= -180.0
-            } else {
-                lo < 180.0 && hi > -180.0
-            };
-            inside
-                .then(|| TileBounds::new(lo.max(-180.0), bbox.lat_min, hi.min(180.0), bbox.lat_max))
-        })
+    wrap_shifts(bbox, 0.0).map(move |shift| {
+        let lo = bbox.lng_min + shift;
+        let hi = bbox.lng_max + shift;
+        TileBounds::new(lo.max(-180.0), bbox.lat_min, hi.min(180.0), bbox.lat_max)
+    })
 }
 
 /// `true` when tile `tc` lies in `ranges`.
@@ -8388,6 +8380,29 @@ mod tests {
         .unwrap()
     }
 
+    fn write_mode_batches(
+        path: &Path,
+        mode: Mode,
+        max_row_group_size: usize,
+        batches: impl ExactSizeIterator<Item = RecordBatch>,
+    ) -> OverviewsMeta {
+        let specs = (0..batches.len())
+            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
+            .collect();
+        let mut opts = OverviewWriterOptions::new(mode, specs);
+        opts.max_row_group_size = max_row_group_size;
+        let mut writer = OverviewWriter::create(path, &Arc::new(source_schema()), opts).unwrap();
+        for (k, batch) in batches.enumerate() {
+            assert_eq!(
+                writer
+                    .write_level(k, Some(batch.num_rows()), std::iter::once(batch))
+                    .unwrap(),
+                LevelWriteOutcome::Written
+            );
+        }
+        writer.finish().unwrap()
+    }
+
     /// Write a 2-level duplicating overview fixture. `level_geoms[k]` are the
     /// geometries (and ids) at level k. Levels use z = 2 + 2k.
     /// Write a one-batch-per-level overview file and return its metadata.
@@ -8402,25 +8417,14 @@ mod tests {
         max_row_group_size: usize,
     ) -> OverviewsMeta {
         let schema = Arc::new(source_schema());
-        let specs: Vec<LevelSpec> = (0..level_geoms.len())
-            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
-            .collect();
-        let mut opts = OverviewWriterOptions::new(mode, specs);
-        opts.max_row_group_size = max_row_group_size;
-        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
-        for (k, (ids, geoms)) in level_geoms.iter().enumerate() {
-            assert_eq!(
-                writer
-                    .write_level(
-                        k,
-                        Some(ids.len()),
-                        std::iter::once(batch(&schema, ids, geoms)),
-                    )
-                    .unwrap(),
-                LevelWriteOutcome::Written
-            );
-        }
-        writer.finish().unwrap()
+        write_mode_batches(
+            path,
+            mode,
+            max_row_group_size,
+            level_geoms
+                .iter()
+                .map(|(ids, geoms)| batch(&schema, ids, geoms)),
+        )
     }
 
     fn write_fixture(path: &Path, level_geoms: &[(Vec<i64>, Vec<Geometry<f64>>)]) -> OverviewsMeta {
@@ -8456,12 +8460,7 @@ mod tests {
 
     // --- tests ---------------------------------------------------------------
 
-    /// Rich 2-level fixture used by the byte-equivalence tests: points, a
-    /// seam-crossing line, a concave polygon and a many-vertex line, with
-    /// id/name properties, at zooms 2 and 4.
-    fn equivalence_fixture(path: &Path) {
-        let pa = Geometry::Point(Point::new(-120.0, 40.0));
-        let pb = Geometry::Point(Point::new(120.0, -40.0));
+    fn equivalence_shapes() -> (Geometry<f64>, Geometry<f64>, Geometry<f64>) {
         let wide = Geometry::LineString(LineString::from(vec![
             (-100.0, 10.0),
             (-80.0, 12.0),
@@ -8484,6 +8483,17 @@ mod tests {
             coords.push((30.0 + k as f64 * 0.3, -20.0 + (k as f64 * 0.1).sin()));
         }
         let wiggly = Geometry::LineString(LineString::from(coords));
+        (wide, concave, wiggly)
+    }
+
+    /// Rich 2-level fixture used by the byte-equivalence tests: points, a
+    /// seam-crossing line, a concave polygon and a many-vertex line, with
+    /// id/name properties, at zooms 2 and 4.
+    #[cfg(test)]
+    fn equivalence_fixture(path: &Path) {
+        let pa = Geometry::Point(Point::new(-120.0, 40.0));
+        let pb = Geometry::Point(Point::new(120.0, -40.0));
+        let (wide, concave, wiggly) = equivalence_shapes();
         write_fixture(
             path,
             &[
@@ -9944,21 +9954,15 @@ mod tests {
         mode: Mode,
     ) -> OverviewsMeta {
         let schema = Arc::new(source_schema());
-        let specs: Vec<LevelSpec> = (0..level_geoms.len())
-            .map(|k| LevelSpec::new(gsd((2 + 2 * k) as u8), Some((2 + 2 * k) as u8)))
-            .collect();
-        let mut opts = OverviewWriterOptions::new(mode, specs);
-        opts.max_row_group_size = 3;
-        let mut writer = OverviewWriter::create(path, &schema, opts).unwrap();
         let mut next_id = 0i64;
-        for (k, geoms) in level_geoms.iter().enumerate() {
+        let batches = level_geoms.iter().map(|geoms| {
             let ids: Vec<i64> = (next_id..next_id + geoms.len() as i64).collect();
             next_id += geoms.len() as i64;
             let typ = GeometryType::new(Default::default());
             let mut b = GeometryBuilder::new(typ).with_prefer_multi(false);
             b.extend_from_iter(geoms.iter().map(Option::as_ref));
             let name = StringArray::from(ids.iter().map(|i| format!("f{i}")).collect::<Vec<_>>());
-            let batch = RecordBatch::try_new(
+            RecordBatch::try_new(
                 schema.clone(),
                 vec![
                     Arc::new(Int64Array::from(ids.clone())),
@@ -9966,15 +9970,9 @@ mod tests {
                     Arc::new(b.finish().to_array_ref()),
                 ],
             )
-            .unwrap();
-            assert_eq!(
-                writer
-                    .write_level(k, Some(ids.len()), std::iter::once(batch))
-                    .unwrap(),
-                LevelWriteOutcome::Written
-            );
-        }
-        writer.finish().unwrap()
+            .unwrap()
+        });
+        write_mode_batches(path, mode, 3, batches)
     }
 
     fn square(x: f64, y: f64, w: f64) -> geo::Polygon<f64> {
@@ -14173,24 +14171,9 @@ mod tests {
     /// per-band mixes of points, seam-crossing lines, and multi-tile polygons
     /// with tiny row groups so bands span several row groups and coarse
     /// features genuinely fan into finer levels' render sets.
+    #[cfg(test)]
     fn partitioning_equivalence_fixture(path: &Path) {
-        let wide = Geometry::LineString(LineString::from(vec![
-            (-100.0, 10.0),
-            (-80.0, 12.0),
-            (-60.0, 8.0),
-            (-40.0, 11.0),
-        ]));
-        let concave = Geometry::Polygon(geo::Polygon::new(
-            LineString::from(vec![
-                (-100.0, 25.0),
-                (-98.0, 25.0),
-                (-98.0, 27.0),
-                (-99.0, 25.5),
-                (-100.0, 27.0),
-                (-100.0, 25.0),
-            ]),
-            vec![],
-        ));
+        let (wide, concave, wiggly) = equivalence_shapes();
         let big_box = Geometry::Polygon(geo::Polygon::new(
             LineString::from(vec![
                 (-20.0, -20.0),
@@ -14201,11 +14184,6 @@ mod tests {
             ]),
             vec![],
         ));
-        let mut coords = Vec::new();
-        for k in 0..200 {
-            coords.push((30.0 + k as f64 * 0.3, -20.0 + (k as f64 * 0.1).sin()));
-        }
-        let wiggly = Geometry::LineString(LineString::from(coords));
         write_partitioning_fixture(
             path,
             &[
@@ -14617,27 +14595,7 @@ mod tests {
     fn exported_property_names(input: &Path) -> Vec<String> {
         let tout = tempfile::NamedTempFile::new().unwrap();
         export_pmtiles(input, tout.path(), &ExportOptions::default()).unwrap();
-        let decoded = tempfile::NamedTempFile::new().unwrap();
-        crate::decode::decode_pmtiles(
-            tout.path(),
-            decoded.path(),
-            &crate::decode::DecodeOptions::default(),
-        )
-        .unwrap();
-        let file = std::fs::File::open(decoded.path()).unwrap();
-        tylertoo_io::open_parquet(file)
-            .unwrap()
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .filter(|n| {
-                !matches!(
-                    n.as_str(),
-                    "zoom" | "layer" | "mvt_id" | "geometry" | "bbox"
-                )
-            })
-            .collect()
+        decoded_property_names(tout.path())
     }
 
     #[test]

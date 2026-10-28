@@ -378,14 +378,14 @@ fn read_cgroup_v2_limit(root: &std::path::Path) -> Option<u64> {
 
 /// cgroup v2 headroom under the smallest of `files` along this process's path.
 fn read_cgroup_v2_headroom(root: &std::path::Path, files: &[&str]) -> Option<u64> {
-    let rel = proc_self_cgroup_path(root, CgroupSelector::V2).unwrap_or_default();
-    let binding = min_limit_along_path(&root.join("sys/fs/cgroup"), &rel, files)?;
-    Some(subtract_unreclaimable_usage(
-        binding.bytes,
-        &binding.dir,
+    read_cgroup_headroom(
+        root,
+        CgroupSelector::V2,
+        "sys/fs/cgroup",
+        files,
         "memory.current",
         &["inactive_file", "slab_reclaimable"],
-    ))
+    )
 }
 
 /// cgroup v1: `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes`, where
@@ -400,17 +400,31 @@ fn read_cgroup_v2_headroom(root: &std::path::Path, files: &[&str]) -> Option<u64
 /// find the real mount point would remove the approximation; v1 is legacy
 /// enough that it has not been worth the extra failure surface.
 fn read_cgroup_v1_limit(root: &std::path::Path) -> Option<u64> {
-    let rel = proc_self_cgroup_path(root, CgroupSelector::V1Memory).unwrap_or_default();
-    let binding = min_limit_along_path(
-        &root.join("sys/fs/cgroup/memory"),
-        &rel,
+    read_cgroup_headroom(
+        root,
+        CgroupSelector::V1Memory,
+        "sys/fs/cgroup/memory",
         &["memory.limit_in_bytes"],
-    )?;
+        "memory.usage_in_bytes",
+        &["total_inactive_file"],
+    )
+}
+
+fn read_cgroup_headroom(
+    root: &std::path::Path,
+    selector: CgroupSelector,
+    mount: &str,
+    files: &[&str],
+    usage: &str,
+    reclaimable: &[&str],
+) -> Option<u64> {
+    let rel = proc_self_cgroup_path(root, selector).unwrap_or_default();
+    let binding = min_limit_along_path(&root.join(mount), &rel, files)?;
     Some(subtract_unreclaimable_usage(
         binding.bytes,
         &binding.dir,
-        "memory.usage_in_bytes",
-        &["total_inactive_file"],
+        usage,
+        reclaimable,
     ))
 }
 

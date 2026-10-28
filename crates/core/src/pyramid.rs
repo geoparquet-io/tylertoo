@@ -3044,6 +3044,7 @@ mod tests {
     /// `vector_layers[].minzoom` (never in its header, which since
     /// #529/#522 always reflects the tiles actually written). Pass `None`
     /// when the test has no such gap.
+    #[cfg(test)]
     fn write_band_with_payload(
         path: &Path,
         layer: &str,
@@ -3531,6 +3532,7 @@ mod tests {
     /// external writer could have stamped, the same way
     /// `empty_archive_with_a_real_declaration_stays_disjoint_under_the_flag`
     /// does.
+    #[cfg(test)]
     fn write_band_declared_range(
         path: &Path,
         layer: &str,
@@ -3565,6 +3567,7 @@ mod tests {
     /// tylertoo per-band export produces under #380 (`tiles --min-zoom 0`
     /// over tiles that start deeper). Since #529/#522 the declaration lands
     /// only in `vector_layers`; the header stays the tiles written.
+    #[cfg(test)]
     fn write_band_declared_in_metadata(
         path: &Path,
         layer: &str,

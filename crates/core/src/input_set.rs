@@ -732,18 +732,12 @@ impl ConvertSource {
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let groups = m.parquet.row_groups();
-                match selected.and_then(|s| s.parts().get(i)) {
-                    Some(picked) => picked
-                        .iter()
-                        .filter_map(|&g| groups.get(g))
-                        .map(tylertoo_io::RowGroupMetaData::num_rows)
-                        .sum::<i64>(),
-                    None => groups
-                        .iter()
-                        .map(tylertoo_io::RowGroupMetaData::num_rows)
-                        .sum::<i64>(),
-                }
+                crate::input::selected_groups(
+                    &m.parquet,
+                    selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
+                )
+                .map(tylertoo_io::RowGroupMetaData::num_rows)
+                .sum::<i64>()
             })
             .sum())
     }
@@ -776,12 +770,10 @@ impl ConvertSource {
             let leaves: Vec<usize> = (0..descr.num_columns())
                 .filter(|&leaf| descr.get_column_root_idx(leaf) == root)
                 .collect();
-            let groups = m.parquet.row_groups();
-            let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(i)) {
-                Some(p) => p.clone(),
-                None => (0..groups.len()).collect(),
-            };
-            for rg in picked.iter().filter_map(|&g| groups.get(g)) {
+            for rg in crate::input::selected_groups(
+                &m.parquet,
+                selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
+            ) {
                 for &leaf in &leaves {
                     let col = rg.column(leaf);
                     let bytes = col
@@ -1721,6 +1713,7 @@ mod tests {
     }
 
     /// Standard two-column fixture: `id: Int64 (non-null)`, `name: Utf8`.
+    #[cfg(test)]
     fn write_standard(path: &Path, ids: Vec<i64>, nullable_id: bool) {
         let n = ids.len();
         write_parquet(
@@ -2317,6 +2310,7 @@ mod tests {
     // --- column restriction (#386) -------------------------------------------
 
     /// Three-column fixture: `id`, `name`, `extra`.
+    #[cfg(test)]
     fn write_three(path: &Path, ids: Vec<i64>) {
         let n = ids.len();
         write_parquet(

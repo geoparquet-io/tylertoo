@@ -6904,6 +6904,7 @@ mod tests {
         use geo::{Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon};
         use proptest::prelude::*;
 
+        #[cfg(test)]
         fn any_f64() -> impl Strategy<Value = f64> {
             prop_oneof![
                 8 => -1.0e6f64..1.0e6f64,
@@ -6924,6 +6925,7 @@ mod tests {
             (any_ring(), proptest::collection::vec(any_ring(), 0..3))
                 .prop_map(|(ext, ints)| Polygon::new(ext, ints))
         }
+        #[cfg(test)]
         pub(super) fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             prop_oneof![
                 any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
@@ -7016,6 +7018,7 @@ mod tests {
         /// to two deep, of both. The #274 generator alone makes an empty
         /// point only when both axes draw NaN, too rarely to reach one
         /// inside a collection.
+        #[cfg(test)]
         fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             let leaf = prop_oneof![
                 8 => super::scan_feature_props::any_geometry(),
@@ -8482,6 +8485,7 @@ mod tests {
 
     /// A mix of points, lines, and polygons spread far apart so coarse-level
     /// thinning keeps distinct cell winners.
+    #[cfg(test)]
     fn synthetic_geometries() -> Vec<Geometry<f64>> {
         let mut geoms = Vec::new();
         // Points on a coarse grid (meters, EPSG:3857-ish scale via 4326? we use
@@ -8801,21 +8805,31 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn convert_sources_and_export(
+        source: &crate::input_set::ConvertSource,
+        workdir: &Path,
+        tag: &str,
+        opts: &ConvertOptions,
+    ) -> Vec<u8> {
+        use crate::overview::export::{export_pmtiles, ExportOptions};
+        let overview = workdir.join(format!("{tag}-overview.parquet"));
+        let pmtiles = workdir.join(format!("{tag}.pmtiles"));
+        convert_to_overviews_sources(source, &overview, opts).unwrap();
+        export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
+        std::fs::read(&pmtiles).unwrap()
+    }
+
     /// Convert `input` and export to PMTiles; returns the archive bytes.
     /// PMTiles export is byte-deterministic (unlike the overview parquet
     /// footer), so multi/single equivalence is asserted on these bytes.
     fn convert_and_export(input: &Path, workdir: &Path, opts: &ConvertOptions) -> Vec<u8> {
-        use crate::overview::export::{export_pmtiles, ExportOptions};
         let stem = input
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .replace('.', "_");
-        let overview = workdir.join(format!("{stem}-overview.parquet"));
-        let pmtiles = workdir.join(format!("{stem}.pmtiles"));
-        convert_to_overviews(input, &overview, opts).unwrap();
-        export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
-        std::fs::read(&pmtiles).unwrap()
+        let source = crate::input_set::ConvertSource::resolve_path(input).unwrap();
+        convert_sources_and_export(&source, workdir, &stem, opts)
     }
 
     fn multi_test_options() -> ConvertOptions {
@@ -9213,6 +9227,7 @@ mod tests {
     /// IDENTICAL there, and a ceiling test over it would pass with the fold
     /// removed. These carry detail at each rung of the ladder, so RDP removes
     /// a different vertex subset at every step and the two disagree.
+    #[cfg(test)]
     fn cascade_sensitive_geometries() -> Vec<Geometry<f64>> {
         // A smooth curve will not do: RDP at a coarse tolerance picks its
         // extrema, a fine pre-pass keeps those same extrema, and cascading
@@ -9996,8 +10011,22 @@ mod tests {
 
     // ---- zoom-band representation selector (#317 / #279) --------------------
 
+    fn centered_square(cx: f64, cy: f64, half: f64) -> Geometry<f64> {
+        Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]),
+            vec![],
+        ))
+    }
+
     /// Polygon fixtures spanning sizes from "visible at every zoom" down to
     /// tiny, scattered so they don't all share thinning cells.
+    #[cfg(test)]
     fn polygon_fixture() -> Vec<Geometry<f64>> {
         let mut geoms = Vec::new();
         for i in 0..12 {
@@ -10005,14 +10034,7 @@ mod tests {
             let cy = -60.0 + (i % 5) as f64 * 27.0;
             // Halves from 20 degrees down to 0.002 degrees.
             let half = 20.0 / (3f64).powi(i % 9);
-            let ext = LineString::from(vec![
-                (cx - half, cy - half),
-                (cx + half, cy - half),
-                (cx + half, cy + half),
-                (cx - half, cy + half),
-                (cx - half, cy - half),
-            ]);
-            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+            geoms.push(centered_square(cx, cy, half));
         }
         geoms
     }
@@ -11975,6 +11997,7 @@ mod tests {
     /// collide during simplification. Adjacent ladder levels commonly
     /// simplify these to byte-identical geometry — exactly the case #499's
     /// cascade Arc-sharing targets.
+    #[cfg(test)]
     fn minimal_square_fixture(n: usize) -> Vec<Geometry<f64>> {
         let mut geoms = Vec::with_capacity(n);
         for i in 0..n {
@@ -11982,14 +12005,7 @@ mod tests {
             let cy = -80.0 + (i / 20) as f64 * 15.0;
             let half = 0.05; // ~5.5km diagonal: survives many fine levels
                              // unchanged, then drops once the visibility gate passes it.
-            let ext = LineString::from(vec![
-                (cx - half, cy - half),
-                (cx + half, cy - half),
-                (cx + half, cy + half),
-                (cx - half, cy + half),
-                (cx - half, cy - half),
-            ]);
-            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+            geoms.push(centered_square(cx, cy, half));
         }
         geoms
     }
@@ -12396,14 +12412,7 @@ mod tests {
                 let (row, col) = (i / cols, i % cols);
                 let cx = -60.0 + col as f64 * spacing;
                 let cy = -40.0 - row as f64 * spacing;
-                let ext = LineString::from(vec![
-                    (cx - half, cy - half),
-                    (cx + half, cy - half),
-                    (cx + half, cy + half),
-                    (cx - half, cy + half),
-                    (cx - half, cy - half),
-                ]);
-                Geometry::Polygon(Polygon::new(ext, vec![]))
+                centered_square(cx, cy, half)
             })
             .collect()
     }
@@ -12507,20 +12516,27 @@ mod tests {
 
     // --- Q4 point clustering -------------------------------------------------
 
-    /// Read the `point_count` column for one level, in row order.
-    fn read_point_counts(reader: &OverviewReader, level: usize) -> Vec<i64> {
+    fn read_count_column<T: arrow_array::types::ArrowPrimitiveType>(
+        reader: &OverviewReader,
+        level: usize,
+        name: &str,
+    ) -> Vec<T::Native> {
         use arrow_array::cast::AsArray;
-        use arrow_array::types::Int64Type;
         let rdr = reader.read_level(level, None).unwrap();
         let mut out = Vec::new();
         for batch in rdr {
             let batch = batch.unwrap();
-            let idx = batch.schema().index_of("point_count").unwrap();
-            let col = batch.column(idx).as_primitive::<Int64Type>().clone();
-            assert_eq!(col.null_count(), 0, "point_count must be NOT NULL");
+            let idx = batch.schema().index_of(name).unwrap();
+            let col = batch.column(idx).as_primitive::<T>().clone();
+            assert_eq!(col.null_count(), 0, "{name} must be NOT NULL");
             out.extend(col.values().iter().copied());
         }
         out
+    }
+
+    /// Read the `point_count` column for one level, in row order.
+    fn read_point_counts(reader: &OverviewReader, level: usize) -> Vec<i64> {
+        read_count_column::<arrow_array::types::Int64Type>(reader, level, "point_count")
     }
 
     /// Read a Float64 column for one level, in row order (None = null).
@@ -12985,23 +13001,13 @@ mod tests {
 
     /// Read the `coalesced_count` column for one level, in row order.
     fn read_coalesced_counts(reader: &OverviewReader, level: usize) -> Vec<i32> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::Int32Type;
-        let rdr = reader.read_level(level, None).unwrap();
-        let mut out = Vec::new();
-        for batch in rdr {
-            let batch = batch.unwrap();
-            let idx = batch.schema().index_of("coalesced_count").unwrap();
-            let col = batch.column(idx).as_primitive::<Int32Type>().clone();
-            assert_eq!(col.null_count(), 0, "coalesced_count must be NOT NULL");
-            out.extend(col.values().iter().copied());
-        }
-        out
+        read_count_column::<arrow_array::types::Int32Type>(reader, level, "coalesced_count")
     }
 
     /// A chain of `n` touching collinear segments (each 0.01° long) starting
     /// at (0,0), plus one far-away point. Each segment alone is below the
     /// coarse-level line visibility gate; the chain is well above it.
+    #[cfg(test)]
     fn fragment_chain_geoms(n: usize) -> Vec<Geometry<f64>> {
         let mut geoms: Vec<Geometry<f64>> = (0..n)
             .map(|i| {
@@ -14369,22 +14375,6 @@ mod tests {
             std::fs::read(tmp.path()).unwrap()
         }
 
-        /// Convert a remote `ConvertSource` and export to PMTiles; returns
-        /// the archive bytes (PMTiles export is byte-deterministic).
-        fn convert_sources_and_export(
-            source: &crate::input_set::ConvertSource,
-            workdir: &Path,
-            tag: &str,
-            opts: &ConvertOptions,
-        ) -> Vec<u8> {
-            use crate::overview::export::{export_pmtiles, ExportOptions};
-            let overview = workdir.join(format!("{tag}-overview.parquet"));
-            let pmtiles = workdir.join(format!("{tag}.pmtiles"));
-            convert_to_overviews_sources(source, &overview, opts).unwrap();
-            export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
-            std::fs::read(&pmtiles).unwrap()
-        }
-
         /// #219's ≈1× guarantee must hold PER PART across the streaming
         /// pipeline's three passes (assign, coarse levels, finest last):
         /// each part's fetched ranges sum to at most ~1.5× its object size
@@ -14795,14 +14785,7 @@ mod tests {
                 let cx = -150.0 + (i % 10) as f64 * 3.0;
                 let cy = -60.0 + (i / 10) as f64 * 1.5;
                 let h = 5e-5;
-                let ext = LineString::from(vec![
-                    (cx - h, cy - h),
-                    (cx + h, cy - h),
-                    (cx + h, cy + h),
-                    (cx - h, cy + h),
-                    (cx - h, cy - h),
-                ]);
-                Geometry::Polygon(Polygon::new(ext, vec![]))
+                centered_square(cx, cy, h)
             })
             .collect()
     }

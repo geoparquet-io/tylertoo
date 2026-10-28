@@ -458,23 +458,38 @@ fn ring_area2(ring: &[(i32, i32)]) -> i64 {
     sum.clamp(-i128::from(i64::MAX), i128::from(i64::MAX)) as i64
 }
 
-/// Exact integer test: do closed segments `a` and `b` share any point
-/// (crossing, touching, or collinear overlap)?
-fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
+/// Signed orientations used by both segment-intersection policies.
+fn segment_orientations(
+    (p1, p2): ((i32, i32), (i32, i32)),
+    (p3, p4): ((i32, i32), (i32, i32)),
+) -> [i64; 4] {
     let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
         (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
             - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
     };
+    [
+        cross(p3, p4, p1),
+        cross(p3, p4, p2),
+        cross(p1, p2, p3),
+        cross(p1, p2, p4),
+    ]
+}
+
+fn proper_crossing([d1, d2, d3, d4]: [i64; 4]) -> bool {
+    ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
+}
+
+/// Exact integer test: do closed segments `a` and `b` share any point
+/// (crossing, touching, or collinear overlap)?
+fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
     let on_segment = |p: (i32, i32), q: (i32, i32), r: (i32, i32)| -> bool {
         r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
     };
     let (p1, p2) = a;
     let (p3, p4) = b;
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+    let sides = segment_orientations(a, b);
+    let [d1, d2, d3, d4] = sides;
+    if proper_crossing(sides) {
         return true;
     }
     (d1 == 0 && on_segment(p3, p4, p1))
@@ -519,17 +534,11 @@ fn any_box_pair(boxes: &[(i32, i32, i32, i32)], mut hit: impl FnMut(usize, usize
 /// polygon may touch at a point (a hole on the exterior, two holes meeting)
 /// and stay valid.
 fn segments_cross_or_overlap(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
-    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
-        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
-            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
-    };
     let (p1, p2) = a;
     let (p3, p4) = b;
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+    let sides = segment_orientations(a, b);
+    let [d1, d2, _, _] = sides;
+    if proper_crossing(sides) {
         return true; // proper crossing
     }
     if d1 == 0 && d2 == 0 {
