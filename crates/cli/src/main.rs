@@ -3031,7 +3031,8 @@ mod tests {
         assert_eq!(options.export.feature_id.as_deref(), Some("-id"));
     }
 
-    #[cfg(unix)]
+    // APFS refuses non-UTF-8 names (EILSEQ), so macOS cannot hold such a path.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn native_spill_paths_do_not_round_trip_through_json() {
         use std::ffi::OsString;

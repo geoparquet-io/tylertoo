@@ -323,6 +323,32 @@ impl core::marker::UnsafeUnpin for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::TileHasher
 pub mod tylertoo_core::diagnostics
+pub enum tylertoo_core::diagnostics::AccountingError
+pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded
+pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded::available: usize
+pub tylertoo_core::diagnostics::AccountingError::BudgetExceeded::needed: usize
+pub tylertoo_core::diagnostics::AccountingError::Io(core::io::error::Error)
+impl core::convert::From<core::io::error::Error> for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::from(core::io::error::Error) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::error::Error for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Send for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Sync for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Unpin for tylertoo_core::diagnostics::AccountingError
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::AccountingError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::AccountingError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::AccountingError
 pub enum tylertoo_core::diagnostics::CoveringWarning
 pub tylertoo_core::diagnostics::CoveringWarning::DuplicateColumns
 pub tylertoo_core::diagnostics::CoveringWarning::InconsistentPartitions
@@ -456,6 +482,9 @@ pub tylertoo_core::diagnostics::Diagnostic::PyramidSkippedTiles::count: usize
 pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled
 pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::cap: usize
 pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::diagnostics::Diagnostic::Unprojectable
 pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
 pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::count: usize
@@ -564,9 +593,9 @@ pub fn tylertoo_core::diagnostics::Diagnostics::extend(&self, impl core::iter::t
 pub fn tylertoo_core::diagnostics::Diagnostics::once(&self, tylertoo_core::diagnostics::Diagnostic)
 pub fn tylertoo_core::diagnostics::Diagnostics::record(&self, tylertoo_core::diagnostics::Diagnostic)
 pub fn tylertoo_core::diagnostics::Diagnostics::snapshot(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
-pub fn tylertoo_core::diagnostics::Diagnostics::source_emitted(&self, u64, u8)
-pub fn tylertoo_core::diagnostics::Diagnostics::source_loss(&self, u64, core::option::Option<u8>, tylertoo_core::diagnostics::SourceLossCause)
-pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_emitted(&self, u64, u8) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_loss(&self, u64, core::option::Option<u8>, tylertoo_core::diagnostics::SourceLossCause) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> core::result::Result<alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>, tylertoo_core::diagnostics::AccountingError>
 impl core::default::Default for tylertoo_core::diagnostics::Diagnostics
 pub fn tylertoo_core::diagnostics::Diagnostics::default() -> Self
 impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostics
@@ -603,6 +632,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::Ran
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::RangeContext
 pub struct tylertoo_core::diagnostics::SourceLoss
 pub tylertoo_core::diagnostics::SourceLoss::cause: tylertoo_core::diagnostics::SourceLossCause
+pub tylertoo_core::diagnostics::SourceLoss::feature_id: core::option::Option<u64>
 pub tylertoo_core::diagnostics::SourceLoss::id: u64
 pub tylertoo_core::diagnostics::SourceLoss::zoom: core::option::Option<u8>
 impl core::clone::Clone for tylertoo_core::diagnostics::SourceLoss
@@ -1725,6 +1755,7 @@ pub fn tylertoo_core::overview::config::entry_zoom(core::option::Option<&str>, u
 pub fn tylertoo_core::overview::config::representation(core::option::Option<&str>) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, tylertoo_core::overview::config::ConfigError>
 pub mod tylertoo_core::overview::convert
 #[non_exhaustive] pub enum tylertoo_core::overview::convert::ConvertError
+pub tylertoo_core::overview::convert::ConvertError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric
@@ -1803,6 +1834,8 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::conv
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::diagnostics::AccountingError) -> Self
 impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::input::InputError) -> Self
 impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::convert::ConvertError
@@ -1948,6 +1981,7 @@ pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_total: usize
 pub tylertoo_core::overview::convert::ConvertReport::skipped_empty_levels: alloc::vec::Vec<tylertoo_core::overview::convert::SkippedLevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub tylertoo_core::overview::convert::ConvertReport::source_row_ranges: alloc::vec::Vec<(u64, u64)>
 pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::total_vertices: usize
@@ -2167,6 +2201,7 @@ pub fn tylertoo_core::overview::convert::write_convert_plan(impl core::convert::
 pub fn tylertoo_core::overview::convert::write_convert_plan_sources(&tylertoo_core::input_set::ConvertSource, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::convert::ConvertError>
 pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
+pub tylertoo_core::overview::export::ExportError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
 pub tylertoo_core::overview::export::ExportError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
@@ -2247,6 +2282,8 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::diagnostics::AccountingError) -> Self
 impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::overview::reader::ReaderError> for tylertoo_core::overview::export::ExportError
@@ -3485,19 +3522,26 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
 pub struct tylertoo_core::overview::tiles::EmptyArchive
+pub tylertoo_core::overview::tiles::EmptyArchive::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
+pub tylertoo_core::overview::tiles::EmptyArchive::input_rows: u64
 pub tylertoo_core::overview::tiles::EmptyArchive::max_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::min_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::pivot_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::role: tylertoo_core::shard::ShardRole
+pub tylertoo_core::overview::tiles::EmptyArchive::source_losses: alloc::vec::Vec<tylertoo_core::diagnostics::SourceLoss>
+pub tylertoo_core::overview::tiles::EmptyArchive::source_row_ranges: alloc::vec::Vec<(u64, u64)>
+pub tylertoo_core::overview::tiles::EmptyArchive::total_tile_features: usize
+pub tylertoo_core::overview::tiles::EmptyArchive::total_tiles: usize
 pub tylertoo_core::overview::tiles::EmptyArchive::why: alloc::string::String
 impl core::clone::Clone for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::clone(&self) -> tylertoo_core::overview::tiles::EmptyArchive
-impl core::cmp::Eq for tylertoo_core::overview::tiles::EmptyArchive
 impl core::cmp::PartialEq for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::eq(&self, &tylertoo_core::overview::tiles::EmptyArchive) -> bool
 impl core::fmt::Debug for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::EmptyArchive
+impl serde_core::ser::Serialize for tylertoo_core::overview::tiles::EmptyArchive
+pub fn tylertoo_core::overview::tiles::EmptyArchive::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl core::marker::Freeze for tylertoo_core::overview::tiles::EmptyArchive
 impl core::marker::Send for tylertoo_core::overview::tiles::EmptyArchive
 impl core::marker::Sync for tylertoo_core::overview::tiles::EmptyArchive
@@ -4179,6 +4223,8 @@ impl core::fmt::Display for tylertoo_core::shard::ShardRole
 pub fn tylertoo_core::shard::ShardRole::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::shard::ShardRole
 impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardRole
+impl serde_core::ser::Serialize for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl core::marker::Freeze for tylertoo_core::shard::ShardRole
 impl core::marker::Send for tylertoo_core::shard::ShardRole
 impl core::marker::Sync for tylertoo_core::shard::ShardRole
@@ -4652,6 +4698,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::compression::Compression
 pub enum tylertoo_core::Error
+pub tylertoo_core::Error::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::Error::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::Error::GeoParquetRead(alloc::string::String)
 pub tylertoo_core::Error::InvalidConfig(alloc::string::String)
@@ -4675,6 +4722,8 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::diagnostics::AccountingError) -> Self
 impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::error::Error for tylertoo_core::Error

@@ -603,6 +603,7 @@ class OverviewReport(TypedDict):
     diagnostics: list[Diagnostic]
     source_losses: list[SourceLoss]
     input_rows: int
+    source_row_ranges: list[tuple[int, int]]
     mode: Literal['duplicating', 'partitioning']
     levels: list[LevelReport]
     skipped_empty_levels: list[SkippedLevel]
@@ -638,6 +639,7 @@ One typed diagnostic aggregated by the core operation.
 
 ```python
 class Diagnostic(TypedDict):
+    diagnostics: NotRequired[list[Diagnostic]]
     exemplars: NotRequired[list[OutOfRangeExemplar]]
     context: NotRequired[dict[str, Any] | None]
     repair_kind: NotRequired[str]
@@ -661,11 +663,12 @@ class Diagnostic(TypedDict):
 
 ### `SourceLoss`
 
-An absent source row or exported feature ID.
+An absent source row, with its optional exported MVT feature ID.
 
 ```python
 class SourceLoss(TypedDict):
     id: int
+    feature_id: int | None
     zoom: int | None
     cause: str
 ```
