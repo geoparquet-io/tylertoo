@@ -959,7 +959,7 @@ pub(crate) mod remote {
             RemoteReader {
                 store: Arc::clone(&self.store),
                 location: self.location.clone(),
-                size: self.object_meta.size,
+                object_meta: self.object_meta.clone(),
                 shared: Arc::clone(&self.shared),
                 cache: Arc::clone(&self.cache),
                 spill: Arc::clone(&self.spill),
@@ -1117,15 +1117,17 @@ pub(crate) mod remote {
             let location = self.location.clone();
             let spill = Arc::clone(&self.spill);
             let shared = Arc::clone(&self.shared);
+            let object_meta = self.object_meta.clone();
 
             runtime().block_on(async move {
                 use futures_util::stream::StreamExt;
                 let mut inflight = futures_util::stream::iter(plan.into_iter().map(|rg| {
                     let store = Arc::clone(&store);
                     let location = location.clone();
+                    let object_meta = object_meta.clone();
                     async move {
-                        let bytes = store
-                            .get_range(&location, rg.span.clone())
+                        let bytes = object_meta
+                            .get_range(store.as_ref(), &location, rg.span.clone())
                             .await
                             .map_err(|e| ParquetError::External(Box::new(e)))?;
                         Ok::<(StagedSpan, Bytes), ParquetError>((rg, bytes))
@@ -1964,7 +1966,7 @@ pub(crate) mod remote {
     pub struct RemoteReader {
         store: Arc<dyn ObjectStore>,
         location: ObjectPath,
-        size: u64,
+        object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
         cache: Arc<Mutex<ChunkCache>>,
         spill: Arc<Mutex<DiskSpill>>,
@@ -1973,13 +1975,17 @@ pub(crate) mod remote {
     impl RemoteReader {
         /// Total object size (the [`tylertoo_io::Length`] answer).
         pub(crate) fn object_size(&self) -> u64 {
-            self.size
+            self.object_meta.size
         }
 
         /// One counted range GET.
         fn fetch(&self, range: Range<u64>) -> Result<Bytes, ParquetError> {
             let bytes = runtime()
-                .block_on(self.store.get_range(&self.location, range.clone()))
+                .block_on(self.object_meta.get_range(
+                    self.store.as_ref(),
+                    &self.location,
+                    range.clone(),
+                ))
                 .map_err(|e| ParquetError::External(Box::new(e)))?;
             self.shared.requests.fetch_add(1, Ordering::Relaxed);
             self.shared
@@ -2077,12 +2083,12 @@ pub(crate) mod remote {
         ) -> Result<Bytes, ParquetError> {
             let end = start
                 .checked_add(length as u64)
-                .filter(|end| *end <= self.size)
+                .filter(|end| *end <= self.object_meta.size)
                 .ok_or_else(|| {
                     ParquetError::EOF(format!(
                         "range {start}..{} beyond object size {} for {}",
                         start as u128 + length as u128,
-                        self.size,
+                        self.object_meta.size,
                         self.location
                     ))
                 })?;
@@ -2142,7 +2148,7 @@ pub(crate) mod remote {
     impl std::io::Read for SequentialRemoteRead {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             if self.buf_offset >= self.buf.len() {
-                let remaining = self.reader.size.saturating_sub(self.pos);
+                let remaining = self.reader.object_meta.size.saturating_sub(self.pos);
                 if remaining == 0 {
                     return Ok(0);
                 }
@@ -2570,6 +2576,44 @@ pub(crate) mod remote {
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
+        }
+
+        #[test]
+        fn replaced_object_is_rejected_by_direct_and_staged_reads() {
+            use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
+            use std::sync::Arc;
+            for staged in [false, true] {
+                let store = Arc::new(InMemory::new());
+                let location = Path::from("versioned.parquet");
+                let original = multi_rg_parquet(10, 2);
+                super::runtime()
+                    .block_on(store.put(&location, original.clone().into()))
+                    .unwrap();
+                let source = super::RemoteSource::from_store(
+                    store.clone(),
+                    location.clone(),
+                    "memory://versioned.parquet".into(),
+                )
+                .unwrap();
+                source.load_footer().unwrap();
+                // Keep the footer and physical layout identical; only the store's
+                // object version changes between HEAD/footer and the data GET.
+                super::runtime()
+                    .block_on(store.put(&location, original.into()))
+                    .unwrap();
+                let err = if staged {
+                    source
+                        .stage_row_groups_with(None, &tunables(0))
+                        .unwrap_err()
+                        .to_string()
+                } else {
+                    source.reader().fetch(4..12).unwrap_err().to_string()
+                };
+                assert!(
+                    err.contains("Precondition") || err.contains("precondition"),
+                    "{err}"
+                );
+            }
         }
 
         fn tunables(window: u64) -> StagingTunables {

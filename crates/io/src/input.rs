@@ -16,6 +16,32 @@ pub struct RemoteObjectMeta {
 }
 
 #[cfg(feature = "remote")]
+impl RemoteObjectMeta {
+    /// Fetch bytes bound to the object identity captured by HEAD or listing.
+    ///
+    /// Both footer/data reads and coalesced staging use this precondition so
+    /// replacing an object cannot mix bytes from different versions (#547).
+    /// Stores without entity tags retain the existing size/footer identity contract.
+    ///
+    /// # Errors
+    /// Returns the store's precondition error if the ETag changed, or any
+    /// transport/body error. A failed conditional read is never retried unbound.
+    pub async fn get_range(
+        &self,
+        store: &dyn object_store::ObjectStore,
+        location: &object_store::path::Path,
+        range: std::ops::Range<u64>,
+    ) -> object_store::Result<bytes::Bytes> {
+        let options = object_store::GetOptions {
+            if_match: self.e_tag.clone(),
+            range: Some(range.into()),
+            ..Default::default()
+        };
+        store.get_opts(location, options).await?.bytes().await
+    }
+}
+
+#[cfg(feature = "remote")]
 impl From<object_store::ObjectMeta> for RemoteObjectMeta {
     fn from(meta: object_store::ObjectMeta) -> Self {
         Self {

@@ -336,6 +336,12 @@ plans without that optional field retain the size/footer binding; stores
 without ETags get a warning explaining its limits. The row count remains
 essential because the winner table is addressed by row *position*.
 
+Every remote range GET (footer, direct data reads and coalesced staging)
+uses `RemoteObjectMeta::get_range` in `tylertoo-io`, with the captured ETag
+as an `If-Match` precondition. A replacement after HEAD or footer loading
+therefore fails at the store instead of mixing object versions. Conditional
+failures propagate without retrying an unconditional read.
+
 Both paths are preflighted in `validate_options` (#513), alongside the #272
 `--spill-dir` check: `--plan` must be readable and carry the plan magic, and
 `--save-plan` must be writable — its parent must exist and accept a write,
@@ -1405,3 +1411,18 @@ need not equal the canonical band's sum. The shared validator still checks
 types and count statistics; whole-source mass equality applies to complete,
 unsharded files. Both engines set this provenance through the shared writer
 options builder.
+
+Sampling and covering-based row-group pruning share the descriptor's CRS
+range validation over both extrema of all four covering leaves. A rejected
+group stays selected for geometry decoding, even when other groups have
+usable bounds. Sampling additionally requires Float64 leaves for exact
+equivalence with geometry-derived signals.
+Ordered infinite bounds retain their empty-envelope pruning semantics but
+cannot supply a finite sample.
+
+Legacy clustered overview shards from tylertoo 0.8.x and earlier lack the
+subset marker. When their level sums differ, validation, reader open and
+export refuse them with a versioned error requesting recreation from the
+original GeoParquet. An unmarked old file cannot safely distinguish spatial
+cropping from invalid cluster counts; legacy files with conserved sums
+remain readable.
