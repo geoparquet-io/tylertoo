@@ -9,9 +9,25 @@ permissions:
 
 jobs:
   mutants:
-    name: Mutants (workspace diff)
+    name: Mutants (workspace diff, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # 2,765 mutants exhausted one runner's 90-minute limit on #787.
+    # 64 native shards put that diff at 43-44 mutants per runner, leaving
+    # room for the workspace baseline and slow mutants. Run every slice;
+    # one survivor must not cancel the other shards' evidence.
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+    env:
+      SHARD: ${{ matrix.shard }}
+      # Derive the denominator from the matrix so slices cannot drift.
+      SHARD_COUNT: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,11 +68,11 @@ jobs:
           eval "$(scripts/setup_go_pmtiles.sh --print-path)"
           echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
       - name: Test mutants in the PR diff
-        run: scripts/mutants-diff.sh HEAD^1
+        run: scripts/mutants-diff.sh HEAD^1 --sharding round-robin --shard "$SHARD/$SHARD_COUNT" -j 2
       - name: Upload mutation results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mutation-diff
+          name: mutation-diff-${{ matrix.shard }}
           path: mutants.out/
           if-no-files-found: ignore

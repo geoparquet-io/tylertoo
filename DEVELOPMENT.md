@@ -803,45 +803,47 @@ The Version Consistency job checks all five. Move versions only with
 ## Scheduled and advisory jobs
 
 These jobs don't block a merge, with one exception: the Mutation gate
-blocks a `fix` PR.
+blocks every code PR.
 
 ### Mutation testing
 
-Every PR gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
-check "Mutation score (diff-scoped)"). It runs `cargo mutants
---in-diff` on the PR's diff against `origin/main`, once for
-`tylertoo-core` (`.cargo/mutants.toml`) and once for the CLI
-(`.cargo/mutants-cli.toml`). So it tests only the mutants inside changed
-core and CLI lines. The mutants are split across up to four runners,
-about twelve each, so a diff of up to ~50 mutants finishes in about 15
-minutes. One
-runner used to take 40 minutes for 65 mutants and time out past ~130.
-A bigger diff gets a random sample instead: each runner takes its share
-from across the whole diff in shuffled order and stops after 20 minutes,
-and the summary says how many of the planned mutants ran.
+The CI plan calls `.github/workflows/mutation-diff.yml` for code PRs.
+Its "Mutants (workspace diff, shard N)" jobs run
+`scripts/mutants-diff.sh HEAD^1`: the diff is against the first parent
+of the checked-out PR merge commit. The script selects the whole
+workspace, including the I/O owner and Python bindings, with all features
+and locked dependencies. It uses `.cargo/mutants-cli.toml`, whose build
+arguments have no package-specific test targets, and passes `--workspace`
+to Cargo so the baseline and each mutant build and test all consumers.
+Only mutation sites on changed lines are selected by `--in-diff`.
 
-The score and the missed mutants (`file:line`) go to the job summary. A
-same-repo PR with missed mutants also gets one sticky comment, updated
-on every push. Missed mutants from a sampled run are posted too. A PR
-that touches no Rust under `crates/core/` or `crates/cli/` skips the
-run, and a diff with no mutation site reports "no mutants in this diff".
+The matrix divides that set into 64 native cargo-mutants shards with
+`--sharding round-robin --shard k/64`, using zero-based indices and
+two workers per shard. Up to 16 shards run at once. Each job has a
+90-minute limit, including setup and the baseline. All mutants are
+assigned; there is no sampling. Fail-fast is disabled so one failed
+shard does not cancel the others. A 2,765-mutant diff has 43–44 mutants
+per shard; actual completion time depends on build and test costs.
 
-The "Mutation gate" check blocks a PR whose title starts with `fix`,
-such as `fix:` or `fix(cli):`, on any missed mutant on a changed line.
-The exception is a mutant annotated as equivalent, with `// mutants:
-equivalent #NNN` at the end of its line or on a comment line just above
-it. A fix whose own lines can change with no test noticing hasn't pinned
-what it fixed. For every other PR the gate passes, and the missed
-mutants stay a hint. The gate reads the title when it runs, so re-run
-the workflow after you retitle a PR.
+The direct cargo-mutants exit status gates every code PR through
+"CI passed", regardless of title. Missed mutants, timeouts, baseline
+failures and cancelled jobs cannot produce a passing gate. The script and
+workflow do not interpret issue-linked equivalent-mutant comments. Each shard uploads its
+`mutants.out/` directory as `mutation-diff-N`, even after failure when
+results are available. The workflow adds no score summary or PR comment.
+An empty mutation selection is handled by cargo-mutants.
 
-`scripts/mutants-diff.sh` is the local twin. It also covers uncommitted
-changes and new `.rs` files, and it exits 1 on a missed mutant, so you
-can use it as a gate:
+`scripts/mutants-diff.sh` also runs locally. It defaults to `origin/main`
+and uses `git diff --no-ext-diff --no-renames BASE`, including tracked
+uncommitted changes. Untracked files are absent from that diff; stage
+them or use `git add -N` first. Extra arguments go directly to
+cargo-mutants, whose exit status is preserved (2 for missed mutants,
+3 for timeouts):
 
 ```bash
 scripts/mutants-diff.sh              # vs origin/main
-scripts/mutants-diff.sh main -- -j 2 # base, extra args
+scripts/mutants-diff.sh main -j 2    # base, extra cargo-mutants args
+scripts/mutants-diff.sh main --sharding round-robin --shard 0/64 -j 2
 ```
 
 The weekly job (`.github/workflows/mutation-tests.yml`, Sundays) runs
@@ -871,7 +873,7 @@ To reproduce locally, with the submodule and fixtures in place:
 cargo install cargo-mutants cargo-nextest --locked
 # What would mutate
 cargo mutants --package tylertoo-core --list
-# One file, in minutes
+# Narrow mutations to one file
 cargo mutants --package tylertoo-core \
   -f crates/core/src/overview/simplify.rs
 # One function's mutants
@@ -879,7 +881,7 @@ cargo mutants --package tylertoo-core -F 'fn_name'
 # Only code this branch touched
 cargo mutants --package tylertoo-core \
   --in-diff <(git diff main...HEAD)
-# The full sweep, about one CPU-day
+# The full core sweep
 cargo mutants --package tylertoo-core
 ```
 
@@ -890,7 +892,7 @@ dependencies at `opt-level = 3`. For a short local run, add
 `target/`, and restores each file at the end, so leave the tree alone
 while it runs.
 
-cargo-mutants can't narrow the tests to the mutated file. Narrowing them
+cargo-mutants does not automatically select tests by mutated file. Narrowing them
 by hand loses catches. In a 30-mutant sample, 11 of 28 catches came from
 a test in *another* module or an integration binary. Run the whole
 `mutants` set, and narrow the *mutants* with `-f`, `-F`, or `--in-diff`
