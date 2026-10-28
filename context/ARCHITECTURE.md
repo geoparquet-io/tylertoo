@@ -1445,3 +1445,22 @@ export refuse them with a versioned error requesting recreation from the
 original GeoParquet. An unmarked old file cannot safely distinguish spatial
 cropping from invalid cluster counts; legacy files with conserved sums
 remain readable.
+
+### Cascade square dithering and quality-matched parity (#749, #779)
+
+The shared cascade planner records a dither policy on each step; serial and
+pipelined execution consume that same step. Density-reduced conversions use
+canonical source area/anchor for collapsed squares, retaining the #749 stopgap
+that prevents previous placeholder squares from inflating coarse-level area.
+When density reduction is disabled (including `--verbatim --simplify-factor 1`),
+the cascade keeps main's working-geometry dither for tippecanoe parity. Applying
+the source-area stopgap to that path reduced Madagascar's z0 overview count
+from 1,150 to 379 with z0–2 and left z1 unchanged at 1,568.
+
+DIVERGENCE FROM TIPPECANOE: density-reduced runs use deterministic source-area
+hash dithering rather than tippecanoe's serial tiny-polygon accumulator (the
+existing #279 divergence). Unreduced runs preserve the calibrated cascade
+behavior, including its coarse-level placeholder area inflation; fully fixing
+#749 there conflicts with the current parity bands. `--no-cascade` remains the
+workaround when source-based per-level simplification is desired. The strict
+Moldova `pv0` decay exemption remains until the stopgap satisfies that invariant.

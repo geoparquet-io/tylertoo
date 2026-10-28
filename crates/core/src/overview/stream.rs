@@ -1018,10 +1018,8 @@ fn build_cascade_chains(
             let mut chain: Vec<CascadeStep> = emitted
                 .iter()
                 .filter(|f| (f.orig as usize) < finest && f.orig >= e.orig)
-                .map(|f| CascadeStep {
-                    gsd_meters: f.gsd,
-                    repr: repr_of(f.zoom),
-                    zoom: f.zoom,
+                .map(|f| {
+                    CascadeStep::for_level(f.gsd, f.zoom, repr_of(f.zoom), options.density.enabled)
                 })
                 .collect();
             chain.reverse();
@@ -6225,12 +6223,11 @@ pub(super) fn process_batch_cascade(
     // (plus the unmaterialized prefix), or Serial and Pipelined would diverge.
     debug_assert!(ctxs.iter().enumerate().all(|(li, c)| c.cascade_chain.len()
         == ctxs.len() - li + prefix.len()
-        && c.cascade_chain.last()
-            == Some(&CascadeStep {
-                gsd_meters: c.gsd_m,
-                repr: c.repr,
-                zoom: c.zoom,
-            })));
+        && c.cascade_chain
+            .last()
+            .is_some_and(|step| step.gsd_meters == c.gsd_m
+                && step.repr == c.repr
+                && step.zoom == c.zoom)));
     // Coalesce-table presence is uniform across buffered levels (tables are
     // built for every non-verbatim level or none); the superset selection
     // below relies on it.
@@ -6326,12 +6323,8 @@ pub(super) fn process_batch_cascade(
                 if !fold.is_alive() && !has_band_upto[li] {
                     break; // only geometry ctxs remain: dropped stays dropped
                 }
-                let step = CascadeStep {
-                    gsd_meters: ctx.gsd_m,
-                    repr: ctx.repr,
-                    zoom: ctx.zoom,
-                };
-                match fold.step(g, &step, ctx.crs, ctx.simplify, finest.diagnostics) {
+                let step = ctx.cascade_chain.last().expect("nonempty cascade chain");
+                match fold.step(g, step, ctx.crs, ctx.simplify, finest.diagnostics) {
                     FoldStep::Keep { geom, shared: s } => {
                         total += 1;
                         // An unchanged step shares its input's allocation
