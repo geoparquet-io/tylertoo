@@ -2821,6 +2821,133 @@ mod tests {
         )
     }
 
+    #[test]
+    fn public_encoders_keep_zero_area_fill_under_all_ring_windings() {
+        use geo::{Area, BooleanOps, Validation};
+        for (x, y, height) in [
+            (100, 100, 1),
+            (100, 100, 10),
+            (-110, -110, 1),
+            (-110, -110, 10),
+            (4196, 4196, 1),
+            (4196, 4196, 10),
+        ] {
+            let crossing = [(x, y), (x + 10, y + height), (x, y + height), (x + 10, y)];
+            let shell = [
+                (x - 5, y - 5),
+                (x + 15, y - 5),
+                (x + 15, y + height + 5),
+                (x - 5, y + height + 5),
+            ];
+            let line = |r: &[(i32, i32)]| {
+                LineString::from(
+                    r.iter()
+                        .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let center = (
+                x + 5,
+                (f64::from(y) + f64::from(height) / 2.0).round() as i32,
+            );
+            let lobes = MultiPolygon(
+                vec![
+                    Polygon::new(line(&[(x, y), (x + 10, y), center, (x, y)]), vec![]),
+                    Polygon::new(
+                        line(&[
+                            (x, y + height),
+                            center,
+                            (x + 10, y + height),
+                            (x, y + height),
+                        ]),
+                        vec![],
+                    ),
+                ]
+                .into_iter()
+                .filter(|p| p.unsigned_area() > 0.0)
+                .collect(),
+            );
+            for is_hole in [false, true] {
+                let expected = if is_hole {
+                    Polygon::new(line(&shell), vec![]).difference(&lobes)
+                } else {
+                    lobes.clone()
+                };
+                for reverse_crossing in [false, true] {
+                    for reverse_shell in [false, true] {
+                        let mut crossing = crossing.to_vec();
+                        let mut shell = shell.to_vec();
+                        if reverse_crossing {
+                            crossing.reverse();
+                        }
+                        if reverse_shell {
+                            shell.reverse();
+                        }
+                        let mut p = poly_in_tile_units(
+                            &crossing
+                                .iter()
+                                .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                .collect::<Vec<_>>(),
+                        );
+                        if is_hole {
+                            let hole = p.exterior().clone();
+                            p = poly_in_tile_units(
+                                &shell
+                                    .iter()
+                                    .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                    .collect::<Vec<_>>(),
+                            );
+                            p.interiors_push(hole);
+                        }
+                        let diagnostics = crate::diagnostics::Diagnostics::default();
+                        // Include a separate part so MultiPolygon also covers
+                        // the overlap resolver in front of the final gate.
+                        let extra = [(x + 30, y), (x + 40, y), (x + 40, y + 10), (x + 30, y + 10)];
+                        let extra_source = poly_in_tile_units(
+                            &extra
+                                .iter()
+                                .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                .collect::<Vec<_>>(),
+                        );
+                        for (commands, expected) in [
+                            (
+                                encode_polygon(&p, &unit_bounds(), 4096, &diagnostics),
+                                expected.clone(),
+                            ),
+                            (
+                                encode_multi_polygon(
+                                    &MultiPolygon(vec![p.clone(), extra_source]),
+                                    &unit_bounds(),
+                                    4096,
+                                    &diagnostics,
+                                ),
+                                expected.union(&Polygon::new(line(&extra), vec![])),
+                            ),
+                        ] {
+                            let rings = rings_of(&commands);
+                            let out = MultiPolygon(rings_to_geo(&rings));
+                            assert!(out.is_valid(), "{rings:?}");
+                            assert_eq!(out.xor(&expected).unsigned_area(), 0.0,
+                                "wrong encoded fill: origin={x},{y} height={height} hole={is_hole} reversed={reverse_crossing},{reverse_shell}: {rings:?}");
+                            assert_eq!(
+                                rings.iter().filter(|r| area2(r) > 0).count(),
+                                expected.0.len()
+                            );
+                            assert_eq!(
+                                rings.iter().filter(|r| area2(r) < 0).count(),
+                                expected
+                                    .0
+                                    .iter()
+                                    .map(|p| p.interiors().len())
+                                    .sum::<usize>()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A valid source ring whose vertices at x=100 and x=99.7 snap to the
     /// same column, so the quantized ring runs down the column it already
     /// ran up (the shape from #383: raster-derived field boundaries with
@@ -3521,16 +3648,16 @@ mod tests {
     /// A bowtie whose lobes cancel exactly has zero net area; that must not
     /// drop both lobes.
     #[test]
-    fn zero_net_area_bowtie_keeps_a_lobe() {
+    fn zero_net_area_bowtie_keeps_both_lobes() {
         let ring = closed(&[(0, 0), (10, 5), (20, 10), (20, 0), (10, 5), (0, 10)]);
         assert_eq!(ring_area2(&ring), 0, "fixture must have zero net area");
         let polys = tile_polygon::finalize_polygons(
             vec![vec![ring]],
             &crate::diagnostics::Diagnostics::default(),
         );
-        assert!(!polys.is_empty(), "both lobes dropped");
+        assert_eq!(polys.len(), 2, "both lobes must survive");
         let area: i64 = polys.iter().flatten().map(|r| ring_area2(r).abs()).sum();
-        assert!(area > 0);
+        assert_eq!(area, 200);
     }
 
     /// A C-shaped mainland with an island in its concavity: the island's box

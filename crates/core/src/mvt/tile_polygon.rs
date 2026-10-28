@@ -13,8 +13,8 @@
 //! exact integer tests ([`check_polygons`]), the same rules GEOS's
 //! `IsValidOp` (and so `shapely.is_valid`) applies to the decoded tile. The
 //! usual outcome is "valid", and the parts go out untouched: a valid polygon
-//! pays one check and nothing else. A feature that fails is repaired in two
-//! by one `i_overlay` union on the tile's own integer grid
+//! pays one check and nothing else. A feature that fails is repaired
+//! by an `i_overlay` union on the tile's own integer grid
 //! ([`repair_polygons`]). The overlay receives the original rings: splitting
 //! pinches first can discard recoverable fill in crossings and zero-area rings.
 //!
@@ -30,13 +30,19 @@
 //! exactly as quantized instead of being re-traced. The engine is
 //! `i_overlay`'s integer overlay rather than wagyu (`corpus/HOSTILE_GEOMETRY.md`
 //! has the engine comparison).
+//!
+//! DIVERGENCE FROM TIPPECANOE: a zero-shoelace ring has no net winding to
+//! normalize for positive fill. Resolve its nonzero fill first, then apply
+//! its exterior/hole role to the resolved contours. This preserves both
+//! crossing lobes regardless of direction or starting vertex, rather than
+//! choosing one arbitrarily as a raw positive-fill union would.
 
 use super::{
     any_box_pair, edge_box, ring_area2, ring_box, segments_cross_or_overlap, segments_meet,
     TileRing,
 };
 use i_overlay::core::fill_rule::FillRule;
-use i_overlay::core::overlay::{IntOverlayOptions, Overlay, ShapeType};
+use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::core::solver::Solver;
 use i_overlay::i_float::int::point::IntPoint;
@@ -113,7 +119,8 @@ fn overlay_polygons<P: AsRef<[TileRing]>>(parts: &[P], scale: i32) -> Vec<Vec<Ti
             let want_positive = i == 0;
             let open = &ring[..ring.len() - 1];
             contour.clear();
-            if (ring_area2(ring) > 0) == want_positive {
+            let area = ring_area2(ring);
+            if (area > 0) == want_positive {
                 contour.extend(
                     open.iter()
                         .map(|&(x, y)| IntPoint::new(x * scale, y * scale)),
@@ -125,7 +132,21 @@ fn overlay_polygons<P: AsRef<[TileRing]>>(parts: &[P], scale: i32) -> Vec<Vec<Ti
                         .map(|&(x, y)| IntPoint::new(x * scale, y * scale)),
                 );
             }
-            overlay.add_contour(&contour, ShapeType::Subject);
+            if area == 0 {
+                // There is no orientation to normalize. Resolve all enclosed
+                // fill before assigning the ring's role in the feature union.
+                let mut options = IntOverlayOptions::ogc();
+                options.output_direction = if want_positive {
+                    ContourDirection::CounterClockwise
+                } else {
+                    ContourDirection::Clockwise
+                };
+                let shapes = Overlay::from_subj_custom(&contour, options, Solver::default())
+                    .overlay(OverlayRule::Subject, FillRule::NonZero);
+                overlay.add_source(&shapes, ShapeType::Subject);
+            } else {
+                overlay.add_contour(&contour, ShapeType::Subject);
+            }
         }
     }
     let close = |c: Vec<IntPoint<i32>>| -> Option<TileRing> {
@@ -660,6 +681,78 @@ fn edge_step(p: (i64, i64), a: (i32, i32), b: (i32, i32)) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geo::{Area, BooleanOps, LineString, MultiPolygon, Polygon};
+
+    fn as_geo(parts: &[Vec<TileRing>]) -> MultiPolygon {
+        let line = |r: &TileRing| {
+            LineString::from(
+                r.iter()
+                    .map(|&(x, y)| (f64::from(x), f64::from(y)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        MultiPolygon(
+            parts
+                .iter()
+                .map(|p| Polygon::new(line(&p[0]), p[1..].iter().map(line).collect()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn zero_area_repair_is_invariant_to_ring_direction_and_start() {
+        for (x, y) in [(100, 100), (-110, -110), (4196, 4196)] {
+            for height in [1, 10] {
+                let crossing = [(x, y), (x + 10, y + height), (x, y + height), (x + 10, y)];
+                // The crossing is halfway up the ring. Snap the two known
+                // lobes independently; a sub-grid lobe can collapse.
+                let center = (
+                    x + 5,
+                    (f64::from(y) + f64::from(height) / 2.0).round() as i32,
+                );
+                let lobes: Vec<_> = [
+                    ring(&[(x, y), (x + 10, y), center]),
+                    ring(&[(x, y + height), center, (x + 10, y + height)]),
+                ]
+                .into_iter()
+                .filter(|r| ring_area2(r) != 0)
+                .map(|r| vec![r])
+                .collect();
+                let shell = vec![vec![square(x - 5, y - 5, x + 15, y + height + 5)]];
+                for is_hole in [false, true] {
+                    let expected = if is_hole {
+                        as_geo(&shell).difference(&as_geo(&lobes))
+                    } else {
+                        as_geo(&lobes)
+                    };
+                    for shift in 0..crossing.len() {
+                        let mut points = crossing.to_vec();
+                        points.rotate_left(shift);
+                        for reverse_crossing in [false, true] {
+                            for reverse_shell in [false, true] {
+                                let mut rings = if is_hole { shell[0].clone() } else { vec![] };
+                                if reverse_shell {
+                                    rings.iter_mut().for_each(|r| r.reverse());
+                                }
+                                let mut r = ring(&points);
+                                if reverse_crossing {
+                                    r.reverse();
+                                }
+                                rings.push(r);
+                                let out = finalize_polygons(
+                                    vec![rings],
+                                    &crate::diagnostics::Diagnostics::default(),
+                                );
+                                assert_eq!(check_polygons(&out), Ok(()));
+                                assert_eq!(as_geo(&out).xor(&expected).unsigned_area(), 0.0,
+                                    "wrong fill: origin={x},{y} height={height} hole={is_hole} shift={shift} reversed={reverse_crossing},{reverse_shell}: {out:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn ring(pts: &[(i32, i32)]) -> TileRing {
         let mut r = pts.to_vec();
@@ -942,9 +1035,7 @@ mod tests {
         assert!(area(&fixed) > 0);
     }
 
-    /// Random rings on a small grid (most of them self-intersecting, holes
-    /// anywhere, parts overlapping) always repair to a feature that passes
-    /// the check, and the check passes valid input through untouched.
+    /// Snapped rings of the two Madagascar ADM4 features from #779.
     #[test]
     fn madagascar_small_crossings_keep_fill() {
         for points in [
@@ -1004,6 +1095,73 @@ mod tests {
     }
 
     #[test]
+    fn repair_preserves_fill_against_independent_unary_union() {
+        use geo::orient::{Direction, Orient};
+
+        let mut seed = 0x779_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32
+        };
+        let (mut repaired, mut kept) = (0, 0);
+        for case in 0..3000 {
+            let origin = [-512, 0, 4096][case % 3];
+            // Each part has known, orientation-independent fill. Overlaps
+            // between parts still require the integer repair. Rectilinear
+            // edges keep intersections on-grid, so no rounding tolerance
+            // can hide a missing component or an incorrectly bound hole.
+            let parts: Vec<Vec<TileRing>> = (0..=next() % 4)
+                .map(|_| {
+                    let (x, y) = (origin + 4 * (next() % 20), origin + 4 * (next() % 20));
+                    let (w, h) = (12 + 4 * (next() % 10), 12 + 4 * (next() % 10));
+                    let mut rings = vec![square(x, y, x + w, y + h)];
+                    if next() % 2 == 0 {
+                        rings.push(square(x + 4, y + 4, x + w - 4, y + h - 4));
+                    }
+                    for r in &mut rings {
+                        if next() % 2 == 0 {
+                            r.reverse();
+                        }
+                    }
+                    rings
+                })
+                .collect();
+            let source = as_geo(&parts).orient(Direction::Default);
+            let expected = geo::algorithm::unary_union(&source.0);
+            let out = finalize_polygons(parts.clone(), &crate::diagnostics::Diagnostics::default());
+            assert_eq!(
+                check_polygons(&out),
+                Ok(()),
+                "case {case}: {parts:?} -> {out:?}"
+            );
+            assert_eq!(
+                filled_area2(&out) as f64 / 2.0,
+                expected.unsigned_area(),
+                "area, case {case}: {parts:?} -> {out:?}"
+            );
+            assert_eq!(
+                as_geo(&out).xor(&expected).unsigned_area(),
+                0.0,
+                "region, case {case}: {parts:?} -> {out:?}"
+            );
+            if out == parts {
+                kept += 1;
+            } else {
+                repaired += 1;
+            }
+        }
+        assert!(
+            repaired > 1000 && kept > 50,
+            "repaired={repaired} kept={kept}"
+        );
+    }
+
+    /// Arbitrary self-crossing rings retain the broader validity stress
+    /// coverage; fill is checked independently above, never by re-running
+    /// the repair as its own oracle.
+    #[test]
     fn repair_always_passes_the_check_on_random_input() {
         let mut seed = 0x748_u64;
         let mut next = move || {
@@ -1027,11 +1185,6 @@ mod tests {
                 .collect();
             let out = finalize_polygons(parts.clone(), &crate::diagnostics::Diagnostics::default());
             assert_eq!(check_polygons(&out), Ok(()), "{parts:?} -> {out:?}");
-            assert_eq!(
-                filled_area2(&out),
-                filled_area2(&repair_polygons(&parts)),
-                "repair lost positive fill: {parts:?} -> {out:?}"
-            );
             if out == parts {
                 kept += 1;
             } else {
