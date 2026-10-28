@@ -190,7 +190,7 @@ fn bind_holes(shells: &mut [Vec<TileRing>], holes: Vec<TileRing>) {
     if holes.is_empty() {
         return;
     }
-    let boxes: Vec<_> = holes.iter().map(|h| ring_box(h)).collect();
+    let boxes: Vec<_> = holes.iter().map(ring_box).collect();
     let areas: Vec<i64> = shells.iter().map(|s| ring_area2(&s[0]).abs()).collect();
     let mut targets: Vec<Option<usize>> = vec![None; holes.len()];
     for (i, shell) in shells.iter().enumerate() {
@@ -612,7 +612,15 @@ fn locate_rings(rings: &[&TileRing], other: &TileRing) -> Vec<Loc> {
 /// exact) against a closed ring. Exact crossing-number test.
 fn locate2(p: (i64, i64), ring: &TileRing) -> Loc {
     let mut inside = false;
+    // Compare edge y coordinates on their original grid. These bounds also
+    // handle negative half-grid queries without doubling every endpoint.
+    let floor_y = p.1.div_euclid(2);
+    let ceil_y = floor_y + (p.1 & 1);
     for w in ring.windows(2) {
+        let (ay, by) = (i64::from(w[0].1), i64::from(w[1].1));
+        if (ay < ceil_y && by < ceil_y) || (ay > floor_y && by > floor_y) {
+            continue;
+        }
         match edge_step(p, w[0], w[1]) {
             Step::Boundary => return Loc::Boundary,
             Step::Toggle => inside = !inside,
@@ -662,7 +670,8 @@ fn locate_points(points: &[(i64, i64)], ring: &TileRing) -> Vec<Loc> {
 }
 
 /// What one ring edge `a`–`b` does to a crossing-number test at the doubled
-/// point `p`.
+/// point `p`. The caller has established that `p` lies in the edge's closed
+/// y interval, either by scalar filtering or a sorted query slice.
 enum Step {
     Boundary,
     Toggle,
@@ -674,9 +683,6 @@ fn edge_step(p: (i64, i64), a: (i32, i32), b: (i32, i32)) -> Step {
     let (px, py) = p;
     let (ax, ay) = (2 * i64::from(a.0), 2 * i64::from(a.1));
     let (bx, by) = (2 * i64::from(b.0), 2 * i64::from(b.1));
-    if py < ay.min(by) || py > ay.max(by) {
-        return Step::Pass;
-    }
     if px >= ax.min(bx) && px <= ax.max(bx) && (bx - ax) * (py - ay) == (by - ay) * (px - ax) {
         return Step::Boundary;
     }
@@ -697,6 +703,39 @@ fn edge_step(p: (i64, i64), a: (i32, i32), b: (i32, i32)) -> Step {
 mod tests {
     use super::*;
     use geo::{Area, BooleanOps, LineString, MultiPolygon, Polygon};
+
+    #[test]
+    fn point_location_matches_geo_at_integer_and_half_grid_queries() {
+        use geo::{Contains, Intersects};
+
+        for points in [
+            &[(0, -4), (4, -4), (4, 4), (0, 4)][..],
+            &[(-4, -3), (3, -3), (3, 3), (0, 0), (-4, 3)][..],
+        ] {
+            let r = ring(points);
+            let shape = as_geo(&[vec![r.clone()]]);
+            let queries: Vec<_> = (-12..=12)
+                .flat_map(|x| (-12..=12).map(move |y| (x, y)))
+                .collect();
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|&(x, y)| {
+                    let p = geo::Point::new(x as f64 / 2.0, y as f64 / 2.0);
+                    if shape.contains(&p) {
+                        Loc::Inside
+                    } else if shape.intersects(&p) {
+                        Loc::Boundary
+                    } else {
+                        Loc::Outside
+                    }
+                })
+                .collect();
+            assert_eq!(locate_points(&queries, &r), expected);
+            for (&p, location) in queries.iter().zip(expected) {
+                assert_eq!(locate2(p, &r), location, "point {p:?}");
+            }
+        }
+    }
 
     fn as_geo(parts: &[Vec<TileRing>]) -> MultiPolygon {
         let line = |r: &TileRing| {
