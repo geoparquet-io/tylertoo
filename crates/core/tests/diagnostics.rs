@@ -4,10 +4,10 @@ use tylertoo_core::diagnostics::{Diagnostic, Diagnostics};
 fn schema_resolution_defers_warning_logs_until_an_operation() {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Mutex;
-    use tylertoo_core::diagnostics::CrsWarning;
+    use tylertoo_core::diagnostics::{CoveringWarning, CrsWarning};
     use tylertoo_core::resolved_schema::ResolvedSchema;
 
-    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static LINES: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
     struct Capture;
     impl log::Log for Capture {
         fn enabled(&self, _: &log::Metadata<'_>) -> bool {
@@ -15,14 +15,16 @@ fn schema_resolution_defers_warning_logs_until_an_operation() {
         }
         fn log(&self, record: &log::Record<'_>) {
             let message = record.args().to_string();
-            if message.contains("GeoParquet 'geo' metadata has no 'version'") {
-                LINES.lock().unwrap().push(message);
+            if message.contains("GeoParquet 'geo' metadata has no 'version'")
+                || message.starts_with("bbox covering fast path declined:")
+            {
+                LINES.lock().unwrap().push((record.level(), message));
             }
         }
         fn flush(&self) {}
     }
     log::set_logger(&Capture).expect("the only logger in this test binary");
-    log::set_max_level(log::LevelFilter::Warn);
+    log::set_max_level(log::LevelFilter::Debug);
 
     let schema = Schema::new_with_metadata(
         vec![Field::new("geometry", DataType::Binary, true)],
@@ -51,8 +53,68 @@ fn schema_resolution_defers_warning_logs_until_an_operation() {
     let operation = Diagnostics::default();
     operation.once(warning.clone());
     operation.once(warning.clone());
-    assert_eq!(*LINES.lock().unwrap(), vec![warning.to_string()]);
+    assert_eq!(
+        *LINES.lock().unwrap(),
+        vec![(log::Level::Warn, warning.to_string())]
+    );
     assert_eq!(operation.snapshot(), vec![warning]);
+
+    // Missing an optional covering is routine; a broken declared covering
+    // needs a warning. Both remain available in the operation's report.
+    let routine = Diagnostic::CoveringRejected {
+        count: 1,
+        reason: CoveringWarning::NoCovering,
+    };
+    let broken = Diagnostic::CoveringRejected {
+        count: 1,
+        reason: CoveringWarning::MissingStatistics(7),
+    };
+    LINES.lock().unwrap().clear();
+    operation.record(routine.clone());
+    operation.record(broken.clone());
+    assert_eq!(
+        *LINES.lock().unwrap(),
+        vec![
+            (log::Level::Debug, routine.to_string()),
+            (log::Level::Warn, broken.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn range_messages_require_events_and_a_denominator() {
+    use tylertoo_core::diagnostics::RangeContext;
+    use tylertoo_core::overview::level::Crs;
+
+    for make in [
+        |count, context| Diagnostic::Wrapped {
+            count,
+            context,
+            exemplars: vec![],
+        },
+        |count, context| Diagnostic::OutOfRange {
+            count,
+            context,
+            exemplars: vec![],
+        },
+        |count, context| Diagnostic::Unprojectable { count, context },
+    ] {
+        let event = |count, total| {
+            make(
+                count,
+                Some(RangeContext {
+                    total,
+                    crs: Crs::Epsg4326,
+                    max_abs: 1000.0,
+                }),
+            )
+        };
+        assert!(event(0, 10).to_string().is_empty());
+        assert!(event(1, 0).to_string().is_empty());
+        assert!(event(1, 10)
+            .to_string()
+            .contains("1 of 10 feature(s) (10.0%)"));
+    }
 }
 
 #[test]
@@ -90,12 +152,8 @@ fn diagnostics_serialize_as_typed_dictionaries() {
 
 #[test]
 fn out_of_range_display_preserves_excess_and_source_identity() {
-    for (axis, value) in [
-        ("lon", 540.000_000_1),
-        ("lat", -90.000_2),
-        ("x", 70_000_000.0),
-    ] {
-        let event = Diagnostic::OutOfRange {
+    let render = |axis, value| {
+        Diagnostic::OutOfRange {
             context: None,
             count: 1,
             exemplars: vec![tylertoo_core::overview::convert::OutOfRangeExemplar {
@@ -104,11 +162,21 @@ fn out_of_range_display_preserves_excess_and_source_identity() {
                 axis,
                 value,
             }],
-        };
-        let message = event.to_string();
+        }
+        .to_string()
+    };
+    let mercator_edge: f64 = 20_037_508.342_789_244;
+    for (axis, value) in [
+        ("lon", 540.000_000_1),
+        ("lat", -90.000_2),
+        ("x", 3.0 * mercator_edge + 0.000_000_1),
+    ] {
+        let message = render(axis, value);
         assert!(message.contains(&value.to_string()), "{message}");
         assert!(message.contains("part 2, row 7"), "{message}");
     }
+    let far = render("lat", -100.123_456);
+    assert!(far.contains("lat -100.123 (part 2, row 7)"), "{far}");
 }
 
 #[test]
