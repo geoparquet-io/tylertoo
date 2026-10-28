@@ -137,9 +137,9 @@ fn overview_surfaces_the_mode_rules() {
             "partitioning",
         ];
         argv.extend_from_slice(flags);
-        let (ok, stderr) = run(&argv);
-        assert!(!ok, "{flags:?} must be refused");
-        assert!(stderr.contains(needle), "{flags:?}: {stderr}");
+        let (code, stderr) = run_code(&argv);
+        assert_refused(code, &stderr, needle, &format!("{flags:?}"));
+        assert!(!output.exists());
     }
 }
 
@@ -150,19 +150,18 @@ fn export_and_pyramid_surface_the_export_rules() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("never-read.parquet");
     let output = dir.path().join("out.pmtiles");
-    let (ok, stderr) = run(&[
+    let (code, stderr) = run_code(&[
         "export-pmtiles",
         input.to_str().unwrap(),
         output.to_str().unwrap(),
         "--spill-dir",
         "/nonexistent/tylertoo-779",
     ]);
-    assert!(!ok);
-    assert!(stderr.contains("not an existing directory"), "{stderr}");
+    assert_refused(code, &stderr, "not an existing directory", "export-pmtiles");
 
     let band = dir.path().join("band.parquet");
     std::fs::write(&band, b"never read").unwrap();
-    let (ok, stderr) = run(&[
+    let (code, stderr) = run_code(&[
         "pyramid",
         output.to_str().unwrap(),
         "--band",
@@ -170,8 +169,18 @@ fn export_and_pyramid_surface_the_export_rules() {
         "--tile-buffer",
         "999",
     ]);
-    assert!(!ok);
-    assert!(stderr.contains("--tile-buffer 999"), "{stderr}");
+    assert_refused(code, &stderr, "--tile-buffer 999", "pyramid");
+    assert!(!output.exists());
+}
+
+#[test]
+fn unreadable_input_is_a_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("missing.parquet");
+    let output = dir.path().join("out.pmtiles");
+    let (code, stderr) = run_code(&["tiles", input.to_str().unwrap(), output.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("missing.parquet"), "{stderr}");
     assert!(!output.exists());
 }
 

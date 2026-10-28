@@ -143,3 +143,123 @@ fn counter_queries_preserve_diagnostic_subtypes() {
         2
     );
 }
+
+#[test]
+fn unusable_geometry_aggregates_both_losses_and_input_rows() {
+    let sink = Diagnostics::default();
+    sink.record(Diagnostic::UnusableGeometry {
+        count: 2,
+        total: 10,
+    });
+    sink.extend([Diagnostic::UnusableGeometry {
+        count: 3,
+        total: 20,
+    }]);
+    let events = sink.snapshot();
+    assert_eq!(
+        events,
+        vec![Diagnostic::UnusableGeometry {
+            count: 5,
+            total: 30
+        }]
+    );
+    assert_eq!(
+        events[0].to_string(),
+        "skipping 5 of 30 input rows with a null, empty, or non-finite geometry"
+    );
+}
+
+#[test]
+fn advisory_counts_are_queried_by_complete_message() {
+    let sink = Diagnostics::default();
+    let first = Diagnostic::Advisory {
+        count: 2,
+        message: "first warning".into(),
+    };
+    let second = Diagnostic::Advisory {
+        count: 3,
+        message: "second warning".into(),
+    };
+    sink.extend([first.clone(), second.clone()]);
+    sink.once(first.clone());
+    assert_eq!(sink.count(&first), 2);
+    assert_eq!(sink.count(&second), 3);
+    assert_eq!(
+        sink.count(&Diagnostic::Advisory {
+            count: 0,
+            message: "absent warning".into()
+        }),
+        0
+    );
+    assert_eq!(sink.snapshot().len(), 2);
+}
+
+#[test]
+fn range_aggregation_preserves_crs_and_combines_only_matching_contexts() {
+    use tylertoo_core::diagnostics::RangeContext;
+    use tylertoo_core::overview::level::Crs;
+
+    // Exercise every range diagnostic through the public sink. CRS is part
+    // of its identity: degrees and metres must never share a denominator.
+    for make in [
+        |context| Diagnostic::OutOfRange {
+            count: 1,
+            context,
+            exemplars: vec![],
+        },
+        |context| Diagnostic::Unprojectable { count: 1, context },
+        |context| Diagnostic::Wrapped {
+            count: 1,
+            context,
+            exemplars: vec![],
+        },
+    ] {
+        let degrees = RangeContext {
+            total: 10,
+            crs: Crs::Epsg4326,
+            max_abs: 200.0,
+        };
+        let metres = RangeContext {
+            total: 30,
+            crs: Crs::Epsg3857,
+            max_abs: 30_000_000.0,
+        };
+        let events = [
+            make(Some(degrees)),
+            make(Some(metres)),
+            make(Some(RangeContext {
+                total: 20,
+                max_abs: 250.0,
+                ..degrees
+            })),
+            make(None),
+        ];
+        for reverse in [false, true] {
+            let sink = Diagnostics::default();
+            let mut ordered = events.clone();
+            if reverse {
+                ordered.reverse();
+            }
+            sink.extend(ordered);
+            let actual = sink.snapshot();
+            let mut combined = make(Some(RangeContext {
+                total: 30,
+                max_abs: 250.0,
+                ..degrees
+            }));
+            match &mut combined {
+                Diagnostic::OutOfRange { count, .. }
+                | Diagnostic::Unprojectable { count, .. }
+                | Diagnostic::Wrapped { count, .. } => *count = 2,
+                _ => unreachable!(),
+            }
+            assert_eq!(actual.len(), 3, "{actual:?}");
+            for expected in [combined, make(Some(metres)), make(None)] {
+                assert!(
+                    actual.contains(&expected),
+                    "missing {expected:?} in {actual:?}"
+                );
+            }
+        }
+    }
+}

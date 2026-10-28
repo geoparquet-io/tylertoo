@@ -1885,6 +1885,50 @@ mod tests {
     use tylertoo_core::overview::export::FeatureOrder;
     use tylertoo_core::overview::level::MemoryProfile;
 
+    #[test]
+    fn usage_errors_retain_their_classification_through_context() {
+        use tylertoo_core::overview::convert::ConvertError;
+        use tylertoo_core::overview::export::ExportError;
+        use tylertoo_core::overview::tiles::TilesError;
+
+        let config_error = || config::ConfigError::InvalidExtent { extent: 0 };
+        for error in [
+            anyhow::Error::new(config_error()),
+            step_failed(
+                "overview conversion",
+                ConvertError::VerbatimPartitioningUnsupported,
+                ConvertError::is_config,
+            ),
+            step_failed(
+                "export",
+                ExportError::Config(config_error()),
+                ExportError::is_config,
+            ),
+            anyhow::Error::new(TilesError::Convert(
+                ConvertError::VerbatimPartitioningUnsupported,
+            )),
+            anyhow::Error::new(TilesError::Export(ExportError::Config(config_error()))),
+            step_failed(
+                "pyramid build",
+                tylertoo_core::Error::InvalidConfig("invalid band".into()),
+                tylertoo_core::Error::is_config,
+            ),
+        ] {
+            assert!(is_usage_error(&error), "{error:#}");
+            assert!(!error.to_string().contains("failed:"), "{error}");
+            assert!(is_usage_error(
+                &error.context("outer context").context("caller")
+            ));
+        }
+        for error in [
+            anyhow::anyhow!("untyped run failure"),
+            anyhow::Error::new(ExportError::Io(std::io::Error::other("disk full"))),
+            anyhow::Error::new(tylertoo_core::Error::Io(std::io::Error::other("disk full"))),
+        ] {
+            assert!(!is_usage_error(&error.context("caller")));
+        }
+    }
+
     /// Every subcommand clap knows is left alone by the bare-form rewrite,
     /// and the names it used to hard-code still are.
     #[test]

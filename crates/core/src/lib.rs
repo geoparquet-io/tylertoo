@@ -137,3 +137,32 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_configuration_errors_are_classified_as_config() {
+        assert!(
+            Error::Config(overview::config::ConfigError::InvalidExtent { extent: 0 }).is_config()
+        );
+        assert!(Error::InvalidConfig("invalid band options".into()).is_config());
+        for error in [
+            Error::GeoParquetRead("invalid footer".into()),
+            Error::PMTilesRead("invalid header".into()),
+            Error::PMTilesWrite("disk full".into()),
+            Error::InvalidGeometry {
+                feature_id: 7,
+                reason: "invalid ring".into(),
+            },
+            Error::MvtEncoding("invalid property".into()),
+            Error::Io(std::io::Error::other("disk full")),
+            Error::Accounting(diagnostics::AccountingError::Io(std::io::Error::other(
+                "spill failed",
+            ))),
+        ] {
+            assert!(!error.is_config(), "runtime error misclassified: {error}");
+        }
+    }
+}

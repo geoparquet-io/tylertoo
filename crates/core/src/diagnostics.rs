@@ -283,13 +283,15 @@ impl Diagnostic {
         event_count!(self)
     }
     fn accumulate(&mut self, event: &Self) {
+        // Both callers select by same_kind first, which owns context
+        // identity (including CRS). Only the counts and totals merge here.
         let count = self.count().saturating_add(event.count());
         match (&mut *self, event) {
             (Self::OutOfRange { context: a, .. }, Self::OutOfRange { context: b, .. })
             | (Self::Unprojectable { context: a, .. }, Self::Unprojectable { context: b, .. })
             | (Self::Wrapped { context: a, .. }, Self::Wrapped { context: b, .. }) => {
                 *a = match (*a, *b) {
-                    (Some(a), Some(b)) if a.crs == b.crs => Some(RangeContext {
+                    (Some(a), Some(b)) => Some(RangeContext {
                         total: a.total.saturating_add(b.total),
                         crs: a.crs,
                         max_abs: a.max_abs.max(b.max_abs),
@@ -324,9 +326,6 @@ impl Diagnostic {
     }
 
     fn same_kind(&self, other: &Self) -> bool {
-        if !self.same_counter_kind(other) {
-            return false;
-        }
         // Counts and denominators aggregate; every other payload belongs to
         // its own context. Comparing normalized events also covers future
         // variants, rather than silently keeping their first payload.
