@@ -80,6 +80,7 @@ additional_cargo_args = [
   "--test", "rayon_pool_reentry",
   "--test", "reader_projection",
   "--test", "resolved_schema",
+  "--test", "simplify_parity",
   "--test", "webmercator_roundtrip",
   "--test", "wrapped_log",
 ]

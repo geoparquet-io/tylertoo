@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,10 +47,10 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch, non_ut
         spill = Path(os.fsdecode(os.fsencode(spill) + b"-\xff"))
     spill.mkdir()
     monkeypatch.setenv("TMPDIR", str(spill))
-    spill_options = {} if non_utf8 else {"spill_dir": str(spill)}
+    spill_dir = None if non_utf8 else str(spill)
     rows = 4096
     source = tmp_path / "losses.parquet"
-    metadata = {
+    metadata: dict[str, Any] = {
         "version": "1.1.0",
         "primary_column": "geometry",
         "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
@@ -69,7 +70,7 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch, non_ut
             min_zoom=0,
             max_zoom=0,
             filter="id = 0",
-            **spill_options,
+            spill_dir=spill_dir,
         )
         losses = (
             report["convert"]["source_losses"]
@@ -102,9 +103,10 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch, non_ut
         str(overview),
         str(tmp_path / "quantized.pmtiles"),
         feature_id="id",
-        **spill_options,
+        spill_dir=spill_dir,
     )
     losses = report["source_losses"]
+    assert not isinstance(losses, list)
     assert losses["count"] == rows - 1
     path = Path(losses["path"])
     with path.open() as stream:
@@ -122,6 +124,6 @@ def test_large_losses_are_exact_caller_owned_jsonl(tmp_path, monkeypatch, non_ut
             max_zoom=0,
             filter="id = 0",
             feature_id="geometry",
-            **spill_options,
+            spill_dir=spill_dir,
         )
     assert list(spill.iterdir()) == []
