@@ -679,7 +679,7 @@ pub(super) fn rebase_plan_for_shard(
         )?);
     }
 
-    plan.totals.source_losses = crate::diagnostics::SourceLosses::try_from_iter(
+    plan.totals.source_losses = crate::diagnostics::SourceLosses::try_from_iter_in(
         plan.totals
             .source_losses
             .iter()
@@ -695,6 +695,7 @@ pub(super) fn rebase_plan_for_shard(
                         })
                     }),
             }),
+        plan.totals.source_losses.spill_dir(),
     )
     .map_err(|e| ConvertError::InvalidConfig(format!("--plan: source accounting: {e}")))?;
     // Side tables are keyed by the same row index, so they move with it.
@@ -1482,13 +1483,7 @@ impl ConvertPlan {
             .checked_add(length)
             .filter(|&n| n <= file.metadata().map_or(0, |m| m.len()).saturating_sub(8))
             .ok_or_else(|| plan_err(path, "loss partition extends past the IPC payload"))?;
-        let stream =
-            serde_json::Deserializer::from_reader(BufReader::new((&mut file).take(length)))
-                .into_iter::<crate::diagnostics::SourceLoss>()
-                .map(|loss| loss.map_err(|e| std::io::Error::other(e).into()));
-        let losses = crate::diagnostics::SourceLosses::try_from_iter_in(stream, spill_dir)
-            .map_err(|e| plan_err(path, &format!("loss partition: {e}")))?;
-        let mut reader = tylertoo_io::open_ipc(ipc_view(file, offset))
+        let mut reader = tylertoo_io::open_ipc(ipc_view(file.try_clone()?, offset))
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
@@ -1509,7 +1504,6 @@ impl ConvertPlan {
                 ),
             ));
         }
-        meta.totals.source_losses = losses;
         // The JSON block is user-reachable input too: `num_levels` sizes an
         // allocation and `finest`/`counts` index it, so bound them here
         // rather than trusting them into a `vec![_; n]`.
@@ -1552,6 +1546,35 @@ impl ConvertPlan {
         }
 
         let min_levels: Vec<u8> = u8_section(&batch, "min_levels", path)?.unwrap_or_default();
+        if min_levels.len() != meta.totals.n_rows {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "holds {} winner-table row(s) but claims {} input row(s)",
+                    min_levels.len(),
+                    meta.totals.n_rows,
+                ),
+            ));
+        }
+        // Read the row domain before touching the loss ledger: a forged ID
+        // must never size a spill file or force a scan to that address.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64 + 8))?;
+        let stream =
+            serde_json::Deserializer::from_reader(BufReader::new((&mut file).take(length)))
+                .into_iter::<crate::diagnostics::SourceLoss>()
+                .map(|loss| {
+                    let loss = loss.map_err(std::io::Error::other)?;
+                    if loss.id >= meta.totals.n_rows as u64 || loss.zoom.is_some() {
+                        return Err(std::io::Error::other(
+                            "source loss outside its input row domain",
+                        )
+                        .into());
+                    }
+                    Ok(loss)
+                });
+        meta.totals.source_losses =
+            crate::diagnostics::SourceLosses::try_from_iter_in(stream, spill_dir)
+                .map_err(|e| plan_err(path, &format!("loss partition: {e}")))?;
         let kinds = u8_section(&batch, "kinds", path)?
             .map(|codes| {
                 codes
@@ -1648,6 +1671,28 @@ fn write_plan_file(
     batch: &RecordBatch,
     losses: &crate::diagnostics::SourceLosses,
 ) -> Result<(), ConvertError> {
+    write_plan_payload(path, |w| {
+        // Length-prefixed JSONL is streamed in both directions. Its bytes and
+        // length are included in the payload checksum, before any decoding.
+        w.write_all(&0u64.to_le_bytes())?;
+        losses.write_json_lines(w)?;
+        let length = w.stream_position()? - PLAN_HEADER_LEN as u64 - 8;
+        let mut ipc = FileWriter::try_new(&mut *w, schema)?;
+        ipc.write(batch)?;
+        ipc.finish()?;
+        drop(ipc);
+        w.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))?;
+        w.write_all(&length.to_le_bytes())?;
+        Ok(())
+    })
+}
+
+/// Frame and checksum a v6 payload, including its length-prefixed loss partition.
+/// The fuzz hook uses this same writer so it can mutate either partition.
+fn write_plan_payload(
+    path: &Path,
+    payload: impl FnOnce(&mut BufWriter<File>) -> Result<(), ConvertError>,
+) -> Result<(), ConvertError> {
     #[expect(
         clippy::disallowed_methods,
         reason = "#521: saved plans intentionally overwrite in place after preflight"
@@ -1657,35 +1702,10 @@ fn write_plan_file(
     w.write_all(PLAN_MAGIC)
         .and_then(|()| w.write_all(&0u64.to_le_bytes()))
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    // Length-prefixed JSONL is streamed in both directions. Its bytes and
-    // length are included in the payload checksum, before any decoding.
-    w.write_all(&0u64.to_le_bytes())
-        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    losses
-        .write_json_lines(&mut w)
-        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    let length = w
-        .stream_position()
-        .map_err(|e| save_plan_err(path, &format!("{e}")))?
-        - PLAN_HEADER_LEN as u64
-        - 8;
-    // Arrow's own errors carry no path: `--save-plan /mnt/full/x.plan` used to
-    // fail with a bare "No space left on device" naming neither the flag nor
-    // the file. Every arrow step is prefixed the same way the io steps are.
-    let arrow = |e: arrow_schema::ArrowError| save_plan_err(path, &format!("{e}"));
-    let mut ipc = FileWriter::try_new(w, schema).map_err(arrow)?;
-    ipc.write(batch).map_err(arrow)?;
-    ipc.finish().map_err(arrow)?;
-    let mut w = ipc.into_inner().map_err(arrow)?;
+    payload(&mut w).map_err(|e| save_plan_err(path, &format!("{e}")))?;
     w.flush()
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    let mut file = w
-        .into_inner()
-        .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))
-        .and_then(|_| file.write_all(&length.to_le_bytes()))
-        .map_err(|e| save_plan_err(path, &format!("writing loss partition length: {e}")))?;
-    drop(file);
+    drop(w);
 
     let checksum = (|| -> std::io::Result<u64> {
         let mut f = File::open(path)?;
@@ -1704,7 +1724,7 @@ fn write_plan_file(
     Ok(())
 }
 
-/// Fuzz hook (#633): read `ipc_payload` back as a saved `--plan` file.
+/// Fuzz hook (#633): read a v6 `payload` back as a saved `--plan` file.
 ///
 /// The checksum in the header rejects almost every mutation before any byte
 /// reaches arrow or serde, so the hook writes a *valid* header (magic plus
@@ -1717,16 +1737,9 @@ fn write_plan_file(
 /// `fuzzing` feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_convert_plan(ipc_payload: &[u8]) -> Result<(), ConvertError> {
-    let mut file = tempfile::NamedTempFile::new()?;
-    file.write_all(PLAN_MAGIC)?;
-    let mut checksum = xxhash_rust::xxh3::Xxh3::new();
-    checksum.update(&0u64.to_le_bytes());
-    checksum.update(ipc_payload);
-    file.write_all(&checksum.digest().to_le_bytes())?;
-    file.write_all(&0u64.to_le_bytes())?;
-    file.write_all(ipc_payload)?;
-    file.flush()?;
+pub fn fuzz_convert_plan(payload: &[u8]) -> Result<(), ConvertError> {
+    let file = tempfile::NamedTempFile::new()?;
+    write_plan_payload(file.path(), |w| Ok(w.write_all(payload)?))?;
     ConvertPlan::load(file.path())?.into_winner_tables()?;
     Ok(())
 }
@@ -2665,8 +2678,106 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "fuzzing")]
+    fn fuzz_hook_reads_the_saved_v6_payload() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut plan = tiny_plan();
+        plan.coalesce = None;
+        let sink = crate::diagnostics::Diagnostics::default();
+        sink.source_loss(3, None, crate::diagnostics::SourceLossCause::Filtered)
+            .unwrap();
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        plan.save(file.path()).unwrap();
+        let bytes = std::fs::read(file.path()).unwrap();
+        // The hook must restore only the header, leaving both v6 partitions intact.
+        assert!(fuzz_convert_plan(&bytes[PLAN_HEADER_LEN..]).is_ok());
+    }
+
+    #[test]
+    fn plan_rejects_loss_ids_before_creating_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("forged.plan");
+        let mut plan = tiny_plan();
+        plan.totals.n_rows = 10_000;
+        plan.min_levels = vec![0; plan.totals.n_rows];
+        plan.kinds = None;
+        plan.save(&file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let missing_spill = dir.path().join("must-not-create-a-ledger");
+        for id in [u64::MAX, plan.totals.n_rows as u64] {
+            let loss = serde_json::to_vec(&crate::diagnostics::SourceLoss {
+                id,
+                zoom: None,
+                cause: crate::diagnostics::SourceLossCause::Filtered,
+                feature_id: None,
+            })
+            .unwrap();
+            let mut payload = (loss.len() as u64).to_le_bytes().to_vec();
+            payload.extend_from_slice(&loss);
+            payload.extend_from_slice(&bytes[PLAN_HEADER_LEN + 8..]);
+            let mut forged = PLAN_MAGIC.to_vec();
+            forged.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&payload).to_le_bytes());
+            forged.extend_from_slice(&payload);
+            std::fs::write(&file, forged).unwrap();
+            // A missing spill directory makes any attempt to grow the ledger fail.
+            // The typed domain error must win over ledger I/O/address errors.
+            let err = ConvertPlan::load_with_spill_dir(&file, Some(&missing_spill)).unwrap_err();
+            assert!(matches!(err, ConvertError::InvalidConfig(_)));
+            assert!(
+                err.to_string().contains("outside its input row domain"),
+                "{err}"
+            );
+            assert!(!missing_spill.exists());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shard_replay_keeps_the_loss_ledger_on_the_configured_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let (source, _guard) = one_part_source(&dir, &[3000, 3000]);
+        let mut plan = tiny_plan();
+        plan.fingerprint.inputs[0].row_groups = None;
+        plan.min_levels = vec![0; 6000];
+        plan.kinds = Some(vec![FeatureKind::Point; 6000]);
+        plan.coalesce = None;
+        plan.totals.n_rows = 6000;
+        let sink = crate::diagnostics::Diagnostics::default();
+        sink.set_accounting_spill_dir(Some(spill.path()));
+        sink.source_loss(5999, None, crate::diagnostics::SourceLossCause::Filtered)
+            .unwrap();
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        drop(sink);
+        rebase_plan_for_shard(
+            &mut plan,
+            &source,
+            Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            Path::new("test.plan"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.totals.source_losses.iter().next().unwrap().unwrap().id,
+            2999
+        );
+        let files: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+            .filter(|path| path.starts_with(spill.path()))
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "the rebased ledger must stay on {spill:?}: {files:?}"
+        );
+    }
+
+    #[test]
     fn plan_loss_partition_stays_outside_schema_metadata() {
         let mut plan = tiny_plan();
+        plan.totals.n_rows = 4096;
+        plan.min_levels = vec![0; 4096];
+        plan.kinds = Some(vec![FeatureKind::Point; 4096]);
         let sink = crate::diagnostics::Diagnostics::default();
         for row in 0..4096 {
             sink.source_loss(row, None, crate::diagnostics::SourceLossCause::Filtered)
@@ -2787,7 +2898,9 @@ mod tests {
         .unwrap();
         // Keep the hostile array buffers unchanged while bringing only the
         // seed's schema metadata forward to the current plan format.
-        let reader = tylertoo_io::open_ipc(std::io::Cursor::new(payload.clone())).unwrap();
+        // The v6 fuzz seed includes an empty, length-prefixed loss partition.
+        assert_eq!(&payload[..8], &0u64.to_le_bytes());
+        let reader = tylertoo_io::open_ipc(std::io::Cursor::new(payload[8..].to_vec())).unwrap();
         let schema = reader.schema();
         let original = &schema.metadata()[PLAN_META_KEY];
         let mut meta: serde_json::Value = serde_json::from_str(original).unwrap();
@@ -2816,14 +2929,7 @@ mod tests {
             payload[at..at + original.len()].copy_from_slice(updated.as_bytes());
         }
         let f = tempfile::NamedTempFile::new().unwrap();
-        let mut bytes = PLAN_MAGIC.to_vec();
-        let mut checksum = xxhash_rust::xxh3::Xxh3::new();
-        checksum.update(&0u64.to_le_bytes());
-        checksum.update(&payload);
-        bytes.extend_from_slice(&checksum.digest().to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        std::fs::write(f.path(), &bytes).unwrap();
+        write_plan_payload(f.path(), |w| Ok(w.write_all(&payload)?)).unwrap();
         let err = ConvertPlan::load(f.path())
             .and_then(ConvertPlan::into_winner_tables)
             .map(|_| ())

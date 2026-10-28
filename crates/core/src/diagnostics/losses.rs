@@ -120,10 +120,8 @@ impl SourceLosses {
             }
         })
     }
-    pub(crate) fn try_from_iter(
-        losses: impl IntoIterator<Item = Result<SourceLoss, AccountingError>>,
-    ) -> Result<Self, AccountingError> {
-        Self::try_from_iter_in(losses, None)
+    pub(crate) fn spill_dir(&self) -> Option<&std::path::Path> {
+        self.spill_dir.as_deref()
     }
     pub(crate) fn try_from_iter_in(
         losses: impl IntoIterator<Item = Result<SourceLoss, AccountingError>>,

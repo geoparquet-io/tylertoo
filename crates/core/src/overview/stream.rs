@@ -2776,17 +2776,6 @@ fn load_plan_state(
         SelectionRule::Identical
     };
     plan.fingerprint.verify_with(&current, selection_rule)?;
-    if plan.min_levels.len() != plan.totals.n_rows {
-        return Err(ConvertError::InvalidConfig(format!(
-            "--plan: {} holds {} winner-table row(s) but claims {} input row(s)",
-            path.display(),
-            plan.min_levels.len(),
-            plan.totals.n_rows,
-        )));
-    }
-    let source_losses_valid = plan.totals.source_losses.iter().all(|loss| {
-        loss.is_ok_and(|loss| loss.id < plan.totals.n_rows as u64 && loss.zoom.is_none())
-    });
     // #511/#512: the winner table is addressed by row position, so the plan's
     // row domain must equal what THIS run will actually stream. The per-part
     // footer row counts are already compared field by field above; this
@@ -2837,12 +2826,6 @@ fn load_plan_state(
              Re-run without --plan (add --save-plan to write a fresh one).",
             path.display(),
             plan.min_levels.len(),
-        )));
-    }
-    if !source_losses_valid {
-        return Err(ConvertError::InvalidConfig(format!(
-            "--plan: {} has a source loss outside its input row domain",
-            path.display()
         )));
     }
     for loss in totals.source_losses.iter() {
