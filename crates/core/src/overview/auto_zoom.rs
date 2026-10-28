@@ -1035,6 +1035,7 @@ mod tests {
         }
         let schema = Arc::new(Schema::new(builder.schema().fields().clone()));
         let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
             .set_key_value_metadata(Some(vec![KeyValue::new("geo".into(), geo.to_string())]))
             .build();
         let mut writer = ArrowWriter::try_new(
@@ -1054,7 +1055,10 @@ mod tests {
                 .map(|c| {
                     let values = c.as_any().downcast_ref::<Float64Array>().unwrap();
                     Arc::new(Float64Array::from_iter(
-                        values.iter().map(|v| v.map(|v| v + 1000.0)),
+                        values
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| v.map(|v| if i < 10 { v + 1000.0 } else { v })),
                     )) as ArrayRef
                 })
                 .collect();
@@ -1080,6 +1084,78 @@ mod tests {
         let stale = ConvertSource::resolve_path(&stale).unwrap();
         let plain = write(&dir, "plain.parquet", &geoms);
         assert_eq!(estimate(&stale, 0).unwrap(), estimate(&plain, 0).unwrap());
+    }
+
+    #[test]
+    fn stale_covering_cannot_prune_geometry_before_fallback() {
+        use super::super::convert::convert_to_overviews_sources;
+        let dir = tempfile::tempdir().unwrap();
+        let geoms = polygon_row(20, 0.009);
+        let covered = write_covered(&dir, "covered.parquet", &geoms);
+        let stale_path = dir.path().join("stale.parquet");
+        rewrite_covering(&covered, &stale_path, true);
+        let stale = ConvertSource::resolve_path(&stale_path).unwrap();
+        let plain = write(&dir, "plain.parquet", &geoms);
+        let bbox = Some([-0.1, -0.1, 1.0, 1.0]);
+        assert_eq!(
+            estimate_with(&stale, 0, 16, bbox.as_ref(), None).unwrap(),
+            estimate_with(&plain, 0, 16, bbox.as_ref(), None).unwrap(),
+            "rejecting the sidecar must retain both row groups"
+        );
+        for streaming in [true, false] {
+            let opts = ConvertOptions {
+                streaming,
+                bbox,
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 10,
+                    max_zoom: 10,
+                },
+                ..Default::default()
+            };
+            let output = dir.path().join(format!("out-{streaming}.parquet"));
+            let report = convert_to_overviews_sources(&stale, &output, &opts).unwrap();
+            assert_eq!(report.input_features, 20, "streaming={streaming}");
+        }
+        #[cfg(feature = "remote")]
+        {
+            use super::super::convert::write_convert_plan_sources;
+            use super::super::export::{export_pmtiles, ExportOptions};
+            let remote = ConvertSource::single(crate::input::test_memory_source(
+                std::fs::read(&stale_path).unwrap(),
+                "stale.parquet",
+            ));
+            let plan = dir.path().join("saved.arrow");
+            let opts = ConvertOptions {
+                save_plan: Some(plan.clone()),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 10,
+                    max_zoom: 10,
+                },
+                ..Default::default()
+            }
+            .verbatim();
+            write_convert_plan_sources(&remote, &opts).unwrap();
+            let opts = ConvertOptions {
+                save_plan: None,
+                plan: Some(plan),
+                shard: Some(crate::shard::TileRange::whole_zoom(1).unwrap()),
+                ..opts
+            };
+            let output = dir.path().join("remote-shard.parquet");
+            let report = convert_to_overviews_sources(&remote, &output, &opts).unwrap();
+            assert_eq!(report.input_features, 20);
+            let exported = export_pmtiles(
+                &output,
+                dir.path().join("remote.pmtiles"),
+                &ExportOptions::default(),
+            )
+            .unwrap();
+            assert!(exported.total_tile_features >= 20);
+            eprintln!(
+                "stale-covering remote plan/shard: {} tile features",
+                exported.total_tile_features
+            );
+        }
     }
 
     #[test]

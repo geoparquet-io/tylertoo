@@ -503,34 +503,61 @@ impl ResolvedSchema {
         let covering = self.f64_covering_shape()?;
         let spec = self.covering().ok_or(CoveringWarning::NoCovering)?;
         let md = metadata.ok_or(CoveringWarning::NoFooterStatistics)?;
-        let crs = self.crs().ok_or(CoveringWarning::UnknownCrs)?;
-        let range = crate::overview::convert::crs_coordinate_range(crs);
         let indices = crate::covering::find_bbox_column_indices(md, spec)
             .ok_or(CoveringWarning::MissingColumn)?;
         for (rg_idx, rg) in md.row_groups().iter().enumerate() {
-            if rg.num_rows() == 0 {
-                continue;
-            }
-            // Check both extrema of ALL four leaves: inverted/dateline boxes
-            // can otherwise hide an out-of-range endpoint in the inner stats.
-            for (col, is_x) in [
-                (indices.xmin, true),
-                (indices.ymin, false),
-                (indices.xmax, true),
-                (indices.ymax, false),
-            ] {
-                for min in [true, false] {
-                    let value = crate::covering::extract_stat_value(rg, col, min)
-                        .filter(|v| v.is_finite())
-                        .ok_or(CoveringWarning::MissingStatistics(rg_idx))?;
-                    // Use the tiler's supported one-world longitude wrap.
-                    if value.abs() > if is_x { 3.0 * range.max_x } else { range.max_y } {
-                        return Err(CoveringWarning::OutOfCrsRange(rg_idx));
-                    }
-                }
+            if !self.validate_covering_row_group(rg_idx, rg, indices)? {
+                return Err(CoveringWarning::MissingStatistics(rg_idx));
             }
         }
         Ok(covering)
+    }
+
+    /// The shared trust decision for sampling and spatial pruning. Pruning
+    /// keeps a rejected group for geometry decoding, including when another
+    /// group's covering is usable. FLOAT coverings can still prune; sampling
+    /// separately requires f64 to preserve its bit-exact geometry oracle.
+    /// Returns whether all statistics are finite: ordered infinities (including
+    /// the conventional empty envelope) can prune but cannot supply a sample.
+    pub(crate) fn validate_covering_row_group(
+        &self,
+        rg_idx: usize,
+        rg: &tylertoo_io::RowGroupMetaData,
+        indices: crate::covering::BboxColumnIndices,
+    ) -> std::result::Result<bool, CoveringWarning> {
+        let crs = self.crs().ok_or(CoveringWarning::UnknownCrs)?;
+        let range = crate::overview::convert::crs_coordinate_range(crs);
+        if [indices.xmin, indices.ymin, indices.xmax, indices.ymax]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != 4
+        {
+            return Err(CoveringWarning::DuplicateColumns);
+        }
+        if rg.num_rows() == 0 {
+            return Ok(true);
+        }
+        let mut finite = true;
+        // Check both extrema of all four leaves: inverted/dateline boxes
+        // can otherwise hide an out-of-range endpoint in the inner stats.
+        for (col, is_x) in [
+            (indices.xmin, true),
+            (indices.ymin, false),
+            (indices.xmax, true),
+            (indices.ymax, false),
+        ] {
+            for min in [true, false] {
+                let value = crate::covering::extract_stat_value(rg, col, min)
+                    .ok_or(CoveringWarning::MissingStatistics(rg_idx))?;
+                if !value.is_finite() {
+                    finite = false;
+                } else if value.abs() > if is_x { 3.0 * range.max_x } else { range.max_y } {
+                    return Err(CoveringWarning::OutOfCrsRange(rg_idx));
+                }
+            }
+        }
+        Ok(finite)
     }
 
     /// Validate output → source rename provenance against the physical fields.

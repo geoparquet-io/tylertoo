@@ -993,12 +993,12 @@ mod tests {
     #[test]
     fn bbox_pruning_selects_only_intersecting_row_groups() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        // level0: ids 0,1 near origin (1 RG). level1: ids 100..103, far away,
-        // split into 2 RGs by max_rg_size=2 (RG1: 100,101; RG2: 102,103).
+        // level0: ids 0,1 near origin (1 RG). level1: ids 60..63, far away
+        // but within the CRS range, split into 2 RGs by max_rg_size=2.
         write_fixture(
             tmp.path(),
             Mode::Duplicating,
-            &[vec![0, 1], vec![100, 101, 102, 103]],
+            &[vec![0, 1], vec![60, 61, 62, 63]],
             2,
         );
         let reader = OverviewReader::open(tmp.path()).unwrap();
@@ -1006,9 +1006,9 @@ mod tests {
         // level1 band is RG {1, 2}.
         assert_eq!(reader.row_groups_for_level(1).unwrap(), vec![1, 2]);
 
-        // A bbox around (100,100) intersects RG1 (ids 100,101) only, not RG2
-        // (ids 102,103) nor RG0 (near origin).
-        let bbox = [99.0, 99.0, 101.0, 101.0];
+        // A bbox around (60,60) intersects RG1 (ids 60,61) only, not RG2
+        // (ids 62,63) nor RG0 (near origin).
+        let bbox = [59.0, 59.0, 61.0, 61.0];
         let pruned = reader.row_groups_intersecting_bbox(&bbox);
         assert_eq!(pruned, vec![1], "whole-file pruned set");
 
@@ -1016,9 +1016,9 @@ mod tests {
         let selected = reader.selected_row_groups(1, Some(bbox)).unwrap();
         assert_eq!(selected, vec![1]);
 
-        // And reading returns only ids 100,101.
+        // And reading returns only ids 60,61.
         let ids = read_ids(reader.read_level(1, Some(bbox)).unwrap());
-        assert_eq!(ids, vec![100, 101]);
+        assert_eq!(ids, vec![60, 61]);
     }
 
     // --- int_column_max on foreign-written columns (#399) -------------------

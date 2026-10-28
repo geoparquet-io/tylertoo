@@ -368,6 +368,13 @@ pub(crate) fn bounds_from_resolved(
 
     for rg_idx in 0..num_row_groups {
         let rg = metadata.row_group(rg_idx);
+        if descriptor
+            .validate_covering_row_group(rg_idx, rg, indices)
+            .is_err()
+        {
+            bounds.push(None);
+            continue;
+        }
 
         // For row group bounds:
         // - xmin: MIN of xmin column (smallest x in this row group)
