@@ -735,6 +735,89 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn non_finite_in_either_axis_of_any_ring_is_counted_once() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for axis in 0..2 {
+                for hole in [false, true] {
+                    for vertex in [0, 2] {
+                        let mut ring = ring_square(2.0, 3.0);
+                        if axis == 0 {
+                            ring.0[vertex].x = bad;
+                        } else {
+                            ring.0[vertex].y = bad;
+                        }
+                        let poly = if hole {
+                            Polygon::new(ring_square(1.0, 4.0), vec![ring])
+                        } else {
+                            Polygon::new(ring, vec![])
+                        };
+                        assert!(!polygon_rect_all_rings(&poly).unwrap().1);
+                        let diagnostics = crate::diagnostics::Diagnostics::default();
+                        assert_eq!(
+                            clip_geometry_simple(
+                                &Geometry::Polygon(poly),
+                                &bounds,
+                                0.0,
+                                true,
+                                true,
+                                &diagnostics,
+                            ),
+                            None,
+                        );
+                        assert_eq!(
+                            diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped {
+                                count: 0
+                            }),
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_in_any_multipolygon_part_poisons_the_whole_feature() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let clean = Polygon::new(ring_square(1.0, 4.0), vec![]);
+        for bad_part in 0..3 {
+            let mut parts = vec![clean.clone(); 3];
+            let mut hole = ring_square(2.0, 3.0);
+            hole.0[2].y = f64::NAN;
+            parts[bad_part] = Polygon::new(ring_square(1.0, 4.0), vec![hole]);
+            let mp = MultiPolygon::new(parts);
+            assert!(!multipolygon_rect_all_rings(&mp).unwrap().1);
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            assert_eq!(
+                clip_geometry_simple(
+                    &Geometry::MultiPolygon(mp),
+                    &bounds,
+                    0.0,
+                    true,
+                    true,
+                    &diagnostics,
+                ),
+                None,
+            );
+            assert_eq!(
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 }),
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_single_coordinate_ring_has_no_closing_vertex_to_recheck() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (x, y) in [(bad, 1.0), (1.0, bad)] {
+                let poly = Polygon::new(LineString::from(vec![(x, y)]), vec![]);
+                assert!(!polygon_rect_all_rings(&poly).unwrap().1);
+            }
+        }
+    }
+
     fn assert_within(g: &Geometry<f64>, b: &TileBounds, what: &str) {
         use geo::CoordsIter;
         for c in g.coords_iter() {
