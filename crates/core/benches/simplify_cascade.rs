@@ -2,9 +2,10 @@
 //!
 //! Times [`simplify_cascade`] — the fine->coarse fold every conversion path
 //! (serial, in-memory, pipelined) drives per feature per level — over real
-//! polygon fixtures at a production-shaped chain: 10 levels, coarse to
-//! fine, mostly full-geometry steps with one zoom-band `Point` step at the
+//! polygon fixtures at a production-shaped chain: 15 levels, fine to
+//! coarse, mostly full-geometry steps with three zoom-band `Point` steps at the
 //! coarse end (#317), matching how a `tiles` run's level plan actually looks.
+//! Both fixtures use longitude/latitude coordinates (EPSG:4326).
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `simplify_cascade`
 
@@ -95,7 +96,9 @@ fn cascade_steps() -> Vec<CascadeStep> {
 }
 
 fn bench_simplify_cascade(c: &mut Criterion) {
-    let mut group = c.benchmark_group("simplify_cascade");
+    // The previous series treated degree coordinates as meters. Keep the
+    // corrected coordinate units explicit in the benchmark history.
+    let mut group = c.benchmark_group("simplify_cascade/epsg4326");
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(20);
 
@@ -132,7 +135,7 @@ fn bench_simplify_cascade(c: &mut Criterion) {
                     black_box(simplify_cascade(
                         black_box(geom),
                         black_box(&steps),
-                        Crs::Epsg3857,
+                        Crs::Epsg4326,
                         black_box(opts),
                         &tylertoo_core::diagnostics::Diagnostics::default(),
                     ))
