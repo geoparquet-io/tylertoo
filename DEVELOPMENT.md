@@ -821,10 +821,13 @@ CI adds `--cap-lints true` so a mutation that leaves an unused variable
 reaches the tests instead of failing on the repository's strict lints.
 The ordinary clippy gate still denies warnings.
 
-The matrix divides that set into 64 native cargo-mutants shards with
-`--sharding round-robin --shard k/64`, using zero-based indices and
-two workers per shard. The mutator is pinned to 27.1.0 so every shard
-enumerates the same set. Up to 16 shards run at once. Each job has a
+The plan job lists that set with `scripts/mutants-diff.sh HEAD^1 --list --json`
+and the gate's flags, without compiling. For a nonempty set it chooses
+`min(ceil(mutants / 40), 64)` native cargo-mutants shards. The matrix uses
+`--sharding round-robin --shard k/N`, with zero-based indices, `N` from the
+matrix's job total, and two workers per shard. `cargo-mutants` is pinned to 27.1.0
+in both planning and testing so every shard enumerates the same set.
+Up to 16 shards run at once. Each job has a
 90-minute limit, including setup and the baseline. All mutants are
 assigned; there is no sampling. Fail-fast is disabled so one failed
 shard does not cancel the others. A 2,765-mutant diff has 43–44 mutants
@@ -836,11 +839,13 @@ failures and cancelled jobs cannot produce a passing gate. The script and
 workflow do not interpret issue-linked equivalent-mutant comments. Each shard uploads its
 `mutants.out/` directory as `mutation-diff-N`, even after failure when
 results are available. The workflow adds no score summary or PR comment.
-An empty mutation selection is handled by cargo-mutants.
+An empty mutation selection starts no shard runners. The final "Mutation gate"
+job reports "No mutants in this diff" and succeeds only after successful
+planning; failed or cancelled planning or mutation jobs fail the gate.
 
 `scripts/mutants-diff.sh` also runs locally. It defaults to `origin/main`
 and uses `git diff --no-ext-diff --no-renames BASE`, including tracked
-uncommitted changes. Untracked files are absent from that diff; stage
+uncommitted changes. The diff omits untracked files; stage
 them or use `git add -N` first. Extra arguments go directly to
 cargo-mutants, whose exit status is preserved (2 for missed mutants,
 3 for timeouts):

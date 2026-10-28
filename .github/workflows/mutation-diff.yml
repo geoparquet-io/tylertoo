@@ -7,23 +7,55 @@ on:
 permissions:
   contents: read
 
+env:
+  MUTATION_TOOL: cargo-mutants@27.1.0
+
 jobs:
+  plan:
+    name: Plan mutation shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - name: Install mutation tools
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: ${{ env.MUTATION_TOOL }}
+      - name: Size shards from the PR diff
+        id: plan
+        shell: bash
+        run: |
+          # Reuse the gate's diff, workspace and config; listing never compiles.
+          # A single shard lists the whole set; --sharding requires --shard.
+          # No changed Rust files produces no JSON; slurp treats that as [].
+          count=$(scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard 0/1 -j 2 --list --json | jq -s 'add // [] | length')
+          # Nonempty diffs get ceil(count / 40) shards, capped at 64.
+          shards=$(jq -cn --argjson n "$count" 'if $n == 0 then [] else [range(0; ([($n / 40 | ceil), 64] | min))] end')
+          echo "$count mutants in this diff; shards=$shards"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
   mutants:
     name: Mutants (workspace diff, shard ${{ matrix.shard }})
+    needs: plan
+    # Job conditions run before matrix expansion: [] launches no runners.
+    if: needs.plan.outputs.shards != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # 2,765 mutants exhausted one runner's 90-minute limit on #787.
-    # 64 native shards put that diff at 43-44 mutants per runner, leaving
-    # room for the workspace baseline and slow mutants. Run every slice;
-    # one survivor must not cancel the other shards' evidence.
+    # Run every slice; one survivor must not cancel the others' evidence.
     strategy:
       fail-fast: false
       max-parallel: 16
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-                32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-                48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
       SHARD: ${{ matrix.shard }}
       # Derive the denominator from the matrix so slices cannot drift.
@@ -46,7 +78,7 @@ jobs:
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           # All shards must enumerate with the same mutator version.
-          tool: cargo-mutants@27.1.0,cargo-nextest
+          tool: ${{ env.MUTATION_TOOL }},cargo-nextest
       - name: Install protoc
         run: |
           sudo apt-get update
@@ -77,3 +109,29 @@ jobs:
           name: mutation-diff-${{ matrix.shard }}
           path: mutants.out/
           if-no-files-found: ignore
+
+  gate:
+    name: Mutation gate
+    needs: [plan, mutants]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful planning and mutation tests
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          MUTANTS_RESULT: ${{ needs.mutants.result }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          if [[ "$PLAN_RESULT" != success ]]; then
+            echo "::error::Mutation planning $PLAN_RESULT"
+            exit 1
+          fi
+          if [[ "$SHARDS" == '[]' && "$MUTANTS_RESULT" == skipped ]]; then
+            echo "No mutants in this diff"
+          elif [[ "$MUTANTS_RESULT" == success ]]; then
+            echo "All mutation shards passed"
+          else
+            echo "::error::Mutation shards $MUTANTS_RESULT"
+            exit 1
+          fi
