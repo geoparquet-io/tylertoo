@@ -47,7 +47,7 @@ dev = [
     "mypy>=1.14",
     # Type checker for the package and its extension stub (CI: Python
     # Quality). Exact pin: ty is pre-1.0 and its rules still move.
-    "ty==0.0.89",
+    "ty==0.0.91",
     "vulture>=2.13",
     "xenon>=0.9",
     "pip-audit>=2.7",
@@ -153,10 +153,15 @@ exclude = ["^tests/docs/conftest\\.py$", "^python/conftest\\.py$"]
 warn_unused_ignores = true
 
 [tool.vulture]
-paths = ["tests"]
-min_confidence = 80
-# pytest hooks are invoked by name, not referenced.
-ignore_names = ["pytest_configure"]
+paths = ["python/tylertoo", "tests"]
+min_confidence = 60
+# Pytest invokes hooks by name; shlex consumes these attributes internally.
+ignore_names = [
+    "pytest_configure",
+    "pytest_collection_modifyitems",
+    "whitespace_split",
+    "commenters",
+]
 
 # Note: Commitizen config is in root .cz.toml - run `cz bump` from repo root
 

@@ -20,6 +20,9 @@ features = ["remote"]
 
 [features]
 default = []
+cli = ["dep:clap"]
+# Scaled byte-array ceilings for the isolated integration-test lane only.
+testing = ["tylertoo-io/testing"]
 dhat-heap = ["dhat"]
 # Fuzz hooks (#424): `#[doc(hidden)]` entry points that let the standalone
 # `fuzz/` crate reach parsers which are private on purpose (the MVT tile
@@ -30,6 +33,7 @@ fuzzing = []
 # and gs:// URLs via range requests (issue #210). Off by default to keep
 # the pure-local library build dependency-light; the CLI enables it.
 remote = [
+    "tylertoo-io/remote",
     "dep:object_store",
     "dep:tokio",
     "dep:aws-config",
@@ -41,16 +45,16 @@ remote = [
 ]
 
 [dependencies]
+clap = { workspace = true, optional = true }
 dhat = { version = "0.3", optional = true }
 geoarrow = { workspace = true }
 geoarrow-array = { workspace = true }
 geo-traits = { workspace = true }
 geoparquet = { workspace = true }
-parquet = { workspace = true }
+tylertoo-io = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-select = { workspace = true }
-arrow-ipc = { workspace = true }
 arrow-cast = { workspace = true }
 # --filter evaluation kernels (overview/filter.rs).
 arrow-ord = { workspace = true }
@@ -76,6 +80,7 @@ fast_hilbert = "2.1"
 # already pulls in.
 rstar = "0.12"
 serde = { workspace = true }
+serde_path_to_error = "0.1"
 # 1.0.129: Value::sort_all_objects (overview/writer.rs).
 serde_json = "1.0.129"
 i_overlay = "9"
@@ -93,7 +98,7 @@ aws-credential-types = { version = "1", optional = true }
 # run and the pin is no longer load-bearing for that reason -- the lock holds
 # 1.6.3 on its own. Keep it only until the upstream fix lands.
 # TODO: drop this pin once aws-config requires aws-smithy-json >= 0.64.
-aws-smithy-types = { version = "=1.8.1", optional = true }
+aws-smithy-types = { version = "=1.9.0", optional = true }
 async-trait = { version = "0.1", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 url = { version = "2", optional = true }
@@ -120,6 +125,7 @@ libc = "0.2"
 prost-build = { workspace = true }
 
 [dev-dependencies]
+tylertoo-io = { workspace = true, features = ["test-support"] }
 # CodSpeed's criterion shim (#614): identical API, so the benches still
 # `use criterion::…`. Under `cargo codspeed` it measures instruction counts;
 # under plain `cargo bench` it is ordinary criterion.
@@ -180,3 +186,7 @@ workspace = true
 # in this crate references it directly.
 [package.metadata.cargo-shear]
 ignored = ["aws-smithy-types"]
+
+[[test]]
+name = "scaled_limits"
+required-features = ["testing"]

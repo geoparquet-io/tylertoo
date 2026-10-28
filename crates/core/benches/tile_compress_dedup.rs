@@ -54,7 +54,13 @@ fn build_tile_bytes(feature_count: usize) -> Vec<u8> {
             ),
             ("rank".to_string(), PropertyValue::UInt((i % 10) as u64)),
         ];
-        builder.add_feature(Some(i as u64), &geom, &props, &bounds);
+        builder.add_feature(
+            Some(i as u64),
+            &geom,
+            &props,
+            &bounds,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        );
     }
     let layer = builder.build();
     let mut tb = tylertoo_core::mvt::TileBuilder::new();

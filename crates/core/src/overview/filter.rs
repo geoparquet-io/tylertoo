@@ -67,8 +67,8 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_ord::cmp;
 use arrow_schema::{DataType, Schema, TimeUnit};
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
-use parquet::file::statistics::Statistics;
+use tylertoo_io::Statistics;
+use tylertoo_io::{ParquetMetaData, RowGroupMetaData};
 
 /// Errors from parsing or binding a `--filter` expression.
 #[derive(Debug, thiserror::Error)]
@@ -514,31 +514,27 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<FilterExpr, FilterError> {
-        let mut left = self.parse_and()?;
-        // Each operator adds one level to the left-deep chain the tree
-        // becomes, and Drop / column_names / eval_expr recurse once per
-        // level, so a chain spends the nesting budget operator by operator
-        // (the fuzz target's 300k-`OR` overflow) and hands it back once the
-        // chain ends.
-        let mut levels = 0;
-        while self.eat(&Token::Or) {
-            self.descend()?;
-            levels += 1;
-            let right = self.parse_and()?;
-            left = FilterExpr::Or(Box::new(left), Box::new(right));
-        }
-        self.depth -= levels;
-        Ok(left)
+        self.parse_chain(Token::Or, Self::parse_and, FilterExpr::Or)
     }
 
     fn parse_and(&mut self) -> Result<FilterExpr, FilterError> {
-        let mut left = self.parse_unary()?;
+        self.parse_chain(Token::And, Self::parse_unary, FilterExpr::And)
+    }
+
+    fn parse_chain(
+        &mut self,
+        operator: Token,
+        next: fn(&mut Self) -> Result<FilterExpr, FilterError>,
+        combine: fn(Box<FilterExpr>, Box<FilterExpr>) -> FilterExpr,
+    ) -> Result<FilterExpr, FilterError> {
+        let mut left = next(self)?;
+        // Each operator spends one level of the left-deep tree's nesting
+        // budget. Return those levels only after the complete chain.
         let mut levels = 0;
-        while self.eat(&Token::And) {
+        while self.eat(&operator) {
             self.descend()?;
             levels += 1;
-            let right = self.parse_unary()?;
-            left = FilterExpr::And(Box::new(left), Box::new(right));
+            left = combine(Box::new(left), Box::new(next(self)?));
         }
         self.depth -= levels;
         Ok(left)
@@ -1213,7 +1209,7 @@ fn widen_i64(v: i64, is_min: bool) -> f64 {
 /// `(min, max)` of a numeric column chunk as `f64` bounds, when available.
 ///
 /// A NaN bound reads as *no* bound (#428): every comparison against it is
-/// false, so [`range_can_match_num`] would answer "cannot match" and prune a
+/// false, so [`range_can_match`] would answer "cannot match" and prune a
 /// row group whose other rows do match. arrow-rs leaves NaN out of the
 /// statistics it writes, but a file written elsewhere can carry one.
 fn num_bounds(stats: &Statistics) -> Option<(f64, f64)> {
@@ -1252,18 +1248,7 @@ fn bool_bounds(stats: &Statistics) -> Option<(bool, bool)> {
 }
 
 /// Could `min <= v <= max` hold for some v satisfying `v op lit`?
-fn range_can_match_num(min: f64, max: f64, op: CmpOp, lit: f64) -> bool {
-    match op {
-        CmpOp::Eq => min <= lit && lit <= max,
-        CmpOp::Ne => !(min == max && min == lit),
-        CmpOp::Lt => min < lit,
-        CmpOp::Le => min <= lit,
-        CmpOp::Gt => max > lit,
-        CmpOp::Ge => max >= lit,
-    }
-}
-
-fn range_can_match_ord<T: Ord + ?Sized>(min: &T, max: &T, op: CmpOp, lit: &T) -> bool {
+fn range_can_match<T: PartialOrd>(min: T, max: T, op: CmpOp, lit: T) -> bool {
     match op {
         CmpOp::Eq => min <= lit && lit <= max,
         CmpOp::Ne => !(min == max && min == lit),
@@ -1296,15 +1281,15 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
         };
         match lit {
             Literal::Number(l) => match num_bounds(stats) {
-                Some((min, max)) => range_can_match_num(min, max, op, *l),
+                Some((min, max)) => range_can_match(min, max, op, *l),
                 None => true,
             },
             Literal::String(l) => match str_bounds(stats) {
-                Some((min, max)) => range_can_match_ord(min, max, op, l.as_str()),
+                Some((min, max)) => range_can_match(min, max, op, l.as_str()),
                 None => true,
             },
             Literal::Bool(l) => match bool_bounds(stats) {
-                Some((min, max)) => range_can_match_ord(&min, &max, op, l),
+                Some((min, max)) => range_can_match(&min, &max, op, l),
                 None => true,
             },
             // Timestamp stats are physical Int64 in the column's own unit
@@ -1314,12 +1299,7 @@ fn rg_can_match(expr: &BoundExpr, rg: &RowGroupMetaData, chunk_idx: &HashMap<&st
                 (ColKind::Ts(unit), Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
                     (Some(min), Some(max)) => {
                         let f = ts_factor(unit);
-                        range_can_match_ord(
-                            &(*min as i128 * f),
-                            &(*max as i128 * f),
-                            op,
-                            &(*l as i128),
-                        )
+                        range_can_match(&(*min as i128 * f), &(*max as i128 * f), op, &(*l as i128))
                     }
                     _ => true,
                 },
@@ -1388,13 +1368,13 @@ mod tests {
 
     // ---- non-finite statistics (#428) ------------------------------------
 
-    /// A NaN min/max makes every `range_can_match_num` comparison false, so
+    /// A NaN min/max makes every `range_can_match` comparison false, so
     /// the row group is PRUNED — the rows that do match the predicate are lost
     /// without a word. Statistics that cannot bound anything must read as
     /// absent, which is the branch that keeps the row group.
     #[test]
     fn nan_numeric_statistics_never_prune() {
-        use parquet::file::statistics::Statistics;
+        use tylertoo_io::Statistics;
 
         let nan = Statistics::double(Some(f64::NAN), Some(f64::NAN), None, Some(0), false);
         assert_eq!(
@@ -2053,11 +2033,12 @@ mod tests {
 
     /// Write a parquet file with one row group per (confidence, crop) pair
     /// and return its metadata.
+    #[cfg(test)]
     fn stats_file(
         rows: &[(Option<f64>, Option<&str>)],
     ) -> (tempfile::NamedTempFile, ParquetMetaData) {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::WriterProperties;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("confidence", DataType::Float64, true),
@@ -2080,9 +2061,10 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let reader = parquet::file::reader::SerializedFileReader::new(f).unwrap();
-        use parquet::file::reader::FileReader;
-        let meta = reader.metadata().clone();
+        let meta = tylertoo_io::read_parquet_metadata(&f)
+            .unwrap()
+            .as_ref()
+            .clone();
         (file, meta)
     }
 
@@ -2269,9 +2251,10 @@ mod tests {
     }
 
     /// Parquet file with a Timestamp(micros) column, one row group per value.
+    #[cfg(test)]
     fn ts_stats_file(rows: &[Option<i64>]) -> (tempfile::NamedTempFile, ParquetMetaData) {
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::WriterProperties;
 
         let dt = DataType::Timestamp(TimeUnit::Microsecond, None);
         let schema = Arc::new(Schema::new(vec![Field::new("time", dt.clone(), true)]));
@@ -2288,9 +2271,10 @@ mod tests {
         writer.close().unwrap();
 
         let f = std::fs::File::open(file.path()).unwrap();
-        let reader = parquet::file::reader::SerializedFileReader::new(f).unwrap();
-        use parquet::file::reader::FileReader;
-        let meta = reader.metadata().clone();
+        let meta = tylertoo_io::read_parquet_metadata(&f)
+            .unwrap()
+            .as_ref()
+            .clone();
         (file, meta)
     }
 

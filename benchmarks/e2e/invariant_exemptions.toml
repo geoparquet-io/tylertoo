@@ -1,0 +1,48 @@
+# Known failures of the strict whole-archive invariants (#779, G3).
+#
+# `benchmarks/e2e/run_e2e.py --invariants` runs `tylertoo tiles` over each
+# (fixture, settings) cell and `scripts/verify_archive.py --strict` over the
+# archive. A failing invariant fails the run unless a row below matches it.
+#
+# One row per {fixture, settings, zoom, invariant, issue}:
+#   fixture    a run_e2e.py dataset id (open-buildings, road-detections,
+#              madagascar-adm4, ftw-moldova-z10, fieldmaps-boundaries)
+#   settings   a run_e2e.py INVARIANT_SETTINGS name (defaults, verbatim,
+#              pv0, sf0, fill)
+#   zoom       an integer zoom, or "*" for every zoom of the invariant;
+#              archive-wide invariants (feature_accounting, decay,
+#              property_accounting) always take "*". For monotone the zoom
+#              is the COARSER of the pair that rose.
+#   invariant  tile_size, polygon_valid, feature_accounting, monotone,
+#              decay, property_accounting
+#   issue      the OPEN issue tracking the failure; e2e.yml fails on a row
+#              whose issue is closed
+#   reason     one line: what fails and who is expected to remove the row
+#
+# Rows are strict: an exempted invariant that passes fails the run as XPASS,
+# so the PR that fixes the issue must delete its rows. Validate the file with:
+# `uv run scripts/verify_archive.py --check-exemptions <this file>`.
+
+[[exemption]]
+fixture = "madagascar-adm4"
+settings = "sf0"
+zoom = 4
+invariant = "monotone"
+issue = 768
+reason = "the per-tile merge valve thins z5 below z4; C2 valve design removes the row"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "pv0"
+zoom = "*"
+invariant = "decay"
+issue = 749
+reason = "source-area dithering still fails strict decay: z8 has 71 distinct squares and z5 has 44 (more than half); #749 remains"
+
+[[exemption]]
+fixture = "ftw-moldova-z10"
+settings = "sf0"
+zoom = 9
+invariant = "monotone"
+issue = 768
+reason = "the per-tile merge valve thins z10 below z9; C2 valve design removes the row"

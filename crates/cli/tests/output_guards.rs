@@ -336,3 +336,19 @@ fn report_over_the_output_or_the_input_is_refused_up_front() {
         );
     }
 }
+
+#[test]
+fn shard_plan_overwrite_warning_retains_exit_code_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("plan.json");
+    std::fs::write(&output, b"existing fleet plan").unwrap();
+    let result = Command::new(tylertoo_bin())
+        .args(["shard-plan", "missing.parquet", "--shards", "2", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let message = String::from_utf8_lossy(&result.stderr);
+    assert!(message.contains("SAME shard plan"), "{message}");
+    assert!(message.contains("silently re-cuts"), "{message}");
+}

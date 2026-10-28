@@ -10,6 +10,10 @@
 //! public API). `crates/core/tests/overview_hostile.rs` compiles this same
 //! file in via `#[path]` instead (#457), so keep it free of `crate::` /
 //! `super::` imports: std and external crates only.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::ArrowWriter;
+use tylertoo_io::test_support::ArrowWriter;
 
 /// Write a GeoParquet file with `id` (Int64), `name` (Utf8) property columns
 /// and the given (possibly null) geometries. `covering` toggles bbox covering
@@ -101,7 +105,7 @@ pub(crate) fn write_input_with_f64_row_groups(
     rg_rows: Option<usize>,
 ) {
     use arrow_array::Float64Array;
-    use parquet::file::properties::WriterProperties;
+    use tylertoo_io::test_support::WriterProperties;
 
     assert_eq!(geoms.len(), values.len(), "one value per geometry");
     let id = Int64Array::from((0..geoms.len() as i64).collect::<Vec<_>>());
@@ -160,7 +164,7 @@ pub(crate) fn write_multi_rg_input_with_crs(
     crs_metadata: Option<geoarrow::datatypes::Metadata>,
 ) {
     use geo::Point;
-    use parquet::file::properties::WriterProperties;
+    use tylertoo_io::test_support::WriterProperties;
 
     let geoms: Vec<Geometry<f64>> = coords
         .iter()
@@ -213,7 +217,7 @@ pub(crate) type AttrRow = ((f64, f64), Option<f64>, Option<&'static str>);
 pub(crate) fn write_multi_rg_attr_input(path: &Path, rows: &[AttrRow]) {
     use arrow_array::Float64Array;
     use geo::Point;
-    use parquet::file::properties::WriterProperties;
+    use tylertoo_io::test_support::WriterProperties;
 
     let geoms: Vec<Geometry<f64>> = rows
         .iter()

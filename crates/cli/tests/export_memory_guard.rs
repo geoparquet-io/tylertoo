@@ -9,6 +9,10 @@
 //! knob, not the machine's memory, so under one export warns with the same
 //! message and carries on. That is what this subprocess test pins, since the
 //! override is read from the environment.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::process::Command;
@@ -16,8 +20,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use tylertoo_io::test_support::ArrowWriter;
+use tylertoo_io::test_support::WriterProperties;
 
 const ROWS: usize = 5_000;
 
@@ -76,7 +80,7 @@ fn write_points(path: &Path) {
         }},
     });
     let props = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+        .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]))

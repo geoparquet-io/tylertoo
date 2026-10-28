@@ -184,6 +184,23 @@ pub enum SortDirection {
     Asc,
 }
 
+impl SortDirection {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortDirection::Desc => "desc",
+            SortDirection::Asc => "asc",
+        }
+    }
+}
+
+/// The spelling [`SortDirection::as_str`] gives.
+impl std::fmt::Display for SortDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for SortDirection {
     type Err = String;
 
@@ -394,6 +411,27 @@ pub struct FeatureTable {
     entry_level: Vec<u8>,
 }
 
+/// Update a lazily materialized column, retaining its empty representation
+/// until a row has a value and using `missing` for all other rows.
+fn set_optional_column<T: Copy>(
+    column: &mut Vec<T>,
+    rows: usize,
+    i: usize,
+    value: Option<T>,
+    missing: T,
+) {
+    match value {
+        Some(value) => {
+            if column.is_empty() {
+                column.resize(rows, missing);
+            }
+            column[i] = value;
+        }
+        None if !column.is_empty() => column[i] = missing,
+        None => {}
+    }
+}
+
 impl FeatureTable {
     /// Bytes per row the always-present columns cost: `index` (8) +
     /// `center_x` + `center_y` + `diag_sq` (8 each) + `kind` (1) = **33**.
@@ -588,31 +626,25 @@ impl FeatureTable {
     /// first finite key. The streaming engine fills this after the scan, once
     /// the ranking tier resolves.
     pub fn set_sort_key(&mut self, i: usize, key: Option<f64>) {
-        let Some(k) = key.filter(|k| k.is_finite()) else {
-            if !self.sort_key.is_empty() {
-                self.sort_key[i] = f64::NAN;
-            }
-            return;
-        };
-        if self.sort_key.is_empty() {
-            self.sort_key = vec![f64::NAN; self.index.len()];
-        }
-        self.sort_key[i] = k;
+        set_optional_column(
+            &mut self.sort_key,
+            self.index.len(),
+            i,
+            key.filter(|k| k.is_finite()),
+            f64::NAN,
+        );
     }
 
     /// Set (or clear) row `i`'s entry level, materializing the column on the
     /// first ladder value.
     pub fn set_entry_level(&mut self, i: usize, entry: Option<u8>) {
-        let Some(e) = entry else {
-            if !self.entry_level.is_empty() {
-                self.entry_level[i] = NO_ENTRY_LEVEL;
-            }
-            return;
-        };
-        if self.entry_level.is_empty() {
-            self.entry_level = vec![NO_ENTRY_LEVEL; self.index.len()];
-        }
-        self.entry_level[i] = clamp_entry_level(e);
+        set_optional_column(
+            &mut self.entry_level,
+            self.index.len(),
+            i,
+            entry.map(clamp_entry_level),
+            NO_ENTRY_LEVEL,
+        );
     }
 
     /// The `entry_level` column, or an empty slice when no row has one.
@@ -656,29 +688,35 @@ impl FeatureTable {
     /// by doubling. [`Self::allocated_bytes`] is the allocation figure. Zero
     /// for an empty table.
     pub fn heap_bytes(&self) -> u64 {
-        let w = |len: usize, width: usize| (len * width) as u64;
-        w(self.index.len(), std::mem::size_of::<usize>())
-            + w(self.center_x.len(), std::mem::size_of::<f64>())
-            + w(self.center_y.len(), std::mem::size_of::<f64>())
-            + w(self.diag_sq.len(), std::mem::size_of::<f64>())
-            + w(self.kind.len(), std::mem::size_of::<u8>())
-            + w(self.sort_key.len(), std::mem::size_of::<f64>())
-            + w(self.entry_level.len(), std::mem::size_of::<u8>())
+        self.memory_bytes().0
     }
 
-    /// Heap bytes the columns have **allocated**: each column's `capacity()`
-    /// times its element width. Unlike [`Self::heap_bytes`] this includes
-    /// capacity slack, so it is the figure that shows whether a fill pattern
-    /// actually costs what the layout promises.
+    /// Heap bytes allocated by the columns, including capacity slack.
     pub fn allocated_bytes(&self) -> u64 {
-        let w = |cap: usize, width: usize| (cap * width) as u64;
-        w(self.index.capacity(), std::mem::size_of::<usize>())
-            + w(self.center_x.capacity(), std::mem::size_of::<f64>())
-            + w(self.center_y.capacity(), std::mem::size_of::<f64>())
-            + w(self.diag_sq.capacity(), std::mem::size_of::<f64>())
-            + w(self.kind.capacity(), std::mem::size_of::<u8>())
-            + w(self.sort_key.capacity(), std::mem::size_of::<f64>())
-            + w(self.entry_level.capacity(), std::mem::size_of::<u8>())
+        self.memory_bytes().1
+    }
+
+    fn memory_bytes(&self) -> (u64, u64) {
+        fn footprint<T>(column: &Vec<T>) -> (u64, u64) {
+            let width = std::mem::size_of::<T>();
+            (
+                (column.len() * width) as u64,
+                (column.capacity() * width) as u64,
+            )
+        }
+        [
+            footprint(&self.index),
+            footprint(&self.center_x),
+            footprint(&self.center_y),
+            footprint(&self.diag_sq),
+            footprint(&self.kind),
+            footprint(&self.sort_key),
+            footprint(&self.entry_level),
+        ]
+        .into_iter()
+        .fold((0, 0), |(used, allocated), (len, cap)| {
+            (used + len, allocated + cap)
+        })
     }
 
     /// What this table actually costs per row: [`Self::BASE_BYTES_PER_ROW`]
@@ -752,20 +790,53 @@ impl From<Vec<AssignFeature>> for FeatureTable {
 /// gives 3–5× more coarse-level polygons on the Moldova corpus at
 /// +0.1% file size, while values below 2 only admit candidates that
 /// RDP kills anyway (wasted density-budget slots).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct AssignConfig {
     /// Grid-cell multiplier for points (coarser grid ⇒ more aggressive thin).
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().point_thinning))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Point thinning grid cell, as a multiple of the level's GSD (default 4.0, or 16.0 with `--cluster`). Larger cells keep fewer points", long_help = None))]
     pub point_thinning: f64,
     /// Grid-cell multiplier for lines.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_thinning))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Line thinning grid cell, as a multiple of the level's GSD (default 1.0). Larger cells keep fewer lines", long_help = None))]
     pub line_thinning: f64,
     /// Grid-cell multiplier for polygons.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_thinning))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Polygon thinning grid cell, as a multiple of the level's GSD (default 0, off). Larger cells keep fewer polygons and can remove a polygon whose center falls in a larger neighbor's cell", long_help = None))]
     pub polygon_thinning: f64,
     /// A line is eligible at level `z` only if `diag >= line_visibility·gsd(z)`.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().line_visibility))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Drop lines whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
     pub line_visibility: f64,
     /// A polygon is eligible at level `z` only if
     /// `diag >= polygon_visibility·gsd(z)`.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Thinning & visibility"))]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().polygon_visibility))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Drop polygons whose bbox diagonal is shorter than this many GSDs at a level (default 2.0)", long_help = None))]
     pub polygon_visibility: f64,
     /// Whether larger or smaller `sort_key` wins.
+    #[serde(
+        serialize_with = "super::config::spelled::serialize",
+        deserialize_with = "super::config::spelled::deserialize_lowercase"
+    )]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = Self::default().sort_direction.as_str(),
+        value_parser = super::config::cli::spelled::<SortDirection>(&["desc", "asc"]),
+        help_heading = "Ranking"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Whether the larger (`desc`) or the smaller (`asc`) `--sort-key` value wins a cell", long_help = None))]
     pub sort_direction: SortDirection,
 }
 
@@ -1944,23 +2015,43 @@ pub const SUPERCELL_GSD_FACTOR: f64 = 128.0;
 pub const MIN_DENSITY_LEVEL_FEATURES: usize = 256;
 
 /// Configuration for the Q2 density budget (see the module section above).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct DensityBudgetConfig {
     /// Master switch. When `false`, [`apply_density_budget`] is an identity and
     /// the pipeline reproduces the pre-Q2 cell-winner behavior byte-for-byte.
+    #[serde(rename = "density_drop")]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().enabled, action = clap::ArgAction::SetFalse, long = "no-density-drop", id = "density_drop", help_heading = "Density budget"))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off the per-level density budget, leaving cell-winner thinning only", long_help = None))]
     pub enabled: bool,
     /// Per-level drop rate: each coarser level keeps `1/drop_rate` of the next
     /// finer level. Must be `> 1` (values `<= 1` disable the budget). Larger ⇒
     /// coarser levels shed harder.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "F",
+        default_value_t = Self::default().drop_rate,
+        help_heading = "Density budget"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Density budget decay: each coarser level keeps 1/rate of the next finer level's feature budget. Larger values thin mid zooms more", long_help = None))]
     pub drop_rate: f64,
     /// Spatial-fairness strength (`>= 1`). `1.0` = proportional cut; larger =
     /// sublinear, protecting sparse neighborhoods (dense areas kept to the
     /// `1/gamma` power of their population).
+    #[serde(rename = "drop_gamma")]
+    #[cfg_attr(feature = "cli", arg(long = "drop-gamma", id = "drop_gamma",
+        value_name = "F",
+        default_value_t = Self::default().gamma,
+        help_heading = "Density budget"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Sparse-area protection: 1 reduces every neighborhood equally; larger values protect sparse areas more", long_help = None))]
     pub gamma: f64,
     /// Which geometry kinds the budget thins (#745). A kind left out keeps
     /// its cell-winner level and does not count toward `N`. Default: points
     /// only, as tippecanoe's `-r` (lines and polygons opt in, its
     /// `--drop-lines` / `--drop-polygons`).
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub kinds: BudgetKinds,
 }
 
@@ -1969,10 +2060,34 @@ pub struct DensityBudgetConfig {
 /// tippecanoe's drop rate (`-r`) thins only points unless `--drop-lines` or
 /// `--drop-polygons` is given: removing a point leaves no hole, removing a
 /// polygon from a coverage does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct BudgetKinds {
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().points))]
     pub points: bool,
+    #[serde(rename = "drop_lines")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "drop-lines",
+            id = "drop_lines",
+            help_heading = "Density budget"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to lines as well as points: smaller, faster tiles that drop line features at coarse zooms (tippecanoe's `--drop-lines`)", long_help = None))]
     pub lines: bool,
+    #[serde(rename = "drop_polygons")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "drop-polygons",
+            id = "drop_polygons",
+            help_heading = "Density budget"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Apply the density budget to polygons as well as points. Removing a polygon leaves a hole in a coverage such as admin areas or parcels, so the budget excludes polygons by default (tippecanoe's `--drop-polygons`)", long_help = None))]
     pub polygons: bool,
 }
 
@@ -2138,7 +2253,10 @@ pub fn apply_density_budget(
     //
     // `level` is a scalar used in arithmetic/comparisons throughout the body
     // (not merely an index), so a range loop is the clearest form here.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "#534: serial coarse-to-fine admission uses the level index in arithmetic and state"
+    )]
     for level in 0..num_levels {
         // Nothing downstream depends on the ORDER of `cands`: the "everything
         // fits" branch only sets flags, and both paths of

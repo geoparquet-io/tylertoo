@@ -23,12 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
-use parquet::arrow::ProjectionMask;
-use parquet::file::metadata::ParquetMetaData;
+use tylertoo_io::ParquetMetaData;
+use tylertoo_io::ReaderMetadata;
 
-use crate::covering::extract_row_group_bounds_from_metadata;
+use crate::resolved_schema::ResolvedSchema;
 use crate::tile::TileBounds;
+use tylertoo_io::{ParquetSource, UntrustedBatchReader};
 
 use super::level::{gsd, Mode, OverviewsMeta, OVERVIEWS_KEY};
 
@@ -40,7 +40,7 @@ pub enum ReaderError {
     Io(#[from] std::io::Error),
     /// Underlying parquet error (footer parse, row-group read).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// The overview file could not be opened (#452: the bare [`Self::Io`]
     /// named no file). Not a `#[source]`, so `Caused by:` chains do not
     /// repeat the reason.
@@ -60,7 +60,7 @@ pub enum ReaderError {
         /// The file as given.
         path: String,
         /// The underlying Parquet error.
-        error: parquet::errors::ParquetError,
+        error: tylertoo_io::ParquetError,
     },
     /// The `geo:overviews` footer key is absent — not an overview file.
     #[error(
@@ -81,6 +81,9 @@ pub enum ReaderError {
     /// hostile `row_group_end` would otherwise drive band arithmetic).
     #[error("invalid 'geo:overviews' metadata: {0}")]
     InvalidMetadata(#[from] super::level::OverviewValidationError),
+    /// The shared schema/conformance validators rejected the file.
+    #[error("invalid overview file: {0}")]
+    Conformance(String),
     /// A level index was requested that does not exist in the file.
     #[error("level {level} out of range (file has {num_levels} levels)")]
     LevelOutOfRange {
@@ -97,13 +100,17 @@ pub enum ReaderError {
 #[derive(Debug, Clone)]
 pub struct OverviewReader {
     path: PathBuf,
+    resolved: ResolvedSchema,
     metadata: Arc<ParquetMetaData>,
     schema: SchemaRef,
     meta: OverviewsMeta,
-    /// Most rows one read batch may hold (#563): an overview level keeps its
-    /// source geometries, so a batch of very large ones would pass arrow's
-    /// i32 byte-array offset ceiling. Every read clamps its batch to this.
-    max_batch_rows: usize,
+    /// The footer and schema [`Self::open`] checked and decoded
+    /// ([`tylertoo_io`]): every read reopens the file with them rather
+    /// than parsing the footer again. Each read's batch is capped there for
+    /// its row groups' widest byte-array column (#563): an overview level
+    /// keeps its source geometries, so a batch of very large ones would pass
+    /// arrow's i32 byte-array offset ceiling.
+    reader_metadata: ReaderMetadata,
 }
 
 impl OverviewReader {
@@ -125,11 +132,9 @@ impl OverviewReader {
             path: shown(),
             error,
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
-            ReaderError::Footer {
-                path: shown(),
-                error,
-            }
+        let builder = tylertoo_io::open_parquet(file).map_err(|error| ReaderError::Footer {
+            path: shown(),
+            error,
         })?;
         let metadata = builder.metadata().clone();
         let schema = builder.schema().clone();
@@ -150,12 +155,30 @@ impl OverviewReader {
         // values, usize-wrapped) row-group reads.
         meta.validate(metadata.num_row_groups() as i64)?;
 
-        let max_batch_rows = crate::input_set::capped_batch_rows(
-            usize::MAX,
-            crate::input_set::widest_byte_array_column(&metadata, None, 0).as_ref(),
+        let resolved = ResolvedSchema::from_parquet(&schema, &metadata)
+            .map_err(|e| ReaderError::Conformance(format!("{}: {e}", shown())))?;
+        let mut report = super::check::validate_resolved_metadata(&metadata, &resolved);
+        super::check::check_cluster_sum_invariant(
+            &path,
+            &metadata,
+            &resolved,
+            &mut report,
+            &crate::diagnostics::Diagnostics::default(),
         );
+        if report.read_failures().next().is_some() {
+            return Err(ReaderError::Conformance(format!(
+                "{}: {}",
+                shown(),
+                report
+                    .read_failures()
+                    .map(|c| format!("{}: {}", c.name, c.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
         Ok(Self {
-            max_batch_rows,
+            resolved,
+            reader_metadata: builder.reader_metadata().clone(),
             path,
             metadata,
             schema,
@@ -171,6 +194,11 @@ impl OverviewReader {
     /// The parsed `geo:overviews` footer metadata.
     pub fn meta(&self) -> &OverviewsMeta {
         &self.meta
+    }
+
+    /// The schema descriptor read from the footer, or resolved once for older files.
+    pub fn resolved_schema(&self) -> &ResolvedSchema {
+        &self.resolved
     }
 
     /// The raw GeoParquet `geo` footer JSON, if the file carries one (an
@@ -248,8 +276,8 @@ impl OverviewReader {
     ///   recorded null count) may hold `{1, null}`: its max is 1, but the
     ///   null/1 distinction is information the tiles would lose.
     pub fn int_column_max(&self, name: &str) -> Option<i64> {
-        use parquet::basic::{ConvertedType, IntType, LogicalType};
-        use parquet::file::statistics::Statistics;
+        use tylertoo_io::Statistics;
+        use tylertoo_io::{ConvertedType, IntType, LogicalType};
 
         let descr = self.metadata.file_metadata().schema_descr();
         let col_idx =
@@ -389,7 +417,7 @@ impl OverviewReader {
     /// with missing statistics kept as in
     /// [`Self::row_groups_intersecting_bbox`].
     fn row_groups_intersecting_any(&self, bboxes: &[[f64; 4]]) -> Vec<usize> {
-        let bounds = extract_row_group_bounds_from_metadata(&self.metadata).unwrap_or_default();
+        let bounds = self.resolved.bounds();
         let filters: Vec<TileBounds> = bboxes
             .iter()
             .map(|bbox| TileBounds {
@@ -457,13 +485,8 @@ impl OverviewReader {
         &self,
         level_idx: usize,
         bbox: Option<[f64; 4]>,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let selected = self.selected_row_groups(level_idx, bbox)?;
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?.with_row_groups(selected);
-        // The builder's default batch (1024 rows), clamped like every read.
-        let reader = builder.with_batch_size(self.batch_rows(1024)).build()?;
-        Ok(reader)
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        self.read_level_batched(level_idx, bbox, tylertoo_io::DEFAULT_BATCH_ROWS)
     }
 
     /// [`Self::read_level`] with an explicit Arrow batch size (the builder
@@ -474,43 +497,38 @@ impl OverviewReader {
     ///
     /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
     /// the Parquet reader cannot be built.
-    pub fn read_level_with_batch_size(
+    pub fn read_level_batched(
         &self,
         level_idx: usize,
         bbox: Option<[f64; 4]>,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        self.read_level_any_bbox_with_batch_size(
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        self.read_level_any_bbox_batched(
             level_idx,
             bbox.as_ref().map(std::slice::from_ref),
             batch_size,
         )
     }
 
-    /// [`Self::read_level_with_batch_size`] pruned by the union of several
+    /// [`Self::read_level_batched`] pruned by the union of several
     /// bboxes. The PMTiles export reads a wave this way so a feature stored
     /// one world width from the wave's tiles, which the export draws there
     /// wrapped (#342), is not pruned away.
-    pub(crate) fn read_level_any_bbox_with_batch_size(
+    pub(crate) fn read_level_any_bbox_batched(
         &self,
         level_idx: usize,
         bboxes: Option<&[[f64; 4]]>,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
+    ) -> Result<UntrustedBatchReader, ReaderError> {
         let selected = self.selected_row_groups_any(level_idx, bboxes)?;
-        let file = File::open(&self.path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_row_groups(selected)
-            .with_batch_size(self.batch_rows(batch_size))
-            .build()?;
-        Ok(reader)
+        Ok(self.rows(selected, batch_size)?.build()?)
     }
 
     /// Read exactly `level_idx`'s **own** row-group band (`start..=end`, the
     /// §3.3 span), unpruned and independent of mode, with an explicit Arrow
     /// batch size.
     ///
-    /// Unlike [`Self::read_level_with_batch_size`] — which in partitioning mode
+    /// Unlike [`Self::read_level_batched`] — which in partitioning mode
     /// reads the accumulating prefix `0..=end` — this reads only the band that
     /// *belongs to* the level. It is the unit of work for a single-read,
     /// fan-out scan of the whole file (issue #233): reading each band once
@@ -521,15 +539,15 @@ impl OverviewReader {
     ///
     /// Returns a [`ReaderError`] if `level_idx` is not a level of the file or
     /// the Parquet reader cannot be built.
-    pub fn read_band_with_batch_size(
+    pub fn read_band_batched(
         &self,
         level_idx: usize,
         batch_size: usize,
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        Ok(self.band_builder(level_idx, batch_size)?.build()?)
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        Ok(self.rows(self.band(level_idx)?, batch_size)?.build()?)
     }
 
-    /// [`Self::read_band_with_batch_size`] projected to the top-level columns
+    /// [`Self::read_band_batched`] projected to the top-level columns
     /// `roots` (indexes into [`Self::schema`]); batches carry only those
     /// columns, in schema order, with their field metadata intact.
     ///
@@ -541,10 +559,8 @@ impl OverviewReader {
         level_idx: usize,
         batch_size: usize,
         roots: &[usize],
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let builder = self.band_builder(level_idx, batch_size)?;
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
-        Ok(builder.with_projection(mask).build()?)
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        self.read_row_groups_projected(self.band(level_idx)?, batch_size, roots)
     }
 
     /// Read exactly the row groups `row_groups` (ascending, file order),
@@ -558,18 +574,32 @@ impl OverviewReader {
         row_groups: Vec<usize>,
         batch_size: usize,
         roots: &[usize],
-    ) -> Result<ParquetRecordBatchReader, ReaderError> {
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_row_groups(row_groups)
-            .with_batch_size(self.batch_rows(batch_size));
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
-        Ok(builder.with_projection(mask).build()?)
+    ) -> Result<UntrustedBatchReader, ReaderError> {
+        Ok(self
+            .rows(row_groups, batch_size)?
+            .with_projection_roots(roots.iter().copied())
+            .build()?)
     }
 
     /// The parsed Parquet footer (row-group sizes and column statistics).
     pub(crate) fn parquet_metadata(&self) -> &ParquetMetaData {
         &self.metadata
+    }
+
+    /// Restore original overview row addresses after spatial pruning.
+    pub(crate) fn row_locator(&self, selected: &[usize]) -> crate::input_set::StreamRowLocator {
+        let counts = self
+            .metadata
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows())
+            .collect();
+        crate::input_set::StreamRowLocator::new(
+            &[counts],
+            Some(&crate::input_set::RowGroupSelection::from_parts(vec![
+                selected.to_vec(),
+            ])),
+        )
     }
 
     /// `(band, rows)` for each of `row_groups`, in the order given: the level
@@ -588,23 +618,26 @@ impl OverviewReader {
             .collect()
     }
 
-    /// A reader builder over `level_idx`'s own row-group band.
-    fn band_builder(
-        &self,
-        level_idx: usize,
-        batch_size: usize,
-    ) -> Result<ParquetRecordBatchReaderBuilder<File>, ReaderError> {
+    /// `level_idx`'s own row-group band, `start..=end`.
+    fn band(&self, level_idx: usize) -> Result<Vec<usize>, ReaderError> {
         let (start, end) = self.level_band(level_idx)?;
-        let file = File::open(&self.path)?;
-        Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_row_groups((start..=end).collect())
-            .with_batch_size(self.batch_rows(batch_size)))
+        Ok((start..=end).collect())
     }
 
-    /// `requested` rows per batch, clamped to [`Self::max_batch_rows`]
-    /// (#563).
-    fn batch_rows(&self, requested: usize) -> usize {
-        requested.clamp(1, self.max_batch_rows)
+    /// A reader over `row_groups` in batches of `batch_size` rows: the file
+    /// reopened through the owner with the footer [`Self::open`] already
+    /// checked, so no second footer parse and the same batch cap.
+    fn rows(
+        &self,
+        row_groups: Vec<usize>,
+        batch_size: usize,
+    ) -> Result<ParquetSource<File>, ReaderError> {
+        let file = File::open(&self.path)?;
+        Ok(
+            tylertoo_io::open_parquet_with_metadata(file, self.reader_metadata.clone())
+                .with_row_groups(row_groups)
+                .with_batch_rows(batch_size),
+        )
     }
 }
 
@@ -639,10 +672,8 @@ pub fn fuzz_overview_file(bytes: &[u8]) -> Result<usize, ReaderError> {
         let _ = reader.level_for_gsd(reader.meta().levels[k].gsd);
         let _ = reader.row_groups_for_level(k)?;
         let _ = reader.selected_row_groups(k, Some([-180.0, -90.0, 180.0, 90.0]))?;
-        for batch in reader.read_band_with_batch_size(k, 256)? {
-            rows += batch
-                .map_err(parquet::errors::ParquetError::from)?
-                .num_rows();
+        for batch in reader.read_band_batched(k, 256)? {
+            rows += batch.map_err(tylertoo_io::ParquetError::from)?.num_rows();
         }
     }
     Ok(rows)
@@ -751,7 +782,7 @@ mod tests {
     }
 
     /// Read the `id` column across a level reader.
-    fn read_ids(reader: ParquetRecordBatchReader) -> Vec<i64> {
+    fn read_ids(reader: tylertoo_io::UntrustedBatchReader) -> Vec<i64> {
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
@@ -825,7 +856,7 @@ mod tests {
     #[test]
     fn open_missing_key_errors() {
         // A plain (non-overview) parquet file: write with parquet directly.
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -978,12 +1009,12 @@ mod tests {
     #[test]
     fn bbox_pruning_selects_only_intersecting_row_groups() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        // level0: ids 0,1 near origin (1 RG). level1: ids 100..103, far away,
-        // split into 2 RGs by max_rg_size=2 (RG1: 100,101; RG2: 102,103).
+        // level0: ids 0,1 near origin (1 RG). level1: ids 60..63, far away
+        // but within the CRS range, split into 2 RGs by max_rg_size=2.
         write_fixture(
             tmp.path(),
             Mode::Duplicating,
-            &[vec![0, 1], vec![100, 101, 102, 103]],
+            &[vec![0, 1], vec![60, 61, 62, 63]],
             2,
         );
         let reader = OverviewReader::open(tmp.path()).unwrap();
@@ -991,9 +1022,9 @@ mod tests {
         // level1 band is RG {1, 2}.
         assert_eq!(reader.row_groups_for_level(1).unwrap(), vec![1, 2]);
 
-        // A bbox around (100,100) intersects RG1 (ids 100,101) only, not RG2
-        // (ids 102,103) nor RG0 (near origin).
-        let bbox = [99.0, 99.0, 101.0, 101.0];
+        // A bbox around (60,60) intersects RG1 (ids 60,61) only, not RG2
+        // (ids 62,63) nor RG0 (near origin).
+        let bbox = [59.0, 59.0, 61.0, 61.0];
         let pruned = reader.row_groups_intersecting_bbox(&bbox);
         assert_eq!(pruned, vec![1], "whole-file pruned set");
 
@@ -1001,9 +1032,9 @@ mod tests {
         let selected = reader.selected_row_groups(1, Some(bbox)).unwrap();
         assert_eq!(selected, vec![1]);
 
-        // And reading returns only ids 100,101.
+        // And reading returns only ids 60,61.
         let ids = read_ids(reader.read_level(1, Some(bbox)).unwrap());
-        assert_eq!(ids, vec![100, 101]);
+        assert_eq!(ids, vec![60, 61]);
     }
 
     // --- int_column_max on foreign-written columns (#399) -------------------
@@ -1175,11 +1206,11 @@ mod tests {
     /// to fold, so the answer is `None` (the caller then treats the column as
     /// carrying information).
     #[test]
-    fn int_column_max_is_none_without_statistics() {
+    fn open_runs_the_conformance_checks() {
         use arrow_array::Int32Array;
-        use parquet::arrow::ArrowWriter;
-        use parquet::file::metadata::KeyValue;
-        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use tylertoo_io::test_support::ArrowWriter;
+        use tylertoo_io::test_support::{EnabledStatistics, WriterProperties};
+        use tylertoo_io::KeyValue;
 
         // Borrow a valid one-level footer from the converter's own writer...
         let donor = tempfile::NamedTempFile::new().unwrap();
@@ -1208,16 +1239,11 @@ mod tests {
             w.write(&batch).unwrap();
             w.close().unwrap();
         }
-        let reader = OverviewReader::open(tmp.path()).unwrap();
+        let report = crate::overview::check::validate_file(tmp.path()).unwrap();
+        assert!(!report.is_valid());
         assert!(
-            reader
-                .metadata
-                .row_group(0)
-                .column(0)
-                .statistics()
-                .is_none(),
-            "fixture must carry no statistics"
+            OverviewReader::open(tmp.path()).is_err(),
+            "open must reject the same invalid file as validate"
         );
-        assert_eq!(reader.int_column_max("n"), None);
     }
 }

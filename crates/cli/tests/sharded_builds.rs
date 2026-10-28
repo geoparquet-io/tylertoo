@@ -1390,7 +1390,7 @@ fn plan_only_tolerates_export_only_flags() {
         out.contains(
             "--plan-only: ignoring export options --layer-name, --max-tile-size, \
              --no-simple-clip-fastpath, --tile-buffer, --partition-wave, \
-             --feature-order, --report, --keep-overview, --force"
+             --feature-order, --keep-overview, --report, --force"
         ),
         "one info line must name every ignored flag: {out}"
     );

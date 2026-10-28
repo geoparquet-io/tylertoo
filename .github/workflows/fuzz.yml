@@ -40,6 +40,21 @@ env:
   # cargo-fuzz needs nightly (-Z sanitizer). Pinned to the same nightly the
   # public-api gate in ci.yml uses, so there is one nightly to bump.
   NIGHTLY: nightly-2026-09-15
+  # Targets held out of the matrix below until the upstream panics they
+  # find are fixed, so they don't keep the run red (a crashing target finds
+  # nothing else). Their seeds still replay on every PR
+  # (crates/core/tests/fuzz_seeds.rs). FUZZ_HOLDOUTS records their issue
+  # references; it is empty while every target is enabled.
+  #
+  # Empty since #779 F5 (#784): untrusted.rs refuses #690's footer and the
+  # IPC block lengths before parquet-rs/arrow-ipc see them, and its panic
+  # boundary turns #683's, #684's and #687's upstream panics into
+  # InputError::DecoderPanic. All four targets ran clean under cargo fuzz
+  # with the crash seeds in the corpus. #683 and #687 stay open to track the
+  # arrow/parquet 60 upgrade that removes the panics themselves; fuzzing
+  # their paths nightly is what catches a regression of the boundary.
+  FUZZ_HOLDOUTS: >-
+    []
 
 jobs:
   fuzz:
@@ -64,20 +79,19 @@ jobs:
           - shard_plan
           - decompress
           - cli_args
-          # Held out until the upstream panics they find are fixed, so they
-          # don't keep the run red (a crashing target finds nothing else):
-          #   overview_file, remote_footer - #683 (arrow-ipc panics on a
-          #     crafted ARROW:schema footer key; fixed in arrow 60)
-          #   remote_footer - also #687 (parquet-rs panics on a crafted
-          #     page's definition levels)
-          #   plan_file - #684 (arrow-ipc panics on a crafted IPC buffer)
-          #   parquet_footer - #690 (parquet-rs reserves ~12 GB for a crafted
-          #     schema's child count; libFuzzer's malloc limit calls it an OOM)
-          # Their seeds still replay on every PR (crates/core/tests/fuzz_seeds.rs).
-          # remote_footer needs a fuzz-crate feature; re-add it as
-          #   include:
-          #     - target: remote_footer
-          #       features: remote
+          # Re-enabled by #779 F5 (#683, #684, #687, #690).
+          - overview_file
+          - plan_file
+          - parquet_footer
+          # Targets held out of this list live in FUZZ_HOLDOUTS above, not
+          # here.
+        # No fuzz-crate feature by default; an `include:` entry for a target
+        # that needs one (remote_footer: remote) sets it. Declared so
+        # `matrix.features` below is a known key (actionlint).
+        features: [""]
+        include:
+          - target: remote_footer
+            features: remote
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,7 +134,7 @@ jobs:
             ${{ runner.os }}-fuzz-target-${{ env.NIGHTLY }}-${{ matrix.features || 'default' }}-
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-fuzz
 
@@ -228,8 +242,9 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/fuzz.yml. It is updated
-          (not duplicated) on every failing nightly run; close it once a run
-          completes green._"
+          (not duplicated) on every failing nightly run. Close it only after
+          a full green nightly run of every target in the matrix, never after
+          a run of one target._"
 
           # Match on the title this job opens with, not the label alone:
           # people file fuzz-found bugs and fuzz work under the `fuzz` label

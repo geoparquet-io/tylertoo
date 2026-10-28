@@ -191,7 +191,20 @@ fn only_wholly_polar_bboxes_count_as_unprojectable() {
 
 #[test]
 fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big() {
-    use super::convert::out_of_range_warning;
+    let out_of_range_warning = |count, total, crs, max_abs, exemplars: &[_]| {
+        (count > 0 && total > 0).then(|| {
+            crate::diagnostics::Diagnostic::OutOfRange {
+                count,
+                exemplars: exemplars.to_vec(),
+                context: Some(crate::diagnostics::RangeContext {
+                    total,
+                    crs,
+                    max_abs,
+                }),
+            }
+            .to_string()
+        })
+    };
     use super::level::Crs;
 
     assert!(out_of_range_warning(0, 10, Crs::Epsg4326, 0.0, &[]).is_none());
@@ -240,7 +253,19 @@ fn out_of_range_warning_diagnoses_a_projected_crs_only_when_the_values_are_big()
 
 #[test]
 fn unprojectable_warning_names_the_mercator_domain_and_offers_no_reprojection() {
-    use super::convert::unprojectable_warning;
+    let unprojectable_warning = |count, total| {
+        (count > 0 && total > 0).then(|| {
+            crate::diagnostics::Diagnostic::Unprojectable {
+                count,
+                context: Some(crate::diagnostics::RangeContext {
+                    total,
+                    crs: super::level::Crs::Epsg4326,
+                    max_abs: 0.0,
+                }),
+            }
+            .to_string()
+        })
+    };
 
     assert!(unprojectable_warning(0, 10).is_none());
     assert!(unprojectable_warning(3, 0).is_none());

@@ -9,22 +9,21 @@
 //! the file is a valid GeoParquet 1.1 overview file per this spec, not whether
 //! its coarse levels are good renderings.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Type as PhysicalType;
-use parquet::file::metadata::ParquetMetaData;
-use parquet::file::statistics::Statistics;
+use tylertoo_io::ParquetMetaData;
+use tylertoo_io::PhysicalType;
+use tylertoo_io::Statistics;
 
-use crate::covering::{find_bbox_column_indices, get_geo_metadata, parse_covering_metadata};
+use crate::covering::find_bbox_column_indices;
+use crate::resolved_schema::ResolvedSchema;
 
 use super::level::{Mode, OverviewsMeta, COGP_KEY, OVERVIEWS_KEY};
 use super::writer::LEVEL_COLUMN;
 
 /// The overviews-spec MAJOR version this validator supports (§3.8).
-pub const SUPPORTED_MAJOR: u64 = 0;
+pub use super::level::SUPPORTED_MAJOR;
 
 /// Result of a single conformance check.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +70,12 @@ impl ValidationReport {
         self.checks.iter().filter(|c| !c.passed)
     }
 
+    /// Failures that prevent reading. A marked partial shard overview remains
+    /// readable; export separately enforces its recorded zoom ceiling (#541).
+    pub(crate) fn read_failures(&self) -> impl Iterator<Item = &CheckResult> {
+        self.failures().filter(|c| c.name != "complete_pyramid")
+    }
+
     /// Whether a specific named check passed. `None` if it was not run.
     pub fn check_passed(&self, name: &str) -> Option<bool> {
         self.checks
@@ -94,16 +99,7 @@ pub enum CheckError {
         "cannot read the Parquet footer: {}",
         crate::input::parquet_error_detail(.0)
     )]
-    Parquet(#[from] parquet::errors::ParquetError),
-}
-
-/// Minimal view of the GeoParquet `geo` metadata for structural checks.
-#[derive(Debug, serde::Deserialize)]
-struct GeoDoc {
-    #[serde(default)]
-    primary_column: Option<String>,
-    #[serde(default)]
-    columns: HashMap<String, serde_json::Value>,
+    Parquet(#[from] tylertoo_io::ParquetError),
 }
 
 /// Validate an overview file at `path` against the §6.2 conformance checklist.
@@ -118,12 +114,32 @@ struct GeoDoc {
 /// cannot be parsed. Failed conformance checks are reported in the
 /// [`ValidationReport`], not as an error.
 pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckError> {
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+
     let path = path.as_ref();
     let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let metadata = builder.metadata().clone();
-    let mut report = validate_metadata(&metadata);
-    check_cluster_sum_invariant(path, &metadata, &mut report);
+    let metadata = tylertoo_io::read_parquet_metadata(&file)?;
+    let reader = match tylertoo_io::reader_metadata(std::sync::Arc::clone(&metadata)) {
+        Ok(reader) => reader,
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail(
+                "arrow_schema_decodes",
+                format!("the footer's ARROW:schema cannot be decoded: {e}"),
+            );
+            return Ok(report);
+        }
+    };
+    let descriptor = match ResolvedSchema::from_parquet(reader.schema(), &metadata) {
+        Ok(descriptor) => descriptor,
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail("resolved_schema", e.to_string());
+            return Ok(report);
+        }
+    };
+    let mut report = validate_resolved_metadata(&metadata, &descriptor);
+    check_cluster_sum_invariant(path, &metadata, &descriptor, &mut report, diagnostics);
     Ok(report)
 }
 
@@ -137,41 +153,36 @@ pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<ValidationReport, CheckE
 /// Does not panic in practice: the clustering check unwraps the parsed
 /// overviews metadata only after confirming it is present.
 pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
+    match ResolvedSchema::from_metadata(metadata) {
+        Ok(descriptor) => validate_resolved_metadata(metadata, &descriptor),
+        Err(e) => {
+            let mut report = ValidationReport::default();
+            report.fail("resolved_schema", e.to_string());
+            report
+        }
+    }
+}
+
+pub(crate) fn validate_resolved_metadata(
+    metadata: &ParquetMetaData,
+    descriptor: &ResolvedSchema,
+) -> ValidationReport {
     let mut report = ValidationReport::default();
     let num_row_groups = metadata.num_row_groups();
 
     // --- GeoParquet 1.1: geo metadata + primary column + covering (§6.2). ----
-    let geo_json = get_geo_metadata(metadata).ok().flatten();
-    match &geo_json {
-        None => {
-            report.fail(
-                "geoparquet_geo_metadata",
-                "no 'geo' footer metadata: not a GeoParquet file",
-            );
-        }
-        Some(j) => match serde_json::from_str::<GeoDoc>(j) {
-            Ok(doc) if doc.primary_column.is_some() || !doc.columns.is_empty() => {
-                report.pass(
-                    "geoparquet_geo_metadata",
-                    "'geo' metadata present with geometry column(s)",
-                );
-            }
-            Ok(_) => report.fail(
-                "geoparquet_geo_metadata",
-                "'geo' metadata declares no geometry columns",
-            ),
-            Err(e) => report.fail(
-                "geoparquet_geo_metadata",
-                format!("'geo' metadata is not valid JSON: {e}"),
-            ),
-        },
+    if !descriptor.geometry_columns().is_empty() && descriptor.version().is_some() {
+        report.pass(
+            "geoparquet_geo_metadata",
+            "'geo' metadata present with geometry column(s)",
+        );
+    } else {
+        report.fail(
+            "geoparquet_geo_metadata",
+            "no valid GeoParquet geometry declaration",
+        );
     }
-
-    // Covering declared (§4.4) — on the PRIMARY column, which §4.4 is about
-    // and which the overviews this validates always declare.
-    let covering = geo_json
-        .as_deref()
-        .and_then(|j| parse_covering_metadata(j, None).ok().flatten());
+    let covering = descriptor.covering();
     match &covering {
         Some(_) => report.pass("geoparquet_covering_declared", "bbox covering declared"),
         None => report.fail(
@@ -235,6 +246,16 @@ pub fn validate_metadata(metadata: &ParquetMetaData) -> ValidationReport {
 
         // Explicit mode/canonical_level consistency (§3.4).
         check_mode_canonical(meta, &mut report);
+
+        if !descriptor.renames().is_empty() {
+            match descriptor.validate_renames() {
+                Ok(()) => report.pass(
+                    "renamed_columns",
+                    "every rename maps real output and source columns",
+                ),
+                Err(message) => report.fail("renamed_columns", message),
+            }
+        }
 
         // #541 review: a partial overview (convert-side zoom ceiling) cannot
         // satisfy §2.4 — its finest level is a simplified one, not the
@@ -415,204 +436,149 @@ fn check_clustering(
     clustering: &crate::overview::level::ClusteringProvenance,
     report: &mut ValidationReport,
 ) {
-    // Mode: duplicating only.
-    match meta.mode {
-        Some(Mode::Duplicating) => report.pass(
-            "cluster_mode",
-            "clustering metadata on a duplicating-mode file",
-        ),
-        other => {
-            report.fail(
-                "cluster_mode",
-                format!(
-                    "clustering metadata requires duplicating mode, found {other:?} \
-                     (a partitioning row is read across many zoom prefixes; a \
-                     per-level point_count would double count)"
-                ),
-            );
-            return;
-        }
-    }
-
-    // Column exists, INT64, NOT NULL.
-    let name = clustering.point_count_column.as_str();
-    let descr = metadata.file_metadata().schema_descr();
-    let col_idx = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name);
-    let col_idx = match col_idx {
-        None => {
-            report.fail(
-                "cluster_point_count_column",
-                format!("clustering metadata names column {name:?} but it is absent"),
-            );
-            return;
-        }
-        Some(idx) => {
-            let col = descr.column(idx);
-            let phys_ok = col.physical_type() == PhysicalType::INT64;
-            let required = col.max_def_level() == 0;
-            if phys_ok && required {
-                report.pass(
-                    "cluster_point_count_column",
-                    format!("{name:?} is INT64 NOT NULL"),
-                );
-                idx
-            } else {
-                report.fail(
-                    "cluster_point_count_column",
-                    format!(
-                        "{name:?} must be INT64 NOT NULL (physical={:?}, max_def_level={})",
-                        col.physical_type(),
-                        col.max_def_level()
-                    ),
-                );
-                return;
-            }
-        }
-    };
-
-    // Values: min >= 1 everywhere; canonical band exactly 1 (via RG stats).
-    let canonical = meta.canonical_level;
-    let mut problems: Vec<String> = Vec::new();
-    for rg in 0..metadata.num_row_groups() {
-        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == canonical;
-        let chunk = metadata.row_group(rg).column(col_idx);
-        match chunk.statistics() {
-            Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
-                (Some(&min), Some(&max)) => {
-                    if min < 1 {
-                        problems.push(format!("RG {rg}: point_count min={min} < 1"));
-                    }
-                    if is_canonical && (min != 1 || max != 1) {
-                        problems.push(format!(
-                            "RG {rg} (canonical): point_count min={min} max={max}, expected 1"
-                        ));
-                    }
-                }
-                _ => problems.push(format!("RG {rg}: point_count has no min/max stats")),
-            },
-            Some(other) => {
-                problems.push(format!("RG {rg}: point_count stats not Int64 ({other:?})"))
-            }
-            None => problems.push(format!("RG {rg}: point_count column has no statistics")),
-        }
-    }
-    if problems.is_empty() {
-        report.pass(
-            "cluster_point_count_values",
-            "point_count >= 1 everywhere; canonical level all 1",
-        );
-    } else {
-        report.fail("cluster_point_count_values", problems.join("; "));
-    }
+    check_count_conformance(metadata, meta, CountConformance {
+        kind: "clustering", mode_key: "cluster_mode",
+        mode_detail: "a partitioning row is read across many zoom prefixes; a per-level point_count would double count",
+        name: &clustering.point_count_column, column_key: "cluster_point_count_column",
+        values_key: "cluster_point_count_values", label: "point_count", physical: PhysicalType::INT64,
+    }, report);
 }
 
-/// Coalescing conformance (Q3, spec §13 draft): when the footer's
-/// `generalization.coalescing` block is present and enabled,
-/// - the mode must be `duplicating` (merged chains cannot satisfy
-///   partitioning's feature-once / geometry-verbatim contract);
-/// - the named merged-count column must exist as INT32 NOT NULL;
-/// - every row group's `coalesced_count` stats must have `min >= 1`, and the
-///   canonical level band's must be exactly `min == max == 1` (the
-///   canonical level is never coalesced, §2.4).
+/// Coalescing count columns follow the same positive-count and canonical
+/// singleton rules as clustering, with an INT32 physical representation.
 fn check_coalescing(
     metadata: &ParquetMetaData,
     meta: &OverviewsMeta,
     coalescing: &crate::overview::level::CoalescingProvenance,
     report: &mut ValidationReport,
 ) {
-    // Mode: duplicating only.
-    match meta.mode {
-        Some(Mode::Duplicating) => report.pass(
-            "coalesce_mode",
-            "coalescing metadata on a duplicating-mode file",
-        ),
-        other => {
-            report.fail(
-                "coalesce_mode",
-                format!(
-                    "coalescing metadata requires duplicating mode, found {other:?} \
-                     (a merged chain replaces several source rows, which \
-                     partitioning's feature-once contract cannot represent)"
-                ),
-            );
-            return;
-        }
+    check_count_conformance(metadata, meta, CountConformance {
+        kind: "coalescing", mode_key: "coalesce_mode",
+        mode_detail: "a merged chain replaces several source rows, which partitioning's feature-once contract cannot represent",
+        name: &coalescing.coalesced_count_column, column_key: "coalesce_count_column",
+        values_key: "coalesce_count_values", label: "coalesced_count", physical: PhysicalType::INT32,
+    }, report);
+}
+
+struct CountConformance<'a> {
+    kind: &'static str,
+    mode_key: &'static str,
+    mode_detail: &'static str,
+    name: &'a str,
+    column_key: &'static str,
+    values_key: &'static str,
+    label: &'static str,
+    physical: PhysicalType,
+}
+
+fn check_count_conformance(
+    metadata: &ParquetMetaData,
+    meta: &OverviewsMeta,
+    spec: CountConformance<'_>,
+    report: &mut ValidationReport,
+) {
+    let CountConformance {
+        kind,
+        mode_key,
+        mode_detail,
+        name,
+        column_key,
+        values_key,
+        label,
+        physical,
+    } = spec;
+    if meta.mode != Some(Mode::Duplicating) {
+        report.fail(
+            mode_key,
+            format!(
+                "{kind} metadata requires duplicating mode, found {:?} ({mode_detail})",
+                meta.mode
+            ),
+        );
+        return;
     }
+    report.pass(
+        mode_key,
+        format!("{kind} metadata on a duplicating-mode file"),
+    );
 
-    // Column exists, INT32, NOT NULL.
-    let name = coalescing.coalesced_count_column.as_str();
     let descr = metadata.file_metadata().schema_descr();
-    let col_idx = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name);
-    let col_idx = match col_idx {
-        None => {
-            report.fail(
-                "coalesce_count_column",
-                format!("coalescing metadata names column {name:?} but it is absent"),
-            );
-            return;
-        }
-        Some(idx) => {
-            let col = descr.column(idx);
-            let phys_ok = col.physical_type() == PhysicalType::INT32;
-            let required = col.max_def_level() == 0;
-            if phys_ok && required {
-                report.pass(
-                    "coalesce_count_column",
-                    format!("{name:?} is INT32 NOT NULL"),
-                );
-                idx
-            } else {
-                report.fail(
-                    "coalesce_count_column",
-                    format!(
-                        "{name:?} must be INT32 NOT NULL (physical={:?}, max_def_level={})",
-                        col.physical_type(),
-                        col.max_def_level()
-                    ),
-                );
-                return;
-            }
-        }
+    let Some(col_idx) = (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == name)
+    else {
+        report.fail(
+            column_key,
+            format!("{kind} metadata names column {name:?} but it is absent"),
+        );
+        return;
     };
+    let col = descr.column(col_idx);
+    if col.physical_type() != physical || col.max_def_level() != 0 {
+        report.fail(
+            column_key,
+            format!(
+                "{name:?} must be {physical:?} NOT NULL (physical={:?}, max_def_level={})",
+                col.physical_type(),
+                col.max_def_level()
+            ),
+        );
+        return;
+    }
+    report.pass(column_key, format!("{name:?} is {physical:?} NOT NULL"));
 
-    // Values: min >= 1 everywhere; canonical band exactly 1 (via RG stats).
-    let canonical = meta.canonical_level;
-    let mut problems: Vec<String> = Vec::new();
+    let stat_kind = if physical == PhysicalType::INT32 {
+        "Int32"
+    } else {
+        "Int64"
+    };
+    let mut problems = Vec::new();
     for rg in 0..metadata.num_row_groups() {
-        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == canonical;
-        let chunk = metadata.row_group(rg).column(col_idx);
-        match chunk.statistics() {
-            Some(Statistics::Int32(s)) => match (s.min_opt(), s.max_opt()) {
-                (Some(&min), Some(&max)) => {
-                    if min < 1 {
-                        problems.push(format!("RG {rg}: coalesced_count min={min} < 1"));
-                    }
-                    if is_canonical && (min != 1 || max != 1) {
-                        problems.push(format!(
-                            "RG {rg} (canonical): coalesced_count min={min} max={max}, expected 1"
-                        ));
-                    }
-                }
-                _ => problems.push(format!("RG {rg}: coalesced_count has no min/max stats")),
-            },
-            Some(other) => problems.push(format!(
-                "RG {rg}: coalesced_count stats not Int32 ({other:?})"
+        let is_canonical = level_for_rg(meta, rg).map(|k| k as i64) == meta.canonical_level;
+        let stats = metadata.row_group(rg).column(col_idx).statistics();
+        let bounds = match stats {
+            Some(Statistics::Int32(s)) if physical == PhysicalType::INT32 => Some((
+                s.min_opt().copied().map(i64::from),
+                s.max_opt().copied().map(i64::from),
             )),
-            None => problems.push(format!("RG {rg}: coalesced_count column has no statistics")),
+            Some(Statistics::Int64(s)) if physical == PhysicalType::INT64 => {
+                Some((s.min_opt().copied(), s.max_opt().copied()))
+            }
+            Some(other) => {
+                problems.push(format!(
+                    "RG {rg}: {label} stats not {stat_kind} ({other:?})"
+                ));
+                None
+            }
+            None => {
+                problems.push(format!("RG {rg}: {label} column has no statistics"));
+                None
+            }
+        };
+        match bounds {
+            Some((Some(min), Some(max))) => {
+                if min < 1 {
+                    problems.push(format!("RG {rg}: {label} min={min} < 1"));
+                }
+                if is_canonical && (min != 1 || max != 1) {
+                    problems.push(format!(
+                        "RG {rg} (canonical): {label} min={min} max={max}, expected 1"
+                    ));
+                }
+            }
+            Some(_) => problems.push(format!("RG {rg}: {label} has no min/max stats")),
+            None => {}
         }
     }
     if problems.is_empty() {
         report.pass(
-            "coalesce_count_values",
-            "coalesced_count >= 1 everywhere; canonical level all 1",
+            values_key,
+            format!("{label} >= 1 everywhere; canonical level all 1"),
         );
     } else {
-        report.fail("coalesce_count_values", problems.join("; "));
+        report.fail(values_key, problems.join("; "));
     }
 }
 
-/// §12.1 strict cluster sum invariant (data-reading check, `validate_file`
-/// only): when clustering provenance is present and enabled on a structurally
+/// §12.1 strict cluster sum invariant, shared by validation and reader open: when clustering provenance is present and enabled on a structurally
 /// sound duplicating file, every level's `Σ point_count` over its **point**
 /// rows must equal the source point count exactly — taken as the number of
 /// point rows in the canonical band, which is the source data verbatim
@@ -621,11 +587,23 @@ fn check_coalescing(
 ///
 /// Skipped (no report entry) when the prerequisites are missing — the
 /// structural checks of [`validate_metadata`] already fail those files.
-fn check_cluster_sum_invariant(
+pub(crate) fn check_cluster_sum_invariant(
     path: &Path,
     metadata: &ParquetMetaData,
+    descriptor: &ResolvedSchema,
     report: &mut ValidationReport,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    // A malformed count/level type must be reported by the metadata validator,
+    // never passed into Arrow's infallible primitive casts. A partial file has
+    // no canonical source band against which to check the sum.
+    if report.check_passed("cluster_point_count_column") != Some(true)
+        || report.check_passed("level_column") != Some(true)
+        || report.check_passed("overviews_structure") != Some(true)
+        || report.check_passed("complete_pyramid") == Some(false)
+    {
+        return;
+    }
     // Prerequisites: parseable footer, enabled clustering, duplicating mode
     // with a valid canonical level, the named INT64 count column, the level
     // column, and a geometry column (needed to tell point rows apart).
@@ -649,7 +627,12 @@ fn check_cluster_sum_invariant(
         return; // mode_canonical already failed
     };
 
-    match cluster_sum_by_level(path, &meta, clustering) {
+    if descriptor.source_is_subset() {
+        report.pass("cluster_sum_invariant", "spatial subset: levels are independently cropped; whole-source mass equality is not applicable");
+        return;
+    }
+
+    match cluster_sum_by_level(path, &meta, clustering, descriptor, diagnostics) {
         Err(e) => report.fail(
             "cluster_sum_invariant",
             format!("could not read cluster columns: {e}"),
@@ -682,50 +665,45 @@ fn check_cluster_sum_invariant(
                     ),
                 );
             } else {
-                report.fail("cluster_sum_invariant", problems.join("; "));
+                let mut message = problems.join("; ");
+                if footer_value(metadata, crate::resolved_schema::RESOLVED_SCHEMA_KEY).is_none()
+                    && footer_value(metadata, crate::resolved_schema::SOURCE_SUBSET_KEY).is_none()
+                {
+                    message.push_str(&format!(
+                        "; legacy clustered overview (overview format {}): tylertoo 0.8.x \
+                         and earlier did not record spatial-subset provenance, so a cropped \
+                         shard cannot be distinguished from invalid cluster counts. Recreate \
+                         this overview from the original GeoParquet with current tylertoo",
+                        meta.version
+                    ));
+                }
+                report.fail("cluster_sum_invariant", message);
             }
         }
     }
 }
 
-/// Rows per batch for the cluster sum-invariant read (#607): the reader's
-/// default of 1024, lowered as [`super::reader::OverviewReader`] lowers its
-/// own so one batch of the widest byte-array column stays under arrow's
-/// 2 GiB offset limit. Without it a file whose geometries average over ~2 MB
-/// fails with "index overflow decoding byte array".
-fn cluster_read_batch_rows(metadata: &ParquetMetaData) -> usize {
-    crate::input_set::capped_batch_rows(
-        CLUSTER_READ_BATCH_ROWS,
-        crate::input_set::widest_byte_array_column(metadata, None, 0).as_ref(),
-    )
-}
-
-/// The parquet reader's default batch size, which the cluster sum-invariant
-/// read uses when no column is wide enough to need fewer rows.
-const CLUSTER_READ_BATCH_ROWS: usize = 1024;
-
 /// Per level: `(point-row count, Σ point_count over point rows)`, read from
 /// the file with a projection over the geometry / `level` / count columns.
 /// `Ok(None)` when a prerequisite column is missing from the schema.
-#[allow(clippy::type_complexity)]
 fn cluster_sum_by_level(
     path: &Path,
     meta: &OverviewsMeta,
     clustering: &crate::overview::level::ClusteringProvenance,
+    descriptor: &ResolvedSchema,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<Vec<(usize, i64)>>, String> {
+    use super::convert::feature_kind;
+    use crate::batch_processor::extract_geometries_opt_from_array;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type};
     use geoarrow::array::from_arrow_array;
-    use parquet::arrow::ProjectionMask;
-
-    use super::convert::{feature_kind, find_geometry_column};
-    use crate::batch_processor::extract_geometries_opt_from_array;
 
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| e.to_string())?;
+    let builder = tylertoo_io::open_parquet(file).map_err(|e| e.to_string())?;
     let schema = builder.schema().clone();
 
-    let Some(geom_idx) = find_geometry_column(&schema) else {
+    let Some(geom_idx) = descriptor.geometry_index() else {
         return Ok(None);
     };
     let Ok(pc_idx) = schema.index_of(&clustering.point_count_column) else {
@@ -736,11 +714,10 @@ fn cluster_sum_by_level(
     };
     let geom_field = schema.field(geom_idx).clone();
 
-    let mask = ProjectionMask::roots(builder.parquet_schema(), [geom_idx, pc_idx, level_idx]);
-    let batch_rows = cluster_read_batch_rows(builder.metadata());
+    // The reader's default batch, capped by the owner (#607) so one batch of
+    // the widest byte-array column stays under arrow's 2 GiB offset limit.
     let reader = builder
-        .with_projection(mask)
-        .with_batch_size(batch_rows)
+        .with_projection_roots([geom_idx, pc_idx, level_idx])
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -770,7 +747,7 @@ fn cluster_sum_by_level(
         let garr = from_arrow_array(g.as_ref(), &geom_field)
             .map_err(|e| format!("geometry decode: {e}"))?;
         geoms.clear();
-        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms)
+        extract_geometries_opt_from_array(garr.as_ref(), &mut geoms, diagnostics)
             .map_err(|e| format!("geometry decode: {e}"))?;
 
         for (i, geom) in geoms.iter().enumerate() {
@@ -926,11 +903,7 @@ fn find_level_column(metadata: &ParquetMetaData) -> Option<usize> {
     (0..descr.num_columns()).find(|&i| descr.column(i).path().string() == LEVEL_COLUMN)
 }
 
-/// Parse a `MAJOR.MINOR.PATCH` semver and return MAJOR, or `None` if invalid
-/// (or if MAJOR does not fit a `u64`).
-fn parse_semver_major(v: &str) -> Option<u64> {
-    super::level::semver_parts(v)?[0].parse().ok()
-}
+use super::level::parse_semver_major;
 
 /// Fuzz hook (#633): decode `thrift` as a Parquet footer (the bytes before
 /// the trailing length and `PAR1`) and put it through every tylertoo reader
@@ -942,19 +915,20 @@ fn parse_semver_major(v: &str) -> Option<u64> {
 /// row-group bbox readers (covering columns and native geo statistics), the
 /// spill-size and batch-size heuristics, and `--filter` pushdown over the
 /// footer's column statistics, with a few filters bound to the footer's own
-/// columns. The footer decode itself is parquet-rs's, and the embedded
-/// `ARROW:schema` is left to the whole-file targets. Only the `fuzz/` crate
-/// calls this; the `fuzzing` feature is never on in a normal build.
+/// columns. The footer goes through the owner's decode
+/// ([`tylertoo_io::decode_footer`]: the #690 pre-check, then parquet-rs
+/// inside the panic boundary), and the embedded `ARROW:schema` is left to
+/// the whole-file targets. Only the `fuzz/` crate calls this; the `fuzzing`
+/// feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_parquet_footer(
-    thrift: &[u8],
-) -> Result<ValidationReport, parquet::errors::ParquetError> {
+pub fn fuzz_parquet_footer(thrift: &[u8]) -> Result<ValidationReport, tylertoo_io::ParquetError> {
     use super::filter::{BoundFilter, CmpOp, FilterExpr, Literal};
     use super::level::Crs;
-    use parquet::file::metadata::ParquetMetaDataReader;
 
-    let md = ParquetMetaDataReader::decode_metadata(thrift)?;
+    // The owner's decode (#779): the #690 pre-check, then parquet-rs's
+    // decode inside the panic boundary.
+    let md = tylertoo_io::decode_footer(thrift)?;
     let report = validate_metadata(&md);
 
     let n = md.num_row_groups();
@@ -978,18 +952,15 @@ pub fn fuzz_parquet_footer(
     let some: Vec<usize> = (0..n).step_by(2).collect();
     for selected in [None, Some(some.as_slice())] {
         let _ = crate::input::selected_compressed_bytes(&md, selected);
-        let widest = crate::input_set::widest_byte_array_column(&md, selected, 0);
-        let _ = crate::input_set::capped_batch_rows(8192, widest.as_ref());
-        let _ = crate::input_set::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
+        let _ = tylertoo_io::read_batch_plan(&md, selected, 8192, tylertoo_io::byte_array_limit());
+        let _ = tylertoo_io::largest_byte_array_column(&md, selected, |i| i % 2 == 0);
     }
 
     // Without the key-value metadata: the embedded `ARROW:schema` hint is
-    // arrow-ipc's to decode (and it panics on a crafted one, #683);
+    // arrow-ipc's to decode (guarded by the owner since #779, #683);
     // `overview_file` and `remote_footer` reach that through the real open.
     // Here the filters only need column names and types.
-    if let Ok(schema) =
-        parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), None)
-    {
+    if let Ok(schema) = tylertoo_io::schema_without_metadata(&md) {
         for field in schema.fields() {
             let column = field.name().clone();
             let filters = [
@@ -1057,6 +1028,119 @@ mod tests {
     }
 
     // --- fixture builders ---------------------------------------------------
+
+    fn with_rename_provenance(path: &Path, renames: serde_json::Value, persisted: bool) {
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        use tylertoo_io::KeyValue;
+        let builder = tylertoo_io::open_parquet(File::open(path).unwrap()).unwrap();
+        let mut kv = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .clone();
+        kv.retain(|kv| {
+            kv.key != crate::resolved_schema::RESOLVED_SCHEMA_KEY && kv.key != "ARROW:schema"
+        });
+        let footer = kv.iter_mut().find(|kv| kv.key == OVERVIEWS_KEY).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(footer.value.as_deref().unwrap()).unwrap();
+        json["generalization"] = serde_json::json!({
+            "engine": "test", "levels": [], "renamed_columns": renames
+        });
+        footer.value = Some(json.to_string());
+        let descriptor = if persisted {
+            let schema = Schema::new_with_metadata(
+                builder.schema().fields().clone(),
+                kv.iter()
+                    .filter_map(|kv| kv.value.as_ref().map(|v| (kv.key.clone(), v.clone())))
+                    .collect(),
+            );
+            Some(
+                ResolvedSchema::resolve(&schema)
+                    .unwrap()
+                    .footer_json()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let schema = Arc::new(Schema::new(builder.schema().fields().clone()));
+        let batches: Vec<_> = builder.build().unwrap().map(Result::unwrap).collect();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(
+                kv.into_iter()
+                    .map(|kv| KeyValue::new(kv.key, kv.value))
+                    .collect(),
+            ))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        for batch in batches {
+            writer.write(&batch).unwrap();
+        }
+        if let Some(json) = descriptor {
+            writer.append_key_value_metadata(KeyValue::new(
+                crate::resolved_schema::RESOLVED_SCHEMA_KEY.into(),
+                json,
+            ));
+        }
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn rename_provenance_is_checked_by_check_and_reader_open() {
+        for (renames, persisted) in [
+            serde_json::json!({"absent": "level"}),
+            serde_json::json!({"id": "absent_source"}),
+            serde_json::json!({"id": "id"}),
+        ]
+        .into_iter()
+        .flat_map(|r| [(r.clone(), false), (r, true)])
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_fixture(tmp.path(), Mode::Duplicating, &[vec![0, 1]], false);
+            with_rename_provenance(tmp.path(), renames.clone(), persisted);
+            let report = validate_file(tmp.path()).unwrap();
+            assert_eq!(
+                report.check_passed("renamed_columns"),
+                Some(false),
+                "{renames}: {report:?}"
+            );
+            let md = tylertoo_io::read_parquet_metadata(&File::open(tmp.path()).unwrap()).unwrap();
+            assert_eq!(
+                validate_metadata(&md).check_passed("renamed_columns"),
+                Some(false)
+            );
+            let error = super::super::reader::OverviewReader::open(tmp.path()).unwrap_err();
+            assert!(error.to_string().contains("renamed_columns"), "{error}");
+        }
+    }
+
+    #[test]
+    fn valid_and_ambiguous_rename_provenance_remains_readable() {
+        for (renames, persisted) in [
+            serde_json::json!({"id": "level"}),
+            // The spec permits duplicate source names; publication restores at most one.
+            serde_json::json!({"id": "level", "name": "level"}),
+            // A published target prevents restoration, but is still real provenance.
+            serde_json::json!({"id": "name"}),
+        ]
+        .into_iter()
+        .flat_map(|r| [(r.clone(), false), (r, true)])
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            write_fixture(tmp.path(), Mode::Duplicating, &[vec![0, 1]], false);
+            with_rename_provenance(tmp.path(), renames.clone(), persisted);
+            let report = validate_file(tmp.path()).unwrap();
+            assert_eq!(
+                report.check_passed("renamed_columns"),
+                Some(true),
+                "{renames}: {report:?}"
+            );
+            super::super::reader::OverviewReader::open(tmp.path()).unwrap();
+        }
+    }
 
     fn geom_for(id: i64) -> Geometry {
         if id % 2 == 0 {
@@ -1144,9 +1228,8 @@ mod tests {
 
     fn meta_of(path: &std::path::Path) -> ParquetMetaData {
         let file = File::open(path).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file)
+        tylertoo_io::read_parquet_metadata(&file)
             .unwrap()
-            .metadata()
             .as_ref()
             .clone()
     }
@@ -1196,7 +1279,7 @@ mod tests {
 
     #[test]
     fn plain_parquet_missing_key_fails() {
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -1220,10 +1303,20 @@ mod tests {
     /// Write a 2-level duplicating fixture whose footer carries clustering
     /// provenance. `point_counts` supplies per-level `point_count` values
     /// (parallel to `level_ids`); `None` omits the column entirely.
+    #[cfg(test)]
     fn write_cluster_fixture(
         path: &std::path::Path,
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
+    ) {
+        write_cluster_fixture_with_subset(path, level_ids, point_counts, false);
+    }
+
+    fn write_cluster_fixture_with_subset(
+        path: &std::path::Path,
+        level_ids: &[Vec<i64>],
+        point_counts: Option<&[Vec<i64>]>,
+        source_is_subset: bool,
     ) {
         use crate::overview::level::{AccumulatedColumn, ClusteringProvenance, Generalization};
         use arrow_array::Int64Array as I64;
@@ -1245,6 +1338,7 @@ mod tests {
             })
             .collect();
         let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.source_is_subset = source_is_subset;
         opts.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
@@ -1291,6 +1385,100 @@ mod tests {
             );
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn legacy_clustered_shard_has_versioned_actionable_error() {
+        use crate::overview::{
+            export::{export_pmtiles, ExportOptions},
+            reader::OverviewReader,
+        };
+        use crate::resolved_schema::{RESOLVED_SCHEMA_KEY, SOURCE_SUBSET_KEY};
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.parquet");
+        let legacy = dir.path().join("legacy.parquet");
+        // A boundary cluster carries an out-of-shard point at level 0;
+        // canonical cropping retains only one of its source points.
+        write_cluster_fixture_with_subset(
+            &current,
+            &[vec![0], vec![0]],
+            Some(&[vec![2], vec![1]]),
+            true,
+        );
+        assert!(validate_file(&current).unwrap().is_valid());
+        OverviewReader::open(&current).unwrap();
+        export_pmtiles(
+            &current,
+            dir.path().join("current.pmtiles"),
+            &ExportOptions::default(),
+        )
+        .unwrap();
+
+        let builder = tylertoo_io::open_parquet(File::open(&current).unwrap()).unwrap();
+        let mut metadata = builder.schema().metadata().clone();
+        metadata.remove(RESOLVED_SCHEMA_KEY);
+        metadata.remove(SOURCE_SUBSET_KEY);
+        let schema = Arc::new(Schema::new_with_metadata(
+            builder.schema().fields().clone(),
+            metadata,
+        ));
+        let kvs = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .filter(|kv| {
+                ![RESOLVED_SCHEMA_KEY, SOURCE_SUBSET_KEY, "ARROW:schema"].contains(&kv.key.as_str())
+            })
+            .cloned()
+            .collect();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(kvs))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&legacy).unwrap(), schema.clone(), Some(props))
+                .unwrap();
+        let groups = builder.metadata().num_row_groups();
+        for rg in 0..groups {
+            for batch in tylertoo_io::open_parquet(File::open(&current).unwrap())
+                .unwrap()
+                .with_row_groups(vec![rg])
+                .build()
+                .unwrap()
+            {
+                writer
+                    .write(
+                        &RecordBatch::try_new(schema.clone(), batch.unwrap().columns().to_vec())
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let report = validate_file(&legacy).unwrap();
+        let failure = report
+            .failures()
+            .find(|c| c.name == "cluster_sum_invariant")
+            .unwrap();
+        assert!(failure.message.contains("0.8.x"), "{}", failure.message);
+        assert!(failure.message.contains("Recreate"), "{}", failure.message);
+        let error = OverviewReader::open(&legacy).unwrap_err().to_string();
+        assert!(
+            error.contains("0.8.x") && error.contains("Recreate"),
+            "{error}"
+        );
+        let archive = dir.path().join("legacy.pmtiles");
+        let error = export_pmtiles(&legacy, &archive, &ExportOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("0.8.x") && error.contains("Recreate"),
+            "{error}"
+        );
+        assert!(!archive.exists());
     }
 
     #[test]
@@ -1419,6 +1607,7 @@ mod tests {
     /// Write a duplicating fixture whose footer carries coalescing
     /// provenance. `coalesced_counts` supplies per-level `coalesced_count`
     /// values (parallel to `level_ids`); `None` omits the column entirely.
+    #[cfg(test)]
     fn write_coalesce_fixture(
         path: &std::path::Path,
         level_ids: &[Vec<i64>],
@@ -1761,7 +1950,7 @@ mod tests {
     #[test]
     fn validate_metadata_reports_all_failures_not_fail_fast() {
         // Plain parquet: multiple independent checks should each be recorded.
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -1787,7 +1976,7 @@ mod tests {
     /// in a binary column, and returns its footer.
     fn wide_rows_meta(rows: usize, row_bytes: usize) -> ParquetMetaData {
         use arrow_array::BinaryArray;
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "geometry",
@@ -1810,16 +1999,20 @@ mod tests {
     #[test]
     fn cluster_read_batch_rows_lowers_the_default_for_wide_rows() {
         // #607: 4 MiB rows put 1024 of them at 4 GiB, past arrow's i32
-        // offsets. The clamp keeps a batch near 1 GiB: 256 rows.
+        // offsets. The owner's cap, which the cluster read now goes
+        // through, keeps a batch near 1 GiB: 256 rows.
         let md = wide_rows_meta(4, 4 << 20);
-        let rows = cluster_read_batch_rows(&md);
-        assert!(rows < CLUSTER_READ_BATCH_ROWS, "{rows}");
+        let rows = tylertoo_io::read_batch_plan(&md, None, 1024, tylertoo_io::byte_array_limit());
+        assert!(rows < 1024, "{rows}");
         assert!((rows as u64) * (4 << 20) <= 1 << 31, "{rows}");
     }
 
     #[test]
     fn cluster_read_batch_rows_keeps_the_default_for_narrow_rows() {
         let md = wide_rows_meta(16, 100);
-        assert_eq!(cluster_read_batch_rows(&md), CLUSTER_READ_BATCH_ROWS);
+        assert_eq!(
+            tylertoo_io::read_batch_plan(&md, None, 1024, tylertoo_io::byte_array_limit()),
+            1024
+        );
     }
 }

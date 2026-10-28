@@ -33,7 +33,8 @@
 //! # Format
 //!
 //! An 8-byte magic ([`PLAN_MAGIC`]) and an xxh3-64 checksum of everything
-//! after it, then one Arrow IPC **file** holding a single record batch whose
+//! after it, then a length-prefixed JSONL loss partition and one Arrow IPC
+//! **file** holding a single record batch whose
 //! every column is
 //! a `LargeList` carrying one whole side table as a single list value (`null`
 //! when the section does not apply). Scalars, the fingerprint, and the
@@ -61,7 +62,7 @@
 //! fingerprint pins the tylertoo version, every thinning-relevant option, and
 //! each input part's identity: path/URL, byte size, footer row count, footer
 //! row-group count and selected row groups for every part, plus mtime for a
-//! local file. See [`Fingerprint`].
+//! local file and ETag for a remote object. See [`Fingerprint`].
 //!
 //! # Entry-zoom ladder
 //!
@@ -89,10 +90,9 @@ use arrow_array::{
     Array, BinaryArray, Float64Array, Int64Array, LargeListArray, RecordBatch, UInt32Array,
     UInt64Array, UInt8Array,
 };
-use arrow_ipc::reader::FileReader;
-use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
+use tylertoo_io::IpcFileWriter as FileWriter;
 
 use crate::input_set::{ConvertSource, RowGroupSelection};
 
@@ -112,8 +112,12 @@ pub(super) const PLAN_META_KEY: &str = "tylertoo:convert_plan";
 /// v2 wrapped the Arrow IPC payload in the [`PLAN_MAGIC`] + checksum header
 /// (#512) and added the per-part row count to the fingerprint (#511). v3
 /// added the resolved entry-zoom ladder (`entry_zoom`) to the JSON block
-/// (#446).
-pub(super) const PLAN_FORMAT_VERSION: u32 = 3;
+/// (#446). v4 added remote-object provenance. v5 replaces the independent
+/// diagnostic counters with the typed channel and exact source losses (#779).
+/// The optional ETag/last-modified fields alone were backwards readable, but
+/// older plans cannot provide the required typed totals. v6 streams losses in
+/// a length-prefixed JSONL partition before IPC, outside resident metadata.
+pub(super) const PLAN_FORMAT_VERSION: u32 = 6;
 
 /// The first bytes of every plan artifact, ahead of the Arrow IPC payload.
 ///
@@ -122,7 +126,7 @@ pub(super) const PLAN_FORMAT_VERSION: u32 = 3;
 /// not a plan" and "this plan is damaged" *before* handing a single byte to
 /// an Arrow decoder — a byte-flip sweep over a real 10.5 KB artifact panicked
 /// inside arrow's buffer/IPC decoders at 11 of 203 positions (#512).
-pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x03";
+pub(super) const PLAN_MAGIC: &[u8; 8] = b"TTPLAN\x00\x06";
 
 /// The format-independent part of [`PLAN_MAGIC`]: everything but the trailing
 /// version byte.
@@ -141,7 +145,7 @@ const _: () = assert!(
     "PLAN_MAGIC's version byte must track PLAN_FORMAT_VERSION"
 );
 
-/// Bytes ahead of the IPC payload: [`PLAN_MAGIC`] (8) + the payload's
+/// Bytes ahead of the checksummed payload: [`PLAN_MAGIC`] (8) + the payload's
 /// xxh3-64 checksum, little-endian (8).
 const PLAN_HEADER_LEN: usize = 16;
 
@@ -191,10 +195,10 @@ impl<R: Seek> Seek for Offset<R> {
 
 /// The plan's IPC payload as arrow wants to see it: byte 0 = the first IPC
 /// byte, with the header hidden.
-fn ipc_view(file: File) -> Offset<BufReader<File>> {
+fn ipc_view(file: File, offset: u64) -> Offset<BufReader<File>> {
     Offset {
         inner: BufReader::new(file),
-        offset: PLAN_HEADER_LEN as u64,
+        offset,
     }
 }
 
@@ -223,9 +227,16 @@ pub(super) struct InputFingerprint {
     /// only when neither is obtainable.
     pub byte_len: Option<u64>,
     /// Modification time in nanoseconds since the Unix epoch. Local files
-    /// only — an object store's `LastModified` is not plumbed through the
-    /// input layer, so this stays `None` for remote parts.
+    /// only; remote last-modified is recorded separately below.
     pub mtime_nanos: Option<i128>,
+    /// Remote entity tag, compared as an opaque string when saved. Older
+    /// plans and stores without entity tags retain the size/footer binding.
+    #[serde(default)]
+    pub e_tag: Option<String>,
+    /// Remote last-modified time (RFC 3339), retained for provenance. The
+    /// content binding uses ETag and size, rather than timestamp precision.
+    #[serde(default)]
+    pub last_modified: Option<String>,
     /// Row groups selected for this part by `--bbox` / `--filter` pruning.
     /// `None` = every row group.
     pub row_groups: Option<Vec<usize>>,
@@ -267,7 +278,7 @@ impl Fingerprint {
     ///
     /// `flag` is the plan flag that asked for it (`"save-plan"` or
     /// `"plan"`), used only in the remote-input honesty warning.
-    pub fn capture(
+    pub(super) fn capture(
         source: &ConvertSource,
         selected_row_groups: Option<&RowGroupSelection>,
         options: &ConvertOptions,
@@ -283,7 +294,10 @@ impl Fingerprint {
             .enumerate()
             .map(|(i, part)| {
                 let path = part.display_name();
-                let meta = std::fs::metadata(&path).ok();
+                let remote = part.remote_meta();
+                let meta = (!part.is_remote())
+                    .then(|| std::fs::metadata(&path).ok())
+                    .flatten();
                 InputFingerprint {
                     // A remote object has no local metadata; its
                     // Content-Length is already in hand from the HEAD /
@@ -291,12 +305,14 @@ impl Fingerprint {
                     byte_len: meta
                         .as_ref()
                         .map(std::fs::Metadata::len)
-                        .or_else(|| part.fetch_stats().map(|s| s.object_size)),
+                        .or_else(|| remote.map(|m| m.size)),
                     mtime_nanos: meta
                         .as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as i128),
+                    e_tag: remote.and_then(|m| m.e_tag.clone()),
+                    last_modified: remote.map(|m| m.last_modified.clone()),
                     row_groups: selected.and_then(|s| s.get(i).cloned()),
                     row_groups_total: footer.get(i).map(|&(_, groups)| groups),
                     num_rows: footer.get(i).map(|&(rows, _)| rows),
@@ -315,13 +331,13 @@ impl Fingerprint {
     /// Verify `self` (loaded from a plan) against the current run's
     /// fingerprint. Any mismatch is a hard error naming the offending field.
     #[cfg(test)]
-    pub fn verify(&self, current: &Fingerprint) -> Result<(), ConvertError> {
+    pub(super) fn verify(&self, current: &Fingerprint) -> Result<(), ConvertError> {
         self.verify_with(current, SelectionRule::Identical)
     }
 
     /// [`Fingerprint::verify`], with an explicit rule for the one term a
     /// shard is allowed to narrow.
-    pub fn verify_with(
+    pub(super) fn verify_with(
         &self,
         current: &Fingerprint,
         selection: SelectionRule,
@@ -417,11 +433,26 @@ fn verify_input(
         ));
     }
     if saved.byte_len != now.byte_len {
-        return Err(mismatch(
-            &what("byte_len"),
-            &opt_str(saved.byte_len),
-            &opt_str(now.byte_len),
-        ));
+        return Err(crate::input::InputError::PlanInputChanged {
+            input: saved.path.clone(),
+            field: "byte_len",
+            saved: opt_str(saved.byte_len),
+            current: opt_str(now.byte_len),
+        }
+        .into());
+    }
+    // A saved ETag must still be available and identical. Stores that never
+    // supplied one (and older plans) keep the existing size/footer checks.
+    if let Some(etag) = &saved.e_tag {
+        if now.e_tag.as_ref() != Some(etag) {
+            return Err(crate::input::InputError::PlanInputChanged {
+                input: saved.path.clone(),
+                field: "ETag",
+                saved: etag.clone(),
+                current: now.e_tag.clone().unwrap_or_else(|| "<none>".into()),
+            }
+            .into());
+        }
     }
     if saved.mtime_nanos != now.mtime_nanos {
         return Err(mismatch(
@@ -648,6 +679,25 @@ pub(super) fn rebase_plan_for_shard(
         )?);
     }
 
+    plan.totals.source_losses = crate::diagnostics::SourceLosses::try_from_iter_in(
+        plan.totals
+            .source_losses
+            .iter()
+            .filter_map(|loss| match loss {
+                Err(e) => Some(Err(e)),
+                Ok(loss) => usize::try_from(loss.id)
+                    .ok()
+                    .and_then(|row| shard_row(&runs, row))
+                    .map(|row| {
+                        Ok(crate::diagnostics::SourceLoss {
+                            id: row as u64,
+                            ..loss
+                        })
+                    }),
+            }),
+        plan.totals.source_losses.spill_dir(),
+    )
+    .map_err(|e| ConvertError::InvalidConfig(format!("--plan: source accounting: {e}")))?;
     // Side tables are keyed by the same row index, so they move with it.
     // A key outside the shard's runs belongs to a row the shard does not
     // read and is dropped.
@@ -710,9 +760,36 @@ pub(super) fn rebase_plan_for_shard(
             *c = ((*c as f64 * ratio).round() as usize).max(1);
         }
     }
+    // A saved plan stores global scan facts. Without per-row provenance,
+    // projecting those counts onto a shard would invent local warnings.
+    // Preserve them under an explicit whole-plan scope instead.
+    if shard_cursor != plan_cursor && !plan.totals.diagnostics.is_empty() {
+        plan.totals.diagnostics = vec![crate::diagnostics::Diagnostic::SavedPlan {
+            count: 1,
+            diagnostics: std::mem::take(&mut plan.totals.diagnostics),
+        }];
+    }
+    let kinds = plan.kinds.as_ref().ok_or_else(|| {
+        plan_err(
+            path,
+            "shard replay requires the saved per-row geometry kinds; re-create it with --save-plan",
+        )
+    })?;
+    plan.totals.n_points = 0;
+    plan.totals.n_lines = 0;
+    plan.totals.n_polygons = 0;
+    for (&kind, &level) in kinds.iter().zip(&plan.min_levels) {
+        if level == super::stream::UNASSIGNED_LEVEL {
+            continue;
+        }
+        match kind {
+            FeatureKind::Point => plan.totals.n_points += 1,
+            FeatureKind::Line => plan.totals.n_lines += 1,
+            FeatureKind::Polygon => plan.totals.n_polygons += 1,
+        }
+    }
     plan.totals.n_rows = shard_cursor;
     plan.totals.n_features = assigned;
-    plan.totals.skipped_rows = shard_cursor - assigned;
     log::info!(
         "[convert] shard: re-addressed the convert plan onto {shard_cursor} of its \
          {plan_cursor} row(s) in {} contiguous run(s); {assigned} feature(s) to build",
@@ -759,32 +836,21 @@ fn selection_excess(
     }
 }
 
-/// One-line honesty note about what a plan does and does not pin for a
-/// **remote** part (#511), emitted on save and on load alike.
-///
-/// A local file is pinned by path, size, mtime, row count and row-group
-/// layout. A remote object has no mtime and no ETag here — the input layer
-/// does not carry either past `connect()` — so its binding is URL,
-/// Content-Length, row count and row-group layout. That catches every
-/// replay that would corrupt the pyramid (the row-indexed winner table
-/// cannot survive a row-count change), but it does not catch an object
-/// rewritten in place with the identical size, row count and row-group
-/// layout.
+/// Explain the weaker binding only for stores that do not supply an ETag.
 fn warn_remote_binding(source: &ConvertSource, flag: &str) {
     let remote = source
         .parts()
         .iter()
-        .filter(|p| p.is_remote())
+        .filter(|p| p.remote_meta().is_some_and(|m| m.e_tag.is_none()))
         .map(|p| p.display_name())
         .collect::<Vec<_>>();
     let Some(first) = remote.first() else {
         return;
     };
     log::warn!(
-        "--{flag}: {} remote input part(s) (e.g. {first}) are pinned by URL, object size, \
-         row count and row-group layout only — an object has no mtime here, so one rewritten \
-         in place with the same size and row count would NOT be detected. Local parts also \
-         pin mtime.",
+        "--{flag}: {} remote input part(s) (e.g. {first}) have no ETag and are pinned by URL, \
+         object size, row count and row-group layout only. An object rewritten in place \
+         with the same size and row structure would NOT be detected. Local parts also pin mtime.",
         remote.len(),
     );
 }
@@ -892,15 +958,13 @@ const NO_SHARD_PLAN: &str = "none";
 
 /// Dataset-wide tallies pass 2 and the convert report need, which otherwise
 /// only exist while the pass-1 feature scratch is alive.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct PlanTotals {
     /// Total input rows streamed, INCLUDING skipped-geometry rows: the domain
     /// of every row-indexed table.
     pub n_rows: usize,
     /// Features that survived the scan (rows with a usable geometry).
     pub n_features: usize,
-    /// Rows skipped for a null, empty, or non-finite geometry.
-    pub skipped_rows: usize,
     /// Line features in the scan.
     pub n_lines: usize,
     /// Point features in the scan.
@@ -910,21 +974,16 @@ pub(super) struct PlanTotals {
     /// Total Arrow byte size of the encoded geometry column across the scan
     /// (#305): sizes pass 2's RAM-vs-spill decision.
     pub geom_bytes: u64,
-    /// Features whose bbox spans more than 180° of longitude (#188).
-    pub antimeridian_suspect: usize,
-    /// Features outside their CRS's coordinate range (#429).
-    pub out_of_range: usize,
-    /// Features valid for the CRS but outside the Web Mercator tiling domain.
-    pub unprojectable: usize,
-    /// Features drawn wrapped across the antimeridian (#644). Defaults to 0
-    /// so a plan saved before the field existed still loads.
-    #[serde(default)]
-    pub wrapped: usize,
+    /// Pass-1 diagnostics, replayed through the run's sink when loading a plan.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// Exact pre-assignment source losses.
+    #[serde(skip)]
+    pub source_losses: crate::diagnostics::SourceLosses,
 }
 
 impl PlanTotals {
     /// The point/total ratio the profile heuristics read.
-    pub fn point_ratio(&self) -> f64 {
+    pub(super) fn point_ratio(&self) -> f64 {
         if self.n_features == 0 {
             0.0
         } else {
@@ -949,7 +1008,7 @@ pub(super) struct RankPlanProvenance {
 
 impl RankPlanProvenance {
     /// Derive from the resolved [`RankingProvenance`] the writer records.
-    pub fn from_provenance(p: &RankingProvenance) -> Self {
+    pub(super) fn from_provenance(p: &RankingProvenance) -> Self {
         RankPlanProvenance {
             mode: p.mode.clone(),
             column: p.column.clone(),
@@ -1004,7 +1063,7 @@ pub(super) struct ConvertPlan {
     /// Coarsest level per INPUT ROW; the `UNASSIGNED_LEVEL` sentinel for
     /// skipped rows.
     pub min_levels: Vec<u8>,
-    /// Per-row geometry kinds (Q3), or `None` when line coalescing is off.
+    /// Per-row geometry kinds for coalescing and exact shard totals.
     pub kinds: Option<Vec<FeatureKind>>,
     /// Per planned level, the tiny-polygon accumulator's carrier rows (#384).
     pub carriers: Vec<Vec<usize>>,
@@ -1028,7 +1087,7 @@ pub(super) struct ConvertPlan {
 impl ConvertPlan {
     /// Build a plan from the winner tables the assignment just produced,
     /// plus the pass-1 scalars pass 2 and the report consume.
-    pub fn from_winner_tables(
+    pub(super) fn from_winner_tables(
         tables: &WinnerTables,
         fingerprint: Fingerprint,
         rank_provenance: &RankingProvenance,
@@ -1082,7 +1141,7 @@ impl ConvertPlan {
 
     /// Rebuild the winner tables pass 2 addresses. Consumes the plan's
     /// O(dataset) tables rather than cloning them.
-    pub fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
+    pub(super) fn into_winner_tables(self) -> Result<WinnerTables, ConvertError> {
         let coalesce_scratch = self
             .coalesce
             .map(|c| {
@@ -1176,8 +1235,8 @@ macro_rules! list_col {
     ($builder:expr, $present:expr, $push:expr) => {{
         let mut b = LargeListBuilder::new($builder);
         if $present {
-            #[allow(clippy::redundant_closure_call)]
-            $push(&mut b);
+            let push = $push;
+            push(&mut b);
             b.append(true);
         } else {
             b.append(false);
@@ -1188,7 +1247,7 @@ macro_rules! list_col {
 
 impl ConvertPlan {
     /// Write the plan to `path` as an Arrow IPC file.
-    pub fn save(&self, path: &Path) -> Result<(), ConvertError> {
+    pub(super) fn save(&self, path: &Path) -> Result<(), ConvertError> {
         let stride = self
             .cluster_tables
             .as_ref()
@@ -1208,7 +1267,7 @@ impl ConvertPlan {
             rank_plan: self.rank_plan.clone(),
             ladder: self.ladder.clone(),
             entry_zoom: self.entry_zoom.clone(),
-            totals: self.totals,
+            totals: self.totals.clone(),
         };
         let meta_json = serde_json::to_string(&meta)
             .map_err(|e| ConvertError::InvalidConfig(format!("--save-plan: {e}")))?;
@@ -1340,7 +1399,7 @@ impl ConvertPlan {
         ];
 
         let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        write_plan_file(path, &schema, &batch)
+        write_plan_file(path, &schema, &batch, &self.totals.source_losses)
     }
 
     /// Read a plan back from `path`.
@@ -1350,7 +1409,15 @@ impl ConvertPlan {
     /// reach an arrow decoder, and every structural check past that point
     /// reports through [`plan_err`] — a hostile or damaged plan is an error
     /// naming `--plan` and the path, never a panic (#512).
-    pub fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(super) fn load(path: &Path) -> Result<ConvertPlan, ConvertError> {
+        Self::load_with_spill_dir(path, None)
+    }
+
+    pub(super) fn load_with_spill_dir(
+        path: &Path,
+        spill_dir: Option<&Path>,
+    ) -> Result<ConvertPlan, ConvertError> {
         let mut file = File::open(path).map_err(|e| plan_err(path, &format!("{e}")))?;
         let mut header = [0u8; PLAN_HEADER_LEN];
         file.read_exact(&mut header).map_err(|_| {
@@ -1406,7 +1473,17 @@ impl ConvertPlan {
                 ),
             ));
         }
-        let mut reader = FileReader::try_new(ipc_view(file), None)
+        // v6 keeps the loss partition out of resident Arrow schema metadata.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))?;
+        let mut length = [0u8; 8];
+        file.read_exact(&mut length)
+            .map_err(|e| plan_err(path, &format!("loss partition length: {e}")))?;
+        let length = u64::from_le_bytes(length);
+        let offset = (PLAN_HEADER_LEN as u64 + 8)
+            .checked_add(length)
+            .filter(|&n| n <= file.metadata().map_or(0, |m| m.len()).saturating_sub(8))
+            .ok_or_else(|| plan_err(path, "loss partition extends past the IPC payload"))?;
+        let mut reader = tylertoo_io::open_ipc(ipc_view(file.try_clone()?, offset))
             .map_err(|e| plan_err(path, &format!("the Arrow IPC payload is unreadable: {e}")))?;
         let schema = reader.schema();
         let meta_json = schema.metadata().get(PLAN_META_KEY).ok_or_else(|| {
@@ -1415,7 +1492,7 @@ impl ConvertPlan {
                 &format!("is not a tylertoo convert plan (no {PLAN_META_KEY} metadata)"),
             )
         })?;
-        let meta: PlanMeta = serde_json::from_str(meta_json)
+        let mut meta: PlanMeta = serde_json::from_str(meta_json)
             .map_err(|e| plan_err(path, &format!("its metadata block is unreadable: {e}")))?;
         if meta.version != PLAN_FORMAT_VERSION {
             return Err(plan_err(
@@ -1469,6 +1546,35 @@ impl ConvertPlan {
         }
 
         let min_levels: Vec<u8> = u8_section(&batch, "min_levels", path)?.unwrap_or_default();
+        if min_levels.len() != meta.totals.n_rows {
+            return Err(plan_err(
+                path,
+                &format!(
+                    "holds {} winner-table row(s) but claims {} input row(s)",
+                    min_levels.len(),
+                    meta.totals.n_rows,
+                ),
+            ));
+        }
+        // Read the row domain before touching the loss ledger: a forged ID
+        // must never size a spill file or force a scan to that address.
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64 + 8))?;
+        let stream =
+            serde_json::Deserializer::from_reader(BufReader::new((&mut file).take(length)))
+                .into_iter::<crate::diagnostics::SourceLoss>()
+                .map(|loss| {
+                    let loss = loss.map_err(std::io::Error::other)?;
+                    if loss.id >= meta.totals.n_rows as u64 || loss.zoom.is_some() {
+                        return Err(std::io::Error::other(
+                            "source loss outside its input row domain",
+                        )
+                        .into());
+                    }
+                    Ok(loss)
+                });
+        meta.totals.source_losses =
+            crate::diagnostics::SourceLosses::try_from_iter_in(stream, spill_dir)
+                .map_err(|e| plan_err(path, &format!("loss partition: {e}")))?;
         let kinds = u8_section(&batch, "kinds", path)?
             .map(|codes| {
                 codes
@@ -1552,27 +1658,51 @@ fn kind_code(k: FeatureKind) -> u8 {
     }
 }
 
-/// Write one record batch to `path` as a plan artifact: the [`PLAN_MAGIC`]
-/// header, the Arrow IPC payload, then the payload's checksum patched back
+/// Write a loss partition and record batch to `path`: the [`PLAN_MAGIC`]
+/// header, length-prefixed JSONL, Arrow IPC, then the checksum patched back
 /// into the header.
 ///
 /// Two-pass rather than buffering the payload in RAM: the artifact is
 /// O(input rows) and `save` runs at pass 1's memory peak, so an extra whole
 /// copy of it is exactly what a planet-scale run cannot afford.
-fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<(), ConvertError> {
+fn write_plan_file(
+    path: &Path,
+    schema: &Schema,
+    batch: &RecordBatch,
+    losses: &crate::diagnostics::SourceLosses,
+) -> Result<(), ConvertError> {
+    write_plan_payload(path, |w| {
+        // Length-prefixed JSONL is streamed in both directions. Its bytes and
+        // length are included in the payload checksum, before any decoding.
+        w.write_all(&0u64.to_le_bytes())?;
+        losses.write_json_lines(w)?;
+        let length = w.stream_position()? - PLAN_HEADER_LEN as u64 - 8;
+        let mut ipc = FileWriter::try_new(&mut *w, schema)?;
+        ipc.write(batch)?;
+        ipc.finish()?;
+        drop(ipc);
+        w.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64))?;
+        w.write_all(&length.to_le_bytes())?;
+        Ok(())
+    })
+}
+
+/// Frame and checksum a v6 payload, including its length-prefixed loss partition.
+/// The fuzz hook uses this same writer so it can mutate either partition.
+fn write_plan_payload(
+    path: &Path,
+    payload: impl FnOnce(&mut BufWriter<File>) -> Result<(), ConvertError>,
+) -> Result<(), ConvertError> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "#521: saved plans intentionally overwrite in place after preflight"
+    )] // #779: plan written in place
     let file = File::create(path).map_err(|e| save_plan_err(path, &format!("{e}")))?;
     let mut w = BufWriter::new(file);
     w.write_all(PLAN_MAGIC)
         .and_then(|()| w.write_all(&0u64.to_le_bytes()))
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
-    // Arrow's own errors carry no path: `--save-plan /mnt/full/x.plan` used to
-    // fail with a bare "No space left on device" naming neither the flag nor
-    // the file. Every arrow step is prefixed the same way the io steps are.
-    let arrow = |e: arrow_schema::ArrowError| save_plan_err(path, &format!("{e}"));
-    let mut ipc = FileWriter::try_new(w, schema).map_err(arrow)?;
-    ipc.write(batch).map_err(arrow)?;
-    ipc.finish().map_err(arrow)?;
-    let mut w = ipc.into_inner().map_err(arrow)?;
+    payload(&mut w).map_err(|e| save_plan_err(path, &format!("{e}")))?;
     w.flush()
         .map_err(|e| save_plan_err(path, &format!("{e}")))?;
     drop(w);
@@ -1594,7 +1724,7 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
     Ok(())
 }
 
-/// Fuzz hook (#633): read `ipc_payload` back as a saved `--plan` file.
+/// Fuzz hook (#633): read a v6 `payload` back as a saved `--plan` file.
 ///
 /// The checksum in the header rejects almost every mutation before any byte
 /// reaches arrow or serde, so the hook writes a *valid* header (magic plus
@@ -1607,12 +1737,9 @@ fn write_plan_file(path: &Path, schema: &Schema, batch: &RecordBatch) -> Result<
 /// `fuzzing` feature is never on in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub fn fuzz_convert_plan(ipc_payload: &[u8]) -> Result<(), ConvertError> {
-    let mut file = tempfile::NamedTempFile::new()?;
-    file.write_all(PLAN_MAGIC)?;
-    file.write_all(&xxhash_rust::xxh3::xxh3_64(ipc_payload).to_le_bytes())?;
-    file.write_all(ipc_payload)?;
-    file.flush()?;
+pub fn fuzz_convert_plan(payload: &[u8]) -> Result<(), ConvertError> {
+    let file = tempfile::NamedTempFile::new()?;
+    write_plan_payload(file.path(), |w| Ok(w.write_all(payload)?))?;
     ConvertPlan::load(file.path())?.into_winner_tables()?;
     Ok(())
 }
@@ -1860,6 +1987,187 @@ fn rebuild_coalesce(batch: &RecordBatch, path: &Path) -> Result<CoalescePlan, Co
 mod tests {
     use super::*;
 
+    #[cfg(feature = "remote")]
+    fn remote_plan_roundtrip(rewrite: bool, listed: bool) {
+        use crate::input::{remote, InputSource};
+        use object_store::{
+            memory::InMemory, path::Path as ObjectPath, ObjectStore, ObjectStoreExt,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        super::super::testutil::write_input(&input, &point_fixture(), true, None);
+        let bytes = std::fs::read(input).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("set/in.parquet");
+        rt.block_on(store.put(&location, bytes.clone().into()))
+            .unwrap();
+        let initial = rt.block_on(store.head(&location)).unwrap();
+        let source = || {
+            if listed {
+                let part = remote::list_parquet_under_prefix(
+                    &store,
+                    &ObjectPath::from("set"),
+                    "memory://set/",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+                // Exercise the production constructor used by prefix inputs.
+                InputSource::Remote(remote::RemoteSource::from_store_meta(
+                    Arc::clone(&store),
+                    "memory://set/in.parquet".into(),
+                    part,
+                ))
+            } else {
+                InputSource::Remote(
+                    remote::RemoteSource::from_store(
+                        Arc::clone(&store),
+                        location.clone(),
+                        "memory://set/in.parquet".into(),
+                    )
+                    .unwrap(),
+                )
+            }
+        };
+        let plan_path = dir.path().join("convert.plan");
+        let base = ConvertOptions {
+            levels: super::super::convert::LevelPlan::ZoomRange {
+                min_zoom: 2,
+                max_zoom: 7,
+            },
+            ..Default::default()
+        };
+        super::super::convert::convert_to_overviews_source(
+            &source(),
+            &dir.path().join("saved.parquet"),
+            &ConvertOptions {
+                save_plan: Some(plan_path.clone()),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        if rewrite {
+            // Identical bytes, size and footer layout; only object identity changes.
+            rt.block_on(store.put(&location, bytes.into())).unwrap();
+        }
+        let current = rt.block_on(store.head(&location)).unwrap();
+        assert_eq!(initial.size, current.size);
+        assert!(initial.e_tag.is_some());
+        assert_eq!(initial.e_tag == current.e_tag, !rewrite);
+        let output = dir.path().join("replayed.parquet");
+        let result = super::super::convert::convert_to_overviews_source(
+            &source(),
+            &output,
+            &ConvertOptions {
+                plan: Some(plan_path.clone()),
+                ..base
+            },
+        );
+        if rewrite {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConvertError::Input(crate::input::InputError::PlanInputChanged {
+                        field: "ETag",
+                        ..
+                    })
+                ),
+                "{err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("--plan") && message.contains("ETag"),
+                "{message}"
+            );
+            assert!(message.contains("memory://set/in.parquet"), "{message}");
+            assert!(
+                message.contains(&format!("{:?}", initial.e_tag.as_ref().unwrap())),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("{:?}", current.e_tag.as_ref().unwrap())),
+                "{message}"
+            );
+            assert!(!output.exists());
+        } else {
+            result.unwrap();
+            let saved = ConvertPlan::load(&plan_path).unwrap();
+            let binding = serde_json::to_value(&saved.fingerprint.inputs[0]).unwrap();
+            assert_eq!(binding["e_tag"], initial.e_tag.unwrap());
+            assert_eq!(binding["last_modified"], initial.last_modified.to_rfc3339());
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_plan_accepts_unchanged_etag() {
+        for listed in [false, true] {
+            remote_plan_roundtrip(false, listed);
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_plan_rejects_changed_etag() {
+        for listed in [false, true] {
+            remote_plan_roundtrip(true, listed);
+        }
+    }
+
+    #[test]
+    fn remote_plan_rejects_changed_size() {
+        let mut saved = tiny_fingerprint();
+        saved.inputs[0].path = "s3://bucket/in.parquet".into();
+        saved.inputs[0].mtime_nanos = None;
+        let mut current = saved.clone();
+        current.inputs[0].byte_len = Some(5678);
+        let err = saved.verify(&current).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::Input(crate::input::InputError::PlanInputChanged {
+                field: "byte_len",
+                ..
+            })
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("1234") && message.contains("5678"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn remote_plan_handles_missing_etags_and_legacy_metadata() {
+        let mut current = tiny_fingerprint();
+        current.inputs[0].path = "s3://bucket/in.parquet".into();
+        current.inputs[0].mtime_nanos = None;
+        current.inputs[0].e_tag = Some("\"opaque-tag\"".into());
+        current.inputs[0].last_modified = Some("2026-10-27T00:00:00+00:00".into());
+        let mut json = serde_json::to_value(&current).unwrap();
+        let input = json["inputs"][0].as_object_mut().unwrap();
+        input.remove("e_tag");
+        input.remove("last_modified");
+        let legacy: Fingerprint = serde_json::from_value(json).unwrap();
+        // No saved ETag: retain the old size/footer binding, including for
+        // stores that never supply ETags. No incompatible plan version bump.
+        legacy.verify(&legacy).unwrap();
+        legacy.verify(&current).unwrap();
+        let err = current.verify(&legacy).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::Input(crate::input::InputError::PlanInputChanged { field: "ETag", .. })
+        ));
+        // Last-modified is recorded as provenance, not a second content key.
+        let mut touched = current.clone();
+        touched.inputs[0].last_modified = None;
+        current.verify(&touched).unwrap();
+    }
+
     fn tiny_fingerprint() -> Fingerprint {
         Fingerprint {
             tylertoo_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1868,6 +2176,8 @@ mod tests {
                 path: "/tmp/in.parquet".to_string(),
                 byte_len: Some(1234),
                 mtime_nanos: Some(99),
+                e_tag: None,
+                last_modified: None,
                 row_groups: Some(vec![0, 2]),
                 row_groups_total: Some(3),
                 num_rows: Some(9),
@@ -1954,27 +2264,39 @@ mod tests {
             totals: PlanTotals {
                 n_rows: 9,
                 n_features: 8,
-                skipped_rows: 1,
                 n_lines: 4,
                 n_points: 2,
                 n_polygons: 2,
                 geom_bytes: 4096,
-                antimeridian_suspect: 1,
-                out_of_range: 0,
-                unprojectable: 2,
-                wrapped: 3,
+                diagnostics: vec![
+                    crate::diagnostics::Diagnostic::AntimeridianSuspect { count: 1 },
+                    crate::diagnostics::Diagnostic::Unprojectable {
+                        context: None,
+                        count: 2,
+                    },
+                    crate::diagnostics::Diagnostic::Wrapped {
+                        exemplars: Vec::new(),
+                        context: None,
+                        count: 3,
+                    },
+                ],
+                source_losses: Default::default(),
             },
         }
     }
 
-    /// #644: a plan saved before `wrapped` existed still loads, as 0.
     #[test]
-    fn plan_totals_without_wrapped_load_as_zero() {
-        let mut json = serde_json::to_value(tiny_plan().totals).unwrap();
-        json.as_object_mut().unwrap().remove("wrapped");
-        let totals: PlanTotals = serde_json::from_value(json).unwrap();
-        assert_eq!(totals.wrapped, 0);
-        assert_eq!(totals.unprojectable, 2);
+    fn v4_plan_is_refused_with_version_message() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tiny_plan().save(f.path()).unwrap();
+        let mut bytes = std::fs::read(f.path()).unwrap();
+        bytes[PLAN_MAGIC_PREFIX.len()] = 4;
+        std::fs::write(f.path(), bytes).unwrap();
+        let err = load_err(f.path());
+        assert!(
+            err.contains("format v4") && err.contains("Re-create it with --save-plan"),
+            "{err}"
+        );
     }
 
     /// The oracle for the artifact itself: every field survives a save/load
@@ -2087,6 +2409,8 @@ mod tests {
                 // absent and the size is whatever the object store reported.
                 byte_len,
                 mtime_nanos: None,
+                e_tag: None,
+                last_modified: None,
                 row_groups: None,
                 row_groups_total: Some(12),
                 num_rows: Some(rows),
@@ -2213,6 +2537,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shard_diagnostics_keep_global_scope_and_local_kind_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path) = one_part_source(&dir, &[2, 2]);
+        let mut plan = tiny_plan();
+        plan.fingerprint.inputs[0].row_groups = None;
+        plan.coalesce = None;
+        plan.min_levels = vec![0; 4];
+        plan.kinds = Some(vec![
+            FeatureKind::Point,
+            FeatureKind::Point,
+            FeatureKind::Polygon,
+            FeatureKind::Polygon,
+        ]);
+        plan.totals.n_rows = 4;
+        plan.totals.n_features = 4;
+        plan.totals.n_points = 2;
+        plan.totals.n_lines = 0;
+        plan.totals.n_polygons = 2;
+        plan.totals.diagnostics =
+            vec![crate::diagnostics::Diagnostic::NonFiniteGeometry { count: 1 }];
+        rebase_plan_for_shard(
+            &mut plan,
+            &source,
+            Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            Path::new("test.plan"),
+        )
+        .unwrap();
+        assert_eq!(plan.totals.point_ratio(), 0.0);
+        assert_eq!(plan.totals.n_polygons, 2);
+        assert!(plan.totals.diagnostics.iter().all(|event| !matches!(
+            event,
+            crate::diagnostics::Diagnostic::NonFiniteGeometry { .. }
+        )));
+    }
+
     /// A single-part `ConvertSource` over a parquet file whose row groups hold
     /// `rows_per_group` rows each — the footer facts the re-addressing reads.
     fn one_part_source(
@@ -2225,11 +2585,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let path = dir.path().join("parts.parquet");
         let file = File::create(&path).expect("create");
-        let props = parquet::file::properties::WriterProperties::builder()
+        let props = tylertoo_io::test_support::WriterProperties::builder()
             .set_max_row_group_row_count(Some(rows_per_group[0].max(1)))
             .build();
-        let mut w = parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props))
-            .expect("writer");
+        let mut w =
+            tylertoo_io::test_support::ArrowWriter::try_new(file, schema.clone(), Some(props))
+                .expect("writer");
         for &n in rows_per_group {
             let batch = RecordBatch::try_new(
                 schema.clone(),
@@ -2316,10 +2677,138 @@ mod tests {
     // an ERROR naming the flag and the path, never a panic.
     // ------------------------------------------------------------------
 
+    #[test]
+    #[cfg(feature = "fuzzing")]
+    fn fuzz_hook_reads_the_saved_v6_payload() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut plan = tiny_plan();
+        plan.coalesce = None;
+        let sink = crate::diagnostics::Diagnostics::default();
+        sink.source_loss(3, None, crate::diagnostics::SourceLossCause::Filtered)
+            .unwrap();
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        plan.save(file.path()).unwrap();
+        let bytes = std::fs::read(file.path()).unwrap();
+        // The hook must restore only the header, leaving both v6 partitions intact.
+        assert!(fuzz_convert_plan(&bytes[PLAN_HEADER_LEN..]).is_ok());
+    }
+
+    #[test]
+    fn plan_rejects_loss_ids_before_creating_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("forged.plan");
+        let mut plan = tiny_plan();
+        plan.totals.n_rows = 10_000;
+        plan.min_levels = vec![0; plan.totals.n_rows];
+        plan.kinds = None;
+        plan.save(&file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let missing_spill = dir.path().join("must-not-create-a-ledger");
+        for id in [u64::MAX, plan.totals.n_rows as u64] {
+            let loss = serde_json::to_vec(&crate::diagnostics::SourceLoss {
+                id,
+                zoom: None,
+                cause: crate::diagnostics::SourceLossCause::Filtered,
+                feature_id: None,
+            })
+            .unwrap();
+            let mut payload = (loss.len() as u64).to_le_bytes().to_vec();
+            payload.extend_from_slice(&loss);
+            payload.extend_from_slice(&bytes[PLAN_HEADER_LEN + 8..]);
+            let mut forged = PLAN_MAGIC.to_vec();
+            forged.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&payload).to_le_bytes());
+            forged.extend_from_slice(&payload);
+            std::fs::write(&file, forged).unwrap();
+            // A missing spill directory makes any attempt to grow the ledger fail.
+            // The typed domain error must win over ledger I/O/address errors.
+            let err = ConvertPlan::load_with_spill_dir(&file, Some(&missing_spill)).unwrap_err();
+            assert!(matches!(err, ConvertError::InvalidConfig(_)));
+            assert!(
+                err.to_string().contains("outside its input row domain"),
+                "{err}"
+            );
+            assert!(!missing_spill.exists());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shard_replay_keeps_the_loss_ledger_on_the_configured_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let (source, _guard) = one_part_source(&dir, &[3000, 3000]);
+        let mut plan = tiny_plan();
+        plan.fingerprint.inputs[0].row_groups = None;
+        plan.min_levels = vec![0; 6000];
+        plan.kinds = Some(vec![FeatureKind::Point; 6000]);
+        plan.coalesce = None;
+        plan.totals.n_rows = 6000;
+        let sink = crate::diagnostics::Diagnostics::default();
+        sink.set_accounting_spill_dir(Some(spill.path()));
+        sink.source_loss(5999, None, crate::diagnostics::SourceLossCause::Filtered)
+            .unwrap();
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        drop(sink);
+        rebase_plan_for_shard(
+            &mut plan,
+            &source,
+            Some(&RowGroupSelection::from_parts(vec![vec![1]])),
+            Path::new("test.plan"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.totals.source_losses.iter().next().unwrap().unwrap().id,
+            2999
+        );
+        let files: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+            .filter(|path| path.starts_with(spill.path()))
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "the rebased ledger must stay on {spill:?}: {files:?}"
+        );
+    }
+
+    #[test]
+    fn plan_loss_partition_stays_outside_schema_metadata() {
+        let mut plan = tiny_plan();
+        plan.totals.n_rows = 4096;
+        plan.min_levels = vec![0; 4096];
+        plan.kinds = Some(vec![FeatureKind::Point; 4096]);
+        let sink = crate::diagnostics::Diagnostics::default();
+        for row in 0..4096 {
+            sink.source_loss(row, None, crate::diagnostics::SourceLossCause::Filtered)
+                .unwrap();
+        }
+        plan.totals.source_losses = sink.source_losses().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        plan.save(file.path()).unwrap();
+        let (schema, _) = reopen(file.path());
+        assert!(
+            schema.metadata()[PLAN_META_KEY].len() < 16 << 10,
+            "losses must stream separately from resident IPC metadata"
+        );
+        assert_eq!(
+            ConvertPlan::load(file.path()).unwrap().totals.source_losses,
+            plan.totals.source_losses
+        );
+    }
+
     /// Re-open a saved plan's IPC payload, so a test can forge a hostile
     /// variant of a *real* artifact.
     fn reopen(path: &Path) -> (Arc<Schema>, RecordBatch) {
-        let mut r = FileReader::try_new(ipc_view(File::open(path).unwrap()), None).unwrap();
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(PLAN_HEADER_LEN as u64)).unwrap();
+        let mut length = [0; 8];
+        file.read_exact(&mut length).unwrap();
+        let mut r = tylertoo_io::open_ipc(ipc_view(
+            file,
+            PLAN_HEADER_LEN as u64 + 8 + u64::from_le_bytes(length),
+        ))
+        .unwrap();
         let schema = r.schema();
         let batch = r.next().unwrap().unwrap();
         (schema, batch)
@@ -2331,7 +2820,7 @@ mod tests {
     fn forge(path: &Path, meta_json: &str, columns: Vec<arrow_array::ArrayRef>) {
         let schema = Arc::new(plan_schema(meta_json.to_string()));
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-        write_plan_file(path, &schema, &batch).unwrap();
+        write_plan_file(path, &schema, &batch, &Default::default()).unwrap();
     }
 
     /// The saved plan's metadata JSON, as a mutable value.
@@ -2358,7 +2847,7 @@ mod tests {
         plan.save(f.path()).unwrap();
         let (schema, _) = reopen(f.path());
         let empty = RecordBatch::new_empty(schema.clone());
-        write_plan_file(f.path(), &schema, &empty).unwrap();
+        write_plan_file(f.path(), &schema, &empty, &Default::default()).unwrap();
         let err = load_err(f.path());
         assert!(err.contains("0-row"), "{err}");
     }
@@ -2396,6 +2885,60 @@ mod tests {
     /// accepted (121/203 positions), quietly wrong, or panic inside arrow's
     /// buffer/IPC decoders (11/203). The checksum turns every one of those
     /// into the same named error, before a byte reaches a decoder.
+    /// #684: a plan whose checksum is right but whose Arrow IPC payload was
+    /// crafted (a buffer offset past its body) panicked inside arrow-ipc's
+    /// `read_buffer`. The checksum cannot catch a crafted plan, so the
+    /// decode itself must turn the panic into the `--plan` error.
+    #[test]
+    fn plan_with_a_crafted_ipc_buffer_is_an_error_not_a_panic() {
+        let mut payload = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fuzz/corpus/plan_file/seed-issue-684-ipc-buffer.arrow"
+        ))
+        .unwrap();
+        // Keep the hostile array buffers unchanged while bringing only the
+        // seed's schema metadata forward to the current plan format.
+        // The v6 fuzz seed includes an empty, length-prefixed loss partition.
+        assert_eq!(&payload[..8], &0u64.to_le_bytes());
+        let reader = tylertoo_io::open_ipc(std::io::Cursor::new(payload[8..].to_vec())).unwrap();
+        let schema = reader.schema();
+        let original = &schema.metadata()[PLAN_META_KEY];
+        let mut meta: serde_json::Value = serde_json::from_str(original).unwrap();
+        meta["version"] = PLAN_FORMAT_VERSION.into();
+        let totals = meta["totals"].as_object_mut().unwrap();
+        for key in [
+            "antimeridian_suspect",
+            "out_of_range",
+            "unprojectable",
+            "wrapped",
+        ] {
+            totals.remove(key);
+        }
+        totals.insert("diagnostics".into(), serde_json::json!([]));
+        totals.insert("source_losses".into(), serde_json::json!([]));
+        let mut updated = serde_json::to_string(&meta).unwrap();
+        assert!(updated.len() <= original.len());
+        updated.extend(std::iter::repeat_n(' ', original.len() - updated.len()));
+        let positions: Vec<usize> = payload
+            .windows(original.len())
+            .enumerate()
+            .filter_map(|(at, bytes)| (bytes == original.as_bytes()).then_some(at))
+            .collect();
+        assert!(!positions.is_empty());
+        for at in positions {
+            payload[at..at + original.len()].copy_from_slice(updated.as_bytes());
+        }
+        let f = tempfile::NamedTempFile::new().unwrap();
+        write_plan_payload(f.path(), |w| Ok(w.write_all(&payload)?)).unwrap();
+        let err = ConvertPlan::load(f.path())
+            .and_then(ConvertPlan::into_winner_tables)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--plan"), "{err}");
+        assert!(err.contains("panicked"), "names the decoder panic: {err}");
+    }
+
     #[test]
     fn plan_rejects_a_flipped_byte() {
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -2587,6 +3130,7 @@ mod tests {
 
     /// A grid of points: enough for a multi-level pyramid with real
     /// thinning and a non-trivial winner table.
+    #[cfg(test)]
     fn point_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::Point;
 
@@ -2605,6 +3149,7 @@ mod tests {
 
     /// Squares of widely differing size: drives the visibility gate, the
     /// simplify cascade, and the tiny-polygon carrier accumulator (#384).
+    #[cfg(test)]
     fn polygon_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::{Coord, LineString, Polygon};
 
@@ -2646,6 +3191,7 @@ mod tests {
     /// artifact, and excluding it here keeps this test a test of the plan.
     /// Touching lines, so the Q3 coalescing scratch (decoded geometries,
     /// sort keys, class groups) actually has to survive the artifact.
+    #[cfg(test)]
     fn line_fixture() -> Vec<Option<geo::Geometry<f64>>> {
         use geo::{Coord, LineString};
 

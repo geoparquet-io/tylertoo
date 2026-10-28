@@ -10,6 +10,10 @@
 //!
 //! Run with:
 //!   cargo test --package tylertoo-core --test `decode_roundtrip` -- --nocapture
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -27,8 +31,8 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
 
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
@@ -149,7 +153,7 @@ struct Row {
 /// Read every row of a decoded GeoParquet file.
 fn read_rows(path: &Path) -> Vec<Row> {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let mut rows = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
@@ -177,7 +181,12 @@ fn read_rows(path: &Path) -> Vec<Row> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "no null geometry rows");
         for (i, geometry) in geoms.into_iter().enumerate() {
             rows.push(Row {
@@ -327,7 +336,7 @@ fn assert_feature_id_roundtrip(mode: Mode) {
     assert!(report.features_written > 0);
 
     let file = std::fs::File::open(&output).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let schema = builder.schema().clone();
     assert!(
         schema.column_with_name("id").is_none(),
@@ -455,7 +464,7 @@ fn decode_layer_filter_matching_and_not() {
     // The empty file must still be readable parquet with the provenance
     // schema (zero rows).
     let file = std::fs::File::open(&out_none).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let names: Vec<String> = builder
         .schema()
         .fields()
@@ -835,7 +844,7 @@ fn decode_reads_foreign_root_with_contiguous_leaf_offsets() {
 /// The raw `geo` footer value of a GeoParquet file, exactly as written.
 fn geo_footer_json(path: &Path) -> String {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     builder
         .metadata()
         .file_metadata()

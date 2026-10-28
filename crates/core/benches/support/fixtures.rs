@@ -10,7 +10,7 @@
 /// (set by CI's regression job) it panics instead: a bench that silently
 /// skips produces no `new/` estimate, and the regression gate would then have
 /// nothing to compare for it.
-pub fn missing(bench: &str, what: &str) {
+pub(crate) fn missing(bench: &str, what: &str) {
     if std::env::var("TYLERTOO_BENCH_REQUIRE_FIXTURES").as_deref() == Ok("1") {
         panic!(
             "{bench}: fixture {what} not found and TYLERTOO_BENCH_REQUIRE_FIXTURES=1 \

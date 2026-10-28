@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use geo::{CoordsIter, Geometry, LineString, MultiLineString};
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tylertoo_io::open_parquet;
 
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::clip::{buffer_pixels_to_degrees, clip_geometry};
@@ -77,7 +77,12 @@ fn unit() -> TileBounds {
 }
 
 fn check(name: &str, input: Geometry<f64>, expected: Option<Vec<Vec<(f64, f64)>>>) {
-    let got = clip_geometry(&input, &unit(), 0.0);
+    let got = clip_geometry(
+        &input,
+        &unit(),
+        0.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     let got_parts = parts(&got);
     eprintln!("{name}: {got_parts:?}");
     assert_eq!(got_parts, expected, "{name}");
@@ -291,7 +296,12 @@ fn line_crossing_at_an_angle_interpolates_the_boundary_point() {
 #[test]
 fn buffered_bounds_are_applied_to_lines() {
     // Through the public API with a buffer: the clip box is widened by it.
-    let got = clip_geometry(&ls(&[(-5.0, 5.0), (15.0, 5.0)]), &unit(), 1.0);
+    let got = clip_geometry(
+        &ls(&[(-5.0, 5.0), (15.0, 5.0)]),
+        &unit(),
+        1.0,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     assert_eq!(
         parts(&got),
         Some(vec![vec![(-1.0, 5.0), (11.0, 5.0)]]),
@@ -310,14 +320,19 @@ fn fixture_path() -> PathBuf {
 
 fn read_geometries(path: &PathBuf) -> Vec<Geometry<f64>> {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let mut geoms = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
         let schema = batch.schema();
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
     }
     geoms
 }
@@ -367,7 +382,12 @@ fn sweep(zoom: u8) -> Sweep {
             for y in y0..=y1 {
                 let bounds = TileCoord::new(x, y, zoom).bounds();
                 let buffer = buffer_pixels_to_degrees(8, &bounds, 4096);
-                let Some(clipped) = clip_geometry(geom, &bounds, buffer) else {
+                let Some(clipped) = clip_geometry(
+                    geom,
+                    &bounds,
+                    buffer,
+                    &tylertoo_core::diagnostics::Diagnostics::default(),
+                ) else {
                     continue;
                 };
                 kept += 1;

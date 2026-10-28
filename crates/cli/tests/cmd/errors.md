@@ -1,5 +1,6 @@
-Exit codes: clap usage errors exit 2; runtime errors exit 1 with `Error: ...`
-on stderr. `errors.out/` checks that the refused overwrite left
+Exit codes: usage errors exit 2, both clap's and the option and output-path
+rules core checks before reading anything (#779); runtime errors exit 1. Both
+print `Error: ...` (clap: `error: ...`) on stderr. `errors.out/` checks that the refused overwrite left
 `existing.pmtiles` empty.
 
 An unknown flag on the bare form is reported against `tiles`.
@@ -37,7 +38,7 @@ An output in a missing directory is refused before the input is read.
 
 ```console
 $ tylertoo overture-names.parquet no-such-dir/out.pmtiles
-? 1
+? 2
 Error: cannot write no-such-dir/out.pmtiles: directory no-such-dir does not exist
 
 ```
@@ -46,7 +47,7 @@ An existing output needs `--force`.
 
 ```console
 $ tylertoo overture-names.parquet existing.pmtiles
-? 1
+? 2
 Error: existing.pmtiles exists (use --force to overwrite)
 
 ```

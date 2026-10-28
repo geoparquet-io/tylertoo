@@ -19,6 +19,18 @@
 #      decodes sampled tiles at every zoom (layer name, geometry validity,
 #      non-zero features). Neither reader shares a line of code with our
 #      writer — the point of #421.
+#   4. The strict whole-archive invariants (#779, G3):
+#      benchmarks/e2e/run_e2e.py --invariants runs `tiles` over a settings
+#      matrix (defaults, --verbatim, --polygon-visibility 0,
+#      --simplify-factor 0, --coverage-fill) and decodes EVERY tile with
+#      scripts/verify_archive.py --strict: tile size <= the caps, OGC-valid
+#      polygons, feature and property accounting, feature counts that never
+#      rise toward coarse zooms, placeholder squares that decay. Steps 1-3
+#      compare output to earlier output; this one checks properties that
+#      must hold whatever the baseline says. Known failures are rows of
+#      benchmarks/e2e/invariant_exemptions.toml, each tied to an open issue.
+#      PRs run defaults plus each fixture's most bug-prone setting; pushes
+#      to main, the nightly schedule and dispatches run the full matrix.
 #
 # Our own tests only ever read our archives with our own code; the writer
 # is self-implemented (the pmtiles crate is read-only). A self-consistent-
@@ -40,12 +52,18 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Nightly: the full invariant matrix (step 4) on main.
+  schedule:
+    - cron: "17 5 * * *"
 
 permissions:
   contents: read
 
+# PRs group per ref and cancel superseded runs; every other event (a push to
+# main, a schedule, a dispatch) groups per SHA, so a main run is never
+# cancelled by the next merge (#779, the same block as ci.yml).
 concurrency:
-  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  group: e2e-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -88,7 +106,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,7 +185,7 @@ jobs:
       # Step 3: the Python readers. uv resolves the script's PEP 723 inline
       # dependencies (pinned pmtiles + mapbox-vector-tile).
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: scripts/verify_archive.py
@@ -180,6 +198,29 @@ jobs:
             uv run scripts/verify_archive.py "$f" --layer "$layer" \
               --per-zoom 5 || status=1
           done
+          exit "$status"
+
+      # Step 4: the strict whole-archive invariants (#779). The exemption
+      # file first: well-formed, its row count equal to the pin in
+      # verify_archive.py, every row's issue still open.
+      - name: Check the invariant exemptions (pinned count, open issues)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run scripts/verify_archive.py \
+            --check-exemptions benchmarks/e2e/invariant_exemptions.toml \
+            --check-issues-open
+
+      - name: Strict invariants over every tile (settings matrix)
+        env:
+          TIER: ${{ github.event_name == 'pull_request' && 'pr' || 'full' }}
+        run: |
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          export PMTILES_BIN
+          status=0
+          python3 benchmarks/e2e/run_e2e.py --invariants --tier "$TIER" \
+            --work e2e-invariants --markdown invariants.md || status=$?
+          cat invariants.md >> "$GITHUB_STEP_SUMMARY" || true
           exit "$status"
 
       # Failure-only: the admin fixture's z0-14 archive is ~100 MB.

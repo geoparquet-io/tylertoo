@@ -12,6 +12,10 @@
 //! A subprocess test for the reason `profile_json_dump.rs` gives: both
 //! `TYLERTOO_AUTO_MEM_LIMIT_BYTES` and `TYLERTOO_PROFILE_JSON` are process
 //! globals, so they are set only in the child's environment.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::process::Command;
@@ -19,8 +23,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use tylertoo_io::test_support::ArrowWriter;
+use tylertoo_io::test_support::WriterProperties;
 
 /// Input rows. Small enough to run in a few seconds, and read in
 /// [`READ_BATCH_ROWS`]-row batches so the light head alone spans far more
@@ -98,7 +102,7 @@ fn write_points(path: &Path, light_rows: usize) {
     });
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(4_096))
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+        .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]))

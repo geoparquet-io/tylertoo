@@ -1,0 +1,109 @@
+Convert GeoParquet to PMTiles in one call, like `tylertoo tiles`.
+
+Runs the same core facade as `tylertoo tiles`, with the same
+options and defaults, so the chain — the removed-after-export
+intermediate overview, its free-space preflight, the option rules,
+and the declared zoom range — matches the CLI. `overview()`
+followed by `export_pmtiles()` is the same chain in two steps.
+Sharded builds (`--shard`, `--plan-only`) stay CLI-only.
+
+Args:
+    input: See `overview()`.
+    output: PMTiles archive to write.
+    min_zoom: See `overview()`.
+    max_zoom: See `overview()`.
+    layer_name: MVT layer name, or `None` for the input's file stem.
+    tile_size_limit: See `export_pmtiles()`. `"auto"` is no limit
+        with `verbatim`.
+    simple_clip_fastpath: See `export_pmtiles()`.
+    feature_order: See `export_pmtiles()`.
+    spill_dir: Scratch directory for the intermediate overview and
+        the export's spill (the CLI's `--spill-dir`). The
+        intermediate is at least input-sized; without this it goes
+        to `$TMPDIR`, then the output's directory. Set it when
+        `$TMPDIR` is small or a tmpfs. A `UserWarning` is raised
+        when the chosen volume looks too small, whether or not the
+        run then fails.
+    include_properties: See `overview()`.
+    exclude_properties: See `overview()`.
+    exclude_all_properties: See `overview()`.
+    size_valve: See `export_pmtiles()`.
+    max_compressed_tile_size: See `export_pmtiles()`. `"auto"` is no
+        limit with `verbatim`.
+    coverage_fill: See `export_pmtiles()`.
+    gsds: See `overview()`.
+    bbox: See `overview()`.
+    name: See `export_pmtiles()`.
+    description: See `export_pmtiles()`.
+    attribution: See `export_pmtiles()`.
+    tile_buffer: See `export_pmtiles()`.
+    extent: See `export_pmtiles()`.
+    partition_wave: See `export_pmtiles()`.
+    feature_id: See `export_pmtiles()`.
+    keep_overview: Keep the intermediate overview file at this path
+        instead of removing it. Its directory must exist.
+    tile_range: See `export_pmtiles()`.
+    gsd_base: See `overview()`.
+    sort_key: See `overview()`.
+    magnitude_ladder: See `overview()`.
+    ladder_step: See `overview()`.
+    entry_zoom: See `overview()`.
+    sort_direction: See `overview()`.
+    class_rank_column: See `overview()`.
+    class_ranks: See `overview()`.
+    class_rank_unknown: See `overview()`.
+    no_auto_rank: See `overview()`.
+    verbatim: See `overview()`. Also turns both tile size limits
+        off unless you pass them.
+    simplify_factor: See `overview()`.
+    collapse: See `overview()`.
+    collapse_square: See `overview()`.
+    no_collapse: See `overview()`.
+    representation: See `overview()`.
+    cascade: See `overview()`.
+    point_thinning: See `overview()`.
+    line_thinning: See `overview()`.
+    polygon_thinning: See `overview()`.
+    line_visibility: See `overview()`.
+    polygon_visibility: See `overview()`.
+    drop_rate: See `overview()`.
+    drop_gamma: See `overview()`.
+    density_drop: See `overview()`.
+    drop_lines: See `overview()`.
+    drop_polygons: See `overview()`.
+    cluster: See `overview()`.
+    accumulate_attributes: See `overview()`.
+    coalesce_lines: See `overview()`.
+    coalesce_snap: See `overview()`.
+    coalesce_junction_angle: See `overview()`.
+    coalesce_max_level_rows: See `overview()`.
+    row_group_size: See `overview()`.
+    row_group_size_policy: See `overview()`.
+    full_column_stats: See `overview()`.
+    streaming: See `overview()`.
+    read_batch_size: See `overview()`.
+    filter: See `overview()`.
+    profile: See `overview()`.
+    in_flight_batches: See `overview()`.
+    read_workers: See `overview()`.
+    save_plan: See `overview()`.
+    plan: See `overview()`.
+
+Returns:
+    Both halves' reports, keyed `"convert"` and `"export"` like the
+    CLI's `tiles --report` JSON.
+
+Raises:
+    ConfigError: Invalid or conflicting options, refused before any
+        input is read.
+    ValueError: A missing or mistyped column, or a property
+        selection the input cannot satisfy.
+    MemoryError: Too little memory for this input.
+    RuntimeError: Conversion or export failed.
+
+Example:
+    >>> report = convert(
+    ...     "buildings.parquet", "out.pmtiles", max_zoom=10
+    ... )
+    >>> sorted(report)
+    ['convert', 'export']

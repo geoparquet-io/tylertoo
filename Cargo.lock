@@ -152,9 +152,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-arith"
-version = "59.3.0"
+version = "59.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2961626677665b2195eb59242af4c7befe7b8737ca2050295389362380104e"
+checksum = "2ab555c0ffe9cb817041c0cee80baa9663a22225d0a035693579771f2693cadc"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -656,9 +656,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.8.1"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69bb407740a197147da48238ecc94498493c9e85445732360cec180296ca45f1"
+checksum = "55752025c39c0e094962fd73f1c57014b191f678612e517f219468e575af9822"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -671,7 +671,6 @@ dependencies = [
  "itoa",
  "num-integer",
  "pin-project-lite",
- "pin-utils",
  "ryu",
  "serde",
  "time",
@@ -2615,9 +2614,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"
@@ -3807,6 +3806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4101,7 +4111,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4220,9 +4230,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4427,11 +4437,12 @@ dependencies = [
  "indicatif",
  "log",
  "mimalloc",
- "parquet",
+ "serde",
  "serde_json",
  "tempfile",
  "trycmd",
  "tylertoo-core",
+ "tylertoo-io",
 ]
 
 [[package]]
@@ -4442,7 +4453,6 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
- "arrow-ipc",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -4452,6 +4462,7 @@ dependencies = [
  "aws-smithy-types",
  "brotli",
  "bytes",
+ "clap",
  "codspeed-criterion-compat",
  "crossbeam-channel",
  "dhat",
@@ -4471,7 +4482,6 @@ dependencies = [
  "log",
  "memory-stats",
  "object_store",
- "parquet",
  "proptest",
  "prost",
  "prost-build",
@@ -4479,9 +4489,11 @@ dependencies = [
  "rstar",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tylertoo-io",
  "url",
  "wkb",
  "xxhash-rust",
@@ -4489,12 +4501,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tylertoo-io"
+version = "0.8.0"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
+ "bytes",
+ "log",
+ "object_store",
+ "parquet",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tylertoo-python"
 version = "0.8.0"
 dependencies = [
+ "clap",
  "pyo3",
  "pyo3-log",
  "pythonize",
+ "serde",
+ "serde_json",
  "tylertoo-core",
 ]
 

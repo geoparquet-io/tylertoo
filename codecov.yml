@@ -1,19 +1,29 @@
-# Codecov reports; it does not gate. The coverage floor is the "Coverage
-# floor" step of the CI Coverage job (scripts/coverage_gate.py, #678): the
-# codecov/project status never posted here, so a target set below gated
-# nothing. Keep `ignore:` in step with DEFAULT_IGNORE in that script.
+# Native Codecov statuses use the same report, with separate crate targets.
 coverage:
   status:
     project:
       default:
-        informational: true
+        target: 94%
+        threshold: 0%
+        informational: false
+      core:
+        target: 94%
+        threshold: 0%
+        paths:
+          - "crates/core/"
+        informational: false
+      cli:
+        target: 81.9%
+        threshold: 0%
+        paths:
+          - "crates/cli/"
+        informational: false
     patch:
       default:
         informational: true
 
 ignore:
-  - "crates/cli/**"        # Don't require high coverage for CLI arg parsing
-  - "crates/python/**"     # pyo3 bindings are integration-tested differently
+  - "crates/python/**"
   - "tests/**"
   - "benches/**"
 

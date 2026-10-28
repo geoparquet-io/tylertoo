@@ -5,7 +5,7 @@
 # https://github.com/sourcefrog/cargo-mutants/blob/main/src/config.rs.
 # The file is parsed with deny_unknown_fields: a typo fails every run.
 #
-# Per-mutant cost is what makes or breaks a sweep of ~8400 mutants, so
+# Per-mutant cost is what makes or breaks a sweep of ~10,300 mutants, so
 # every knob below is there to shrink it; the measurements behind each one
 # are in the PR that introduced it (perf(mutants), 2026-09) and in
 # DEVELOPMENT.md.
@@ -57,13 +57,18 @@ features = ["remote"]
 additional_cargo_args = [
   "--lib",
   "--test", "accumulate_log",
+  "--test", "config_preflight",
+  "--test", "config_spec",
   "--test", "coverage_defaults",
   "--test", "coverage_fill",
   "--test", "decode_errors",
   "--test", "decode_roundtrip",
+  "--test", "diagnostics",
   "--test", "export_geometry_column_name",
   "--test", "hostile_geometry_eval",
   "--test", "invalid_geometry_clipping",
+  "--test", "invariant_fixtures",
+  "--test", "io_boundary",
   "--test", "ioverlay_real_fixtures_test",
   "--test", "leaf_directory_integration",
   "--test", "line_clip_pinned",
@@ -73,6 +78,9 @@ additional_cargo_args = [
   "--test", "overview_property_tests",
   "--test", "pmtiles_clustered",
   "--test", "rayon_pool_reentry",
+  "--test", "reader_projection",
+  "--test", "resolved_schema",
+  "--test", "simplify_parity",
   "--test", "webmercator_roundtrip",
   "--test", "wrapped_log",
 ]

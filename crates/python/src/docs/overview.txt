@@ -1,0 +1,130 @@
+Build a GeoParquet overview file: one generalized level per zoom.
+
+Args:
+    input: GeoParquet in lon/lat (`EPSG:4326`) or Web Mercator
+        (`EPSG:3857`). Pass a file, directory, glob, `s3://`,
+        `gs://`, or `https://` URL or prefix, or a list of files.
+    output: Overview file to write.
+    mode: `"duplicating"` makes each level a complete map;
+        `"partitioning"` stores each feature once.
+    min_zoom: Coarsest zoom.
+    max_zoom: Finest zoom, or `"auto"` to estimate it (at most 16).
+    gsds: Per-level GSDs in meters, coarse to fine, instead of
+        zooms.
+    gsd_base: Pixels per tile edge when mapping zooms to GSDs. A
+        larger base keeps more detail.
+    sort_key: Numeric column used to choose each cell's winner.
+    magnitude_ladder: Column whose values set each feature's first
+        zoom, largest first.
+    ladder_step: Zooms between `magnitude_ladder` values.
+    entry_zoom: First zoom for listed values of a column, as
+        `"COLUMN:VALUE=ZOOM,VALUE=ZOOM"`, such as
+        `"density:5000=4,1000=6"`. Unlisted values use the normal
+        visibility gate. Not with `magnitude_ladder`.
+    sort_direction: Whether larger or smaller `sort_key` values win.
+    class_rank_column: String column ranked by `class_ranks`.
+    class_ranks: Finite priority per class; higher values win.
+    class_rank_unknown: Priority of unlisted classes, or `None` to
+        rank them last.
+    no_auto_rank: Skip automatic ranking of Overture roads and
+        places.
+    verbatim: Turn off thinning, visibility gates, simplification,
+        the density budget, and line coalescing, for pre-aggregated
+        or pre-levelled input. Sets the defaults of the options
+        below to off; an option you pass still applies.
+    simplify_factor: Simplification tolerance, in GSDs, or `None`
+        for 1 (0 with `verbatim`).
+    collapse: Represent small polygons as points instead of the
+        default placeholder squares.
+    collapse_square: Represent small polygons as placeholder
+        squares. Squares are the default except with an entry-zoom
+        ladder, which uses points unless you set this option.
+    no_collapse: Drop small polygons instead of using placeholders.
+        This was the default before #745. Output is smaller, but
+        polygon coverages have holes at coarse zooms.
+    representation: Geometry kind per zoom band, such as
+        `"0-7:point,8-14:geom"`.
+    cascade: Speed up simplification by deriving each level from
+        the next finer one.
+    point_thinning: Point grid cell size in GSDs, or `None` for 4
+        (16 with `cluster`, 0 with `verbatim`).
+    line_thinning: Line grid cell size in GSDs, or `None` for 1
+        (0 with `verbatim`).
+    polygon_thinning: Polygon grid cell size in GSDs, or `None` for
+        0 (off).
+    line_visibility: Smallest line bounding-box diagonal kept, in
+        GSDs, or `None` for 2 (0 with `verbatim`).
+    polygon_visibility: Smallest polygon bounding-box diagonal kept,
+        in GSDs, or `None` for 2 (0 with `verbatim`).
+    drop_rate: Ratio between feature budgets of adjacent levels.
+    drop_gamma: How strongly the budget spares sparse areas.
+    density_drop: Apply the per-level feature budget, or `None` for
+        on (off with `verbatim`). It thins points only unless
+        `drop_lines` or `drop_polygons` is set.
+    drop_lines: Apply the feature budget to lines too.
+    drop_polygons: Apply the feature budget to polygons too, which
+        leaves holes in a polygon coverage.
+    cluster: Merge each cell's points and add `point_count`.
+    accumulate_attributes: Aggregation method for each column in
+        a cluster.
+    coalesce_lines: Join touching same-class lines at coarse levels,
+        or `None` for on (off with `verbatim`). `True` is refused in
+        partitioning mode.
+    coalesce_snap: Largest gap between joined line ends, in GSDs.
+    coalesce_junction_angle: Largest turn through a junction, in
+        degrees. Set `0` to stop at every junction.
+    coalesce_max_level_rows: Skip joining above this line count per
+        level to bound memory.
+    include_properties: Keep only these property columns and skip
+        reading the rest. Columns other options read, such as
+        `sort_key`, must stay in the list. `[]` keeps none.
+    exclude_properties: Drop these property columns.
+        `include_properties` overrides it.
+    exclude_all_properties: Drop every property column, writing
+        geometry only. `include_properties` overrides it.
+    cogp_compat: Write the third-party `cogp` footer key for readers
+        of that overview format.
+    row_group_size: Maximum rows per output row group.
+    row_group_size_policy: `"constant"`, or `"zoom-scaled"` to
+        double the row-group cap per zoom coarser than the finest.
+    full_column_stats: Keep Parquet statistics for every column.
+    streaming: Read the input in
+        [batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
+    read_batch_size: Rows per
+        [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
+    bbox: Keep features that intersect this lon/lat box, also one
+        ±360° wrap away, as for 0..360 data.
+    filter: SQL-style predicate, such as `"confidence > 0.8"`.
+    profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
+        `"speed"` holds output in RAM, `"bounded"` uses disk, and
+        `"auto"` chooses per run.
+    in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
+        or `0` to size from the CPU count.
+    read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
+        or `0` to size from the CPU count.
+    spill_dir: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files)
+        for remote input.
+    save_plan: Save the convert plan (pass 1 and the level
+        assignment) here and continue converting.
+    plan: Reuse a saved convert plan, skipping pass 1. Its
+        fingerprint must match this run's version, options and
+        inputs.
+
+Returns:
+    Counts and sizes for each level written, with input diagnostics.
+
+Raises:
+    ConfigError: Invalid or conflicting options, refused before any
+        input is read.
+    ValueError: A missing or mistyped column, a property selection
+        the input cannot satisfy, an unsupported projection, or
+        almost nothing to tile.
+    MemoryError: Too little memory for this input.
+    RuntimeError: Reading or writing failed.
+
+Example:
+    >>> report = overview(
+    ...     "buildings.parquet", "overview.parquet", max_zoom=10
+    ... )
+    >>> report["input_features"]
+    1000

@@ -98,11 +98,11 @@ class TestConvertErrors:
         ],
     )
     def test_convert_rejects_removed_legacy_kwargs(self, removed_kwarg):
-        """Legacy pipeline kwargs were removed and must raise TypeError."""
+        """Removed legacy keywords raise ConfigError before input is read."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "output.pmtiles"
 
-            with pytest.raises(TypeError):
+            with pytest.raises(tylertoo.ConfigError, match=next(iter(removed_kwarg))):
                 tylertoo.convert(
                     input="/some/input.parquet",
                     output=str(output),
@@ -294,9 +294,10 @@ class TestConvertIntegration:
         input_file = REALDATA_DIR / "open-buildings.parquet"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Output path inside a nonexistent subdirectory: the temp file
-            # then targets that missing directory and creation fails early;
-            # nothing may leak into tmpdir either way.
+            # Output path inside a nonexistent subdirectory: core's output
+            # preflight refuses it before the intermediate is created,
+            # whatever $TMPDIR is (#452, #709); nothing may leak into
+            # tmpdir either way.
             output = Path(tmpdir) / "missing-subdir" / "output.pmtiles"
 
             with pytest.raises(Exception):

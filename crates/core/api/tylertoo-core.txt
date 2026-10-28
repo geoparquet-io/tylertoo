@@ -63,6 +63,8 @@ impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for ty
 pub fn tylertoo_core::Error::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::decode::DecodeError
 pub fn tylertoo_core::decode::DecodeError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::export::ExportError
@@ -84,15 +86,15 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::atomic_output::Outp
 pub fn tylertoo_core::atomic_output::check_writable(&std::path::Path) -> core::result::Result<(), tylertoo_core::atomic_output::OutputNotWritable>
 pub fn tylertoo_core::atomic_output::check_writable_in_place(&std::path::Path) -> core::result::Result<(), tylertoo_core::atomic_output::OutputNotWritable>
 pub mod tylertoo_core::batch_processor
-pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>) -> tylertoo_core::Result<()>
-pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>) -> tylertoo_core::Result<()>
+pub fn tylertoo_core::batch_processor::extract_geometries_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<geo_types::geometry::Geometry<f64>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<()>
+pub fn tylertoo_core::batch_processor::extract_geometries_opt_from_array(&dyn geoarrow_array::trait_::GeoArrowArray, &mut alloc::vec::Vec<core::option::Option<geo_types::geometry::Geometry<f64>>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::batch_processor::resolve_parquet_files(&std::path::Path) -> tylertoo_core::Result<alloc::vec::Vec<std::path::PathBuf>>
 pub mod tylertoo_core::clip
 pub const tylertoo_core::clip::DEFAULT_BUFFER_PIXELS: u32
 pub const tylertoo_core::clip::DEFAULT_EXTENT: u32
 pub fn tylertoo_core::clip::buffer_pixels_to_degrees(u32, &tylertoo_core::tile::TileBounds, u32) -> f64
-pub fn tylertoo_core::clip::clip_geometry(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::clip::clip_geometry_simple(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, bool, bool) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::clip::clip_geometry(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::clip::clip_geometry_simple(&geo_types::geometry::Geometry<f64>, &tylertoo_core::tile::TileBounds, f64, bool, bool, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub fn tylertoo_core::clip::geometry_is_simple(&geo_types::geometry::Geometry<f64>) -> bool
 pub mod tylertoo_core::compression
 #[repr(u8)] pub enum tylertoo_core::compression::Compression
@@ -104,8 +106,8 @@ pub tylertoo_core::compression::Compression::Zstd = 4
 impl tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::code(&self) -> u8
 pub fn tylertoo_core::compression::Compression::from_code(u8) -> core::option::Option<Self>
-pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::option::Option<Self>
 pub fn tylertoo_core::compression::Compression::name(&self) -> &'static str
+pub fn tylertoo_core::compression::Compression::parse(&str) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::clone(&self) -> tylertoo_core::compression::Compression
 impl core::cmp::Eq for tylertoo_core::compression::Compression
@@ -117,6 +119,9 @@ impl core::fmt::Debug for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::compression::Compression
 impl core::marker::StructuralPartialEq for tylertoo_core::compression::Compression
+impl core::str::traits::FromStr for tylertoo_core::compression::Compression
+pub type tylertoo_core::compression::Compression::Err = alloc::string::String
+pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::compression::Compression
 impl core::marker::Send for tylertoo_core::compression::Compression
 impl core::marker::Sync for tylertoo_core::compression::Compression
@@ -165,6 +170,10 @@ pub fn tylertoo_core::covering::CoveringSpec::eq(&self, &tylertoo_core::covering
 impl core::fmt::Debug for tylertoo_core::covering::CoveringSpec
 pub fn tylertoo_core::covering::CoveringSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::covering::CoveringSpec
+impl serde_core::ser::Serialize for tylertoo_core::covering::CoveringSpec
+pub fn tylertoo_core::covering::CoveringSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::covering::CoveringSpec
+pub fn tylertoo_core::covering::CoveringSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::covering::CoveringSpec
 impl core::marker::Send for tylertoo_core::covering::CoveringSpec
 impl core::marker::Sync for tylertoo_core::covering::CoveringSpec
@@ -198,7 +207,6 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::covering::RowGro
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::covering::RowGroupBounds
 pub fn tylertoo_core::covering::extract_row_group_bounds(&std::path::Path) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::extract_row_group_bounds_from_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
-pub fn tylertoo_core::covering::extract_row_group_bounds_from_reader(&parquet::file::serialized_reader::SerializedFileReader<std::fs::File>) -> core::result::Result<alloc::vec::Vec<core::option::Option<tylertoo_core::covering::RowGroupBounds>>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::find_bbox_column_indices(&parquet::file::metadata::ParquetMetaData, &tylertoo_core::covering::CoveringSpec) -> core::option::Option<tylertoo_core::covering::BboxColumnIndices>
 pub fn tylertoo_core::covering::get_geo_metadata(&parquet::file::metadata::ParquetMetaData) -> core::result::Result<core::option::Option<alloc::string::String>, tylertoo_core::Error>
 pub fn tylertoo_core::covering::parse_bounds(&str) -> core::result::Result<tylertoo_core::tile::TileBounds, tylertoo_core::Error>
@@ -314,11 +322,370 @@ impl core::marker::Unpin for tylertoo_core::dedup::TileHasher
 impl core::marker::UnsafeUnpin for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::dedup::TileHasher
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::dedup::TileHasher
+pub mod tylertoo_core::diagnostics
+pub enum tylertoo_core::diagnostics::AccountingError
+pub tylertoo_core::diagnostics::AccountingError::Io(core::io::error::Error)
+impl core::convert::From<core::io::error::Error> for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::from(core::io::error::Error) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::error::Error for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::AccountingError
+pub fn tylertoo_core::diagnostics::AccountingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Send for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Sync for tylertoo_core::diagnostics::AccountingError
+impl core::marker::Unpin for tylertoo_core::diagnostics::AccountingError
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::AccountingError
+impl !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::AccountingError
+impl !core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::AccountingError
+pub enum tylertoo_core::diagnostics::CoveringWarning
+pub tylertoo_core::diagnostics::CoveringWarning::DuplicateColumns
+pub tylertoo_core::diagnostics::CoveringWarning::InconsistentPartitions
+pub tylertoo_core::diagnostics::CoveringWarning::MissingColumn
+pub tylertoo_core::diagnostics::CoveringWarning::MissingStatistics(usize)
+pub tylertoo_core::diagnostics::CoveringWarning::NoCovering
+pub tylertoo_core::diagnostics::CoveringWarning::NoFooterStatistics
+pub tylertoo_core::diagnostics::CoveringWarning::NoUsableSample
+pub tylertoo_core::diagnostics::CoveringWarning::NotFloat64
+pub tylertoo_core::diagnostics::CoveringWarning::OutOfCrsRange(usize)
+pub tylertoo_core::diagnostics::CoveringWarning::ReadFailed(alloc::string::String)
+pub tylertoo_core::diagnostics::CoveringWarning::UnknownCrs
+pub tylertoo_core::diagnostics::CoveringWarning::UnsupportedPath
+impl core::clone::Clone for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::clone(&self) -> tylertoo_core::diagnostics::CoveringWarning
+impl core::cmp::Eq for tylertoo_core::diagnostics::CoveringWarning
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::eq(&self, &tylertoo_core::diagnostics::CoveringWarning) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::CoveringWarning
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::CoveringWarning
+pub fn tylertoo_core::diagnostics::CoveringWarning::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Send for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Sync for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::Unpin for tylertoo_core::diagnostics::CoveringWarning
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::CoveringWarning
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::CoveringWarning
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::CoveringWarning
+pub enum tylertoo_core::diagnostics::CrsWarning
+pub tylertoo_core::diagnostics::CrsWarning::MissingColumn(alloc::string::String)
+pub tylertoo_core::diagnostics::CrsWarning::MissingVersion
+pub tylertoo_core::diagnostics::CrsWarning::NoColumns
+pub tylertoo_core::diagnostics::CrsWarning::NoGeoMetadata
+pub tylertoo_core::diagnostics::CrsWarning::NoKeyValueMetadata
+pub tylertoo_core::diagnostics::CrsWarning::NullCrsDegrees
+pub tylertoo_core::diagnostics::CrsWarning::NullCrsUnknown
+pub tylertoo_core::diagnostics::CrsWarning::UnexpectedFormat(alloc::string::String)
+pub tylertoo_core::diagnostics::CrsWarning::UnknownVersion(alloc::string::String)
+impl core::clone::Clone for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::clone(&self) -> tylertoo_core::diagnostics::CrsWarning
+impl core::cmp::Eq for tylertoo_core::diagnostics::CrsWarning
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::eq(&self, &tylertoo_core::diagnostics::CrsWarning) -> bool
+impl core::error::Error for tylertoo_core::diagnostics::CrsWarning
+impl core::fmt::Debug for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::CrsWarning
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::CrsWarning
+pub fn tylertoo_core::diagnostics::CrsWarning::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Send for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Sync for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::Unpin for tylertoo_core::diagnostics::CrsWarning
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::CrsWarning
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::CrsWarning
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::CrsWarning
+pub enum tylertoo_core::diagnostics::Diagnostic
+pub tylertoo_core::diagnostics::Diagnostic::Advisory
+pub tylertoo_core::diagnostics::Diagnostic::Advisory::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Advisory::message: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect
+pub tylertoo_core::diagnostics::Diagnostic::AntimeridianSuspect::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped
+pub tylertoo_core::diagnostics::Diagnostic::ClipGuardDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CoveringRejected::reason: tylertoo_core::diagnostics::CoveringWarning
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CrsAssumed::input: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::CrsMetadata::reason: tylertoo_core::diagnostics::CrsWarning
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::first_written_gsd: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::first_written_zoom: core::option::Option<u8>
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::gsd_max: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::gsd_min: f64
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::input_features: usize
+pub tylertoo_core::diagnostics::Diagnostic::EmptyLevels::levels: alloc::vec::Vec<usize>
+pub tylertoo_core::diagnostics::Diagnostic::EncodeDropped
+pub tylertoo_core::diagnostics::Diagnostic::EncodeDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::EncodeQuantized
+pub tylertoo_core::diagnostics::Diagnostic::EncodeQuantized::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::FullResolutionFallback
+pub tylertoo_core::diagnostics::Diagnostic::FullResolutionFallback::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterEncode
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterEncode::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterSimplify
+pub tylertoo_core::diagnostics::Diagnostic::InvalidAfterSimplify::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::limit: u64
+pub tylertoo_core::diagnostics::Diagnostic::MemoryBudget::machine: core::option::Option<u64>
+pub tylertoo_core::diagnostics::Diagnostic::Merged
+pub tylertoo_core::diagnostics::Diagnostic::Merged::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry
+pub tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::OutOfRange::exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PolygonRepaired::kind: tylertoo_core::diagnostics::PolygonRepairKind
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::data_type: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::PropertySkipped::name: alloc::string::String
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMetadataConflict
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMetadataConflict::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingBounds
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingBounds::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingMetadata
+pub tylertoo_core::diagnostics::Diagnostic::PyramidMissingMetadata::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSharedTiles
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSharedTiles::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSkippedTiles
+pub tylertoo_core::diagnostics::Diagnostic::PyramidSkippedTiles::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::cap: usize
+pub tylertoo_core::diagnostics::Diagnostic::RowGroupAutoscaled::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::SavedPlan::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::Unprojectable::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::UnusableGeometry::total: usize
+pub tylertoo_core::diagnostics::Diagnostic::ValidationSkipped
+pub tylertoo_core::diagnostics::Diagnostic::ValidationSkipped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::ValveDropped
+pub tylertoo_core::diagnostics::Diagnostic::ValveDropped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::context: core::option::Option<tylertoo_core::diagnostics::RangeContext>
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::count: usize
+pub tylertoo_core::diagnostics::Diagnostic::Wrapped::exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
+impl tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::count(&self) -> usize
+impl core::clone::Clone for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::clone(&self) -> tylertoo_core::diagnostics::Diagnostic
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::eq(&self, &tylertoo_core::diagnostics::Diagnostic) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::Diagnostic
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::Diagnostic
+pub fn tylertoo_core::diagnostics::Diagnostic::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Send for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Sync for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::Unpin for tylertoo_core::diagnostics::Diagnostic
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::Diagnostic
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::Diagnostic
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::Diagnostic
+pub enum tylertoo_core::diagnostics::PolygonRepairKind
+pub tylertoo_core::diagnostics::PolygonRepairKind::CollapsedRing
+pub tylertoo_core::diagnostics::PolygonRepairKind::DisconnectedInterior
+pub tylertoo_core::diagnostics::PolygonRepairKind::HoleOutsideShell
+pub tylertoo_core::diagnostics::PolygonRepairKind::NestedHoles
+pub tylertoo_core::diagnostics::PolygonRepairKind::NestedShells
+pub tylertoo_core::diagnostics::PolygonRepairKind::PartsOverlap
+pub tylertoo_core::diagnostics::PolygonRepairKind::RingSelfTouch
+pub tylertoo_core::diagnostics::PolygonRepairKind::RingsCross
+impl core::clone::Clone for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::clone(&self) -> tylertoo_core::diagnostics::PolygonRepairKind
+impl core::cmp::Eq for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::eq(&self, &tylertoo_core::diagnostics::PolygonRepairKind) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::PolygonRepairKind
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::PolygonRepairKind
+pub fn tylertoo_core::diagnostics::PolygonRepairKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Send for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Sync for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::Unpin for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::PolygonRepairKind
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::PolygonRepairKind
+pub enum tylertoo_core::diagnostics::SourceLossCause
+pub tylertoo_core::diagnostics::SourceLossCause::ClipDropped
+pub tylertoo_core::diagnostics::SourceLossCause::EncodeDropped
+pub tylertoo_core::diagnostics::SourceLossCause::Filtered
+pub tylertoo_core::diagnostics::SourceLossCause::Merged
+pub tylertoo_core::diagnostics::SourceLossCause::MissingGeometry
+pub tylertoo_core::diagnostics::SourceLossCause::NonFiniteGeometry
+pub tylertoo_core::diagnostics::SourceLossCause::OutsideBbox
+pub tylertoo_core::diagnostics::SourceLossCause::Quantized
+pub tylertoo_core::diagnostics::SourceLossCause::ValveDropped
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::clone(&self) -> tylertoo_core::diagnostics::SourceLossCause
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLossCause
+impl core::cmp::Ord for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::cmp(&self, &tylertoo_core::diagnostics::SourceLossCause) -> core::cmp::Ordering
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::eq(&self, &tylertoo_core::diagnostics::SourceLossCause) -> bool
+impl core::cmp::PartialOrd for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::partial_cmp(&self, &tylertoo_core::diagnostics::SourceLossCause) -> core::option::Option<core::cmp::Ordering>
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::SourceLossCause
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLossCause
+pub fn tylertoo_core::diagnostics::SourceLossCause::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLossCause
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLossCause
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLossCause
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLossCause
+pub struct tylertoo_core::diagnostics::Diagnostics
+impl tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::count(&self, &tylertoo_core::diagnostics::Diagnostic) -> usize
+pub fn tylertoo_core::diagnostics::Diagnostics::extend(&self, impl core::iter::traits::collect::IntoIterator<Item = tylertoo_core::diagnostics::Diagnostic>)
+pub fn tylertoo_core::diagnostics::Diagnostics::once(&self, tylertoo_core::diagnostics::Diagnostic)
+pub fn tylertoo_core::diagnostics::Diagnostics::record(&self, tylertoo_core::diagnostics::Diagnostic)
+pub fn tylertoo_core::diagnostics::Diagnostics::snapshot(&self) -> alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_emitted(&self, u64, u8) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_loss(&self, u64, core::option::Option<u8>, tylertoo_core::diagnostics::SourceLossCause) -> core::result::Result<(), tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::Diagnostics::source_losses(&self) -> core::result::Result<tylertoo_core::diagnostics::SourceLosses, tylertoo_core::diagnostics::AccountingError>
+impl core::default::Default for tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::default() -> Self
+impl core::fmt::Debug for tylertoo_core::diagnostics::Diagnostics
+pub fn tylertoo_core::diagnostics::Diagnostics::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Send for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Sync for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::Unpin for tylertoo_core::diagnostics::Diagnostics
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::Diagnostics
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::Diagnostics
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::Diagnostics
+pub struct tylertoo_core::diagnostics::RangeContext
+pub tylertoo_core::diagnostics::RangeContext::crs: tylertoo_core::overview::level::Crs
+pub tylertoo_core::diagnostics::RangeContext::max_abs: f64
+pub tylertoo_core::diagnostics::RangeContext::total: usize
+impl core::clone::Clone for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::clone(&self) -> tylertoo_core::diagnostics::RangeContext
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::eq(&self, &tylertoo_core::diagnostics::RangeContext) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::diagnostics::RangeContext
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::RangeContext
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::RangeContext
+pub fn tylertoo_core::diagnostics::RangeContext::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Send for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Sync for tylertoo_core::diagnostics::RangeContext
+impl core::marker::Unpin for tylertoo_core::diagnostics::RangeContext
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::RangeContext
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::RangeContext
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::RangeContext
+pub struct tylertoo_core::diagnostics::SourceLoss
+pub tylertoo_core::diagnostics::SourceLoss::cause: tylertoo_core::diagnostics::SourceLossCause
+pub tylertoo_core::diagnostics::SourceLoss::feature_id: core::option::Option<u64>
+pub tylertoo_core::diagnostics::SourceLoss::id: u64
+pub tylertoo_core::diagnostics::SourceLoss::zoom: core::option::Option<u8>
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::clone(&self) -> tylertoo_core::diagnostics::SourceLoss
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLoss
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::eq(&self, &tylertoo_core::diagnostics::SourceLoss) -> bool
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::diagnostics::SourceLoss
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLoss
+pub fn tylertoo_core::diagnostics::SourceLoss::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLoss
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLoss
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLoss
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLoss
+pub struct tylertoo_core::diagnostics::SourceLosses
+impl tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::for_python(&self) -> core::result::Result<Self, tylertoo_core::diagnostics::AccountingError>
+pub fn tylertoo_core::diagnostics::SourceLosses::is_empty(&self) -> bool
+pub fn tylertoo_core::diagnostics::SourceLosses::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = core::result::Result<tylertoo_core::diagnostics::SourceLoss, tylertoo_core::diagnostics::AccountingError>> + '_
+pub fn tylertoo_core::diagnostics::SourceLosses::len(&self) -> usize
+pub fn tylertoo_core::diagnostics::SourceLosses::publish_python(&self)
+pub fn tylertoo_core::diagnostics::SourceLosses::python_path(&self) -> core::option::Option<std::path::PathBuf>
+impl core::clone::Clone for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::clone(&self) -> tylertoo_core::diagnostics::SourceLosses
+impl core::cmp::Eq for tylertoo_core::diagnostics::SourceLosses
+impl core::cmp::PartialEq for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::eq(&self, &Self) -> bool
+impl core::default::Default for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::default() -> Self
+impl core::fmt::Debug for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::SourceLosses::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Send for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Sync for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::Unpin for tylertoo_core::diagnostics::SourceLosses
+impl core::marker::UnsafeUnpin for tylertoo_core::diagnostics::SourceLosses
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::diagnostics::SourceLosses
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::diagnostics::SourceLosses
+pub fn tylertoo_core::diagnostics::write_report(&std::path::Path, &impl serde_core::ser::Serialize) -> core::result::Result<(), core::io::error::Error>
 pub mod tylertoo_core::fs_probe
 pub fn tylertoo_core::fs_probe::is_ram_backed(&std::path::Path) -> core::option::Option<bool>
 pub mod tylertoo_core::input
 pub enum tylertoo_core::input::InputError
 pub tylertoo_core::input::InputError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::input::InputError::Decode(tylertoo_io::Error)
 pub tylertoo_core::input::InputError::Footer
 pub tylertoo_core::input::InputError::Footer::error: parquet::errors::ParquetError
 pub tylertoo_core::input::InputError::Footer::input: alloc::string::String
@@ -342,6 +709,11 @@ pub tylertoo_core::input::InputError::Open
 pub tylertoo_core::input::InputError::Open::error: core::io::error::Error
 pub tylertoo_core::input::InputError::Open::input: alloc::string::String
 pub tylertoo_core::input::InputError::Parquet(parquet::errors::ParquetError)
+pub tylertoo_core::input::InputError::PlanInputChanged
+pub tylertoo_core::input::InputError::PlanInputChanged::current: alloc::string::String
+pub tylertoo_core::input::InputError::PlanInputChanged::field: &'static str
+pub tylertoo_core::input::InputError::PlanInputChanged::input: alloc::string::String
+pub tylertoo_core::input::InputError::PlanInputChanged::saved: alloc::string::String
 pub tylertoo_core::input::InputError::RemoteDisabled(alloc::string::String)
 pub tylertoo_core::input::InputError::RemotePrefixUnsupported
 pub tylertoo_core::input::InputError::RemotePrefixUnsupported::url: alloc::string::String
@@ -358,6 +730,8 @@ impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::ov
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::input::InputError) -> Self
 impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::shard::ShardError
 pub fn tylertoo_core::shard::ShardError::from(tylertoo_core::input::InputError) -> Self
+impl core::convert::From<tylertoo_io::Error> for tylertoo_core::input::InputError
+pub fn tylertoo_core::input::InputError::from(tylertoo_io::Error) -> Self
 impl core::error::Error for tylertoo_core::input::InputError
 pub fn tylertoo_core::input::InputError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::input::InputError
@@ -397,8 +771,9 @@ pub fn tylertoo_core::input::InputSource::fetched_ranges(&self) -> core::option:
 pub fn tylertoo_core::input::InputSource::from_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::from_str_input(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::is_remote(&self) -> bool
-pub fn tylertoo_core::input::InputSource::open(&self) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<tylertoo_core::input::InputReader>, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input::InputSource::open(&self) -> core::result::Result<tylertoo_io::untrusted::ParquetSource<tylertoo_core::input::InputReader>, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input::InputSource::release_read_cache(&self)
+pub fn tylertoo_core::input::InputSource::remote_meta(&self) -> core::option::Option<&tylertoo_io::input::RemoteObjectMeta>
 pub fn tylertoo_core::input::InputSource::set_spill_dir(&self, core::option::Option<&std::path::Path>)
 pub fn tylertoo_core::input::InputSource::stage_row_groups(&self, core::option::Option<&[usize]>) -> core::result::Result<(), tylertoo_core::input::InputError>
 impl core::clone::Clone for tylertoo_core::input::InputSource
@@ -455,6 +830,7 @@ pub fn tylertoo_core::input_set::ConvertSource::part_row_counts(&self) -> core::
 pub fn tylertoo_core::input_set::ConvertSource::parts(&self) -> &[tylertoo_core::input::InputSource]
 pub fn tylertoo_core::input_set::ConvertSource::resolve(&str) -> core::result::Result<Self, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::resolve_path(&std::path::Path) -> core::result::Result<Self, tylertoo_core::input::InputError>
+pub fn tylertoo_core::input_set::ConvertSource::resolved_schema(&self) -> core::result::Result<&tylertoo_core::resolved_schema::ResolvedSchema, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::restrict_columns(&self, alloc::vec::Vec<usize>) -> core::result::Result<(), tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::schema(&self) -> core::result::Result<arrow_schema::schema::SchemaRef, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::select_row_groups(&self, &[f64; 4]) -> core::result::Result<tylertoo_core::input_set::RowGroupSelection, tylertoo_core::input::InputError>
@@ -473,24 +849,6 @@ impl core::marker::Unpin for tylertoo_core::input_set::ConvertSource
 impl core::marker::UnsafeUnpin for tylertoo_core::input_set::ConvertSource
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::ConvertSource
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::ConvertSource
-pub struct tylertoo_core::input_set::LargestByteArrayColumn
-pub tylertoo_core::input_set::LargestByteArrayColumn::column: alloc::string::String
-pub tylertoo_core::input_set::LargestByteArrayColumn::total_bytes: u64
-impl core::clone::Clone for tylertoo_core::input_set::LargestByteArrayColumn
-pub fn tylertoo_core::input_set::LargestByteArrayColumn::clone(&self) -> tylertoo_core::input_set::LargestByteArrayColumn
-impl core::cmp::Eq for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::cmp::PartialEq for tylertoo_core::input_set::LargestByteArrayColumn
-pub fn tylertoo_core::input_set::LargestByteArrayColumn::eq(&self, &tylertoo_core::input_set::LargestByteArrayColumn) -> bool
-impl core::fmt::Debug for tylertoo_core::input_set::LargestByteArrayColumn
-pub fn tylertoo_core::input_set::LargestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::marker::Freeze for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::marker::Send for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::marker::Sync for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::marker::Unpin for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::marker::UnsafeUnpin for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::LargestByteArrayColumn
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::LargestByteArrayColumn
 pub struct tylertoo_core::input_set::MultiSource
 impl tylertoo_core::input_set::MultiSource
 pub fn tylertoo_core::input_set::MultiSource::from_sources(alloc::string::String, alloc::vec::Vec<tylertoo_core::input::InputSource>) -> core::result::Result<Self, tylertoo_core::input::InputError>
@@ -559,33 +917,11 @@ impl<'a> core::marker::Unpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> core::marker::UnsafeUnpin for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::SourceStream<'a>
 impl<'a> !core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::SourceStream<'a>
-pub struct tylertoo_core::input_set::WidestByteArrayColumn
-pub tylertoo_core::input_set::WidestByteArrayColumn::avg_row_bytes: u64
-pub tylertoo_core::input_set::WidestByteArrayColumn::column: alloc::string::String
-pub tylertoo_core::input_set::WidestByteArrayColumn::part: usize
-pub tylertoo_core::input_set::WidestByteArrayColumn::row_group: usize
-impl core::clone::Clone for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::clone(&self) -> tylertoo_core::input_set::WidestByteArrayColumn
-impl core::cmp::Eq for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::cmp::PartialEq for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::eq(&self, &tylertoo_core::input_set::WidestByteArrayColumn) -> bool
-impl core::fmt::Debug for tylertoo_core::input_set::WidestByteArrayColumn
-pub fn tylertoo_core::input_set::WidestByteArrayColumn::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Freeze for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Send for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Sync for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::Unpin for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::marker::UnsafeUnpin for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
-impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::input_set::WidestByteArrayColumn
-pub const tylertoo_core::input_set::BYTE_ARRAY_BATCH_LIMIT: u64
 pub fn tylertoo_core::input_set::derive_layer_name(&str) -> alloc::string::String
 pub mod tylertoo_core::ioverlay_clip
-pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>) -> core::option::Option<geo_types::geometry::Geometry<f64>>
-pub fn tylertoo_core::ioverlay_clip::union_polygons_ioverlay(&[geo_types::geometry::polygon::Polygon<f64>]) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::clip_multipolygon_ioverlay(&geo_types::geometry::multi_polygon::MultiPolygon<f64>, &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::clip_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
+pub fn tylertoo_core::ioverlay_clip::repair_polygon_ioverlay(&geo_types::geometry::polygon::Polygon<f64>, &tylertoo_core::diagnostics::Diagnostics) -> core::option::Option<geo_types::geometry::Geometry<f64>>
 pub mod tylertoo_core::merge
 pub struct tylertoo_core::merge::MergeOptions
 pub tylertoo_core::merge::MergeOptions::metadata: tylertoo_core::TilesetMetadata
@@ -656,7 +992,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::mvt::PropertyVal
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::mvt::PropertyValue
 pub struct tylertoo_core::mvt::LayerBuilder
 impl tylertoo_core::mvt::LayerBuilder
-pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds)
+pub fn tylertoo_core::mvt::LayerBuilder::add_feature(&mut self, core::option::Option<u64>, &geo_types::geometry::Geometry, &[(alloc::string::String, tylertoo_core::mvt::PropertyValue)], &tylertoo_core::tile::TileBounds, &tylertoo_core::diagnostics::Diagnostics)
 pub fn tylertoo_core::mvt::LayerBuilder::build(self) -> tylertoo_core::vector_tile::tile::Layer
 pub fn tylertoo_core::mvt::LayerBuilder::dropped_features(&self) -> usize
 pub fn tylertoo_core::mvt::LayerBuilder::feature_count(&self) -> usize
@@ -688,13 +1024,13 @@ pub const tylertoo_core::mvt::DEFAULT_EXTENT: u32
 pub const tylertoo_core::mvt::TILE_COORD_CLAMP: i32
 pub fn tylertoo_core::mvt::command_decode(u32) -> (u32, u32)
 pub fn tylertoo_core::mvt::command_encode(u32, u32) -> u32
-pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
+pub fn tylertoo_core::mvt::encode_geometry(&geo_types::geometry::Geometry, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> (alloc::vec::Vec<u32>, tylertoo_core::vector_tile::tile::GeomType)
 pub fn tylertoo_core::mvt::encode_linestring(&geo_types::geometry::line_string::LineString, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_multi_linestring(&geo_types::geometry::multi_line_string::MultiLineString, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_multi_point(&geo_types::geometry::multi_point::MultiPoint, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
-pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::encode_multi_polygon(&geo_types::geometry::multi_polygon::MultiPolygon, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::encode_point(&geo_types::geometry::point::Point, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
-pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32) -> alloc::vec::Vec<u32>
+pub fn tylertoo_core::mvt::encode_polygon(&geo_types::geometry::polygon::Polygon, &tylertoo_core::tile::TileBounds, u32, &tylertoo_core::diagnostics::Diagnostics) -> alloc::vec::Vec<u32>
 pub fn tylertoo_core::mvt::flatten_geometry_collection(&geo_types::geometry::geometry_collection::GeometryCollection<f64>) -> alloc::vec::Vec<geo_types::geometry::Geometry>
 pub fn tylertoo_core::mvt::geo_to_tile_coords(f64, f64, &tylertoo_core::tile::TileBounds, u32) -> (i32, i32)
 pub fn tylertoo_core::mvt::orient_multi_polygon_for_mvt(&geo_types::geometry::multi_polygon::MultiPolygon) -> geo_types::geometry::multi_polygon::MultiPolygon
@@ -743,6 +1079,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -787,6 +1127,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::Representation
 pub fn tylertoo_core::overview::simplify::Representation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::Representation
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::Representation
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::Representation
 impl core::marker::Send for tylertoo_core::overview::simplify::Representation
 impl core::marker::Sync for tylertoo_core::overview::simplify::Representation
@@ -797,12 +1141,16 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify:
 pub enum tylertoo_core::overview::assign::SortDirection
 pub tylertoo_core::overview::assign::SortDirection::Asc
 pub tylertoo_core::overview::assign::SortDirection::Desc
+impl tylertoo_core::overview::assign::SortDirection
+pub fn tylertoo_core::overview::assign::SortDirection::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::clone(&self) -> tylertoo_core::overview::assign::SortDirection
 impl core::cmp::Eq for tylertoo_core::overview::assign::SortDirection
 impl core::cmp::PartialEq for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::eq(&self, &tylertoo_core::overview::assign::SortDirection) -> bool
 impl core::fmt::Debug for tylertoo_core::overview::assign::SortDirection
+pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::assign::SortDirection
 pub fn tylertoo_core::overview::assign::SortDirection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::SortDirection
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::SortDirection
@@ -830,6 +1178,10 @@ pub fn tylertoo_core::overview::assign::AssignConfig::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::assign::AssignConfig
 pub fn tylertoo_core::overview::assign::AssignConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::AssignConfig
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::AssignConfig
+pub fn tylertoo_core::overview::assign::AssignConfig::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::AssignConfig where tylertoo_core::overview::assign::AssignConfig: core::default::Default
+pub fn tylertoo_core::overview::assign::AssignConfig::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::AssignConfig
 impl core::marker::Send for tylertoo_core::overview::assign::AssignConfig
 impl core::marker::Sync for tylertoo_core::overview::assign::AssignConfig
@@ -898,6 +1250,10 @@ impl core::marker::StructuralPartialEq for tylertoo_core::overview::assign::Budg
 impl core::str::traits::FromStr for tylertoo_core::overview::assign::BudgetKinds
 pub type tylertoo_core::overview::assign::BudgetKinds::Err = alloc::string::String
 pub fn tylertoo_core::overview::assign::BudgetKinds::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::BudgetKinds
+pub fn tylertoo_core::overview::assign::BudgetKinds::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::BudgetKinds where tylertoo_core::overview::assign::BudgetKinds: core::default::Default
+pub fn tylertoo_core::overview::assign::BudgetKinds::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::BudgetKinds
 impl core::marker::Send for tylertoo_core::overview::assign::BudgetKinds
 impl core::marker::Sync for tylertoo_core::overview::assign::BudgetKinds
@@ -917,6 +1273,10 @@ pub fn tylertoo_core::overview::assign::DensityBudgetConfig::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::assign::DensityBudgetConfig
 pub fn tylertoo_core::overview::assign::DensityBudgetConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::assign::DensityBudgetConfig
+impl serde_core::ser::Serialize for tylertoo_core::overview::assign::DensityBudgetConfig
+pub fn tylertoo_core::overview::assign::DensityBudgetConfig::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::assign::DensityBudgetConfig where tylertoo_core::overview::assign::DensityBudgetConfig: core::default::Default
+pub fn tylertoo_core::overview::assign::DensityBudgetConfig::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::assign::DensityBudgetConfig
 impl core::marker::Send for tylertoo_core::overview::assign::DensityBudgetConfig
 impl core::marker::Sync for tylertoo_core::overview::assign::DensityBudgetConfig
@@ -1232,8 +1592,196 @@ pub const tylertoo_core::overview::coalesce::DEFAULT_COALESCE_MAX_LEVEL_ROWS: us
 pub const tylertoo_core::overview::coalesce::DEFAULT_JUNCTION_ANGLE_DEG: f64
 pub const tylertoo_core::overview::coalesce::DEFAULT_SNAP_GSD_FACTOR: f64
 pub fn tylertoo_core::overview::coalesce::coalesce_level_lines(&[tylertoo_core::overview::coalesce::CoalesceInput<'_>], f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::assign::AssignConfig, &tylertoo_core::overview::coalesce::CoalesceParams) -> alloc::vec::Vec<tylertoo_core::overview::coalesce::CoalescedLine>
+pub mod tylertoo_core::overview::config
+pub mod tylertoo_core::overview::config::keywords
+pub struct tylertoo_core::overview::config::keywords::ConvertSyntax
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::class_rank: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::collapse: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::collapse_square: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::entry_zoom: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::explicit_coalesce_lines: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::ladder_step: u8
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::magnitude_ladder: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::no_collapse: bool
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::representation: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::keywords::ConvertSyntax::verbatim: bool
+impl core::clone::Clone for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::clone(&self) -> tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::default::Default for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::default() -> Self
+impl core::fmt::Debug for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub fn tylertoo_core::overview::config::keywords::ConvertSyntax::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl core::marker::Freeze for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Send for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Sync for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::Unpin for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::keywords::ConvertSyntax
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::keywords::ConvertSyntax
+pub const tylertoo_core::overview::config::keywords::CONVERT_POSITIONAL: &[&str]
+pub fn tylertoo_core::overview::config::keywords::command_defaults(&str) -> serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub fn tylertoo_core::overview::config::keywords::convert(serde_json::map::Map<alloc::string::String, serde_json::value::Value>, tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertOptions, tylertoo_core::overview::convert::ConvertError>
+pub fn tylertoo_core::overview::config::keywords::defaults<T: serde_core::ser::Serialize>(T) -> serde_json::map::Map<alloc::string::String, serde_json::value::Value>
+pub fn tylertoo_core::overview::config::keywords::deserialize_value<'de>(&str, impl serde_core::de::Deserializer<'de>) -> core::result::Result<serde_json::value::Value, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::export(serde_json::map::Map<alloc::string::String, serde_json::value::Value>, tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportOptions, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::max_zoom(&mut serde_json::map::Map<alloc::string::String, serde_json::value::Value>, &str) -> core::result::Result<tylertoo_core::overview::auto_zoom::MaxZoom, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::pyramid(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::pyramid::PyramidOptions, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::keywords::tiles(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::overview::tiles::TilesOptions, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::config::keywords::validate_rank_syntax<'de>(impl serde_core::de::Deserializer<'de>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+#[non_exhaustive] pub enum tylertoo_core::overview::config::ConfigError
+pub tylertoo_core::overview::config::ConfigError::ClassRankIncomplete
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite::class: core::option::Option<alloc::string::String>
+pub tylertoo_core::overview::config::ConfigError::ClassRankNotFinite::rank: f64
+pub tylertoo_core::overview::config::ConfigError::ClassRankSpelledTwice
+pub tylertoo_core::overview::config::ConfigError::CoalescePartitioningUnsupported
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom::min_zoom: u8
+pub tylertoo_core::overview::config::ConfigError::CoarseShardHasNoZoom::pivot: u8
+pub tylertoo_core::overview::config::ConfigError::CollapseConflict
+pub tylertoo_core::overview::config::ConfigError::EntryZoomConflict
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureIdAccumulated::op: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded
+pub tylertoo_core::overview::config::ConfigError::FeatureIdColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded
+pub tylertoo_core::overview::config::ConfigError::FeatureOrderColumnExcluded::name: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::InvalidBbox
+pub tylertoo_core::overview::config::ConfigError::InvalidBbox::bbox: [f64; 4]
+pub tylertoo_core::overview::config::ConfigError::InvalidExtent
+pub tylertoo_core::overview::config::ConfigError::InvalidExtent::extent: u32
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec::message: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::InvalidSpec::option: &'static str
+pub tylertoo_core::overview::config::ConfigError::KeepOverviewDirMissing
+pub tylertoo_core::overview::config::ConfigError::KeepOverviewDirMissing::dir: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::MetadataTooLarge(alloc::string::String)
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::command: &'static str
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::option: &'static str
+pub tylertoo_core::overview::config::ConfigError::OptionIgnored::reason: &'static str
+pub tylertoo_core::overview::config::ConfigError::Output(tylertoo_core::atomic_output::OutputNotWritable)
+pub tylertoo_core::overview::config::ConfigError::OutputExists
+pub tylertoo_core::overview::config::ConfigError::OutputExists::kind: tylertoo_core::overview::config::OutputKind
+pub tylertoo_core::overview::config::ConfigError::OutputExists::path: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::kind: tylertoo_core::overview::config::OutputKind
+pub tylertoo_core::overview::config::ConfigError::OutputIsDirectory::path: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::PlanOnlyDataShard
+pub tylertoo_core::overview::config::ConfigError::PlanOnlyWithoutSavePlan
+pub tylertoo_core::overview::config::ConfigError::SavePlanWithPlan
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::pivot: u8
+pub tylertoo_core::overview::config::ConfigError::ShardPivotMismatch::range_pivot: u8
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotDirectory(std::path::PathBuf)
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable::dir: std::path::PathBuf
+pub tylertoo_core::overview::config::ConfigError::SpillDirNotWritable::reason: alloc::string::String
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::buffer: u32
+pub tylertoo_core::overview::config::ConfigError::TileBufferTooWide::max: u32
+pub tylertoo_core::overview::config::ConfigError::TileRangeWithShard
+impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::overview::config::ConfigError) -> Self
+impl core::error::Error for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::config::ConfigError
+pub fn tylertoo_core::overview::config::ConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::overview::config::ConfigError
+impl core::marker::Send for tylertoo_core::overview::config::ConfigError
+impl core::marker::Sync for tylertoo_core::overview::config::ConfigError
+impl core::marker::Unpin for tylertoo_core::overview::config::ConfigError
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::ConfigError
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::ConfigError
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::ConfigError
+pub enum tylertoo_core::overview::config::OutputKind
+pub tylertoo_core::overview::config::OutputKind::GeoParquet
+pub tylertoo_core::overview::config::OutputKind::Pmtiles
+pub tylertoo_core::overview::config::OutputKind::ShardPlan
+impl core::clone::Clone for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::clone(&self) -> tylertoo_core::overview::config::OutputKind
+impl core::cmp::Eq for tylertoo_core::overview::config::OutputKind
+impl core::cmp::PartialEq for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::eq(&self, &tylertoo_core::overview::config::OutputKind) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::config::OutputKind
+pub fn tylertoo_core::overview::config::OutputKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::config::OutputKind
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::config::OutputKind
+impl core::marker::Freeze for tylertoo_core::overview::config::OutputKind
+impl core::marker::Send for tylertoo_core::overview::config::OutputKind
+impl core::marker::Sync for tylertoo_core::overview::config::OutputKind
+impl core::marker::Unpin for tylertoo_core::overview::config::OutputKind
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::OutputKind
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::OutputKind
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::OutputKind
+pub enum tylertoo_core::overview::config::SizeCap
+pub tylertoo_core::overview::config::SizeCap::Auto
+pub tylertoo_core::overview::config::SizeCap::Bytes(usize)
+impl tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::or(self, core::option::Option<usize>) -> core::option::Option<usize>
+impl core::clone::Clone for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::clone(&self) -> tylertoo_core::overview::config::SizeCap
+impl core::cmp::Eq for tylertoo_core::overview::config::SizeCap
+impl core::cmp::PartialEq for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::eq(&self, &tylertoo_core::overview::config::SizeCap) -> bool
+impl core::default::Default for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::default() -> tylertoo_core::overview::config::SizeCap
+impl core::fmt::Debug for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_core::overview::config::SizeCap
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::config::SizeCap
+impl serde_core::ser::Serialize for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::config::SizeCap
+pub fn tylertoo_core::overview::config::SizeCap::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+impl core::marker::Freeze for tylertoo_core::overview::config::SizeCap
+impl core::marker::Send for tylertoo_core::overview::config::SizeCap
+impl core::marker::Sync for tylertoo_core::overview::config::SizeCap
+impl core::marker::Unpin for tylertoo_core::overview::config::SizeCap
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::config::SizeCap
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::SizeCap
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::SizeCap
+pub struct tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T> tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::options(&self) -> &'a T
+impl<'a, T: core::clone::Clone> core::clone::Clone for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::clone(&self) -> tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T: core::fmt::Debug> core::fmt::Debug for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+pub fn tylertoo_core::overview::config::ValidatedConfig<'a, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a, T: core::marker::Copy> core::marker::Copy for tylertoo_core::overview::config::ValidatedConfig<'a, T>
+impl<'a, T> core::marker::Freeze for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Freeze
+impl<'a, T> core::marker::Send for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Send
+impl<'a, T> core::marker::Sync for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Sync
+impl<'a, T> core::marker::Unpin for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::Unpin
+impl<'a, T> core::marker::UnsafeUnpin for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::marker::UnsafeUnpin
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::RefUnwindSafe
+impl<'a, T> core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::config::ValidatedConfig<'a, T> where &'a T: core::panic::unwind_safe::UnwindSafe
+pub const tylertoo_core::overview::config::DEFAULT_LADDER_STEP: u8
+pub fn tylertoo_core::overview::config::check_output(&std::path::Path, tylertoo_core::overview::config::OutputKind, bool) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::check_spill_dir(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::check_work_dir(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::class_ranking(core::option::Option<&str>, core::option::Option<alloc::string::String>, core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, f64>>, core::option::Option<f64>) -> core::result::Result<core::option::Option<tylertoo_core::overview::convert::ClassRanking>, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::collapse_mode(bool, bool, bool) -> core::result::Result<tylertoo_core::overview::simplify::CollapseMode, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::entry_zoom(core::option::Option<&str>, u8, core::option::Option<&str>) -> core::result::Result<core::option::Option<tylertoo_core::overview::ladder::EntryZoomSpec>, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::config::representation(core::option::Option<&str>) -> core::result::Result<alloc::vec::Vec<tylertoo_core::overview::convert::RepresentationBand>, tylertoo_core::overview::config::ConfigError>
 pub mod tylertoo_core::overview::convert
 #[non_exhaustive] pub enum tylertoo_core::overview::convert::ConvertError
+pub tylertoo_core::overview::convert::ConvertError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::AccumulateColumnNotNumeric
@@ -1253,9 +1801,10 @@ pub tylertoo_core::overview::convert::ConvertError::AutoZoomMinAboveCeiling::min
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::AutoZoomNoSignal::sampled: usize
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::limit_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::ByteArrayRowTooLarge::widest: tylertoo_core::input_set::WidestByteArrayColumn
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::available: u64
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::needed: u64
+pub tylertoo_core::overview::convert::ConvertError::BudgetExceeded::phase: &'static str
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnMissing::name: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString
@@ -1264,10 +1813,11 @@ pub tylertoo_core::overview::convert::ConvertError::ClassRankColumnNotString::na
 pub tylertoo_core::overview::convert::ConvertError::ClusterInvariant(alloc::string::String)
 pub tylertoo_core::overview::convert::ConvertError::ClusterPartitioningUnsupported
 pub tylertoo_core::overview::convert::ConvertError::CoalescedCountColumnPresent
+pub tylertoo_core::overview::convert::ConvertError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::convert::ConvertError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::convert::ConvertError::Filter(tylertoo_core::overview::filter::FilterError)
 pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge
-pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge::largest: tylertoo_core::input_set::LargestByteArrayColumn
+pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge::largest: tylertoo_io::untrusted::LargestByteArrayColumn
 pub tylertoo_core::overview::convert::ConvertError::InMemoryByteArrayTooLarge::limit_bytes: u64
 pub tylertoo_core::overview::convert::ConvertError::Input(tylertoo_core::input::InputError)
 pub tylertoo_core::overview::convert::ConvertError::InvalidConfig(alloc::string::String)
@@ -1281,10 +1831,6 @@ pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling
 pub tylertoo_core::overview::convert::ConvertError::NothingAtOrBelowCeiling::ceiling: u8
 pub tylertoo_core::overview::convert::ConvertError::Output(tylertoo_core::atomic_output::OutputNotWritable)
 pub tylertoo_core::overview::convert::ConvertError::Parquet(parquet::errors::ParquetError)
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::estimated_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::limit_bytes: u64
-pub tylertoo_core::overview::convert::ConvertError::Pass1MemoryFloorExceeded::rows: u64
 pub tylertoo_core::overview::convert::ConvertError::PointCountColumnPresent
 pub tylertoo_core::overview::convert::ConvertError::Properties(tylertoo_core::overview::properties::PropertySelectionError)
 pub tylertoo_core::overview::convert::ConvertError::RankingConflict
@@ -1302,6 +1848,8 @@ pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::asked: alloc::string::String
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::ceiling: u8
 pub tylertoo_core::overview::convert::ConvertError::ZoomAboveCeiling::zoom: i64
+impl tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::is_config(&self) -> bool
 impl core::convert::From<arrow_schema::error::ArrowError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(arrow_schema::error::ArrowError) -> Self
 impl core::convert::From<core::io::error::Error> for tylertoo_core::overview::convert::ConvertError
@@ -1312,8 +1860,12 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::conv
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::diagnostics::AccountingError) -> Self
 impl core::convert::From<tylertoo_core::input::InputError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::input::InputError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::convert::ConvertError
+pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::overview::filter::FilterError> for tylertoo_core::overview::convert::ConvertError
 pub fn tylertoo_core::overview::convert::ConvertError::from(tylertoo_core::overview::filter::FilterError) -> Self
 impl core::convert::From<tylertoo_core::overview::properties::PropertySelectionError> for tylertoo_core::overview::convert::ConvertError
@@ -1345,6 +1897,10 @@ pub fn tylertoo_core::overview::convert::LevelPlan::eq(&self, &tylertoo_core::ov
 impl core::fmt::Debug for tylertoo_core::overview::convert::LevelPlan
 pub fn tylertoo_core::overview::convert::LevelPlan::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::LevelPlan
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::LevelPlan
+pub fn tylertoo_core::overview::convert::LevelPlan::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::LevelPlan
+pub fn tylertoo_core::overview::convert::LevelPlan::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::LevelPlan
 impl core::marker::Send for tylertoo_core::overview::convert::LevelPlan
 impl core::marker::Sync for tylertoo_core::overview::convert::LevelPlan
@@ -1365,6 +1921,10 @@ pub fn tylertoo_core::overview::convert::ClassRanking::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::ClassRanking::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::ClassRanking
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::ClassRanking::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::ClassRanking
+pub fn tylertoo_core::overview::convert::ClassRanking::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::ClassRanking
 impl core::marker::Send for tylertoo_core::overview::convert::ClassRanking
 impl core::marker::Sync for tylertoo_core::overview::convert::ClassRanking
@@ -1410,6 +1970,7 @@ pub tylertoo_core::overview::convert::ConvertOptions::streaming: bool
 pub tylertoo_core::overview::convert::ConvertOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::is_verbatim(&self) -> bool
+pub fn tylertoo_core::overview::convert::ConvertOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::ConvertOptions::verbatim(self) -> Self
 pub fn tylertoo_core::overview::convert::ConvertOptions::with_generalization(self, &tylertoo_core::overview::convert::GeneralizationOverrides, bool) -> core::result::Result<Self, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::convert::ConvertOptions
@@ -1418,6 +1979,10 @@ impl core::default::Default for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::convert::ConvertOptions
 pub fn tylertoo_core::overview::convert::ConvertOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::ConvertOptions
+pub fn tylertoo_core::overview::convert::ConvertOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::ConvertOptions where tylertoo_core::overview::convert::ConvertOptions: core::default::Default
+pub fn tylertoo_core::overview::convert::ConvertOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::ConvertOptions
 impl core::marker::Send for tylertoo_core::overview::convert::ConvertOptions
 impl core::marker::Sync for tylertoo_core::overview::convert::ConvertOptions
@@ -1428,9 +1993,11 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::
 pub struct tylertoo_core::overview::convert::ConvertReport
 pub tylertoo_core::overview::convert::ConvertReport::antimeridian_suspect_features: usize
 pub tylertoo_core::overview::convert::ConvertReport::crs_assumed_wgs84: bool
+pub tylertoo_core::overview::convert::ConvertReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::overview::convert::ConvertReport::duration_secs: f64
 pub tylertoo_core::overview::convert::ConvertReport::effective_max_row_group_size: core::option::Option<usize>
 pub tylertoo_core::overview::convert::ConvertReport::input_features: usize
+pub tylertoo_core::overview::convert::ConvertReport::input_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::levels: alloc::vec::Vec<tylertoo_core::overview::convert::LevelReport>
 pub tylertoo_core::overview::convert::ConvertReport::mode: tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::convert::ConvertReport::out_of_range_exemplars: alloc::vec::Vec<tylertoo_core::overview::convert::OutOfRangeExemplar>
@@ -1439,6 +2006,8 @@ pub tylertoo_core::overview::convert::ConvertReport::remote_fetch: core::option:
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_read: usize
 pub tylertoo_core::overview::convert::ConvertReport::row_groups_total: usize
 pub tylertoo_core::overview::convert::ConvertReport::skipped_empty_levels: alloc::vec::Vec<tylertoo_core::overview::convert::SkippedLevelReport>
+pub tylertoo_core::overview::convert::ConvertReport::source_losses: tylertoo_core::diagnostics::SourceLosses
+pub tylertoo_core::overview::convert::ConvertReport::source_row_ranges: alloc::vec::Vec<(u64, u64)>
 pub tylertoo_core::overview::convert::ConvertReport::total_compressed_bytes: i64
 pub tylertoo_core::overview::convert::ConvertReport::total_rows: usize
 pub tylertoo_core::overview::convert::ConvertReport::total_vertices: usize
@@ -1479,6 +2048,10 @@ impl core::fmt::Debug for tylertoo_core::overview::convert::GeneralizationOverri
 pub fn tylertoo_core::overview::convert::GeneralizationOverrides::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::GeneralizationOverrides
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::GeneralizationOverrides
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::GeneralizationOverrides where tylertoo_core::overview::convert::GeneralizationOverrides: core::default::Default
+pub fn tylertoo_core::overview::convert::GeneralizationOverrides::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::Send for tylertoo_core::overview::convert::GeneralizationOverrides
 impl core::marker::Sync for tylertoo_core::overview::convert::GeneralizationOverrides
@@ -1525,6 +2098,8 @@ impl core::marker::Copy for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl serde_core::ser::Serialize for tylertoo_core::overview::convert::OutOfRangeExemplar
 pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::OutOfRangeExemplar
+pub fn tylertoo_core::overview::convert::OutOfRangeExemplar::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 impl core::marker::Freeze for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::Send for tylertoo_core::overview::convert::OutOfRangeExemplar
 impl core::marker::Sync for tylertoo_core::overview::convert::OutOfRangeExemplar
@@ -1600,6 +2175,10 @@ impl core::fmt::Debug for tylertoo_core::overview::convert::RepresentationBand
 pub fn tylertoo_core::overview::convert::RepresentationBand::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::convert::RepresentationBand
+impl serde_core::ser::Serialize for tylertoo_core::overview::convert::RepresentationBand
+pub fn tylertoo_core::overview::convert::RepresentationBand::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::convert::RepresentationBand
+pub fn tylertoo_core::overview::convert::RepresentationBand::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::Send for tylertoo_core::overview::convert::RepresentationBand
 impl core::marker::Sync for tylertoo_core::overview::convert::RepresentationBand
@@ -1636,7 +2215,6 @@ pub const tylertoo_core::overview::convert::READ_WORKERS_MAX: usize
 pub fn tylertoo_core::overview::convert::convert_to_overviews(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_source(&tylertoo_core::input::InputSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::convert::convert_to_overviews_sources(&tylertoo_core::input_set::ConvertSource, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
-pub fn tylertoo_core::overview::convert::out_of_range_exemplar_note(&[tylertoo_core::overview::convert::OutOfRangeExemplar]) -> alloc::string::String
 pub fn tylertoo_core::overview::convert::overture_road_ranking(alloc::string::String) -> tylertoo_core::overview::convert::ClassRanking
 pub fn tylertoo_core::overview::convert::parse_accumulate(&str) -> core::result::Result<tylertoo_core::overview::cluster::AccumulateSpec, alloc::string::String>
 pub fn tylertoo_core::overview::convert::parse_class_rank(&str) -> core::result::Result<tylertoo_core::overview::convert::ClassRanking, alloc::string::String>
@@ -1649,7 +2227,9 @@ pub fn tylertoo_core::overview::convert::write_convert_plan(impl core::convert::
 pub fn tylertoo_core::overview::convert::write_convert_plan_sources(&tylertoo_core::input_set::ConvertSource, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::convert::ConvertError>
 pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
+pub tylertoo_core::overview::export::ExportError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::overview::export::ExportError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::export::ExportError::CoveringProperty
 pub tylertoo_core::overview::export::ExportError::CoveringProperty::name: alloc::string::String
@@ -1662,8 +2242,6 @@ pub tylertoo_core::overview::export::ExportError::DeclaredMinZoomTooFine::declar
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::FeatureIdColumn::reason: tylertoo_core::overview::export::FeatureIdColumnProblem
-pub tylertoo_core::overview::export::ExportError::InvalidExtent
-pub tylertoo_core::overview::export::ExportError::InvalidExtent::extent: u32
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::column: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::InvalidFeatureId::level: usize
@@ -1686,7 +2264,6 @@ pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previo
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_level: usize
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::previous_zoom: u8
 pub tylertoo_core::overview::export::ExportError::LevelZoomsNotAscending::zoom: u8
-pub tylertoo_core::overview::export::ExportError::MetadataTooLarge(alloc::string::String)
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn
 pub tylertoo_core::overview::export::ExportError::NoGeometryColumn::path: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::export::ExportError::Output(tylertoo_core::atomic_output::OutputNotWritable)
@@ -1700,10 +2277,6 @@ pub tylertoo_core::overview::export::ExportError::Reader(tylertoo_core::overview
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::coarsest: u8
 pub tylertoo_core::overview::export::ExportError::RestrictionEmitsNoZoom::finest: u8
-pub tylertoo_core::overview::export::ExportError::SpillDirNotDirectory(std::path::PathBuf)
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::buffer: u32
-pub tylertoo_core::overview::export::ExportError::TileBufferTooWide::max: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::buffer: u32
 pub tylertoo_core::overview::export::ExportError::TileBufferTooWideForShard::max: u32
@@ -1725,6 +2298,8 @@ pub tylertoo_core::overview::export::ExportError::UnsupportedCrs::path: alloc::s
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty::data_type: alloc::string::String
 pub tylertoo_core::overview::export::ExportError::UnsupportedProperty::name: alloc::string::String
+impl tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::is_config(&self) -> bool
 impl core::convert::From<arrow_schema::error::ArrowError> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(arrow_schema::error::ArrowError) -> Self
 impl core::convert::From<core::io::error::Error> for tylertoo_core::overview::export::ExportError
@@ -1733,6 +2308,10 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::export::ExportError
+pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::convert::From<tylertoo_core::overview::reader::ReaderError> for tylertoo_core::overview::export::ExportError
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::overview::reader::ReaderError) -> Self
 impl core::error::Error for tylertoo_core::overview::export::ExportError
@@ -1787,6 +2366,8 @@ impl core::default::Default for tylertoo_core::overview::export::FeatureOrder
 pub fn tylertoo_core::overview::export::FeatureOrder::default() -> tylertoo_core::overview::export::FeatureOrder
 impl core::fmt::Debug for tylertoo_core::overview::export::FeatureOrder
 pub fn tylertoo_core::overview::export::FeatureOrder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::FeatureOrder
+pub fn tylertoo_core::overview::export::FeatureOrder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::FeatureOrder
 impl core::str::traits::FromStr for tylertoo_core::overview::export::FeatureOrder
 pub type tylertoo_core::overview::export::FeatureOrder::Err = alloc::string::String
@@ -1835,6 +2416,8 @@ impl core::default::Default for tylertoo_core::overview::export::SizeValve
 pub fn tylertoo_core::overview::export::SizeValve::default() -> tylertoo_core::overview::export::SizeValve
 impl core::fmt::Debug for tylertoo_core::overview::export::SizeValve
 pub fn tylertoo_core::overview::export::SizeValve::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::export::SizeValve
+pub fn tylertoo_core::overview::export::SizeValve::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::export::SizeValve
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::export::SizeValve
 impl core::str::traits::FromStr for tylertoo_core::overview::export::SizeValve
@@ -1866,13 +2449,18 @@ pub tylertoo_core::overview::export::ExportOptions::tile_range: core::option::Op
 pub tylertoo_core::overview::export::ExportOptions::tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::export::ExportOptions::zoom_ceiling: core::option::Option<u8>
 impl tylertoo_core::overview::export::ExportOptions
-pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<(), tylertoo_core::overview::export::ExportError>
+pub fn tylertoo_core::overview::export::ExportOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::config::ConfigError>
+pub fn tylertoo_core::overview::export::ExportOptions::verbatim(self) -> Self
 impl core::clone::Clone for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::clone(&self) -> tylertoo_core::overview::export::ExportOptions
 impl core::default::Default for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::export::ExportOptions
 pub fn tylertoo_core::overview::export::ExportOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::export::ExportOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::export::ExportOptions where tylertoo_core::overview::export::ExportOptions: core::default::Default
+pub fn tylertoo_core::overview::export::ExportOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::export::ExportOptions
 impl core::marker::Send for tylertoo_core::overview::export::ExportOptions
 impl core::marker::Sync for tylertoo_core::overview::export::ExportOptions
@@ -1881,6 +2469,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::export::ExportOption
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::export::ExportOptions
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::export::ExportOptions
 pub struct tylertoo_core::overview::export::ExportReport
+pub tylertoo_core::overview::export::ExportReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::overview::export::ExportReport::duration_secs: f64
 pub tylertoo_core::overview::export::ExportReport::encode_dropped_features: usize
 pub tylertoo_core::overview::export::ExportReport::encode_quantized_features: usize
@@ -1890,6 +2479,7 @@ pub tylertoo_core::overview::export::ExportReport::min_zoom: u8
 pub tylertoo_core::overview::export::ExportReport::mode: alloc::string::String
 pub tylertoo_core::overview::export::ExportReport::oversized_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::skipped_property_columns: alloc::vec::Vec<tylertoo_core::overview::export::SkippedPropertyColumn>
+pub tylertoo_core::overview::export::ExportReport::source_losses: tylertoo_core::diagnostics::SourceLosses
 pub tylertoo_core::overview::export::ExportReport::total_tile_features: usize
 pub tylertoo_core::overview::export::ExportReport::total_tiles: usize
 pub tylertoo_core::overview::export::ExportReport::valve_dropped_features: usize
@@ -2108,6 +2698,10 @@ pub fn tylertoo_core::overview::ladder::EntryZoomKind::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::ladder::EntryZoomKind
 pub fn tylertoo_core::overview::ladder::EntryZoomKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::ladder::EntryZoomKind
+impl serde_core::ser::Serialize for tylertoo_core::overview::ladder::EntryZoomKind
+pub fn tylertoo_core::overview::ladder::EntryZoomKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::ladder::EntryZoomKind
+pub fn tylertoo_core::overview::ladder::EntryZoomKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::ladder::EntryZoomKind
 impl core::marker::Send for tylertoo_core::overview::ladder::EntryZoomKind
 impl core::marker::Sync for tylertoo_core::overview::ladder::EntryZoomKind
@@ -2171,6 +2765,10 @@ pub fn tylertoo_core::overview::ladder::EntryZoomSpec::eq(&self, &tylertoo_core:
 impl core::fmt::Debug for tylertoo_core::overview::ladder::EntryZoomSpec
 pub fn tylertoo_core::overview::ladder::EntryZoomSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::ladder::EntryZoomSpec
+impl serde_core::ser::Serialize for tylertoo_core::overview::ladder::EntryZoomSpec
+pub fn tylertoo_core::overview::ladder::EntryZoomSpec::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::ladder::EntryZoomSpec
+pub fn tylertoo_core::overview::ladder::EntryZoomSpec::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::ladder::EntryZoomSpec
 impl core::marker::Send for tylertoo_core::overview::ladder::EntryZoomSpec
 impl core::marker::Sync for tylertoo_core::overview::ladder::EntryZoomSpec
@@ -2195,6 +2793,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -2206,6 +2808,8 @@ pub enum tylertoo_core::overview::level::MemoryProfile
 pub tylertoo_core::overview::level::MemoryProfile::Auto
 pub tylertoo_core::overview::level::MemoryProfile::Bounded
 pub tylertoo_core::overview::level::MemoryProfile::Speed
+impl tylertoo_core::overview::level::MemoryProfile
+pub fn tylertoo_core::overview::level::MemoryProfile::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::clone(&self) -> tylertoo_core::overview::level::MemoryProfile
 impl core::cmp::Eq for tylertoo_core::overview::level::MemoryProfile
@@ -2214,6 +2818,8 @@ pub fn tylertoo_core::overview::level::MemoryProfile::eq(&self, &tylertoo_core::
 impl core::default::Default for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::default() -> tylertoo_core::overview::level::MemoryProfile
 impl core::fmt::Debug for tylertoo_core::overview::level::MemoryProfile
+pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::level::MemoryProfile
 pub fn tylertoo_core::overview::level::MemoryProfile::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::MemoryProfile
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::MemoryProfile
@@ -2234,6 +2840,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::level::Me
 pub enum tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::level::Mode::Duplicating
 pub tylertoo_core::overview::level::Mode::Partitioning
+impl tylertoo_core::overview::level::Mode
+pub fn tylertoo_core::overview::level::Mode::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::level::Mode
 pub fn tylertoo_core::overview::level::Mode::clone(&self) -> tylertoo_core::overview::level::Mode
 impl core::cmp::Eq for tylertoo_core::overview::level::Mode
@@ -2283,6 +2891,7 @@ pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::index: usize
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::num_row_groups: i64
 pub tylertoo_core::overview::level::OverviewValidationError::RowGroupOutOfRange::value: i64
+pub tylertoo_core::overview::level::OverviewValidationError::UnsupportedVersion(alloc::string::String)
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing::index: usize
 pub tylertoo_core::overview::level::OverviewValidationError::ZoomNotIncreasing::previous: u8
@@ -2581,6 +3190,7 @@ pub const tylertoo_core::overview::level::GSD_TILE_BASE: f64
 pub const tylertoo_core::overview::level::METERS_PER_DEGREE: f64
 pub const tylertoo_core::overview::level::OVERVIEWS_KEY: &str
 pub const tylertoo_core::overview::level::SPEC_VERSION: &str
+pub const tylertoo_core::overview::level::SUPPORTED_MAJOR: u64
 pub const tylertoo_core::overview::level::WEBMERC_CIRCUMFERENCE_M: f64
 pub fn tylertoo_core::overview::level::gsd(u8) -> f64
 pub fn tylertoo_core::overview::level::gsd_with_base(u8, f64) -> f64
@@ -2634,6 +3244,10 @@ pub fn tylertoo_core::overview::properties::PropertySelection::default() -> tyle
 impl core::fmt::Debug for tylertoo_core::overview::properties::PropertySelection
 pub fn tylertoo_core::overview::properties::PropertySelection::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::properties::PropertySelection
+impl serde_core::ser::Serialize for tylertoo_core::overview::properties::PropertySelection
+pub fn tylertoo_core::overview::properties::PropertySelection::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::properties::PropertySelection where tylertoo_core::overview::properties::PropertySelection: core::default::Default
+pub fn tylertoo_core::overview::properties::PropertySelection::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::properties::PropertySelection
 impl core::marker::Send for tylertoo_core::overview::properties::PropertySelection
 impl core::marker::Sync for tylertoo_core::overview::properties::PropertySelection
@@ -2643,6 +3257,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::proper
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::properties::PropertySelection
 pub mod tylertoo_core::overview::reader
 pub enum tylertoo_core::overview::reader::ReaderError
+pub tylertoo_core::overview::reader::ReaderError::Conformance(alloc::string::String)
 pub tylertoo_core::overview::reader::ReaderError::Footer
 pub tylertoo_core::overview::reader::ReaderError::Footer::error: parquet::errors::ParquetError
 pub tylertoo_core::overview::reader::ReaderError::Footer::path: alloc::string::String
@@ -2692,9 +3307,10 @@ pub fn tylertoo_core::overview::reader::OverviewReader::num_levels(&self) -> usi
 pub fn tylertoo_core::overview::reader::OverviewReader::num_row_groups(&self) -> usize
 pub fn tylertoo_core::overview::reader::OverviewReader::open<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::path(&self) -> &std::path::Path
-pub fn tylertoo_core::overview::reader::OverviewReader::read_band_with_batch_size(&self, usize, usize) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
-pub fn tylertoo_core::overview::reader::OverviewReader::read_level(&self, usize, core::option::Option<[f64; 4]>) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
-pub fn tylertoo_core::overview::reader::OverviewReader::read_level_with_batch_size(&self, usize, core::option::Option<[f64; 4]>, usize) -> core::result::Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_band_batched(&self, usize, usize) -> core::result::Result<tylertoo_io::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_level(&self, usize, core::option::Option<[f64; 4]>) -> core::result::Result<tylertoo_io::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::read_level_batched(&self, usize, core::option::Option<[f64; 4]>, usize) -> core::result::Result<tylertoo_io::untrusted::UntrustedBatchReader, tylertoo_core::overview::reader::ReaderError>
+pub fn tylertoo_core::overview::reader::OverviewReader::resolved_schema(&self) -> &tylertoo_core::resolved_schema::ResolvedSchema
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_for_level(&self, usize) -> core::result::Result<alloc::vec::Vec<usize>, tylertoo_core::overview::reader::ReaderError>
 pub fn tylertoo_core::overview::reader::OverviewReader::row_groups_intersecting_bbox(&self, &[f64; 4]) -> alloc::vec::Vec<usize>
 pub fn tylertoo_core::overview::reader::OverviewReader::schema(&self) -> &arrow_schema::schema::SchemaRef
@@ -2730,6 +3346,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::CollapseMode
 pub fn tylertoo_core::overview::simplify::CollapseMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::CollapseMode
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::CollapseMode
+pub fn tylertoo_core::overview::simplify::CollapseMode::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::CollapseMode
+pub fn tylertoo_core::overview::simplify::CollapseMode::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::Send for tylertoo_core::overview::simplify::CollapseMode
 impl core::marker::Sync for tylertoo_core::overview::simplify::CollapseMode
@@ -2751,6 +3371,10 @@ impl core::fmt::Debug for tylertoo_core::overview::level::Crs
 pub fn tylertoo_core::overview::level::Crs::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::level::Crs
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::level::Crs
+impl serde_core::ser::Serialize for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::level::Crs
+pub fn tylertoo_core::overview::level::Crs::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::level::Crs
 impl core::marker::Send for tylertoo_core::overview::level::Crs
 impl core::marker::Sync for tylertoo_core::overview::level::Crs
@@ -2775,6 +3399,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::Representation
 pub fn tylertoo_core::overview::simplify::Representation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::Representation
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::Representation
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::Representation
+pub fn tylertoo_core::overview::simplify::Representation::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::Representation
 impl core::marker::Send for tylertoo_core::overview::simplify::Representation
 impl core::marker::Sync for tylertoo_core::overview::simplify::Representation
@@ -2837,6 +3465,10 @@ impl core::fmt::Debug for tylertoo_core::overview::simplify::SimplifyOptions
 pub fn tylertoo_core::overview::simplify::SimplifyOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::simplify::SimplifyOptions
+impl serde_core::ser::Serialize for tylertoo_core::overview::simplify::SimplifyOptions
+pub fn tylertoo_core::overview::simplify::SimplifyOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::simplify::SimplifyOptions where tylertoo_core::overview::simplify::SimplifyOptions: core::default::Default
+pub fn tylertoo_core::overview::simplify::SimplifyOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::Send for tylertoo_core::overview::simplify::SimplifyOptions
 impl core::marker::Sync for tylertoo_core::overview::simplify::SimplifyOptions
@@ -2846,33 +3478,27 @@ impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::simpli
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::simplify::SimplifyOptions
 pub const tylertoo_core::overview::simplify::DEFAULT_SIMPLIFY_FACTOR: f64
 pub const tylertoo_core::overview::simplify::METERS_PER_DEGREE: f64
-pub fn tylertoo_core::overview::simplify::full_resolution_fallback_count() -> u64
-pub fn tylertoo_core::overview::simplify::simplify_cascade(&geo_types::geometry::Geometry<f64>, &[tylertoo_core::overview::simplify::CascadeStep], tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation) -> tylertoo_core::overview::simplify::Simplified
-pub fn tylertoo_core::overview::simplify::validation_skip_count() -> u64
+pub fn tylertoo_core::overview::simplify::simplify_cascade(&geo_types::geometry::Geometry<f64>, &[tylertoo_core::overview::simplify::CascadeStep], tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
+pub fn tylertoo_core::overview::simplify::simplify_for_level(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
+pub fn tylertoo_core::overview::simplify::simplify_step(&geo_types::geometry::Geometry<f64>, f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions, tylertoo_core::overview::simplify::Representation, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::overview::simplify::Simplified
 pub fn tylertoo_core::overview::simplify::world_tolerance(f64, tylertoo_core::overview::level::Crs, &tylertoo_core::overview::simplify::SimplifyOptions) -> f64
 pub mod tylertoo_core::overview::tiles
 #[non_exhaustive] pub enum tylertoo_core::overview::tiles::TilesError
+pub tylertoo_core::overview::tiles::TilesError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::tiles::TilesError::Convert(tylertoo_core::overview::convert::ConvertError)
 pub tylertoo_core::overview::tiles::TilesError::EmptyCoarseArchive(tylertoo_core::overview::export::ExportError)
 pub tylertoo_core::overview::tiles::TilesError::EmptyShardArchive(tylertoo_core::overview::export::ExportError)
 pub tylertoo_core::overview::tiles::TilesError::Export(tylertoo_core::overview::export::ExportError)
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::name: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdAccumulated::op: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded
-pub tylertoo_core::overview::tiles::TilesError::FeatureIdColumnExcluded::name: alloc::string::String
-pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded
-pub tylertoo_core::overview::tiles::TilesError::FeatureOrderColumnExcluded::name: alloc::string::String
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::dir: std::path::PathBuf
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::source: core::io::error::Error
-pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing
-pub tylertoo_core::overview::tiles::TilesError::KeepOverviewDirMissing::dir: std::path::PathBuf
 pub tylertoo_core::overview::tiles::TilesError::Output(tylertoo_core::atomic_output::OutputNotWritable)
+impl tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::is_config(&self) -> bool
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::tiles::TilesError
 pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::overview::tiles::TilesError
+pub fn tylertoo_core::overview::tiles::TilesError::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::error::Error for tylertoo_core::overview::tiles::TilesError
 pub fn tylertoo_core::overview::tiles::TilesError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesError
@@ -2892,6 +3518,7 @@ pub tylertoo_core::overview::tiles::TilesInput::Path(std::path::PathBuf)
 impl tylertoo_core::overview::tiles::TilesInput
 pub fn tylertoo_core::overview::tiles::TilesInput::convert(&self, &std::path::Path, &tylertoo_core::overview::convert::ConvertOptions) -> core::result::Result<tylertoo_core::overview::convert::ConvertReport, tylertoo_core::overview::convert::ConvertError>
 pub fn tylertoo_core::overview::tiles::TilesInput::derive_layer_name(&self) -> alloc::string::String
+pub fn tylertoo_core::overview::tiles::TilesInput::source(&self) -> core::result::Result<tylertoo_core::input_set::ConvertSource, tylertoo_core::overview::convert::ConvertError>
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesInput
 pub fn tylertoo_core::overview::tiles::TilesInput::clone(&self) -> tylertoo_core::overview::tiles::TilesInput
 impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesInput
@@ -2921,19 +3548,26 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesOutcome
 pub struct tylertoo_core::overview::tiles::EmptyArchive
+pub tylertoo_core::overview::tiles::EmptyArchive::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
+pub tylertoo_core::overview::tiles::EmptyArchive::input_rows: u64
 pub tylertoo_core::overview::tiles::EmptyArchive::max_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::min_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::pivot_zoom: u8
 pub tylertoo_core::overview::tiles::EmptyArchive::role: tylertoo_core::shard::ShardRole
+pub tylertoo_core::overview::tiles::EmptyArchive::source_losses: tylertoo_core::diagnostics::SourceLosses
+pub tylertoo_core::overview::tiles::EmptyArchive::source_row_ranges: alloc::vec::Vec<(u64, u64)>
+pub tylertoo_core::overview::tiles::EmptyArchive::total_tile_features: usize
+pub tylertoo_core::overview::tiles::EmptyArchive::total_tiles: usize
 pub tylertoo_core::overview::tiles::EmptyArchive::why: alloc::string::String
 impl core::clone::Clone for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::clone(&self) -> tylertoo_core::overview::tiles::EmptyArchive
-impl core::cmp::Eq for tylertoo_core::overview::tiles::EmptyArchive
 impl core::cmp::PartialEq for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::eq(&self, &tylertoo_core::overview::tiles::EmptyArchive) -> bool
 impl core::fmt::Debug for tylertoo_core::overview::tiles::EmptyArchive
 pub fn tylertoo_core::overview::tiles::EmptyArchive::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::EmptyArchive
+impl serde_core::ser::Serialize for tylertoo_core::overview::tiles::EmptyArchive
+pub fn tylertoo_core::overview::tiles::EmptyArchive::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl core::marker::Freeze for tylertoo_core::overview::tiles::EmptyArchive
 impl core::marker::Send for tylertoo_core::overview::tiles::EmptyArchive
 impl core::marker::Sync for tylertoo_core::overview::tiles::EmptyArchive
@@ -2961,28 +3595,42 @@ impl core::marker::Unpin for tylertoo_core::overview::tiles::IntermediateOvervie
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
+pub struct tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub tylertoo_core::overview::tiles::SpaceRemedies::keep_overview: &'a str
+pub tylertoo_core::overview::tiles::SpaceRemedies::spill_dir: &'a str
+impl<'a> core::clone::Clone for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub fn tylertoo_core::overview::tiles::SpaceRemedies<'a>::clone(&self) -> tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::fmt::Debug for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+pub fn tylertoo_core::overview::tiles::SpaceRemedies<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Freeze for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Send for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Sync for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::Unpin for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::SpaceRemedies<'a>
+impl<'a> core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::SpaceRemedies<'a>
 pub struct tylertoo_core::overview::tiles::TilesOptions
-pub tylertoo_core::overview::tiles::TilesOptions::compressed_tile_size_limit: core::option::Option<usize>
 pub tylertoo_core::overview::tiles::TilesOptions::convert: tylertoo_core::overview::convert::ConvertOptions
-pub tylertoo_core::overview::tiles::TilesOptions::coverage_fill: bool
-pub tylertoo_core::overview::tiles::TilesOptions::feature_id: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::tiles::TilesOptions::feature_order: tylertoo_core::overview::export::FeatureOrder
+pub tylertoo_core::overview::tiles::TilesOptions::export: tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::overview::tiles::TilesOptions::keep_overview: core::option::Option<std::path::PathBuf>
 pub tylertoo_core::overview::tiles::TilesOptions::layer_name: core::option::Option<alloc::string::String>
-pub tylertoo_core::overview::tiles::TilesOptions::metadata: tylertoo_core::TilesetMetadata
-pub tylertoo_core::overview::tiles::TilesOptions::partition_wave: usize
 pub tylertoo_core::overview::tiles::TilesOptions::shard: core::option::Option<tylertoo_core::overview::tiles::TilesShard>
-pub tylertoo_core::overview::tiles::TilesOptions::simple_clip_fastpath: bool
-pub tylertoo_core::overview::tiles::TilesOptions::size_valve: tylertoo_core::overview::export::SizeValve
-pub tylertoo_core::overview::tiles::TilesOptions::tile_buffer: u32
-pub tylertoo_core::overview::tiles::TilesOptions::tile_range: core::option::Option<tylertoo_core::shard::TileRange>
-pub tylertoo_core::overview::tiles::TilesOptions::tile_size_limit: core::option::Option<usize>
+impl tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::export_defaults(bool) -> tylertoo_core::overview::export::ExportOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::ignored_by_plan_only(&self, &tylertoo_core::overview::export::ExportOptions) -> alloc::vec::Vec<&'static str>
+pub fn tylertoo_core::overview::tiles::TilesOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::TilesOptions::validate_plan_only(&self) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::clone(&self) -> tylertoo_core::overview::tiles::TilesOptions
 impl core::default::Default for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::overview::tiles::TilesOptions
 pub fn tylertoo_core::overview::tiles::TilesOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::overview::tiles::TilesOptions
+pub fn tylertoo_core::overview::tiles::TilesOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::overview::tiles::TilesOptions where tylertoo_core::overview::tiles::TilesOptions: core::default::Default
+pub fn tylertoo_core::overview::tiles::TilesOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::overview::tiles::TilesOptions
 impl core::marker::Send for tylertoo_core::overview::tiles::TilesOptions
 impl core::marker::Sync for tylertoo_core::overview::tiles::TilesOptions
@@ -3016,7 +3664,6 @@ pub tylertoo_core::overview::tiles::TilesShard::range: core::option::Option<tyle
 pub tylertoo_core::overview::tiles::TilesShard::role: tylertoo_core::shard::ShardRole
 impl tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::apply_selection(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
-pub fn tylertoo_core::overview::tiles::TilesShard::apply_to_convert(&self, &mut tylertoo_core::overview::convert::ConvertOptions)
 impl core::clone::Clone for tylertoo_core::overview::tiles::TilesShard
 pub fn tylertoo_core::overview::tiles::TilesShard::clone(&self) -> tylertoo_core::overview::tiles::TilesShard
 impl core::cmp::Eq for tylertoo_core::overview::tiles::TilesShard
@@ -3032,14 +3679,15 @@ impl core::marker::Unpin for tylertoo_core::overview::tiles::TilesShard
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesShard
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesShard
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesShard
+pub const tylertoo_core::overview::tiles::TILES_DEFAULT_MAX_ZOOM: u8
 pub trait tylertoo_core::overview::tiles::TilesObserver
 pub fn tylertoo_core::overview::tiles::TilesObserver::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
 impl tylertoo_core::overview::tiles::TilesObserver for ()
 pub fn ()::overview_written(&mut self, &tylertoo_core::overview::tiles::IntermediateOverview, &tylertoo_core::overview::convert::ConvertReport)
-pub fn tylertoo_core::overview::tiles::check_keep_overview(core::option::Option<&std::path::Path>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
-pub fn tylertoo_core::overview::tiles::check_knob_columns(&tylertoo_core::overview::convert::ConvertOptions, &tylertoo_core::overview::export::FeatureOrder, core::option::Option<&str>) -> core::result::Result<(), tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::tiles::convert_to_pmtiles_observed(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, &mut dyn tylertoo_core::overview::tiles::TilesObserver) -> core::result::Result<tylertoo_core::overview::tiles::TilesOutcome, tylertoo_core::overview::tiles::TilesError>
+pub fn tylertoo_core::overview::tiles::intermediate_space_preflight(&tylertoo_core::overview::tiles::TilesInput, &std::path::Path, &tylertoo_core::overview::tiles::TilesOptions, tylertoo_core::overview::tiles::SpaceRemedies<'_>) -> core::option::Option<alloc::string::String>
+pub fn tylertoo_core::overview::tiles::write_plan(&tylertoo_core::overview::tiles::TilesInput, &tylertoo_core::overview::tiles::TilesOptions) -> core::result::Result<tylertoo_core::overview::convert::PlanReport, tylertoo_core::overview::tiles::TilesError>
 pub mod tylertoo_core::overview::writer
 pub enum tylertoo_core::overview::writer::LevelWriteOutcome
 pub tylertoo_core::overview::writer::LevelWriteOutcome::SkippedEmpty
@@ -3063,6 +3711,8 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::writer::L
 pub enum tylertoo_core::overview::writer::RowGroupSizePolicy
 pub tylertoo_core::overview::writer::RowGroupSizePolicy::Constant
 pub tylertoo_core::overview::writer::RowGroupSizePolicy::ZoomScaled
+impl tylertoo_core::overview::writer::RowGroupSizePolicy
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::as_str(self) -> &'static str
 impl core::clone::Clone for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::clone(&self) -> tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::cmp::Eq for tylertoo_core::overview::writer::RowGroupSizePolicy
@@ -3071,6 +3721,8 @@ pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::eq(&self, &tylertoo_
 impl core::default::Default for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::default() -> tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::fmt::Debug for tylertoo_core::overview::writer::RowGroupSizePolicy
+pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for tylertoo_core::overview::writer::RowGroupSizePolicy
 pub fn tylertoo_core::overview::writer::RowGroupSizePolicy::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::overview::writer::RowGroupSizePolicy
 impl core::marker::StructuralPartialEq for tylertoo_core::overview::writer::RowGroupSizePolicy
@@ -3167,6 +3819,7 @@ pub tylertoo_core::overview::writer::OverviewWriterOptions::max_row_group_size: 
 pub tylertoo_core::overview::writer::OverviewWriterOptions::mode: tylertoo_core::overview::level::Mode
 pub tylertoo_core::overview::writer::OverviewWriterOptions::primary_column: core::option::Option<alloc::string::String>
 pub tylertoo_core::overview::writer::OverviewWriterOptions::row_group_size_policy: tylertoo_core::overview::writer::RowGroupSizePolicy
+pub tylertoo_core::overview::writer::OverviewWriterOptions::source_is_subset: bool
 pub tylertoo_core::overview::writer::OverviewWriterOptions::version: alloc::string::String
 pub tylertoo_core::overview::writer::OverviewWriterOptions::zstd_level: i32
 impl tylertoo_core::overview::writer::OverviewWriterOptions
@@ -3286,7 +3939,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pmtiles_writer::Hea
 pub struct tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, u8, u32, u32, u64, &[u8], usize, usize) -> core::io::error::Result<()>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, tylertoo_core::tile::TileCoord, u64, &[u8], usize, usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
@@ -3409,12 +4062,19 @@ pub tylertoo_core::pyramid::PyramidOptions::convert: tylertoo_core::overview::co
 pub tylertoo_core::pyramid::PyramidOptions::export: tylertoo_core::overview::export::ExportOptions
 pub tylertoo_core::pyramid::PyramidOptions::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::pyramid::PyramidOptions::work_dir: core::option::Option<std::path::PathBuf>
+impl tylertoo_core::pyramid::PyramidOptions
+pub fn tylertoo_core::pyramid::PyramidOptions::new(bool) -> Self
+pub fn tylertoo_core::pyramid::PyramidOptions::validate(&self) -> core::result::Result<tylertoo_core::overview::config::ValidatedConfig<'_, Self>, tylertoo_core::Error>
 impl core::clone::Clone for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::clone(&self) -> tylertoo_core::pyramid::PyramidOptions
 impl core::default::Default for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::default() -> Self
 impl core::fmt::Debug for tylertoo_core::pyramid::PyramidOptions
 pub fn tylertoo_core::pyramid::PyramidOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::pyramid::PyramidOptions
+pub fn tylertoo_core::pyramid::PyramidOptions::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::pyramid::PyramidOptions where tylertoo_core::pyramid::PyramidOptions: core::default::Default
+pub fn tylertoo_core::pyramid::PyramidOptions::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::pyramid::PyramidOptions
 impl core::marker::Send for tylertoo_core::pyramid::PyramidOptions
 impl core::marker::Sync for tylertoo_core::pyramid::PyramidOptions
@@ -3425,6 +4085,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::pyramid::PyramidOpt
 pub struct tylertoo_core::pyramid::PyramidReport
 pub tylertoo_core::pyramid::PyramidReport::bands_without_bounds: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::bands_without_metadata: alloc::vec::Vec<alloc::string::String>
+pub tylertoo_core::pyramid::PyramidReport::diagnostics: alloc::vec::Vec<tylertoo_core::diagnostics::Diagnostic>
 pub tylertoo_core::pyramid::PyramidReport::metadata: tylertoo_core::TilesetMetadata
 pub tylertoo_core::pyramid::PyramidReport::metadata_conflicts: alloc::vec::Vec<alloc::string::String>
 pub tylertoo_core::pyramid::PyramidReport::per_band_tiles: alloc::vec::Vec<(alloc::string::String, u8, u8, usize)>
@@ -3434,6 +4095,8 @@ impl core::clone::Clone for tylertoo_core::pyramid::PyramidReport
 pub fn tylertoo_core::pyramid::PyramidReport::clone(&self) -> tylertoo_core::pyramid::PyramidReport
 impl core::fmt::Debug for tylertoo_core::pyramid::PyramidReport
 pub fn tylertoo_core::pyramid::PyramidReport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for tylertoo_core::pyramid::PyramidReport
+pub fn tylertoo_core::pyramid::PyramidReport::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl core::marker::Freeze for tylertoo_core::pyramid::PyramidReport
 impl core::marker::Send for tylertoo_core::pyramid::PyramidReport
 impl core::marker::Sync for tylertoo_core::pyramid::PyramidReport
@@ -3455,8 +4118,15 @@ pub tylertoo_core::quality::CrsInfo::is_wgs84: bool
 pub tylertoo_core::quality::CrsInfo::name: core::option::Option<alloc::string::String>
 impl core::clone::Clone for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::clone(&self) -> tylertoo_core::quality::CrsInfo
+impl core::cmp::PartialEq for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::eq(&self, &tylertoo_core::quality::CrsInfo) -> bool
 impl core::fmt::Debug for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::quality::CrsInfo
+impl serde_core::ser::Serialize for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::quality::CrsInfo
 impl core::marker::Send for tylertoo_core::quality::CrsInfo
 impl core::marker::Sync for tylertoo_core::quality::CrsInfo
@@ -3464,9 +4134,39 @@ impl core::marker::Unpin for tylertoo_core::quality::CrsInfo
 impl core::marker::UnsafeUnpin for tylertoo_core::quality::CrsInfo
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::quality::CrsInfo
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
-pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
-pub fn tylertoo_core::quality::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::quality::crs_info_from_kv_metadata(core::option::Option<&alloc::vec::Vec<parquet::file::metadata::KeyValue>>, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::quality::extract_crs(&std::path::Path, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::quality::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
+pub mod tylertoo_core::resolved_schema
+pub struct tylertoo_core::resolved_schema::ResolvedSchema
+impl tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::bounds(&self) -> &[core::option::Option<tylertoo_core::covering::RowGroupBounds>]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::covering(&self) -> core::option::Option<&tylertoo_core::covering::CoveringSpec>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::crs(&self) -> core::option::Option<tylertoo_core::overview::level::Crs>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::crs_info(&self) -> &tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::from_metadata(&parquet::file::metadata::ParquetMetaData) -> tylertoo_core::Result<Self>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_columns(&self) -> &[alloc::string::String]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_index(&self) -> core::option::Option<usize>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::geometry_name(&self) -> core::option::Option<&str>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::primary_column(&self) -> core::option::Option<&str>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::properties(&self) -> &[usize]
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::renames(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::resolve(&arrow_schema::schema::Schema) -> tylertoo_core::Result<Self>
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::schema(&self) -> &arrow_schema::schema::Schema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::version(&self) -> core::option::Option<&str>
+impl core::clone::Clone for tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::clone(&self) -> tylertoo_core::resolved_schema::ResolvedSchema
+impl core::fmt::Debug for tylertoo_core::resolved_schema::ResolvedSchema
+pub fn tylertoo_core::resolved_schema::ResolvedSchema::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Send for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Sync for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::Unpin for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::marker::UnsafeUnpin for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::resolved_schema::ResolvedSchema
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::resolved_schema::ResolvedSchema
+pub const tylertoo_core::resolved_schema::DEFAULT_GEOMETRY_COLUMN: &str
+pub const tylertoo_core::resolved_schema::RESOLVED_SCHEMA_KEY: &str
 pub mod tylertoo_core::shard
 pub enum tylertoo_core::shard::ShardError
 pub tylertoo_core::shard::ShardError::BadShardSelector
@@ -3549,6 +4249,8 @@ impl core::fmt::Display for tylertoo_core::shard::ShardRole
 pub fn tylertoo_core::shard::ShardRole::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::shard::ShardRole
 impl core::marker::StructuralPartialEq for tylertoo_core::shard::ShardRole
+impl serde_core::ser::Serialize for tylertoo_core::shard::ShardRole
+pub fn tylertoo_core::shard::ShardRole::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl core::marker::Freeze for tylertoo_core::shard::ShardRole
 impl core::marker::Send for tylertoo_core::shard::ShardRole
 impl core::marker::Sync for tylertoo_core::shard::ShardRole
@@ -3998,8 +4700,8 @@ pub tylertoo_core::Compression::Zstd = 4
 impl tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::code(&self) -> u8
 pub fn tylertoo_core::compression::Compression::from_code(u8) -> core::option::Option<Self>
-pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::option::Option<Self>
 pub fn tylertoo_core::compression::Compression::name(&self) -> &'static str
+pub fn tylertoo_core::compression::Compression::parse(&str) -> core::option::Option<Self>
 impl core::clone::Clone for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::clone(&self) -> tylertoo_core::compression::Compression
 impl core::cmp::Eq for tylertoo_core::compression::Compression
@@ -4011,6 +4713,9 @@ impl core::fmt::Debug for tylertoo_core::compression::Compression
 pub fn tylertoo_core::compression::Compression::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for tylertoo_core::compression::Compression
 impl core::marker::StructuralPartialEq for tylertoo_core::compression::Compression
+impl core::str::traits::FromStr for tylertoo_core::compression::Compression
+pub type tylertoo_core::compression::Compression::Err = alloc::string::String
+pub fn tylertoo_core::compression::Compression::from_str(&str) -> core::result::Result<Self, Self::Err>
 impl core::marker::Freeze for tylertoo_core::compression::Compression
 impl core::marker::Send for tylertoo_core::compression::Compression
 impl core::marker::Sync for tylertoo_core::compression::Compression
@@ -4019,6 +4724,8 @@ impl core::marker::UnsafeUnpin for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::compression::Compression
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::compression::Compression
 pub enum tylertoo_core::Error
+pub tylertoo_core::Error::Accounting(tylertoo_core::diagnostics::AccountingError)
+pub tylertoo_core::Error::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::Error::GeoParquetRead(alloc::string::String)
 pub tylertoo_core::Error::InvalidConfig(alloc::string::String)
 pub tylertoo_core::Error::InvalidGeometry
@@ -4029,6 +4736,8 @@ pub tylertoo_core::Error::MvtEncoding(alloc::string::String)
 pub tylertoo_core::Error::Output(tylertoo_core::atomic_output::OutputNotWritable)
 pub tylertoo_core::Error::PMTilesRead(alloc::string::String)
 pub tylertoo_core::Error::PMTilesWrite(alloc::string::String)
+impl tylertoo_core::Error
+pub fn tylertoo_core::Error::is_config(&self) -> bool
 impl core::convert::From<core::io::error::Error> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(core::io::error::Error) -> Self
 impl core::convert::From<tylertoo_core::Error> for tylertoo_core::decode::DecodeError
@@ -4039,6 +4748,10 @@ impl core::convert::From<tylertoo_core::Error> for tylertoo_core::overview::expo
 pub fn tylertoo_core::overview::export::ExportError::from(tylertoo_core::Error) -> Self
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::Error
 pub fn tylertoo_core::Error::from(tylertoo_core::atomic_output::OutputNotWritable) -> Self
+impl core::convert::From<tylertoo_core::diagnostics::AccountingError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::diagnostics::AccountingError) -> Self
+impl core::convert::From<tylertoo_core::overview::config::ConfigError> for tylertoo_core::Error
+pub fn tylertoo_core::Error::from(tylertoo_core::overview::config::ConfigError) -> Self
 impl core::error::Error for tylertoo_core::Error
 pub fn tylertoo_core::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for tylertoo_core::Error
@@ -4059,8 +4772,15 @@ pub tylertoo_core::CrsInfo::is_wgs84: bool
 pub tylertoo_core::CrsInfo::name: core::option::Option<alloc::string::String>
 impl core::clone::Clone for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::clone(&self) -> tylertoo_core::quality::CrsInfo
+impl core::cmp::PartialEq for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::eq(&self, &tylertoo_core::quality::CrsInfo) -> bool
 impl core::fmt::Debug for tylertoo_core::quality::CrsInfo
 pub fn tylertoo_core::quality::CrsInfo::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::quality::CrsInfo
+impl serde_core::ser::Serialize for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::quality::CrsInfo
+pub fn tylertoo_core::quality::CrsInfo::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::quality::CrsInfo
 impl core::marker::Send for tylertoo_core::quality::CrsInfo
 impl core::marker::Sync for tylertoo_core::quality::CrsInfo
@@ -4071,7 +4791,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::quality::CrsInfo
 pub struct tylertoo_core::StreamingPmtilesWriter
 impl tylertoo_core::pmtiles_writer::StreamingPmtilesWriter
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile(&mut self, u8, u32, u32, &[u8]) -> core::io::error::Result<()>
-pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, u8, u32, u32, u64, &[u8], usize, usize) -> core::io::error::Result<()>
+pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_precompressed(&mut self, tylertoo_core::tile::TileCoord, u64, &[u8], usize, usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::add_tile_with_count(&mut self, u8, u32, u32, &[u8], usize) -> core::io::error::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::checkpoint(&mut self, &std::path::Path) -> tylertoo_core::Result<()>
 pub fn tylertoo_core::pmtiles_writer::StreamingPmtilesWriter::finalize(self, &std::path::Path) -> tylertoo_core::Result<tylertoo_core::pmtiles_writer::StreamingWriteStats>
@@ -4140,6 +4860,8 @@ pub fn tylertoo_core::TilesetMetadata::fmt(&self, &mut core::fmt::Formatter<'_>)
 impl core::marker::StructuralPartialEq for tylertoo_core::TilesetMetadata
 impl serde_core::ser::Serialize for tylertoo_core::TilesetMetadata
 pub fn tylertoo_core::TilesetMetadata::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for tylertoo_core::TilesetMetadata where tylertoo_core::TilesetMetadata: core::default::Default
+pub fn tylertoo_core::TilesetMetadata::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 impl core::marker::Freeze for tylertoo_core::TilesetMetadata
 impl core::marker::Send for tylertoo_core::TilesetMetadata
 impl core::marker::Sync for tylertoo_core::TilesetMetadata
@@ -4147,6 +4869,6 @@ impl core::marker::Unpin for tylertoo_core::TilesetMetadata
 impl core::marker::UnsafeUnpin for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::TilesetMetadata
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::TilesetMetadata
-pub fn tylertoo_core::extract_crs(&std::path::Path) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
+pub fn tylertoo_core::extract_crs(&std::path::Path, &tylertoo_core::diagnostics::Diagnostics) -> tylertoo_core::Result<tylertoo_core::quality::CrsInfo>
 pub fn tylertoo_core::validate_wgs84(&std::path::Path) -> tylertoo_core::Result<()>
 pub type tylertoo_core::Result<T> = core::result::Result<T, tylertoo_core::Error>

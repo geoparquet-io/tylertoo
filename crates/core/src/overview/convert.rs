@@ -1,78 +1,59 @@
-//! Overview conversion pipeline (task P5; streaming since H3).
+//! Public conversion options, reports and entry points.
 //!
-//! [`convert_to_overviews`] wires the existing overview modules into a single
-//! GeoParquet → GeoParquet overview build. By default
-//! ([`ConvertOptions::streaming`]) it dispatches to the two-pass
-//! bounded-memory pipeline in `super::stream`; the in-memory reference
-//! implementation below (`streaming: false`) proceeds as:
+//! Both storage modes run the same stages in `super::stream`: preflight,
+//! pass-1 scan, assignment, carriers, writer setup, and write/report. The
+//! `super::source::MemorySource` adapter retains input batches in memory;
+//! the streaming source reads Parquet batches on demand. Both preserve
+//! input order and use the same row addresses throughout the pipeline.
 //!
-//! 1. **read** the whole input GeoParquet preserving the full property schema
-//!    (the entire table is concatenated into one batch). The CRS is detected
-//!    from the `geo` metadata and mapped to [`Crs`]; non-4326/3857 inputs and
-//!    inputs that already carry a `level` column are rejected (spec Q3, §4.1).
-//! 2. **assign** every feature a coarsest level via `assign::assign_levels`
-//!    over per-feature bbox + [`FeatureKind`] + an optional sort key.
-//! 3. **generalize + write**, coarse→fine, feeding [`OverviewWriter`]:
-//!    - `duplicating` non-canonical levels: `simplify::simplify_for_level`
-//!      per feature, dropping [`Simplified::Dropped`];
-//!    - `duplicating` canonical (finest) level: original geometry **untouched**
-//!      (spec §2.4, value-identity — no simplify round-trip);
-//!    - `partitioning` (all levels): original geometry **verbatim** (§2.3).
-//!
-//! Input (Hilbert) order is preserved within each level (no re-sort).
-//! 4. **report**: a [`ConvertReport`] (per-level feature/vertex/byte counts,
-//!    totals, duration) is returned and is `serde` `Serialize` for the later
-//!    benchmark tasks.
-//!
-//! The in-memory path is the correctness-first reference: memory is
-//! `O(dataset)`. The default streaming path (`super::stream`) produces
-//! equivalent output in `O(read batch + winner tables)` memory; equivalence
-//! is asserted by the `streaming_matches_*` tests below.
+//! Canonical duplicating levels and all partitioning levels retain original
+//! geometries. Other duplicating levels run the shared generalization stage.
+//! The `streaming_matches_in_memory_*` tests pin the storage-mode equivalence.
 
+#[cfg(test)]
+use super::assign::AssignFeature;
+#[cfg(test)]
+use geoarrow::array::from_arrow_array;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
-use geo::{Area, BoundingRect, Geometry};
+#[cfg(test)]
+use geo::BoundingRect;
+use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geo_traits::{
     CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType as TraitGeometryType,
     LineStringTrait, MultiLineStringTrait, MultiPointTrait, MultiPolygonTrait, PointTrait,
     PolygonTrait,
 };
-use geoarrow::array::{from_arrow_array, GeometryBuilder};
+use geoarrow::array::GeometryBuilder;
 use geoarrow::datatypes::GeometryType;
 use geoarrow_array::GeoArrowArray;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::input::InputSource;
-use crate::input_set::{ConvertSource, RowGroupSelection};
+use crate::input_set::ConvertSource;
 use serde::Serialize;
 
-use crate::batch_processor::extract_geometries_opt_from_array;
 use crate::shard::TileRange;
 use crate::tile::MAX_ZOOM;
 
-use super::accumulate::{is_carrier, level_accumulates, tiny_polygon_carriers, AccumulateLevel};
 use super::assign::{
-    apply_density_budget, assign_levels_bounded, AssignConfig, AssignFeature, Assignment,
-    DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
+    AssignConfig, DensityBudgetConfig, FeatureKind, FeatureTable, SUPERCELL_GSD_FACTOR,
 };
 use super::cluster::{
     build_cluster_tables, verify_sum_invariant, AccumulateSpec, ClusterEntry, ClusterTables,
     POINT_COUNT_COLUMN,
 };
 use super::coalesce::{
-    coalesce_level_lines, collected_line_bytes, CoalesceInput, CoalesceParams,
-    COALESCED_COUNT_COLUMN, COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS,
-    DEFAULT_JUNCTION_ANGLE_DEG, DEFAULT_SNAP_GSD_FACTOR,
+    coalesce_level_lines, CoalesceInput, CoalesceParams, COALESCED_COUNT_COLUMN,
+    COALESCE_NOMINAL_BYTES_PER_LINE, DEFAULT_COALESCE_MAX_LEVEL_ROWS, DEFAULT_JUNCTION_ANGLE_DEG,
+    DEFAULT_SNAP_GSD_FACTOR,
 };
 use super::ladder::{
     build_ladder, dense_rank_span, entry_levels, EntryZoomKind, EntryZoomLadder, EntryZoomSpec,
@@ -86,15 +67,12 @@ use super::level::{
 use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
 use super::simplify::{
-    carrier_square, simplify_cascade, simplify_for_level, simplify_step_at, CascadeStep,
-    CollapseMode, Representation, Simplified, SimplifyOptions,
+    simplify_for_level, CollapseMode, Representation, Simplified, SimplifyOptions,
 };
-use super::writer::{
-    LevelSpec, LevelWriteOutcome, OverviewWriter, RowGroupSizePolicy, WriterError, LEVEL_COLUMN,
-};
+use super::writer::{LevelWriteOutcome, RowGroupSizePolicy, WriterError, LEVEL_COLUMN};
 
 /// How the caller specifies the overview levels.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LevelPlan {
     /// A Web Mercator zoom range, mapped through `gsd_for_zoom`. `min_zoom`
     /// is the coarsest (level 0), `max_zoom` the finest. Both inclusive.
@@ -227,7 +205,7 @@ impl LevelPlan {
             LevelPlan::ZoomRange { min_zoom, max_zoom } => {
                 if min_zoom > max_zoom {
                     return Err(ConvertError::InvalidLevels(format!(
-                        "min_zoom {min_zoom} must be <= max_zoom {max_zoom}"
+                        "--min-zoom {min_zoom} (min_zoom) must be <= --max-zoom {max_zoom} (max_zoom)"
                     )));
                 }
                 check_len(*max_zoom as usize - *min_zoom as usize + 1)?;
@@ -274,7 +252,7 @@ impl LevelPlan {
 /// every named rank — **loses to all named classes but still beats a
 /// null/missing value** (nulls encode as `None`, which loses to any `Some` in
 /// the priority order).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassRanking {
     /// Name of the (Utf8/LargeUtf8) column whose values are ranked.
     pub column: String,
@@ -308,17 +286,12 @@ impl ClassRanking {
         ranks: Vec<(String, f64)>,
         unknown_rank: Option<f64>,
     ) -> Result<Self, String> {
-        const NOT_FINITE: &str =
-            "must be a finite number (NaN and infinity cannot be ordered against other classes)";
         if ranks.is_empty() {
             return Err("at least one class rank is required".to_string());
         }
-        if let Some((value, rank)) = ranks.iter().find(|(_, r)| !r.is_finite()) {
-            return Err(format!("rank {rank} for class {value:?} {NOT_FINITE}"));
-        }
-        if let Some(unknown) = unknown_rank.filter(|u| !u.is_finite()) {
-            return Err(format!("unknown-class rank {unknown} {NOT_FINITE}"));
-        }
+        // The one finiteness rule and message (#428), shared with a
+        // struct-literal ranking's check in `validate_options`.
+        super::config::check_ranks_finite(&ranks, unknown_rank).map_err(|e| e.to_string())?;
         let min_rank = ranks.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
         Ok(Self {
             column: column.into(),
@@ -414,13 +387,22 @@ pub(super) const KNOWN_ROAD_CLASSES: &[&str] = &[
 pub(super) const ROAD_VOCAB_MIN_DISTINCT: usize = 3;
 
 /// Options for [`convert_to_overviews`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "cli", command(group(clap::ArgGroup::new("overview_only").multiple(true))))]
 pub struct ConvertOptions {
     /// Level materialization mode. Default [`Mode::Duplicating`].
+    #[cfg_attr(feature = "cli", arg(long, default_value = Self::default().mode.as_str(), value_parser = super::config::cli::spelled::<Mode>(&["duplicating", "partitioning"])))]
+    #[cfg_attr(feature = "cli", arg(help = "Level layout: `duplicating` writes each level in full, and `partitioning` writes each feature once, at its coarsest level", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "overview_only"))]
     pub mode: Mode,
     /// How levels are specified (zoom range or explicit GSDs).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().levels))]
     pub levels: LevelPlan,
     /// Thinning / visibility / sort configuration for level assignment.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub assign: AssignConfig,
     /// Attribute-driven entry zoom (#364): a magnitude ladder that decides how
     /// early each feature may appear, overriding the visibility gate and
@@ -431,6 +413,7 @@ pub struct ConvertOptions {
     /// backwards. [`sort_key`](Self::sort_key) cannot fix that on its own — it
     /// chooses between features competing for a cell, and the gate has already
     /// dropped the small ones on size.
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().entry_zoom))]
     pub entry_zoom: Option<EntryZoomSpec>,
     /// Optional column name whose (numeric) value is used as the cell-winner
     /// sort key. Mutually exclusive with [`class_ranking`](Self::class_ranking).
@@ -439,14 +422,24 @@ pub struct ConvertOptions {
     /// spells nodata — is a *missing* key: the feature still appears, it just
     /// loses any cell it contests to a feature that has a key
     /// (`extract_sort_keys`).
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "COL", help_heading = "Ranking")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Numeric column used to choose each thinning cell's winning feature. Conflicts with `--class-rank`", long_help = None))]
     pub sort_key: Option<String>,
     /// Optional explicit categorical class ranking (Q1 tier 1). Mutually
     /// exclusive with [`sort_key`](Self::sort_key).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().class_ranking))]
     pub class_ranking: Option<ClassRanking>,
     /// Disable tier-3 auto-detection of well-known schemas (Overture roads /
     /// places confidence). No effect when `sort_key` or `class_ranking` is set.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Ranking"))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off automatic ranking for known schemas (Overture roads `class`/`road_class`, Overture places `confidence`)", long_help = None))]
     pub no_auto_rank: bool,
     /// Per-level simplification options (duplicating mode only).
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub simplify: SimplifyOptions,
     /// Zoom-band representation selector (#317 / #279): per-zoom-band
     /// [`Representation`] overrides — e.g. `0-7:point, 8-14:geom` renders
@@ -464,29 +457,60 @@ pub struct ConvertOptions {
     /// point-thinning grid; within a `square` band they bypass the gate but
     /// keep the polygon grid. Lines and genuine points are unaffected by
     /// every band kind. Default empty (all levels `geom`).
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().representation))]
     pub representation: Vec<RepresentationBand>,
     /// Per-level density budget applied after cell-winner thinning (Q2). Default
     /// enabled; disable via `--no-density-drop` to reproduce pre-Q2 behavior.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub density: DensityBudgetConfig,
     /// GSD tile-band base for zoom→GSD derivation (spec §5.2 / Q6; the cogp-rs
     /// `base` knob). Default [`GSD_TILE_BASE`] (1024). Larger ⇒ smaller GSDs
     /// (finer detail / less thinning); smaller ⇒ larger GSDs (coarser / more
     /// thinning). No effect on an explicit [`LevelPlan::Gsds`] plan.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "F",
+        default_value_t = ConvertOptions::default().gsd_base,
+        help_heading = "Generalization"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Base of the zoom-to-GSD mapping, `gsd(z) = 40075016.69 / base / 2^z`: a larger base keeps more detail at every level. No effect with `--gsd`", long_help = None))]
     pub gsd_base: f64,
     /// Emit the optional COGP compatibility footer key (§3.1). Default `false`.
+    #[serde(rename = "cogp_compat")]
+    #[cfg_attr(feature = "cli", arg(id = "cogp_compat", long = "cogp-compat"))]
+    #[cfg_attr(feature = "cli", arg(help = "Write the third-party `cogp` footer key for readers of that overview format. Partitioning mode only", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "overview_only"))]
     pub cogp_compat_key: bool,
     /// Maximum row-group size in rows for the output writer.
+    #[serde(rename = "row_group_size")]
+    #[cfg_attr(feature = "cli", arg(long = "row-group-size", id = "row_group_size",
+        default_value_t = ConvertOptions::default().max_row_group_size,
+        help_heading = "Output layout"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Maximum rows per output row group at each level. The cap increases if a level would exceed Parquet's row-group limit", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(value_name = "ROW_GROUP_SIZE"))]
     pub max_row_group_size: usize,
     /// How the per-level row-group cap is derived from `max_row_group_size`
     /// (#202). Default [`RowGroupSizePolicy::Constant`]; `ZoomScaled` doubles
     /// the cap per zoom step below the finest level (fewer requests on coarse
     /// bands that wide viewports read mostly whole anyway).
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ConvertOptions::default().row_group_size_policy.as_str(),
+        value_parser = super::config::cli::spelled::<RowGroupSizePolicy>(&["constant", "zoom-scaled"]),
+        help_heading = "Output layout"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "How the row-group cap varies by level: `constant`, or `zoom-scaled`, which doubles it per zoom step coarser than the finest level", long_help = None))]
     pub row_group_size_policy: RowGroupSizePolicy,
     /// Keep full Parquet statistics on every column (including high-cardinality
     /// string/binary property columns and the WKB geometry column). Default
     /// `false`: those stats are suppressed to keep the footer small (H1); the
     /// bbox covering and `level` column always keep their pruning stats. Set
     /// `true` for clients that push property predicates to the remote file.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Output layout"))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep Parquet min/max stats on every column, even large string and geometry columns. Use it when remote clients filter on property columns", long_help = None))]
     pub full_column_stats: bool,
     /// Use the two-pass bounded-memory streaming pipeline (H3). Default `true`.
     ///
@@ -494,18 +518,35 @@ pub struct ConvertOptions {
     /// (level assignment + Q2 density budget); pass 2 streams the input again
     /// per level, simplifying and writing batch-by-batch. Peak memory is
     /// `O(read batch + winner tables)` instead of `O(dataset)`. Set `false`
-    /// to use the original in-memory pipeline (kept for comparison; produces
-    /// equivalent output).
+    /// to cache the input batches in memory and run the same stages over them.
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().streaming, action = clap::ArgAction::SetFalse, long = "no-streaming", help_heading = "Memory & performance"))]
+    #[cfg_attr(feature = "cli", arg(help = "Load the whole dataset into memory instead of streaming it in two passes. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
     pub streaming: bool,
     /// Rows per Arrow read batch in the streaming pipeline (both passes).
     /// Default [`DEFAULT_READ_BATCH_SIZE`]. Larger batches amortize per-batch
     /// overhead at the cost of proportionally more peak memory; smaller
-    /// batches bound memory tighter. No effect when `streaming` is `false`.
+    /// batches bound memory tighter. Also sets cached batch sizes when
+    /// `streaming` is `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = ConvertOptions::default().read_batch_size,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>", long_help = None))]
     pub read_batch_size: usize,
     /// Memory/throughput profile for the streaming pass-2 engine (#213/#212).
     /// Default [`MemoryProfile::Auto`], resolved per mode + estimated output
     /// size at convert entry. Changes speed and peak memory only — output is
     /// byte-identical across profiles. No effect when `streaming` is `false`.
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ConvertOptions::default().profile.as_str(),
+        value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -520,6 +561,14 @@ pub struct ConvertOptions {
     /// window's output batches). 1 or 2 processes one batch at a time. Output
     /// is byte-identical for every value. No effect when `streaming` is
     /// `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_in_flight_batches,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub in_flight_batches: usize,
     /// Number of concurrent reader threads pass 2 (#494) and pass 1 (#717)
     /// each split the input across. Default [`READ_WORKERS_AUTO`], which
@@ -531,6 +580,14 @@ pub struct ConvertOptions {
     /// [`read_workers_ceiling`] and clamped (with a warning) above it. Ignored
     /// for remote inputs (see `super::pipeline`) and when `streaming` is
     /// `false`.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "N|auto",
+        default_value = "auto",
+        value_parser = super::config::cli::parse_read_workers,
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -538,11 +595,16 @@ pub struct ConvertOptions {
     /// INT64 NOT NULL column (1 at the canonical level) and the winner keeps
     /// its own geometry and attributes (see [`super::cluster`]). Lines and
     /// polygons are unaffected. Default `false`.
+    #[cfg_attr(feature = "cli", arg(long, help_heading = "Clustering"))]
+    #[cfg_attr(feature = "cli", arg(help = "Merge each thinning cell's points into its surviving point, which gains a `point_count` column. Duplicating mode only", long_help = None))]
     pub cluster: bool,
     /// Numeric per-cluster attribute aggregation (Q6): for each spec, the
     /// winner's value of the column becomes the aggregate over itself + the
     /// absorbed features at that level. Requires [`cluster`](Self::cluster).
     /// Empty by default.
+    #[serde(rename = "accumulate_attributes", with = "super::config::accumulation")]
+    #[cfg_attr(feature = "cli", arg(long = "accumulate-attribute", id = "accumulate_attributes", value_name = "COL:OP", help_heading = "Clustering", value_parser = parse_accumulate))]
+    #[cfg_attr(feature = "cli", arg(help = "Aggregate a numeric column over each cluster as `COL:OP`, where `OP` is `sum`, `max`, `min`, or `mean` (repeatable). Requires `--cluster`", long_help = None))]
     pub accumulate: Vec<AccumulateSpec>,
     /// Enable line network coalescing (plan Q3). **Default `true`** (like
     /// `line_thinning = 1.0` and the clustering point grid, chosen by
@@ -560,11 +622,20 @@ pub struct ConvertOptions {
     /// this option is treated as INERT for partitioning conversions — the
     /// output has no `coalesced_count` column and no coalescing provenance.
     /// (The CLI additionally rejects an *explicit* request.)
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().coalesce_lines, action = clap::ArgAction::SetFalse, long = "no-coalesce-lines", help_heading = "Line coalescing"))]
+    #[cfg_attr(feature = "cli", arg(help = "Turn off line coalescing, which joins touching same-class line segments into longer strokes at coarse levels", long_help = None))]
     pub coalesce_lines: bool,
     /// Endpoint snap tolerance for coalescing, in GSD multiples (default
     /// [`DEFAULT_SNAP_GSD_FACTOR`] = 1.0): after exact-endpoint chaining,
     /// chain ends within `factor × gsd` of each other are joined. `<= 0`
     /// disables the snap pass (exact coordinate matching only).
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "F",
+        default_value_t = ConvertOptions::default().coalesce_snap,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Join line ends within this many GSDs of each other when coalescing. Set 0 to join only ends that match exactly", long_help = None))]
     pub coalesce_snap: f64,
     /// Per-level candidate ceiling for coalescing (default
     /// [`DEFAULT_COALESCE_MAX_LEVEL_ROWS`]): chaining holds the level's
@@ -581,6 +652,13 @@ pub struct ConvertOptions {
     /// such inputs anyway, at a proportional memory cost. Exceeding either skips coalescing. Both are pure
     /// functions of the input, so the verdict is identical across engines,
     /// machines and read-batch sizes.
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = ConvertOptions::default().coalesce_max_level_rows,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Skip coalescing above this candidate-line count to bound memory. Long lines reach a corresponding geometry-size limit first", long_help = None))]
     pub coalesce_max_level_rows: usize,
     /// Junction continuation threshold for coalescing, in degrees (default
     /// [`DEFAULT_JUNCTION_ANGLE_DEG`] = `0` = OFF, per maintainer render
@@ -589,6 +667,13 @@ pub struct ConvertOptions {
     /// lines that continue each other within this deviation from straight
     /// merge best-pair-first, so arterials chain THROUGH same-class
     /// crossings (fewer, longer strokes at the cost of over-merging).
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        value_name = "DEG",
+        default_value_t = ConvertOptions::default().coalesce_junction_angle,
+        help_heading = "Line coalescing"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Continue a line through a junction when the straightest pair turns by at most this many degrees. Set 0 to stop chains at every junction", long_help = None))]
     pub coalesce_junction_angle: f64,
     /// Regional extract (#102): `[xmin, ymin, xmax, ymax]` in EPSG:4326
     /// lon/lat degrees. When set, the conversion behaves as if the input
@@ -604,6 +689,8 @@ pub struct ConvertOptions {
     /// read and only the exact per-feature filter applies, so the output is
     /// identical either way. Default `None` (full-extent conversion,
     /// byte-identical output to a build without this option).
+    #[cfg_attr(feature = "cli", arg(value_parser = super::config::cli::parse_bbox, long, value_name = "XMIN,YMIN,XMAX,YMAX"))]
+    #[cfg_attr(feature = "cli", arg(help = "Convert features whose bbox intersects this lon/lat box, or would one ±360° wrap away (0..360 data). Skips row groups outside the box", long_help = None))]
     pub bbox: Option<[f64; 4]>,
     /// Attribute filter (#315): a SQL-WHERE-style predicate over the input's
     /// property columns (`--filter` / `--where`), e.g. `confidence > 0.8`,
@@ -616,6 +703,16 @@ pub struct ConvertOptions {
     /// input those byte ranges are never fetched); row groups without usable
     /// statistics degrade gracefully to the exact per-row evaluation. See
     /// [`super::filter`] for the grammar. Default `None` (no filtering).
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long,
+            value_name = "EXPR",
+            visible_alias = "where",
+            help_heading = "Filtering"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Filter property columns with a SQL `WHERE` predicate, such as `confidence > 0.8`. Skips row groups that cannot match. Grammar: <https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/>", long_help = None))]
     pub filter: Option<String>,
     /// Which property columns the output carries (#386): tippecanoe's
     /// `-x` / `-y` / `-X`. Resolved once against the input schema and applied
@@ -625,6 +722,8 @@ pub struct ConvertOptions {
     /// column another knob reads (`sort_key`, `class_ranking`, `entry_zoom`,
     /// `accumulate`, `filter`) must stay included; excluding it is rejected.
     /// Default: keep everything.
+    #[serde(flatten)]
+    #[cfg_attr(feature = "cli", command(flatten))]
     pub properties: PropertySelection,
     /// Directory for the remote-input disk spill (#219 / #272). A remote
     /// convert stages every fetched column chunk in an anonymous temp file
@@ -633,6 +732,11 @@ pub struct ConvertOptions {
     /// under the process temp dir (`$TMPDIR`); set this to use a roomier
     /// or faster volume instead. The directory must exist (validated up
     /// front). Local inputs never spill, so this has no effect on them.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
     pub spill_dir: Option<PathBuf>,
     /// Write the **convert plan artifact** to this path once pass 1 and the
     /// level assignment are done, then carry on with the conversion.
@@ -650,19 +754,29 @@ pub struct ConvertOptions {
     /// column), so a sharded build MUST consume one plan rather than
     /// recompute the assignment per shard. Mutually exclusive with
     /// [`plan`](Self::plan). Streaming pipeline only. Default `None`.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Save the convert plan to PATH and continue converting. Reuse it with `--plan`; sharded builds share one plan", long_help = None))]
     pub save_plan: Option<PathBuf>,
     /// Load a previously saved convert plan from this path instead of running
     /// pass 1 and the level assignment.
     ///
     /// The plan's fingerprint must match this run: the tylertoo version, every
-    /// thinning-relevant option, and each input part's path, size, mtime and
-    /// selected row groups. Any mismatch is a hard error naming the offending
+    /// thinning-relevant option, and each input part's path, size, local mtime
+    /// or remote ETag, and selected row groups. Any mismatch names the offending
     /// field — a stale plan never silently produces a different pyramid. The
     /// *write-side* knobs (profile, row-group sizing, in-flight depth,
     /// compression, spill directory) are deliberately not fingerprinted, so
     /// one plan can be replayed across them. Mutually exclusive with
     /// [`save_plan`](Self::save_plan). Streaming pipeline only. Default
     /// `None`.
+    #[cfg_attr(
+        feature = "cli",
+        arg(long, value_name = "PATH", help_heading = "Memory & performance")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Reuse a convert plan, skipping the first pass and level assignment. Its fingerprint must match this run's version, flags, and inputs", long_help = None))]
     pub plan: Option<PathBuf>,
     /// Convert one shard of a sharded build (#498): read only the row groups
     /// whose bbox reaches this tile range, and re-address the `--plan`
@@ -684,6 +798,8 @@ pub struct ConvertOptions {
     /// same thinning options as the plan and only narrows which row groups it
     /// reads, which the fingerprint check accepts as a subset relation rather
     /// than an equality (see `plan_state::SelectionRule`). Default `None`.
+    #[serde(with = "super::config::tile_range")]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().shard))]
     pub shard: Option<TileRange>,
     /// [`crate::shard::ShardPlan::cut_digest_hex`] of the shard plan this run
     /// was given, binding the whole fleet to **one cut** (#498).
@@ -701,6 +817,8 @@ pub struct ConvertOptions {
     /// shards alike. `None` for an unsharded run, which is itself part of the
     /// binding: a plan saved without a shard plan cannot be consumed by a
     /// shard, and vice versa. Default `None`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().shard_plan_digest))]
     pub shard_plan_digest: Option<String>,
     /// Materialize only the levels at or coarser than this zoom (#541): the
     /// **coarse job**'s half of a sharded build, on the convert side.
@@ -746,6 +864,7 @@ pub struct ConvertOptions {
     /// [`export_pmtiles`]: super::export::export_pmtiles
     ///
     /// [`ExportOptions::zoom_ceiling`]: super::export::ExportOptions::zoom_ceiling
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().zoom_ceiling))]
     pub zoom_ceiling: Option<u8>,
 }
 
@@ -846,8 +965,8 @@ pub fn read_workers_ceiling() -> usize {
 /// a larger share slows the compute it is feeding (12 cores → 3 readers). Any
 /// explicit positive value is honoured verbatim **up to
 /// [`read_workers_ceiling`]**; the caller opted in to the memory cost, which
-/// the engine still bounds against the memory budget. Above the ceiling the
-/// value is clamped and a warning is logged.
+/// the engine still bounds against the memory budget. Values above the
+/// ceiling are rejected by [`ConvertOptions::validate`].
 ///
 /// Output is byte-identical for every value — see `super::pipeline`'s
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
@@ -859,19 +978,51 @@ pub fn resolve_read_workers(requested: usize) -> usize {
             .unwrap_or(1)
             .clamp(1, READ_WORKERS_MAX)
     } else {
-        let ceiling = read_workers_ceiling();
-        let resolved = requested.clamp(1, ceiling);
-        if resolved != requested {
-            log::warn!(
-                "[convert] read_workers {requested} is above the ceiling of {ceiling} \
-                 (2× this machine's cores); using {resolved}"
-            );
-        }
-        resolved
+        requested
     }
 }
 
 impl ConvertOptions {
+    /// Check every option rule that needs no input file (#779): numeric
+    /// ranges, the level plan, mutually exclusive and mode-incompatible
+    /// options, the spill and plan paths. Every conversion entry point runs
+    /// this first; a front end that does work before converting (the `tiles`
+    /// facade, `--max-zoom auto`) calls it up front and fails in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken. [`ConvertError::is_config`] is true for every
+    /// error this returns.
+    /// Validate these options and return the immutable engine configuration.
+    pub fn validate(&self) -> Result<super::config::ValidatedConfig<'_, Self>, ConvertError> {
+        super::config::validate_convert(self)
+    }
+
+    pub(super) fn check_finite_numbers(&self) -> Result<(), ConvertError> {
+        for (name, value) in [
+            ("gsd-base", self.gsd_base),
+            ("point-thinning", self.assign.point_thinning),
+            ("line-thinning", self.assign.line_thinning),
+            ("polygon-thinning", self.assign.polygon_thinning),
+            ("line-visibility", self.assign.line_visibility),
+            ("polygon-visibility", self.assign.polygon_visibility),
+            ("simplify-factor", self.simplify.factor),
+            ("drop-rate", self.density.drop_rate),
+            ("drop-gamma", self.density.gamma),
+            ("coalesce-snap", self.coalesce_snap),
+            ("coalesce-junction-angle", self.coalesce_junction_angle),
+        ] {
+            super::config::finite_number(name, value).map_err(ConvertError::InvalidConfig)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check(&self) -> Result<(), ConvertError> {
+        validate_options(self)?;
+        self.levels.resolve(self.gsd_base)?;
+        Ok(())
+    }
+
     /// Turn off the whole generalization ladder: tile this input **exactly as
     /// given** at every level (#345 / #360).
     ///
@@ -948,7 +1099,13 @@ impl ConvertOptions {
         if verbatim && matches!(self.mode, Mode::Partitioning) {
             return Err(ConvertError::VerbatimPartitioningUnsupported);
         }
-        let defaults = AssignConfig::default();
+        // Q3: coalescing is on by default and silently inert in partitioning
+        // mode (core logs it), but an EXPLICIT request is an error the
+        // caller should hear about. Formerly a CLI-only check (#779).
+        if overrides.coalesce_lines == Some(true) && matches!(self.mode, Mode::Partitioning) {
+            return Err(super::config::ConfigError::CoalescePartitioningUnsupported.into());
+        }
+        let defaults = Self::default();
         let tuned = |explicit: Option<f64>, default: f64| {
             explicit.unwrap_or(if verbatim { 0.0 } else { default })
         };
@@ -957,20 +1114,25 @@ impl ConvertOptions {
         let point_default = if self.cluster {
             super::assign::CLUSTER_POINT_THINNING_DEFAULT
         } else {
-            defaults.point_thinning
+            defaults.assign.point_thinning
         };
         self.assign.point_thinning = tuned(overrides.point_thinning, point_default);
-        self.assign.line_thinning = tuned(overrides.line_thinning, defaults.line_thinning);
-        self.assign.polygon_thinning = tuned(overrides.polygon_thinning, defaults.polygon_thinning);
-        self.assign.line_visibility = tuned(overrides.line_visibility, defaults.line_visibility);
-        self.assign.polygon_visibility =
-            tuned(overrides.polygon_visibility, defaults.polygon_visibility);
-        self.simplify.factor = tuned(
-            overrides.simplify_factor,
-            super::simplify::DEFAULT_SIMPLIFY_FACTOR,
+        self.assign.line_thinning = tuned(overrides.line_thinning, defaults.assign.line_thinning);
+        self.assign.polygon_thinning =
+            tuned(overrides.polygon_thinning, defaults.assign.polygon_thinning);
+        self.assign.line_visibility =
+            tuned(overrides.line_visibility, defaults.assign.line_visibility);
+        self.assign.polygon_visibility = tuned(
+            overrides.polygon_visibility,
+            defaults.assign.polygon_visibility,
         );
-        self.density.enabled = overrides.density_drop.unwrap_or(!verbatim);
-        self.coalesce_lines = overrides.coalesce_lines.unwrap_or(!verbatim);
+        self.simplify.factor = tuned(overrides.simplify_factor, defaults.simplify.factor);
+        self.density.enabled = overrides
+            .density_drop
+            .unwrap_or(!verbatim && defaults.density.enabled);
+        self.coalesce_lines = overrides
+            .coalesce_lines
+            .unwrap_or(!verbatim && defaults.coalesce_lines);
 
         // Logged because "no features were dropped" is a surprising thing to
         // infer from a quiet run — and the message has to tell the truth about
@@ -1031,7 +1193,8 @@ impl ConvertOptions {
 ///
 /// One field per CLI flag (`--point-thinning`, …, `--no-density-drop`,
 /// `--no-coalesce-lines`) and per Python keyword argument.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GeneralizationOverrides {
     /// Point grid cell size in GSDs.
     pub point_thinning: Option<f64>,
@@ -1283,33 +1446,18 @@ pub struct SkippedLevelReport {
 pub(super) fn warn_plan_skipped_levels(
     skipped: &[SkippedLevelReport],
     input_features: usize,
-    first_written_gsd: f64,
-    first_written_zoom: Option<u8>,
+    (first_written_gsd, first_written_zoom): (f64, Option<u8>),
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
-    if skipped.is_empty() {
-        return;
-    }
-    let ids: Vec<String> = skipped
-        .iter()
-        .map(|s| s.planned_level.to_string())
-        .collect();
-    let gsd_max = skipped.iter().map(|s| s.gsd).fold(f64::MIN, f64::max);
-    let gsd_min = skipped.iter().map(|s| s.gsd).fold(f64::MAX, f64::min);
-    let zoom_note = first_written_zoom.map_or_else(String::new, |z| format!(" (zoom {z})"));
-    log::warn!(
-        "omitting {} empty level(s) [{}] spanning GSD {:.2}–{:.2} m: none of the {} input \
-         feature(s) are visible at those scales (visibility gates / density budget); the \
-         output pyramid starts at GSD {:.2} m{}. To populate coarse levels, lower \
-         --polygon-visibility/--line-visibility, or pass --collapse to keep sub-GSD \
-         polygons as representative points (see docs/OVERVIEW_TUNING.md)",
-        skipped.len(),
-        ids.join(", "),
-        gsd_max,
-        gsd_min,
+    diagnostics.once(crate::diagnostics::Diagnostic::EmptyLevels {
+        count: skipped.len(),
+        levels: skipped.iter().map(|s| s.planned_level).collect(),
+        gsd_max: skipped.iter().map(|s| s.gsd).fold(f64::MIN, f64::max),
+        gsd_min: skipped.iter().map(|s| s.gsd).fold(f64::MAX, f64::min),
         input_features,
         first_written_gsd,
-        zoom_note,
-    );
+        first_written_zoom,
+    });
 }
 
 /// Fold one [`OverviewWriter::write_level`] outcome into the driver
@@ -1320,15 +1468,15 @@ pub(super) fn warn_plan_skipped_levels(
 pub(super) fn record_level_outcome(
     outcome: LevelWriteOutcome,
     planned: SkippedLevelReport,
-    candidates: usize,
-    rows: usize,
-    vertices: usize,
+    counts: (usize, usize, usize),
     level_reports: &mut Vec<LevelReport>,
     skipped: &mut Vec<SkippedLevelReport>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
+    let (candidates, rows, vertices) = counts;
     match outcome {
         LevelWriteOutcome::SkippedEmpty => {
-            log::warn!(
+            diagnostics.warn(format!(
                 "level planned at GSD {:.2} m{} became empty after simplification \
                  (all {} candidate feature(s) collapsed); omitted from the output pyramid. \
                  Pass --collapse to keep sub-GSD polygons as representative points at \
@@ -1338,7 +1486,7 @@ pub(super) fn record_level_outcome(
                     .zoom
                     .map_or_else(String::new, |z| format!(" (zoom {z})")),
                 candidates,
-            );
+            ));
             skipped.push(planned);
         }
         LevelWriteOutcome::Written => level_reports.push(LevelReport {
@@ -1435,6 +1583,15 @@ pub struct PlanReport {
 /// Result of a conversion, `Serialize` for JSON output (benchmark tasks).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConvertReport {
+    /// Input rows read before filtering unusable geometries.
+    pub input_rows: usize,
+    /// Exact source losses, disjoint from any source emitted at that zoom.
+    pub source_losses: crate::diagnostics::SourceLosses,
+    /// Half-open original input row ranges read by this run. Footer-pruned
+    /// groups are outside the accounting domain; exact gates record losses.
+    pub source_row_ranges: Vec<(u64, u64)>,
+    /// Aggregated diagnostics for this conversion only.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
     /// Level materialization mode used.
     pub mode: Mode,
     /// Per-level statistics, coarse→fine. `level` here is the index in the
@@ -1529,6 +1686,38 @@ pub struct ConvertReport {
     pub effective_max_row_group_size: Option<usize>,
 }
 
+impl ConvertReport {
+    pub(crate) fn with_diagnostics(
+        mut self,
+        sink: &crate::diagnostics::Diagnostics,
+    ) -> Result<Self, ConvertError> {
+        use crate::diagnostics::Diagnostic;
+        if let Some(cap) = self.effective_max_row_group_size {
+            sink.once(Diagnostic::RowGroupAutoscaled { count: 1, cap });
+        }
+        self.diagnostics = sink.snapshot();
+        self.source_losses = sink.source_losses()?;
+        self.source_row_ranges = sink.source_row_ranges();
+        self.antimeridian_suspect_features =
+            sink.count(&Diagnostic::AntimeridianSuspect { count: 0 });
+        self.out_of_range_features = sink.count(&Diagnostic::OutOfRange {
+            context: None,
+            count: 0,
+            exemplars: Vec::new(),
+        });
+        self.unprojectable_features = sink.count(&Diagnostic::Unprojectable {
+            context: None,
+            count: 0,
+        });
+        self.wrapped_features = sink.count(&Diagnostic::Wrapped {
+            exemplars: Vec::new(),
+            context: None,
+            count: 0,
+        });
+        Ok(self)
+    }
+}
+
 /// Errors from [`convert_to_overviews`].
 ///
 /// `#[non_exhaustive]`: new failure modes (like the #543 memory preflight)
@@ -1536,6 +1725,9 @@ pub struct ConvertReport {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConvertError {
+    /// Source accounting spill or report exceeded its budget.
+    #[error(transparent)]
+    Accounting(#[from] crate::diagnostics::AccountingError),
     /// I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -1547,7 +1739,7 @@ pub enum ConvertError {
     Properties(#[from] PropertySelectionError),
     /// Underlying parquet error (reading the input).
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// Arrow error (concat / take / batch build).
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -1647,6 +1839,10 @@ pub enum ConvertError {
     /// non-positive where a positive finite value is required).
     #[error("invalid option: {0}")]
     InvalidConfig(String),
+    /// An option rule shared with the other frontends' options (#779),
+    /// refused before any input is read.
+    #[error(transparent)]
+    Config(#[from] super::config::ConfigError),
     /// The attribute filter (#315) failed to parse or bind against the input
     /// schema (unknown column, type mismatch, unsupported column type).
     #[error(transparent)]
@@ -1795,97 +1991,65 @@ pub enum ConvertError {
         /// The safety ceiling checked against.
         ceiling: usize,
     },
-    /// The pass-1 feature table (`Vec<AssignFeature>`, held resident from
-    /// pass 1's scan through the level assignment — see `super::stream`'s
-    /// module doc) alone exceeds the process's hard cgroup memory limit
-    /// (#543), so the run would be OOM-killed. Caught from footer row counts
-    /// alone, before pass 1 scans a single row, so this fails in seconds
-    /// instead of after however long the scan ran before an OOM kill (the
-    /// field incident that motivated this check: a 1.58B-row coarse job was
-    /// killed 25 minutes in).
-    ///
-    /// Only raised against a hard limit (cgroup v2 `memory.max`, v1
-    /// `memory.limit_in_bytes`) and only when the row count is exact — never
-    /// under a per-feature `--bbox`/`--filter`, whose footer-derived count is
-    /// only an upper bound. Every other case warns instead.
-    #[error("{}", pass1_memory_floor_message(.rows, .estimated_bytes, .limit_bytes))]
-    Pass1MemoryFloorExceeded {
-        /// The footer-known selected row count (row-group pruning applied;
-        /// with no per-feature filter active, every one of them becomes a
-        /// feature-table entry unless its geometry is null or unusable).
-        rows: u64,
-        /// `rows * ``PASS1_BYTES_PER_ROW`.
-        estimated_bytes: u64,
-        /// The hard cgroup memory limit's headroom the estimate was checked
-        /// against (NOT `super::pipeline`'s fractional `Auto` budget — the
-        /// feature table must exist in full regardless of `MemoryProfile`).
-        limit_bytes: u64,
+    /// A phase's required resident state exceeds the available memory.
+    #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.")]
+    BudgetExceeded {
+        /// Pipeline stage that cannot fit.
+        phase: &'static str,
+        /// Estimated required bytes.
+        needed: u64,
+        /// Available bytes at conversion start.
+        available: u64,
     },
-    /// The rows of one byte-array column (WKB geometry, a string) average
-    /// more than arrow's `i32` offsets can address in a single batch (#563):
-    /// no batch size, and no row-group size, can decode them. Found from
-    /// footer statistics before any data page is read. Smaller rows never
-    /// get here: the read batch is capped to fit them instead
-    /// ([`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]).
-    #[error("{}", byte_array_row_too_large_message(.widest, .limit_bytes))]
-    ByteArrayRowTooLarge {
-        /// The column chunk whose rows are too large.
-        widest: crate::input_set::WidestByteArrayColumn,
-        /// The per-batch ceiling checked against.
-        limit_bytes: u64,
-    },
-    /// The in-memory reference path (`--no-streaming`) holds the whole
-    /// input in one arrow batch, and one byte-array column of the selected
-    /// row groups sums past the bytes arrow's `i32` offsets can address in
-    /// one batch (#606). Found from footer statistics before any data page
-    /// is read. The streaming pipeline reads such an input in smaller
-    /// batches.
+    /// A selected byte-array column exceeds the non-streaming aggregate
+    /// ceiling (#606). The cached source retains this preflight contract;
+    /// the I/O reader separately checks whether any individual row fits.
     #[error("{}", in_memory_byte_array_too_large_message(.largest, .limit_bytes))]
     InMemoryByteArrayTooLarge {
         /// The column whose total is too large.
-        largest: crate::input_set::LargestByteArrayColumn,
-        /// The per-batch ceiling checked against.
+        largest: tylertoo_io::LargestByteArrayColumn,
+        /// The aggregate column ceiling checked against.
         limit_bytes: u64,
     },
 }
 
 /// The message body of [`ConvertError::InMemoryByteArrayTooLarge`] (#606).
 fn in_memory_byte_array_too_large_message(
-    largest: &crate::input_set::LargestByteArrayColumn,
+    largest: &tylertoo_io::LargestByteArrayColumn,
     limit_bytes: &u64,
 ) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     format!(
-        "--no-streaming reads the whole input into one arrow batch, and column '{}' \
-         holds {:.2} GiB in the row groups to read, beyond the {:.2} GiB one batch can \
-         hold for it (i32 offsets). Drop --no-streaming: the streaming pipeline reads \
-         this input in smaller batches.",
+        "--no-streaming caches the whole input, and column '{}' \
+         holds {:.2} GiB in the row groups to read, beyond the {:.2} GiB aggregate \
+         column limit. Drop --no-streaming: the streaming source reads \
+         this input in bounded batches.",
         largest.column,
         largest.total_bytes as f64 / GIB,
         *limit_bytes as f64 / GIB,
     )
 }
 
-/// The message body of [`ConvertError::ByteArrayRowTooLarge`] (#563).
-fn byte_array_row_too_large_message(
-    widest: &crate::input_set::WidestByteArrayColumn,
-    limit_bytes: &u64,
-) -> String {
-    const GIB: f64 = (1u64 << 30) as f64;
-    let where_ = if widest.part == 0 {
-        format!("row group {}", widest.row_group)
-    } else {
-        format!("row group {} of part {}", widest.row_group, widest.part)
-    };
-    format!(
-        "{where_}'s column '{}' averages {:.2} GiB per row, beyond the {:.2} GiB one \
-         arrow batch can hold for it (i32 offsets). Every read would fail with 'index \
-         overflow decoding byte array', whatever the batch or row-group size. Split or \
-         simplify those features before tiling.",
-        widest.column,
-        widest.avg_row_bytes as f64 / GIB,
-        *limit_bytes as f64 / GIB,
-    )
+impl ConvertError {
+    /// Whether this is an option the caller must fix, refused before any
+    /// input was read ([`ConvertOptions::validate`]'s errors), as opposed to
+    /// a problem with the data or the run. The Python bindings raise these
+    /// as `tylertoo.ConfigError`.
+    pub fn is_config(&self) -> bool {
+        matches!(
+            self,
+            ConvertError::Config(_)
+                | ConvertError::InvalidConfig(_)
+                | ConvertError::InvalidLevels(_)
+                | ConvertError::ZoomAboveCeiling { .. }
+                | ConvertError::RankingConflict
+                | ConvertError::ClusterPartitioningUnsupported
+                | ConvertError::VerbatimPartitioningUnsupported
+                | ConvertError::AccumulateWithoutCluster
+                | ConvertError::AutoZoomMinAboveCeiling { .. }
+                | ConvertError::Filter(super::filter::FilterError::Parse(_))
+        )
+    }
 }
 
 /// #541: [`ConvertOptions::zoom_ceiling`]'s up-front checks, split out of
@@ -1956,8 +2120,9 @@ fn validate_zoom_ceiling(options: &ConvertOptions) -> Result<(), ConvertError> {
 /// feature — so nonsensical values are rejected up front with a clear error
 /// instead of producing an "everything at the canonical level" file.
 pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertError> {
+    options.check_finite_numbers()?;
     let positive = |name: &str, v: f64| {
-        if !v.is_finite() || v <= 0.0 {
+        if v <= 0.0 {
             return Err(ConvertError::InvalidConfig(format!(
                 "{name} = {v} must be a finite value > 0"
             )));
@@ -1965,16 +2130,43 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
         Ok(())
     };
     let non_negative = |name: &str, v: f64| {
-        if !v.is_finite() || v < 0.0 {
+        if v < 0.0 {
             return Err(ConvertError::InvalidConfig(format!(
                 "{name} = {v} must be a finite value >= 0"
             )));
         }
         Ok(())
     };
+    if !(1..=1_048_576).contains(&options.read_batch_size) {
+        return Err(ConvertError::InvalidConfig(
+            "read-batch-size must be in 1..=1048576 (a batch is fully resident)".into(),
+        ));
+    }
+    let ceiling = read_workers_ceiling();
+    if options.read_workers > ceiling {
+        return Err(ConvertError::InvalidConfig(format!(
+            "read-workers must be auto or 1..={ceiling} (2× this machine's cores)"
+        )));
+    }
     // #371: the zoom ceiling is checked FIRST, before the input is opened or
     // any pass runs — `--max-zoom 33` used to be accepted and spin forever.
     options.levels.check_zoom_ceiling()?;
+    // Q1: a numeric sort key and a categorical class ranking would both drive
+    // `AssignFeature::sort_key`. Formerly also checked by the CLI and the
+    // Python bindings (#779); this is the one copy.
+    if options.sort_key.is_some() && options.class_ranking.is_some() {
+        return Err(ConvertError::RankingConflict);
+    }
+    // #428 (b8fa58a): `ClassRanking::new` refuses a NaN rank, but the fields
+    // are public, so a struct literal could still carry one.
+    if let Some(ranking) = &options.class_ranking {
+        super::config::check_class_ranking(ranking)?;
+    }
+    // Option combinations no pipeline can honour (cluster or verbatim in
+    // partitioning mode, accumulation without clustering): checked here, with
+    // the other option rules, so every entry point refuses them before any
+    // input is read (#779).
+    check_mode_combinations(options)?;
     positive("gsd-base", options.gsd_base)?;
     // Thinning factors accept 0 as the documented OFF switch (#345/#360):
     // every feature is its own cell, so nothing is thinned. Negative and
@@ -1984,28 +2176,9 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     non_negative("polygon-thinning", options.assign.polygon_thinning)?;
     non_negative("line-visibility", options.assign.line_visibility)?;
     non_negative("polygon-visibility", options.assign.polygon_visibility)?;
-    // Negative snap / junction-angle values are documented OFF switches; only
-    // NaN is meaningless.
-    if options.coalesce_snap.is_nan() {
-        return Err(ConvertError::InvalidConfig(
-            "coalesce-snap must not be NaN (use <= 0 to disable snapping)".to_string(),
-        ));
-    }
-    if options.coalesce_junction_angle.is_nan() {
-        return Err(ConvertError::InvalidConfig(
-            "coalesce-junction-angle must not be NaN (use 0 to disable)".to_string(),
-        ));
-    }
-    if let Some(bb) = &options.bbox {
-        if bb.iter().any(|v| !v.is_finite()) {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must contain only finite values"
-            )));
-        }
-        if bb[0] > bb[2] || bb[1] > bb[3] {
-            return Err(ConvertError::InvalidConfig(format!(
-                "bbox {bb:?} must satisfy xmin <= xmax and ymin <= ymax"
-            )));
+    if let Some(bb) = options.bbox {
+        if bb.iter().any(|v| !v.is_finite()) || bb[0] > bb[2] || bb[1] > bb[3] {
+            return Err(super::config::ConfigError::InvalidBbox { bbox: bb }.into());
         }
     }
     // Attribute filter (#315): fail fast on a syntactically invalid
@@ -2018,12 +2191,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // of the same run, and both need the streaming pipeline (the in-memory
     // reference path has no separable pass 1 to skip).
     if options.save_plan.is_some() && options.plan.is_some() {
-        return Err(ConvertError::InvalidConfig(
-            "--save-plan and --plan are mutually exclusive: one writes the \
-             pass-1/assignment artifact, the other replaces pass 1 with a \
-             saved one"
-                .to_string(),
-        ));
+        return Err(super::config::ConfigError::SavePlanWithPlan.into());
     }
     if !options.streaming && (options.save_plan.is_some() || options.plan.is_some()) {
         return Err(ConvertError::InvalidConfig(
@@ -2077,7 +2245,6 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // end of a possibly multi-hour run. Probe its path here, with the other
     // path preflights, so a typo'd or unwritable target is loud immediately.
     // Non-fatal by design: a diagnostics-only knob never gates output.
-    super::stream::preflight_profile_json_path();
     // Zoom-band representation selector (#317 / #279).
     if !options.representation.is_empty() {
         if matches!(options.mode, Mode::Partitioning)
@@ -2167,14 +2334,7 @@ pub(super) fn validate_options(options: &ConvertOptions) -> Result<(), ConvertEr
     // #272: fail fast on a bad spill dir — the spill is best-effort, so a
     // mid-convert creation failure would only surface as a silent degrade
     // to network re-fetch.
-    if let Some(dir) = &options.spill_dir {
-        if !dir.is_dir() {
-            return Err(ConvertError::InvalidConfig(format!(
-                "spill-dir {} is not an existing directory",
-                dir.display()
-            )));
-        }
-    }
+    super::config::check_spill_dir(options.spill_dir.as_deref())?;
     Ok(())
 }
 
@@ -2252,22 +2412,12 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
             parent.display(),
         ));
     }
-    let probe = parent.join(format!(
-        ".tylertoo-save-plan-probe.{}.{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-    ));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(e) => {
-            return bad(format!(
-                "--save-plan {}: its parent directory {} is not writable: {e}",
-                path.display(),
-                parent.display(),
-            ));
-        }
+    if let Err(e) = crate::atomic_output::probe_directory(parent) {
+        return bad(format!(
+            "--save-plan {}: its parent directory {} is not writable: {e}",
+            path.display(),
+            parent.display(),
+        ));
     }
     if path.exists() {
         // #513 follow-up: a writable parent says nothing about an existing
@@ -2292,7 +2442,7 @@ fn preflight_save_plan_writable(path: &Path) -> Result<(), ConvertError> {
 
 /// One zoom band of the representation selector (#317 / #279): levels whose
 /// zoom lies in `min_zoom..=max_zoom` (inclusive) take `repr`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepresentationBand {
     /// Coarsest zoom of the band (inclusive).
     pub min_zoom: u8,
@@ -2342,7 +2492,7 @@ pub fn parse_representation_spec(spec: &str) -> Result<Vec<RepresentationBand>, 
             format!("representation entry {part:?} must be LO-HI:KIND (e.g. 0-7:point)")
         })?;
         let repr = match kind.trim() {
-            "geom" | "geometry" => Representation::Geometry,
+            "geom" | crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN => Representation::Geometry,
             "point" => Representation::Point,
             "square" => Representation::Square,
             other => {
@@ -2400,17 +2550,17 @@ pub fn parse_entry_zoom(spec: &str) -> Result<crate::overview::ladder::EntryZoom
         let (value, zoom) = pair
             .split_once('=')
             .ok_or_else(|| format!("--entry-zoom {spec:?}: expected VALUE=ZOOM, got {pair:?}"))?;
-        let value: f64 = value
-            .trim()
+        let raw = value.trim();
+        let value: f64 = raw
             .parse()
-            .map_err(|_| format!("--entry-zoom {spec:?}: {value:?} is not a number"))?;
+            .map_err(|_| format!("--entry-zoom {spec:?}: {raw:?} is not a number"))?;
         // #428, same rule as `parse_class_rank`: `f64::from_str` accepts
         // `nan` and `inf`. A NaN rung is not ordered against any column
         // value, and an `inf` rung snaps the match to the SMALLEST observed
         // value — the exact inverse of the ladder this flag documents.
         if !value.is_finite() {
             return Err(format!(
-                "--entry-zoom {spec:?}: {value:?} is not a finite number (NaN and infinity \
+                "--entry-zoom {spec:?}: {raw:?} is not a finite number (NaN and infinity \
                  cannot be ordered against the column's values)"
             ));
         }
@@ -2474,12 +2624,6 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
             .trim()
             .parse()
             .map_err(|e| format!("invalid rank in '{pair}': {e}"))?;
-        if !rank.is_finite() {
-            return Err(format!(
-                "invalid rank in '{pair}': ranks must be finite numbers \
-                 (NaN and infinity cannot be ordered against other classes)"
-            ));
-        }
         ranks.push((value.to_string(), rank));
     }
     if ranks.is_empty() {
@@ -2488,8 +2632,8 @@ pub fn parse_class_rank(spec: &str) -> Result<ClassRanking, String> {
         ));
     }
 
-    // The shared rules (unknown values lose to every named class but beat
-    // nulls); the per-entry messages above already named any offender.
+    // The shared rules: finite ranks (#428), and unknown values losing to
+    // every named class but beating nulls.
     ClassRanking::new(column, ranks, None)
 }
 
@@ -2579,6 +2723,7 @@ pub fn write_convert_plan(
     input_path: impl AsRef<Path>,
     options: &ConvertOptions,
 ) -> Result<PlanReport, ConvertError> {
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     write_convert_plan_sources(&source, options)
 }
@@ -2596,6 +2741,10 @@ pub fn write_convert_plan_sources(
     source: &ConvertSource,
     options: &ConvertOptions,
 ) -> Result<PlanReport, ConvertError> {
+    options.validate()?;
+    let diagnostics = &crate::diagnostics::Diagnostics::default();
+    source.record_diagnostics(diagnostics);
+
     // The plan IS the output: without a target there is nothing for this run
     // to produce, and silently doing the whole scan for nothing is the one
     // outcome worth refusing outright.
@@ -2618,7 +2767,7 @@ pub fn write_convert_plan_sources(
         ));
     }
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options)? {
+    let options: &ConvertOptions = match normalize_convert_options(source, options, diagnostics)? {
         Some(adjusted) => {
             inert_options = adjusted;
             &inert_options
@@ -2629,14 +2778,15 @@ pub fn write_convert_plan_sources(
     // covers pass 2 and the export, neither of which a plan-only run reaches.
     // Said up front rather than exiting 0 with an empty (or untouched) file.
     if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
-        log::warn!(
+        diagnostics.warn(
             "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
              covers a full convert; a plan-only run writes no dump"
+                .to_owned(),
         );
     }
     // `--save-plan` already requires the streaming pipeline (validated above),
     // which is where the separable pass-1 + assignment stage lives.
-    super::stream::write_plan_streaming(source, options)
+    super::stream::write_plan_streaming(source, &options.validate()?, diagnostics)
 }
 
 /// Convert a GeoParquet input into a multi-resolution overview file.
@@ -2665,6 +2815,7 @@ pub fn convert_to_overviews(
     // requests through the same sync parquet plumbing, composing with the
     // bbox row-group pruning below so pruned row groups are never
     // downloaded at all.
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     convert_to_overviews_source_strategy(
         &source,
@@ -2718,12 +2869,7 @@ pub fn convert_to_overviews_source(
     options: &ConvertOptions,
 ) -> Result<ConvertReport, ConvertError> {
     // `InputSource` clones are cheap handles sharing caches and counters.
-    convert_to_overviews_source_strategy(
-        &ConvertSource::single(source.clone()),
-        output_path,
-        options,
-        super::stream::Pass2Strategy::Pipelined,
-    )
+    convert_to_overviews_sources(&ConvertSource::single(source.clone()), output_path, options)
 }
 
 /// [`convert_to_overviews`] over a path with an explicit pass-2
@@ -2738,95 +2884,9 @@ pub(crate) fn convert_to_overviews_strategy(
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
+    options.validate()?;
     let source = ConvertSource::resolve_path(input_path.as_ref())?;
     convert_to_overviews_source_strategy(&source, output_path.as_ref(), options, strategy)
-}
-
-/// Decode every geometry in `full` (row-aligned to the batch) and drop the rows
-/// that cannot participate in level assignment: a null/empty/non-finite
-/// geometry, or — under a regional extract (#102) — one whose bbox misses
-/// `bbox_query`. The batch and the geometry vec are filtered together so every
-/// downstream index stays aligned. Returns the filtered batch and its surviving
-/// geometries.
-fn decode_and_filter_geometries(
-    full: RecordBatch,
-    geom_idx: usize,
-    geom_field: &Field,
-    bbox_query: Option<&BboxQuery>,
-    filter_mask: Option<&[Option<bool>]>,
-) -> Result<DecodedInput, ConvertError> {
-    let geom_array: Arc<dyn GeoArrowArray> =
-        from_arrow_array(full.column(geom_idx).as_ref(), geom_field)
-            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-    let mut geom_opts: Vec<Option<Geometry<f64>>> = Vec::with_capacity(full.num_rows());
-    extract_geometries_opt_from_array(geom_array.as_ref(), &mut geom_opts)?;
-    let mut geom_skipped = 0usize;
-    let keep: Vec<bool> = geom_opts
-        .iter()
-        .enumerate()
-        .map(|(i, g)| {
-            // Attribute filter (#315): a row is kept only when the predicate
-            // evaluated TRUE (SQL-UNKNOWN drops, like FALSE).
-            if let Some(mask) = filter_mask {
-                if mask[i] != Some(true) {
-                    return false;
-                }
-            }
-            match g.as_ref().filter(|g| usable_geometry(g)) {
-                // Regional extract (#102): drop features whose bbox misses the
-                // requested region exactly, independent of row-group pruning.
-                Some(g) => bbox_query.is_none_or(|q| q.intersects(&geometry_bbox(g))),
-                None => {
-                    geom_skipped += 1;
-                    false
-                }
-            }
-        })
-        .collect();
-    let dropped = keep.iter().filter(|k| !**k).count();
-    if dropped == 0 {
-        return Ok(DecodedInput {
-            full,
-            geometries: geom_opts.into_iter().flatten().collect(),
-            kept_rows: None,
-        });
-    }
-    if geom_skipped > 0 {
-        log::warn!(
-            "skipping {geom_skipped} of {} input rows with a null, empty, or \
-             non-finite geometry",
-            full.num_rows()
-        );
-    }
-    let mask = arrow_array::BooleanArray::from(keep.clone());
-    let filtered = arrow_select::filter::filter_record_batch(&full, &mask)?;
-    let kept_rows = keep
-        .iter()
-        .enumerate()
-        .filter_map(|(i, k)| k.then_some(i))
-        .collect();
-    let geoms = geom_opts
-        .into_iter()
-        .zip(&keep)
-        .filter(|(_, k)| **k)
-        .map(|(g, _)| g.expect("kept rows are Some"))
-        .collect();
-    Ok(DecodedInput {
-        full: filtered,
-        geometries: geoms,
-        kept_rows: Some(kept_rows),
-    })
-}
-
-/// [`decode_and_filter_geometries`]'s result: the kept rows and their
-/// decoded geometries, row-aligned.
-struct DecodedInput {
-    full: RecordBatch,
-    geometries: Vec<Geometry<f64>>,
-    /// Each kept row's position in the batch that was read, or `None` when
-    /// every row was kept (the identity). Lets a diagnostic name the input
-    /// row a feature came from (#553).
-    kept_rows: Option<Vec<usize>>,
 }
 
 /// Adjustments both pipelines make before converting, or `None` to use the
@@ -3061,7 +3121,7 @@ fn knob_columns(options: &ConvertOptions, schema: &Schema) -> Vec<(String, Strin
 }
 
 /// Every column auto-rank probes (Q1 tier 3, as [`super::stream`]'s rank
-/// plan and [`resolve_ranking`] probe them), in probe order, with its tier:
+/// plan and the shared ranking stage probe them), in probe order, with its tier:
 /// each Overture road-class candidate in schema order, then the first places
 /// `confidence` column. Schema-level only: the data gates (road vocabulary
 /// overlap, point majority) decide at ranking time which one, if any, ranks.
@@ -3156,6 +3216,7 @@ fn auto_rank_exclusion_note(
 pub(super) fn apply_property_selection(
     source: &ConvertSource,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ConvertError> {
     if source.column_projection().is_some() {
         return Err(
@@ -3171,10 +3232,12 @@ pub(super) fn apply_property_selection(
         return Ok(());
     }
     let schema = source.file_schema()?;
-    let geom_idx = find_geometry_column(&schema).ok_or_else(|| ConvertError::NoGeometryColumn {
-        input: source.display_name(),
+    let geom_idx = source.resolved_schema()?.geometry_index().ok_or_else(|| {
+        ConvertError::NoGeometryColumn {
+            input: source.display_name(),
+        }
     })?;
-    let mut warn = |msg: String| log::warn!("[convert] {msg}");
+    let mut warn = |msg: String| diagnostics.warn(format!("[convert] {msg}"));
     let keep = options.properties.resolve(
         &schema,
         geom_idx,
@@ -3230,7 +3293,11 @@ mod property_selection_tests {
             .iter()
             .map(|(n, t)| Field::new(*n, t.clone(), true))
             .collect();
-        v.push(Field::new("geometry", DataType::Binary, false));
+        v.push(Field::new(
+            crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+            DataType::Binary,
+            false,
+        ));
         Schema::new(v)
     }
 
@@ -3439,7 +3506,11 @@ mod property_selection_tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("extra", DataType::Utf8, true),
-            Field::new("geometry", DataType::Binary, false),
+            Field::new(
+                crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+                DataType::Binary,
+                false,
+            ),
             Field::new(
                 "bbox",
                 DataType::Struct(
@@ -3494,50 +3565,14 @@ mod property_selection_tests {
     }
 }
 
-/// Apply the property selection (#386) to the in-memory path's parquet
-/// builder as a read projection — exactly what the streaming path gets
-/// through `ConvertSource::schema` — and return the builder with the schema
-/// its batches will carry.
-fn project_builder_to_selection(
+/// Preserve the eager source's existing aggregate byte-column ceiling (#606).
+/// It differs from the reader's single-row ceiling and keeps previously
+/// rejected whole-input loads from silently becoming unbounded caches.
+/// Unprojected columns and columns using i64 offsets or views are excluded,
+/// matching the pre-refactor contract.
+pub(super) fn check_in_memory_byte_array_total(
     source: &ConvertSource,
-    builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
-        crate::input::InputReader,
-    >,
-) -> Result<
-    (
-        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<crate::input::InputReader>,
-        SchemaRef,
-    ),
-    ConvertError,
-> {
-    match source.column_projection() {
-        Some(keep) => {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                keep.iter().copied(),
-            );
-            let projected = Arc::new(builder.schema().project(keep)?);
-            Ok((builder.with_projection(mask), projected))
-        }
-        None => {
-            let schema = builder.schema().clone();
-            Ok((builder, schema))
-        }
-    }
-}
-
-/// #606: every row the in-memory path reads lands in the one `RecordBatch`
-/// [`load_input_table`] concatenates, so a byte-array column's total over
-/// the `row_groups` to read must fit arrow's i32 offsets. Past that the
-/// concat fails with an opaque `Offset overflow error`. This check names the
-/// cause from footer statistics, before any data page is read. Unprojected
-/// columns, and columns the reader decodes with i64 offsets or views,
-/// cannot overflow and are not counted.
-fn check_in_memory_byte_array_total(
-    source: &ConvertSource,
-    builder: &parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<
-        crate::input::InputReader,
-    >,
+    builder: &tylertoo_io::ParquetSource<crate::input::InputReader>,
     row_groups: Option<&[usize]>,
     limit_bytes: u64,
 ) -> Result<(), ConvertError> {
@@ -3555,7 +3590,7 @@ fn check_in_memory_byte_array_total(
                 )
             })
     };
-    match crate::input_set::largest_byte_array_column(builder.metadata(), row_groups, counts) {
+    match tylertoo_io::largest_byte_array_column(builder.metadata(), row_groups, counts) {
         Some(largest) if largest.total_bytes > limit_bytes => {
             Err(ConvertError::InMemoryByteArrayTooLarge {
                 largest,
@@ -3564,23 +3599,6 @@ fn check_in_memory_byte_array_total(
         }
         _ => Ok(()),
     }
-}
-
-/// Intern the class-group column that line coalescing (Q3) groups chains by.
-///
-/// `None` unless the resolved ranking is class-based, which is what supplies
-/// the grouping column.
-fn intern_coalesce_groups(
-    input_schema: &Schema,
-    full: &RecordBatch,
-    ranking_provenance: &RankingProvenance,
-) -> Option<Vec<u32>> {
-    let col = coalesce_group_column(ranking_provenance)?;
-    let idx = input_schema.index_of(col).expect("ranking column exists");
-    let mut interner = GroupInterner::default();
-    let mut groups = Vec::with_capacity(full.num_rows());
-    interner.extend(full.column(idx).as_ref(), &mut groups);
-    Some(groups)
 }
 
 /// Build the cluster tables (Q4) and check the §12.1 sum invariant.
@@ -3611,419 +3629,6 @@ pub(super) fn build_verified_cluster_tables(
     Ok(tables)
 }
 
-/// The in-memory input table, plus everything the footer settles about it.
-///
-/// The in-memory reference path reads the whole (row-group-pruned, attribute-
-/// filtered) input into one `RecordBatch` and decodes its geometries once.
-struct LoadedInput {
-    /// `options` with reserved-column renames applied (#288); the caller
-    /// borrows this for the rest of the conversion.
-    options: ConvertOptions,
-    input_schema: SchemaRef,
-    crs: Crs,
-    renames: Vec<(String, String)>,
-    geom_idx: usize,
-    geom_field: Field,
-    /// Schema indices of the accumulate columns (Q4).
-    acc_cols: Vec<usize>,
-    /// The filtered table, relabelled to `input_schema`.
-    full: RecordBatch,
-    /// Decoded geometries, row-aligned with `full`.
-    geometries: Vec<Geometry<f64>>,
-    /// Maps a `full` row back to its file row (#553).
-    rows: InMemoryRows,
-    row_groups_total: usize,
-    row_groups_read: usize,
-    /// The input declared no CRS and WGS84 was assumed (#451).
-    crs_assumed_wgs84: bool,
-}
-
-fn load_input_table(
-    source: &ConvertSource,
-    source_single: &InputSource,
-    options: &ConvertOptions,
-) -> Result<LoadedInput, ConvertError> {
-    load_input_table_with_limit(
-        source,
-        source_single,
-        options,
-        crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-    )
-}
-
-/// [`load_input_table`], parameterized on the #606 ceiling for one
-/// byte-array column's bytes across the whole table (test seam). Production
-/// passes [`crate::input_set::BYTE_ARRAY_BATCH_LIMIT`]; tests pass a tiny
-/// one to prove the error fires from footer statistics alone.
-fn load_input_table_with_limit(
-    source: &ConvertSource,
-    source_single: &InputSource,
-    options: &ConvertOptions,
-    byte_array_limit: u64,
-) -> Result<LoadedInput, ConvertError> {
-    // #543: the same footer-only pass-1 memory preflight the streaming path
-    // runs, before the whole table is loaded.
-    preflight_pass1_memory_probed(source, options)?;
-
-    // --- Read the input footer, preserving the full property schema. ---------
-    // (For a remote source, the footer is range-fetched once and cached.)
-    // `read_schema` matches the raw batches read below; `input_schema` is the
-    // possibly-renamed schema used for every downstream (name-based) lookup.
-    let (builder, read_schema) = project_builder_to_selection(source, source_single.open()?)?;
-
-    // --- CRS detection + rejection (spec Q3) — footer metadata only. ---------
-    let (crs, crs_assumed_wgs84) = detect_crs_from_kv_assumed(
-        builder.metadata().file_metadata().key_value_metadata(),
-        &source_single.display_name(),
-    )?;
-    if crs_assumed_wgs84 {
-        warn_assumed_wgs84(&source_single.display_name());
-    }
-
-    // Reserved-column collisions (#288): rename any input column named `level`
-    // / `point_count` / `coalesced_count` (case-insensitive) out of the way
-    // rather than reject the file, keeping the reserved output columns
-    // authoritative. `options` is cloned so by-name ranking/accumulate options
-    // can be rewritten to the renamed columns. The rename preserves column
-    // order, so `read_schema` and `input_schema` share indices.
-    let mut resolved = options.clone();
-    let (input_schema, renames) = resolve_reserved_column_collisions(&read_schema, &mut resolved);
-    let options = &resolved;
-
-    // Attribute filter (#315): parse + bind against the (possibly renamed)
-    // input schema. Syntax was already validated in `validate_options`.
-    let bound_filter = bind_attribute_filter(options, &input_schema, &renames)?;
-
-    let geom_idx =
-        find_geometry_column(&input_schema).ok_or_else(|| ConvertError::NoGeometryColumn {
-            input: source.display_name(),
-        })?;
-    let geom_field = input_schema.field(geom_idx).clone();
-
-    // Clustering schema checks + accumulate column resolution (Q4).
-    let acc_cols = validate_cluster_schema(&input_schema, options)?;
-    // Coalescing schema check (Q3).
-    validate_coalesce_schema(&input_schema, options)?;
-
-    // Regional extract (#102) + attribute filter (#315): prune input row
-    // groups by footer statistics (bbox covering stats / per-column
-    // min-max-null stats), before any data pages are read. The two prunings
-    // compose by intersection. Groups without stats are kept; the exact
-    // per-feature filters below guarantee identical output either way.
-    let row_groups_total = builder.metadata().num_row_groups();
-    let bbox_query = options.bbox.map(|b| BboxQuery::new(&b, crs));
-    let combined_sel = select_input_row_groups_combined(
-        builder.metadata(),
-        bbox_query.as_ref(),
-        bound_filter.as_ref(),
-    );
-    let read_selection = combined_sel.clone();
-
-    check_in_memory_byte_array_total(source, &builder, combined_sel.as_deref(), byte_array_limit)?;
-
-    let (builder, row_groups_read) = match combined_sel {
-        Some(sel) => {
-            let n = sel.len();
-            let what = pruning_label(bbox_query.is_some(), bound_filter.is_some());
-            log::info!("{what} filter: reading {n}/{row_groups_total} input row groups");
-            (builder.with_row_groups(sel), n)
-        }
-        None => (builder, row_groups_total),
-    };
-
-    let reader = builder.build()?;
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    for batch in reader {
-        batches.push(batch?);
-    }
-    // Concat with `read_schema` (the raw batches carry the original names).
-    let full = concat_batches(&read_schema, &batches)?;
-
-    // Decode geometries once (in-memory v1), row-aligned. Rows with a null,
-    // empty, or non-finite geometry cannot participate in level assignment:
-    // they are dropped, from the batch and the geometry vec together, so every
-    // downstream index stays aligned (H4: an interleaved null geometry must
-    // never shift attributes onto a neighboring row's geometry).
-    // Attribute filter (#315): evaluate the predicate over the full table
-    // once (identity projection — the raw batch carries the full schema, and
-    // the #288 rename is order-preserving so indices line up).
-    let filter_mask: Option<Vec<Option<bool>>> =
-        bound_filter.as_ref().map(|f| f.eval_mask(&full, &|i| i));
-    let DecodedInput {
-        full,
-        geometries,
-        kept_rows,
-    } = decode_and_filter_geometries(
-        full,
-        geom_idx,
-        &geom_field,
-        bbox_query.as_ref(),
-        filter_mask.as_deref(),
-    )?;
-    let row_locator = source.stream_row_locator(
-        read_selection
-            .map(|sel| RowGroupSelection::from_parts(vec![sel]))
-            .as_ref(),
-    )?;
-
-    // Apply the reserved-column renames (#288) to the in-memory table. Columns
-    // are positional, so re-associating them with the renamed schema is a
-    // metadata-only relabel (a no-op when nothing collided).
-    let full = if Arc::ptr_eq(&input_schema, &read_schema) {
-        full
-    } else {
-        RecordBatch::try_new(input_schema.clone(), full.columns().to_vec())?
-    };
-
-    Ok(LoadedInput {
-        options: resolved.clone(),
-        input_schema,
-        crs,
-        renames,
-        geom_idx,
-        geom_field,
-        acc_cols,
-        full,
-        geometries,
-        rows: InMemoryRows {
-            kept_rows,
-            row_locator,
-        },
-        row_groups_total,
-        row_groups_read,
-        crs_assumed_wgs84,
-    })
-}
-
-/// Maps a row of the in-memory path's filtered table back to its row in the
-/// input file (#553), for diagnostics that name a row.
-struct InMemoryRows {
-    /// Each filtered row's position in the batch that was read, or `None`
-    /// when no row was dropped.
-    kept_rows: Option<Vec<usize>>,
-    /// Maps a read-batch position back to its file row.
-    row_locator: crate::input_set::StreamRowLocator,
-}
-
-impl InMemoryRows {
-    /// `(part, file row)` for filtered-table row `i`; a single file names no
-    /// part.
-    fn locate(&self, i: usize) -> (Option<usize>, usize) {
-        let stream_row = self.kept_rows.as_ref().map_or(i, |k| k[i]);
-        let row = self.row_locator.locate(stream_row).map_or(i, |(_, r)| r);
-        (None, row)
-    }
-}
-
-struct EmittedLevel {
-    /// Index in the resolved level plan (cluster-table key; may differ
-    /// from the emitted index when empty levels are omitted, §7.3).
-    orig: usize,
-    gsd: f64,
-    zoom: Option<u8>,
-    indices: Vec<usize>,
-    geoms: Vec<Geometry<f64>>,
-    vertex_count: usize,
-    /// Coalescing (Q3): this level's chain table (rep row → merged
-    /// geometry + member count). `None` at non-coalesced levels.
-    coalesce: Option<CoalesceTable>,
-}
-
-/// Record whether any emitted level's chain table joined two or more
-/// segments — the in-memory path's `coalescing.merged` (#379 / #541 review; same rule as the
-/// streaming pipeline, which has no ceiling to account for here).
-fn record_emitted_merged(
-    writer_opts: &mut super::writer::OverviewWriterOptions,
-    emitted: &[EmittedLevel],
-) {
-    let merged = emitted
-        .iter()
-        .filter_map(|e| e.coalesce.as_ref())
-        .any(coalesce_table_merged);
-    record_coalesce_merged(writer_opts.generalization.as_mut(), merged);
-}
-
-/// Build every level's generalized selection, coarse to fine.
-///
-/// Returns the emitted levels and the planned levels that were omitted because
-/// every candidate collapsed (§7.3, #211 auto-clamp).
-#[allow(clippy::too_many_arguments)]
-fn build_emitted_levels(
-    assignment: &Assignment,
-    features: &FeatureTable,
-    geometries: &[Geometry<f64>],
-    level_specs: &[(f64, Option<u8>)],
-    level_reprs: &[Representation],
-    line_groups: Option<&Vec<u32>>,
-    coalesce_on: bool,
-    finest: usize,
-    crs: Crs,
-    // Coarsest level per input row (#384), and per planned level the
-    // tiny-polygon accumulator's carrier rows.
-    row_min_levels: &[u8],
-    carriers: &[Vec<usize>],
-    options: &ConvertOptions,
-) -> (Vec<EmittedLevel>, Vec<SkippedLevelReport>) {
-    // --- Build per-level generalized selections (coarse→fine). ---------------
-    // Each emitted entry: (spec, feature indices, geometries, vertex_count).
-    let mut emitted: Vec<EmittedLevel> = Vec::new();
-    let mut skipped: Vec<SkippedLevelReport> = Vec::new();
-
-    for (level, &(gsd_m, zoom)) in level_specs.iter().enumerate() {
-        let member_indices: Vec<usize> = match options.mode {
-            Mode::Duplicating => {
-                let mut v = assignment.duplicating_at_level(level as u8);
-                // #384: carriers join the level (sorted merge; disjoint from
-                // members by construction).
-                if !carriers[level].is_empty() {
-                    v.extend_from_slice(&carriers[level]);
-                    v.sort_unstable();
-                }
-                v
-            }
-            Mode::Partitioning => assignment.partitioning_at_level(level as u8),
-        };
-
-        // Verbatim path: partitioning at every level (§2.3), and duplicating at
-        // the canonical (finest) level (§2.4). Otherwise simplify per feature.
-        let verbatim = matches!(options.mode, Mode::Partitioning) || level == finest;
-
-        // Coalescing (Q3): at non-canonical duplicating levels, ALL line rows
-        // enter the per-level chain stage (pre-gate, pre-thinning — chains of
-        // sub-visibility fragments must be reclaimable) and the winner-table
-        // path handles only the non-line rows. The chain table's rep rows are
-        // added back below with their merged, pre-simplified geometry.
-        let coalesce: Option<CoalesceTable> = if coalesce_on && !verbatim {
-            let inputs: Vec<CoalesceInput<'_>> = (0..features.len())
-                .filter(|&p| features.kind(p) == FeatureKind::Line)
-                .map(|p| {
-                    let index = features.indices()[p];
-                    CoalesceInput {
-                        index,
-                        geom: &geometries[index],
-                        sort_key: features.sort_key(p),
-                        group: line_groups.as_ref().map_or(0, |g| g[index]),
-                    }
-                })
-                .collect();
-            Some(build_level_coalesce_table(
-                &inputs, level, finest, gsd_m, crs, options,
-            ))
-        } else {
-            None
-        };
-        let member_indices: Vec<usize> = if let Some(table) = &coalesce {
-            let mut v: Vec<usize> = member_indices
-                .into_iter()
-                .filter(|&i| features.kind(i) != FeatureKind::Line)
-                .collect();
-            v.extend(table.keys().copied());
-            v.sort_unstable();
-            v
-        } else {
-            member_indices
-        };
-
-        let mut indices = Vec::with_capacity(member_indices.len());
-        let mut geoms = Vec::with_capacity(member_indices.len());
-        let mut vertex_count = 0usize;
-
-        // Cascading (#218, duplicating default): fold canonical geometry
-        // through the fine→coarse GSD chain ending at this level, so this
-        // level consumes the next-finer level's output. Same chain the
-        // streaming ctxs build — the paths stay in lockstep.
-        // Zoom-band point representation (#317): this level's representation,
-        // and the chain steps carry each contributing level's representation
-        // so the fold pointifies at the band boundary (see `simplify_cascade`).
-        let repr = level_reprs[level];
-        let cascade_chain: Vec<CascadeStep> = if options.simplify.cascade && !verbatim {
-            (level..finest)
-                .rev()
-                .map(|li| CascadeStep {
-                    gsd_meters: level_specs[li].0,
-                    repr: level_reprs[li],
-                    zoom: level_specs[li].1,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        if verbatim {
-            for i in member_indices {
-                let g = &geometries[i];
-                vertex_count += count_vertices(g);
-                indices.push(i);
-                geoms.push(g.clone());
-            }
-        } else {
-            for i in member_indices {
-                // Chain reps carry their merged, already-simplified geometry.
-                if let Some((g, _)) = coalesce.as_ref().and_then(|t| t.get(&i)) {
-                    vertex_count += count_vertices(g);
-                    indices.push(i);
-                    geoms.push(g.clone());
-                    continue;
-                }
-                // #384: a carrier is not a member — it stands in for its
-                // cell's dropped area as one placeholder square.
-                if usize::from(row_min_levels[i]) > level && is_carrier(&carriers[level], i) {
-                    if let Some(sq) =
-                        carrier_square(&geometries[i], gsd_m, level_specs[level].1, crs)
-                    {
-                        vertex_count += count_vertices(&sq);
-                        indices.push(i);
-                        geoms.push(sq);
-                    }
-                    continue;
-                }
-                let simplified = if cascade_chain.is_empty() {
-                    simplify_step_at(
-                        &geometries[i],
-                        gsd_m,
-                        level_specs[level].1,
-                        crs,
-                        &options.simplify,
-                        repr,
-                    )
-                } else {
-                    simplify_cascade(&geometries[i], &cascade_chain, crs, &options.simplify)
-                };
-                match simplified {
-                    Simplified::Keep(g) => {
-                        vertex_count += count_vertices(&g);
-                        indices.push(i);
-                        geoms.push(g);
-                    }
-                    Simplified::Dropped => {}
-                }
-            }
-        }
-
-        // Empty levels are not allowed (§7.3): omit and renumber (#211
-        // auto-clamp), recording the omission for the report + warning.
-        if indices.is_empty() {
-            skipped.push(SkippedLevelReport {
-                planned_level: level,
-                gsd: gsd_m,
-                zoom,
-            });
-            continue;
-        }
-        emitted.push(EmittedLevel {
-            orig: level,
-            gsd: gsd_m,
-            zoom,
-            indices,
-            geoms,
-            vertex_count,
-            coalesce,
-        });
-    }
-
-    (emitted, skipped)
-}
-
 /// The option normalization every conversion entry point runs before any
 /// input is read: knob sanity, the property projection, the spill directory,
 /// the mode-combination checks, and the ladder/mode rewrites.
@@ -4036,16 +3641,16 @@ fn build_emitted_levels(
 fn normalize_convert_options(
     source: &ConvertSource,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<ConvertOptions>, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
     // #386: narrow the source to the requested property columns before any
     // schema index is derived, so both pipelines see the projected layout.
-    apply_property_selection(source, options)?;
+    apply_property_selection(source, options, diagnostics)?;
     // #272: place the remote-input disk spill (#219) where the caller asked
     // (no-op for local inputs, which never spill).
     source.set_spill_dir(options.spill_dir.as_deref());
-    check_mode_combinations(options)?;
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
@@ -4056,420 +3661,46 @@ fn normalize_convert_options(
     Ok(adjusted_for_ladder_and_mode(options))
 }
 
-/// [`convert_to_overviews_source`] with an explicit pass-2 [`Pass2Strategy`].
-/// Runs the full option normalization (validation, cluster/accumulate checks,
-/// the partitioning-coalesce-inert rewrite) before dispatching.
-/// #517: the profile dump is emitted by the streaming pipeline only — the
-/// in-memory reference path has no `Pass2Timers`/phase-wall instrumentation
-/// to dump. Say so rather than exiting 0 with an empty (or untouched) file
-/// and letting an operator conclude the knob is broken.
-fn warn_profile_json_not_streaming() {
-    if std::env::var_os("TYLERTOO_PROFILE_JSON").is_some_and(|v| !v.is_empty()) {
-        log::warn!(
-            "[profile] TYLERTOO_PROFILE_JSON is set but the profile dump only \
-             covers the streaming pipeline; --no-streaming writes no dump"
-        );
-    }
-}
-
 pub(crate) fn convert_to_overviews_source_strategy(
     source: &ConvertSource,
     output_path: &Path,
     options: &ConvertOptions,
     strategy: super::stream::Pass2Strategy,
 ) -> Result<ConvertReport, ConvertError> {
-    let adjusted = normalize_convert_options(source, options)?;
-    let options: &ConvertOptions = adjusted.as_ref().unwrap_or(options);
-    // #452: the output is created after pass 1; a missing or read-only
-    // directory must not cost the whole scan first. After the option checks
-    // above (which read at most a footer, for a property selection), so a
-    // bad option is reported as such wherever the output points.
+    convert_to_overviews_source_diagnostics(
+        source,
+        output_path,
+        options,
+        strategy,
+        &crate::diagnostics::Diagnostics::default(),
+    )
+}
+
+pub(crate) fn convert_to_overviews_source_diagnostics(
+    source: &ConvertSource,
+    output_path: &Path,
+    options: &ConvertOptions,
+    strategy: super::stream::Pass2Strategy,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<ConvertReport, ConvertError> {
+    options.validate()?;
+    let adjusted = normalize_convert_options(source, options, diagnostics)?;
+    let options = adjusted.as_ref().unwrap_or(options);
+    let validated = options.validate()?;
+    convert_to_overviews_validated(source, output_path, &validated, strategy, diagnostics)
+}
+
+fn convert_to_overviews_validated(
+    source: &ConvertSource,
+    output_path: &Path,
+    config: &super::config::ValidatedConfig<'_, ConvertOptions>,
+    strategy: super::stream::Pass2Strategy,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<ConvertReport, ConvertError> {
+    source.record_diagnostics(diagnostics);
     crate::atomic_output::check_writable(output_path)?;
-    warn_if_unsorted(source);
-
-    // Two-pass bounded-memory pipeline (H3, default). The in-memory path below
-    // is kept as the reference implementation (`streaming: false`).
-    if options.streaming {
-        return super::stream::convert_streaming_strategy(source, output_path, options, strategy);
-    }
-
-    warn_profile_json_not_streaming();
-
-    // The in-memory reference path below predates multi-partition input
-    // (v0.7) and reads through one parquet builder; multi sources are
-    // streaming-only.
-    let source_single: &InputSource = match source {
-        ConvertSource::Single(s) => s.input(),
-        ConvertSource::Multi(_) => return Err(ConvertError::MultiPartitionRequiresStreaming),
-    };
-
-    let start = Instant::now();
-
-    // A numeric sort key and a categorical class ranking are mutually
-    // exclusive (Q1): they would both drive `AssignFeature::sort_key`.
-    if options.sort_key.is_some() && options.class_ranking.is_some() {
-        return Err(ConvertError::RankingConflict);
-    }
-
-    let LoadedInput {
-        options: resolved_options,
-        input_schema,
-        crs,
-        renames,
-        geom_idx,
-        geom_field,
-        acc_cols,
-        full,
-        geometries,
-        rows,
-        row_groups_total,
-        row_groups_read,
-        crs_assumed_wgs84,
-    } = load_input_table(source, source_single, options)?;
-    let options = &resolved_options;
-    let num_features = full.num_rows();
-
-    // Resolve the cell-winner ranking (Q1): explicit sort key / explicit class
-    // ranking / auto-detected well-known schema / size fallback. Returns the
-    // per-feature sort keys and the provenance recorded in the footer (§3.5).
-    let (sort_keys, ranking_provenance) =
-        resolve_ranking(&input_schema, &full, &geometries, options)?;
-
-    // --- Coalescing groups (Q3): interned class values, when class-ranked. ---
-    let (num_lines, line_bytes) = coalesce_line_tally(&geometries);
-    let coalesce_on = coalesce_effective(options, num_lines, line_bytes);
-    let line_groups: Option<Vec<u32>> = coalesce_on
-        .then(|| intern_coalesce_groups(&input_schema, &full, &ranking_provenance))
-        .flatten();
-
-    // --- Level assignment. ---------------------------------------------------
-    let level_specs = options.levels.resolve(options.gsd_base)?;
-    let level_gsds: Vec<f64> = level_specs.iter().map(|(g, _)| *g).collect();
-
-    // Entry-zoom ladder (#364), resolved before assignment so the gate and
-    // thinning never see the features it governs.
-    let ladder_values = entry_zoom_column_values(options, &input_schema, &full)?;
-    let entry = resolve_entry_levels(options, &ladder_values, &level_specs)?;
-
-    // The bbox-derived tallies ride along with the table build (#543): #188
-    // antimeridian suspects, and the #429 losses (outside the CRS range, or
-    // outside the Web Mercator tiling domain). The table keeps center +
-    // squared diagonal, not the bbox, so the tally has to see each bbox here,
-    // while it is in hand. Warns once per kind and refuses to "succeed" into
-    // an empty archive when ~everything is lost.
-    let mut tally = BboxTally::default();
-    let mut features = FeatureTable::with_capacity(geometries.len());
-    for (i, g) in geometries.iter().enumerate() {
-        let bbox = geometry_bbox(g);
-        tally.observe(&bbox, crs, i);
-        features.push(&AssignFeature {
-            index: i,
-            bbox,
-            kind: feature_kind(g),
-            sort_key: sort_keys[i],
-            entry_level: entry.as_ref().and_then(|e| e.levels[i]),
-        });
-    }
-    let tallies = tally.finish(features.len(), crs, &|i| rows.locate(i))?;
-
-    // #306: cap the transient winner-grid memory at the profile-derived RAM
-    // budget (`speed` stays unbounded). Pure scheduling — output-identical.
-    // Zoom-band representation selector (#317 / #279): per-level
-    // representations, parallel to the plan.
-    let level_reprs = level_representations(&level_specs, &options.representation);
-    let assignment = assign_levels_bounded(
-        &features,
-        &level_gsds,
-        &options.assign,
-        crs,
-        super::pipeline::pass1_grid_budget_bytes(options.profile),
-        &level_reprs,
-    );
-    // Q2: layer the per-level density budget on top of cell-winner thinning.
-    // When disabled this is an identity, so `--no-density-drop` reproduces the
-    // pre-Q2 assignment (and, since no density_drop provenance is emitted, a
-    // byte-identical footer).
-    let assignment = if options.density.enabled {
-        apply_density_budget(
-            &assignment,
-            &features,
-            &level_gsds,
-            &options.assign,
-            &options.density,
-            crs,
-        )
-    } else {
-        assignment
-    };
-    let num_levels = level_gsds.len();
-    let finest = num_levels.saturating_sub(1);
-
-    // #384: tiny-polygon accumulator carriers per level (row-indexed here,
-    // since `features[i].index == i`), and the winner table by row for the
-    // carrier test in the level loop.
-    let row_min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
-    let carriers = in_memory_carriers(
-        options,
-        &features,
-        &row_min_levels,
-        &geometries,
-        &level_specs,
-        &level_reprs,
-        crs,
-    );
-
-    // --- Cluster tables (Q4): per level, winner → point_count + aggregates. --
-    let cluster_tables = if options.cluster {
-        let min_levels: Vec<u8> = assignment.assignments.iter().map(|a| a.min_level).collect();
-        let acc_values = extract_accumulate_values(&full, &acc_cols);
-        Some(build_verified_cluster_tables(
-            &features,
-            &min_levels,
-            &level_gsds,
-            &acc_values,
-            crs,
-            options,
-        )?)
-    } else {
-        None
-    };
-
-    let (emitted, mut skipped) = build_emitted_levels(
-        &assignment,
-        &features,
-        &geometries,
-        &level_specs,
-        &level_reprs,
-        line_groups.as_ref(),
-        coalesce_on,
-        finest,
-        crs,
-        &row_min_levels,
-        &carriers,
-        options,
-    );
-
-    if emitted.is_empty() {
-        return Err(ConvertError::NoData);
-    }
-    warn_plan_skipped_levels(&skipped, num_features, emitted[0].gsd, emitted[0].zoom);
-
-    // --- Build the output writer schema (source schema + geoarrow geometry). -
-    // Base + point_count when clustering (Q4) + coalesced_count when
-    // coalescing (Q3) — the same three schemas the streaming path builds.
-    let geom_name = geom_field.name().clone();
-    let (source_schema, cluster_schema, out_schema) =
-        super::stream::build_level_schemas(&input_schema, geom_idx, &geom_name, crs, options);
-
-    let writer_levels: Vec<LevelSpec> = emitted
-        .iter()
-        .map(|e| LevelSpec::new(e.gsd, e.zoom))
-        .collect();
-    let level_row_counts: Vec<usize> = emitted.iter().map(|e| e.indices.len()).collect();
-    let mut writer_opts = super::stream::build_writer_options(
-        writer_levels,
-        &emitted.iter().map(|e| e.gsd).collect::<Vec<f64>>(),
-        &level_row_counts,
-        crs,
-        ranking_provenance,
-        &renames,
-        options,
-    )?;
-    writer_opts.primary_column = Some(geom_name.clone());
-    record_emitted_merged(&mut writer_opts, &emitted);
-    if let Some(g) = writer_opts.generalization.as_mut() {
-        g.entry_zoom = entry.and_then(|e| e.provenance);
-    }
-    // #507: `build_writer_options` may have raised the cap to fit parquet's
-    // row-group ceiling. Record it before the options move into the writer.
-    let effective_max_row_group_size = (writer_opts.max_row_group_size
-        != options.max_row_group_size)
-        .then_some(writer_opts.max_row_group_size);
-
-    let mut writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
-
-    // Column indices of the non-geometry source columns (preserve original order).
-    let non_geom_cols: Vec<usize> = (0..input_schema.fields().len())
-        .filter(|&c| c != geom_idx)
-        .collect();
-
-    let mut level_reports = write_emitted_levels(
-        &mut writer,
-        &emitted,
-        &LevelWriteInputs {
-            full: &full,
-            source_schema: &source_schema,
-            cluster_schema: &cluster_schema,
-            out_schema: &out_schema,
-            non_geom_cols: &non_geom_cols,
-            geom_idx,
-            cluster_tables: cluster_tables.as_ref(),
-            acc_cols: &acc_cols,
-            finest,
-        },
-        options,
-        &mut skipped,
-    )?;
-    skipped.sort_by_key(|s| s.planned_level);
-
-    let meta = writer.finish()?;
-
-    // --- Fill in real per-level byte sizes from the output footer. -----------
-    fill_level_bytes(output_path, &meta, &mut level_reports)?;
-
-    let total_rows: usize = level_reports.iter().map(|l| l.feature_count).sum();
-    let total_vertices: usize = level_reports.iter().map(|l| l.vertex_count).sum();
-    let total_compressed_bytes: i64 = level_reports.iter().map(|l| l.compressed_bytes).sum();
-
-    Ok(ConvertReport {
-        mode: options.mode,
-        levels: level_reports,
-        skipped_empty_levels: skipped,
-        input_features: num_features,
-        total_rows,
-        total_vertices,
-        total_compressed_bytes,
-        row_groups_total,
-        row_groups_read,
-        antimeridian_suspect_features: tallies.antimeridian_suspect,
-        out_of_range_features: tallies.out_of_range,
-        unprojectable_features: tallies.unprojectable,
-        out_of_range_exemplars: tallies.out_of_range_exemplars,
-        wrapped_features: tallies.wrapped,
-        crs_assumed_wgs84,
-        duration_secs: start.elapsed().as_secs_f64(),
-        remote_fetch: log_remote_fetch(source),
-        effective_max_row_group_size,
-    })
-}
-
-/// Everything the in-memory level-write loop reads besides the levels.
-///
-/// `write_emitted_levels` borrows a dozen pieces of the conversion state;
-/// threading them as separate parameters made the signature longer than the
-/// body, so they travel together.
-struct LevelWriteInputs<'a> {
-    /// The whole input table; each level takes its rows by index.
-    full: &'a RecordBatch,
-    source_schema: &'a Schema,
-    cluster_schema: &'a Schema,
-    out_schema: &'a Schema,
-    non_geom_cols: &'a [usize],
-    geom_idx: usize,
-    /// Cluster tables (Q4), or `None` when clustering is off.
-    cluster_tables: Option<&'a ClusterTables>,
-    /// Schema indices of the accumulate columns (Q4).
-    acc_cols: &'a [usize],
-    /// Index of the canonical (finest) planned level.
-    finest: usize,
-}
-
-/// Write every emitted level to the output file, coarse to fine.
-///
-/// Per level: take the member rows into a batch, layer the cluster (Q4) and
-/// coalesced-count (Q3) columns on top, and record what the writer did with
-/// it. Levels the writer skipped are appended to `skipped`, matching the
-/// streaming path's bookkeeping.
-fn write_emitted_levels(
-    writer: &mut OverviewWriter<File>,
-    emitted: &[EmittedLevel],
-    inputs: &LevelWriteInputs<'_>,
-    options: &ConvertOptions,
-    skipped: &mut Vec<SkippedLevelReport>,
-) -> Result<Vec<LevelReport>, ConvertError> {
-    let mut level_reports = Vec::with_capacity(emitted.len());
-    for (level_idx, e) in emitted.iter().enumerate() {
-        // `build_level_batch` takes `Arc<Geometry<f64>>` so the streaming
-        // cascade fold can share allocations across levels (#499); this
-        // in-memory path has nothing to share, so it just wraps each owned
-        // geometry once here (`EmittedLevel::geoms` stays a plain
-        // `Vec<Geometry<f64>>` — out of scope for #499's compute-side PR).
-        let mut batch = build_level_batch(
-            inputs.source_schema,
-            inputs.full,
-            inputs.non_geom_cols,
-            inputs.geom_idx,
-            &e.indices,
-            &e.geoms,
-        )?;
-        if let Some(tables) = inputs.cluster_tables {
-            // Canonical level: singleton clusters, columns verbatim (§2.4).
-            let table = (e.orig != inputs.finest).then(|| &tables[e.orig]);
-            batch = apply_cluster_columns(
-                batch,
-                inputs.cluster_schema,
-                &e.indices,
-                table,
-                inputs.acc_cols,
-            )?;
-        }
-        if options.coalesce_lines {
-            // Canonical level (and guard-skipped runs): table is None ⇒ all 1.
-            batch =
-                apply_coalesced_count(batch, inputs.out_schema, &e.indices, e.coalesce.as_ref())?;
-        }
-        // SkippedEmpty is unreachable here (every emitted level has >= 1
-        // feature), but the bookkeeping stays aligned with the streaming path.
-        let outcome =
-            writer.write_level(level_idx, Some(e.indices.len()), std::iter::once(batch))?;
-        record_level_outcome(
-            outcome,
-            SkippedLevelReport {
-                planned_level: e.orig,
-                gsd: e.gsd,
-                zoom: e.zoom,
-            },
-            e.indices.len(),
-            e.indices.len(),
-            e.vertex_count,
-            &mut level_reports,
-            skipped,
-        );
-    }
-    Ok(level_reports)
-}
-
-/// The tiny-polygon accumulator's carriers for the in-memory reference path
-/// (#384): the same function the streaming path runs, over the same feature
-/// table, so the two paths agree on every carrier.
-fn in_memory_carriers(
-    options: &ConvertOptions,
-    features: &FeatureTable,
-    row_min_levels: &[u8],
-    geometries: &[Geometry<f64>],
-    level_specs: &[(f64, Option<u8>)],
-    level_reprs: &[Representation],
-    crs: Crs,
-) -> Vec<Vec<usize>> {
-    let num_levels = level_specs.len();
-    let finest = num_levels.saturating_sub(1);
-    let enabled = matches!(options.mode, Mode::Duplicating)
-        && (options.simplify.collapse.is_square() || level_reprs.contains(&Representation::Square));
-    let acc_levels: Vec<AccumulateLevel> = level_specs
-        .iter()
-        .enumerate()
-        .map(|(l, &(gsd, zoom))| {
-            AccumulateLevel::new(
-                gsd,
-                zoom,
-                enabled
-                    && l != finest
-                    && level_accumulates(options.simplify.collapse, level_reprs[l]),
-            )
-        })
-        .collect();
-    if !acc_levels.iter().any(|l| l.enabled) {
-        return vec![Vec::new(); num_levels];
-    }
-    let areas: Vec<f32> = geometries
-        .iter()
-        .map(|g| match g {
-            Geometry::Polygon(p) => p.unsigned_area() as f32,
-            Geometry::MultiPolygon(mp) => mp.unsigned_area() as f32,
-            _ => 0.0,
-        })
-        .collect();
-    tiny_polygon_carriers(features, row_min_levels, &areas, &acc_levels, crs)
+    warn_if_unsorted(source, diagnostics);
+    super::stream::run_stages(source, output_path, config, strategy, diagnostics)
 }
 
 /// Snapshot (and `log::info!`) the remote fetch counters at the end of a
@@ -4500,24 +3731,28 @@ pub(super) fn log_remote_fetch(source: &ConvertSource) -> Option<crate::input::F
 /// [`Crs`], rejecting anything that is not EPSG:4326 or EPSG:3857 (spec Q3).
 /// Metadata-only so remote inputs (#210) pay no extra footer fetch.
 /// `input` names the file in the error (#452).
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn detect_crs_from_kv(
-    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Crs, ConvertError> {
-    detect_crs_from_kv_assumed(kv, input).map(|(crs, _)| crs)
+    detect_crs_from_kv_assumed(kv, input, diagnostics).map(|(crs, _)| crs)
 }
 
 /// [`detect_crs_from_kv`], also reporting whether the WGS84 answer was the
 /// missing-metadata *assumption* rather than a declaration (#451 — see
 /// [`crate::quality::CrsInfo::assumed_wgs84`]), so the convert paths can
 /// warn naming the input and record the assumption on the [`ConvertReport`].
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn detect_crs_from_kv_assumed(
-    kv: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    kv: Option<&Vec<tylertoo_io::KeyValue>>,
     input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(Crs, bool), ConvertError> {
     use crate::quality::CrsKind;
 
-    let info = crate::quality::crs_info_from_kv_metadata(kv)?;
+    let info = crate::quality::crs_info_from_kv_metadata(kv, diagnostics)?;
     // Ask the shared classifier what the declaration IS, rather than
     // substring-matching here (#518 — the duplicated matcher in
     // `crate::covering` read EPSG:3857's "WGS 84 / Pseudo-Mercator"
@@ -4540,16 +3775,36 @@ pub(crate) fn detect_crs_from_kv_assumed(
     }
 }
 
+/// Temporary engine adapter until F1 carries the descriptor through all stages.
+pub(crate) fn crs_from_resolved(
+    schema: &crate::resolved_schema::ResolvedSchema,
+    input: &str,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<(Crs, bool), ConvertError> {
+    schema.record_diagnostics(diagnostics);
+    let info = schema.crs_info();
+    schema
+        .crs()
+        .map(|crs| (crs, info.assumed_wgs84))
+        .ok_or_else(|| ConvertError::UnsupportedCrs {
+            crs: info
+                .identifier
+                .clone()
+                .or_else(|| info.name.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            input: input.to_string(),
+        })
+}
+
 /// #451: tell the user, BY NAME, that this input's CRS is an assumption. The
-/// once-per-process warnings in [`crate::quality`] describe the exact
+/// per-run warnings in [`crate::quality`] describe the exact
 /// metadata quirk; this one names the file and the consequence, once per
 /// conversion, from both pipelines.
-pub(super) fn warn_assumed_wgs84(input_name: &str) {
-    log::warn!(
-        "input {input_name}: no CRS declared in the GeoParquet metadata; assuming WGS84 \
-         lon/lat (EPSG:4326). If the coordinates are not lon/lat degrees the output will \
-         be misplaced \u{2014} check the input with `gpio inspect {input_name}`"
-    );
+pub(super) fn warn_assumed_wgs84(input_name: &str, diagnostics: &crate::diagnostics::Diagnostics) {
+    diagnostics.once(crate::diagnostics::Diagnostic::CrsAssumed {
+        count: 1,
+        input: input_name.to_owned(),
+    });
 }
 
 /// Fuzz hook (#633): run one GeoParquet `geo` key-value string through every
@@ -4558,7 +3813,7 @@ pub(super) fn warn_assumed_wgs84(input_name: &str) {
 /// Covers CRS detection ([`detect_crs_from_kv`] →
 /// [`crate::quality::crs_info_from_kv_metadata`] and the shared classifiers,
 /// #518), the bbox covering parse with and without a named column, the
-/// `primary_column` lookup in [`find_geometry_column`], and the bare
+/// `primary_column` lookup in [`crate::resolved_schema::ResolvedSchema::geometry_index`], and the bare
 /// identifier classifier that a GeoParquet 2.0 `LogicalType::Geometry(crs)`
 /// string reaches. Only the `fuzz/` crate calls this; the `fuzzing` feature
 /// is never on in a normal build.
@@ -4566,20 +3821,34 @@ pub(super) fn warn_assumed_wgs84(input_name: &str) {
 #[doc(hidden)]
 pub fn fuzz_geo_metadata(geo_json: &str) -> Result<Crs, ConvertError> {
     let _ = crate::covering::parse_covering_metadata(geo_json, None);
-    let _ = crate::covering::parse_covering_metadata(geo_json, Some("geometry"));
+    let _ = crate::covering::parse_covering_metadata(
+        geo_json,
+        Some(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN),
+    );
     let _ = crate::quality::classify_crs_identifier(geo_json);
     let schema = Schema::new_with_metadata(
-        ["geometry", "geom_shape", "centroid", "bbox"]
-            .map(|name| Field::new(name, DataType::Binary, true))
-            .to_vec(),
+        [
+            crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+            "geom_shape",
+            "centroid",
+            "bbox",
+        ]
+        .map(|name| Field::new(name, DataType::Binary, true))
+        .to_vec(),
         [("geo".to_string(), geo_json.to_string())].into(),
     );
-    let _ = find_geometry_column(&schema);
-    let kv = vec![parquet::file::metadata::KeyValue::new(
+    let _ = crate::resolved_schema::ResolvedSchema::resolve(&schema)
+        .ok()
+        .and_then(|s| s.geometry_index());
+    let kv = vec![tylertoo_io::KeyValue::new(
         "geo".to_string(),
         geo_json.to_string(),
     )];
-    detect_crs_from_kv(Some(&kv), "fuzz input")
+    detect_crs_from_kv(
+        Some(&kv),
+        "fuzz input",
+        &crate::diagnostics::Diagnostics::default(),
+    )
 }
 
 use crate::tile::WEBMERC_HALF_M;
@@ -4706,71 +3975,27 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
 /// "can't tell" case.
 ///
 /// The geometry column is resolved the same way
-/// ([`crate::covering::resolve_geometry_column_name`], the footer twin of
-/// [`find_geometry_column`]) and threaded into tier 2, so a file with more
+/// ([`crate::resolved_schema::ResolvedSchema::geometry_name`], the footer twin of
+/// [`crate::resolved_schema::ResolvedSchema::geometry_index`]) and threaded into tier 2, so a file with more
 /// than one geometry column can never be pruned on an envelope the reader
 /// will not read (#518).
+#[cfg(test)]
 pub(crate) fn select_input_row_groups_any(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     boxes: &[[f64; 4]],
 ) -> Vec<usize> {
-    let bounds = input_row_group_bounds(metadata);
-    let filters: Vec<crate::tile::TileBounds> = boxes
-        .iter()
-        .map(|b| crate::tile::TileBounds {
-            lng_min: b[0],
-            lat_min: b[1],
-            lng_max: b[2],
-            lat_max: b[3],
-        })
-        .collect();
-    (0..metadata.num_row_groups())
-        .filter(|&i| match bounds.get(i).and_then(|b| b.as_ref()) {
-            Some(b) => {
-                let tested = if b.xmin > b.xmax {
-                    &filters[..filters.len().min(1)]
-                } else {
-                    &filters[..]
-                };
-                tested.iter().any(|f| b.intersects(f))
-            }
-            None => true, // no stats — must read to stay correct
-        })
-        .collect()
+    crate::resolved_schema::ResolvedSchema::from_metadata(metadata)
+        .map(|schema| schema.select_row_groups(boxes))
+        .unwrap_or_else(|_| (0..metadata.num_row_groups()).collect())
 }
 
 /// [`select_input_row_groups_any`] for a single box.
 #[cfg(test)]
 pub(crate) fn select_input_row_groups(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     bbox_units: &[f64; 4],
 ) -> Vec<usize> {
     select_input_row_groups_any(metadata, std::slice::from_ref(bbox_units))
-}
-
-/// Per-row-group bboxes for one part, from footer metadata only.
-///
-/// The extraction half of [`select_input_row_groups_any`], split out because the
-/// shard planner (#498) wants the same bboxes for a different purpose: it
-/// spreads each group's rows over the pivot tiles the bbox covers to balance
-/// the cut. Both callers therefore see exactly the same view of the input,
-/// which matters — a shard prunes against a bbox derived from the very ranges
-/// this estimate produced.
-///
-/// Entry `i` is row group `i`'s bbox, or `None` when neither statistics tier
-/// can supply one.
-pub(crate) fn input_row_group_bounds(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-) -> Vec<Option<crate::covering::RowGroupBounds>> {
-    let geom_column = crate::covering::resolve_geometry_column_name(metadata);
-    // The error is discarded (it falls back below), so its name is moot.
-    match detect_crs_from_kv(metadata.file_metadata().key_value_metadata(), "") {
-        Ok(crs) => {
-            crate::covering::extract_row_group_bounds_tiered(metadata, crs, geom_column.as_deref())
-        }
-        Err(_) => crate::covering::extract_row_group_bounds_from_metadata(metadata)
-            .unwrap_or_else(|_| vec![None; metadata.num_row_groups()]),
-    }
 }
 
 /// The mean share of the input's extent that one row group's bbox covers
@@ -4822,19 +4047,19 @@ const UNSORTED_ROW_GROUP_SPREAD: f64 = 0.5;
 /// pruning works poorly on such input, and the merge size valve merges each
 /// feature into the one stored before it, which on unsorted input is an
 /// arbitrary feature rather than a neighbour. Footer statistics only.
-fn warn_if_unsorted(source: &ConvertSource) {
+fn warn_if_unsorted(source: &ConvertSource, diagnostics: &crate::diagnostics::Diagnostics) {
     let Ok(parts) = source.part_row_group_bounds() else {
         return;
     };
     if let Some(spread) = row_group_spread(&parts) {
         if spread > UNSORTED_ROW_GROUP_SPREAD {
-            log::warn!(
+            diagnostics.warn(format!(
                 "[convert] the input does not look spatially sorted: each row group spans \
                  {:.0}% of the data's extent on average. Row-group pruning, and merging \
                  oversized tiles into neighbouring features, work best on Hilbert-sorted \
                  input; sort it first with `gpio sort hilbert`.",
                 spread * 100.0
-            );
+            ));
         }
     }
 }
@@ -4866,65 +4091,8 @@ pub(super) fn pruning_label(bbox: bool, filter: bool) -> &'static str {
     }
 }
 
-/// Combined single-file footer-statistics row-group selection: bbox covering
-/// pruning (#102) intersected with attribute-filter statistics pushdown
-/// (#315). `None` when neither pruning is active (read everything).
-fn select_input_row_groups_combined(
-    metadata: &parquet::file::metadata::ParquetMetaData,
-    bbox_query: Option<&BboxQuery>,
-    filter: Option<&super::filter::BoundFilter>,
-) -> Option<Vec<usize>> {
-    let bbox_sel: Option<Vec<usize>> =
-        bbox_query.map(|q| select_input_row_groups_any(metadata, q.boxes()));
-    let filter_sel: Option<Vec<usize>> = filter.map(|f| f.select_row_groups(metadata));
-    match (bbox_sel, filter_sel) {
-        (Some(a), Some(b)) => Some(a.into_iter().filter(|i| b.contains(i)).collect()),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-/// Find the primary geometry column index: the "geo" metadata's
-/// `primary_column` when the schema carries that metadata and the named
-/// column exists, else the name heuristic (`geometry`, else first `geom*`).
-///
-/// The `primary_column` step is what keeps this in lockstep with
-/// [`crate::covering::resolve_geometry_column_name`], which pruning uses
-/// (#518): the two must name the SAME column or a pruned row group is
-/// silent data loss. GeoParquet makes `primary_column` required, so it is
-/// authoritative whenever a "geo" key exists; the heuristic covers the
-/// GeoParquet 2.0 / no-metadata case. `parquet_to_arrow_schema` copies the
-/// file's key-value metadata onto the Arrow schema, and the reserved-column
-/// rename preserves it, so it is available at every call site.
-pub(super) fn find_geometry_column(schema: &Schema) -> Option<usize> {
-    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    // Case-INSENSITIVE, matching both footer readers
-    // ([`crate::covering::get_geo_metadata`] and
-    // [`crate::quality::crs_info_from_kv_metadata`], which both lowercase the
-    // key). A file whose key is spelled "GEO" would otherwise leave the
-    // reader on the name heuristic while pruning followed `primary_column` —
-    // the very disagreement #518 closed, left open on this side (#519).
-    if let Some(geo_json) = schema
-        .metadata()
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
-        .map(|(_, v)| v)
-    {
-        if let Some(primary) = serde_json::from_str::<serde_json::Value>(geo_json)
-            .ok()
-            .and_then(|v| v.get("primary_column")?.as_str().map(str::to_string))
-        {
-            if let Some(idx) = names.iter().position(|n| *n == primary) {
-                return Some(idx);
-            }
-        }
-    }
-    let pick = crate::covering::geometry_column_by_name(&names)?;
-    names.iter().position(|n| *n == pick)
-}
-
 /// `[xmin, ymin, xmax, ymax]` of a geometry (`[0;4]` when the bbox is undefined).
+#[cfg(test)]
 pub(super) fn geometry_bbox(g: &Geometry<f64>) -> [f64; 4] {
     match g.bounding_rect() {
         Some(r) => [r.min().x, r.min().y, r.max().x, r.max().y],
@@ -4941,24 +4109,10 @@ pub(super) fn bbox_antimeridian_suspect(bbox: &[f64; 4], crs: Crs) -> bool {
     bbox[2] - bbox[0] > crs.meters_to_units(180.0 * METERS_PER_DEGREE)
 }
 
-/// Emit the single aggregate antimeridian warning (#188 follow-up). Called
-/// once per convert, from both the streaming and in-memory paths.
-pub(super) fn warn_antimeridian_suspects(count: usize) {
-    if count > 0 {
-        log::warn!(
-            "{count} feature(s) have bounding boxes wider than 180° of longitude — \
-             likely antimeridian-crossing geometry. These will be assigned to \
-             overly coarse levels and defeat bbox pruning; pre-split them at \
-             ±180° before converting (see docs/advanced-usage.md, \
-             \"Antimeridian-Crossing Geometry\")."
-        );
-    }
-}
-
 /// The coordinate range a [`Crs`] admits, plus the words a message needs for
 /// it. Feeds the #429 out-of-range gate and every message derived from it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct CrsRange {
+pub(crate) struct CrsRange {
     /// Largest legal `|x|` (longitude degrees, or Web Mercator meters).
     pub max_x: f64,
     /// Largest legal `|y|` (latitude degrees, or Web Mercator meters).
@@ -4970,7 +4124,7 @@ pub(super) struct CrsRange {
 }
 
 /// The coordinate range `crs` admits (#429).
-pub(super) fn crs_coordinate_range(crs: Crs) -> CrsRange {
+pub(crate) fn crs_coordinate_range(crs: Crs) -> CrsRange {
     match crs {
         Crs::Epsg4326 => CrsRange {
             max_x: 180.0,
@@ -5042,34 +4196,6 @@ fn wrapped_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
     (axis, if east >= west { bbox[2] } else { bbox[0] })
 }
 
-/// #644 message (pure, so it is unit-testable without capturing logs): the
-/// one aggregate info line for `count` of `total` features drawn wrapped
-/// across the antimeridian, or `None` to stay quiet. `exemplars` names the
-/// first few rows, in the out-of-range warning's format.
-pub(super) fn wrapped_note(
-    count: usize,
-    total: usize,
-    crs: Crs,
-    exemplars: &[OutOfRangeExemplar],
-) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let edge = match crs {
-        Crs::Epsg4326 => "±180° longitude",
-        Crs::Epsg3857 => "the ±20037508.34 m world edge in x",
-    };
-    let pct = count as f64 / total as f64 * 100.0;
-    let exemplar = exemplar_note(exemplars, ExemplarEdge::Wrap);
-    let stop = if exemplar.is_empty() { "" } else { "." };
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) reach past {edge} and are drawn \
-         wrapped across the antimeridian.{exemplar}{stop} That is expected for 0..360 data \
-         and dateline cells; otherwise check that the coordinates really are the \
-         declared CRS."
-    ))
-}
-
 /// Whether a bbox is legal for its CRS yet lies wholly outside the Web
 /// Mercator TILING domain (#429, review S1-3).
 ///
@@ -5127,7 +4253,7 @@ fn looks_projected(crs: Crs, max_abs: f64) -> bool {
 /// declared CRS (#429, review S2-3). Honest for both a 4326-labeled file
 /// holding projected coordinates and a file that already declares a projected
 /// CRS but overflows its world extent.
-fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
+pub(crate) fn reprojection_advice(crs: Crs, max_abs: f64) -> String {
     if !looks_projected(crs, max_abs) {
         return String::new();
     }
@@ -5170,6 +4296,32 @@ pub struct OutOfRangeExemplar {
     pub value: f64,
 }
 
+impl<'de> serde::Deserialize<'de> for OutOfRangeExemplar {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Owned {
+            part: Option<usize>,
+            row: usize,
+            axis: String,
+            value: f64,
+        }
+        let value = Owned::deserialize(de)?;
+        let axis = match value.axis.as_str() {
+            "lon" => "lon",
+            "lat" => "lat",
+            "x" => "x",
+            "y" => "y",
+            _ => return Err(serde::de::Error::custom("unknown coordinate axis")),
+        };
+        Ok(Self {
+            part: value.part,
+            row: value.row,
+            axis,
+            value: value.value,
+        })
+    }
+}
+
 /// At most this many out-of-range exemplars are kept (#553): enough to show
 /// a pattern (e.g. "every offender near +180°") without holding a growing
 /// `Vec` for a run where millions of features are out of range.
@@ -5204,118 +4356,6 @@ fn out_of_range_coordinate(bbox: &[f64; 4], crs: Crs) -> (&'static str, f64) {
         .unwrap_or((lon, bbox[0]))
 }
 
-/// The suffix naming the first few out-of-range exemplars (#553).
-///
-/// It reads "e.g. lat 95.5 (row 1041), lat -91.2 (row 2210)", or `""`
-/// when there are none. Shared by the aggregate `log::warn!` (`out_of_range_warning`) and the
-/// CLI's `tiles` summary line, so both name where the loss came from instead
-/// of only how much was lost.
-pub fn out_of_range_exemplar_note(exemplars: &[OutOfRangeExemplar]) -> String {
-    exemplar_note(exemplars, ExemplarEdge::OutOfRange)
-}
-
-/// The range edge an exemplar's coordinate lies past, which sets where
-/// [`exemplar_value_text`] must not round it back to.
-#[derive(Debug, Clone, Copy)]
-enum ExemplarEdge {
-    /// [`bbox_out_of_crs_range`]'s edges: x and longitude carry the export's
-    /// one-world wrap (#342).
-    OutOfRange,
-    /// [`bbox_wraps`]'s edge: the world's own ±180° (#644).
-    Wrap,
-}
-
-impl ExemplarEdge {
-    /// The `|value|` an exemplar on `axis` lies beyond.
-    fn limit(self, axis: &str) -> f64 {
-        let wrap = match self {
-            Self::OutOfRange => 3.0,
-            Self::Wrap => 1.0,
-        };
-        match axis {
-            "lon" => wrap * 180.0,
-            "lat" => 90.0,
-            "x" => wrap * WEBMERC_HALF_M,
-            _ => WEBMERC_HALF_M,
-        }
-    }
-}
-
-/// [`out_of_range_exemplar_note`] for exemplars past `edge`.
-fn exemplar_note(exemplars: &[OutOfRangeExemplar], edge: ExemplarEdge) -> String {
-    if exemplars.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = exemplars
-        .iter()
-        .map(|e| {
-            let value = exemplar_value_text(e.value, edge.limit(e.axis));
-            match e.part {
-                None => format!("{} {value} (row {})", e.axis, e.row),
-                Some(p) => format!("{} {value} (part {p}, row {})", e.axis, e.row),
-            }
-        })
-        .collect();
-    format!(" e.g. {}", parts.join(", "))
-}
-
-/// An exemplar's coordinate as text: three decimals, unless rounding to
-/// three decimals would land it back on the range edge `limit` (540.0000001
-/// as "540.000"), in which case the shortest exact form, which always shows
-/// the excess.
-fn exemplar_value_text(value: f64, limit: f64) -> String {
-    let short = format!("{value:.3}");
-    match short.parse::<f64>() {
-        Ok(rounded) if rounded.abs() > limit => short,
-        _ => format!("{value}"),
-    }
-}
-
-/// #429 decision + message (pure, so it is unit-testable without capturing
-/// logs). The one aggregate warning for `count` of `total` out-of-range
-/// features, or `None` to stay quiet.
-///
-/// `max_abs` is the largest `|coordinate|` among the offenders: the
-/// projected-CRS diagnosis (and its `gpio` hint) is gated on it, so one
-/// stray point at lng 600 gets neutral wording rather than being told
-/// its whole file is in the wrong CRS (review S2-2). `exemplars` names the
-/// first few offending rows and coordinates (#553).
-pub(super) fn out_of_range_warning(
-    count: usize,
-    total: usize,
-    crs: Crs,
-    max_abs: f64,
-    exemplars: &[OutOfRangeExemplar],
-) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let range = crs_coordinate_range(crs);
-    let (label, text) = (range.label, range.text);
-    let pct = count as f64 / total as f64 * 100.0;
-    let advice = reprojection_advice(crs, max_abs);
-    let exemplar = out_of_range_exemplar_note(exemplars);
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) reach beyond the {label} coordinate \
-         range ({text}) and were dropped or clipped.{exemplar}{advice}"
-    ))
-}
-
-/// The one aggregate warning for features that are valid lon/lat but lie
-/// outside the Web Mercator tiling domain (#429, review S1-3), or `None`.
-pub(super) fn unprojectable_warning(count: usize, total: usize) -> Option<String> {
-    if count == 0 || total == 0 {
-        return None;
-    }
-    let pct = count as f64 / total as f64 * 100.0;
-    Some(format!(
-        "{count} of {total} feature(s) ({pct:.1}%) have valid lon/lat but lie outside the \
-         Web Mercator tiling domain (|lat| > 85.05°); these features cannot be tiled. \
-         Web Mercator does not reach the poles — clip the input to |lat| ≤ 85.05° or use \
-         a polar tiling scheme instead."
-    ))
-}
-
 /// Share of the input that must be lost before a conversion is a failure
 /// rather than a warning (#429, review S2-1). Exactly 100% let a million-row
 /// wrong-CRS file sail through on a dozen `POINT(0 0)` placeholder rows.
@@ -5346,10 +4386,42 @@ pub(super) struct BboxTallies {
     /// the coordinate past the edge.
     pub wrapped_exemplars: Vec<OutOfRangeExemplar>,
 }
+impl BboxTallies {
+    pub(super) fn record(
+        &self,
+        total: usize,
+        crs: Crs,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) {
+        use crate::diagnostics::{Diagnostic, RangeContext};
+        let context = Some(RangeContext {
+            total,
+            crs,
+            max_abs: self.max_abs_out_of_range,
+        });
+        diagnostics.once(Diagnostic::AntimeridianSuspect {
+            count: self.antimeridian_suspect,
+        });
+        diagnostics.once(Diagnostic::OutOfRange {
+            count: self.out_of_range,
+            exemplars: self.out_of_range_exemplars.clone(),
+            context,
+        });
+        diagnostics.once(Diagnostic::Unprojectable {
+            count: self.unprojectable,
+            context,
+        });
+        diagnostics.once(Diagnostic::Wrapped {
+            exemplars: self.wrapped_exemplars.clone(),
+            count: self.wrapped,
+            context,
+        });
+    }
+}
 
 impl BboxTallies {
     /// Features that cannot be tiled at all, by either cause.
-    pub fn lost(&self) -> usize {
+    pub(super) fn lost(&self) -> usize {
         self.out_of_range + self.unprojectable
     }
 }
@@ -5530,22 +4602,6 @@ impl BboxTally {
             wrapped: self.wrapped,
             wrapped_exemplars: resolve(self.wrapped_exemplars),
         };
-        warn_antimeridian_suspects(t.antimeridian_suspect);
-        if let Some(msg) = out_of_range_warning(
-            t.out_of_range,
-            total,
-            crs,
-            t.max_abs_out_of_range,
-            &t.out_of_range_exemplars,
-        ) {
-            log::warn!("{msg}");
-        }
-        if let Some(msg) = unprojectable_warning(t.unprojectable, total) {
-            log::warn!("{msg}");
-        }
-        if let Some(msg) = wrapped_note(t.wrapped, total, crs, &t.wrapped_exemplars) {
-            log::info!("{msg}");
-        }
         match all_lost_error(&t, total, crs) {
             Some(e) => Err(e),
             None => Ok(t),
@@ -5609,13 +4665,14 @@ pub(super) fn warn_full_file_remote(
     source: &ConvertSource,
     row_groups_read: usize,
     row_groups_total: usize,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     let object_size = source.fetch_stats().map_or(0, |s| s.object_size);
     let remote_parts = source.parts().iter().filter(|p| p.is_remote()).count();
     if let Some(msg) =
         full_file_remote_warning(remote_parts, row_groups_read, row_groups_total, object_size)
     {
-        log::warn!("{msg}");
+        diagnostics.warn(msg);
     }
 }
 
@@ -5692,6 +4749,7 @@ pub(super) fn warn_spill_space(
     source: &ConvertSource,
     estimated_spill_bytes: u64,
     spill_dir: Option<&Path>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) {
     let dir = spill_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
     if let Some(msg) = spill_space_check(
@@ -5700,7 +4758,7 @@ pub(super) fn warn_spill_space(
         &dir,
         probe_available_space,
     ) {
-        log::warn!("{msg}");
+        diagnostics.warn(msg);
     }
 }
 
@@ -5861,7 +4919,11 @@ const PASS1_MEMORY_REMEDIATION: &str = "A sharded build does not avoid this: its
 /// The realistic "this input needs ≳X GiB" total: the floor ×
 /// [`PASS1_RECOMMENDED_FACTOR`].
 fn recommended_total_gib(rows: u64) -> f64 {
-    gib(rows.saturating_mul(PASS1_BYTES_PER_ROW)) * PASS1_RECOMMENDED_FACTOR
+    gib(super::memory::MemoryBudget::with_available(None).estimate(
+        super::memory::MemoryPhase::Scan,
+        rows,
+        None,
+    )) * PASS1_RECOMMENDED_FACTOR
 }
 
 /// #543 decision (pure). `limit = None` (nothing could be probed, e.g.
@@ -5894,7 +4956,11 @@ fn pass1_memory_verdict(
     let Some(limit) = limit else {
         return Pass1MemoryVerdict::Fits;
     };
-    let estimated_bytes = rows.saturating_mul(PASS1_BYTES_PER_ROW);
+    let estimated_bytes = super::memory::MemoryBudget::with_available(None).estimate(
+        super::memory::MemoryPhase::Scan,
+        rows,
+        None,
+    );
     if estimated_bytes > limit.bytes && limit.source.is_hard() && !per_feature_filter_active {
         Pass1MemoryVerdict::Exceeds {
             estimated_bytes,
@@ -5942,7 +5008,7 @@ fn pass1_memory_warn_message(
     )
 }
 
-/// The message body of [`ConvertError::Pass1MemoryFloorExceeded`].
+/// The message body of [`ConvertError::BudgetExceeded`].
 fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u64) -> String {
     format!(
         "{rows} input row(s) need an estimated {:.1} GiB for the pass-1 feature table alone \
@@ -5961,7 +5027,7 @@ fn pass1_memory_floor_message(rows: &u64, estimated_bytes: &u64, limit_bytes: &u
 /// job around it) cannot fit. Everything is a parameter so tests never read
 /// the environment or a real probe; production passes
 /// [`super::pipeline::probe_preflight_memory_limit`] and
-/// [`skip_memory_preflight_from_env`] via [`preflight_pass1_memory_probed`].
+/// [`skip_memory_preflight_from_env`] through the shared preflight.
 ///
 /// Returns the verdict on the paths that survive it (#626 item 4): the
 /// streaming driver carries it into the `TYLERTOO_PROFILE_JSON` dump, so a job
@@ -5972,6 +5038,7 @@ pub(super) fn preflight_pass1_memory(
     limit: Option<MemoryLimit>,
     skip_on_exceed: bool,
     per_feature_filter_active: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Pass1MemoryReport, ConvertError> {
     let report = |outcome, estimated_bytes| Pass1MemoryReport {
         outcome,
@@ -5983,16 +5050,22 @@ pub(super) fn preflight_pass1_memory(
     match pass1_memory_verdict(rows, limit, per_feature_filter_active) {
         Pass1MemoryVerdict::Fits => Ok(report(
             Pass1MemoryOutcome::Fits,
-            rows.saturating_mul(PASS1_BYTES_PER_ROW),
+            super::memory::MemoryBudget::with_available(None).estimate(
+                super::memory::MemoryPhase::Scan,
+                rows,
+                None,
+            ),
         )),
         Pass1MemoryVerdict::Warn {
             estimated_bytes,
             limit,
         } => {
-            log::warn!(
-                "{}",
-                pass1_memory_warn_message(rows, estimated_bytes, limit, per_feature_filter_active)
-            );
+            diagnostics.warn(pass1_memory_warn_message(
+                rows,
+                estimated_bytes,
+                limit,
+                per_feature_filter_active,
+            ));
             Ok(report(Pass1MemoryOutcome::Warned, estimated_bytes))
         }
         Pass1MemoryVerdict::Exceeds {
@@ -6000,21 +5073,19 @@ pub(super) fn preflight_pass1_memory(
             limit_bytes,
         } => {
             if skip_on_exceed {
-                log::warn!(
+                diagnostics.warn(format!(
                     "[convert] {SKIP_MEMORY_PREFLIGHT_ENV} set: downgrading the pass-1 \
                      memory-floor error to a warning — {}",
                     pass1_memory_floor_message(&rows, &estimated_bytes, &limit_bytes),
-                );
+                ));
                 Ok(report(
                     Pass1MemoryOutcome::ExceededButForced,
                     estimated_bytes,
                 ))
             } else {
-                Err(ConvertError::Pass1MemoryFloorExceeded {
-                    rows,
-                    estimated_bytes,
-                    limit_bytes,
-                })
+                super::memory::MemoryBudget::with_available(Some(limit_bytes))
+                    .require(super::memory::MemoryPhase::Scan, estimated_bytes)?;
+                unreachable!("the memory verdict already proved the floor exceeds the limit")
             }
         }
     }
@@ -6025,27 +5096,6 @@ pub(super) fn skip_memory_preflight_from_env() -> bool {
     std::env::var(SKIP_MEMORY_PREFLIGHT_ENV).is_ok_and(|v| env_flag_enabled(&v))
 }
 
-/// [`preflight_pass1_memory`] against the real (uncached) probe and the
-/// escape-hatch env var. Used by the in-memory path; the streaming preflight
-/// wires the same two inputs through its own test seam.
-///
-/// This path needs far more than the streaming one (the whole table and every
-/// geometry), so the feature-table floor is an even looser lower bound here.
-/// The row count is unpruned; with `--bbox`/`--filter` it is only an upper
-/// bound, so the verdict is warn-only then.
-fn preflight_pass1_memory_probed(
-    source: &ConvertSource,
-    options: &ConvertOptions,
-) -> Result<Pass1MemoryReport, ConvertError> {
-    let rows = u64::try_from(source.selected_row_count(None)?).unwrap_or(0);
-    preflight_pass1_memory(
-        rows,
-        super::pipeline::probe_preflight_memory_limit(),
-        skip_memory_preflight_from_env(),
-        options.bbox.is_some() || options.filter.is_some(),
-    )
-}
-
 /// Whether a decoded geometry can participate in level assignment: it must
 /// carry at least one coordinate and every coordinate must be finite.
 ///
@@ -6053,6 +5103,7 @@ fn preflight_pass1_memory_probed(
 /// a warning** rather than converted: an empty geometry has no location to
 /// thin against, and a NaN/infinite coordinate would silently collapse into
 /// grid cell `(0, 0)` (H4 hostile-input hardening).
+#[cfg(test)]
 pub(super) fn usable_geometry(g: &Geometry<f64>) -> bool {
     use geo::coords_iter::CoordsIter;
     let mut any = false;
@@ -6506,10 +5557,13 @@ pub(super) fn mixed_geometry_field(
 /// Build the writer source schema: original fields, geometry field replaced by
 /// the geoarrow-typed field, no file-level metadata (the encoder regenerates it).
 pub(super) fn build_source_schema(
-    input_schema: &Schema,
-    geom_idx: usize,
+    descriptor: &crate::resolved_schema::ResolvedSchema,
     geom_out_field: Arc<Field>,
 ) -> Schema {
+    let input_schema = descriptor.schema();
+    let geom_idx = descriptor
+        .geometry_index()
+        .expect("preflight checked geometry");
     let fields: Vec<Arc<Field>> = input_schema
         .fields()
         .iter()
@@ -6625,9 +5679,10 @@ fn flatten_nested_collections(g: &Geometry<f64>) -> Option<Geometry<f64>> {
 ///   (case-insensitive, mirroring the `level` column rule §4.1);
 /// - every accumulate column exists and is numeric.
 pub(super) fn validate_cluster_schema(
-    schema: &Schema,
+    descriptor: &crate::resolved_schema::ResolvedSchema,
     options: &ConvertOptions,
 ) -> Result<Vec<usize>, ConvertError> {
+    let schema = descriptor.schema();
     if !options.cluster {
         return Ok(Vec::new());
     }
@@ -6688,26 +5743,6 @@ pub(super) fn append_point_count_field(schema: &Schema) -> Schema {
         false,
     )));
     Schema::new(fields)
-}
-
-/// Per-feature accumulate values (one vector per spec, parallel to the rows),
-/// extracted from the resolved column indices of a batch-shaped table.
-///
-/// Read through [`extract_numeric_values`], not [`extract_sort_keys`] (#428):
-/// aggregation is not ranking. A NaN is skipped (it would poison every
-/// aggregate it touched, and it is nodata far more often than a value), but
-/// ±inf is a summand like any other — dropping it would make
-/// `--accumulate-attribute v:max` over `{1.0, +inf}` report `1.0` at the
-/// coarse levels while the canonical level, which copies the source value
-/// verbatim, still shows `inf`: a pyramid contradicting itself.
-pub(super) fn extract_accumulate_values(
-    batch: &RecordBatch,
-    acc_col_indices: &[usize],
-) -> Vec<Vec<Option<f64>>> {
-    acc_col_indices
-        .iter()
-        .map(|&idx| extract_numeric_values(batch.column(idx).as_ref()))
-        .collect()
 }
 
 /// Append the `point_count` column to a level batch and overwrite the
@@ -6823,9 +5858,10 @@ pub(super) type CoalesceTable = HashMap<usize, (Geometry<f64>, i32)>;
 /// already carry a `coalesced_count` column (case-insensitive, mirroring the
 /// `level` / `point_count` rules).
 pub(super) fn validate_coalesce_schema(
-    schema: &Schema,
+    descriptor: &crate::resolved_schema::ResolvedSchema,
     options: &ConvertOptions,
 ) -> Result<(), ConvertError> {
+    let schema = descriptor.schema();
     if !options.coalesce_lines {
         return Ok(());
     }
@@ -6877,15 +5913,15 @@ fn reserved_output_columns(options: &ConvertOptions) -> Vec<&'static str> {
 /// positionally) stays valid against the raw input. Any by-name option that
 /// referenced a renamed column (`sort_key`, `class_ranking.column`,
 /// `accumulate[].column`) is rewritten in `options` to the new name so it still
-/// resolves. A `log::warn!` is emitted per rename.
+/// resolves. Each rename is recorded in the diagnostics sink.
 ///
-/// Returns the rewritten schema — the same `Arc` when nothing collided, so
-/// callers can cheaply detect the no-op via [`Arc::ptr_eq`] — and the applied
-/// `(old, new)` renames.
+/// Returns the rewritten schema and the applied `(old, new)` renames.
 pub(super) fn resolve_reserved_column_collisions(
-    input_schema: &SchemaRef,
+    descriptor: &crate::resolved_schema::ResolvedSchema,
     options: &mut ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (SchemaRef, Vec<(String, String)>) {
+    let input_schema = descriptor.schema();
     let reserved = reserved_output_columns(options);
     let match_reserved = |name: &str| -> Option<&'static str> {
         reserved
@@ -6918,11 +5954,11 @@ pub(super) fn resolve_reserved_column_collisions(
             candidate.push('_');
         }
         taken.insert(candidate.to_ascii_lowercase());
-        log::warn!(
+        diagnostics.warn(format!(
             "input column {name:?} collides with the reserved overview column \
              {reserved_name:?}; renaming the input column to {candidate:?} in \
              the output (the reserved {reserved_name:?} column is authoritative)"
-        );
+        ));
         renames.push((name.to_string(), candidate.clone()));
         new_fields.push(Arc::new(
             Field::new(candidate, field.data_type().clone(), field.is_nullable())
@@ -6931,7 +5967,7 @@ pub(super) fn resolve_reserved_column_collisions(
     }
 
     if renames.is_empty() {
-        return (input_schema.clone(), renames);
+        return (Arc::new(input_schema.clone()), renames);
     }
 
     // A by-name option that pointed at a renamed column must follow the rename,
@@ -7003,17 +6039,6 @@ pub(super) fn apply_coalesced_count(
         .collect();
     columns.push(Arc::new(Int32Array::from(counts)));
     Ok(RecordBatch::try_new(Arc::new(out_schema.clone()), columns)?)
-}
-
-/// The class column driving coalescing compatibility groups, when the Q1
-/// ranking is class-based (explicit `--class-rank` or auto-detected Overture
-/// roads). Numeric rankings (`--sort-key`, auto-confidence) and the size
-/// fallback have no class semantics: all lines are compatible.
-pub(super) fn coalesce_group_column(ranking: &RankingProvenance) -> Option<&str> {
-    match ranking.mode.as_str() {
-        "class-ranking" | "auto-overture-roads" => ranking.column.as_deref(),
-        _ => None,
-    }
 }
 
 /// Incremental string→id interner for coalescing compatibility groups.
@@ -7121,8 +6146,9 @@ pub(super) fn build_level_coalesce_table(
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> CoalesceTable {
-    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options).0
+    build_level_coalesce_table_and_hint(inputs, level, finest, gsd_m, crs, options, diagnostics).0
 }
 
 /// [`build_level_coalesce_table`] plus the level's PRE-simplification chain
@@ -7142,6 +6168,7 @@ pub(super) fn build_level_coalesce_table_and_hint(
     gsd_m: f64,
     crs: Crs,
     options: &ConvertOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> (CoalesceTable, usize) {
     use rayon::prelude::*;
 
@@ -7165,12 +6192,12 @@ pub(super) fn build_level_coalesce_table_and_hint(
     // consumer depends on its order — they sort the keys or look up by one).
     let table: CoalesceTable = chains
         .into_par_iter()
-        .filter_map(
-            |chain| match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify) {
+        .filter_map(|chain| {
+            match simplify_for_level(&chain.geom, gsd_m, crs, &options.simplify, diagnostics) {
                 Simplified::Keep(g) => Some((chain.rep, (g, chain.count))),
                 Simplified::Dropped => None,
-            },
-        )
+            }
+        })
         .collect();
     // Per-level chain-stage split. Simplification of a coalesced stroke is
     // RDP, whose worst case is O(vertices²) (#575), so "how long was the
@@ -7183,20 +6210,6 @@ pub(super) fn build_level_coalesce_table_and_hint(
         t_simplify.elapsed().as_secs_f64(),
     );
     (table, hint)
-}
-
-/// Both limbs of the coalescing memory guard (#449) over a decoded geometry
-/// set: `(candidate lines, bytes those lines would retain)`. Counted over
-/// exactly the features the streaming engine collects (`kind == Line`), so
-/// the two engines feed [`coalesce_effective`] the same totals and reach the
-/// same verdict.
-fn coalesce_line_tally(geometries: &[Geometry<f64>]) -> (usize, u64) {
-    geometries
-        .iter()
-        .filter(|g| feature_kind(g) == FeatureKind::Line)
-        .fold((0usize, 0u64), |(n, b), g| {
-            (n + 1, b + collected_line_bytes(g))
-        })
 }
 
 /// The retained-geometry limb of the coalescing memory guard (#449), in
@@ -7224,6 +6237,7 @@ pub(super) fn coalesce_effective(
     options: &ConvertOptions,
     num_lines: usize,
     line_bytes: u64,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> bool {
     if !options.coalesce_lines {
         return false;
@@ -7232,15 +6246,12 @@ pub(super) fn coalesce_effective(
     let rows_over = num_lines > options.coalesce_max_level_rows;
     let bytes_over = line_bytes > max_bytes;
     if rows_over || bytes_over {
-        log::warn!(
-            "{}",
-            coalesce_skipped_message(
-                num_lines,
-                line_bytes,
-                options.coalesce_max_level_rows,
-                max_bytes
-            )
-        );
+        diagnostics.warn(coalesce_skipped_message(
+            num_lines,
+            line_bytes,
+            options.coalesce_max_level_rows,
+            max_bytes,
+        ));
         return false;
     }
     true
@@ -7327,6 +6338,7 @@ pub(super) fn resolve_entry_levels(
     options: &ConvertOptions,
     column_values: &[Option<f64>],
     level_specs: &[(f64, Option<u8>)],
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<ResolvedEntryZoom>, ConvertError> {
     let Some(spec) = &options.entry_zoom else {
         return Ok(None);
@@ -7351,13 +6363,14 @@ pub(super) fn resolve_entry_levels(
     // Orthogonal mechanisms, so this warns rather than overriding; the CLI
     // composes them by defaulting `--collapse` on alongside a ladder.
     if matches!(options.simplify.collapse, CollapseMode::Drop) && options.simplify.factor > 0.0 {
-        log::warn!(
+        diagnostics.warn(
             "[assign] entry-zoom ladder with --collapse off: a laddered feature \
              admitted to a coarse level is still DROPPED there if its geometry \
              simplifies below that level's tolerance, which is the usual case for \
              the small-but-strong features a ladder exists to promote. Pass \
              --collapse (representative point) or --collapse-square to keep them, \
              or --simplify-factor 0 to disable simplification."
+                .to_owned(),
         );
     }
     // Likewise the per-level density budget, which runs after assignment and
@@ -7365,12 +6378,13 @@ pub(super) fn resolve_entry_levels(
     // unless a sort key says otherwise — the same inversion the ladder exists
     // to correct — so it can undo the promotion feature by feature.
     if options.density.enabled && options.sort_key.is_none() {
-        log::warn!(
+        diagnostics.warn(
             "[assign] entry-zoom ladder with the density budget on and no \
              --sort-key: the budget caps each level and sheds its lowest-priority \
              survivors by SIZE, which can drop the small-but-strong features the \
              ladder just promoted. Pass --no-density-drop, or --sort-key on the \
              same column so the budget ranks the way the ladder does."
+                .to_owned(),
         );
     }
     let provenance = (placed > 0).then(|| entry_zoom_provenance(spec, &ladder, &level_zooms));
@@ -7407,24 +6421,6 @@ fn entry_zoom_provenance(
         rung_count: ladder.len(),
         rungs: (ladder.len() <= MAX_PROVENANCE_RANKS).then(|| ladder.to_map()),
     }
-}
-
-/// Extract the ladder column's values, by name, from an in-memory table.
-pub(super) fn entry_zoom_column_values(
-    options: &ConvertOptions,
-    schema: &Schema,
-    table: &RecordBatch,
-) -> Result<Vec<Option<f64>>, ConvertError> {
-    let Some(spec) = &options.entry_zoom else {
-        return Ok(Vec::new());
-    };
-    let idx = schema.index_of(&spec.column).map_err(|_| {
-        ConvertError::InvalidConfig(format!(
-            "entry-zoom column {:?} not found in the input schema",
-            spec.column
-        ))
-    })?;
-    Ok(extract_sort_keys(table.column(idx).as_ref()))
 }
 
 /// Build informative generalization provenance (§3.5) from the emitted gsds.
@@ -7586,107 +6582,6 @@ pub(super) fn record_coalesce_merged(generalization: Option<&mut Generalization>
     }
 }
 
-/// Resolve the cell-winner ranking for a conversion (Q1). Returns per-feature
-/// sort keys (parallel to `full`'s rows / `geometries`) plus the provenance
-/// block (§3.5). Tiers, in priority order:
-///
-/// 1. explicit numeric `--sort-key`;
-/// 2. explicit categorical `class_ranking`;
-/// 3. auto-detected Overture roads (`road_class`/`class`) or places
-///    (`confidence`, points only) — unless `no_auto_rank`;
-/// 4. `size-fallback` (no keys; assignment ranks by bbox diagonal + hash).
-///
-/// The chosen tier is logged (`log::info!`) so corpus runs show what happened.
-fn resolve_ranking(
-    input_schema: &Schema,
-    full: &RecordBatch,
-    geometries: &[Geometry<f64>],
-    options: &ConvertOptions,
-) -> Result<(Vec<Option<f64>>, RankingProvenance), ConvertError> {
-    let n = full.num_rows();
-
-    // Tier 1a: explicit numeric --sort-key.
-    if let Some(name) = &options.sort_key {
-        let idx = input_schema
-            .index_of(name)
-            .map_err(|_| ConvertError::SortKeyColumnMissing { name: name.clone() })?;
-        let keys = extract_sort_keys(full.column(idx));
-        log::info!("overview ranking: explicit numeric sort-key column {name:?}");
-        return Ok((
-            keys,
-            RankingProvenance {
-                mode: "explicit-sort-key".to_string(),
-                column: Some(name.clone()),
-                ranks: None,
-                unknown_rank: None,
-            },
-        ));
-    }
-
-    // Tier 1b: explicit categorical class ranking.
-    if let Some(cr) = &options.class_ranking {
-        let idx = input_schema.index_of(&cr.column).map_err(|_| {
-            ConvertError::ClassRankColumnMissing {
-                name: cr.column.clone(),
-            }
-        })?;
-        let keys = extract_class_ranks(full.column(idx), cr)?;
-        log::info!(
-            "overview ranking: explicit class-ranking on column {:?} ({} named classes, unknown_rank={})",
-            cr.column,
-            cr.ranks.len(),
-            cr.unknown_rank
-        );
-        return Ok((keys, class_ranking_provenance("class-ranking", cr)));
-    }
-
-    // Tier 3: auto-detection of well-known schemas.
-    if !options.no_auto_rank {
-        // Overture transportation road classes.
-        if let Some((idx, col_name)) = find_road_class_column(input_schema, full) {
-            let cr = overture_road_ranking(col_name.clone());
-            let keys = extract_class_ranks(full.column(idx), &cr)?;
-            log::info!(
-                "overview ranking: auto-detected Overture road classes in column {col_name:?}; \
-                 applying built-in ranking (motorway > … > service > tail)"
-            );
-            return Ok((keys, class_ranking_provenance("auto-overture-roads", &cr)));
-        }
-        // Overture places confidence (numeric, point datasets only).
-        if let Some((idx, col_name)) = find_confidence_column(input_schema, geometries) {
-            let keys = extract_sort_keys(full.column(idx));
-            log::info!(
-                "overview ranking: auto-detected Overture places confidence column {col_name:?} \
-                 (numeric point ranking)"
-            );
-            return Ok((
-                keys,
-                RankingProvenance {
-                    mode: "auto-confidence".to_string(),
-                    column: Some(col_name),
-                    ranks: None,
-                    unknown_rank: None,
-                },
-            ));
-        }
-    }
-
-    // Fallback: size (bbox diagonal) + deterministic hash (existing behavior).
-    log::info!(
-        "overview ranking: no sort key specified or auto-detected; using size + \
-         deterministic-hash fallback"
-    );
-    Ok((
-        vec![None; n],
-        RankingProvenance {
-            mode: "size-fallback".to_string(),
-            column: None,
-            ranks: None,
-            unknown_rank: None,
-        },
-    ))
-}
-
 /// Provenance for a categorical class ranking, echoing the map when small.
 /// The footer shape is a JSON object map (spec §3.5 v0.2.0), so the ordered
 /// pair list collapses into a `BTreeMap` here.
@@ -7745,58 +6640,10 @@ pub(super) fn extract_class_ranks(
     }
 }
 
-/// Auto-detect an Overture road-class column: a Utf8/LargeUtf8 column named
-/// `road_class` or `class` (case-insensitive) whose values overlap the known
-/// transportation vocabulary by at least [`ROAD_VOCAB_MIN_DISTINCT`] distinct
-/// classes. Returns `(column index, column name)`.
-fn find_road_class_column(schema: &Schema, full: &RecordBatch) -> Option<(usize, String)> {
-    for (idx, f) in schema.fields().iter().enumerate() {
-        if !is_road_class_candidate(f) {
-            continue;
-        }
-        if column_overlaps_road_vocab(full.column(idx)) {
-            return Some((idx, f.name().clone()));
-        }
-    }
-    None
-}
-
-/// True if the string column contains at least [`ROAD_VOCAB_MIN_DISTINCT`]
-/// distinct values from [`KNOWN_ROAD_CLASSES`].
-fn column_overlaps_road_vocab(col: &dyn Array) -> bool {
-    use arrow_array::cast::AsArray;
-
-    let vocab: HashSet<&str> = KNOWN_ROAD_CLASSES.iter().copied().collect();
-    let mut found: HashSet<&str> = HashSet::new();
-
-    macro_rules! scan {
-        ($arr:expr) => {{
-            let a = $arr;
-            for i in 0..a.len() {
-                if a.is_null(i) {
-                    continue;
-                }
-                if let Some(&hit) = vocab.get(a.value(i)) {
-                    found.insert(hit);
-                    if found.len() >= ROAD_VOCAB_MIN_DISTINCT {
-                        return true;
-                    }
-                }
-            }
-        }};
-    }
-
-    match col.data_type() {
-        DataType::Utf8 => scan!(col.as_string::<i32>()),
-        DataType::LargeUtf8 => scan!(col.as_string::<i64>()),
-        _ => return false,
-    }
-    found.len() >= ROAD_VOCAB_MIN_DISTINCT
-}
-
 /// Auto-detect an Overture places `confidence` column: a Float32/Float64 column
 /// named `confidence` (case-insensitive), applied only when the dataset is
 /// predominantly points. Returns `(column index, column name)`.
+#[cfg(test)]
 fn find_confidence_column(
     schema: &Schema,
     geometries: &[Geometry<f64>],
@@ -7828,8 +6675,7 @@ pub(super) fn fill_level_bytes(
     reports: &mut [LevelReport],
 ) -> Result<(), ConvertError> {
     let file = std::fs::File::open(output_path)?;
-    let pq = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let pmeta = pq.metadata();
+    let pmeta = tylertoo_io::read_parquet_metadata(&file)?;
 
     let mut start = 0usize;
     for (level, report) in meta.levels.iter().zip(reports.iter_mut()) {
@@ -8002,78 +6848,6 @@ mod tests {
         assert_eq!(tallies.out_of_range_exemplars[0].axis, "lon");
     }
 
-    /// The exemplar note is what turns a bare count into something naming
-    /// WHERE the loss came from (#553's ask), and is empty when there is
-    /// nothing to name.
-    #[test]
-    fn out_of_range_exemplar_note_names_rows_and_coordinates() {
-        assert_eq!(out_of_range_exemplar_note(&[]), "");
-
-        let exemplars = vec![
-            OutOfRangeExemplar {
-                part: None,
-                row: 1041,
-                axis: "lon",
-                value: 600.548,
-            },
-            OutOfRangeExemplar {
-                part: None,
-                row: 2210,
-                axis: "lon",
-                value: 600.101,
-            },
-        ];
-        let note = out_of_range_exemplar_note(&exemplars);
-        assert!(note.contains("lon 600.548 (row 1041)"), "{note}");
-        assert!(note.contains("lon 600.101 (row 2210)"), "{note}");
-
-        // The full aggregate warning includes it too.
-        let msg =
-            out_of_range_warning(19, 1000, Crs::Epsg4326, 600.548, &exemplars).expect("warns");
-        assert!(msg.contains("19 of 1000"), "{msg}");
-        assert!(msg.contains("lon 600.548 (row 1041)"), "{msg}");
-    }
-
-    /// #553 review: an exemplar just past the edge (float noise from a
-    /// reprojection, a vertex at 540.0000001) must not print as
-    /// "lon 540.000", a value that reads as in range. Three decimals when
-    /// they still show the excess, full precision when they do not.
-    #[test]
-    fn out_of_range_exemplar_note_never_rounds_back_into_range() {
-        let ex = |axis: &'static str, value: f64| OutOfRangeExemplar {
-            part: None,
-            row: 7,
-            axis,
-            value,
-        };
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 540.000_000_1)]),
-            " e.g. lon 540.0000001 (row 7)"
-        );
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lat", -90.000_2)]),
-            " e.g. lat -90.0002 (row 7)"
-        );
-        // 3857's y edge (20037508.342789...) rounds UP at three decimals,
-        // so the short form already shows the excess.
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("y", WEBMERC_HALF_M + 0.0001)]),
-            " e.g. y 20037508.343 (row 7)"
-        );
-        // Its x edge (60112525.028367...) rounds DOWN, so the long form.
-        let note = out_of_range_exemplar_note(&[ex("x", 3.0 * WEBMERC_HALF_M + 0.0001)]);
-        assert!(note.starts_with(" e.g. x 60112525.0284"), "{note}");
-        // Clearly out of range: the short form.
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("lon", 600.548_123)]),
-            " e.g. lon 600.548 (row 7)"
-        );
-        assert_eq!(
-            out_of_range_exemplar_note(&[ex("x", 70_000_000.0)]),
-            " e.g. x 70000000.000 (row 7)"
-        );
-    }
-
     /// #644: [`BboxTally`] counts the features past ±180° that the export
     /// wraps, apart from the losses, and names the first few in file order
     /// across merged chunks.
@@ -8119,39 +6893,6 @@ mod tests {
         assert_eq!(t.wrapped_exemplars[0].value, -181.5, "the west edge");
     }
 
-    /// #644: the wrapped note is quiet at zero, and otherwise names the count,
-    /// the edge, and the first rows, with the same exemplar format as the
-    /// out-of-range warning.
-    #[test]
-    fn wrapped_note_names_rows_and_stays_quiet_at_zero() {
-        let ex = |part, row, axis: &'static str, value| OutOfRangeExemplar {
-            part,
-            row,
-            axis,
-            value,
-        };
-        assert_eq!(wrapped_note(0, 10, Crs::Epsg4326, &[]), None);
-
-        let msg = wrapped_note(1, 10, Crs::Epsg4326, &[ex(None, 7, "lon", 190.25)])
-            .expect("a wrapped feature is noted");
-        assert!(msg.contains("1 of 10 feature(s)"), "{msg}");
-        assert!(msg.contains("±180° longitude"), "{msg}");
-        assert!(msg.contains("e.g. lon 190.250 (row 7). That"), "{msg}");
-        let bare = wrapped_note(1, 10, Crs::Epsg4326, &[]).unwrap();
-        assert!(bare.contains("antimeridian. That"), "{bare}");
-
-        let msg = wrapped_note(2, 4, Crs::Epsg4326, &[ex(Some(1), 3, "lon", -180.5)]).unwrap();
-        assert!(msg.contains("lon -180.500 (part 1, row 3)"), "{msg}");
-
-        // Just past the edge prints in full, never as "180.000".
-        let msg = wrapped_note(1, 1, Crs::Epsg4326, &[ex(None, 0, "lon", 180.000_000_1)]).unwrap();
-        assert!(msg.contains("lon 180.0000001 (row 0)"), "{msg}");
-
-        let msg = wrapped_note(1, 1, Crs::Epsg3857, &[ex(None, 0, "x", 30_000_000.0)]).unwrap();
-        assert!(msg.contains("±20037508.34 m"), "{msg}");
-        assert!(msg.contains("x 30000000.000 (row 0)"), "{msg}");
-    }
-
     /// The filter path reads the same columns but must NOT lose ±inf: it is a
     /// perfectly comparable value there, and dropping it would be a silent
     /// data loss of its own. Only NaN — which no comparison can answer — is
@@ -8189,6 +6930,7 @@ mod tests {
         use geo::{Geometry, LineString, MultiLineString, MultiPolygon, Point, Polygon};
         use proptest::prelude::*;
 
+        #[cfg(test)]
         fn any_f64() -> impl Strategy<Value = f64> {
             prop_oneof![
                 8 => -1.0e6f64..1.0e6f64,
@@ -8209,6 +6951,7 @@ mod tests {
             (any_ring(), proptest::collection::vec(any_ring(), 0..3))
                 .prop_map(|(ext, ints)| Polygon::new(ext, ints))
         }
+        #[cfg(test)]
         pub(super) fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             prop_oneof![
                 any_coord().prop_map(|c| Geometry::Point(Point::from(c))),
@@ -8301,6 +7044,7 @@ mod tests {
         /// to two deep, of both. The #274 generator alone makes an empty
         /// point only when both axes draw NaN, too rarely to reach one
         /// inside a collection.
+        #[cfg(test)]
         fn any_geometry() -> impl Strategy<Value = Geometry<f64>> {
             let leaf = prop_oneof![
                 8 => super::scan_feature_props::any_geometry(),
@@ -8718,7 +7462,7 @@ mod tests {
     use geoparquet::writer::{
         GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
     };
-    use parquet::arrow::ArrowWriter;
+    use tylertoo_io::test_support::ArrowWriter;
 
     use crate::batch_processor::extract_geometries_from_array;
 
@@ -8919,7 +7663,10 @@ mod tests {
     }
 
     // `Option` because every call site feeds an `Option<MemoryLimit>` parameter.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "#543: test helper returns the optional memory-limit shape consumed by preflight"
+    )]
     fn mem_limit(bytes: u64, source: MemoryLimitSource) -> Option<MemoryLimit> {
         Some(MemoryLimit { bytes, source })
     }
@@ -9002,7 +7749,14 @@ mod tests {
             pass1_memory_verdict(1_000, limit, true),
             Pass1MemoryVerdict::Warn { .. }
         ));
-        assert!(preflight_pass1_memory(1_000, limit, false, true).is_ok());
+        assert!(preflight_pass1_memory(
+            1_000,
+            limit,
+            false,
+            true,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_ok());
     }
 
     /// #543 review (S2-2): the motivating incident — 1.58B rows OOM'd under a
@@ -9025,7 +7779,14 @@ mod tests {
                 limit: limit.unwrap(),
             }
         );
-        assert!(preflight_pass1_memory(rows, limit, false, false).is_ok());
+        assert!(preflight_pass1_memory(
+            rows,
+            limit,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_ok());
         assert_eq!(
             pass1_memory_verdict(
                 rows,
@@ -9108,15 +7869,28 @@ mod tests {
     #[test]
     fn preflight_pass1_memory_fits_and_fails() {
         let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
-        assert!(preflight_pass1_memory(1_000, hard(1 << 30), false, false).is_ok());
-        let err = preflight_pass1_memory(1_580_000_000, hard(1_000), false, false)
-            .expect_err("a 1,580,000,000-row table cannot fit a 1,000-byte limit");
+        assert!(preflight_pass1_memory(
+            1_000,
+            hard(1 << 30),
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_ok());
+        let err = preflight_pass1_memory(
+            1_580_000_000,
+            hard(1_000),
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect_err("a 1,580,000,000-row table cannot fit a 1,000-byte limit");
         assert!(
             matches!(
                 err,
-                ConvertError::Pass1MemoryFloorExceeded {
-                    rows: 1_580_000_000,
-                    limit_bytes: 1_000,
+                ConvertError::BudgetExceeded {
+                    phase: "pass-1 scan",
+                    available: 1_000,
                     ..
                 }
             ),
@@ -9128,8 +7902,22 @@ mod tests {
     #[test]
     fn preflight_pass1_memory_skip_hatch_downgrades_error_to_ok() {
         let hard = mem_limit(1_000, MemoryLimitSource::CgroupMax);
-        assert!(preflight_pass1_memory(1_580_000_000, hard, false, false).is_err());
-        assert!(preflight_pass1_memory(1_580_000_000, hard, true, false).is_ok());
+        assert!(preflight_pass1_memory(
+            1_580_000_000,
+            hard,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_err());
+        assert!(preflight_pass1_memory(
+            1_580_000_000,
+            hard,
+            true,
+            false,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_ok());
     }
 
     /// #626 item 4: every surviving verdict is reported with the numbers
@@ -9139,7 +7927,14 @@ mod tests {
     #[test]
     fn preflight_pass1_memory_reports_its_verdict() {
         let hard = |b| mem_limit(b, MemoryLimitSource::CgroupMax);
-        let fits = preflight_pass1_memory(1_000, hard(1 << 30), false, false).unwrap();
+        let fits = preflight_pass1_memory(
+            1_000,
+            hard(1 << 30),
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(fits.outcome, Pass1MemoryOutcome::Fits);
         assert_eq!(fits.rows, 1_000);
         assert_eq!(fits.estimated_bytes, 1_000 * PASS1_BYTES_PER_ROW);
@@ -9152,16 +7947,37 @@ mod tests {
         // Floor fits, the ×PASS1_RECOMMENDED_FACTOR total does not → warned,
         // not failed.
         let need = (10.0 * PASS1_BYTES_PER_ROW as f64 * PASS1_RECOMMENDED_FACTOR).ceil() as u64;
-        let warned = preflight_pass1_memory(10, hard(need - 1), false, false).unwrap();
+        let warned = preflight_pass1_memory(
+            10,
+            hard(need - 1),
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(warned.outcome, Pass1MemoryOutcome::Warned);
 
         // Over a hard limit, but the hatch is set.
-        let forced = preflight_pass1_memory(1_580_000_000, hard(1_000), true, false).unwrap();
+        let forced = preflight_pass1_memory(
+            1_580_000_000,
+            hard(1_000),
+            true,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(forced.outcome, Pass1MemoryOutcome::ExceededButForced);
         assert_eq!(forced.estimated_bytes, 1_580_000_000 * PASS1_BYTES_PER_ROW);
 
         // Nothing probed: the preflight never invents a limit.
-        let unknown = preflight_pass1_memory(1_580_000_000, None, false, false).unwrap();
+        let unknown = preflight_pass1_memory(
+            1_580_000_000,
+            None,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(unknown.outcome, Pass1MemoryOutcome::Fits);
         assert_eq!(unknown.limit_bytes, None);
         assert_eq!(unknown.limit_source, None);
@@ -9452,8 +8268,10 @@ mod tests {
         // A plan written by a FUTURE tylertoo: reported as the version skew
         // it is, not as "bad magic bytes", which sends whoever reads the
         // message looking for a corrupt file instead.
-        let future = dir.path().join("v4.plan");
-        let mut bytes = b"TTPLAN\x00\x04".to_vec();
+        let next = super::super::plan_state::PLAN_FORMAT_VERSION_BYTE + 1;
+        let future = dir.path().join(format!("v{next}.plan"));
+        let mut bytes = super::super::plan_state::PLAN_MAGIC.to_vec();
+        bytes[7] = next;
         bytes.extend_from_slice(&0u64.to_le_bytes());
         std::fs::write(&future, &bytes).unwrap();
         let msg = validate_options(&ConvertOptions {
@@ -9463,7 +8281,7 @@ mod tests {
         .expect_err("a future plan format must be rejected")
         .to_string();
         assert!(
-            msg.contains("format v4"),
+            msg.contains(&format!("format v{next}")),
             "names the version it found: {msg}"
         );
         assert!(!msg.contains("bad magic"), "{msg}");
@@ -9494,26 +8312,21 @@ mod tests {
         );
         assert!(msg.contains("does not exist"), "{msg}");
 
-        // A writable parent passes, and leaves no probe file behind.
+        // A writable parent passes, and leaves the directory unchanged.
+        let entries = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = entries();
         let ok = dir.path().join("fine.plan");
         validate_options(&ConvertOptions {
             save_plan: Some(ok.clone()),
             ..Default::default()
         })
         .expect("a writable --save-plan target is accepted");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| {
-                let name = e.unwrap().file_name();
-                name.to_string_lossy()
-                    .starts_with(".tylertoo-save-plan-probe")
-                    .then_some(name)
-            })
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "probe file left behind: {leftovers:?}"
-        );
+        assert_eq!(entries(), before, "preflight left an artifact behind");
 
         // Clobbering an existing plan is ALLOWED (matching how overview and
         // tiles treat their own outputs); only `pyramid` gates that behind
@@ -9698,6 +8511,7 @@ mod tests {
 
     /// A mix of points, lines, and polygons spread far apart so coarse-level
     /// thinning keeps distinct cell winners.
+    #[cfg(test)]
     fn synthetic_geometries() -> Vec<Geometry<f64>> {
         let mut geoms = Vec::new();
         // Points on a coarse grid (meters, EPSG:3857-ish scale via 4326? we use
@@ -9749,7 +8563,7 @@ mod tests {
     /// Field names of an overview output file, in schema order.
     fn output_column_names(path: &Path) -> Vec<String> {
         let file = std::fs::File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         builder
             .schema()
             .fields()
@@ -9943,7 +8757,12 @@ mod tests {
             )
             .unwrap();
             let mut gvec = Vec::new();
-            extract_geometries_from_array(garr.as_ref(), &mut gvec).unwrap();
+            extract_geometries_from_array(
+                garr.as_ref(),
+                &mut gvec,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
             for (i, g) in gvec.iter().enumerate() {
                 out.push((
                     ids.value(i),
@@ -9968,7 +8787,7 @@ mod tests {
         range: std::ops::Range<usize>,
         row_group_rows: Option<usize>,
     ) {
-        use parquet::file::properties::WriterProperties;
+        use tylertoo_io::test_support::WriterProperties;
         let total = geoms.len();
         let idx: Vec<usize> = range.collect();
         let id = Int64Array::from(idx.iter().map(|&i| i as i64).collect::<Vec<_>>());
@@ -10012,21 +8831,31 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn convert_sources_and_export(
+        source: &crate::input_set::ConvertSource,
+        workdir: &Path,
+        tag: &str,
+        opts: &ConvertOptions,
+    ) -> Vec<u8> {
+        use crate::overview::export::{export_pmtiles, ExportOptions};
+        let overview = workdir.join(format!("{tag}-overview.parquet"));
+        let pmtiles = workdir.join(format!("{tag}.pmtiles"));
+        convert_to_overviews_sources(source, &overview, opts).unwrap();
+        export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
+        std::fs::read(&pmtiles).unwrap()
+    }
+
     /// Convert `input` and export to PMTiles; returns the archive bytes.
     /// PMTiles export is byte-deterministic (unlike the overview parquet
     /// footer), so multi/single equivalence is asserted on these bytes.
     fn convert_and_export(input: &Path, workdir: &Path, opts: &ConvertOptions) -> Vec<u8> {
-        use crate::overview::export::{export_pmtiles, ExportOptions};
         let stem = input
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .replace('.', "_");
-        let overview = workdir.join(format!("{stem}-overview.parquet"));
-        let pmtiles = workdir.join(format!("{stem}.pmtiles"));
-        convert_to_overviews(input, &overview, opts).unwrap();
-        export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
-        std::fs::read(&pmtiles).unwrap()
+        let source = crate::input_set::ConvertSource::resolve_path(input).unwrap();
+        convert_sources_and_export(&source, workdir, &stem, opts)
     }
 
     fn multi_test_options() -> ConvertOptions {
@@ -10165,8 +8994,8 @@ mod tests {
         );
     }
 
-    /// #606: the in-memory path concatenates every read row into one batch,
-    /// so a byte-array column whose total over the read row groups passes
+    /// #606: preserve the non-streaming aggregate limit: a byte-array
+    /// column whose total over the read row groups passes
     /// the ceiling fails from footer statistics, naming the column and the
     /// way out. A bbox that prunes the input under the ceiling reads it.
     #[test]
@@ -10179,16 +9008,13 @@ mod tests {
         // (186 bytes).
         write_input_partition(&input, &geoms, 0..geoms.len(), Some(6));
         let source = ConvertSource::resolve_path(&input).unwrap();
-        let ConvertSource::Single(single) = &source else {
-            panic!("one file resolves to a single source");
-        };
         let limit = 1000;
         let opts = ConvertOptions {
             streaming: false,
             ..multi_test_options()
         };
 
-        let Err(err) = load_input_table_with_limit(&source, single.input(), &opts, limit) else {
+        let Err(err) = super::super::stream::memory_source_for_test(&source, &opts, limit) else {
             panic!("the whole table passes the ceiling");
         };
         let ConvertError::InMemoryByteArrayTooLarge {
@@ -10213,32 +9039,30 @@ mod tests {
             bbox: Some([-30.0, -60.0, -20.0, -50.0]),
             ..opts.clone()
         };
-        let loaded = load_input_table_with_limit(&source, single.input(), &pruned, limit)
+        let loaded = super::super::stream::memory_source_for_test(&source, &pruned, limit)
             .expect("the pruned row groups fit the ceiling");
-        assert_eq!(loaded.row_groups_read, 1);
+        assert_eq!(loaded.1, 1);
 
-        let unlimited = load_input_table_with_limit(&source, single.input(), &opts, u64::MAX)
+        let unlimited = super::super::stream::memory_source_for_test(&source, &opts, u64::MAX)
             .expect("the real ceiling reads a small input");
-        assert_eq!(unlimited.full.num_rows(), geoms.len());
+        assert_eq!(unlimited.0.num_rows(), geoms.len());
 
-        // The ceiling is inclusive: a total equal to it fits one batch.
+        // The aggregate ceiling is inclusive.
         let at_limit =
-            load_input_table_with_limit(&source, single.input(), &opts, largest.total_bytes)
+            super::super::stream::memory_source_for_test(&source, &opts, largest.total_bytes)
                 .expect("a total equal to the ceiling fits");
-        assert_eq!(at_limit.full.num_rows(), geoms.len());
+        assert_eq!(at_limit.0.num_rows(), geoms.len());
     }
 
     /// #606: the message reports both sizes in GiB.
     #[test]
     fn in_memory_byte_array_message_reports_sizes_in_gib() {
-        let largest = crate::input_set::LargestByteArrayColumn {
+        let largest = tylertoo_io::LargestByteArrayColumn {
             column: "geometry".into(),
             total_bytes: 5 << 29,
         };
-        let msg = in_memory_byte_array_too_large_message(
-            &largest,
-            &crate::input_set::BYTE_ARRAY_BATCH_LIMIT,
-        );
+        let msg =
+            in_memory_byte_array_too_large_message(&largest, &tylertoo_io::BYTE_ARRAY_BATCH_LIMIT);
         assert!(msg.contains("'geometry' holds 2.50 GiB"), "{msg}");
         assert!(msg.contains("beyond the 2.00 GiB"), "{msg}");
     }
@@ -10248,7 +9072,7 @@ mod tests {
     /// projection leaves out, cannot overflow the concat.
     #[test]
     fn in_memory_byte_array_check_skips_large_and_unprojected_columns() {
-        use parquet::arrow::ArrowWriter;
+        use tylertoo_io::test_support::ArrowWriter;
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.parquet");
@@ -10429,6 +9253,7 @@ mod tests {
     /// IDENTICAL there, and a ceiling test over it would pass with the fold
     /// removed. These carry detail at each rung of the ladder, so RDP removes
     /// a different vertex subset at every step and the two disagree.
+    #[cfg(test)]
     fn cascade_sensitive_geometries() -> Vec<Geometry<f64>> {
         // A smooth curve will not do: RDP at a coarse tolerance picks its
         // extrema, a fine pre-pass keeps those same extrema, and cascading
@@ -11212,8 +10037,22 @@ mod tests {
 
     // ---- zoom-band representation selector (#317 / #279) --------------------
 
+    fn centered_square(cx: f64, cy: f64, half: f64) -> Geometry<f64> {
+        Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+                (cx - half, cy - half),
+            ]),
+            vec![],
+        ))
+    }
+
     /// Polygon fixtures spanning sizes from "visible at every zoom" down to
     /// tiny, scattered so they don't all share thinning cells.
+    #[cfg(test)]
     fn polygon_fixture() -> Vec<Geometry<f64>> {
         let mut geoms = Vec::new();
         for i in 0..12 {
@@ -11221,14 +10060,7 @@ mod tests {
             let cy = -60.0 + (i % 5) as f64 * 27.0;
             // Halves from 20 degrees down to 0.002 degrees.
             let half = 20.0 / (3f64).powi(i % 9);
-            let ext = LineString::from(vec![
-                (cx - half, cy - half),
-                (cx + half, cy - half),
-                (cx + half, cy + half),
-                (cx - half, cy + half),
-                (cx - half, cy - half),
-            ]);
-            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+            geoms.push(centered_square(cx, cy, half));
         }
         geoms
     }
@@ -11631,6 +10463,12 @@ mod tests {
                 "{bad:?} must be rejected as non-finite, got: {err}"
             );
         }
+        // #709 item 3: the message quotes the value as typed, not as parsed
+        // (`"infinity"`, not `inf`), so the user can find it in their spec.
+        let err = parse_entry_zoom("density:infinity=4").unwrap_err();
+        assert!(err.contains("\"infinity\" is not a finite number"), "{err}");
+        let err = parse_entry_zoom("density: NaN =4").unwrap_err();
+        assert!(err.contains("\"NaN\" is not a finite number"), "{err}");
     }
 
     /// #428: `f64::from_str` accepts `nan`, `inf` and `-inf`, and either one
@@ -11926,13 +10764,13 @@ mod tests {
 
     /// Build the "geo" key-value metadata for a single WKB geometry column
     /// with the given `crs` value (a PROJJSON object or a string).
-    fn kv_geo_with_crs(crs: serde_json::Value) -> Vec<parquet::file::metadata::KeyValue> {
+    fn kv_geo_with_crs(crs: serde_json::Value) -> Vec<tylertoo_io::KeyValue> {
         let geo = serde_json::json!({
             "version": "1.1.0",
             "primary_column": "geometry",
             "columns": { "geometry": { "encoding": "WKB", "crs": crs } }
         });
-        vec![parquet::file::metadata::KeyValue::new(
+        vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]
@@ -11954,7 +10792,12 @@ mod tests {
         });
         let kv = kv_geo_with_crs(projjson);
         assert_eq!(
-            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg3857
         );
 
@@ -11962,7 +10805,12 @@ mod tests {
         for id in ["EPSG:3857", "EPSG:900913"] {
             let kv = kv_geo_with_crs(serde_json::Value::String(id.to_string()));
             assert_eq!(
-                detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+                detect_crs_from_kv(
+                    Some(&kv),
+                    "t.parquet",
+                    &crate::diagnostics::Diagnostics::default()
+                )
+                .unwrap(),
                 Crs::Epsg3857,
                 "{id}"
             );
@@ -11974,7 +10822,12 @@ mod tests {
             "id": { "authority": "EPSG", "code": 4326 }
         }));
         assert_eq!(
-            detect_crs_from_kv(Some(&kv), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg4326
         );
 
@@ -11986,7 +10839,11 @@ mod tests {
             "id": { "authority": "EPSG", "code": 32633 }
         }));
         assert!(matches!(
-            detect_crs_from_kv(Some(&kv), "t.parquet"),
+            detect_crs_from_kv(
+                Some(&kv),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Err(ConvertError::UnsupportedCrs { .. })
         ));
     }
@@ -12017,16 +10874,16 @@ mod tests {
         write_multi_rg_input_with_crs(tin.path(), &metres, true, Some(md));
 
         // Sanity: the file really does declare 3857.
-        let reader = parquet::file::serialized_reader::SerializedFileReader::new(
-            std::fs::File::open(tin.path()).unwrap(),
-        )
-        .unwrap();
-        let kv = parquet::file::reader::FileReader::metadata(&reader)
-            .file_metadata()
-            .key_value_metadata()
-            .cloned();
+        let meta =
+            tylertoo_io::read_parquet_metadata(&std::fs::File::open(tin.path()).unwrap()).unwrap();
+        let kv = meta.file_metadata().key_value_metadata().cloned();
         assert_eq!(
-            detect_crs_from_kv(kv.as_ref(), "t.parquet").unwrap(),
+            detect_crs_from_kv(
+                kv.as_ref(),
+                "t.parquet",
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .unwrap(),
             Crs::Epsg3857
         );
 
@@ -12055,8 +10912,8 @@ mod tests {
         );
     }
 
-    /// [`find_geometry_column`] and
-    /// [`crate::covering::resolve_geometry_column_name`] must name the SAME
+    /// [`crate::resolved_schema::ResolvedSchema::geometry_index`] and
+    /// [`crate::resolved_schema::ResolvedSchema::geometry_name`] must name the SAME
     /// column, or pruning drops what the reader would have kept (#518).
     #[test]
     fn find_geometry_column_honors_the_primary_column() {
@@ -12070,14 +10927,22 @@ mod tests {
             [("geo".to_string(), geo.to_string())].into_iter().collect(),
         );
         assert_eq!(
-            find_geometry_column(&with_geo),
+            crate::resolved_schema::ResolvedSchema::resolve(&with_geo)
+                .ok()
+                .and_then(|s| s.geometry_index()),
             Some(0),
             "primary_column is authoritative"
         );
 
         // No "geo" metadata: the name heuristic, unchanged.
         let bare = Schema::new(fields);
-        assert_eq!(find_geometry_column(&bare), Some(1), "first `geom*` column");
+        assert_eq!(
+            crate::resolved_schema::ResolvedSchema::resolve(&bare)
+                .ok()
+                .and_then(|s| s.geometry_index()),
+            Some(1),
+            "first `geom*` column"
+        );
 
         // A primary_column naming a column that isn't there falls back.
         let stale = r#"{"version":"1.1.0","primary_column":"nope","columns":{}}"#;
@@ -12090,7 +10955,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        assert_eq!(find_geometry_column(&with_stale), Some(1));
+        assert_eq!(
+            crate::resolved_schema::ResolvedSchema::resolve(&with_stale)
+                .ok()
+                .and_then(|s| s.geometry_index()),
+            Some(1)
+        );
     }
 
     /// #519: whatever shape the input declares its CRS in, the OUTPUT
@@ -12181,7 +11051,9 @@ mod tests {
                 [(key.to_string(), geo.to_string())].into_iter().collect(),
             );
             assert_eq!(
-                find_geometry_column(&schema),
+                crate::resolved_schema::ResolvedSchema::resolve(&schema)
+                    .ok()
+                    .and_then(|s| s.geometry_index()),
                 Some(0),
                 "primary_column must be honored for a {key:?} key"
             );
@@ -12196,8 +11068,7 @@ mod tests {
         let tin = tempfile::NamedTempFile::new().unwrap();
         write_multi_rg_input(tin.path(), &coords, true);
         let file = std::fs::File::open(tin.path()).unwrap();
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let schema = builder.schema();
         assert!(
             schema.metadata().contains_key("geo"),
@@ -12205,7 +11076,9 @@ mod tests {
             schema.metadata().keys().collect::<Vec<_>>()
         );
         assert_eq!(
-            find_geometry_column(schema),
+            crate::resolved_schema::ResolvedSchema::resolve(schema)
+                .ok()
+                .and_then(|s| s.geometry_index()),
             Some(
                 crate::covering::resolve_geometry_column_name(builder.metadata())
                     .and_then(|n| schema.fields().iter().position(|f| *f.name() == n))
@@ -12264,7 +11137,11 @@ mod tests {
             Field::new("geometry", DataType::Binary, false),
         ]));
         let mut opts = ConvertOptions::default();
-        let (out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        let (out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(renames, vec![("level".to_string(), "level__".to_string())]);
         let names: Vec<_> = out.fields().iter().map(|f| f.name().clone()).collect();
         assert_eq!(names, vec!["id", "level__", "level_", "geometry"]);
@@ -12282,7 +11159,11 @@ mod tests {
             sort_key: Some("LEVEL".to_string()),
             ..Default::default()
         };
-        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        let (_out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(renames.len(), 1);
         assert_eq!(opts.sort_key.as_deref(), Some("level_"));
     }
@@ -12314,11 +11195,16 @@ mod tests {
         let many: Vec<f64> = (0..70).map(f64::from).collect();
         let values: Vec<Option<f64>> = many.iter().copied().map(Some).collect();
         let options = explicit(many.iter().map(|&v| (v, 3)).collect());
-        let p = resolve_entry_levels(&options, &values, &specs)
-            .unwrap()
-            .unwrap()
-            .provenance
-            .expect("the ladder placed every row");
+        let p = resolve_entry_levels(
+            &options,
+            &values,
+            &specs,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .provenance
+        .expect("the ladder placed every row");
         assert_eq!(p.rung_count, 70);
         assert_eq!(
             p.rungs, None,
@@ -12328,20 +11214,30 @@ mod tests {
         // Duplicate requests collapse before the cap is applied: 70 pairs
         // naming 2 values give a 2-rung map.
         let dupes = explicit((0..70).map(|i| (f64::from(i % 2), 3)).collect());
-        let p = resolve_entry_levels(&dupes, &values, &specs)
-            .unwrap()
-            .unwrap()
-            .provenance
-            .unwrap();
+        let p = resolve_entry_levels(
+            &dupes,
+            &values,
+            &specs,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .provenance
+        .unwrap();
         assert_eq!(p.rung_count, 2);
         assert_eq!(p.rungs.map(|r| r.len()), Some(2));
 
         let widened = f64::from(0.3_f32);
-        let p = resolve_entry_levels(&explicit(vec![(0.3, 2)]), &[Some(widened)], &specs)
-            .unwrap()
-            .unwrap()
-            .provenance
-            .unwrap();
+        let p = resolve_entry_levels(
+            &explicit(vec![(0.3, 2)]),
+            &[Some(widened)],
+            &specs,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .provenance
+        .unwrap();
         assert_eq!(
             p.rungs,
             Some(std::collections::BTreeMap::from([(widened.to_string(), 2)])),
@@ -12365,7 +11261,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        let (_out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(renames.len(), 1);
         assert_eq!(
             opts.entry_zoom.as_ref().unwrap().column,
@@ -12376,16 +11276,19 @@ mod tests {
 
     #[test]
     fn resolver_noop_when_no_collision() {
-        // No reserved-name collision → same `Arc` returned (cheap no-op) and no
-        // renames.
+        // No reserved-name collision preserves the schema and adds no renames.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("geometry", DataType::Binary, false),
         ]));
         let mut opts = ConvertOptions::default();
-        let (out, renames) = resolve_reserved_column_collisions(&schema, &mut opts);
+        let (out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(renames.is_empty());
-        assert!(Arc::ptr_eq(&out, &schema));
+        assert_eq!(out, schema);
     }
 
     #[test]
@@ -12402,7 +11305,11 @@ mod tests {
             coalesce_lines: false,
             ..Default::default()
         };
-        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut off);
+        let (_out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut off,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(
             renames.is_empty(),
             "point_count is a passthrough without --cluster"
@@ -12412,7 +11319,11 @@ mod tests {
             cluster: true,
             ..Default::default()
         };
-        let (_out, renames) = resolve_reserved_column_collisions(&schema, &mut on);
+        let (_out, renames) = resolve_reserved_column_collisions(
+            &crate::resolved_schema::ResolvedSchema::resolve(&schema).unwrap(),
+            &mut on,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(
             renames,
             vec![("point_count".to_string(), "point_count_".to_string())]
@@ -12897,7 +11808,7 @@ mod tests {
     /// Raw `geo:overviews` footer JSON of an overview file.
     fn overviews_footer_json(path: &Path) -> String {
         let file = std::fs::File::open(path).unwrap();
-        let b = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let b = tylertoo_io::open_parquet(file).unwrap();
         b.metadata()
             .file_metadata()
             .key_value_metadata()
@@ -12981,12 +11892,9 @@ mod tests {
     /// run-to-run (serial-vs-serial also differs by a few bytes there), so a raw
     /// `Vec<u8>` compare is not a valid equivalence check.
     fn assert_outputs_equivalent(a: &Path, b: &Path, ctx: &str) {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-
         // Row-group layout (num groups, rows per group, column count).
         let layout = |p: &Path| -> Vec<(i64, usize)> {
-            let r = SerializedFileReader::new(std::fs::File::open(p).unwrap()).unwrap();
-            let md = r.metadata();
+            let md = tylertoo_io::read_parquet_metadata(&std::fs::File::open(p).unwrap()).unwrap();
             (0..md.num_row_groups())
                 .map(|i| (md.row_group(i).num_rows(), md.row_group(i).columns().len()))
                 .collect()
@@ -13115,6 +12023,7 @@ mod tests {
     /// collide during simplification. Adjacent ladder levels commonly
     /// simplify these to byte-identical geometry — exactly the case #499's
     /// cascade Arc-sharing targets.
+    #[cfg(test)]
     fn minimal_square_fixture(n: usize) -> Vec<Geometry<f64>> {
         let mut geoms = Vec::with_capacity(n);
         for i in 0..n {
@@ -13122,14 +12031,7 @@ mod tests {
             let cy = -80.0 + (i / 20) as f64 * 15.0;
             let half = 0.05; // ~5.5km diagonal: survives many fine levels
                              // unchanged, then drops once the visibility gate passes it.
-            let ext = LineString::from(vec![
-                (cx - half, cy - half),
-                (cx + half, cy - half),
-                (cx + half, cy + half),
-                (cx - half, cy + half),
-                (cx - half, cy - half),
-            ]);
-            geoms.push(Geometry::Polygon(Polygon::new(ext, vec![])));
+            geoms.push(centered_square(cx, cy, half));
         }
         geoms
     }
@@ -13370,10 +12272,13 @@ mod tests {
         assert_eq!(resolve_read_workers(ceiling), ceiling);
         assert_eq!(resolve_read_workers(READ_WORKERS_MAX), READ_WORKERS_MAX);
 
-        // Above the ceiling: clamped, never honoured. `usize::MAX` is the
-        // regression case — it used to drive an O(workers) decrement loop.
-        assert_eq!(resolve_read_workers(ceiling + 1), ceiling);
-        assert_eq!(resolve_read_workers(usize::MAX), ceiling);
+        // Validation owns explicit bounds; expansion handles only auto.
+        assert!(ConvertOptions {
+            read_workers: ceiling + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -13533,14 +12438,7 @@ mod tests {
                 let (row, col) = (i / cols, i % cols);
                 let cx = -60.0 + col as f64 * spacing;
                 let cy = -40.0 - row as f64 * spacing;
-                let ext = LineString::from(vec![
-                    (cx - half, cy - half),
-                    (cx + half, cy - half),
-                    (cx + half, cy + half),
-                    (cx - half, cy + half),
-                    (cx - half, cy - half),
-                ]);
-                Geometry::Polygon(Polygon::new(ext, vec![]))
+                centered_square(cx, cy, half)
             })
             .collect()
     }
@@ -13644,20 +12542,27 @@ mod tests {
 
     // --- Q4 point clustering -------------------------------------------------
 
-    /// Read the `point_count` column for one level, in row order.
-    fn read_point_counts(reader: &OverviewReader, level: usize) -> Vec<i64> {
+    fn read_count_column<T: arrow_array::types::ArrowPrimitiveType>(
+        reader: &OverviewReader,
+        level: usize,
+        name: &str,
+    ) -> Vec<T::Native> {
         use arrow_array::cast::AsArray;
-        use arrow_array::types::Int64Type;
         let rdr = reader.read_level(level, None).unwrap();
         let mut out = Vec::new();
         for batch in rdr {
             let batch = batch.unwrap();
-            let idx = batch.schema().index_of("point_count").unwrap();
-            let col = batch.column(idx).as_primitive::<Int64Type>().clone();
-            assert_eq!(col.null_count(), 0, "point_count must be NOT NULL");
+            let idx = batch.schema().index_of(name).unwrap();
+            let col = batch.column(idx).as_primitive::<T>().clone();
+            assert_eq!(col.null_count(), 0, "{name} must be NOT NULL");
             out.extend(col.values().iter().copied());
         }
         out
+    }
+
+    /// Read the `point_count` column for one level, in row order.
+    fn read_point_counts(reader: &OverviewReader, level: usize) -> Vec<i64> {
+        read_count_column::<arrow_array::types::Int64Type>(reader, level, "point_count")
     }
 
     /// Read a Float64 column for one level, in row order (None = null).
@@ -14122,23 +13027,13 @@ mod tests {
 
     /// Read the `coalesced_count` column for one level, in row order.
     fn read_coalesced_counts(reader: &OverviewReader, level: usize) -> Vec<i32> {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::Int32Type;
-        let rdr = reader.read_level(level, None).unwrap();
-        let mut out = Vec::new();
-        for batch in rdr {
-            let batch = batch.unwrap();
-            let idx = batch.schema().index_of("coalesced_count").unwrap();
-            let col = batch.column(idx).as_primitive::<Int32Type>().clone();
-            assert_eq!(col.null_count(), 0, "coalesced_count must be NOT NULL");
-            out.extend(col.values().iter().copied());
-        }
-        out
+        read_count_column::<arrow_array::types::Int32Type>(reader, level, "coalesced_count")
     }
 
     /// A chain of `n` touching collinear segments (each 0.01° long) starting
     /// at (0,0), plus one far-away point. Each segment alone is below the
     /// coarse-level line visibility gate; the chain is well above it.
+    #[cfg(test)]
     fn fragment_chain_geoms(n: usize) -> Vec<Geometry<f64>> {
         let mut geoms: Vec<Geometry<f64>> = (0..n)
             .map(|i| {
@@ -14765,6 +13660,8 @@ mod tests {
         let report_bbox = convert_to_overviews(tin.path(), tout_bbox.path(), &opts_bbox).unwrap();
         // The bbox intersects only one row group, so pruning should fire.
         assert_eq!(report_bbox.row_groups_total, 4);
+        assert_eq!(report_bbox.source_row_ranges, vec![(1, 2)]);
+        assert!(report_bbox.source_losses.is_empty());
         assert_eq!(
             report_bbox.row_groups_read, 1,
             "bbox pruning did not fire: read {} row groups",
@@ -14783,6 +13680,91 @@ mod tests {
             })
             .collect();
         assert_eq!(ids_bbox, ids_posthoc);
+    }
+
+    #[test]
+    fn loss_row_addresses_survive_footer_pruning_and_saved_plan_replay() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_input_with_f64_row_groups(
+            input.path(),
+            &[
+                Some(Geometry::Point(Point::new(1.0, 1.0))),
+                Some(Geometry::Point(Point::new(2.0, 2.0))),
+                None,
+                Some(Geometry::Point(Point::new(3.0, 3.0))),
+            ],
+            "keep",
+            &[0.0, 0.0, 1.0, 1.0],
+            Some(2),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("convert.plan");
+        let options = ConvertOptions {
+            filter: Some("keep > 0".into()),
+            save_plan: Some(plan.clone()),
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 6,
+                max_zoom: 6,
+            },
+            coalesce_lines: false,
+            ..Default::default()
+        };
+        let fresh =
+            convert_to_overviews(input.path(), dir.path().join("fresh.parquet"), &options).unwrap();
+        let replay = convert_to_overviews(
+            input.path(),
+            dir.path().join("replay.parquet"),
+            &ConvertOptions {
+                save_plan: None,
+                plan: Some(plan),
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.input_rows, 2);
+        assert_eq!(fresh.row_groups_read, 1);
+        assert_eq!(fresh.source_row_ranges, vec![(2, 4)]);
+        assert_eq!(fresh.source_losses.len(), 1);
+        assert_eq!(fresh.source_losses.iter().next().unwrap().unwrap().id, 2);
+        assert_eq!(fresh.source_losses, replay.source_losses);
+        assert_eq!(fresh.source_row_ranges, replay.source_row_ranges);
+    }
+
+    #[test]
+    fn bbox_rejections_are_accounted_for_in_scanned_domain() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        crate::overview::testutil::write_input(
+            input.path(),
+            &[
+                Some(Geometry::Point(Point::new(0.0, 0.0))),
+                Some(Geometry::Point(Point::new(30.0, 30.0))),
+                Some(Geometry::Point(Point::new(1.0, 1.0))),
+            ],
+            false,
+            None,
+        );
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let report = convert_to_overviews(
+            input.path(),
+            output.path(),
+            &ConvertOptions {
+                bbox: Some([-2.0, -2.0, 2.0, 2.0]),
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 6,
+                    max_zoom: 6,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.input_rows, 3);
+        assert_eq!(report.input_features, 2);
+        assert_eq!(report.source_losses.len(), 1);
+        assert_eq!(report.source_losses.iter().next().unwrap().unwrap().id, 1);
+        assert_eq!(
+            report.source_losses.iter().next().unwrap().unwrap().cause,
+            crate::diagnostics::SourceLossCause::OutsideBbox
+        );
     }
 
     #[test]
@@ -14808,6 +13790,15 @@ mod tests {
         assert_eq!(
             report.row_groups_read, 4,
             "stats-free should read all row groups"
+        );
+        assert_eq!(report.input_rows, 4);
+        assert_eq!(
+            report
+                .source_losses
+                .iter()
+                .map(|l| l.unwrap().id)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
         );
         // Exact per-feature filter still applies: only id=1 survives.
         let reader = OverviewReader::open(tout.path()).unwrap();
@@ -15169,10 +14160,7 @@ mod tests {
                 value: 591.5,
             }]
         );
-        assert_eq!(
-            out_of_range_exemplar_note(&report.out_of_range_exemplars),
-            " e.g. lon 591.500 (part 1, row 1)"
-        );
+        assert!(report.diagnostics.iter().any(|d| matches!(d, crate::diagnostics::Diagnostic::OutOfRange {exemplars,..} if exemplars[0].part == Some(1))));
     }
 
     /// String equality / IN, IS NULL, and OR-composition semantics.
@@ -15269,9 +14257,7 @@ mod tests {
 
         /// Byte span `[start, end)` of each row group's data pages.
         fn row_group_spans(bytes: &[u8]) -> Vec<std::ops::Range<u64>> {
-            let builder =
-                ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
-                    .unwrap();
+            let builder = tylertoo_io::open_parquet(bytes::Bytes::from(bytes.to_vec())).unwrap();
             builder
                 .metadata()
                 .row_groups()
@@ -15509,22 +14495,6 @@ mod tests {
             let tmp = tempfile::NamedTempFile::new().unwrap();
             write_input_partition(tmp.path(), geoms, range, row_group_rows);
             std::fs::read(tmp.path()).unwrap()
-        }
-
-        /// Convert a remote `ConvertSource` and export to PMTiles; returns
-        /// the archive bytes (PMTiles export is byte-deterministic).
-        fn convert_sources_and_export(
-            source: &crate::input_set::ConvertSource,
-            workdir: &Path,
-            tag: &str,
-            opts: &ConvertOptions,
-        ) -> Vec<u8> {
-            use crate::overview::export::{export_pmtiles, ExportOptions};
-            let overview = workdir.join(format!("{tag}-overview.parquet"));
-            let pmtiles = workdir.join(format!("{tag}.pmtiles"));
-            convert_to_overviews_sources(source, &overview, opts).unwrap();
-            export_pmtiles(&overview, &pmtiles, &ExportOptions::default()).unwrap();
-            std::fs::read(&pmtiles).unwrap()
         }
 
         /// #219's ≈1× guarantee must hold PER PART across the streaming
@@ -15937,14 +14907,7 @@ mod tests {
                 let cx = -150.0 + (i % 10) as f64 * 3.0;
                 let cy = -60.0 + (i / 10) as f64 * 1.5;
                 let h = 5e-5;
-                let ext = LineString::from(vec![
-                    (cx - h, cy - h),
-                    (cx + h, cy - h),
-                    (cx + h, cy + h),
-                    (cx - h, cy + h),
-                    (cx - h, cy - h),
-                ]);
-                Geometry::Polygon(Polygon::new(ext, vec![]))
+                centered_square(cx, cy, h)
             })
             .collect()
     }

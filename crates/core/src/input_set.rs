@@ -41,11 +41,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-};
-use parquet::arrow::ProjectionMask;
-use parquet::file::metadata::{KeyValue, ParquetMetaData};
+use tylertoo_io::ReaderMetadata;
+use tylertoo_io::{KeyValue, ParquetMetaData};
 
 #[cfg(feature = "remote")]
 use crate::input::is_remote_scheme;
@@ -67,6 +64,10 @@ pub enum ConvertSource {
 /// row-group counts, selection) parse the footer ONCE — matching the pre-v0.7
 /// single-open header cost.
 #[derive(Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub struct SingleSource {
     source: InputSource,
     meta: std::sync::OnceLock<PartMeta>,
@@ -75,6 +76,10 @@ pub struct SingleSource {
 }
 
 impl SingleSource {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+    )]
     fn new(source: InputSource) -> Self {
         SingleSource {
             source,
@@ -103,6 +108,7 @@ impl SingleSource {
 /// Footer-derived metadata of one partition.
 #[derive(Debug, Clone)]
 struct PartMeta {
+    resolved: Arc<crate::resolved_schema::ResolvedSchema>,
     /// Arrow schema decoded from the part's footer.
     schema: SchemaRef,
     /// Parsed parquet metadata (row groups, key-value metadata).
@@ -112,13 +118,17 @@ struct PartMeta {
     /// Load-bearing for the pass-2 parallel read (#494), which opens one
     /// reader per segment: a 1084-segment run parsed the footer 1084 times,
     /// twice per conversion.
-    reader: ArrowReaderMetadata,
+    reader: ReaderMetadata,
 }
 
 /// An ordered set of parquet partitions (local files and/or remote
 /// objects) with footers loaded and validated up front (see the module
 /// docs for the compatibility rules).
 #[derive(Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub struct MultiSource {
     /// The original input string (directory path or glob pattern).
     root: String,
@@ -143,175 +153,6 @@ pub struct MultiSource {
 #[derive(Debug, Clone)]
 pub struct RowGroupSelection(Vec<Vec<usize>>);
 
-/// Most bytes of one byte-array column a single decoded record batch can hold.
-///
-/// arrow-rs decodes a parquet `BYTE_ARRAY` column (WKB geometry, strings)
-/// into a `BinaryArray`/`StringArray` whose offsets are `i32`, so one decoded
-/// record batch holds at most this many bytes of any one such column (#563).
-/// Past it the read fails with the opaque `Parquet error: index overflow
-/// decoding byte array`.
-///
-/// The ceiling applies per BATCH, not per row group: a batch may be a slice
-/// of one row group or straddle several. A row group larger than this reads
-/// fine in batches of fewer rows, and row groups each well under it overflow
-/// when one batch spans enough of them.
-pub const BYTE_ARRAY_BATCH_LIMIT: u64 = i32::MAX as u64;
-
-/// The byte-array column chunk with the most bytes per row among some row
-/// groups (#563): the one that decides how many rows one batch can hold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WidestByteArrayColumn {
-    /// Index into the source's parts (0 for a single file).
-    pub part: usize,
-    /// The row group's local index within its part.
-    pub row_group: usize,
-    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
-    pub column: String,
-    /// Decoded bytes per row, averaged over the row group, rounded up.
-    pub avg_row_bytes: u64,
-}
-
-/// The widest byte-array column chunk of `meta`'s row groups `row_groups`
-/// (`None` = all), or `None` when there is no non-empty byte-array chunk.
-///
-/// Footer-only. The per-chunk size is the larger of the chunk's
-/// `total_uncompressed_size` and, when the writer recorded it, its
-/// `unencoded_byte_array_data_bytes` size statistic: a dictionary-encoded
-/// chunk's uncompressed size counts each distinct value once, while the
-/// decoded array holds a copy per row.
-pub(crate) fn widest_byte_array_column(
-    meta: &ParquetMetaData,
-    row_groups: Option<&[usize]>,
-    part: usize,
-) -> Option<WidestByteArrayColumn> {
-    let groups = meta.row_groups();
-    let all: Vec<usize>;
-    let picked: &[usize] = match row_groups {
-        Some(p) => p,
-        None => {
-            all = (0..groups.len()).collect();
-            &all
-        }
-    };
-    let mut widest: Option<WidestByteArrayColumn> = None;
-    for &gi in picked {
-        let Some(rg) = groups.get(gi) else {
-            continue;
-        };
-        let rows = rg.num_rows().max(0) as u64;
-        if rows == 0 {
-            continue;
-        }
-        for col in rg.columns() {
-            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
-                continue;
-            }
-            let bytes = col
-                .uncompressed_size()
-                .max(col.unencoded_byte_array_data_bytes().unwrap_or(0))
-                .max(0) as u64;
-            let avg_row_bytes = bytes.div_ceil(rows);
-            if widest
-                .as_ref()
-                .is_none_or(|w| avg_row_bytes > w.avg_row_bytes)
-            {
-                widest = Some(WidestByteArrayColumn {
-                    part,
-                    row_group: gi,
-                    column: col.column_path().string(),
-                    avg_row_bytes,
-                });
-            }
-        }
-    }
-    widest
-}
-
-/// The byte-array column that holds the most decoded bytes in total over some
-/// row groups (#606): what decides whether one batch can hold all of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LargestByteArrayColumn {
-    /// The column's dotted path (`geometry`, or `a.b` for a nested leaf).
-    pub column: String,
-    /// Decoded bytes summed over the row groups.
-    pub total_bytes: u64,
-}
-
-/// The byte-array leaf column of `meta` with the most decoded bytes summed
-/// over row groups `row_groups` (`None` = all), counting only leaves under a
-/// root column for which `root_counts` returns true. `None` when no counted
-/// leaf holds any bytes.
-///
-/// Footer-only. A chunk's size is its `unencoded_byte_array_data_bytes` size
-/// statistic when the writer recorded it, the exact length of the values the
-/// decoded array holds. Without it the chunk's `total_uncompressed_size`
-/// stands in. That figure counts a dictionary-encoded chunk's distinct values
-/// once, so the total can then fall short of the decoded size.
-pub(crate) fn largest_byte_array_column(
-    meta: &ParquetMetaData,
-    row_groups: Option<&[usize]>,
-    root_counts: impl Fn(usize) -> bool,
-) -> Option<LargestByteArrayColumn> {
-    let descr = meta.file_metadata().schema_descr();
-    let groups = meta.row_groups();
-    let all: Vec<usize>;
-    let picked: &[usize] = match row_groups {
-        Some(p) => p,
-        None => {
-            all = (0..groups.len()).collect();
-            &all
-        }
-    };
-    let mut totals = vec![0u64; descr.num_columns()];
-    for &gi in picked {
-        let Some(rg) = groups.get(gi) else {
-            continue;
-        };
-        for (leaf, col) in rg.columns().iter().enumerate() {
-            if col.column_descr().physical_type() != parquet::basic::Type::BYTE_ARRAY {
-                continue;
-            }
-            let bytes = col
-                .unencoded_byte_array_data_bytes()
-                .unwrap_or_else(|| col.uncompressed_size())
-                .max(0) as u64;
-            totals[leaf] = totals[leaf].saturating_add(bytes);
-        }
-    }
-    totals
-        .iter()
-        .enumerate()
-        .filter(|&(leaf, &bytes)| bytes > 0 && root_counts(descr.get_column_root_idx(leaf)))
-        .max_by_key(|&(_, &bytes)| bytes)
-        .map(|(leaf, &total_bytes)| LargestByteArrayColumn {
-            column: descr.column(leaf).path().string(),
-            total_bytes,
-        })
-}
-
-/// Rows per batch that keep an average batch of the widest byte-array column
-/// at or under half of `limit` (#563), never below 1. The half is headroom
-/// for rows larger than their row group's average.
-pub(crate) fn byte_array_batch_rows(avg_row_bytes: u64, limit: u64) -> usize {
-    let budget = limit / 2;
-    usize::try_from(budget / avg_row_bytes.max(1))
-        .unwrap_or(usize::MAX)
-        .max(1)
-}
-
-/// `requested` rows per batch, lowered when `widest` needs fewer to stay
-/// under [`BYTE_ARRAY_BATCH_LIMIT`].
-pub(crate) fn capped_batch_rows(requested: usize, widest: Option<&WidestByteArrayColumn>) -> usize {
-    match widest {
-        Some(w) => requested.min(byte_array_batch_rows(
-            w.avg_row_bytes,
-            BYTE_ARRAY_BATCH_LIMIT,
-        )),
-        None => requested,
-    }
-    .max(1)
-}
-
 /// Maps a row's position in a [`ConvertSource`]'s read stream back to the
 /// part and the row within that part's file (#553).
 ///
@@ -328,6 +169,7 @@ pub(crate) struct StreamRowLocator {
     /// One entry per selected, non-empty row group, in read order:
     /// `(first stream row, part, first file row within the part)`.
     starts: Vec<(u64, usize, u64)>,
+    part_bases: Vec<u64>,
     /// Rows in the whole stream: one past the last stream row.
     total: u64,
 }
@@ -339,7 +181,10 @@ impl StreamRowLocator {
     pub(crate) fn new(row_counts: &[Vec<i64>], selected: Option<&RowGroupSelection>) -> Self {
         let mut starts = Vec::new();
         let mut stream_row = 0u64;
+        let mut part_bases = Vec::with_capacity(row_counts.len());
+        let mut part_base = 0u64;
         for (part, counts) in row_counts.iter().enumerate() {
+            part_bases.push(part_base);
             // A row group's first file row: the sum of every earlier group's
             // rows, whether selected or not.
             let mut first_rows = Vec::with_capacity(counts.len());
@@ -348,6 +193,7 @@ impl StreamRowLocator {
                 first_rows.push(acc);
                 acc += n.max(0) as u64;
             }
+            part_base += acc;
             let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(part)) {
                 Some(p) => p.clone(),
                 None => (0..counts.len()).collect(),
@@ -366,8 +212,35 @@ impl StreamRowLocator {
         }
         Self {
             starts,
+            part_bases,
             total: stream_row,
         }
+    }
+
+    /// Original row ordinal across all parts, including pruned groups.
+    pub(crate) fn global_row(&self, stream_row: usize) -> Option<u64> {
+        let (part, row) = self.locate(stream_row)?;
+        Some(self.part_bases[part] + row as u64)
+    }
+
+    /// Half-open original row ranges constituting the selected read stream.
+    pub(crate) fn ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (i, &(stream, part, first)) in self.starts.iter().enumerate() {
+            let end = self.starts.get(i + 1).map_or(self.total, |r| r.0);
+            let first = self.part_bases[part] + first;
+            let end = first + end - stream;
+            if let Some(previous) = ranges.last_mut().filter(|r| r.1 == first) {
+                previous.1 = end;
+            } else {
+                ranges.push((first, end));
+            }
+        }
+        ranges
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.total
     }
 
     /// `(part, row within the part's file)` for stream position
@@ -456,12 +329,12 @@ pub struct SourceStream<'a> {
     parts: &'a [InputSource],
     /// Each part's already-parsed footer, parallel to `parts`, so opening a
     /// part's reader costs a `File::open` and nothing else (#494 follow-up).
-    metas: Vec<ArrowReaderMetadata>,
+    metas: Vec<ReaderMetadata>,
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<Vec<usize>>>,
     batch_size: usize,
     part_idx: usize,
-    current: Option<ParquetRecordBatchReader>,
+    current: Option<tylertoo_io::UntrustedBatchReader>,
     done: bool,
 }
 
@@ -639,15 +512,14 @@ impl ConvertSource {
     fn from_explicit_list(root: &str, entries: &[(String, String)]) -> Result<Self, InputError> {
         let parts = resolve_list_entries(entries, |context, entry| {
             let src = InputSource::from_str_input(entry)?;
-            // Without the `remote` feature `Local` is the only variant.
-            #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
-            if let InputSource::Local(p) = &src {
-                if !p.is_file() {
+            match &src {
+                InputSource::Local(p) if !p.is_file() => {
                     return Err(InputError::MissingListedInput {
                         context: context.to_string(),
                         input: entry.to_string(),
                     });
                 }
+                _ => {}
             }
             Ok(src)
         })?;
@@ -771,6 +643,14 @@ impl ConvertSource {
         }
     }
 
+    pub(crate) fn record_diagnostics(&self, sink: &crate::diagnostics::Diagnostics) {
+        if let Self::Multi(source) = self {
+            for meta in &source.metas {
+                meta.resolved.record_diagnostics(sink);
+            }
+        }
+    }
+
     /// Parquet key-value metadata of partition 0 (the `geo` metadata used
     /// for CRS detection; construction validated all parts agree).
     ///
@@ -790,6 +670,29 @@ impl ConvertSource {
                 .file_metadata()
                 .key_value_metadata()
                 .cloned()),
+        }
+    }
+
+    /// The cached schema interpretation of the first part. Construction proves
+    /// all remaining parts agree on geometry and CRS.
+    ///
+    /// # Errors
+    /// Returns an input error if a part's footer cannot be resolved.
+    pub fn resolved_schema(&self) -> Result<&crate::resolved_schema::ResolvedSchema, InputError> {
+        match self {
+            ConvertSource::Single(s) => Ok(&s.meta()?.resolved),
+            ConvertSource::Multi(m) => Ok(&m.metas[0].resolved),
+        }
+    }
+
+    /// Cached descriptors for every physical part, in read order. Consumers
+    /// using a common projection must not trust only the first part's footer.
+    pub(crate) fn resolved_schemas(
+        &self,
+    ) -> Result<Vec<&crate::resolved_schema::ResolvedSchema>, InputError> {
+        match self {
+            Self::Single(s) => Ok(vec![s.meta()?.resolved.as_ref()]),
+            Self::Multi(m) => Ok(m.metas.iter().map(|meta| meta.resolved.as_ref()).collect()),
         }
     }
 
@@ -861,18 +764,12 @@ impl ConvertSource {
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let groups = m.parquet.row_groups();
-                match selected.and_then(|s| s.parts().get(i)) {
-                    Some(picked) => picked
-                        .iter()
-                        .filter_map(|&g| groups.get(g))
-                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
-                        .sum::<i64>(),
-                    None => groups
-                        .iter()
-                        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
-                        .sum::<i64>(),
-                }
+                crate::input::selected_groups(
+                    &m.parquet,
+                    selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
+                )
+                .map(tylertoo_io::RowGroupMetaData::num_rows)
+                .sum::<i64>()
             })
             .sum())
     }
@@ -881,7 +778,7 @@ impl ConvertSource {
     /// when `selected` is `None`), straight from the footers: every leaf under
     /// the column, each counted as its uncompressed size or, for a byte-array
     /// leaf whose footer records it, its unencoded data bytes if larger (the
-    /// #563 rule in [`widest_byte_array_column`]).
+    /// #563 rule in [`tylertoo_io::read_batch_plan`]).
     ///
     /// `column` indexes the schema this source exposes, as a
     /// [`ReadPlan::projection`] does. Pass 1 reports this as the geometry
@@ -905,12 +802,10 @@ impl ConvertSource {
             let leaves: Vec<usize> = (0..descr.num_columns())
                 .filter(|&leaf| descr.get_column_root_idx(leaf) == root)
                 .collect();
-            let groups = m.parquet.row_groups();
-            let picked: Vec<usize> = match selected.and_then(|s| s.parts().get(i)) {
-                Some(p) => p.clone(),
-                None => (0..groups.len()).collect(),
-            };
-            for rg in picked.iter().filter_map(|&g| groups.get(g)) {
+            for rg in crate::input::selected_groups(
+                &m.parquet,
+                selected.and_then(|s| s.parts().get(i)).map(Vec::as_slice),
+            ) {
                 for &leaf in &leaves {
                     let col = rg.column(leaf);
                     let bytes = col
@@ -936,7 +831,7 @@ impl ConvertSource {
         Ok(self
             .metas()?
             .iter()
-            .map(|m| crate::overview::convert::input_row_group_bounds(&m.parquet))
+            .map(|m| m.resolved.bounds().to_vec())
             .collect())
     }
 
@@ -956,7 +851,7 @@ impl ConvertSource {
                 m.parquet
                     .row_groups()
                     .iter()
-                    .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                    .map(tylertoo_io::RowGroupMetaData::num_rows)
                     .collect()
             })
             .collect())
@@ -997,7 +892,7 @@ impl ConvertSource {
         let per_part = self
             .metas()?
             .iter()
-            .map(|m| crate::overview::convert::select_input_row_groups_any(&m.parquet, boxes))
+            .map(|m| m.resolved.select_row_groups(boxes))
             .collect();
         Ok(RowGroupSelection(per_part))
     }
@@ -1052,22 +947,25 @@ impl ConvertSource {
             .fold(0, u64::saturating_add))
     }
 
-    /// The widest byte-array column chunk among the `selected` row groups of
-    /// every part (`None` selection = all), footer statistics only (#563).
-    /// See [`BYTE_ARRAY_BATCH_LIMIT`].
-    pub(crate) fn widest_byte_array_column(
+    /// Plan reads for all selected parts through the untrusted-reader owner.
+    pub(crate) fn read_batch_rows(
         &self,
         selected: Option<&RowGroupSelection>,
-    ) -> Result<Option<WidestByteArrayColumn>, InputError> {
-        let metas = self.metas()?;
-        Ok(metas
+        requested: usize,
+        limit: u64,
+    ) -> Result<usize, InputError> {
+        Ok(self
+            .metas()?
             .iter()
             .enumerate()
-            .filter_map(|(pi, m)| {
-                let picked = selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice);
-                widest_byte_array_column(&m.parquet, picked, pi)
-            })
-            .max_by_key(|w| w.avg_row_bytes))
+            .fold(requested, |rows, (pi, m)| {
+                tylertoo_io::read_batch_plan(
+                    &m.parquet,
+                    selected.and_then(|s| s.parts().get(pi)).map(Vec::as_slice),
+                    rows,
+                    limit,
+                )
+            }))
     }
 
     /// Fetch counters summed over remote parts (`None` when no part is
@@ -1148,16 +1046,16 @@ impl ConvertSource {
             .iter()
             .map(|m| m.reader.clone())
             .collect::<Vec<_>>();
-        // #563: never ask arrow for a batch whose byte-array column could
-        // pass its i32 offset ceiling. Output does not depend on the batch
-        // size; only the opaque overflow error does.
-        let widest = self.widest_byte_array_column(plan.row_groups)?;
+        // #563: each part's reader caps the batch for its selected row
+        // groups' widest byte-array column (`untrusted::ParquetSource::build`),
+        // so no batch can pass arrow's i32 offset ceiling. Output does not
+        // depend on the batch size; only the opaque overflow error does.
         Ok(SourceStream {
             parts,
             metas,
             projection,
             row_groups: plan.row_groups.map(|s| s.0.clone()),
-            batch_size: capped_batch_rows(plan.batch_size.max(1), widest.as_ref()),
+            batch_size: plan.batch_size.max(1),
             part_idx: 0,
             current: None,
             done: false,
@@ -1284,11 +1182,14 @@ impl ConvertSource {
 fn load_part_meta(source: &InputSource) -> Result<PartMeta, InputError> {
     let builder = source.open()?;
     let parquet = builder.metadata().clone();
-    // Re-derives the arrow schema from the footer we already have — no I/O,
-    // no second footer parse — so every later reader over this part can be
-    // built with `new_with_metadata`.
-    let reader = ArrowReaderMetadata::try_new(parquet.clone(), ArrowReaderOptions::new())?;
+    // The footer and schema the owner already checked and decoded (#779):
+    // every later reader over this part is built from it, with no second
+    // footer parse and no second `ARROW:schema` decode.
+    let reader = builder.reader_metadata().clone();
+    let resolved = crate::resolved_schema::ResolvedSchema::from_parquet(builder.schema(), &parquet)
+        .map_err(|e| InputError::Parquet(tylertoo_io::ParquetError::General(e.to_string())))?;
     Ok(PartMeta {
+        resolved: Arc::new(resolved),
         schema: builder.schema().clone(),
         parquet,
         reader,
@@ -1306,6 +1207,10 @@ const FOOTER_LOAD_CONCURRENCY: usize = 8;
 /// are written into per-index slots so the returned order always matches
 /// `parts` regardless of completion order; the first error (by part index)
 /// wins.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 fn load_part_metas(parts: &[InputSource]) -> Result<Vec<PartMeta>, InputError> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let workers = FOOTER_LOAD_CONCURRENCY.min(parts.len());
@@ -1356,6 +1261,10 @@ impl MultiSource {
     /// # Panics
     ///
     /// Panics if `parts` is empty.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: initializes per-input or per-tile worker caches"
+    )]
     pub fn from_sources(root: String, parts: Vec<InputSource>) -> Result<Self, InputError> {
         assert!(!parts.is_empty(), "MultiSource requires at least one part");
         let metas = load_part_metas(&parts)?;
@@ -1367,24 +1276,13 @@ impl MultiSource {
         // that consistently carries one unsupported CRS still errors with
         // the standard UnsupportedCrs message.
         // Only Ok/Err is used here, so the error's input name is moot.
-        let crs_of = |m: &PartMeta| {
-            crate::overview::convert::detect_crs_from_kv(
-                m.parquet.file_metadata().key_value_metadata(),
-                "",
-            )
-            .ok()
-        };
-        // Raw CRS descriptor from the `geo` metadata: disambiguates two
-        // *different* unsupported CRSs, which both detect to `None` and
-        // would otherwise "agree" here only to error later naming just
-        // part 0's CRS.
+        let crs_of = |m: &PartMeta| m.resolved.crs();
         let raw_crs_of = |m: &PartMeta| -> String {
-            crate::quality::crs_info_from_kv_metadata(
-                m.parquet.file_metadata().key_value_metadata(),
-            )
-            .ok()
-            .and_then(|info| info.identifier.or(info.name))
-            .unwrap_or_else(|| "unknown".to_string())
+            let info = m.resolved.crs_info();
+            info.identifier
+                .clone()
+                .or_else(|| info.name.clone())
+                .unwrap_or_else(|| "unknown".to_string())
         };
         let first_crs = crs_of(&metas[0]);
 
@@ -1395,6 +1293,13 @@ impl MultiSource {
                 detail,
             };
             validate_schema_shape(&metas[0].schema, &meta.schema).map_err(incompatible)?;
+            if meta.resolved.geometry_name() != metas[0].resolved.geometry_name() {
+                return Err(incompatible(format!(
+                    "primary geometry mismatch: {:?} versus {:?}",
+                    meta.resolved.geometry_name(),
+                    metas[0].resolved.geometry_name()
+                )));
+            }
             let crs = crs_of(meta);
             if crs != first_crs {
                 return Err(incompatible(format!(
@@ -1533,16 +1438,15 @@ impl SourceStream<'_> {
     /// Open part `i`'s reader with this stream's projection / row-group
     /// selection / batch size. Schemas are identical across parts, so the
     /// root-column projection indices are valid for every part.
-    fn open_part(&self, i: usize) -> Result<ParquetRecordBatchReader, InputError> {
+    fn open_part(&self, i: usize) -> Result<tylertoo_io::UntrustedBatchReader, InputError> {
         let mut builder = self.parts[i].open_with_metadata(&self.metas[i])?;
         if let Some(cols) = &self.projection {
-            let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
-            builder = builder.with_projection(mask);
+            builder = builder.with_projection_roots(cols.iter().copied());
         }
         if let Some(sel) = &self.row_groups {
             builder = builder.with_row_groups(sel[i].clone());
         }
-        Ok(builder.with_batch_size(self.batch_size).build()?)
+        Ok(builder.with_batch_rows(self.batch_size).build()?)
     }
 }
 
@@ -1615,6 +1519,10 @@ const LIST_CONNECT_CONCURRENCY: usize = 8;
 /// per-index slots, so the returned vector always matches `entries` order
 /// regardless of completion order — the row-order invariant — and the
 /// first error (by entry index) wins.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-input metadata caches and per-call worker coordination"
+)]
 fn resolve_list_entries<F>(
     entries: &[(String, String)],
     resolve: F,
@@ -1676,7 +1584,6 @@ pub(crate) fn manifest_entries(text: &str) -> Vec<(usize, &str)> {
 /// single object (the pre-v0.7 classification).
 // Used by `resolve` only when remote support is compiled in; the pure
 // classification is unit-tested under every feature set.
-#[cfg_attr(not(feature = "remote"), allow(dead_code))]
 fn remote_url_is_prefix(url: &str) -> bool {
     let no_fragment = url.split('#').next().unwrap_or(url);
     let no_query = no_fragment.split('?').next().unwrap_or(no_fragment);
@@ -1812,9 +1719,9 @@ mod tests {
     use super::*;
     use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrow_schema::DataType;
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
     use std::fs::File;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     /// Write a small parquet file with the given fields/columns and row
     /// group size (None = single row group).
@@ -1838,6 +1745,7 @@ mod tests {
     }
 
     /// Standard two-column fixture: `id: Int64 (non-null)`, `name: Utf8`.
+    #[cfg(test)]
     fn write_standard(path: &Path, ids: Vec<i64>, nullable_id: bool) {
         let n = ids.len();
         write_parquet(
@@ -2117,7 +2025,7 @@ mod tests {
             let file = File::create(&path).unwrap();
             let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
             writer.write(&batch).unwrap();
-            writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            writer.append_key_value_metadata(tylertoo_io::KeyValue::new(
                 "geo".to_string(),
                 geo(epsg),
             ));
@@ -2335,10 +2243,7 @@ mod tests {
         let src = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
 
         // Leaves 1 and 2 (pt.x, pt.y) sit under root column 1.
-        let reader =
-            parquet::file::serialized_reader::SerializedFileReader::new(File::open(&path).unwrap())
-                .unwrap();
-        let meta = parquet::file::reader::FileReader::metadata(&reader);
+        let meta = tylertoo_io::read_parquet_metadata(&File::open(&path).unwrap()).unwrap();
         assert_eq!(meta.num_row_groups(), 4);
         let rg_bytes = |g: usize| -> u64 {
             let rg = meta.row_group(g);
@@ -2437,6 +2342,7 @@ mod tests {
     // --- column restriction (#386) -------------------------------------------
 
     /// Three-column fixture: `id`, `name`, `extra`.
+    #[cfg(test)]
     fn write_three(path: &Path, ids: Vec<i64>) {
         let n = ids.len();
         write_parquet(
@@ -2758,11 +2664,10 @@ b.parquet
             let parts: Vec<InputSource> = listed
                 .into_iter()
                 .map(|p| {
-                    InputSource::Remote(RemoteSource::from_store_sized(
+                    InputSource::Remote(RemoteSource::from_store_meta(
                         Arc::clone(&store),
-                        p.location.clone(),
                         format!("memory://{}", p.location),
-                        p.size,
+                        p,
                     ))
                 })
                 .collect();
@@ -2784,6 +2689,10 @@ b.parquet
         /// order VERBATIM (the row-order invariant) — never completion or
         /// lexicographic order.
         #[test]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: test observes concurrent per-call worker progress"
+        )]
         fn explicit_list_parallel_connect_preserves_order() {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::{Condvar, Mutex as StdMutex};
@@ -2992,57 +2901,11 @@ b.parquet
 
     // --- #563: byte-array batch ceiling -------------------------------------
 
-    /// A fixture with one `geometry` (Binary) column of `blob_sizes` zero
-    /// blobs, `max_row_group_size` rows per row group.
-    fn write_geometry_fixture_with_grouping(
-        path: &Path,
-        blob_sizes: &[usize],
-        max_row_group_size: Option<usize>,
-    ) {
-        use arrow_array::BinaryArray;
-
-        let blobs: Vec<Vec<u8>> = blob_sizes.iter().map(|&n| vec![0u8; n]).collect();
-        let refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
-        write_parquet(
-            path,
-            vec![Field::new("geometry", DataType::Binary, false)],
-            vec![Arc::new(BinaryArray::from_vec(refs))],
-            max_row_group_size,
-        );
-    }
-
-    /// The widest column is found per row group, respecting the selection,
-    /// and averaged over the group's rows.
-    #[test]
-    fn widest_byte_array_column_names_the_row_group_and_respects_the_selection() {
-        let dir = tmpdir();
-        let f = dir.path().join("geo.parquet");
-        // Row group 0: two 16-byte rows. Row group 1: two 4096-byte rows.
-        write_geometry_fixture_with_grouping(&f, &[16, 16, 4096, 4096], Some(2));
-        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-
-        let w = src.widest_byte_array_column(None).unwrap().unwrap();
-        assert_eq!((w.part, w.row_group, w.column.as_str()), (0, 1, "geometry"));
-        assert!(
-            w.avg_row_bytes >= 4096 && w.avg_row_bytes < 4096 + 64,
-            "average bytes per row, not the chunk total: {w:?}"
-        );
-
-        let only_small = RowGroupSelection::from_parts(vec![vec![0]]);
-        let w = src
-            .widest_byte_array_column(Some(&only_small))
-            .unwrap()
-            .unwrap();
-        assert_eq!(w.row_group, 0);
-        assert!(w.avg_row_bytes < 64, "{w:?}");
-    }
-
     /// The largest column is the one with the most bytes summed over the
     /// selected row groups, counting only the roots the caller asks for.
     #[test]
     fn largest_byte_array_column_sums_the_selected_groups_and_counted_roots() {
         use arrow_array::BinaryArray;
-        use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let dir = tmpdir();
         let f = dir.path().join("geo.parquet");
@@ -3066,71 +2929,26 @@ b.parquet
             ],
             Some(2),
         );
-        let reader = SerializedFileReader::new(std::fs::File::open(&f).unwrap()).unwrap();
-        let meta = reader.metadata();
+        let meta = tylertoo_io::read_parquet_metadata(&std::fs::File::open(&f).unwrap()).unwrap();
+        let meta = meta.as_ref();
 
-        let all = largest_byte_array_column(meta, None, |_| true).unwrap();
+        let all = tylertoo_io::largest_byte_array_column(meta, None, |_| true).unwrap();
         assert_eq!(all.column, "geometry");
         assert!(
             (8224..8224 + 128).contains(&all.total_bytes),
             "the sum over both groups: {all:?}"
         );
 
-        let small = largest_byte_array_column(meta, Some(&[0]), |_| true).unwrap();
+        let small = tylertoo_io::largest_byte_array_column(meta, Some(&[0]), |_| true).unwrap();
         assert_eq!(small.column, "name", "2000 name bytes beat 32: {small:?}");
 
-        let names_only = largest_byte_array_column(meta, None, |root| root == 1).unwrap();
+        let names_only =
+            tylertoo_io::largest_byte_array_column(meta, None, |root| root == 1).unwrap();
         assert_eq!(names_only.column, "name");
-        assert!(largest_byte_array_column(meta, None, |_| false).is_none());
+        assert!(tylertoo_io::largest_byte_array_column(meta, None, |_| false).is_none());
         assert!(
-            largest_byte_array_column(meta, None, |root| root == 2).is_none(),
+            tylertoo_io::largest_byte_array_column(meta, None, |root| root == 2).is_none(),
             "a column holding no bytes is not a largest column"
         );
-    }
-
-    /// The batch cap keeps an average batch at half the ceiling, never
-    /// drops below one row, and leaves a narrow input's batch alone.
-    #[test]
-    fn byte_array_batch_rows_budgets_half_the_ceiling() {
-        assert_eq!(byte_array_batch_rows(100, 1000), 5);
-        assert_eq!(byte_array_batch_rows(10_000, 1000), 1);
-        assert_eq!(byte_array_batch_rows(0, 1000), 500);
-        // 128 KiB rows against the real ceiling: 8191 rows (1 GiB - 1 byte).
-        assert_eq!(
-            byte_array_batch_rows(128 * 1024, BYTE_ARRAY_BATCH_LIMIT),
-            8191
-        );
-        assert_eq!(capped_batch_rows(8192, None), 8192);
-        let wide = WidestByteArrayColumn {
-            part: 0,
-            row_group: 0,
-            column: "geometry".into(),
-            avg_row_bytes: 300_000,
-        };
-        assert_eq!(capped_batch_rows(8192, Some(&wide)), 3579);
-        assert_eq!(capped_batch_rows(100, Some(&wide)), 100);
-    }
-
-    /// #563's real failure, end to end: one row group of 9000 rows x 300 KB
-    /// (2.5 GiB of geometry). At 8192 rows per batch arrow overflows its i32
-    /// offsets; the capped stream reads every row. Ignored by default
-    /// (writes a multi-GiB fixture); run with `--ignored`.
-    #[test]
-    #[ignore = "writes a >2GiB parquet fixture; run explicitly with --ignored"]
-    fn open_stream_reads_a_real_oversized_row_group() {
-        let dir = tmpdir();
-        let f = dir.path().join("huge.parquet");
-        write_geometry_fixture_with_grouping(&f, &vec![300_000; 9000], None);
-        let src = ConvertSource::resolve(f.to_str().unwrap()).unwrap();
-        let rows: usize = src
-            .open_stream(&ReadPlan {
-                batch_size: 8192,
-                projection: None,
-                row_groups: None,
-            })
-            .unwrap()
-            .map(|b| b.unwrap().num_rows())
-            .sum();
-        assert_eq!(rows, 9000);
     }
 }

@@ -5,6 +5,17 @@ Notable changes to this project are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Rust callers pass a `TileCoord` to
+  `StreamingPmtilesWriter::add_tile_precompressed` instead of separate
+  zoom, x and y arguments. `Compression::from_str` is now
+  `Compression::parse`; `str::parse::<Compression>()` is also available.
+- Remote staging reports each operation's live concurrency, including
+  later operations in the same process (#779).
+
 ## v0.8.0 (2026-10-06)
 
 Sharded builds, much faster conversion and export, and a long list of

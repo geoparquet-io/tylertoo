@@ -1,0 +1,10 @@
+{
+ "bbox": [
+  -170.0,
+  -5.0,
+  -160.0,
+  5.0
+ ],
+ "expected_selected": 400,
+ "rule": "feature bbox, or it shifted by +-360, intersects bbox"
+}

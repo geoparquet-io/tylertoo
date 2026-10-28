@@ -6,6 +6,26 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
+## Fix at the Owner
+
+Most bugs here are a concept implemented in several places with a fix that reached one of them (#779): 15 of 23 fix PRs to `convert.rs` also had to edit `stream.rs`; the 2 GiB reader fix reached 2 of 4 paths (#577 → #606/#607); the geometry column had 4 resolvers (#518 → #676).
+
+Shared concepts have owners in core; the frontends consume them. The table
+records the ownership refactors landing in #779.
+
+| Concept | Owner |
+|---|---|
+| Opening untrusted Parquet/IPC input (batch-size cap, footer pre-check, panic → error) | `untrusted::{open_parquet, open_ipc}` (landing in #779) |
+| Options and their validation, before any I/O, for tiles/overview/export/pyramid, CLI and Python | `TilesConfig { convert, export }` and its `validate()` (landing in #779) |
+| Warnings, drop counters, and report lines | the typed `Diagnostic` channel in `diagnostics.rs`; one `Display` each (landing in #779) |
+| Geometry column, CRS, version, renames, property columns of an input | `ResolvedSchema` / `InputDescriptor`, computed once per input part (landing in #779) |
+| Pass-1 scan, assign, carriers, writer options, report, memory budget | the shared pipeline stages (`Pass1Ctx`, `MemoryBudget`) both engines call (landing in #779) |
+
+Clippy's `disallowed-methods` checks reader and output calls, cargo-deny
+checks dependency policy, jscpd checks Rust and Python token clones, and
+similarity-rs checks Rust function similarity. The CLI/Python parity tests
+check the current frontend surfaces. `ci/README.md` describes these tools.
+
 ## Agent-wide rules
 
 `AGENTS.md` holds the rules every coding agent follows, including how to
@@ -181,6 +201,7 @@ feat(cli): add --report flag to export-pmtiles
 | `examples/` | The two tutorials (Madagascar local, Brazil remote and sharded) as runnable scripts; `crates/python/tests/docs` runs them and checks the site shows them verbatim |
 | `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup, running CI gates locally |
 | `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
+| `ci/README.md` | CI tools, their scope, and local commands |
 | `context/archive/` | Frozen historical docs (plans, session artifacts, legacy-pipeline notes) |
 
 ## Setup

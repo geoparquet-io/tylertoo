@@ -1,8 +1,8 @@
 //! Level-banded GeoParquet overview writer (spec §4, §6.1).
 //!
-//! [`OverviewWriter`] drives a low-level [`parquet::file::writer::SerializedFileWriter`]
-//! (obtained from a [`parquet::arrow::ArrowWriter`] via
-//! [`ArrowWriter::into_serialized_writer`]) and a
+//! [`OverviewWriter`] drives a low-level [`tylertoo_io::SerializedFileWriter`]
+//! (obtained from a [`tylertoo_io::BatchWriter`] via
+//! [`tylertoo_io::BatchWriter::into_serialized_writer`]) and a
 //! [`geoparquet::writer::GeoParquetRecordBatchEncoder`]. The caller drives it
 //! **coarse → fine**, one level at a time; the writer:
 //!
@@ -61,19 +61,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch};
-use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_channel::{bounded, Receiver, RecvError, RecvTimeoutError};
-use parquet::arrow::arrow_writer::{
+use tylertoo_io::KeyValue;
+use tylertoo_io::ParquetError;
+use tylertoo_io::SerializedFileWriter;
+use tylertoo_io::{
     compute_leaves, ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::errors::ParquetError;
-use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::ColumnPath;
 
 use geoparquet::metadata::GeoParquetMetadata;
 use geoparquet::writer::{
@@ -152,6 +147,23 @@ pub enum RowGroupSizePolicy {
     ZoomScaled,
 }
 
+impl RowGroupSizePolicy {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowGroupSizePolicy::Constant => "constant",
+            RowGroupSizePolicy::ZoomScaled => "zoom-scaled",
+        }
+    }
+}
+
+/// The spelling [`RowGroupSizePolicy::as_str`] gives.
+impl std::fmt::Display for RowGroupSizePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for RowGroupSizePolicy {
     type Err = String;
 
@@ -225,6 +237,9 @@ pub struct OverviewWriterOptions {
     /// every reader of the overview would tile the wrong column. The convert
     /// paths set it to the input's primary column. Default `None`.
     pub primary_column: Option<String>,
+    /// The levels were independently cropped to a shard's spatial domain.
+    /// Such levels do not obey a whole-source cluster-mass equality.
+    pub source_is_subset: bool,
 }
 
 impl OverviewWriterOptions {
@@ -243,6 +258,7 @@ impl OverviewWriterOptions {
             generalization: None,
             encode_concurrency: 1,
             primary_column: None,
+            source_is_subset: false,
         }
     }
 }
@@ -252,7 +268,7 @@ impl OverviewWriterOptions {
 pub enum WriterError {
     /// Underlying parquet error.
     #[error("parquet error: {}", crate::input::parquet_error_detail(.0))]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
     /// Arrow error (e.g. building a record batch).
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -330,7 +346,7 @@ pub struct OverviewWriter<W: Write + Send> {
     /// itself runs on the Rayon pool (#296).
     writer: SerializedFileWriter<W>,
     /// Factory for a new row group's per-column Arrow writers, derived from the
-    /// same target schema + properties the [`ArrowWriter`] would have used.
+    /// same target schema + properties the serial batch writer would have used.
     rg_factory: ArrowRowGroupWriterFactory,
     /// The GeoParquet-encoded target schema (WKB geometry + generated covering).
     /// Held so the parallel encode tasks can map columns to leaves via
@@ -506,7 +522,9 @@ impl<W: Write + Send> OverviewWriter<W> {
             return Err(WriterError::LevelColumnExists);
         }
 
-        let geometry_columns = geometry_columns(source_schema);
+        let descriptor = crate::resolved_schema::ResolvedSchema::resolve(source_schema)
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        let geometry_columns = descriptor.geometry_columns().to_vec();
         if geometry_columns.is_empty() {
             return Err(WriterError::NoGeometryColumn);
         }
@@ -532,17 +550,7 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map(|(i, _)| i)
             .collect();
 
-        let wkb_columns: Vec<(usize, String)> = source_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                f.metadata()
-                    .get(EXTENSION_TYPE_NAME_KEY)
-                    .is_some_and(|name| name == "geoarrow.wkb")
-            })
-            .map(|(i, f)| (i, f.name().clone()))
-            .collect();
+        let wkb_columns = descriptor.wkb_columns();
 
         // Augment schema: retained source fields + NOT NULL Int32 `level`
         // column (§4.1).
@@ -554,23 +562,30 @@ impl<W: Write + Send> OverviewWriter<W> {
             .map(|(_, f)| f.clone())
             .collect();
         fields.push(Arc::new(Field::new(LEVEL_COLUMN, DataType::Int32, false)));
-        let augmented_schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            source_schema.metadata().clone(),
-        ));
+        let mut source_metadata = source_schema.metadata().clone();
+        source_metadata.remove(crate::resolved_schema::SOURCE_SUBSET_KEY);
+        let augmented_schema = Arc::new(Schema::new_with_metadata(fields, source_metadata));
 
         let gpq_options = geoparquet_options(options.primary_column.as_deref());
         let encoder = GeoParquetRecordBatchEncoder::try_new(&augmented_schema, &gpq_options)
             .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
         let target_schema = encoder.target_schema();
 
-        let props = build_writer_properties(&options, &geometry_columns, &augmented_schema)?;
-        // Build an ArrowWriter exactly as before (so the parquet schema, writer
-        // properties, and embedded `ARROW:schema` footer key are byte-for-byte
-        // what a serial ArrowWriter would produce), then lower it to a
-        // `SerializedFileWriter` + `ArrowRowGroupWriterFactory` so we can encode
-        // row groups off-thread and append them ourselves (#296).
-        let arrow_writer = ArrowWriter::try_new(sink, target_schema.clone(), Some(props))?;
+        let io_options = tylertoo_io::OverviewWriteOptions {
+            zstd_level: options.zstd_level,
+            full_column_stats: options.full_column_stats,
+            geometry_columns: geometry_columns.clone(),
+            covering_columns: geometry_columns
+                .iter()
+                .map(|g| covering_name_for(g))
+                .collect(),
+        };
+        let arrow_writer = tylertoo_io::overview_writer(
+            sink,
+            target_schema.clone(),
+            &augmented_schema,
+            &io_options,
+        )?;
         let (writer, rg_factory) = arrow_writer.into_serialized_writer()?;
 
         Ok(Self {
@@ -861,11 +876,7 @@ impl<W: Write + Send> OverviewWriter<W> {
         rx: Receiver<WkbEncodeResult>,
         asm: &mut RgAssembly,
     ) -> Result<(), WriterError> {
-        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
-        // downstream schema/metadata failure) leaves this writer's row groups
-        // in a partially-appended state, so it poisons the writer (defense in
-        // depth, see `Self::failed`) regardless of which step failed.
-        let outcome: Result<(), WriterError> = (|| {
+        self.with_write_failure(|writer| {
             // A disconnect means the task's sender was dropped without
             // sending — it never ran (pool shutdown). A panic inside the task
             // arrives as an ordinary `Err` on the channel instead (#426).
@@ -874,14 +885,11 @@ impl<W: Write + Send> OverviewWriter<W> {
                     WriterError::GeoParquet(format!("{WKB_TASK} did not report a result"))
                 })?
                 .map_err(WriterError::GeoParquet)?;
-            let encoded = align_to_target_schema(encoded, &self.target_schema)?;
-            fold_geo_metadata(&mut self.geo_meta_acc, geo_meta).map_err(WriterError::GeoParquet)?;
-            self.slice_into_row_groups(encoded, asm)
-        })();
-        if outcome.is_err() {
-            self.failed = true;
-        }
-        outcome
+            let encoded = align_to_target_schema(encoded, &writer.target_schema)?;
+            fold_geo_metadata(&mut writer.geo_meta_acc, geo_meta)
+                .map_err(WriterError::GeoParquet)?;
+            writer.slice_into_row_groups(encoded, asm)
+        })
     }
 
     /// Dispatch one complete row group's column encoding to the Rayon pool,
@@ -932,12 +940,7 @@ impl<W: Write + Send> OverviewWriter<W> {
     /// Wait for one in-flight row group's encode to finish and append its
     /// column chunks to the file as the next row group (serial, in order).
     fn drain_encoded(&mut self, rx: Receiver<EncodeResult>) -> Result<(), WriterError> {
-        // Any error here (disconnect, a caught panic surfaced as `Err`, or a
-        // failure appending the already-encoded chunks) leaves this writer's
-        // row groups in a partially-appended state, so it poisons the writer
-        // (defense in depth, see `Self::failed`) regardless of which step
-        // failed.
-        let outcome: Result<(), WriterError> = (|| {
+        self.with_write_failure(|writer| {
             // As in `drain_wkb_encoded`: a disconnect means the task never
             // ran; a panic inside it arrives as an `Err` on the channel (#426).
             let chunks = recv_in_pool(&rx).map_err(|_| {
@@ -945,14 +948,23 @@ impl<W: Write + Send> OverviewWriter<W> {
                     "{ROW_GROUP_TASK} did not report a result"
                 )))
             })??;
-            let mut rg_writer = self.writer.next_row_group()?;
+            let mut rg_writer = writer.writer.next_row_group()?;
             for chunk in chunks {
                 chunk.append_to_row_group(&mut rg_writer)?;
             }
             rg_writer.close()?;
-            self.row_groups_written += 1;
+            writer.row_groups_written += 1;
             Ok(())
-        })();
+        })
+    }
+
+    /// Every failed append poisons the writer, including a task disconnect,
+    /// caught encode panic, or downstream schema/metadata failure (#426).
+    fn with_write_failure(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> Result<(), WriterError>,
+    ) -> Result<(), WriterError> {
+        let outcome = write(self);
         if outcome.is_err() {
             self.failed = true;
         }
@@ -1006,11 +1018,38 @@ impl<W: Write + Send> OverviewWriter<W> {
             Some(geo_meta) => geo_meta,
             None => self.encoder.into_geoparquet_metadata(),
         };
-        let geo_kv = KeyValue::new(
-            "geo".to_string(),
-            geo_metadata_json_deterministic(&geo_meta)?,
-        );
-        self.writer.append_key_value_metadata(geo_kv);
+        let geo_json = geo_metadata_json_deterministic(&geo_meta)?;
+        // The descriptor describes the PHYSICAL output schema (generated covering
+        // and level column included), not the input's now-stale bbox or indices.
+        let mut schema_metadata = self.target_schema.metadata().clone();
+        schema_metadata.retain(|key, _| {
+            !key.eq_ignore_ascii_case("geo") && key != crate::resolved_schema::RESOLVED_SCHEMA_KEY
+        });
+        schema_metadata.insert("geo".to_string(), geo_json.clone());
+        schema_metadata.insert(OVERVIEWS_KEY.to_string(), meta.to_json()?);
+        if self.options.source_is_subset {
+            schema_metadata.insert(
+                crate::resolved_schema::SOURCE_SUBSET_KEY.to_string(),
+                "true".to_string(),
+            );
+            self.writer.append_key_value_metadata(KeyValue::new(
+                crate::resolved_schema::SOURCE_SUBSET_KEY.to_string(),
+                "true".to_string(),
+            ));
+        }
+        let output_schema =
+            Schema::new_with_metadata(self.target_schema.fields().clone(), schema_metadata);
+        let descriptor = crate::resolved_schema::ResolvedSchema::resolve(&output_schema)
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        let descriptor_json = descriptor
+            .footer_json()
+            .map_err(|e| WriterError::GeoParquet(e.to_string()))?;
+        self.writer
+            .append_key_value_metadata(KeyValue::new("geo".to_string(), geo_json));
+        self.writer.append_key_value_metadata(KeyValue::new(
+            crate::resolved_schema::RESOLVED_SCHEMA_KEY.to_string(),
+            descriptor_json,
+        ));
 
         // `geo:overviews` footer key (§3).
         let overviews_json = meta.to_json()?;
@@ -1351,21 +1390,6 @@ pub(crate) fn geo_metadata_json_deterministic(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Names of geometry columns in a schema (fields carrying a `geoarrow.*`
-/// extension type). Mirrors the geoparquet encoder's detection.
-fn geometry_columns(schema: &Schema) -> Vec<String> {
-    schema
-        .fields()
-        .iter()
-        .filter(|f| {
-            f.metadata()
-                .get(EXTENSION_TYPE_NAME_KEY)
-                .is_some_and(|name| name.starts_with("geoarrow"))
-        })
-        .map(|f| f.name().clone())
-        .collect()
-}
-
 /// Whether `field` is a bbox-covering struct: a `Struct` whose child field
 /// names are exactly `{xmin, ymin, xmax, ymax}` (case-insensitive). Used to
 /// recognise (and drop) a pre-existing covering column that would collide with
@@ -1428,7 +1452,8 @@ pub(crate) fn is_covering_column(
 /// Covering column name the encoder will produce for a geometry column, per its
 /// default rule (`bbox` for `geometry`/`geography`, else `{name}_bbox`).
 pub(crate) fn covering_name_for(column_name: &str) -> String {
-    if column_name == "geometry" || column_name == "geography" {
+    if column_name == crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN || column_name == "geography"
+    {
         "bbox".to_string()
     } else {
         format!("{column_name}_bbox")
@@ -1575,76 +1600,6 @@ fn round_up_clean(n: usize) -> usize {
     n.div_ceil(STEP).saturating_mul(STEP)
 }
 
-/// Build [`WriterProperties`]: ZSTD, no dictionary on geometry + bbox columns
-/// (§4.5), manual per-level row-group control, and statistics tuned so the
-/// footer stays small (H1) while the pruning index survives.
-///
-/// - `set_max_row_group_row_count(Some(usize::MAX))`: the writer never splits row groups on
-///   its own; [`OverviewWriter::write_level`] drives every boundary so each
-///   level is sized independently and ends on a row-group boundary (§4.2).
-/// - Statistics: the bbox covering children and `level` column keep full stats
-///   (the spatial-pruning index, §4.4). Unless `full_column_stats` is set, the
-///   WKB geometry column and every Utf8/Binary property column have their stats
-///   suppressed — their per-row-group min/max are never used by a reader but
-///   dominate the footer on high-cardinality data (e.g. Overture ULID `id`).
-fn build_writer_properties(
-    options: &OverviewWriterOptions,
-    geometry_columns: &[String],
-    augmented_schema: &Schema,
-) -> Result<WriterProperties, WriterError> {
-    let mut builder = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(options.zstd_level)?))
-        // Manual per-level row-group control (see write_level): disable the
-        // writer's own row-count splitting.
-        .set_max_row_group_row_count(Some(usize::MAX))
-        // Per-row-group (chunk) statistics are the spatial-pruning index (§4.4);
-        // Page-level also carries chunk-level min/max.
-        .set_statistics_enabled(EnabledStatistics::Page);
-
-    let geom_set: std::collections::HashSet<&str> =
-        geometry_columns.iter().map(|s| s.as_str()).collect();
-
-    for geom in geometry_columns {
-        // Geometry (WKB) column: no dictionary (§4.5).
-        builder = builder.set_column_dictionary_enabled(ColumnPath::from(geom.clone()), false);
-
-        // bbox covering struct children: no dictionary (§4.5).
-        let covering = covering_name_for(geom);
-        for child in ["xmin", "ymin", "xmax", "ymax"] {
-            let path = ColumnPath::from(vec![covering.clone(), child.to_string()]);
-            builder = builder.set_column_dictionary_enabled(path, false);
-        }
-    }
-
-    // Statistics suppression on high-cardinality columns (H1). Suppress the WKB
-    // geometry column and every string/binary property column; keep everything
-    // else (covering children — a generated `bbox` struct not present in this
-    // schema — and the `level` column both keep the default Page stats).
-    if !options.full_column_stats {
-        for field in augmented_schema.fields() {
-            let name = field.name();
-            let is_geometry = geom_set.contains(name.as_str());
-            let is_string_or_binary = matches!(
-                field.data_type(),
-                DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-                    | DataType::Binary
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-            );
-            if is_geometry || is_string_or_binary {
-                builder = builder.set_column_statistics_enabled(
-                    ColumnPath::from(name.clone()),
-                    EnabledStatistics::None,
-                );
-            }
-        }
-    }
-
-    Ok(builder.build())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,8 +1609,8 @@ mod tests {
     use geoarrow::array::GeometryBuilder;
     use geoarrow::datatypes::GeometryType;
     use geoarrow_array::GeoArrowArray;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::file::statistics::Statistics;
+
+    use tylertoo_io::Statistics;
 
     /// Deterministic geometry for a feature id: even ids are points, odd ids are
     /// square polygons. Keeps a mix of Point + Polygon in the column.
@@ -1730,7 +1685,7 @@ mod tests {
     /// Read the `level` column values for a single row group.
     fn read_level_column(path: &std::path::Path, rg: usize) -> Vec<i32> {
         let file = File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let reader = builder.with_row_groups(vec![rg]).build().unwrap();
         let mut out = Vec::new();
         for batch in reader {
@@ -1752,7 +1707,7 @@ mod tests {
     /// byte compare is invalid; #296).
     fn layout_and_rows(path: &std::path::Path) -> (Vec<i64>, Vec<(i32, i64)>) {
         let file = File::open(path).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let md = builder.metadata().clone();
         let rows_per_rg: Vec<i64> = (0..md.num_row_groups())
             .map(|i| md.row_group(i).num_rows())
@@ -1858,30 +1813,14 @@ mod tests {
     /// the `covering` columns; comparing the raw JSON keeps the footer check
     /// faithful to exactly what is written.
     fn geo_footer(path: &std::path::Path) -> serde_json::Value {
-        let file = File::open(path).unwrap();
-        let md = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
-        let kv = md
-            .file_metadata()
-            .key_value_metadata()
-            .unwrap()
-            .iter()
-            .find(|kv| kv.key == "geo")
-            .expect("geo footer key present")
-            .clone();
-        serde_json::from_str(kv.value.as_ref().unwrap()).unwrap()
+        serde_json::from_str(&geo_footer_raw(path)).unwrap()
     }
 
     /// The raw (unparsed) `geo` footer JSON string, for byte-identical
     /// determinism checks (#508).
     fn geo_footer_raw(path: &std::path::Path) -> String {
         let file = File::open(path).unwrap();
-        let md = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let md = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         md.file_metadata()
             .key_value_metadata()
             .unwrap()
@@ -1897,6 +1836,7 @@ mod tests {
     /// order-independent comparison. `geo_metadata_json_deterministic` (#508,
     /// fixed) already makes the written array order stable run to run, so
     /// this sort is now belt-and-suspenders rather than load-bearing.
+    #[cfg(test)]
     fn footer_geometry_types(footer: &serde_json::Value, column: &str) -> Vec<String> {
         let mut types: Vec<String> = footer["columns"][column]["geometry_types"]
             .as_array()
@@ -1946,6 +1886,7 @@ mod tests {
 
     /// Sorted string forms of a column's geometry types (the set has no
     /// deterministic iteration order).
+    #[cfg(test)]
     fn sorted_geometry_types(meta: &GeoParquetMetadata, column: &str) -> Vec<String> {
         let mut types: Vec<String> = meta.columns[column]
             .geometry_types
@@ -2511,10 +2452,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let parquet_meta = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let parquet_meta = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
 
         // Exactly ONE physical `bbox.xmin` column — no `bbox`/`bbox_1`
         // duplication from passing the input covering through.
@@ -2601,7 +2539,7 @@ mod tests {
 
         // Re-open and inspect the physical file.
         let file = File::open(tmp.path()).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let parquet_meta = builder.metadata().clone();
         assert_eq!(parquet_meta.num_row_groups(), 3);
 
@@ -2685,7 +2623,7 @@ mod tests {
 
         // Canonical-level rows (RG 2) re-read value-identical to the input.
         let file = File::open(tmp.path()).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader = tylertoo_io::open_parquet(file)
             .unwrap()
             .with_row_groups(vec![2])
             .build()
@@ -2766,7 +2704,7 @@ mod tests {
         assert_eq!(written_meta.canonical_level, None);
 
         let file = File::open(tmp.path()).unwrap();
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let builder = tylertoo_io::open_parquet(file).unwrap();
         let kvs = builder
             .metadata()
             .file_metadata()
@@ -2879,10 +2817,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), 4);
         // Level 0 is a single row group of all 3 rows.
         assert_eq!(pm.row_group(0).num_rows(), 3);
@@ -2953,10 +2888,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), projected);
     }
 
@@ -2995,10 +2927,7 @@ mod tests {
             writer.finish().unwrap();
         }
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), projected);
     }
 
@@ -3105,10 +3034,7 @@ mod tests {
         }
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert!(
             pm.num_row_groups() <= ceiling,
             "row groups {} exceed the mocked ceiling {ceiling}",
@@ -3165,10 +3091,7 @@ mod tests {
         assert_eq!(meta.levels[1].row_group_end, 3);
 
         let file = File::open(tmp.path()).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         assert_eq!(pm.num_row_groups(), 4);
         assert_eq!(pm.row_group(0).num_rows(), 10);
         let l1: Vec<i64> = (1..=3).map(|r| pm.row_group(r).num_rows()).collect();
@@ -3188,10 +3111,7 @@ mod tests {
     /// `path`? Helper for the stats-suppression tests.
     fn rg_has_stats(path: &std::path::Path, rg: usize, col_path: &str) -> bool {
         let file = File::open(path).unwrap();
-        let pm = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .metadata()
-            .clone();
+        let pm = tylertoo_io::open_parquet(file).unwrap().metadata().clone();
         pm.row_group(rg)
             .columns()
             .iter()

@@ -1,225 +1,107 @@
-# Mutation Diff — cargo-mutants on the lines a PR changes.
-#
-# Purpose: the weekly sweep (mutation-tests.yml, ~8200 mutants, ~120 CPU-
-# hours) is far too slow for the PR path, so mutation testing never saw a
-# change before it merged. This workflow gives every PR a diff-scoped run:
-# `cargo mutants --in-diff` generates mutants only inside the hunks of
-# `git diff origin/<base>...HEAD`. It reads the same .cargo/mutants.toml as
-# the weekly job (nextest, `quick` tier, timeouts), so the two measurements
-# agree; scripts/mutants-diff.sh is the local twin.
-#
-# Layout (#756): `plan` lists the mutants, `mutants` is a matrix that runs
-# one `--shard k/n` slice each, and `summary` merges the shards into one
-# job summary and one sticky PR comment.
-#
-# Why shards: one runner did ~0.5 min per mutant after ~6 min of setup and
-# baseline, so a 20-mutant diff took 12-17 min, a 65-mutant one 41 min, and
-# anything past ~130 hit the 45-min step timeout and posted nothing. A
-# result that lands after the PR merged doesn't get used. Now the plan sizes
-# the shard count at ~MUTANTS_PER_SHARD mutants each, up to MAX_SHARDS
-# runners (the org runs 20 jobs at once across every PR; a core PR's CI
-# already holds ~13), so a diff up to MAX_SHARDS x MUTANTS_PER_SHARD
-# mutants finishes in ~15 min.
-#
-# Bigger diffs get a sample, on time: each shard takes its mutants
-# round-robin across the whole diff, runs them in random order (--shuffle),
-# and stops at the step timeout. The summary says how many of the planned
-# mutants were tested, and missed mutants from a partial run are still
-# posted: a missed mutant is real whether or not its neighbours ran.
-#
-# Advisory, never red: each shard's mutants step has continue-on-error and
-# its own timeout, and the result is a job summary (score, per-outcome
-# counts, the missed mutants as file:line) plus, when mutants are missed on
-# a same-repo PR, one sticky PR comment updated in place on every run. A
-# missed mutant is a hint about test strength, not a defect in the change,
-# and equivalent mutants exist, so a gate here would train people to ignore
-# it. Only the `comment` job holds `pull-requests: write`; it never checks
-# out code.
-#
-# No memory cap: mutation-tests.yml (#602/#604) runs its shards in a cgroup
-# because a runaway mutant (a loop that no longer advances) can fill the
-# runner's RAM and take the VM down. A diff-scoped shard is small enough
-# that a lost job costs minutes, not hours, and it is advisory, so the
-# cgroup dance is not worth its sudo and self-test here; port it from the
-# weekly job if a lost runner ever becomes a habit.
-#
-# PRs that change no Rust under crates/core/ (docs, workflows, CLI, Python)
-# stop after the plan job's diff; only tylertoo-core is mutated, as in the
-# weekly job.
-
+# Direct cargo-mutants exit status gates every code PR through CI passed.
 name: Mutation Diff
 
 on:
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-# A new push to the PR supersedes the previous run: the old result would
-# describe lines that no longer exist.
-concurrency:
-  group: mutation-diff-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # Shard sizing; see the header.
-  MUTANTS_PER_SHARD: "12"
-  MAX_SHARDS: "4"
+  MUTATION_TOOL: cargo-mutants@27.1.0
+  # Runner budget: see the plan step.
+  MAX_SHARDS: 4
 
 jobs:
   plan:
-    name: Plan mutants
+    name: Plan mutation shards
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      rust_changed: ${{ steps.diff.outputs.rust_changed }}
-      planned: ${{ steps.plan.outputs.planned }}
       shards: ${{ steps.plan.outputs.shards }}
-      shard_count: ${{ steps.plan.outputs.shard_count }}
+      shard_total: ${{ steps.plan.outputs.shard_total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Full history so the merge-base with the base branch exists for
-          # the three-dot diff below.
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Diff against the base branch
-        id: diff
-        env:
-          # Empty on workflow_dispatch: measure the dispatched ref against main.
-          BASE_REF: ${{ github.base_ref || 'main' }}
-        # On pull_request the checkout is the merge commit of the PR onto
-        # its base, so `origin/<base>...HEAD` is exactly the PR's change
-        # as it would land. Only tylertoo-core is mutated (as in the weekly
-        # job: the pyo3 cdylib's wrappers have no Rust tests and would all
-        # show as missed), so only Rust under crates/core/ can yield
-        # mutants and anything else is a clean skip. A deletion-only diff
-        # has no `+++ b/` lines but is still a diff.
-        run: |
-          git diff "origin/$BASE_REF...HEAD" -- ':(glob)crates/core/**/*.rs' > pr.diff
-          if [ -s pr.diff ]; then
-            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Rust files changed vs origin/$BASE_REF:"
-            grep '^+++ b/' pr.diff | sed 's|^+++ b/|  |' || echo "  (deletions only)"
-          else
-            echo "rust_changed=false" >> "$GITHUB_OUTPUT"
-            echo "No Rust source under crates/core/ changed vs origin/$BASE_REF; skipping."
-            {
-              echo "## Mutation Diff"
-              echo ""
-              echo "Skipped: this PR changes no Rust source under \`crates/core/\`, so there is nothing to mutate."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
+          fetch-depth: 2
       - name: Install Rust
-        if: steps.diff.outputs.rust_changed == 'true'
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-
-      - name: Install cargo-mutants
-        if: steps.diff.outputs.rust_changed == 'true'
-        # Pinned to the release the weekly job currently resolves (its
-        # install-action line floats), so the two runs agree on the
-        # mutation catalogue; bump both together, and the shard job below.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - name: Install mutation tools
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-mutants@27.1.0
-
-      # Listing reads `cargo metadata` and parses the source; it builds
-      # nothing. A diff that touches Rust but no mutation site (tests only,
-      # a cfg(test) module, comments) plans zero mutants and starts no
-      # shard.
-      - name: List the mutants and size the shards
+          tool: ${{ env.MUTATION_TOOL }}
+      - name: Size shards from the PR diff
         id: plan
-        if: steps.diff.outputs.rust_changed == 'true'
+        shell: bash
         run: |
-          cargo mutants --package tylertoo-core --in-diff pr.diff --list > mutants.list
-          planned=$(wc -l < mutants.list)
-          n=$(( (planned + MUTANTS_PER_SHARD - 1) / MUTANTS_PER_SHARD ))
-          [ "$n" -le "$MAX_SHARDS" ] || n=$MAX_SHARDS
-          [ "$n" -ge 1 ] || n=1
-          shards=$(seq 0 $((n - 1)) | jq -cs .)
+          # Reuse the gate's diff, workspace and config; listing never compiles.
+          # A single shard lists the whole set; --sharding requires --shard.
+          # No changed Rust files produces no JSON; slurp treats that as [].
+          count=$(scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard 0/1 -j 2 --list --json | jq -s 'add // [] | length')
+          # The diff is cut into ceil(count / 40) round-robin slices, and at
+          # most MAX_SHARDS of them run: the org runs 20 jobs at once across
+          # every PR and a core PR's CI already holds ~13. Up to 160 mutants
+          # that is the whole diff; past it, slices 0..3 are a fixed sample
+          # spread across the whole diff (round-robin), the same on every run.
+          # The weekly mutation-tests.yml sweep covers the rest.
+          total=$(jq -n --argjson n "$count" 'if $n == 0 then 0 else ($n / 40 | ceil) end')
+          shards=$(jq -cn --argjson t "$total" --argjson m "$MAX_SHARDS" '[range(0; ([$t, $m] | min))]')
+          run=$(jq -n --argjson n "$count" --argjson t "$total" --argjson m "$MAX_SHARDS" 'if $t <= $m then $n else ([range(0; $m)] | map(($n - . + $t - 1) / $t | floor) | add) end')
+          echo "$count mutants in this diff; running slices $shards of $total ($run mutants)"
           {
-            echo "planned=$planned"
-            echo "shard_count=$n"
-            echo "shards=$shards"
-          } >> "$GITHUB_OUTPUT"
-          echo "$planned mutants in the diff, $n shard(s):"
-          cat mutants.list
-
-      - name: Upload the plan
-        if: steps.diff.outputs.rust_changed == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: mutation-diff-plan
-          path: |
-            pr.diff
-            mutants.list
+            echo "### Mutation plan"
+            echo "$count mutants in this diff. Running slices \`$shards\` of $total: $run mutants."
+            if [ "$total" -gt "$MAX_SHARDS" ]; then
+              echo "Diff exceeds $((MAX_SHARDS * 40)) mutants: this is a fixed round-robin sample."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shard_total=$total" >> "$GITHUB_OUTPUT"
 
   mutants:
-    name: Mutants (shard ${{ matrix.shard }})
+    name: Mutants (workspace diff, shard ${{ matrix.shard }})
     needs: plan
-    if: needs.plan.outputs.rust_changed == 'true' && needs.plan.outputs.planned != '0'
+    # Job conditions run before matrix expansion: [] launches no runners.
+    if: needs.plan.outputs.shards != '[]'
     runs-on: ubuntu-latest
-    # Ceiling for the whole job; the mutants step below carries its own,
-    # shorter one so a slow shard ends as an advisory partial result rather
-    # than a cancelled job.
-    timeout-minutes: 40
+    timeout-minutes: 90
+    # Run every slice; one survivor must not cancel the others' evidence.
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      # The slice count comes from the plan, not the matrix: a sampled
+      # diff runs fewer jobs than it has slices.
+      SHARD_COUNT: ${{ needs.plan.outputs.shard_total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The submodule so the baseline's geometry tests pass in
-          # cargo-mutants' scratch copy (#419).
           submodules: recursive
           persist-credentials: false
-
-      # The plan's diff, not a fresh one: every shard must split the same
-      # mutant list (https://mutants.rs/shards.html).
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: mutation-diff-plan
-
-      - name: Cache test fixtures
-        id: fixture-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: tests/fixtures/realdata/*.parquet
-          key: fixtures-v1-${{ runner.os }}-${{ hashFiles('tests/fixtures/realdata/*.parquet') }}
-
+          fetch-depth: 2
       - name: Download test fixtures
-        if: steps.fixture-cache.outputs.cache-hit != 'true'
-        run: |
-          gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
         env:
           GH_TOKEN: ${{ github.token }}
-
+        run: gh release download fixtures-v1 --dir tests/fixtures/realdata/ --clobber
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-
+      - name: Install mutation tools
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          # All shards must enumerate with the same mutator version.
+          tool: ${{ env.MUTATION_TOOL }},cargo-nextest
       - name: Install protoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      # The `quick` tier the baseline runs includes decode_roundtrip's
-      # tippecanoe-decode golden test, a hard failure under CI when the
-      # binary is missing (#420): same pinned build as the Test job in
-      # ci.yml and the weekly mutation job.
-      - name: Install tippecanoe build deps
-        run: sudo apt-get install -y libsqlite3-dev zlib1g-dev
-
+          sudo apt-get install -y protobuf-compiler libsqlite3-dev zlib1g-dev
       - name: Cache tippecanoe
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -227,314 +109,48 @@ jobs:
             .tools/tippecanoe-*
             .tools/src-*
           key: tippecanoe-${{ hashFiles('benchmarks/e2e/setup_tippecanoe.sh') }}-${{ runner.os }}-${{ runner.arch }}
-
       - name: Build tippecanoe (pinned tag + SHA) and put it on PATH
         run: |
           benchmarks/e2e/setup_tippecanoe.sh
           eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
           dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
-
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install cargo-mutants and cargo-nextest
-        # cargo-mutants: same pin as the plan job. nextest:
-        # .cargo/mutants.toml sets test_tool = "nextest" so the quick tier
-        # from .config/nextest.toml applies to every mutant.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-mutants@27.1.0,cargo-nextest
-
-      - name: Sanity-check the scratch copy sees the fixtures
-        # Fail fast (seconds, not the multi-minute baseline) with a clear
-        # message if the checkout regresses (#419).
+      - name: Install go-pmtiles (pinned, checksummed)
         run: |
-          test -d tests/fixtures/geometry-test-data/examples \
-            || { echo "::error::geometry-test-data submodule is empty — checkout needs submodules: recursive"; exit 1; }
-          test -f tests/fixtures/realdata/fieldmaps-boundaries.parquet \
-            || { echo "::error::realdata fixtures missing — gh release download failed"; exit 1; }
-
-      - name: Run cargo-mutants on this shard
-        id: mutants
-        # Advisory: a missed mutant (exit 2) or a timeout (exit 3) is a
-        # completed measurement and passes; a failed baseline (4: the
-        # PR's own tests fail, which CI's Test job reports properly) or an
-        # internal error fails this step only, and the job goes on to
-        # upload what it has. The step timeout (not the job's) bounds a
-        # big shard the same way: cargo-mutants writes outcomes.json after
-        # every mutant, so the summary shows the partial result.
-        # Round-robin + --shuffle make a partial shard a random sample of
-        # the whole diff, not its first few files.
-        # Exit codes: https://mutants.rs/exit-codes.html
-        #
-        # `--output DIR` creates mutants.out *inside* DIR.
-        continue-on-error: true
-        timeout-minutes: 20
-        env:
-          SHARD: ${{ matrix.shard }}
-          SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
-        run: |
-          echo "unfinished" > exit_code
-          start=$(date +%s)
-          set +e
-          cargo mutants --package tylertoo-core --in-diff pr.diff --output . -j 2 \
-            --shard "$SHARD/$SHARD_COUNT" --sharding round-robin --shuffle
-          code=$?
-          set -e
-          echo "$code" > exit_code
-          echo "$(( $(date +%s) - start ))" > elapsed
-          case "$code" in
-            0|2|3) echo "cargo mutants finished (exit $code)"; exit 0 ;;
-            4) echo "::warning::cargo mutants: unmutated baseline failed, no mutants tested"; exit 1 ;;
-            *) echo "::warning::cargo mutants failed with exit $code"; exit 1 ;;
-          esac
-
-      - name: Upload this shard's results
-        if: (!cancelled())
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
+      - name: Test mutants in the PR diff
+        run: scripts/mutants-diff.sh HEAD^1 --cap-lints true --sharding round-robin --shard "$SHARD/$SHARD_COUNT" -j 2
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mutation-diff-shard-${{ matrix.shard }}
-          path: |
-            mutants.out/
-            exit_code
-            elapsed
-          if-no-files-found: warn
+          name: mutation-diff-${{ matrix.shard }}
+          path: mutants.out/
+          if-no-files-found: ignore
 
-  summary:
-    name: Mutation score (diff-scoped)
+  gate:
+    name: Mutation gate
     needs: [plan, mutants]
-    # `!cancelled()` rather than `always()`: a run superseded by a newer
-    # push must not report. A failed or skipped shard still reports.
-    if: (!cancelled()) && needs.plan.outputs.rust_changed == 'true'
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    outputs:
-      measured: ${{ steps.summary.outputs.measured }}
-      missed: ${{ steps.summary.outputs.missed }}
-      comment: ${{ steps.summary.outputs.comment }}
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: mutation-diff-shard-*
-          path: shards
-
-      - name: Merge the shards and post the summary
-        id: summary
-        # `measured` tells the comment job whether the run is complete: a
-        # failed baseline or missing fixtures leave outcomes.json absent or
-        # partial, and rewriting the sticky comment to "all caught" from
-        # that would be a lie. Missed mutants from a partial run are still
-        # reported (see the header).
+      - name: Require successful planning and mutation tests
         env:
-          PLANNED: ${{ needs.plan.outputs.planned }}
-          SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          BASE_REF: ${{ github.base_ref || 'main' }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          MUTANTS_RESULT: ${{ needs.mutants.result }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
-          {
-            echo "## Mutation Diff"
-            echo ""
-            echo "cargo-mutants on the lines this change touches (\`git diff origin/$BASE_REF...HEAD\`, Rust under \`crates/core/\`). Advisory: never a red check."
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "${PLANNED:-}" = "0" ]; then
-            echo "No mutants in this diff: the changed Rust lines hold no mutation site (tests, cfg(test) modules, comments)." >> "$GITHUB_STEP_SUMMARY"
-            {
-              echo "measured=true"
-              echo "missed=0"
-              echo "comment="
-            } >> "$GITHUB_OUTPUT"
-            exit 0
+          if [[ "$PLAN_RESULT" != success ]]; then
+            echo "::error::Mutation planning $PLAN_RESULT"
+            exit 1
           fi
-
-          mkdir -p merged
-          : > merged/missed.txt
-          : > merged/timeout.txt
-          reported=0
-          codes=""
-          slowest=0
-          for dir in shards/mutation-diff-shard-*; do
-            [ -d "$dir" ] || continue
-            codes="$codes $(cat "$dir/exit_code" 2>/dev/null || echo none)"
-            e=$(cat "$dir/elapsed" 2>/dev/null || echo 0)
-            [ "$e" -gt "$slowest" ] && slowest=$e
-            if [ -f "$dir/mutants.out/outcomes.json" ]; then
-              reported=$((reported + 1))
-              cp "$dir/mutants.out/outcomes.json" "merged/outcomes-$(basename "$dir").json"
-              for kind in missed timeout; do
-                if [ -f "$dir/mutants.out/$kind.txt" ]; then
-                  cat "$dir/mutants.out/$kind.txt" >> "merged/$kind.txt"
-                fi
-              done
-            fi
-          done
-
-          if [ "$reported" -eq 0 ]; then
-            {
-              echo "Inconclusive: no shard wrote an outcomes.json (planned $PLANNED mutants over $SHARD_COUNT shard(s); exit codes:${codes:- none})."
-              echo "A failed baseline (exit 4) means this branch's own tests fail; see the shard logs and the mutation-diff-shard-* artifacts."
-            } >> "$GITHUB_STEP_SUMMARY"
-            {
-              echo "measured=false"
-              echo "missed=0"
-              echo "comment="
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # outcomes.json top-level counts (cargo-mutants' LabOutcome),
-          # summed over the shards. Score = caught / (caught + missed +
-          # timeout): unviable mutants (did not compile) are not a test-
-          # suite failure, matching how cargo-mutants itself reports.
-          read -r total caught missed timeout unviable < <(jq -rs \
-            'map([.total_mutants, .caught, .missed, .timeout, .unviable])
-             | transpose | map(add) | @tsv' merged/outcomes-*.json)
-          tested=$((caught + missed + timeout))
-          if [ "$tested" -gt 0 ]; then
-            score=$(awk -v c="$caught" -v t="$tested" 'BEGIN { printf "%.1f", 100 * c / t }')
+          if [[ "$SHARDS" == '[]' && "$MUTANTS_RESULT" == skipped ]]; then
+            echo "No mutants in this diff"
+          elif [[ "$MUTANTS_RESULT" == success ]]; then
+            echo "All mutation shards passed"
           else
-            score="n/a"
-          fi
-          echo "missed=$missed" >> "$GITHUB_OUTPUT"
-
-          # outcomes.json counts only mutants that ran (total_mutants grows
-          # per tested mutant), so "partial" is measured against the plan.
-          # A complete run is a measurement even when some mutants were
-          # missed or timed out (exit 2/3).
-          partial=""
-          done_count=$((tested + unviable))
-          if [ "$done_count" -lt "$PLANNED" ]; then
-            partial=" (partial: ${done_count} of ${PLANNED} planned mutants, a random sample; shard exit codes:${codes})"
-            echo "measured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "measured=true" >> "$GITHUB_OUTPUT"
-          fi
-          took=" in $((slowest / 60))m$((slowest % 60))s over ${SHARD_COUNT} shard(s)"
-
-          # Same body for the summary and the sticky comment, minus the header.
-          {
-            echo "**Mutation score: ${score}%** (${caught} caught / ${tested} tested${took})${partial}"
-            echo ""
-            echo "| Outcome | Count |"
-            echo "|---|---|"
-            echo "| Planned (in diff) | ${PLANNED} |"
-            echo "| Tested | ${total} |"
-            echo "| Caught | ${caught} |"
-            echo "| Missed | ${missed} |"
-            echo "| Timeout | ${timeout} |"
-            echo "| Unviable (did not compile) | ${unviable} |"
-            echo ""
-            for kind in missed timeout; do
-              list=merged/${kind}.txt
-              if [ -s "$list" ]; then
-                n=$(wc -l < "$list")
-                echo "<details open><summary>${kind} (${n})</summary>"
-                echo ""
-                echo '```'
-                sort "$list" | head -n 100
-                [ "$n" -gt 100 ] && echo "... ($((n - 100)) more in the mutation-diff-shard-* artifacts)"
-                echo '```'
-                echo "</details>"
-                echo ""
-              fi
-            done
-          } > body.md
-          cat body.md >> "$GITHUB_STEP_SUMMARY"
-
-          # The sticky comment gets a title, the run link and the how-to.
-          {
-            echo "### Mutation Diff: ${missed} missed mutant(s) in this change"
-            echo ""
-            cat body.md
-            echo "A missed mutant is a code change no test in the \`quick\` tier detects; it is a hint about test strength, not a failure. Some are equivalent mutants and can be ignored. Reproduce locally with \`scripts/mutants-diff.sh\`. [Run](${RUN_URL}) · updated in place on every push."
-          } > comment.md
-          {
-            echo "comment<<MUTATION_DIFF_EOF_$GITHUB_RUN_ID"
-            cat comment.md
-            echo "MUTATION_DIFF_EOF_$GITHUB_RUN_ID"
-          } >> "$GITHUB_OUTPUT"
-
-  comment:
-    name: Sticky PR comment
-    needs: [plan, summary]
-    # Same-repo PRs only: a fork's GITHUB_TOKEN is read-only, so posting
-    # would fail there anyway (the job summary still has the result).
-    # `!cancelled()` rather than `always()`: a run superseded by a newer
-    # push must not touch the comment.
-    if: >-
-      (!cancelled()) && github.event_name == 'pull_request'
-      && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Create or update the sticky comment
-        # One comment per PR, found by its HTML marker and edited in place.
-        # Created only when a mutant is missed (a partial run's missed
-        # mutants count); once it exists, a later clean run (all caught, no
-        # mutants in the diff, or no Rust left in the diff) rewrites it
-        # instead of leaving a stale list. An inconclusive run (failed
-        # baseline, missing fixtures, a partial run with nothing missed)
-        # leaves the comment alone. Never a second comment.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RUST_CHANGED: ${{ needs.plan.outputs.rust_changed }}
-          PLANNED: ${{ needs.plan.outputs.planned }}
-          MEASURED: ${{ needs.summary.outputs.measured }}
-          MISSED: ${{ needs.summary.outputs.missed }}
-          COMMENT: ${{ needs.summary.outputs.comment }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ "$RUST_CHANGED" = "true" ] && [ "$MEASURED" != "true" ] && [ "${MISSED:-0}" -eq 0 ]; then
-            echo "Run was inconclusive (measured=${MEASURED:-unset}, nothing missed); leaving any existing comment alone."
-            exit 0
-          fi
-
-          marker='<!-- mutation-diff-sticky-comment -->'
-          existing=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
-
-          if [ "${MISSED:-0}" -gt 0 ] && [ -n "$COMMENT" ]; then
-            body="$marker
-          $COMMENT"
-          elif [ -z "$existing" ]; then
-            echo "No missed mutants and no earlier comment: nothing to post."
-            exit 0
-          elif [ "$RUST_CHANGED" = "true" ] && [ "$PLANNED" = "0" ]; then
-            body="$marker
-          ### Mutation Diff: no mutants in this diff
-
-          The latest push changes Rust under \`crates/core/\`, but the changed lines hold no mutation site (tests, cfg(test) modules, comments). [Run](${RUN_URL})"
-          elif [ "$RUST_CHANGED" = "true" ]; then
-            body="$marker
-          ### Mutation Diff: all mutants in this change are caught
-
-          The latest push leaves no missed mutant in the diff-scoped run. [Run](${RUN_URL})"
-          else
-            body="$marker
-          ### Mutation Diff: nothing to mutate
-
-          The latest push changes no Rust source under \`crates/core/\`, so the diff-scoped run was skipped. [Run](${RUN_URL})"
-          fi
-
-          if [ -n "$existing" ]; then
-            echo "Updating comment $existing"
-            gh api -X PATCH "repos/$GH_REPO/issues/comments/$existing" -f body="$body" --silent
-          else
-            echo "Creating comment on #$PR_NUMBER"
-            gh api -X POST "repos/$GH_REPO/issues/$PR_NUMBER/comments" -f body="$body" --silent
+            echo "::error::Mutation shards $MUTANTS_RESULT"
+            exit 1
           fi

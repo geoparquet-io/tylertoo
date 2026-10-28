@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exit 0 when every changed path read from stdin is Python-side or
-# documentation, 1 otherwise. CI uses it to skip the Rust-only jobs (Check,
-# Test, Slow Tests, Coverage, Archive e2e, tippecanoe parity) on PRs that
+# documentation, 1 otherwise. CI uses it to skip build/test jobs (Test, Slow Tests,
+# Coverage, Archive e2e, tippecanoe parity) on PRs that
 # can't change a Rust build or its output (#756):
 #
 #   git diff --name-only HEAD^1 HEAD | scripts/ci/python_only.sh
@@ -13,7 +13,8 @@
 # examples/, the tutorials that crates/python/tests/docs runs in the Docs
 # job. No Rust test reads any of these, and the e2e and parity scripts pin
 # their own dependencies (PEP 723), not crates/python/uv.lock. The Python
-# jobs and Docs still run on these PRs: they are what tests these files.
+# jobs, Check (clippy and duplicate detection), Lint (including cargo-deny),
+# and Docs still run on these PRs.
 
 set -euo pipefail
 

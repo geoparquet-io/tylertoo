@@ -1,0 +1,34 @@
+Decode a PMTiles archive of vector tiles back to GeoParquet.
+
+Writes one row per feature per tile: the tiled representation, so
+features are simplified, clipped at tile edges, and repeated at
+every zoom and in every tile they cross. The columns are `zoom`,
+`layer`, `mvt_id`, the properties in name order, then `geometry`
+as lon/lat (`EPSG:4326`) WKB. The output is overwritten if it
+exists.
+
+Args:
+    input: PMTiles archive of vector tiles.
+    output: GeoParquet file to write.
+    min_zoom: Coarsest zoom to decode, or `None` for the
+        archive's coarsest.
+    max_zoom: Finest zoom to decode, or `None` for the archive's
+        finest. Set both to one zoom to decode only that zoom.
+    layer: Decode only this MVT layer, or `None` for every layer.
+
+Returns:
+    Counts of tiles read and features written, with the layers and
+    zooms found.
+
+Raises:
+    ValueError: `min_zoom` above `max_zoom`, an archive of raster
+        tiles, or a property named like a provenance column.
+    RuntimeError: Not a PMTiles archive, a damaged tile, or reading
+        or writing failed.
+
+Example:
+    >>> report = decode(
+    ...     "buildings.pmtiles", "decoded.parquet", min_zoom=10
+    ... )
+    >>> report["layers"], report["zoom_range"]
+    (['overview'], (10, 10))

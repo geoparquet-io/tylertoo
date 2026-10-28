@@ -32,10 +32,7 @@
 # branch-protection setting ("tippecanoe parity"), which this file cannot
 # set.
 #
-# When a PR moves a ratio on purpose (a closed divergence, a new default),
-# it updates the band in tippecanoe_tolerances.toml in the same PR with the
-# new measurement in the comment - the same ratchet rule as the convert
-# guard baseline and the golden tile digests.
+# Per-zoom ratio bands live in benchmarks/e2e/tippecanoe_tolerances.toml.
 
 name: tippecanoe parity
 
@@ -53,8 +50,11 @@ on:
 permissions:
   contents: read
 
+# PRs cancel their superseded runs; every other run gets its own group per
+# event and commit, so a push to main is never cancelled by the next one
+# (#779; see ci.yml's concurrency note).
 concurrency:
-  group: parity-${{ github.workflow }}-${{ github.ref }}
+  group: parity-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -157,7 +157,7 @@ jobs:
         run: benchmarks/e2e/setup_tippecanoe.sh
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: benchmarks/e2e/compare_tippecanoe.py
@@ -218,10 +218,11 @@ jobs:
 
           ---
           _This issue is managed by .github/workflows/tippecanoe-compare.yml. It is
-          updated (not duplicated) on every failing scheduled run; close it once
-          the ratio is back in band or the band in
-          benchmarks/e2e/tippecanoe_tolerances.toml has been moved on purpose,
-          with the new measurement in its comment._"
+          updated (not duplicated) on every failing scheduled run. Close it only
+          after a full green scheduled (or dispatched) run on main, once the
+          ratio is back in band or the band in
+          benchmarks/e2e/tippecanoe_tolerances.toml has been moved on purpose
+          (new measurement in its comment)._"
 
           EXISTING=$(gh issue list --label tippecanoe-parity --state open \
             --json number --jq '.[0].number // empty')

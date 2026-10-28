@@ -2,9 +2,10 @@
 //!
 //! Times [`simplify_cascade`] — the fine->coarse fold every conversion path
 //! (serial, in-memory, pipelined) drives per feature per level — over real
-//! polygon fixtures at a production-shaped chain: 10 levels, coarse to
-//! fine, mostly full-geometry steps with one zoom-band `Point` step at the
+//! polygon fixtures at a production-shaped chain: 15 levels, fine to
+//! coarse, mostly full-geometry steps with three zoom-band `Point` steps at the
 //! coarse end (#317), matching how a `tiles` run's level plan actually looks.
+//! Both fixtures use longitude/latitude coordinates (EPSG:4326).
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `simplify_cascade`
 
@@ -20,11 +21,11 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geo::Geometry;
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 use tylertoo_core::overview::simplify::{
     simplify_cascade, CascadeStep, CollapseMode, Crs, SimplifyOptions,
 };
+use tylertoo_io::open_parquet;
 
 /// Path to the Antarctica polygon fixture (316k coords).
 const ANTARCTICA_FIXTURE: &str = "../../tests/fixtures/realdata/antarctica-polygon.wkb";
@@ -50,7 +51,7 @@ fn load_largest_boundary() -> Option<Geometry<f64>> {
         return None;
     }
     let file = File::open(path).ok()?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let builder = open_parquet(file).ok()?;
     let schema = builder.schema().clone();
     let gidx = schema.index_of("geometry").ok()?;
     let gfield = schema.field(gidx).clone();
@@ -60,7 +61,12 @@ fn load_largest_boundary() -> Option<Geometry<f64>> {
         let batch = batch.ok()?;
         let garr = from_arrow_array(batch.column(gidx).as_ref(), &gfield).ok()?;
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).ok()?;
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .ok()?;
         for g in geoms {
             let len = geo::coords_iter::CoordsIter::coords_count(&g);
             if len > best_len {
@@ -90,7 +96,9 @@ fn cascade_steps() -> Vec<CascadeStep> {
 }
 
 fn bench_simplify_cascade(c: &mut Criterion) {
-    let mut group = c.benchmark_group("simplify_cascade");
+    // The previous series treated degree coordinates as meters. Keep the
+    // corrected coordinate units explicit in the benchmark history.
+    let mut group = c.benchmark_group("simplify_cascade/epsg4326");
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(20);
 
@@ -127,8 +135,9 @@ fn bench_simplify_cascade(c: &mut Criterion) {
                     black_box(simplify_cascade(
                         black_box(geom),
                         black_box(&steps),
-                        Crs::Epsg3857,
+                        Crs::Epsg4326,
                         black_box(opts),
+                        &tylertoo_core::diagnostics::Diagnostics::default(),
                     ))
                 });
             });

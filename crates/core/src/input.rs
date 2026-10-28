@@ -4,7 +4,7 @@
 //! [`std::fs::File`]. This module generalizes that to an [`InputSource`]
 //! that can also point at an object in remote storage (`s3://`, `https://`,
 //! `http://`, `gs://`), served to the existing *synchronous* parquet reader
-//! plumbing through the [`parquet::file::reader::ChunkReader`] trait:
+//! plumbing through the [`tylertoo_io::ChunkReader`] trait:
 //!
 //! - the parquet footer is fetched with range requests,
 //! - each column chunk of each *selected* row group is fetched as ONE byte
@@ -49,10 +49,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-use parquet::errors::ParquetError;
-use parquet::file::reader::{ChunkReader, Length};
 use serde::Serialize;
+use tylertoo_io::ParquetError;
+use tylertoo_io::ReaderMetadata;
+use tylertoo_io::{ChunkReader, Length};
+
+use tylertoo_io::ParquetSource;
 
 /// Schemes recognized as remote inputs (when the `remote` feature is on).
 const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
@@ -60,6 +62,21 @@ const REMOTE_SCHEMES: &[&str] = &["s3", "s3a", "http", "https", "gs"];
 /// Errors from opening or reading an [`InputSource`].
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
+    /// A saved convert plan belongs to a different version of an input.
+    #[error("--plan: saved plan does not match this run: input {input:?} {field} was {saved:?} when the plan was saved but is {current:?} now. Re-run without --plan (add --save-plan to write a fresh one).")]
+    PlanInputChanged {
+        /// Input path or URL.
+        input: String,
+        /// Identity field that changed.
+        field: &'static str,
+        /// Value stored in the plan.
+        saved: String,
+        /// Value observed for this run.
+        current: String,
+    },
+    /// A checked-I/O boundary refused the input.
+    #[error(transparent)]
+    Decode(#[from] tylertoo_io::Error),
     /// Local I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -186,6 +203,9 @@ pub enum InputError {
 pub(crate) fn parquet_error_detail(error: &ParquetError) -> String {
     match error {
         ParquetError::General(message) => message.clone(),
+        // The owner's typed errors (#779) travel as `External`: show them,
+        // not parquet's "External: " prefix.
+        ParquetError::External(inner) => inner.to_string(),
         other => other.to_string(),
     }
 }
@@ -277,6 +297,16 @@ impl InputSource {
         }
     }
 
+    /// Metadata captured when the remote object was opened or listed.
+    /// Local files continue to use filesystem metadata for plan binding.
+    pub fn remote_meta(&self) -> Option<&tylertoo_io::RemoteObjectMeta> {
+        match self {
+            Self::Local(_) => None,
+            #[cfg(feature = "remote")]
+            Self::Remote(source) => Some(&source.object_meta),
+        }
+    }
+
     /// Human-readable name of the input (path or URL).
     pub fn display_name(&self) -> String {
         match self {
@@ -301,23 +331,26 @@ impl InputSource {
     ///
     /// Returns an [`InputError`] if the file cannot be opened or its Parquet
     /// footer cannot be read or fetched.
-    pub fn open(&self) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+    pub fn open(&self) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
             InputSource::Local(p) => {
-                let file = File::open(p).map_err(|error| InputError::Open {
+                tylertoo_io::open_parquet(self.open_local(p)?).map_err(|error| InputError::Footer {
                     input: self.display_name(),
                     error,
-                })?;
-                ParquetRecordBatchReaderBuilder::try_new(InputReader::Local(file)).map_err(
-                    |error| InputError::Footer {
-                        input: self.display_name(),
-                        error,
-                    },
-                )
+                })
             }
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
         }
+    }
+
+    fn open_local(&self, path: &Path) -> Result<InputReader, InputError> {
+        File::open(path)
+            .map(InputReader::Local)
+            .map_err(|error| InputError::Open {
+                input: self.display_name(),
+                error,
+            })
     }
 
     /// Open a parquet reader builder over this input using ALREADY-PARSED
@@ -332,23 +365,17 @@ impl InputSource {
     /// (`input_set::PartMeta`), so hand it over instead.
     ///
     /// Remote inputs ignore `meta` and take [`Self::open`]'s path: it already
-    /// caches its `ArrowReaderMetadata`, and opening also re-sizes the chunk
+    /// caches its `ReaderMetadata`, and opening also re-sizes the chunk
     /// cache from the footer, which is load-bearing (#261).
     pub(crate) fn open_with_metadata(
         &self,
-        meta: &ArrowReaderMetadata,
-    ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+        meta: &ReaderMetadata,
+    ) -> Result<ParquetSource<InputReader>, InputError> {
         match self {
-            InputSource::Local(p) => {
-                let file = File::open(p).map_err(|error| InputError::Open {
-                    input: self.display_name(),
-                    error,
-                })?;
-                Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
-                    InputReader::Local(file),
-                    meta.clone(),
-                ))
-            }
+            InputSource::Local(p) => Ok(tylertoo_io::open_parquet_with_metadata(
+                self.open_local(p)?,
+                meta.clone(),
+            )),
             #[cfg(feature = "remote")]
             InputSource::Remote(r) => r.open_builder(),
         }
@@ -379,8 +406,9 @@ impl InputSource {
     /// which never spill. Call before reading: chunks already spilled stay
     /// in the previously created file; only the spill-file creation (lazy,
     /// on the first spilled chunk) honors the directory.
-    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn set_spill_dir(&self, dir: Option<&Path>) {
+        #[cfg(not(feature = "remote"))]
+        let _ = dir;
         #[cfg(feature = "remote")]
         if let InputSource::Remote(r) = self {
             r.set_spill_dir(dir);
@@ -412,8 +440,9 @@ impl InputSource {
     ///
     /// Returns an [`InputError`] if fetching a remote row group or writing it
     /// to the spill fails.
-    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
+        #[cfg(not(feature = "remote"))]
+        let _ = selected;
         match self {
             InputSource::Local(_) => Ok(()),
             #[cfg(feature = "remote")]
@@ -431,24 +460,24 @@ impl InputSource {
 /// out of range are ignored. Single-file shape on purpose (metadata +
 /// selection → bytes): a multi-partition source sums it across parts.
 pub fn selected_compressed_bytes(
-    metadata: &parquet::file::metadata::ParquetMetaData,
+    metadata: &tylertoo_io::ParquetMetaData,
     selected_row_groups: Option<&[usize]>,
 ) -> u64 {
-    let group_bytes = |i: usize| -> u64 {
-        metadata
-            .row_groups()
-            .get(i)
-            .map_or(0, row_group_compressed_bytes)
-    };
-    match selected_row_groups {
-        None => (0..metadata.num_row_groups())
-            .map(group_bytes)
-            .fold(0, u64::saturating_add),
-        Some(selected) => selected
-            .iter()
-            .map(|&i| group_bytes(i))
-            .fold(0, u64::saturating_add),
-    }
+    selected_groups(metadata, selected_row_groups)
+        .map(row_group_compressed_bytes)
+        .fold(0, u64::saturating_add)
+}
+
+/// Iterate a footer selection in its supplied order, ignoring invalid indices.
+/// With no selection, visit every row group. Counts and byte estimates share
+/// these semantics for both single-file and multipart inputs.
+pub(crate) fn selected_groups<'a>(
+    metadata: &'a tylertoo_io::ParquetMetaData,
+    selected: Option<&'a [usize]>,
+) -> impl Iterator<Item = &'a tylertoo_io::RowGroupMetaData> {
+    let groups = metadata.row_groups();
+    let len = selected.map_or(groups.len(), <[usize]>::len);
+    (0..len).filter_map(move |i| groups.get(selected.map_or(i, |picked| picked[i])))
 }
 
 /// A row group's compressed bytes as its footer declares them, saturating.
@@ -456,7 +485,7 @@ pub fn selected_compressed_bytes(
 /// Not parquet-rs's `RowGroupMetaData::compressed_size`: that sums the
 /// chunks' `i64` sizes unchecked, and a footer can declare any size (#686).
 /// A negative chunk size counts as nothing.
-pub(crate) fn row_group_compressed_bytes(rg: &parquet::file::metadata::RowGroupMetaData) -> u64 {
+pub(crate) fn row_group_compressed_bytes(rg: &tylertoo_io::RowGroupMetaData) -> u64 {
     rg.columns()
         .iter()
         .map(|col| col.compressed_size().max(0) as u64)
@@ -538,7 +567,15 @@ pub(crate) mod remote {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::ops::Range;
     use std::path::{Path, PathBuf};
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::{Arc, Mutex, OnceLock};
 
     use bytes::Bytes;
@@ -552,17 +589,14 @@ pub(crate) mod remote {
         ClientConfigKey, ClientOptions, CredentialProvider, ObjectStore, ObjectStoreExt,
         ObjectStoreScheme,
     };
-    use parquet::arrow::arrow_reader::{
-        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-    };
-    use parquet::errors::ParquetError;
-    use parquet::file::metadata::ParquetMetaData;
+    use tylertoo_io::ParquetError;
+    use tylertoo_io::ReaderMetadata;
     use url::Url;
 
     use super::{FetchStats, InputError, InputReader};
 
     /// Readahead for the *sequential* read path
-    /// ([`parquet::file::reader::ChunkReader::get_read`]). The page reader
+    /// ([`tylertoo_io::ChunkReader::get_read`]). The page reader
     /// uses `get_read` only to thrift-decode page *headers* (tens of bytes;
     /// page data goes through exact-range `get_bytes`), so keep this small —
     /// and always clamp it to the surrounding column chunk (see
@@ -574,6 +608,10 @@ pub(crate) mod remote {
     /// synchronous reader plumbing. Two worker threads: requests are issued
     /// one at a time per reader, so this only needs to run the HTTP client.
     fn runtime() -> &'static tokio::runtime::Runtime {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
@@ -589,6 +627,10 @@ pub(crate) mod remote {
     /// fetched-range log, and (once the footer is parsed) the column-chunk
     /// byte ranges used to clamp sequential readahead.
     #[derive(Debug, Default)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+    )]
     struct SharedState {
         requests: AtomicU64,
         bytes: AtomicU64,
@@ -630,9 +672,13 @@ pub(crate) mod remote {
         url: String,
         store: Arc<dyn ObjectStore>,
         location: ObjectPath,
-        size: u64,
+        pub(super) object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
-        metadata: OnceLock<ArrowReaderMetadata>,
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
+        metadata: OnceLock<ReaderMetadata>,
         cache: Arc<Mutex<ChunkCache>>,
         /// On-disk overflow for fetched column chunks (issue #219), shared by
         /// every reader clone across the pipeline's passes so a chunk fetched
@@ -656,6 +702,10 @@ pub(crate) mod remote {
     pub(crate) fn store_and_location(
         url_str: &str,
     ) -> Result<(Arc<dyn ObjectStore>, ObjectPath), InputError> {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static STORES: OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>> =
             OnceLock::new();
 
@@ -666,7 +716,11 @@ pub(crate) mod remote {
         })?;
         let key = url[..url::Position::BeforePath].to_ascii_lowercase();
         let stores = STORES.get_or_init(Default::default);
-        if let Some(store) = stores.lock().expect("store cache lock").get(&key) {
+        if let Some(store) = stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Ok((Arc::clone(store), location));
         }
         let overrides = effective_client_overrides();
@@ -708,17 +762,9 @@ pub(crate) mod remote {
         // last insert wins.
         stores
             .lock()
-            .expect("store cache lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, Arc::clone(&store));
         Ok((store, location))
-    }
-
-    /// One `.parquet` object found under a remote prefix.
-    pub(crate) struct ListedPart {
-        /// Full object key (from the bucket root).
-        pub location: ObjectPath,
-        /// Object size in bytes, straight from the listing (no HEAD).
-        pub size: u64,
     }
 
     /// List the `.parquet` objects under remote prefix `prefix`, applying
@@ -732,13 +778,13 @@ pub(crate) mod remote {
         store: &Arc<dyn ObjectStore>,
         prefix: &ObjectPath,
         url_str: &str,
-    ) -> Result<Vec<ListedPart>, InputError> {
+    ) -> Result<Vec<object_store::ObjectMeta>, InputError> {
         use futures_util::TryStreamExt;
         let metas: Vec<object_store::ObjectMeta> = runtime()
             .block_on(store.list(Some(prefix)).try_collect())
             .map_err(|e| store_error(url_str, e))?;
         let prefix_depth = prefix.parts().count();
-        let mut parts: Vec<ListedPart> = metas
+        let mut parts: Vec<object_store::ObjectMeta> = metas
             .into_iter()
             .filter(|m| {
                 m.size > 0
@@ -747,10 +793,6 @@ pub(crate) mod remote {
                         .parts()
                         .skip(prefix_depth)
                         .all(|c| !c.as_ref().starts_with(['.', '_']))
-            })
-            .map(|m| ListedPart {
-                location: m.location,
-                size: m.size,
             })
             .collect();
         parts.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
@@ -768,7 +810,7 @@ pub(crate) mod remote {
             .into_iter()
             .map(|p| {
                 let url = part_url(url_str, &p.location);
-                RemoteSource::from_store_sized(Arc::clone(&store), p.location, url, p.size)
+                RemoteSource::from_store_meta(Arc::clone(&store), url, p)
             })
             .collect())
     }
@@ -814,36 +856,38 @@ pub(crate) mod remote {
             let head = runtime()
                 .block_on(store.head(&location))
                 .map_err(|e| store_error(&url, e))?;
-            Ok(Self::from_store_sized_with_cap_base(
-                store, location, url, head.size, cap_base,
+            Ok(Self::from_store_meta_with_cap_base(
+                store, url, head, cap_base,
             ))
         }
 
-        /// [`Self::from_store`] with the object size already known (from a
+        /// [`Self::from_store`] with object metadata already known (from a
         /// prefix listing) — skips the HEAD request, so connecting N listed
         /// parts costs no network round-trips at all.
-        pub(crate) fn from_store_sized(
+        pub(crate) fn from_store_meta(
             store: Arc<dyn ObjectStore>,
-            location: ObjectPath,
             url: String,
-            size: u64,
+            meta: object_store::ObjectMeta,
         ) -> Self {
-            Self::from_store_sized_with_cap_base(store, location, url, size, CHUNK_CACHE_MAX_BYTES)
+            Self::from_store_meta_with_cap_base(store, url, meta, CHUNK_CACHE_MAX_BYTES)
         }
 
-        fn from_store_sized_with_cap_base(
+        fn from_store_meta_with_cap_base(
             store: Arc<dyn ObjectStore>,
-            location: ObjectPath,
             url: String,
-            size: u64,
+            meta: object_store::ObjectMeta,
             cap_base: u64,
         ) -> Self {
             Self {
                 url,
                 store,
-                location,
-                size,
+                location: meta.location.clone(),
+                object_meta: meta.into(),
                 shared: Arc::new(SharedState::default()),
+                #[expect(
+                    clippy::disallowed_types,
+                    reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+                )]
                 metadata: OnceLock::new(),
                 cache: Arc::new(Mutex::new(ChunkCache::new(cap_base))),
                 spill: Arc::new(Mutex::new(DiskSpill::default())),
@@ -860,7 +904,7 @@ pub(crate) mod remote {
         /// opens so multi-pass pipelines fetch it once.
         pub(crate) fn open_builder(
             &self,
-        ) -> Result<ParquetRecordBatchReaderBuilder<InputReader>, InputError> {
+        ) -> Result<tylertoo_io::ParquetSource<InputReader>, InputError> {
             let reader = InputReader::Remote(self.reader());
             let metadata = self.load_footer()?;
             // Column-chunk byte ranges (sorted) for readahead clamping.
@@ -901,12 +945,13 @@ pub(crate) mod remote {
                 .max()
                 .unwrap_or(0);
             {
-                let mut cache = self.cache.lock().expect("chunk cache lock");
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cache.cap = self.cap_base.max(max_row_group);
             }
-            Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
-                reader, metadata,
-            ))
+            Ok(tylertoo_io::open_parquet_with_metadata(reader, metadata))
         }
 
         /// A cheap handle for issuing counted range requests.
@@ -914,7 +959,7 @@ pub(crate) mod remote {
             RemoteReader {
                 store: Arc::clone(&self.store),
                 location: self.location.clone(),
-                size: self.size,
+                object_meta: self.object_meta.clone(),
                 shared: Arc::clone(&self.shared),
                 cache: Arc::clone(&self.cache),
                 spill: Arc::clone(&self.spill),
@@ -926,70 +971,33 @@ pub(crate) mod remote {
         ///
         /// [`InputSource::set_spill_dir`]: super::InputSource::set_spill_dir
         pub(crate) fn set_spill_dir(&self, dir: Option<&Path>) {
-            self.spill.lock().expect("spill lock").dir = dir.map(Path::to_path_buf);
+            self.spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dir = dir.map(Path::to_path_buf);
         }
 
         /// Parse (and cache) the footer, returning the shared metadata.
         /// Mirrors the load in [`Self::open_builder`] so staging (pass 0) does
         /// not depend on a builder open; the header phase has usually loaded
         /// it already, in which case this is a cheap clone with no fetch.
-        fn load_footer(&self) -> Result<ArrowReaderMetadata, InputError> {
+        fn load_footer(&self) -> Result<ReaderMetadata, InputError> {
             if let Some(md) = self.metadata.get() {
                 return Ok(md.clone());
             }
             let reader = InputReader::Remote(self.reader());
+            // The owner (#779) runs the footer pre-check, the #430 chunk-range
+            // check against the object size and the guarded schema decode,
+            // exactly as it does for a local file.
             let md =
-                ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new()).map_err(|error| {
-                    InputError::Footer {
-                        input: self.url.clone(),
-                        error,
-                    }
+                tylertoo_io::load_reader_metadata(&reader).map_err(|error| InputError::Footer {
+                    input: self.url.clone(),
+                    error,
                 })?;
-            self.validate_chunk_ranges(md.metadata())?;
             // A concurrent open may have won the race; either copy is
             // equivalent.
             let _ = self.metadata.set(md.clone());
             Ok(md)
-        }
-
-        /// #430: reject a footer whose column chunk byte ranges overflow or
-        /// run past the object before anything is built on it. Every later
-        /// `start + len` over these ranges (chunk map, staging spans, page
-        /// slices) would otherwise wrap in release or panic in debug on a
-        /// hostile parquet.
-        fn validate_chunk_ranges(&self, metadata: &ParquetMetaData) -> Result<(), InputError> {
-            for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
-                for (col_idx, col) in rg.columns().iter().enumerate() {
-                    // parquet's `byte_range()` asserts on a negative offset
-                    // or length, and the thrift decoder does not reject
-                    // them, so check the raw fields first.
-                    let raw_start = col
-                        .dictionary_page_offset()
-                        .unwrap_or_else(|| col.data_page_offset());
-                    let raw_len = col.compressed_size();
-                    if raw_start < 0 || raw_len < 0 {
-                        return Err(ParquetError::EOF(format!(
-                            "column chunk (row group {rg_idx}, column {col_idx}) has a \
-                             negative offset or length ({raw_start}, {raw_len}) for {}",
-                            self.location
-                        ))
-                        .into());
-                    }
-                    let (start, len) = col.byte_range();
-                    let end = start.checked_add(len).filter(|end| *end <= self.size);
-                    if end.is_none() || usize::try_from(len).is_err() {
-                        return Err(ParquetError::EOF(format!(
-                            "column chunk (row group {rg_idx}, column {col_idx}) range \
-                             {start}..{} beyond object size {} for {}",
-                            start as u128 + len as u128,
-                            self.size,
-                            self.location
-                        ))
-                        .into());
-                    }
-                }
-            }
-            Ok(())
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
@@ -1055,13 +1063,13 @@ pub(crate) mod remote {
                     // fetch the wrong bytes.
                     let chunk_end = s
                         .checked_add(len)
-                        .filter(|e| *e <= self.size)
+                        .filter(|e| *e <= self.object_meta.size)
                         .zip(usize::try_from(len).ok())
                         .ok_or_else(|| {
                             ParquetError::EOF(format!(
                                 "column chunk range {s}..{} beyond object size {} for {}",
                                 s as u128 + len as u128,
-                                self.size,
+                                self.object_meta.size,
                                 self.location
                             ))
                         })?;
@@ -1109,15 +1117,17 @@ pub(crate) mod remote {
             let location = self.location.clone();
             let spill = Arc::clone(&self.spill);
             let shared = Arc::clone(&self.shared);
+            let object_meta = self.object_meta.clone();
 
             runtime().block_on(async move {
                 use futures_util::stream::StreamExt;
                 let mut inflight = futures_util::stream::iter(plan.into_iter().map(|rg| {
                     let store = Arc::clone(&store);
                     let location = location.clone();
+                    let object_meta = object_meta.clone();
                     async move {
-                        let bytes = store
-                            .get_range(&location, rg.span.clone())
+                        let bytes = object_meta
+                            .get_range(store.as_ref(), &location, rg.span.clone())
                             .await
                             .map_err(|e| ParquetError::External(Box::new(e)))?;
                         Ok::<(StagedSpan, Bytes), ParquetError>((rg, bytes))
@@ -1135,14 +1145,16 @@ pub(crate) mod remote {
                     shared
                         .ranges
                         .lock()
-                        .expect("ranges lock")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(rg.span.clone());
                     // Slice into per-column-chunk spill entries. Guard the
                     // slice bounds: a well-behaved store returns exactly the
                     // requested span, but a short read must fall back to the
                     // reader's network path (skip spilling), never panic.
                     let base = rg.span.start;
-                    let mut spill = spill.lock().expect("spill lock");
+                    let mut spill = spill
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for (chunk_start, len) in rg.chunks {
                         // Checked (#430): a wrapped `off + len` would pass the
                         // bound and panic inside `slice`.
@@ -1167,13 +1179,17 @@ pub(crate) mod remote {
             FetchStats {
                 requests: self.shared.requests.load(Ordering::Relaxed),
                 bytes_fetched: self.shared.bytes.load(Ordering::Relaxed),
-                object_size: self.size,
+                object_size: self.object_meta.size,
             }
         }
 
         /// The byte ranges fetched so far, in request order.
         pub fn fetched_ranges(&self) -> Vec<Range<u64>> {
-            self.shared.ranges.lock().expect("ranges lock").clone()
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// Drop the in-memory (L1) chunk cache. The disk spill (L2) and the
@@ -1182,7 +1198,10 @@ pub(crate) mod remote {
         /// on part transitions so resident memory stays O(one part's row
         /// group) instead of O(parts × cap) (v0.7 multi-partition input).
         pub fn release_read_cache(&self) {
-            let mut cache = self.cache.lock().expect("chunk cache lock");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.entries.clear();
             cache.order.clear();
             cache.total = 0;
@@ -1364,6 +1383,10 @@ pub(crate) mod remote {
     /// on the first store build, logging warnings plus one info line naming
     /// the overrides in force (so a #290 sweep run records what it tested).
     fn effective_client_overrides() -> &'static [(ClientConfigKey, String)] {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+        )]
         static CELL: OnceLock<Vec<(ClientConfigKey, String)>> = OnceLock::new();
         CELL.get_or_init(|| {
             let vars = std::env::vars_os()
@@ -1649,7 +1672,15 @@ pub(crate) mod remote {
         /// values — info when an override is set (so a #290 sweep run can
         /// confirm what it tested), debug otherwise.
         pub(super) fn effective() -> &'static StagingTunables {
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+            )]
             use std::sync::OnceLock;
+            #[expect(
+                clippy::disallowed_types,
+                reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+            )]
             static CELL: OnceLock<StagingTunables> = OnceLock::new();
             CELL.get_or_init(|| {
                 let lookup = |name: &str| std::env::var(name).ok();
@@ -1676,7 +1707,7 @@ pub(crate) mod remote {
             })
         }
 
-        /// Log the *live* in-flight concurrency once per process, at info
+        /// Log this operation's *live* in-flight concurrency, at info
         /// when an override is set.
         ///
         /// [`effective`]'s line reports the concurrency *ceiling*, but the
@@ -1685,13 +1716,10 @@ pub(crate) mod remote {
         /// recording a concurrency it never actually ran — the 8 and 16
         /// points of a 1/2/4/8/16 sweep produce identical runs on an input
         /// whose row groups are large enough, and only the ceiling appears in
-        /// the log. Logged once rather than per call, because
-        /// `stage_row_groups` runs per part and a multi-part input would
-        /// otherwise repeat it for every partition.
+        /// the log. Each staging operation reports its own value, including
+        /// later operations in the same process.
         pub(super) fn log_live_concurrency(t: &StagingTunables, concurrency: usize, max_span: u64) {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !t.overridden || LOGGED.swap(true, Ordering::Relaxed) {
+            if !t.overridden {
                 return;
             }
             if concurrency < t.max_concurrency {
@@ -1938,28 +1966,36 @@ pub(crate) mod remote {
     pub struct RemoteReader {
         store: Arc<dyn ObjectStore>,
         location: ObjectPath,
-        size: u64,
+        object_meta: tylertoo_io::RemoteObjectMeta,
         shared: Arc<SharedState>,
         cache: Arc<Mutex<ChunkCache>>,
         spill: Arc<Mutex<DiskSpill>>,
     }
 
     impl RemoteReader {
-        /// Total object size (the [`parquet::file::reader::Length`] answer).
+        /// Total object size (the [`tylertoo_io::Length`] answer).
         pub(crate) fn object_size(&self) -> u64 {
-            self.size
+            self.object_meta.size
         }
 
         /// One counted range GET.
         fn fetch(&self, range: Range<u64>) -> Result<Bytes, ParquetError> {
             let bytes = runtime()
-                .block_on(self.store.get_range(&self.location, range.clone()))
+                .block_on(self.object_meta.get_range(
+                    self.store.as_ref(),
+                    &self.location,
+                    range.clone(),
+                ))
                 .map_err(|e| ParquetError::External(Box::new(e)))?;
             self.shared.requests.fetch_add(1, Ordering::Relaxed);
             self.shared
                 .bytes
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            self.shared.ranges.lock().expect("ranges lock").push(range);
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(range);
             Ok(bytes)
         }
 
@@ -1979,14 +2015,22 @@ pub(crate) mod remote {
         fn chunk_data(&self, chunk: &Range<u64>) -> Result<Bytes, ParquetError> {
             // L1: in-memory cache (hot, one row group's working set).
             {
-                let cache = self.cache.lock().expect("chunk cache lock");
+                let cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some((_, data)) = cache.entries.get(&chunk.start) {
                     return Ok(data.clone());
                 }
             }
             // L2: local disk spill. A hit avoids re-fetching over the network on
             // a later pass; re-warm L1 so same-pass touches stay in memory.
-            if let Some(data) = self.spill.lock().expect("spill lock").get(chunk.start) {
+            if let Some(data) = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(chunk.start)
+            {
                 self.cache_insert(chunk, &data);
                 return Ok(data);
             }
@@ -2000,7 +2044,7 @@ pub(crate) mod remote {
             }
             self.spill
                 .lock()
-                .expect("spill lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .put(chunk.start, &data);
             self.cache_insert(chunk, &data);
             Ok(data)
@@ -2010,7 +2054,10 @@ pub(crate) mod remote {
         /// order until the working-set budget (`cap`, sized to the largest row
         /// group in [`RemoteSource::open_builder`]) is respected.
         fn cache_insert(&self, chunk: &Range<u64>, data: &Bytes) {
-            let mut cache = self.cache.lock().expect("chunk cache lock");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !cache.entries.contains_key(&chunk.start) {
                 cache.total += data.len() as u64;
                 cache
@@ -2028,7 +2075,7 @@ pub(crate) mod remote {
             }
         }
 
-        /// Exact-range read for [`parquet::file::reader::ChunkReader::get_bytes`].
+        /// Exact-range read for [`tylertoo_io::ChunkReader::get_bytes`].
         pub(crate) fn get_bytes_range(
             &self,
             start: u64,
@@ -2036,12 +2083,12 @@ pub(crate) mod remote {
         ) -> Result<Bytes, ParquetError> {
             let end = start
                 .checked_add(length as u64)
-                .filter(|end| *end <= self.size)
+                .filter(|end| *end <= self.object_meta.size)
                 .ok_or_else(|| {
                     ParquetError::EOF(format!(
                         "range {start}..{} beyond object size {} for {}",
                         start as u128 + length as u128,
-                        self.size,
+                        self.object_meta.size,
                         self.location
                     ))
                 })?;
@@ -2077,7 +2124,7 @@ pub(crate) mod remote {
         }
 
         /// Chunked sequential reader for
-        /// [`parquet::file::reader::ChunkReader::get_read`] (not used by the
+        /// [`tylertoo_io::ChunkReader::get_read`] (not used by the
         /// arrow reader path, provided for trait completeness).
         pub(crate) fn sequential_reader(&self, start: u64) -> SequentialRemoteRead {
             SequentialRemoteRead {
@@ -2091,7 +2138,7 @@ pub(crate) mod remote {
 
     /// `Read` adapter fetching forward in [`SEQUENTIAL_CHUNK`] steps, each
     /// step clamped to the column chunk containing the read position.
-    pub struct SequentialRemoteRead {
+    pub(crate) struct SequentialRemoteRead {
         reader: RemoteReader,
         pos: u64,
         buf: Bytes,
@@ -2101,7 +2148,7 @@ pub(crate) mod remote {
     impl std::io::Read for SequentialRemoteRead {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             if self.buf_offset >= self.buf.len() {
-                let remaining = self.reader.size.saturating_sub(self.pos);
+                let remaining = self.reader.object_meta.size.saturating_sub(self.pos);
                 if remaining == 0 {
                     return Ok(0);
                 }
@@ -2506,10 +2553,11 @@ pub(crate) mod remote {
         }
 
         /// `groups` row groups of `rows` rows each.
+        #[cfg(test)]
         fn multi_rg_parquet(rows: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let props = WriterProperties::builder()
                 .set_max_row_group_row_count(Some(rows))
@@ -2519,11 +2567,53 @@ pub(crate) mod remote {
                 RecordBatch::try_from_iter([("v", Arc::new(Int64Array::from(values)) as _)])
                     .unwrap();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
+        }
+
+        #[test]
+        fn replaced_object_is_rejected_by_direct_and_staged_reads() {
+            use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
+            use std::sync::Arc;
+            for staged in [false, true] {
+                let store = Arc::new(InMemory::new());
+                let location = Path::from("versioned.parquet");
+                let original = multi_rg_parquet(10, 2);
+                super::runtime()
+                    .block_on(store.put(&location, original.clone().into()))
+                    .unwrap();
+                let source = super::RemoteSource::from_store(
+                    store.clone(),
+                    location.clone(),
+                    "memory://versioned.parquet".into(),
+                )
+                .unwrap();
+                source.load_footer().unwrap();
+                // Keep the footer and physical layout identical; only the store's
+                // object version changes between HEAD/footer and the data GET.
+                super::runtime()
+                    .block_on(store.put(&location, original.into()))
+                    .unwrap();
+                let err = if staged {
+                    source
+                        .stage_row_groups_with(None, &tunables(0))
+                        .unwrap_err()
+                        .to_string()
+                } else {
+                    source.reader().fetch(4..12).unwrap_err().to_string()
+                };
+                assert!(
+                    err.contains("Precondition") || err.contains("precondition"),
+                    "{err}"
+                );
+            }
         }
 
         fn tunables(window: u64) -> StagingTunables {
@@ -2592,9 +2682,8 @@ pub(crate) mod remote {
         #[test]
         fn a_large_window_never_fetches_a_pruned_row_group() {
             let bytes = multi_rg_parquet(1000, 5);
-            let md = parquet::file::metadata::ParquetMetaDataReader::new()
-                .parse_and_finish(&bytes::Bytes::from(bytes.clone()))
-                .unwrap();
+            let md =
+                tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone())).unwrap();
             let pruned = md.row_group(2);
             let lo = pruned
                 .columns()
@@ -2780,6 +2869,38 @@ pub(crate) mod remote {
                 String::from_utf8_lossy(&out.stderr)
             );
             false
+        }
+
+        #[test]
+        fn live_staging_concurrency_is_logged_for_each_operation() {
+            if !run_in_child("live_staging_concurrency_is_logged_for_each_operation", &[]) {
+                return;
+            }
+            struct Capture;
+            static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            impl log::Log for Capture {
+                fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                    true
+                }
+                fn log(&self, record: &log::Record<'_>) {
+                    LINES.lock().unwrap().push(record.args().to_string());
+                }
+                fn flush(&self) {}
+            }
+            log::set_logger(&Capture).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+            let (mut tunables, _) = staging_tunables::resolve(|_| None);
+            tunables.overridden = true;
+            staging_tunables::log_live_concurrency(&tunables, 2, 4096);
+            staging_tunables::log_live_concurrency(&tunables, 3, 8192);
+            let lines = LINES.lock().unwrap();
+            assert_eq!(
+                lines.len(),
+                2,
+                "each operation must report its own live concurrency"
+            );
+            assert!(lines[0].contains("live concurrency 2"));
+            assert!(lines[1].contains("live concurrency 3"));
         }
 
         #[test]
@@ -2991,8 +3112,16 @@ pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStoreExt;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     use std::sync::{Arc, OnceLock};
 
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: runtime, client and per-input caches; never diagnostic suppression"
+    )]
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let rt = RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -3010,7 +3139,7 @@ pub fn fuzz_remote_footer(bytes: &[u8]) -> Result<usize, InputError> {
     )?);
     source.stage_row_groups(None)?;
     let mut rows = 0;
-    for batch in source.open()?.with_batch_size(256).build()? {
+    for batch in source.open()?.with_batch_rows(256).build()? {
         rows += batch?.num_rows();
     }
     source.release_read_cache();
@@ -3049,11 +3178,10 @@ pub(crate) fn test_memory_multi_source(
     let parts: Vec<InputSource> = listed
         .into_iter()
         .map(|p| {
-            InputSource::Remote(remote::RemoteSource::from_store_sized(
+            InputSource::Remote(remote::RemoteSource::from_store_meta(
                 Arc::clone(&store),
-                p.location.clone(),
                 format!("memory://{}", p.location),
-                p.size,
+                p,
             ))
         })
         .collect();
@@ -3196,13 +3324,13 @@ mod tests {
 
     /// A footer whose row groups declare `sizes` compressed bytes per
     /// column chunk, two `INT64` columns each, and nothing else.
-    fn footer_with_chunk_sizes(sizes: &[[i64; 2]]) -> parquet::file::metadata::ParquetMetaData {
-        use parquet::basic::Type as PhysicalType;
-        use parquet::file::metadata::{
+    fn footer_with_chunk_sizes(sizes: &[[i64; 2]]) -> tylertoo_io::ParquetMetaData {
+        use std::sync::Arc;
+        use tylertoo_io::test_support::{
             ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData,
         };
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        use std::sync::Arc;
+        use tylertoo_io::test_support::{SchemaDescriptor, Type};
+        use tylertoo_io::PhysicalType;
 
         let fields = ["a", "b"]
             .map(|n| {
@@ -3270,8 +3398,8 @@ mod tests {
         /// Minimal single-column parquet bytes for reader plumbing tests.
         fn tiny_parquet() -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch};
-            use parquet::arrow::ArrowWriter;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::ArrowWriter;
 
             let batch = RecordBatch::try_from_iter([(
                 "v",
@@ -3323,8 +3451,8 @@ mod tests {
 
         #[test]
         fn sequential_read_matches_object_bytes() {
-            use parquet::file::reader::ChunkReader;
             use std::io::Read;
+            use tylertoo_io::ChunkReader;
 
             let bytes = tiny_parquet();
             let source = memory_source(bytes.clone(), "tiny.parquet");
@@ -3382,8 +3510,8 @@ mod tests {
         /// distinct so the wide column stays genuinely wide.
         fn two_column_multipage_parquet(rows: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch, StringArray};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let wide: Vec<String> = (0..rows)
                 .map(|i| format!("feature-{i:08}-{:-<48}", i % 7))
@@ -3399,8 +3527,12 @@ mod tests {
                 .set_data_page_row_count_limit(128)
                 .build();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
@@ -3419,7 +3551,7 @@ mod tests {
             // Floor far below one row group, forcing the eviction path.
             let source = super::super::test_memory_source_with_cap(bytes, "wide.parquet", 64);
 
-            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
             let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
             assert_eq!(rows, 4096);
 
@@ -3456,7 +3588,7 @@ mod tests {
             // Three full in-order passes, mimicking the converter's assign +
             // coarse-level + finest-streamed-last reads.
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3501,7 +3633,7 @@ mod tests {
             source.set_spill_dir(Some(Path::new("/nonexistent/tylertoo-spill-dir-272")));
 
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3529,7 +3661,7 @@ mod tests {
             source.set_spill_dir(Some(dir.path()));
 
             for _ in 0..3 {
-                let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+                let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
                 let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
                 assert_eq!(rows, 4096 * 3);
             }
@@ -3579,10 +3711,11 @@ mod tests {
         /// groups, so a full read walks several oversized row groups in
         /// sequence — exercising cross-row-group eviction (the cache must drop
         /// the previous group's chunks, not accumulate them).
+        #[cfg(test)]
         fn multi_row_group_wide_parquet(rows_per_group: usize, groups: usize) -> Vec<u8> {
             use arrow_array::{Int64Array, RecordBatch, StringArray};
-            use parquet::file::properties::WriterProperties;
             use std::sync::Arc as SArc;
+            use tylertoo_io::test_support::WriterProperties;
 
             let props = WriterProperties::builder()
                 .set_dictionary_enabled(false)
@@ -3600,8 +3733,12 @@ mod tests {
             ])
             .unwrap();
             let mut buf = Vec::new();
-            let mut w = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
-                .unwrap();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut buf,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
             w.write(&batch).unwrap();
             w.close().unwrap();
             buf
@@ -3629,7 +3766,7 @@ mod tests {
             let source =
                 super::super::test_memory_source_with_cap(bytes, "bench-wide.parquet", cap_base);
 
-            let reader = source.open().unwrap().with_batch_size(64).build().unwrap();
+            let reader = source.open().unwrap().with_batch_rows(64).build().unwrap();
             let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
             assert_eq!(rows, 8192 * 3);
 
@@ -3684,14 +3821,12 @@ mod tests {
         fn with_hostile_chunks(
             bytes: &[u8],
             mutate: impl Fn(
-                parquet::file::metadata::ColumnChunkMetaDataBuilder,
-            ) -> parquet::file::metadata::ColumnChunkMetaDataBuilder,
+                tylertoo_io::test_support::ColumnChunkMetaDataBuilder,
+            ) -> tylertoo_io::test_support::ColumnChunkMetaDataBuilder,
         ) -> Vec<u8> {
-            use parquet::file::metadata::{ParquetMetaDataReader, ParquetMetaDataWriter};
+            use tylertoo_io::test_support::ParquetMetaDataWriter;
 
-            let md = ParquetMetaDataReader::new()
-                .parse_and_finish(&Bytes::from(bytes.to_vec()))
-                .unwrap();
+            let md = tylertoo_io::read_parquet_metadata(&Bytes::from(bytes.to_vec())).unwrap();
             let row_groups: Vec<_> = md
                 .row_groups()
                 .iter()
@@ -3708,7 +3843,10 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let md = md.into_builder().set_row_groups(row_groups).build();
+            let md = Arc::unwrap_or_clone(md)
+                .into_builder()
+                .set_row_groups(row_groups)
+                .build();
             let footer_len =
                 u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
                     as usize;
@@ -3911,8 +4049,8 @@ mod tests {
         /// also fail cleanly.
         #[test]
         fn truncated_chunk_sequential_read_is_error_not_panic() {
-            use parquet::file::reader::ChunkReader;
             use std::io::Read;
+            use tylertoo_io::ChunkReader;
 
             let bytes = tiny_parquet();
             let source = truncating_source(bytes, 3);

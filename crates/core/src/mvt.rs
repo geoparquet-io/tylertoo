@@ -19,6 +19,8 @@ use geo::CoordsIter;
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
 
+mod tile_polygon;
+
 /// Default tile extent (4096 as per MVT spec)
 pub const DEFAULT_EXTENT: u32 = 4096;
 
@@ -157,19 +159,20 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 ///
 /// * a coordinate difference `|a - b|` is at most 2^25;
 /// * a cross or dot product of two differences (the cleaner's
-///   `segments_meet`, `ring_is_simple`, `node_insert`, `point_in_ring`
-///   tests) is at most 2^25 · 2^25 + 2^25 · 2^25 = 2^51;
+///   `segments_meet` tests) is at most
+///   2^25 · 2^25 + 2^25 · 2^25 = 2^51, and the validity owner's
+///   (`tile_polygon`) doubled-coordinate point location at most 2^53;
 /// * a shoelace term `x0·y1 - x1·y0` in `ring_area2` is at most
 ///   2 · 2^24 · 2^24 = 2^49, and the sum is accumulated in `i128`, which
 ///   holds 2^78 such terms — no ring length can overflow it;
 /// * a MoveTo/LineTo delta is at most 2^25, which zigzag-encodes without
 ///   overflowing `i32` (the shift needs `|n| < 2^30`).
 ///
-/// 2^24 is also the largest power of two at which every integer is exactly
-/// representable in `f64`, so a clamped value survives the round trip
-/// through the `f64` overlay in `tile_rings_to_polygon` unchanged, and it
-/// leaves three orders of magnitude of headroom over the largest tile
-/// extent plus buffer in practical use (65536 + buffer).
+/// 2^24 is also well inside the ±2^30 coordinate range of `i_overlay`'s
+/// `i32` engine, which repairs polygons on this grid without leaving it
+/// (`tile_polygon::repair_polygons`), and it leaves three orders of
+/// magnitude of headroom over the largest tile extent plus buffer in
+/// practical use (65536 + buffer).
 ///
 /// Only input outside the tile — reachable through the public
 /// [`encode_polygon`] / [`encode_multi_polygon`] / [`geo_to_tile_coords`]
@@ -393,11 +396,8 @@ pub fn encode_multi_linestring(
 /// A closed ring in integer tile coordinates (first == last).
 type TileRing = Vec<(i32, i32)>;
 
-/// One edge of a ring, as its two endpoints.
-type TileEdge = ((i32, i32), (i32, i32));
-
 /// Smallest axis-aligned square side, in tile units, that the polygon
-/// cleaner ([`quantize_ring`] / [`requantize_ring`]) is guaranteed to keep.
+/// cleaner ([`quantize_ring`]) is guaranteed to keep.
 ///
 /// The cleaner snaps each vertex to the integer grid and drops a ring left
 /// with fewer than three distinct vertices. Rounding is monotone, so two
@@ -444,7 +444,7 @@ fn quantize_ring(ring: &LineString, proj: &TileProjector) -> Option<TileRing> {
 /// saturated into `±i64::MAX` — which only matters for a ring of more than
 /// 2^14 vertices all near the clamp, and even then keeps the sign and the
 /// ordering the callers use. The negative bound is `-i64::MAX`, not
-/// `i64::MIN`, because [`regroup_pinched`] takes `.abs()` of the result and
+/// `i64::MIN`, because callers take `.abs()` of the result and
 /// `i64::MIN.abs()` overflows.
 fn ring_area2(ring: &[(i32, i32)]) -> i64 {
     let sum: i128 = ring
@@ -458,247 +458,38 @@ fn ring_area2(ring: &[(i32, i32)]) -> i64 {
     sum.clamp(-i128::from(i64::MAX), i128::from(i64::MAX)) as i64
 }
 
-fn tile_rings_to_polygon(rings: &[TileRing]) -> Polygon<f64> {
-    let to_ls = |r: &TileRing| {
-        LineString::from(
-            r.iter()
-                .map(|&(x, y)| (f64::from(x), f64::from(y)))
-                .collect::<Vec<_>>(),
-        )
+/// Signed orientations used by both segment-intersection policies.
+fn segment_orientations(
+    (p1, p2): ((i32, i32), (i32, i32)),
+    (p3, p4): ((i32, i32), (i32, i32)),
+) -> [i64; 4] {
+    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
+        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
+            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
     };
-    Polygon::new(to_ls(&rings[0]), rings[1..].iter().map(to_ls).collect())
+    [
+        cross(p3, p4, p1),
+        cross(p3, p4, p2),
+        cross(p1, p2, p3),
+        cross(p1, p2, p4),
+    ]
 }
 
-/// Round a repaired (f64, integer-valued except at new crossing points)
-/// ring back to tile units, with the same dedup/closure rules as
-/// [`quantize_ring`].
-fn requantize_ring(ring: &LineString<f64>) -> Option<TileRing> {
-    let mut out: TileRing = Vec::with_capacity(ring.0.len());
-    for c in &ring.0 {
-        // The overlay's inputs were clamped, so its crossing points lie in
-        // the same box; snapping (rather than a bare cast) keeps that an
-        // invariant instead of an assumption.
-        let p = (snap_tile_coord(c.x), snap_tile_coord(c.y));
-        if out.last() != Some(&p) {
-            out.push(p);
-        }
-    }
-    if out.len() > 1 && out.first() == out.last() {
-        out.pop();
-    }
-    if out.len() < 3 {
-        return None;
-    }
-    let first = out[0];
-    out.push(first);
-    Some(out)
-}
-
-/// Split a closed ring at every vertex it visits twice (a "pinch": a neck
-/// that snapped shut, or a spike that folded back). Each loop between two
-/// visits of the same vertex becomes its own closed ring; zero-area loops
-/// (spikes) are dropped. The returned rings visit no vertex twice.
-///
-/// One pass, `O(n)`: walk the ring keeping the path so far with every
-/// closed loop cut out, and each path vertex's index. A vertex already on
-/// the path closes the loop from its earlier visit, which is cut out and
-/// emitted, leaving the vertex once. Until #759 this re-sorted the
-/// remaining ring after every split, `O(pinches × n log n)`: a coastline
-/// snapped to a coarse tile has pinches by the thousand, and one 316k-vertex
-/// Antarctica tile took ~7 s. The output is identical (rings, vertices and
-/// order; `split_pinches_matches_the_resorting_reference`).
-fn split_pinches(mut ring: TileRing) -> Vec<TileRing> {
-    ring.pop(); // work on the open ring
-    let mut out = Vec::new();
-    let mut path: Vec<(i32, i32)> = Vec::with_capacity(ring.len());
-    let mut at: HashMap<(i32, i32), usize> = HashMap::with_capacity(ring.len());
-    for v in ring {
-        if let Some(&i) = at.get(&v) {
-            // `path[i..]` plus the return to `v` is a loop entered at `v`.
-            let mut piece = Vec::with_capacity(path.len() - i);
-            piece.push(v);
-            for u in path.drain(i + 1..) {
-                at.remove(&u);
-                piece.push(u);
-            }
-            push_closed_loop(&mut out, piece);
-        } else {
-            at.insert(v, path.len());
-            path.push(v);
-        }
-    }
-    push_closed_loop(&mut out, path);
-    out
-}
-
-/// Close an open loop from [`split_pinches`] and keep it if it is a ring
-/// with area (a two-vertex spike or a zero-area fold is dropped).
-fn push_closed_loop(out: &mut Vec<TileRing>, mut open: Vec<(i32, i32)>) {
-    if open.len() >= 3 {
-        let first = open[0];
-        open.push(first);
-        if ring_area2(&open) != 0 {
-            out.push(open);
-        }
-    }
-}
-
-/// Insert every vertex that lies strictly inside a non-adjacent edge into
-/// that edge, so a ring that touches itself vertex-on-edge (a "T-touch")
-/// becomes one that visits the vertex twice, which [`split_pinches`] then
-/// resolves. Exact integer arithmetic; only exact coincidences qualify,
-/// which after snapping to the grid they frequently do.
-fn node_ring(ring: TileRing) -> TileRing {
-    let n = ring.len() - 1;
-    if n > NODE_MAX_EDGES {
-        return ring;
-    }
-    let inserts = if n <= NODE_SWEEP_MIN_EDGES {
-        node_inserts_all_pairs(&ring, n)
-    } else {
-        node_inserts_sweep(&ring, n)
-    };
-    apply_node_inserts(ring, inserts)
-}
-
-/// Every vertex against every edge — `O(n²)` [`node_insert`] calls, all in
-/// registers and without allocating beyond the result.
-///
-/// The whole of [`node_ring`] until #535, and still the cheapest thing to do
-/// for a short ring. It is also the oracle [`node_inserts_sweep`] is tested
-/// against, which is why it stays here rather than being inlined.
-fn node_inserts_all_pairs(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
-    // (edge index, position along the edge, vertex) for every insertion.
-    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    for k in 0..n {
-        for i in 0..n {
-            if let Some(ins) = node_insert(ring, n, k, i) {
-                inserts.push(ins);
-            }
-        }
-    }
-    inserts
-}
-
-/// [`node_inserts_all_pairs`] by x-sorted sweep (#535).
-///
-/// The all-pairs scan is `O(n²)`, and on a 3.07 M-feature z0–13 export it was
-/// the single hottest thing in the whole encode stage (32 core-seconds, 15e9
-/// inner iterations) — the coalesced overview polygons carry exterior rings of
-/// thousands of edges, and those few rings dominate the `n²` sum.
-///
-/// An insertion needs the vertex inside the edge's bounding box, so a vertex
-/// can only match edges whose x-span covers it. Sorting the vertices by x once
-/// makes each edge's candidate vertices a contiguous slice, cutting the scan to
-/// `O(n log n + Σ candidates)`.
-///
-/// The result is the same **multiset** as the all-pairs scan: the per-pair test
-/// is the same [`node_insert`] and every box-overlapping pair is still visited,
-/// so only the order of discovery differs — which [`apply_node_inserts`]'s sort
-/// normalizes.
-fn node_inserts_sweep(ring: &[(i32, i32)], n: usize) -> Vec<(usize, i64, (i32, i32))> {
-    let mut inserts: Vec<(usize, i64, (i32, i32))> = Vec::new();
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    order.sort_unstable_by_key(|&k| ring[k as usize].0);
-    let xs: Vec<i32> = order.iter().map(|&k| ring[k as usize].0).collect();
-    for i in 0..n {
-        let bx = edge_box(ring[i], ring[i + 1]);
-        let lo = xs.partition_point(|&x| x < bx.0);
-        let hi = xs.partition_point(|&x| x <= bx.2);
-        for &k in &order[lo..hi] {
-            if let Some(ins) = node_insert(ring, n, k as usize, i) {
-                inserts.push(ins);
-            }
-        }
-    }
-    inserts
-}
-
-/// Splice [`node_insert`] results into `ring`: each `(edge index, position
-/// along the edge, vertex)` lands inside the edge it was found on, in order
-/// along that edge, with a vertex already present not repeated.
-///
-/// The sort is what makes the enumeration order in [`node_ring`] irrelevant:
-/// the tuples carry their own position, and equal tuples (the same vertex
-/// value found from two ring positions) are indistinguishable, so any
-/// discovery order splices to the same ring.
-fn apply_node_inserts(ring: TileRing, mut inserts: Vec<(usize, i64, (i32, i32))>) -> TileRing {
-    if inserts.is_empty() {
-        return ring;
-    }
-    inserts.sort_unstable();
-    let n = ring.len() - 1;
-    let mut out: TileRing = Vec::with_capacity(ring.len() + inserts.len());
-    let mut next = 0;
-    for (i, &v0) in ring[..n].iter().enumerate() {
-        out.push(v0);
-        while next < inserts.len() && inserts[next].0 == i {
-            let v = inserts[next].2;
-            if out.last() != Some(&v) {
-                out.push(v);
-            }
-            next += 1;
-        }
-    }
-    let first = out[0];
-    out.push(first);
-    out
-}
-
-/// Ring sizes at or below this keep [`node_ring`]'s all-pairs scan: `n²`
-/// register-only tests beat an x-sort plus two heap allocations until the ring
-/// is a few dozen edges long.
-const NODE_SWEEP_MIN_EDGES: usize = 32;
-
-/// [`node_ring`]'s per-pair test: the insertion of vertex `ring[k]` into edge
-/// `i`, if the vertex lies exactly on that edge's interior.
-///
-/// `None` when the edge is one of the two meeting at the vertex (which contain
-/// it trivially), when the vertex is outside the edge's bounding box or is one
-/// of its endpoints, or when it is not exactly collinear with it.
-#[inline]
-fn node_insert(
-    ring: &[(i32, i32)],
-    n: usize,
-    k: usize,
-    i: usize,
-) -> Option<(usize, i64, (i32, i32))> {
-    // Edges that end or start at v contain it trivially.
-    if i == k || (i + 1) % n == k {
-        return None;
-    }
-    let v = ring[k];
-    let (a, b) = (ring[i], ring[i + 1]);
-    let bx = edge_box(a, b);
-    if v.0 < bx.0 || v.0 > bx.2 || v.1 < bx.1 || v.1 > bx.3 || v == a || v == b {
-        return None;
-    }
-    let cross = (i64::from(b.0) - i64::from(a.0)) * (i64::from(v.1) - i64::from(a.1))
-        - (i64::from(b.1) - i64::from(a.1)) * (i64::from(v.0) - i64::from(a.0));
-    if cross != 0 {
-        return None;
-    }
-    let along = (i64::from(v.0) - i64::from(a.0)).abs() + (i64::from(v.1) - i64::from(a.1)).abs();
-    Some((i, along, v))
+fn proper_crossing([d1, d2, d3, d4]: [i64; 4]) -> bool {
+    ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
 }
 
 /// Exact integer test: do closed segments `a` and `b` share any point
 /// (crossing, touching, or collinear overlap)?
 fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
-    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
-        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
-            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
-    };
     let on_segment = |p: (i32, i32), q: (i32, i32), r: (i32, i32)| -> bool {
         r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
     };
     let (p1, p2) = a;
     let (p3, p4) = b;
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+    let sides = segment_orientations(a, b);
+    let [d1, d2, d3, d4] = sides;
+    if proper_crossing(sides) {
         return true;
     }
     (d1 == 0 && on_segment(p3, p4, p1))
@@ -712,22 +503,6 @@ fn segments_meet(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bo
 fn edge_box(p: (i32, i32), q: (i32, i32)) -> (i32, i32, i32, i32) {
     (p.0.min(q.0), p.1.min(q.1), p.0.max(q.0), p.1.max(q.1))
 }
-
-#[inline]
-fn boxes_meet(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
-    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
-}
-
-/// Rings with more edges than this skip noding ([`node_ring`], which is
-/// quadratic in the vertex count). The simplicity and ring-meeting checks
-/// are plane sweeps ([`any_box_pair`]) and have no cap: a smooth 10k-edge
-/// ring (coastline-like, short edges) checks in ~0.4 ms release, a 4k-edge
-/// one in ~0.1 ms; only a saw of long edges that all overlap in x costs
-/// milliseconds. A ring over the cap that fails the checks still goes
-/// through pinch-splitting and the overlay; it only misses the vertex-on-
-/// edge noding, so a T-touch on such a ring reaches the overlay instead of
-/// the cheap split — the result is the same, it just costs more.
-const NODE_MAX_EDGES: usize = 4096;
 
 /// Visit every pair of boxes that meet, once, and stop at the first pair
 /// `hit` accepts. A plane sweep over x: boxes are sorted by their min x and
@@ -753,52 +528,17 @@ fn any_box_pair(boxes: &[(i32, i32, i32, i32)], mut hit: impl FnMut(usize, usize
     false
 }
 
-/// Is a closed ring (no repeated vertices — see [`split_pinches`]) simple:
-/// no two non-adjacent edges meet, and no adjacent pair folds back onto
-/// itself?
-fn ring_is_simple(ring: &TileRing) -> bool {
-    let n = ring.len() - 1; // edges
-
-    // Adjacent edges share a vertex by construction; they may not overlap
-    // beyond it (a 180° fold), which is: collinear at the shared vertex and
-    // the second edge running back along the first. Tested on the actual
-    // consecutive triple (prev, v, next) for every vertex, including
-    // ring[0] — a collinear-through vertex there (RDP never tests a ring's
-    // first vertex, so snapping leaves them constantly) is not a fold.
-    for i in 0..n {
-        let (p, v, q) = (ring[(i + n - 1) % n], ring[i], ring[i + 1]);
-        let cross = (i64::from(v.0) - i64::from(p.0)) * (i64::from(q.1) - i64::from(v.1))
-            - (i64::from(v.1) - i64::from(p.1)) * (i64::from(q.0) - i64::from(v.0));
-        let dot = (i64::from(v.0) - i64::from(p.0)) * (i64::from(q.0) - i64::from(v.0))
-            + (i64::from(v.1) - i64::from(p.1)) * (i64::from(q.1) - i64::from(v.1));
-        if cross == 0 && dot < 0 {
-            return false;
-        }
-    }
-    let boxes: Vec<_> = (0..n).map(|i| edge_box(ring[i], ring[i + 1])).collect();
-    !any_box_pair(&boxes, |i, j| {
-        let adjacent = (i + 1) % n == j || (j + 1) % n == i;
-        !adjacent && segments_meet((ring[i], ring[i + 1]), (ring[j], ring[j + 1]))
-    })
-}
-
 /// Exact integer test: do closed segments `a` and `b` cross properly or
 /// overlap along a stretch? Touching at a single point — an endpoint on the
 /// other segment, or a shared endpoint — is NOT counted: two rings of one
 /// polygon may touch at a point (a hole on the exterior, two holes meeting)
 /// and stay valid.
 fn segments_cross_or_overlap(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, i32))) -> bool {
-    let cross = |o: (i32, i32), p: (i32, i32), q: (i32, i32)| -> i64 {
-        (i64::from(p.0) - i64::from(o.0)) * (i64::from(q.1) - i64::from(o.1))
-            - (i64::from(p.1) - i64::from(o.1)) * (i64::from(q.0) - i64::from(o.0))
-    };
     let (p1, p2) = a;
     let (p3, p4) = b;
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)) {
+    let sides = segment_orientations(a, b);
+    let [d1, d2, _, _] = sides;
+    if proper_crossing(sides) {
         return true; // proper crossing
     }
     if d1 == 0 && d2 == 0 {
@@ -815,92 +555,6 @@ fn segments_cross_or_overlap(a: ((i32, i32), (i32, i32)), b: ((i32, i32), (i32, 
     false
 }
 
-/// Do the edges of any two *different* rings among `rings` cross or overlap
-/// (touching at points is fine)? One sweep over every edge of every ring.
-fn any_rings_meet(rings: &[&TileRing]) -> bool {
-    // Every edge, tagged with the ring it belongs to.
-    let mut edges: Vec<(u32, TileEdge)> =
-        Vec::with_capacity(rings.iter().map(|r| r.len() - 1).sum());
-    for (k, r) in rings.iter().enumerate() {
-        edges.extend(r.windows(2).map(|w| (k as u32, (w[0], w[1]))));
-    }
-    let boxes: Vec<_> = edges.iter().map(|&(_, (a, b))| edge_box(a, b)).collect();
-    any_box_pair(&boxes, |i, j| {
-        let (ki, ei) = edges[i];
-        let (kj, ej) = edges[j];
-        ki != kj && segments_cross_or_overlap(ei, ej)
-    })
-}
-
-/// Do the edges of two rings cross or overlap (touching at points is fine)?
-fn rings_meet(a: &TileRing, b: &TileRing) -> bool {
-    boxes_meet(ring_box(a), ring_box(b)) && any_rings_meet(&[a, b])
-}
-
-/// Is a polygon (exterior first, then holes) clean in tile space: every ring
-/// simple and no two rings crossing or overlapping? (Rings touching at a
-/// point are left alone; a hole touching the exterior twice — a
-/// disconnected interior — slips through, and is rare enough to accept.)
-fn polygon_is_clean(rings: &[TileRing]) -> bool {
-    if !rings.iter().all(ring_is_simple) {
-        return false;
-    }
-    if rings.len() < 2 {
-        return true;
-    }
-    // Rings whose boxes are disjoint cannot meet; sweep the rest together.
-    let boxes: Vec<_> = rings.iter().map(ring_box).collect();
-    let mut keep = vec![false; rings.len()];
-    any_box_pair(&boxes, |i, j| {
-        keep[i] = true;
-        keep[j] = true;
-        false
-    });
-    let candidates: Vec<&TileRing> = rings
-        .iter()
-        .zip(&keep)
-        .filter(|(_, &k)| k)
-        .map(|(r, _)| r)
-        .collect();
-    candidates.len() < 2 || !any_rings_meet(&candidates)
-}
-
-/// Is `p` inside a closed integer ring? Exact crossing-number test; a point
-/// on the boundary (on an edge or at a vertex) counts as inside.
-fn point_in_ring(p: (i32, i32), ring: &TileRing) -> bool {
-    let (px, py) = (i64::from(p.0), i64::from(p.1));
-    let mut inside = false;
-    for w in ring.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let (ax, ay, bx, by) = (
-            i64::from(a.0),
-            i64::from(a.1),
-            i64::from(b.0),
-            i64::from(b.1),
-        );
-        let eb = edge_box(a, b);
-        if p.0 >= eb.0
-            && p.0 <= eb.2
-            && p.1 >= eb.1
-            && p.1 <= eb.3
-            && (bx - ax) * (py - ay) - (by - ay) * (px - ax) == 0
-        {
-            return true;
-        }
-        // Half-open in y so a ray through a vertex counts once; the x of the
-        // edge at y = py is compared without dividing.
-        if (ay > py) != (by > py) {
-            let num = (py - ay) * (bx - ax);
-            let den = by - ay;
-            let lhs = (px - ax) * den;
-            if (den > 0 && lhs < num) || (den < 0 && lhs > num) {
-                inside = !inside;
-            }
-        }
-    }
-    inside
-}
-
 fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
     ring.iter()
         .fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |b, &(x, y)| {
@@ -908,195 +562,26 @@ fn ring_box(ring: &TileRing) -> (i32, i32, i32, i32) {
         })
 }
 
-/// Split every ring at its pinches and regroup the pieces into polygons.
+/// Do two polygons (exterior first) interact: would they fail the owner's
+/// check as two parts of one MultiPolygon ([`tile_polygon::check_polygons`])?
+/// That is: they cross or share an edge stretch, one passes from outside
+/// the other to inside it at a shared vertex, or one lies in the other's
+/// fill. Touching at a point is not an interaction, and an island inside a
+/// hole is a valid multipolygon, not an overlap.
 ///
-/// Orientation is judged against each ring's *own* original sense, not a
-/// global convention, because source rings carry no guaranteed winding: a
-/// piece of the exterior that keeps the exterior's sense is another
-/// exterior (an island the neck used to join); one that reverses it is a
-/// hole touching the boundary. For a hole ring the roles swap. A ring whose
-/// lobes cancel exactly (a bowtie with equal lobes, net area zero) has no
-/// sense of its own; its largest piece stands in for it. Holes are then
-/// attached to the smallest exterior that geometrically contains them
-/// (falling back to the first whose box does).
-fn regroup_pinched(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
-    let mut exteriors: Vec<TileRing> = Vec::new();
-    let mut holes: Vec<TileRing> = Vec::new();
-    for (k, ring) in rings.into_iter().enumerate() {
-        let mut own_sign = ring_area2(&ring).signum();
-        let pieces = split_pinches(node_ring(ring));
-        if own_sign == 0 {
-            own_sign = pieces
-                .iter()
-                .max_by_key(|p| ring_area2(p).abs())
-                .map_or(0, |p| ring_area2(p).signum());
-        }
-        for piece in pieces {
-            let same_sense = ring_area2(&piece).signum() == own_sign;
-            let is_exterior = (k == 0) == same_sense;
-            if is_exterior {
-                exteriors.push(piece);
-            } else {
-                holes.push(piece);
-            }
-        }
-    }
-    let boxes: Vec<_> = exteriors.iter().map(ring_box).collect();
-    let areas: Vec<i64> = exteriors.iter().map(|e| ring_area2(e).abs()).collect();
-    let mut polys: Vec<Vec<TileRing>> = exteriors.into_iter().map(|e| vec![e]).collect();
-    for hole in holes {
-        let hb = ring_box(&hole);
-        // Box containment is only a filter: after a pinch split an L-shaped
-        // lobe's box often contains an island in its concavity, and the
-        // island's hole must land on the island.
-        let mut by_box = boxes
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.0 <= hb.0 && b.1 <= hb.1 && b.2 >= hb.2 && b.3 >= hb.3)
-            .map(|(i, _)| i);
-        let Some(first) = by_box.next() else {
-            continue;
-        };
-        // PERF (#535): with a single box-containing exterior the answer is
-        // `first` whichever way the point-in-ring test goes — it either
-        // survives the filter as the only candidate, or the filter empties and
-        // `unwrap_or(first)` lands on it anyway — so the O(ring) crossing
-        // count is pure waste. That is the overwhelmingly common shape (one
-        // exterior, its own holes): the test was 5 % of all active CPU on a
-        // 3.07 M-feature export, ~3.5 M calls, essentially all of them
-        // single-candidate.
-        let target = match by_box.next() {
-            None => first,
-            Some(second) => [first, second]
-                .into_iter()
-                .chain(by_box)
-                .filter(|&i| point_in_ring(hole[0], &polys[i][0]))
-                .min_by_key(|&i| areas[i])
-                .unwrap_or(first),
-        };
-        polys[target].push(hole);
-    }
-    polys
-}
-
-/// Make a quantized polygon valid in tile space.
-///
-/// Snapping to the tile grid can fold a ring onto itself: two source
-/// vertices that were a fraction of a unit apart land on the same column,
-/// and the ring now runs back down an edge it already ran up (raster-derived
-/// field boundaries with near-collinear vertices do this constantly), or a
-/// narrow neck closes and the ring touches itself. The source was valid; the
-/// tile geometry is not, and a fill renderer can show slivers or holes where
-/// the ring overlaps. tippecanoe cleans every polygon after snapping; this
-/// does the same, but only as much as each polygon needs:
-///
-/// 1. the polygon is checked with exact integer tests (no ring
-///    self-intersects, no two rings meet) — the usual outcome, returned
-///    untouched;
-/// 2. one that fails has its rings noded (a vertex lying on another edge is
-///    inserted into it) and split at pinch points (a vertex visited twice),
-///    and the pieces regrouped — this settles the common neck-snapped-shut
-///    and vertex-on-edge cases without an overlay;
-/// 3. a piece that still fails is re-resolved through the even-odd overlay
-///    that already repairs RDP bowties, snapped again, and pinch-split
-///    again (bounded rounds).
-///
-/// The result may be several polygons (a neck that closed splits the
-/// shape) — that is the correct tile geometry. Rings that collapse to
-/// nothing are dropped; an empty result means the polygon has no area at
-/// this zoom.
-fn clean_tile_polygon(rings: Vec<TileRing>) -> Vec<Vec<TileRing>> {
-    if rings.is_empty() {
-        return Vec::new();
-    }
-    // The usual case: nothing touches, nothing crosses. One pass of the
-    // integer checks and out; noding and pinch-splitting only run on the
-    // polygons that fail it (a touch of any kind fails it).
-    if polygon_is_clean(&rings) {
-        return vec![rings];
-    }
-    let mut out = Vec::new();
-    for poly in regroup_pinched(rings) {
-        clean_into(poly, 0, &mut out);
-    }
-    out
-}
-
-/// Overlay rounds a polygon gets before it is emitted as-is. The overlay's
-/// new crossing points are fractional; snapping them can (rarely) cross
-/// again, and one more round settles that. Beyond that, emit what we have —
-/// a fill renderer copes, and unbounded loops are worse than a rare sliver.
-const MAX_REPAIR_ROUNDS: u32 = 2;
-
-/// Push `poly` onto `out` once it is clean, repairing through the overlay
-/// (and re-snapping) up to [`MAX_REPAIR_ROUNDS`] times.
-fn clean_into(poly: Vec<TileRing>, round: u32, out: &mut Vec<Vec<TileRing>>) {
-    if round >= MAX_REPAIR_ROUNDS || polygon_is_clean(&poly) {
-        out.push(poly);
-        return;
-    }
-    let Some(repaired) =
-        crate::ioverlay_clip::repair_polygon_ioverlay(&tile_rings_to_polygon(&poly))
-    else {
-        // The overlay has nothing to say (it only returns `None` for input
-        // it cannot trace); same policy as the round bound — emit what we
-        // have rather than drop a piece that has area.
-        out.push(poly);
-        return;
-    };
-    for rs in requantized_parts(repaired) {
-        for piece in regroup_pinched(rs) {
-            clean_into(piece, round + 1, out);
-        }
-    }
-}
-
-/// Snap an overlay result back to tile rings, one `Vec<TileRing>` per part.
-fn requantized_parts(g: Geometry<f64>) -> Vec<Vec<TileRing>> {
-    let parts: Vec<Polygon<f64>> = match g {
-        Geometry::Polygon(p) => vec![p],
-        Geometry::MultiPolygon(mp) => mp.0,
-        _ => Vec::new(),
-    };
-    parts
-        .iter()
-        .filter_map(|p| {
-            let exterior = requantize_ring(p.exterior())?;
-            let mut rs = vec![exterior];
-            rs.extend(p.interiors().iter().filter_map(requantize_ring));
-            Some(rs)
-        })
-        .collect()
-}
-
-/// Orient a polygon's rings in tile space: exterior positive, holes negative.
-fn orient_tile_polygon(rings: &mut [TileRing]) {
-    for (i, ring) in rings.iter_mut().enumerate() {
-        let positive = ring_area2(ring) > 0;
-        if positive != (i == 0) {
-            ring.reverse();
-        }
-    }
-}
-
-/// Do two clean polygons (exterior first) interact — exteriors crossing or
-/// overlapping, or one exterior's first vertex inside the other's fill
-/// (inside the exterior and not inside one of its holes)? Touching at a
-/// point is not an interaction, and an island inside a hole is a valid
-/// multipolygon, not an overlap.
+/// Until #748 this tested the exteriors' edges and each exterior's first
+/// vertex only, which missed two parts that share two vertices and overlap
+/// between them (Madagascar adm4 feature 7844 at 4/10/8).
 fn parts_interact(a: &[TileRing], b: &[TileRing]) -> bool {
-    let inside_fill = |p: (i32, i32), poly: &[TileRing]| {
-        point_in_ring(p, &poly[0]) && !poly[1..].iter().any(|h| point_in_ring(p, h))
-    };
-    rings_meet(&a[0], &b[0]) || inside_fill(b[0][0], a) || inside_fill(a[0][0], b)
+    tile_polygon::check_polygons(&[a, b]).is_err()
 }
 
 /// Resolve overlaps *between* the parts of a multipolygon: each part is
 /// clean on its own by now, but two parts may overlap or nest, and a fill
 /// renderer under even-odd would show the overlap as a hole. Parts that
 /// actually interact (see [`parts_interact`]) are grouped into connected
-/// components; each component of two or more is oriented consistently,
-/// unioned under `NonZero`, then snapped and cleaned again. Every other part
+/// components; each component of two or more is unioned on the tile grid
+/// ([`union_group`]). Every other part
 /// — including a mainland-and-island pair whose boxes nest but whose rings
 /// never touch — passes through untouched, in its original order.
 fn resolve_part_overlaps(parts: Vec<Vec<TileRing>>) -> Vec<Vec<TileRing>> {
@@ -1171,43 +656,24 @@ fn union_interacting_with(
     out
 }
 
-/// One component of interacting parts, oriented consistently, unioned under
-/// `NonZero`, then snapped and cleaned again. Depends only on the parts, in
-/// order.
+/// One component of interacting parts, unioned by the owner's integer
+/// overlay ([`tile_polygon::repair_polygons`]). Depends only on the parts,
+/// in order.
 fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
-    let polys: Vec<Polygon<f64>> = group
-        .iter()
-        .map(|&k| {
-            let mut p = parts[k].clone();
-            orient_tile_polygon(&mut p);
-            tile_rings_to_polygon(&p)
-        })
-        .collect();
-    let mut out = Vec::new();
-    match crate::ioverlay_clip::union_polygons_ioverlay(&polys) {
-        Some(unioned) => {
-            for rs in requantized_parts(unioned) {
-                for piece in regroup_pinched(rs) {
-                    clean_into(piece, 1, &mut out);
-                }
-            }
-        }
-        // The overlay could not trace the group: emit the parts as they
-        // are rather than drop them.
-        None => out.extend(group.iter().map(|&k| parts[k].clone())),
-    }
-    out
+    let members: Vec<&[TileRing]> = group.iter().map(|&k| &parts[k][..]).collect();
+    tile_polygon::repair_polygons(&members)
 }
 
-/// A tile's polygonal features projected, quantized and cleaned once, and
-/// which of their parts interact, so that the size valve can encode them in
-/// many groupings without redoing either (#758).
+/// A tile's polygonal features projected and quantized once, and which of
+/// their parts interact, so that the size valve can encode them in many
+/// groupings without redoing either (#758).
 ///
 /// The merge valve (`overview::export::merge_to_fit`) encodes a tile once
 /// per pass, merging more features into each other every time. A merged
 /// feature is a MultiPolygon of its members' polygons, and encoding it
-/// quantizes and cleans each polygon on its own, then unions the parts that
-/// interact. Neither the cleaned parts nor whether two parts interact depend
+/// quantizes each polygon, unions the parts that interact, and hands the
+/// result to the validity owner. Neither the quantized parts nor whether two
+/// parts interact depend
 /// on the grouping, so this quantizes once per tile and tests a pair of
 /// parts at most once, when a pass first puts both in one feature; each pass
 /// then only unions. A component of interacting parts unions to the same pieces
@@ -1220,10 +686,14 @@ fn union_group(group: &[usize], parts: &[Vec<TileRing>]) -> Vec<Vec<TileRing>> {
 /// have thousands, and storing their pairs would cost more than re-encoding.
 const MAX_CANDIDATES_PER_PART: u32 = 64;
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 pub(crate) struct QuantizedPolygons {
     /// Per feature, `None` when it is not polygonal.
     features: Vec<Option<QuantizedFeature>>,
-    /// Every feature's cleaned parts, feature by feature.
+    /// Every feature's quantized parts, feature by feature.
     parts: Vec<Vec<TileRing>>,
     /// Per part, its feature's merge key: parts with different keys are
     /// never grouped, so they are never tested against each other.
@@ -1268,6 +738,10 @@ impl QuantizedPolygons {
     /// polygons can (scene footprints, buffers): their pairs grow with the
     /// square of the part count, and the caller encodes such a tile without
     /// the cache.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: initializes per-input or per-tile worker caches"
+    )]
     pub(crate) fn new<'a>(
         features: impl IntoIterator<Item = (&'a Geometry, u64)>,
         bounds: &TileBounds,
@@ -1276,7 +750,7 @@ impl QuantizedPolygons {
         use rayon::prelude::*;
         let proj = TileProjector::new(bounds, extent);
         let (geometries, feature_keys): (Vec<&Geometry>, Vec<u64>) = features.into_iter().unzip();
-        // Per feature: its cleaned parts, `multi` and `has_coords`.
+        // Per feature: its quantized parts, `multi` and `has_coords`.
         type Quantized = (Vec<Vec<TileRing>>, bool, bool);
         let quantized: Vec<Option<Quantized>> = geometries
             .par_iter()
@@ -1413,7 +887,11 @@ impl QuantizedPolygons {
     /// [`EncodedFeatureGeometry::encode`] encodes the feature alone or the
     /// MultiPolygon of the group's polygons. `None` if a feature in the
     /// group is not polygonal.
-    pub(crate) fn encode(&self, group: &[usize]) -> Option<EncodedFeatureGeometry> {
+    pub(crate) fn encode(
+        &self,
+        group: &[usize],
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Option<EncodedFeatureGeometry> {
         let feats: Vec<&QuantizedFeature> = group
             .iter()
             .map(|&i| self.features[i].as_ref())
@@ -1439,7 +917,7 @@ impl QuantizedPolygons {
         } else {
             polys
         };
-        let commands = encode_tile_polygons(&polys);
+        let commands = encode_tile_polygons(polys, diagnostics);
         Some(if !commands.is_empty() {
             EncodedFeatureGeometry::Parts(vec![(commands, GeomType::Polygon)])
         } else if feats.iter().any(|f| f.has_coords) {
@@ -1478,8 +956,10 @@ impl QuantizedPolygons {
     }
 }
 
-/// Quantize every ring of `polygon`, clean the result, and return the
-/// polygons to emit (exterior first in each).
+/// Quantize every ring of `polygon`: the polygon in tile units (exterior
+/// first), or nothing when its exterior collapses. Not cleaned: snapping
+/// defects are settled once per feature by [`tile_polygon::finalize_polygons`]
+/// in [`encode_tile_polygons`].
 fn quantized_polygons(polygon: &Polygon, proj: &TileProjector) -> Vec<Vec<TileRing>> {
     let Some(exterior) = quantize_ring(polygon.exterior(), proj) else {
         return Vec::new();
@@ -1491,7 +971,7 @@ fn quantized_polygons(polygon: &Polygon, proj: &TileProjector) -> Vec<Vec<TileRi
             .iter()
             .filter_map(|r| quantize_ring(r, proj)),
     );
-    clean_tile_polygon(rings)
+    vec![rings]
 }
 
 /// Encode one closed integer ring with the orientation the spec requires
@@ -1530,7 +1010,19 @@ fn encode_tile_ring(
     out.push(command_encode(CMD_CLOSE_PATH, 1));
 }
 
-fn encode_tile_polygons(polys: &[Vec<TileRing>]) -> Vec<u32> {
+/// Encode one feature's polygons (each an exterior followed by its holes, in
+/// integer tile units) as a polygon command stream.
+///
+/// This is the only place polygon commands are produced, and every caller's
+/// parts go through [`tile_polygon::finalize_polygons`] here first: whatever
+/// path built them (plain encode, the merge valve's cached unions, the
+/// coverage fill, placeholder squares, `--verbatim`), what leaves is a valid
+/// OGC MultiPolygon in tile space, or a counted failure (#748).
+fn encode_tile_polygons(
+    polys: Vec<Vec<TileRing>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
+    let polys = tile_polygon::finalize_polygons(polys, diagnostics);
     let total: usize = polys.iter().flatten().map(|r| 4 + r.len() * 2).sum();
     let mut out = Vec::with_capacity(total);
     let mut cursor = (0i32, 0i32);
@@ -1559,11 +1051,16 @@ fn encode_tile_polygons(polys: &[Vec<TileRing>]) -> Vec<u32> {
 /// clamp, and `NaN`, which snaps to 0 — never panic and never produce a
 /// geometry outside the clamp. Such a clamped ring is still a valid MVT
 /// polygon, but its shape past the clamp is not preserved.
-pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+pub fn encode_polygon(
+    polygon: &Polygon,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
     // Quantize first, clean in tile space (#383), then orient on the stored
     // integer coordinates — the sign the spec is defined on.
     let proj = TileProjector::new(bounds, extent);
-    encode_tile_polygons(&quantized_polygons(polygon, &proj))
+    encode_tile_polygons(quantized_polygons(polygon, &proj), diagnostics)
 }
 
 /// Encode a MultiPolygon geometry to MVT geometry commands.
@@ -1575,23 +1072,29 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 ///
 /// Out-of-tile and non-finite vertices are clamped exactly as in
 /// [`encode_polygon`] (see its "Out-of-tile input" section).
-pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+pub fn encode_multi_polygon(
+    polygons: &MultiPolygon,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Vec<u32> {
     let proj = TileProjector::new(bounds, extent);
     let polys: Vec<Vec<TileRing>> = polygons
         .0
         .iter()
         .flat_map(|p| quantized_polygons(p, &proj))
         .collect();
-    encode_tile_polygons(&resolve_part_overlaps(polys))
+    encode_tile_polygons(resolve_part_overlaps(polys), diagnostics)
 }
 
 /// Encode polygons already in integer tile units (each one an exterior
 /// followed by its holes, rings open or closed) as one MultiPolygon command
-/// stream: clean, resolve overlapping parts and orient exactly as
+/// stream: resolve overlapping parts, make valid and orient exactly as
 /// [`encode_multi_polygon`] does. Empty when nothing has area. The #750
 /// coverage fill is built in tile units, so it skips the projection.
 pub(crate) fn encode_tile_unit_polygons<'a>(
     polygons: impl IntoIterator<Item = &'a Vec<Vec<(i32, i32)>>>,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Vec<u32> {
     let close = |ring: &Vec<(i32, i32)>| -> Option<TileRing> {
         let mut r: TileRing = Vec::with_capacity(ring.len() + 1);
@@ -1613,9 +1116,8 @@ pub(crate) fn encode_tile_unit_polygons<'a>(
             rs.extend(rings[1..].iter().filter_map(close));
             Some(rs)
         })
-        .flat_map(clean_tile_polygon)
         .collect();
-    encode_tile_polygons(&resolve_part_overlaps(polys))
+    encode_tile_polygons(resolve_part_overlaps(polys), diagnostics)
 }
 
 /// Encode a single-type `geo::Geometry` to MVT geometry commands and return the
@@ -1626,7 +1128,12 @@ pub(crate) fn encode_tile_unit_polygons<'a>(
 /// `(vec![], GeomType::Unknown)`: split it first with
 /// [`flatten_geometry_collection`], which is what [`LayerBuilder::add_feature`]
 /// does (#431).
-pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Vec<u32>, GeomType) {
+pub fn encode_geometry(
+    geom: &Geometry,
+    bounds: &TileBounds,
+    extent: u32,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> (Vec<u32>, GeomType) {
     match geom {
         Geometry::Point(p) => (encode_point(p, bounds, extent), GeomType::Point),
         Geometry::MultiPoint(mp) => (encode_multi_point(mp, bounds, extent), GeomType::Point),
@@ -1635,18 +1142,24 @@ pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Ve
             encode_multi_linestring(mls, bounds, extent),
             GeomType::Linestring,
         ),
-        Geometry::Polygon(p) => (encode_polygon(p, bounds, extent), GeomType::Polygon),
-        Geometry::MultiPolygon(mp) => (encode_multi_polygon(mp, bounds, extent), GeomType::Polygon),
+        Geometry::Polygon(p) => (
+            encode_polygon(p, bounds, extent, diagnostics),
+            GeomType::Polygon,
+        ),
+        Geometry::MultiPolygon(mp) => (
+            encode_multi_polygon(mp, bounds, extent, diagnostics),
+            GeomType::Polygon,
+        ),
         Geometry::Line(l) => (
             encode_linestring(&LineString::from(*l), bounds, extent),
             GeomType::Linestring,
         ),
         Geometry::Rect(r) => (
-            encode_polygon(&r.to_polygon(), bounds, extent),
+            encode_polygon(&r.to_polygon(), bounds, extent, diagnostics),
             GeomType::Polygon,
         ),
         Geometry::Triangle(t) => (
-            encode_polygon(&t.to_polygon(), bounds, extent),
+            encode_polygon(&t.to_polygon(), bounds, extent, diagnostics),
             GeomType::Polygon,
         ),
         Geometry::GeometryCollection(_) => (vec![], GeomType::Unknown),
@@ -1826,15 +1339,20 @@ impl EncodedFeatureGeometry {
     /// into one part per geometry kind present (polygons, lines, points, in
     /// that draw order). Parts that encode to nothing are skipped, since MVT
     /// 2.1 §4.2 requires a geometry.
-    pub(crate) fn encode(geometry: &Geometry, bounds: &TileBounds, extent: u32) -> Self {
+    pub(crate) fn encode(
+        geometry: &Geometry,
+        bounds: &TileBounds,
+        extent: u32,
+        diagnostics: &crate::diagnostics::Diagnostics,
+    ) -> Self {
         let parts: Vec<(Vec<u32>, GeomType)> = match geometry {
             Geometry::GeometryCollection(gc) => flatten_geometry_collection(gc)
                 .iter()
-                .map(|part| encode_geometry(part, bounds, extent))
+                .map(|part| encode_geometry(part, bounds, extent, diagnostics))
                 .filter(|(commands, _)| !commands.is_empty())
                 .collect(),
             _ => {
-                let encoded = encode_geometry(geometry, bounds, extent);
+                let encoded = encode_geometry(geometry, bounds, extent, diagnostics);
                 if encoded.0.is_empty() {
                     Vec::new()
                 } else {
@@ -1991,8 +1509,9 @@ impl LayerBuilder {
         geometry: &Geometry,
         properties: &[(String, PropertyValue)],
         bounds: &TileBounds,
+        diagnostics: &crate::diagnostics::Diagnostics,
     ) {
-        let encoded = EncodedFeatureGeometry::encode(geometry, bounds, self.extent);
+        let encoded = EncodedFeatureGeometry::encode(geometry, bounds, self.extent, diagnostics);
         self.add_encoded_feature(id, encoded, properties);
     }
 
@@ -2213,7 +1732,12 @@ mod tests {
     /// polygons in group order (`coalesce_valve::concat_geometry`).
     fn merged_reference(geoms: &[Geometry], group: &[usize]) -> EncodedFeatureGeometry {
         if let [only] = group {
-            return EncodedFeatureGeometry::encode(&geoms[*only], &test_bounds(), 4096);
+            return EncodedFeatureGeometry::encode(
+                &geoms[*only],
+                &test_bounds(),
+                4096,
+                &crate::diagnostics::Diagnostics::default(),
+            );
         }
         let mut polys = Vec::new();
         for &i in group {
@@ -2229,6 +1753,7 @@ mod tests {
             &Geometry::MultiPolygon(MultiPolygon(polys)),
             &test_bounds(),
             4096,
+            &crate::diagnostics::Diagnostics::default(),
         )
     }
 
@@ -2270,8 +1795,16 @@ mod tests {
 
         let mut q = QuantizedPolygons::new(geoms.iter().map(|g| (g, 0)), &test_bounds(), 4096)
             .expect("a few overlaps");
-        assert!(q.encode(&[19]).is_none(), "a line is not cached");
-        assert!(q.encode(&[0, 19]).is_none(), "nor a group holding one");
+        assert!(
+            q.encode(&[19], &crate::diagnostics::Diagnostics::default())
+                .is_none(),
+            "a line is not cached"
+        );
+        assert!(
+            q.encode(&[0, 19], &crate::diagnostics::Diagnostics::default())
+                .is_none(),
+            "nor a group holding one"
+        );
         let polygonal: Vec<usize> = (0..19).collect();
         let mut groups: Vec<Vec<usize>> = polygonal.iter().map(|&i| vec![i]).collect();
         groups.push(polygonal.clone());
@@ -2293,7 +1826,8 @@ mod tests {
         for pass in 0..3 {
             for g in &groups {
                 assert_eq!(
-                    q.encode(g).expect("polygonal"),
+                    q.encode(g, &crate::diagnostics::Diagnostics::default())
+                        .expect("polygonal"),
                     merged_reference(&geoms, g),
                     "pass {pass}, group {g:?}"
                 );
@@ -2337,7 +1871,12 @@ mod tests {
         )
         .expect("a few overlaps");
         for g in [vec![0, 2, 4], vec![1, 3, 5], vec![2, 4]] {
-            assert_eq!(q.encode(&g).unwrap(), merged_reference(&geoms, &g), "{g:?}");
+            assert_eq!(
+                q.encode(&g, &crate::diagnostics::Diagnostics::default())
+                    .unwrap(),
+                merged_reference(&geoms, &g),
+                "{g:?}"
+            );
         }
     }
 
@@ -2352,7 +1891,7 @@ mod tests {
             4096,
         )
         .expect("two parts");
-        let _ = q.encode(&[0, 1]);
+        let _ = q.encode(&[0, 1], &crate::diagnostics::Diagnostics::default());
     }
 
     fn test_bounds() -> TileBounds {
@@ -2580,7 +2119,12 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0), // Closing point
         ];
-        let commands = encode_polygon(&poly, &bounds, 4096);
+        let commands = encode_polygon(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Should have: MoveTo(1), x, y, LineTo(3), dx1, dy1, dx2, dy2, dx3, dy3, ClosePath(1)
         // MoveTo + 2 coords + LineTo + 6 coords + ClosePath = 10 elements
@@ -2612,7 +2156,13 @@ mod tests {
             ("value".to_string(), PropertyValue::Int(42)),
         ];
 
-        builder.add_feature(Some(1), &point, &properties, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point,
+            &properties,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2636,8 +2186,20 @@ mod tests {
         let props1 = vec![("name".to_string(), PropertyValue::String("a".to_string()))];
         let props2 = vec![("name".to_string(), PropertyValue::String("b".to_string()))];
 
-        builder.add_feature(Some(1), &point1, &props1, &bounds);
-        builder.add_feature(Some(2), &point2, &props2, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point1,
+            &props1,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        builder.add_feature(
+            Some(2),
+            &point2,
+            &props2,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2664,8 +2226,20 @@ mod tests {
             PropertyValue::String("building".to_string()),
         )];
 
-        builder.add_feature(Some(1), &point1, &props1, &bounds);
-        builder.add_feature(Some(2), &point2, &props2, &bounds);
+        builder.add_feature(
+            Some(1),
+            &point1,
+            &props1,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        builder.add_feature(
+            Some(2),
+            &point2,
+            &props2,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let layer = builder.build();
 
@@ -2688,6 +2262,7 @@ mod tests {
             &Geometry::Point(point!(x: 0.5, y: 0.5)),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
 
         let mut layer2 = LayerBuilder::new("lines");
@@ -2695,7 +2270,13 @@ mod tests {
             (x: 0.0, y: 0.0),
             (x: 1.0, y: 1.0),
         ]);
-        layer2.add_feature(Some(2), &line, &[], &bounds);
+        layer2.add_feature(
+            Some(2),
+            &line,
+            &[],
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         let mut tile_builder = TileBuilder::new();
         tile_builder.add_layer(layer1.build());
@@ -2716,12 +2297,21 @@ mod tests {
     fn test_encode_geometry_returns_correct_type() {
         let bounds = test_bounds();
 
-        let (_, geom_type) =
-            encode_geometry(&Geometry::Point(point!(x: 0.5, y: 0.5)), &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &Geometry::Point(point!(x: 0.5, y: 0.5)),
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Point);
 
         let line = Geometry::LineString(line_string![(x: 0.0, y: 0.0), (x: 1.0, y: 1.0)]);
-        let (_, geom_type) = encode_geometry(&line, &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &line,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Linestring);
 
         let poly = Geometry::Polygon(polygon![
@@ -2731,7 +2321,12 @@ mod tests {
             (x: 0.0, y: 1.0),
             (x: 0.0, y: 0.0),
         ]);
-        let (_, geom_type) = encode_geometry(&poly, &bounds, 4096);
+        let (_, geom_type) = encode_geometry(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(geom_type, GeomType::Polygon);
     }
 
@@ -2807,7 +2402,12 @@ mod tests {
                 ],
             ],
         ];
-        let commands = encode_polygon(&poly, &bounds, 4096);
+        let commands = encode_polygon(
+            &poly,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Decode the command stream into rings of absolute tile coords.
         let mut rings: Vec<Vec<(i64, i64)>> = Vec::new();
@@ -2976,8 +2576,18 @@ mod tests {
         ];
 
         // Both should produce equivalent MVT output (same geometry, just different input winding)
-        let commands_cw = encode_polygon(&poly_cw, &bounds, 4096);
-        let commands_ccw = encode_polygon(&poly_ccw, &bounds, 4096);
+        let commands_cw = encode_polygon(
+            &poly_cw,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let commands_ccw = encode_polygon(
+            &poly_ccw,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // The encoded geometry should be the same for both inputs
         // because winding correction normalizes them
@@ -3067,6 +2677,7 @@ mod tests {
             &Geometry::MultiLineString(multi_linestring.clone()),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let multi_tile = TileBuilder::new();
         let mut multi_builder = multi_tile;
@@ -3080,6 +2691,7 @@ mod tests {
             &Geometry::LineString(single_linestring.clone()),
             &[],
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         let single_tile = TileBuilder::new();
         let mut single_builder = single_tile;
@@ -3209,6 +2821,133 @@ mod tests {
         )
     }
 
+    #[test]
+    fn public_encoders_keep_zero_area_fill_under_all_ring_windings() {
+        use geo::{Area, BooleanOps, Validation};
+        for (x, y, height) in [
+            (100, 100, 1),
+            (100, 100, 10),
+            (-110, -110, 1),
+            (-110, -110, 10),
+            (4196, 4196, 1),
+            (4196, 4196, 10),
+        ] {
+            let crossing = [(x, y), (x + 10, y + height), (x, y + height), (x + 10, y)];
+            let shell = [
+                (x - 5, y - 5),
+                (x + 15, y - 5),
+                (x + 15, y + height + 5),
+                (x - 5, y + height + 5),
+            ];
+            let line = |r: &[(i32, i32)]| {
+                LineString::from(
+                    r.iter()
+                        .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let center = (
+                x + 5,
+                (f64::from(y) + f64::from(height) / 2.0).round() as i32,
+            );
+            let lobes = MultiPolygon(
+                vec![
+                    Polygon::new(line(&[(x, y), (x + 10, y), center, (x, y)]), vec![]),
+                    Polygon::new(
+                        line(&[
+                            (x, y + height),
+                            center,
+                            (x + 10, y + height),
+                            (x, y + height),
+                        ]),
+                        vec![],
+                    ),
+                ]
+                .into_iter()
+                .filter(|p| p.unsigned_area() > 0.0)
+                .collect(),
+            );
+            for is_hole in [false, true] {
+                let expected = if is_hole {
+                    Polygon::new(line(&shell), vec![]).difference(&lobes)
+                } else {
+                    lobes.clone()
+                };
+                for reverse_crossing in [false, true] {
+                    for reverse_shell in [false, true] {
+                        let mut crossing = crossing.to_vec();
+                        let mut shell = shell.to_vec();
+                        if reverse_crossing {
+                            crossing.reverse();
+                        }
+                        if reverse_shell {
+                            shell.reverse();
+                        }
+                        let mut p = poly_in_tile_units(
+                            &crossing
+                                .iter()
+                                .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                .collect::<Vec<_>>(),
+                        );
+                        if is_hole {
+                            let hole = p.exterior().clone();
+                            p = poly_in_tile_units(
+                                &shell
+                                    .iter()
+                                    .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                    .collect::<Vec<_>>(),
+                            );
+                            p.interiors_push(hole);
+                        }
+                        let diagnostics = crate::diagnostics::Diagnostics::default();
+                        // Include a separate part so MultiPolygon also covers
+                        // the overlap resolver in front of the final gate.
+                        let extra = [(x + 30, y), (x + 40, y), (x + 40, y + 10), (x + 30, y + 10)];
+                        let extra_source = poly_in_tile_units(
+                            &extra
+                                .iter()
+                                .map(|&(a, b)| (f64::from(a), f64::from(b)))
+                                .collect::<Vec<_>>(),
+                        );
+                        for (commands, expected) in [
+                            (
+                                encode_polygon(&p, &unit_bounds(), 4096, &diagnostics),
+                                expected.clone(),
+                            ),
+                            (
+                                encode_multi_polygon(
+                                    &MultiPolygon(vec![p.clone(), extra_source]),
+                                    &unit_bounds(),
+                                    4096,
+                                    &diagnostics,
+                                ),
+                                expected.union(&Polygon::new(line(&extra), vec![])),
+                            ),
+                        ] {
+                            let rings = rings_of(&commands);
+                            let out = MultiPolygon(rings_to_geo(&rings));
+                            assert!(out.is_valid(), "{rings:?}");
+                            assert_eq!(out.xor(&expected).unsigned_area(), 0.0,
+                                "wrong encoded fill: origin={x},{y} height={height} hole={is_hole} reversed={reverse_crossing},{reverse_shell}: {rings:?}");
+                            assert_eq!(
+                                rings.iter().filter(|r| area2(r) > 0).count(),
+                                expected.0.len()
+                            );
+                            assert_eq!(
+                                rings.iter().filter(|r| area2(r) < 0).count(),
+                                expected
+                                    .0
+                                    .iter()
+                                    .map(|p| p.interiors().len())
+                                    .sum::<usize>()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A valid source ring whose vertices at x=100 and x=99.7 snap to the
     /// same column, so the quantized ring runs down the column it already
     /// ran up (the shape from #383: raster-derived field boundaries with
@@ -3235,7 +2974,12 @@ mod tests {
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid(), "the source polygon is valid");
 
-        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        let commands = encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let rings = rings_of(&commands);
         assert!(!rings.is_empty(), "the polygon must not vanish");
         // Every emitted polygon is valid in tile space (the closed neck
@@ -3269,7 +3013,12 @@ mod tests {
             (10.1, 20.0),
             (10.0, 10.0),
         ]);
-        let commands = encode_polygon(&poly, &unit_bounds(), 4096);
+        let commands = encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(commands.is_empty(), "got {commands:?}");
     }
 
@@ -3284,7 +3033,12 @@ mod tests {
             (10.0, 50.0),
             (10.0, 10.0),
         ]);
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 1);
         assert_eq!(
             rings[0].len(),
@@ -3324,7 +3078,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             )],
         );
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 2);
         assert_eq!(rings[0].len(), 5);
         assert_eq!(rings[1].len(), 5);
@@ -3356,7 +3115,12 @@ mod tests {
         ];
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid());
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 2, "pinch must split: {rings:?}");
         for p in &out {
@@ -3393,7 +3157,12 @@ mod tests {
         ];
         let poly = poly_in_tile_units(&ext);
         assert!(poly.is_valid());
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 1, "{rings:?}");
         assert_eq!(out[0].interiors().len(), 1, "{rings:?}");
@@ -3441,7 +3210,10 @@ mod tests {
         ];
         let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 200, y + 200)).collect();
         let before = ring_area2(&ring).abs();
-        let polys = clean_tile_polygon(vec![ring]);
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         let out = rings_to_geo(&flat);
         assert_eq!(out.len(), 1, "{flat:?}");
@@ -3473,7 +3245,12 @@ mod tests {
             sq(30.0, 30.0, 70.0, 70.0),
             sq(200.0, 200.0, 210.0, 210.0),
         ]);
-        let rings = rings_of(&encode_multi_polygon(&mp, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_multi_polygon(
+            &mp,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         let out = rings_to_geo(&rings);
         assert_eq!(out.len(), 2, "{rings:?}");
         for p in &out {
@@ -3507,8 +3284,14 @@ mod tests {
             (0, 0),
         ];
         let ring: TileRing = ring.into_iter().map(|(x, y)| (x + 100, y + 100)).collect();
-        assert!(!ring_is_simple(&ring), "fixture must self-intersect");
-        let polys = clean_tile_polygon(vec![ring]);
+        assert!(
+            tile_polygon::check_polygons(&[vec![ring.clone()]]).is_err(),
+            "fixture must self-intersect"
+        );
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
         assert!(!flat.is_empty());
         for p in rings_to_geo(&flat) {
@@ -3593,153 +3376,6 @@ mod tests {
         );
     }
 
-    /// The x-sorted sweep must find exactly the insertions the all-pairs scan
-    /// found, and node the ring to exactly the same vertices — on rings big
-    /// enough to take the sweep branch in production and on rings small enough
-    /// to take the direct one, including the T-touch-heavy ones a tiny
-    /// coordinate grid manufactures.
-    ///
-    /// Both enumerations are run explicitly, so the check does not depend on
-    /// which branch [`node_ring`] happens to pick at a given size.
-    #[test]
-    fn node_ring_sweep_matches_all_pairs_reference() {
-        let mut seed = 0x0d0d_1234_5678_u64;
-        let mut touched = 0usize;
-        let mut swept = 0usize;
-        for case in 0..784 {
-            // Alternate a tiny grid (frequent exact collinearity → T-touches)
-            // with a wider one, and walk EVERY ring size 3..=100 (eight rings
-            // each), both sides of the sweep threshold.
-            let grid = if case % 2 == 0 { 8 } else { 40 } as u32;
-            let n = 3 + (case / 2) % 98;
-            let mut pts: Vec<(i32, i32)> = Vec::new();
-            let mut guard = 0;
-            while pts.len() < n && guard < 4000 {
-                guard += 1;
-                let p = (
-                    (lcg(&mut seed) % grid) as i32,
-                    (lcg(&mut seed) % grid) as i32,
-                );
-                if pts.last() != Some(&p) {
-                    pts.push(p);
-                }
-            }
-            if pts.len() < 3 || pts.first() == pts.last() {
-                continue;
-            }
-            let ring = closed(&pts);
-            let n = ring.len() - 1;
-
-            // The insertion multisets must agree (sorted, because the sweep
-            // discovers them edge-major and the scan vertex-major).
-            let mut all_pairs = node_inserts_all_pairs(&ring, n);
-            let mut sweep = node_inserts_sweep(&ring, n);
-            all_pairs.sort_unstable();
-            sweep.sort_unstable();
-            assert_eq!(sweep, all_pairs, "insertions diverged, ring={ring:?}");
-
-            // ...and so must the noded rings, including via the branch
-            // `node_ring` actually takes at this size.
-            let expected = apply_node_inserts(ring.clone(), all_pairs);
-            if expected.len() != ring.len() {
-                touched += 1;
-                swept += usize::from(n > NODE_SWEEP_MIN_EDGES);
-            }
-            assert_eq!(node_ring(ring.clone()), expected, "ring={ring:?}");
-        }
-        assert!(
-            touched > 20 && swept > 10,
-            "too few noded rings to be meaningful: {touched} ({swept} past the sweep threshold)"
-        );
-    }
-
-    /// The pre-#759 [`split_pinches`]: re-sort the remaining ring after every
-    /// split, `O(pinches × n log n)`. Kept as the oracle the single pass is
-    /// tested against, with one fix: ties are broken by index. The original
-    /// sorted by vertex alone with `sort_unstable`, so for a vertex visited
-    /// three or more times the adjacent pairs it compared were arbitrary and
-    /// it could miss the earliest second visit its own comment promises.
-    ///
-    /// Split a closed ring at every vertex it visits twice (a "pinch": a neck
-    /// that snapped shut, or a spike that folded back). Each loop between two
-    /// visits of the same vertex becomes its own closed ring; zero-area loops
-    /// (spikes) are dropped. The returned rings visit no vertex twice.
-    fn split_pinches_reference(mut ring: TileRing) -> Vec<TileRing> {
-        ring.pop(); // work on the open ring
-        let mut out = Vec::new();
-        let mut stack = vec![ring];
-        while let Some(mut cur) = stack.pop() {
-            // Find the first repeated vertex: sort (index, vertex) by vertex and
-            // look for an equal neighbour. No hashing, and n is small.
-            let mut order: Vec<usize> = (0..cur.len()).collect();
-            order.sort_unstable_by_key(|&i| (cur[i], i));
-            let mut pinch: Option<(usize, usize)> = None;
-            for w in order.windows(2) {
-                if cur[w[0]] == cur[w[1]] {
-                    let (i, j) = (w[0].min(w[1]), w[0].max(w[1]));
-                    // Take the earliest second visit so loops nest predictably.
-                    if pinch.is_none_or(|(_, pj)| j < pj) {
-                        pinch = Some((i, j));
-                    }
-                }
-            }
-            match pinch {
-                None => {
-                    if cur.len() >= 3 {
-                        let first = cur[0];
-                        cur.push(first);
-                        if ring_area2(&cur) != 0 {
-                            out.push(cur);
-                        }
-                    }
-                }
-                Some((i, j)) => {
-                    // `cur[i..j]` is the loop entered at the pinch vertex; removing
-                    // it leaves the vertex once, at index i, in the remainder.
-                    let sub: Vec<(i32, i32)> = cur.drain(i..j).collect();
-                    stack.push(cur);
-                    stack.push(sub);
-                }
-            }
-        }
-        out
-    }
-
-    /// The single-pass [`split_pinches`] returns exactly what the re-sorting
-    /// reference does: the same rings, vertices and order. Rings on tiny
-    /// grids revisit vertices constantly, including three and more times,
-    /// which is where the original's arbitrary tie order parted ways.
-    #[test]
-    fn split_pinches_matches_the_resorting_reference() {
-        let mut seed = 0x5eed_0f9a_u64;
-        let mut pinched = 0usize;
-        for case in 0..2000 {
-            let grid = [3u32, 5, 8, 16][case % 4];
-            let n = 3 + (case / 4) % 120;
-            let mut pts: Vec<(i32, i32)> = Vec::new();
-            while pts.len() < n {
-                let p = (
-                    (lcg(&mut seed) % grid) as i32,
-                    (lcg(&mut seed) % grid) as i32,
-                );
-                if pts.last() != Some(&p) {
-                    pts.push(p);
-                }
-            }
-            if pts.first() == pts.last() {
-                continue;
-            }
-            let ring = closed(&pts);
-            let expected = split_pinches_reference(ring.clone());
-            pinched += usize::from(expected.len() > 1);
-            assert_eq!(split_pinches(ring.clone()), expected, "ring={ring:?}");
-        }
-        assert!(
-            pinched > 500,
-            "too few pinched rings to be meaningful: {pinched}"
-        );
-    }
-
     /// The tile projector is a hoisted-constant refactor of the
     /// per-coordinate transform, so every projected coordinate must come out
     /// BIT-identical (not merely close) to the pre-#535 formula.
@@ -3792,19 +3428,20 @@ mod tests {
     /// the ring must read as simple whichever vertex it starts at.
     #[test]
     fn collinear_first_vertex_is_not_a_fold() {
+        let simple = |r: &[(i32, i32)]| tile_polygon::check_polygons(&[vec![closed(r)]]).is_ok();
         let square = [(50, 0), (100, 0), (100, 100), (0, 100), (0, 0)];
-        assert!(ring_is_simple(&closed(&square)), "collinear at ring[0]");
+        assert!(simple(&square), "collinear at ring[0]");
         let mut rotated = square.to_vec();
         rotated.rotate_left(1); // the collinear vertex is now ring[4]
-        assert!(ring_is_simple(&closed(&rotated)), "collinear at ring[n-1]");
+        assert!(simple(&rotated), "collinear at ring[n-1]");
         // A genuine fold at ring[0]: ring[n-1] -> ring[0] -> ring[1] runs
         // (0,0) -> (100,0) -> (50,0), back along the same line.
         let fold = [(100, 0), (50, 0), (100, 100), (0, 100), (0, 0)];
-        assert!(!ring_is_simple(&closed(&fold)), "fold at ring[0]");
+        assert!(!simple(&fold), "fold at ring[0]");
         // ...and the same fold anywhere else.
         let mut fold2 = fold.to_vec();
         fold2.rotate_left(2);
-        assert!(!ring_is_simple(&closed(&fold2)), "fold at ring[3]");
+        assert!(!simple(&fold2), "fold at ring[3]");
     }
 
     /// The collinear-first-vertex square is clean, so the encoder must emit
@@ -3820,7 +3457,12 @@ mod tests {
             (0.0, 0.0),
             (50.0, 0.0),
         ]);
-        let rings = rings_of(&encode_polygon(&poly, &unit_bounds(), 4096));
+        let rings = rings_of(&encode_polygon(
+            &poly,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(rings.len(), 1);
         assert_eq!(
             rings[0],
@@ -3845,13 +3487,15 @@ mod tests {
             &Geometry::Polygon(poly),
             &[("k".to_string(), PropertyValue::Int(1))],
             &unit_bounds(),
+            &crate::diagnostics::Diagnostics::default(),
         );
         let built = layer.build();
         assert_eq!(built.features.len(), 0, "{:?}", built.features);
     }
 
-    /// Naive pairwise reference for [`ring_is_simple`]'s non-adjacent edge
-    /// test, kept here so the sweep can be checked against it.
+    /// Naive pairwise reference for the owner's ring-simplicity test
+    /// ([`tile_polygon::check_polygons`] on one ring), kept here so the
+    /// sweep can be checked against it.
     fn ring_is_simple_pairwise(ring: &TileRing) -> bool {
         let n = ring.len() - 1;
         for i in 0..n {
@@ -3908,8 +3552,12 @@ mod tests {
                 }
             }
             let ring = closed(&pts);
+            if ring_area2(&ring) == 0 {
+                continue; // collapsed: a different defect
+            }
             let expected = ring_is_simple_pairwise(&ring);
-            assert_eq!(ring_is_simple(&ring), expected, "{ring:?}");
+            let got = tile_polygon::check_polygons(&[vec![ring.clone()]]);
+            assert_eq!(got.is_ok(), expected, "{ring:?}: {got:?}");
             if expected {
                 simple += 1;
             } else {
@@ -3918,9 +3566,23 @@ mod tests {
         }
         assert!(simple > 20 && not > 20, "simple={simple} not={not}");
 
-        // Two rings: the cross-ring sweep against its pairwise reference.
-        let (mut meet, mut apart) = (0, 0);
-        for _ in 0..400 {
+        // Two simple rings as two parts: the owner's verdict against geo's
+        // DE-9IM relate, an independent implementation. Two parts are valid
+        // together when their interiors are disjoint and their boundaries
+        // share at most points.
+        use geo::{coordinate_position::CoordPos, dimensions::Dimensions, Relate};
+        let to_geo = |r: &TileRing| {
+            Polygon::new(
+                LineString::from(
+                    r.iter()
+                        .map(|&(x, y)| (f64::from(x), f64::from(y)))
+                        .collect::<Vec<_>>(),
+                ),
+                vec![],
+            )
+        };
+        let (mut meet, mut apart, mut vertex_only) = (0, 0, 0);
+        for _ in 0..2000 {
             let gen = |off: i32, seed: &mut u64| {
                 let n = 3 + (lcg(seed) % 6) as usize;
                 let mut pts: Vec<(i32, i32)> = Vec::new();
@@ -3934,131 +3596,68 @@ mod tests {
             };
             let a = gen(0, &mut seed);
             let off = (lcg(&mut seed) % 6) as i32;
-            let b = gen(off, &mut seed);
-            let expected = rings_meet_pairwise(&a, &b);
-            assert_eq!(rings_meet(&a, &b), expected, "{a:?} {b:?}");
-            if expected {
+            let mut b = gen(off, &mut seed);
+            // Borrow some of a's vertices, so the rings share points: the
+            // case segment tests cannot judge alone.
+            let n = b.len() - 1;
+            for k in 0..n {
+                if lcg(&mut seed).is_multiple_of(3) {
+                    let v = a[(lcg(&mut seed) as usize) % (a.len() - 1)];
+                    if !b[..n].contains(&v) {
+                        b[k] = v;
+                    }
+                }
+            }
+            b[n] = b[0];
+            let usable = |r: &TileRing| ring_area2(r) != 0 && ring_is_simple_pairwise(r);
+            if !usable(&a) || !usable(&b) {
+                continue;
+            }
+            let m = to_geo(&a).relate(&to_geo(&b));
+            let valid = m.get(CoordPos::Inside, CoordPos::Inside) == Dimensions::Empty
+                && m.get(CoordPos::OnBoundary, CoordPos::OnBoundary) != Dimensions::OneDimensional;
+            let got = tile_polygon::check_polygons(&[vec![a.clone()], vec![b.clone()]]);
+            assert_eq!(got.is_ok(), valid, "{a:?} {b:?}: {got:?}");
+            if rings_meet_pairwise(&a, &b) {
                 meet += 1;
-            } else {
+            } else if valid {
                 apart += 1;
+            } else {
+                vertex_only += 1; // overlap with no edge crossing: nested or at shared vertices
             }
         }
-        assert!(meet > 20 && apart > 20, "meet={meet} apart={apart}");
+        assert!(
+            meet > 20 && apart > 20 && vertex_only > 5,
+            "meet={meet} apart={apart} vertex_only={vertex_only}"
+        );
     }
 
-    /// Two rings whose boxes are disjoint never meet, whatever their edges.
+    /// Two rings whose boxes are disjoint are two valid parts, but not an
+    /// exterior and its hole.
     #[test]
     fn rings_with_disjoint_boxes_do_not_meet() {
         let a = closed(&[(0, 0), (10, 0), (10, 10), (0, 10)]);
         let b = closed(&[(20, 0), (30, 0), (30, 10), (20, 10)]);
-        assert!(!rings_meet(&a, &b));
-        assert!(polygon_is_clean(&[a, b]));
-    }
-
-    /// An L-shaped lobe whose box contains an island in its concavity: a
-    /// hole inside the island must attach to the island, not to the first
-    /// exterior whose box contains it.
-    #[test]
-    fn pinched_hole_attaches_to_the_exterior_that_contains_it() {
-        use geo::Validation;
-        let ext = closed(&[
-            (60, 30),
-            (60, 80),
-            (30, 80),
-            (20, 20),
-            (20, 100),
-            (0, 100),
-            (0, 0),
-            (100, 0),
-            (100, 20),
-            (20, 20),
-        ]);
-        let hole = closed(&[(35, 45), (50, 45), (50, 60), (35, 60)]);
-        let polys = regroup_pinched(vec![ext, hole]);
-        assert_eq!(polys.len(), 2, "{polys:?}");
-        let with_hole = polys
-            .iter()
-            .find(|p| p.len() == 2)
-            .unwrap_or_else(|| panic!("hole dropped: {polys:?}"));
-        assert!(
-            with_hole[0].contains(&(60, 30)),
-            "hole must land on the island: {polys:?}"
+        assert_eq!(
+            tile_polygon::check_polygons(&[vec![a.clone()], vec![b.clone()]]),
+            Ok(())
         );
-        let flat: Vec<TileRing> = polys.iter().flatten().cloned().collect();
-        for mut p in polys.clone() {
-            orient_tile_polygon(&mut p);
-            let g = tile_rings_to_polygon(&p);
-            assert!(g.is_valid(), "{flat:?}");
-        }
-    }
-
-    /// The single-candidate short-circuit (#535) must not change where a hole
-    /// lands, including in the case that makes it sound risky: exactly one
-    /// exterior box contains the hole's box, but the hole's first vertex is
-    /// NOT inside that exterior's ring. The containment filter then empties
-    /// and the pre-#535 code fell back to that same exterior via
-    /// `unwrap_or(first)`, so skipping the test has to agree.
-    #[test]
-    fn hole_with_one_box_candidate_attaches_without_the_containment_test() {
-        // A C: the hole's box sits in the notch, inside the C's bbox but
-        // outside its fill, and the hole's first vertex is in the notch too.
-        let ext = closed(&[
-            (0, 0),
-            (100, 0),
-            (100, 20),
-            (20, 20),
-            (20, 80),
-            (100, 80),
-            (100, 100),
-            (0, 100),
-        ]);
-        let hole = closed(&[(40, 40), (60, 40), (60, 60), (40, 60)]);
-        assert!(
-            !point_in_ring(hole[0], &ext),
-            "fixture must have the hole vertex OUTSIDE the exterior's fill"
-        );
-        let polys = regroup_pinched(vec![ext.clone(), hole.clone()]);
-        assert_eq!(polys.len(), 1, "{polys:?}");
-        assert_eq!(polys[0], vec![ext, hole], "hole must still attach to it");
-    }
-
-    /// Point-in-ring: inside, outside, on an edge and on a vertex.
-    #[test]
-    fn point_in_ring_counts_boundary_as_inside() {
-        let sq = closed(&[(0, 0), (10, 0), (10, 10), (0, 10)]);
-        assert!(point_in_ring((5, 5), &sq));
-        assert!(!point_in_ring((15, 5), &sq));
-        assert!(!point_in_ring((5, -1), &sq));
-        assert!(point_in_ring((10, 5), &sq), "on an edge");
-        assert!(point_in_ring((0, 0), &sq), "on a vertex");
-        // Concave: the notch of a C is outside.
-        let c = closed(&[
-            (0, 0),
-            (30, 0),
-            (30, 10),
-            (10, 10),
-            (10, 20),
-            (30, 20),
-            (30, 30),
-            (0, 30),
-        ]);
-        assert!(!point_in_ring((20, 15), &c));
-        assert!(point_in_ring((5, 15), &c));
-        // A vertex-level ray (y equal to a vertex's y) is not double-counted.
-        assert!(point_in_ring((5, 10), &c));
-        assert!(point_in_ring((20, 10), &c), "on the notch edge");
+        assert!(tile_polygon::check_polygons(&[vec![a, b]]).is_err());
     }
 
     /// A bowtie whose lobes cancel exactly has zero net area; that must not
     /// drop both lobes.
     #[test]
-    fn zero_net_area_bowtie_keeps_a_lobe() {
+    fn zero_net_area_bowtie_keeps_both_lobes() {
         let ring = closed(&[(0, 0), (10, 5), (20, 10), (20, 0), (10, 5), (0, 10)]);
         assert_eq!(ring_area2(&ring), 0, "fixture must have zero net area");
-        let polys = clean_tile_polygon(vec![ring]);
-        assert!(!polys.is_empty(), "both lobes dropped");
+        let polys = tile_polygon::finalize_polygons(
+            vec![vec![ring]],
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(polys.len(), 2, "both lobes must survive");
         let area: i64 = polys.iter().flatten().map(|r| ring_area2(r).abs()).sum();
-        assert!(area > 0);
+        assert_eq!(area, 200);
     }
 
     /// A C-shaped mainland with an island in its concavity: the island's box
@@ -4156,7 +3755,12 @@ mod tests {
     fn encode_polygon_saturated_coordinates_do_not_overflow() {
         let far =
             polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
-        let cmds = encode_polygon(&far, &tiny_bounds(), 4096);
+        let cmds = encode_polygon(
+            &far,
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(
             !cmds.is_empty(),
             "a huge ring covering the tile still encodes"
@@ -4184,8 +3788,18 @@ mod tests {
                 (0.5, -0.5),
             ])],
         );
-        assert_clamped(&encode_polygon(&huge, &tiny_bounds(), 4096));
-        assert_clamped(&encode_polygon(&huge, &test_bounds(), 4096));
+        assert_clamped(&encode_polygon(
+            &huge,
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+        assert_clamped(&encode_polygon(
+            &huge,
+            &test_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 
     /// `f64::MAX` / MIN, ±inf and NaN vertices must be handled explicitly:
@@ -4221,9 +3835,19 @@ mod tests {
         for pts in cases {
             let poly = Polygon::new(LineString::from(pts.clone()), vec![]);
             for bounds in [tiny_bounds(), test_bounds()] {
-                assert_clamped(&encode_polygon(&poly, &bounds, 4096));
+                assert_clamped(&encode_polygon(
+                    &poly,
+                    &bounds,
+                    4096,
+                    &crate::diagnostics::Diagnostics::default(),
+                ));
                 let multi = MultiPolygon::new(vec![poly.clone(), poly.clone()]);
-                assert_clamped(&encode_multi_polygon(&multi, &bounds, 4096));
+                assert_clamped(&encode_multi_polygon(
+                    &multi,
+                    &bounds,
+                    4096,
+                    &crate::diagnostics::Diagnostics::default(),
+                ));
             }
         }
     }
@@ -4236,7 +3860,12 @@ mod tests {
             polygon![(x: -1.0, y: -1.0), (x: 1.0, y: -1.0), (x: 1.0, y: 1.0), (x: -1.0, y: 1.0)];
         let b =
             polygon![(x: -1e12, y: 0.3), (x: 1e12, y: 0.3), (x: 1e12, y: 0.7), (x: -1e12, y: 0.7)];
-        let cmds = encode_multi_polygon(&MultiPolygon::new(vec![a, b]), &tiny_bounds(), 4096);
+        let cmds = encode_multi_polygon(
+            &MultiPolygon::new(vec![a, b]),
+            &tiny_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(!cmds.is_empty());
         assert_clamped(&cmds);
     }
@@ -4284,28 +3913,33 @@ mod tests {
     /// sub-unit squares, it does not drop them all.
     #[test]
     fn a_square_of_the_minimum_side_survives_quantization() {
-        let sq = |x: f64, y: f64, side: f64| {
-            LineString::from(vec![
-                (x, y),
-                (x + side, y),
-                (x + side, y + side),
-                (x, y + side),
-                (x, y),
-            ])
+        // Squares placed in tile units, quantized by the production path.
+        let proj = TileProjector::new(&unit_bounds(), 4096);
+        let snapped = |x: f64, y: f64, side: f64| {
+            let ring = LineString::from(
+                [
+                    (x, y),
+                    (x + side, y),
+                    (x + side, y + side),
+                    (x, y + side),
+                    (x, y),
+                ]
+                .iter()
+                .map(|&(x, y)| lnglat(x, y))
+                .collect::<Vec<_>>(),
+            );
+            quantize_ring(&ring, &proj).is_some()
         };
         let min = MIN_SURVIVING_SQUARE_SIDE;
         for i in 0..40 {
             for j in 0..40 {
-                let (x, y) = (-10.0 + i as f64 * 0.513, 7.0 + j as f64 * 0.271);
+                let (x, y) = (10.0 + i as f64 * 0.513, 7.0 + j as f64 * 0.271);
                 for side in [min, min * 1.5, min * 3.0] {
-                    assert!(
-                        requantize_ring(&sq(x, y, side)).is_some(),
-                        "side {side} at ({x}, {y}) was dropped"
-                    );
+                    assert!(snapped(x, y, side), "side {side} at ({x}, {y}) was dropped");
                 }
             }
         }
-        assert!(requantize_ring(&sq(0.6, 0.6, 0.0)).is_none());
+        assert!(!snapped(0.6, 0.6, 0.0));
         // Sub-unit sides: survival over a uniform grid of offsets in one
         // unit cell is the product of the per-axis straddle chances, s².
         let n = 200;
@@ -4314,8 +3948,11 @@ mod tests {
             let mut kept = 0usize;
             for i in 0..n {
                 for j in 0..n {
-                    let (x, y) = ((i as f64 + 0.5) / n as f64, (j as f64 + 0.5) / n as f64);
-                    kept += usize::from(requantize_ring(&sq(x, y, side)).is_some());
+                    let (x, y) = (
+                        100.0 + (i as f64 + 0.5) / n as f64,
+                        100.0 + (j as f64 + 0.5) / n as f64,
+                    );
+                    kept += usize::from(snapped(x, y, side));
                 }
             }
             let frac = kept as f64 / (n * n) as f64;
@@ -4382,7 +4019,13 @@ mod tests {
             ]),
         ]));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(42), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(42),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(builder.feature_count(), 3, "one feature per geometry kind");
         assert_eq!(builder.dropped_features(), 0);
 
@@ -4423,7 +4066,13 @@ mod tests {
             Geometry::LineString(line_string![(x: 0.1, y: 0.1), (x: 0.9, y: 0.9)]),
         ]));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(3),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert_eq!(builder.dropped_features(), 0);
         let layer = builder.build();
         assert_eq!(
@@ -4452,18 +4101,31 @@ mod tests {
         let gc =
             Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new()));
         let mut builder = LayerBuilder::new("gc");
-        builder.add_feature(Some(1), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(1),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A collection of empty collections is just as empty.
         let nested = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
             Geometry::GeometryCollection(geo::GeometryCollection::from(Vec::<Geometry>::new())),
         ]));
-        builder.add_feature(Some(2), &nested, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(2),
+            &nested,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A plain point still encodes, so the counter is per input feature.
         builder.add_feature(
             Some(3),
             &Geometry::Point(point!(x: 0.5, y: 0.5)),
             &gc_props(),
             &bounds,
+            &crate::diagnostics::Diagnostics::default(),
         );
         assert_eq!(builder.feature_count(), 1);
         assert_eq!(builder.dropped_features(), 2);
@@ -4485,7 +4147,13 @@ mod tests {
         let mut builder = LayerBuilder::new("q");
         // One point is not a line: encode_linestring returns nothing.
         let stub = Geometry::LineString(LineString::from(vec![(0.5, 0.5)]));
-        builder.add_feature(Some(1), &stub, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(1),
+            &stub,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A polygon far below one tile unit collapses to zero area.
         let eps = 1e-9;
         let sliver = Geometry::Polygon(polygon![
@@ -4494,16 +4162,34 @@ mod tests {
             (x: 0.5 + eps, y: 0.5 + eps),
             (x: 0.5, y: 0.5),
         ]);
-        builder.add_feature(Some(2), &sliver, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(2),
+            &sliver,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // A collection whose only parts quantize away is quantized, not empty.
         let gc = Geometry::GeometryCollection(geo::GeometryCollection::from(vec![
             stub.clone(),
             sliver.clone(),
         ]));
-        builder.add_feature(Some(3), &gc, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(3),
+            &gc,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         // Truly empty input stays on the unencodable side.
         let empty = Geometry::LineString(LineString::from(Vec::<(f64, f64)>::new()));
-        builder.add_feature(Some(4), &empty, &gc_props(), &bounds);
+        builder.add_feature(
+            Some(4),
+            &empty,
+            &gc_props(),
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         assert_eq!(builder.feature_count(), 0);
         assert_eq!(builder.quantized_features(), 3);
@@ -4523,13 +4209,44 @@ mod tests {
             (0.5, 0.9).into(),
         ));
         assert_eq!(
-            encode_geometry(&line, &bounds, 4096).1,
+            encode_geometry(
+                &line,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
             GeomType::Linestring
         );
-        assert_eq!(encode_geometry(&rect, &bounds, 4096).1, GeomType::Polygon);
-        assert_eq!(encode_geometry(&tri, &bounds, 4096).1, GeomType::Polygon);
+        assert_eq!(
+            encode_geometry(
+                &rect,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
+            GeomType::Polygon
+        );
+        assert_eq!(
+            encode_geometry(
+                &tri,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .1,
+            GeomType::Polygon
+        );
         for g in [&line, &rect, &tri] {
-            assert!(!encode_geometry(g, &bounds, 4096).0.is_empty());
+            assert!(!encode_geometry(
+                g,
+                &bounds,
+                4096,
+                &crate::diagnostics::Diagnostics::default()
+            )
+            .0
+            .is_empty());
         }
         // Inside a collection they group with their kind.
         let gc = geo::GeometryCollection::from(vec![line, rect, tri]);
@@ -4537,5 +4254,218 @@ mod tests {
         assert_eq!(parts.len(), 2, "one MultiPolygon + one MultiLineString");
         assert!(matches!(parts[0], Geometry::MultiPolygon(ref mp) if mp.0.len() == 2));
         assert!(matches!(parts[1], Geometry::MultiLineString(ref mls) if mls.0.len() == 1));
+    }
+}
+
+#[cfg(test)]
+mod tile_space_validity_748 {
+    //! Real features that left the encoder invalid in tile coordinates
+    //! before #748: each is encoded through the production entry point,
+    //! decoded, and checked with `geo`'s validator and the GEOS rules of
+    //! [`tile_polygon::check_polygons`].
+    use super::*;
+    use geo::Validation;
+
+    fn unit_bounds() -> TileBounds {
+        TileBounds::new(0.0, 0.0, 1.0, 1.0)
+    }
+
+    /// Tile units to lng/lat on [`unit_bounds`], at a quarter-unit offset so
+    /// that rounding lands each vertex back on the integer it came from.
+    fn lnglat(x: i32, y: i32) -> geo::Coord<f64> {
+        let b = unit_bounds();
+        let (x, y) = (f64::from(x) + 0.25, f64::from(y) + 0.25);
+        let lng = b.lng_min + x / 4096.0 * (b.lng_max - b.lng_min);
+        let top = mercator_y_fraction(b.lat_max);
+        let bottom = mercator_y_fraction(b.lat_min);
+        let f = top + y / 4096.0 * (bottom - top);
+        let lat = (std::f64::consts::PI * (1.0 - 2.0 * f))
+            .sinh()
+            .atan()
+            .to_degrees();
+        geo::Coord { x: lng, y: lat }
+    }
+
+    fn polygon(rings: &[&[(i32, i32)]]) -> Polygon<f64> {
+        let ls = |r: &[(i32, i32)]| {
+            let mut c: Vec<_> = r.iter().map(|&(x, y)| lnglat(x, y)).collect();
+            c.push(c[0]);
+            LineString::new(c)
+        };
+        Polygon::new(ls(rings[0]), rings[1..].iter().map(|r| ls(r)).collect())
+    }
+
+    /// Decode a polygon command stream the way a client does: a ring with
+    /// the first ring's winding starts a polygon, the others are its holes.
+    fn decoded_parts(commands: &[u32]) -> Vec<Vec<TileRing>> {
+        let mut parts: Vec<Vec<TileRing>> = Vec::new();
+        let (mut cur, mut cx, mut cy, mut i) = (Vec::new(), 0i32, 0i32, 0);
+        let mut winding = 0;
+        while i < commands.len() {
+            let (cmd, count) = command_decode(commands[i]);
+            i += 1;
+            if cmd == CMD_CLOSE_PATH {
+                let mut ring: TileRing = std::mem::take(&mut cur);
+                ring.push(ring[0]);
+                let sign = ring_area2(&ring).signum();
+                if winding == 0 {
+                    winding = sign;
+                }
+                if sign == winding {
+                    parts.push(vec![ring]);
+                } else {
+                    parts.last_mut().expect("exterior first").push(ring);
+                }
+                continue;
+            }
+            for _ in 0..count {
+                cx += zigzag_decode(commands[i]);
+                cy += zigzag_decode(commands[i + 1]);
+                i += 2;
+                cur.push((cx, cy));
+            }
+        }
+        parts
+    }
+
+    fn assert_valid(commands: &[u32]) {
+        let parts = decoded_parts(commands);
+        assert!(!parts.is_empty(), "the feature kept some area");
+        let ls = |r: &TileRing| {
+            LineString::from(
+                r.iter()
+                    .map(|&(x, y)| (f64::from(x), f64::from(y)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mp = MultiPolygon::new(
+            parts
+                .iter()
+                .map(|rings| Polygon::new(ls(&rings[0]), rings[1..].iter().map(ls).collect()))
+                .collect(),
+        );
+        assert!(mp.is_valid(), "geo: {:?}", mp.validation_errors());
+        assert_eq!(tile_polygon::check_polygons(&parts), Ok(()), "{parts:?}");
+    }
+
+    #[test]
+    fn valid_thin_source_survives_bowtie_rounding() {
+        let b = unit_bounds();
+        let to_geo = |(x, y): (f64, f64)| {
+            let top = mercator_y_fraction(b.lat_max);
+            let bottom = mercator_y_fraction(b.lat_min);
+            let f = top + y / 4096.0 * (bottom - top);
+            geo::Coord {
+                x: b.lng_min + x / 4096.0 * (b.lng_max - b.lng_min),
+                y: (std::f64::consts::PI * (1.0 - 2.0 * f))
+                    .sinh()
+                    .atan()
+                    .to_degrees(),
+            }
+        };
+        let mut vertices: Vec<_> = [
+            (99.51, 99.51),
+            (109.51, 100.51),
+            (99.51, 101.49),
+            (110.49, 100.49),
+        ]
+        .into_iter()
+        .map(to_geo)
+        .collect();
+        vertices.push(vertices[0]);
+        let polygon = Polygon::new(LineString::new(vertices), vec![]);
+        assert!(polygon.is_valid(), "the source must be valid");
+        let (commands, kind) = encode_geometry(
+            &Geometry::Polygon(polygon),
+            &b,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        assert_eq!(kind, GeomType::Polygon);
+        assert_valid(&commands);
+    }
+
+    /// Madagascar adm4 feature 7844, default export, z4 tile 4/10/8: two
+    /// parts sharing two vertices and overlapping between them.
+    #[test]
+    fn multipolygon_parts_crossing_at_shared_vertices_madagascar_7844() {
+        let mp = MultiPolygon::new(vec![
+            polygon(&[&[(679, 3655), (677, 3659), (669, 3653), (677, 3648)]]),
+            polygon(&[&[(668, 3656), (669, 3653), (673, 3654), (677, 3659)]]),
+        ]);
+        assert_valid(&encode_multi_polygon(
+            &mp,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+    }
+
+    /// Madagascar adm4 feature 15595, z4 tile 4/10/8 (shifted 200 units
+    /// right): two holes that each touch the exterior twice.
+    #[test]
+    fn polygon_holes_touching_twice_madagascar_15595() {
+        let shift = |r: &[(i32, i32)]| r.iter().map(|&(x, y)| (x + 200, y)).collect::<Vec<_>>();
+        let shell = shift(&[
+            (-125, 3998),
+            (-125, 3994),
+            (-122, 3994),
+            (-122, 3991),
+            (-118, 3991),
+            (-124, 3983),
+            (-113, 3982),
+            (-115, 3995),
+            (-117, 3992),
+            (-117, 4002),
+            (-121, 3997),
+            (-121, 3998),
+        ]);
+        let h1 = shift(&[(-118, 3991), (-118, 3993), (-117, 3992)]);
+        let h2 = shift(&[(-121, 3997), (-120, 3995), (-121, 3995)]);
+        let p = polygon(&[&shell, &h1, &h2]);
+        assert_valid(&encode_polygon(
+            &p,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+    }
+
+    /// Madagascar adm4 feature 10108, `--verbatim`, z1 tile 1/1/1: a hole
+    /// that snapped outside its exterior.
+    #[test]
+    fn polygon_hole_snapped_outside_madagascar_10108() {
+        let p = polygon(&[
+            &[
+                (1045, 385),
+                (1043, 386),
+                (1042, 386),
+                (1043, 385),
+                (1043, 384),
+                (1044, 384),
+                (1044, 383),
+                (1045, 383),
+            ],
+            &[(1043, 385), (1042, 384), (1042, 385)],
+        ]);
+        assert_valid(&encode_polygon(
+            &p,
+            &unit_bounds(),
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+    }
+
+    /// The same parts through the coverage fill's tile-unit entry point.
+    #[test]
+    fn tile_unit_polygons_go_through_the_owner_too() {
+        let parts = [
+            vec![vec![(679, 3655), (677, 3659), (669, 3653), (677, 3648)]],
+            vec![vec![(668, 3656), (669, 3653), (673, 3654), (677, 3659)]],
+        ];
+        assert_valid(&encode_tile_unit_polygons(
+            parts.iter(),
+            &crate::diagnostics::Diagnostics::default(),
+        ));
     }
 }

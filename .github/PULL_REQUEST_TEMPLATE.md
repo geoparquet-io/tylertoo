@@ -4,9 +4,20 @@
 
 Closes #
 
+## Concept owner / sites
+
+<!--
+For changes to shared concepts, describe the owner in core and the callers
+that consume it. Duplication and lint checks are listed in ci/README.md.
+-->
+
+- Concept:
+- Owner:
+- Sites routed through it (former copies removed):
+
 ## Checklist
 
-Local CI gates (see [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-io/tylertoo/blob/main/DEVELOPMENT.md#ci-gates--and-how-to-run-them-locally) for the full list):
+Local CI gates (see [ci/README.md](https://github.com/geoparquet-io/tylertoo/blob/main/ci/README.md) for every gate and the command that runs it):
 
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
@@ -16,3 +27,7 @@ Local CI gates (see [DEVELOPMENT.md → CI Gates](https://github.com/geoparquet-
       `cargo run -p tylertoo --features gen-docs -- gen-reference-docs > docs/reference/cli.md`
 - [ ] Version files untouched (or bumped only via `uv run cz bump` from the
       repo root, per CONTRIBUTING.md), if applicable
+- [ ] Rust/Python duplication checks pass (`npx --yes jscpd@4.0.5` and
+      similarity-rs; see DEVELOPMENT.md)
+- [ ] Diff-scoped cargo-mutants passes for core and CLI
+      (`scripts/mutants-diff.sh origin/main`)

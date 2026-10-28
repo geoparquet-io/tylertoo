@@ -1,0 +1,23 @@
+{
+  "path": [
+    "crates/io/src",
+    "crates/core/src",
+    "crates/cli/src",
+    "crates/python/src",
+    "crates/python/python/tylertoo"
+  ],
+  "format": [
+    "rust",
+    "python"
+  ],
+  "minLines": 10,
+  "minTokens": 100,
+  "maxLines": 100000,
+  "maxSize": "10mb",
+  "threshold": 0.44,
+  "reporters": [
+    "console",
+    "json"
+  ],
+  "output": "target/jscpd"
+}

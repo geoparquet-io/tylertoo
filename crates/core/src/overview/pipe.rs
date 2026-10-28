@@ -187,6 +187,10 @@ where
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-operation caches, worker coordination and profiling; no diagnostic globals"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

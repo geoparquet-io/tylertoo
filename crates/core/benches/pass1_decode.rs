@@ -14,6 +14,7 @@
 //! the timed closure.
 //!
 //! Run with: cargo bench --package tylertoo-core --bench `pass1_decode`
+// #779: test code; reads and writes its own trusted fixtures
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
@@ -26,9 +27,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use geoarrow::array::from_arrow_array;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::time::Duration;
 use tylertoo_core::batch_processor::extract_geometries_from_array;
+use tylertoo_io::open_parquet;
 
 /// Real-world fixtures under `tests/fixtures/realdata/` (#448 note: reuse
 /// in-repo fixtures rather than synthesizing new ones). Throughput is the
@@ -51,7 +52,7 @@ fn load_batches(path: &Path) -> Option<(SchemaRef, Field, usize, Vec<RecordBatch
         return None;
     }
     let file = File::open(path).ok()?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let builder = open_parquet(file).ok()?;
     let schema = builder.schema().clone();
     let gidx = schema.index_of("geometry").ok()?;
     let gfield = schema.field(gidx).clone();
@@ -67,7 +68,12 @@ fn decode_all(gfield: &Field, gidx: usize, batches: &[RecordBatch]) -> usize {
     for batch in batches {
         let garr = from_arrow_array(batch.column(gidx).as_ref(), gfield).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         total += geoms.len();
     }
     total

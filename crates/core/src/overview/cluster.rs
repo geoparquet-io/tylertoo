@@ -1451,6 +1451,7 @@ mod tests {
 
     /// Exhaustive reference: the minimum over EVERY present cell winner of
     /// (squared distance to the orphan cell center, `Priority`, position).
+    #[cfg(test)]
     fn nearest_present_exhaustive(
         cell_key: (i64, i64),
         present: &HashMap<(i64, i64), usize>,

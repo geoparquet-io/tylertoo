@@ -25,12 +25,13 @@ name = "tylertoo"
 path = "src/main.rs"
 
 [dependencies]
-tylertoo-core = { workspace = true, features = ["remote"] }
+tylertoo-core = { workspace = true, features = ["remote", "cli"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 indicatif = { workspace = true }
+serde = { workspace = true }
 serde_json = "1"
 dhat = { version = "0.3", optional = true }
 # Exact pin (not caret): the CI drift-guard regenerates reference/cli.md and
@@ -62,9 +63,10 @@ tempfile = "3"
 # Synthetic GeoParquet fixtures written by the CLI integration tests.
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-parquet = { workspace = true }
+tylertoo-io = { workspace = true, features = ["test-support"] }
 # Snapshot tests of the CLI's stdout/stderr/exit code (tests/cmd, #613).
 trycmd = "1.2.1"
+
 
 [lints]
 workspace = true

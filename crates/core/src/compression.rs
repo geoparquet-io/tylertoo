@@ -33,8 +33,7 @@ impl Compression {
     /// Parse compression from string (case-insensitive).
     ///
     /// Valid values: "none", "gzip", "brotli", "zstd"
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "none" => Some(Compression::None),
             "gzip" => Some(Compression::Gzip),
@@ -73,6 +72,14 @@ impl Compression {
             Compression::Brotli => "brotli",
             Compression::Zstd => "zstd",
         }
+    }
+}
+
+impl std::str::FromStr for Compression {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("unknown compression {s:?}"))
     }
 }
 
@@ -132,7 +139,7 @@ struct Codec<A> {
 
 const COMPRESS: &Codec<()> = &Codec {
     verb: "compress",
-    none: copy_all,
+    none: |data, ()| Ok(data.to_vec()),
     gzip: compress_gzip,
     brotli: compress_brotli,
     zstd: compress_zstd,
@@ -238,15 +245,6 @@ pub fn decompress_capped(
     max_out: u64,
 ) -> io::Result<Vec<u8>> {
     dispatch(data, compression, max_out, DECOMPRESS)
-}
-
-/// Copy the input through, the compression side's `None` arm.
-///
-/// Infallible, but the `Result` is what the codec table's function pointers
-/// are shaped like — the other three arms can all fail.
-#[allow(clippy::unnecessary_wraps)]
-fn copy_all(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
-    Ok(data.to_vec())
 }
 
 /// Copy the input through, the decompression side's `None` arm: the ceiling
@@ -367,12 +365,14 @@ mod tests {
 
     #[test]
     fn test_compression_from_str() {
-        assert_eq!(Compression::from_str("none"), Some(Compression::None));
-        assert_eq!(Compression::from_str("gzip"), Some(Compression::Gzip));
-        assert_eq!(Compression::from_str("brotli"), Some(Compression::Brotli));
-        assert_eq!(Compression::from_str("zstd"), Some(Compression::Zstd));
-        assert_eq!(Compression::from_str("GZIP"), Some(Compression::Gzip)); // case insensitive
-        assert_eq!(Compression::from_str("invalid"), Option::None);
+        assert_eq!(Compression::parse("none"), Some(Compression::None));
+        assert_eq!(Compression::parse("gzip"), Some(Compression::Gzip));
+        assert_eq!(Compression::parse("brotli"), Some(Compression::Brotli));
+        assert_eq!(Compression::parse("zstd"), Some(Compression::Zstd));
+        assert_eq!(Compression::parse("GZIP"), Some(Compression::Gzip)); // case insensitive
+        assert_eq!(Compression::parse("invalid"), Option::None);
+        assert_eq!("GZIP".parse::<Compression>().unwrap(), Compression::Gzip);
+        assert!("invalid".parse::<Compression>().is_err());
     }
 
     #[test]

@@ -31,6 +31,10 @@
 //! Both are deliberately not `#[ignore]`d: this is the acceptance test for the
 //! whole feature, and a sharded build that is not proven identical is not a
 //! sharded build.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -677,8 +681,8 @@ fn write_point_grid(path: &Path) {
 
     use arrow_array::{ArrayRef, BinaryArray, Float64Array, Int64Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Fields, Schema};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     const COLS: i64 = 60;
     const ROWS: i64 = 20;
@@ -785,7 +789,7 @@ fn write_point_grid(path: &Path) {
         // turn this test into a no-op that still says `ok`. (The
         // `expect_row_group_pruning` assertion is the backstop, and it caught
         // exactly that.)
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+        .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]))
@@ -969,8 +973,8 @@ fn write_line_chains(path: &Path) {
 
     use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
+    use tylertoo_io::test_support::ArrowWriter;
+    use tylertoo_io::test_support::WriterProperties;
 
     let linestring = |pts: &[(f64, f64)]| -> Vec<u8> {
         let mut out = Vec::with_capacity(9 + 16 * pts.len());
@@ -1017,7 +1021,7 @@ fn write_line_chains(path: &Path) {
     });
     let batch = RecordBatch::try_new(schema.clone(), vec![ids, geometry]).expect("line batch");
     let props = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+        .set_key_value_metadata(Some(vec![tylertoo_io::KeyValue::new(
             "geo".to_string(),
             geo.to_string(),
         )]))

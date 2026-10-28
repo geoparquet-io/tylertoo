@@ -10,7 +10,8 @@
 #                   Vale + proselint on the handwritten docs, the public-API
 #                   baseline, and a build on the declared MSRV
 #   Check           rustfmt, clippy (-D warnings + curated lint set in
-#                   Cargo.toml [workspace.lints]), cargo-shear, unit tests
+#                   Cargo.toml [workspace.lints]), cargo-shear, unit tests,
+#                   jscpd and similarity-rs duplicate detection
 #   Test            the `quick` nextest tier (ubuntu/macos stable; beta on
 #                   main) — see .config/nextest.toml (#457); installs the
 #                   pinned tippecanoe so the tippecanoe-decode golden test
@@ -27,9 +28,10 @@
 #                   matches regeneration from source; rustdoc -D warnings;
 #                   tests/docs runs both tutorials, the README quickstart,
 #                   the --help flag check, and the strict site build
-#   Coverage        cargo-llvm-cov -> lcov; scripts/coverage_gate.py fails
-#                   below the line-coverage floor; codecov gets the report
-#                   (informational)
+#   Coverage        cargo-llvm-cov -> lcov; Codecov native project targets
+#                   cover workspace, core and CLI
+#   Gate scripts    pytest for the independent archive verifier
+#   Mutation gate   cargo-mutants --in-diff for core and CLI on PRs
 #   CI passed       fails if any job above failed or was cancelled; the only
 #                   CI context branch protection requires
 #
@@ -42,7 +44,8 @@
 #                   touches only docs and the Python side
 #                   (scripts/ci/python_only.sh: crates/python outside its
 #                   Rust, examples/) also runs the Python jobs, and skips
-#                   Check, Test, Slow Tests, Coverage and Lint's Rust steps.
+#                   Test, Slow Tests, Coverage and Lint's build steps. Check and
+#                   cargo-deny still run, alongside Python Quality.
 #   push to main    everything: adds the beta Test lanes and the macOS Slow
 #                   Tests, so a macOS-only or beta break shows up on the
 #                   merge that caused it. This is also the backstop for two
@@ -89,8 +92,13 @@ permissions:
   contents: read
 
 # Cancel superseded runs on the same PR to keep the feedback loop short.
+# Every other event gets its own group per commit (#779): with one group
+# per ref, a third push to main cancelled the second one's queued run, so
+# 8 of 40 main runs never ran their macOS Slow Tests and beta lanes. Each
+# merge to main must get the full run; it is the backstop for PRs that
+# pass apart and break together (see WHAT RUNS WHEN).
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -157,7 +165,7 @@ jobs:
   check:
     name: Check
     needs: plan
-    if: needs.plan.outputs.rust == 'true'
+    if: needs.plan.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -190,7 +198,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-shear
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-shear
 
@@ -202,7 +210,14 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install similarity-rs
-        run: cargo install similarity-rs --locked
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: similarity-rs@0.5.0
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
 
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -257,22 +272,11 @@ jobs:
         # [package.metadata.cargo-shear] in the owning crate.
         run: cargo shear
 
-      - name: Check for duplicated code
-        # Hard gate at 0.95 APTED similarity. The workspace has zero pairs at
-        # or above this threshold. similarity-rs has no baseline or per-pair
-        # suppression, so a new finding must be refactored, not annotated.
-        # RATCHET: lower the threshold as duplication drops — never raise it.
-        run: |
-          similarity-rs \
-            --threshold 0.95 \
-            --min-lines 10 \
-            --skip-test \
-            crates/core/src crates/cli/src crates/python/src \
-            | tee similarity.txt
-          if grep -q "Similarity:" similarity.txt; then
-            echo "::error::duplicate code found at >=0.95 similarity"
-            exit 1
-          fi
+      - name: Check for duplicated Rust and Python (jscpd)
+        run: npx --yes jscpd@4.0.5 --config .jscpd.json
+
+      - name: Check for duplicated Rust functions (similarity-rs)
+        run: similarity-rs --threshold 0.938 --min-lines 10 --skip-test --fail-on-duplicates crates/io/src crates/core/src crates/cli/src crates/python/src
 
       - name: Run unit tests
         run: cargo test --locked --lib --all-features
@@ -353,7 +357,7 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
 
@@ -380,6 +384,15 @@ jobs:
           eval "$(benchmarks/e2e/setup_tippecanoe.sh --print-path)"
           dirname "$TIPPECANOE_BIN" >> "$GITHUB_PATH"
 
+      # leaf_directory_integration runs `pmtiles verify` on its archives and
+      # fails on CI when the CLI is missing (#779; it passed vacuously
+      # before). The pinned, checksummed go-pmtiles that e2e.yml uses.
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
+
       - name: Run all tests (quick tier)
         # `quick` excludes the slow end-to-end suites (#524) and the manual
         # large-polygon regression test (see tests/fixtures/realdata/README.md)
@@ -395,7 +408,7 @@ jobs:
         # .cargo/mutants.toml names the core test binaries cargo-mutants
         # builds per mutant (only those with a test the run would execute,
         # so the slow-tier and all-#[ignore] binaries are not relinked
-        # ~8400 times a sweep). A binary missing from that list is tested
+        # ~10,300 times a sweep). A binary missing from that list is tested
         # nowhere in the weekly sweep, so the list must follow the tree:
         # this fails when crates/core/tests or the nextest slow set changed
         # and the list did not. Fix: scripts/mutants-test-binaries.sh
@@ -510,9 +523,18 @@ jobs:
         run: brew install protobuf
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest
+
+      # leaf_directory_integration runs `pmtiles verify` on its archives and
+      # fails on CI when the CLI is missing (#779; it passed vacuously
+      # before). The pinned, checksummed go-pmtiles that e2e.yml uses.
+      - name: Install go-pmtiles (pinned, checksummed)
+        run: |
+          scripts/setup_go_pmtiles.sh
+          eval "$(scripts/setup_go_pmtiles.sh --print-path)"
+          echo "PMTILES_BIN=$PMTILES_BIN" >> "$GITHUB_ENV"
 
       - name: Run slow tests (${{ matrix.shard }})
         env:
@@ -578,7 +600,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -641,7 +663,7 @@ jobs:
 
       - name: xenon (complexity gate)
         # Max absolute grade C: two golden-report tests rank C today.
-        # RATCHET: tighten to B once they are split up — never loosen.
+        # Current complexity limit for Python functions.
         run: uv run xenon --max-absolute C --max-modules A --max-average A tests
 
       - name: pip-audit (uv lockfile)
@@ -713,7 +735,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-python-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -800,7 +822,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-docs-
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: crates/python/uv.lock
@@ -928,7 +950,7 @@ jobs:
       - name: Install cargo-llvm-cov and cargo-nextest
         # Prebuilt binaries via install-action; compiling them from source
         # costs minutes on every run.
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -967,25 +989,13 @@ jobs:
           --exclude tylertoo-python
           --lcov --output-path lcov.info
 
-      # The coverage gate (#678). It reads the lcov total here rather than
-      # waiting on Codecov: the codecov/project status never posted on this
-      # repo, so the 80% target in codecov.yml gated nothing. Same file set
-      # as Codecov (the script's defaults mirror codecov.yml's `ignore:`).
-      # Main was at 95.6% (Codecov, 2026-10-15) when the floor went in.
-      # RATCHET: raise the floor as coverage grows — never lower it.
-      - name: Coverage floor
-        run: python3 scripts/coverage_gate.py --check lcov.info --min 94
-
-      # Report only: the per-file view and the PR comment. The gate is the
-      # step above, so a Codecov outage or a missing token (fork PRs) must
-      # not fail the job.
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          fail_ci_if_error: true
 
       # Main only; see CACHES in the header.
       - name: Save cargo build cache
@@ -1070,7 +1080,7 @@ jobs:
 
       - name: Install uv
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       # CI Lint: zizmor (GitHub Actions security linter) on these workflows.
       - name: zizmor
@@ -1177,7 +1187,7 @@ jobs:
       # catches new advisories between PRs.
       - name: Install cargo-audit and cargo-deny
         if: ${{ !cancelled() }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit,cargo-deny
 
@@ -1231,7 +1241,7 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: cargo "+$MSRV" check --locked --workspace --all-targets --all-features
 
-      # Public API surface: fail when tylertoo-core's exported API drifts from
+      # Public API surface: fail when core's or io's exported API drifts from
       # the committed baseline. This is a REVIEW gate, not a ban on growth —
       # an intentional change is landed by regenerating the baseline in the
       # same PR:
@@ -1254,16 +1264,43 @@ jobs:
 
       - name: Diff the public API against the baseline
         if: ${{ !cancelled() && needs.plan.outputs.rust == 'true' }}
-        working-directory: crates/core
         run: |
-          cargo "+$NIGHTLY" public-api --simplified > api-current.txt
-          if ! diff -u api/tylertoo-core.txt api-current.txt; then
-            echo "::error::tylertoo-core public API changed."
-            echo "Regenerate the baseline in this PR if the change is intended:"
-            echo "  cd crates/core && cargo +$NIGHTLY public-api \\"
-            echo "    --simplified > api/tylertoo-core.txt"
-            exit 1
-          fi
+          for crate in core io; do
+            (
+              cd "crates/$crate"
+              cargo "+$NIGHTLY" public-api --simplified > api-current.txt
+              if ! diff -u "api/tylertoo-$crate.txt" api-current.txt; then
+                echo "::error::tylertoo-$crate public API changed."
+                echo "Regenerate the baseline in this PR if the change is intended:"
+                echo "  cd crates/$crate && cargo +$NIGHTLY public-api \\"
+                echo "    --simplified > api/tylertoo-$crate.txt"
+                exit 1
+              fi
+            ) || exit 1
+          done
+
+  # Independent archive-verifier regression tests; one scripts/ci pytest step.
+  gate-scripts:
+    name: Gate scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - name: Test the archive verifier
+        run: >-
+          uv run --no-project --with pytest==8.4.2 --with pmtiles==3.8.1
+          --with mapbox-vector-tile==2.2.0 --with shapely==2.2.0 --with pyarrow==26.0.0
+          pytest -q scripts/ci/tests
+
+  mutation-diff:
+    name: Mutation gate
+    needs: plan
+    if: github.event_name == 'pull_request' && needs.plan.outputs.code == 'true'
+    uses: ./.github/workflows/mutation-diff.yml
 
   # The one CI context branch protection requires. Every job above is
   # blocking through it: it fails when any of them failed or was cancelled.
@@ -1283,6 +1320,8 @@ jobs:
       - python-tests
       - docs
       - coverage
+      - gate-scripts
+      - mutation-diff
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

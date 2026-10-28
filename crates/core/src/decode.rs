@@ -81,19 +81,19 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::KeyValue;
 use prost::Message;
 use serde::Serialize;
 use thiserror::Error;
+use tylertoo_io::BatchWriter as ArrowWriter;
+use tylertoo_io::KeyValue;
 
 use crate::archive_index::FileBytes;
-use crate::compression::{decompress_capped, MAX_INTERNAL_BYTES, MAX_TILE_BYTES};
+use crate::compression::{decompress_capped, MAX_TILE_BYTES};
 use crate::mvt::{command_decode, zigzag_decode};
 use crate::overview::writer::geo_metadata_json_deterministic;
 use crate::pmtiles_writer::{
-    decode_directory, max_expanded_entries, tile_id_to_zxy, ArchiveBytes, DirEntry, Header,
-    TileType, HEADER_BYTES, MAX_LEAF_DIRECTORIES,
+    max_expanded_entries, tile_id_to_zxy, walk_directories, ArchiveBytes, DirEntry, DirWalkError,
+    Header, TileType, HEADER_BYTES,
 };
 use crate::vector_tile::tile::GeomType;
 use crate::vector_tile::Tile;
@@ -103,7 +103,12 @@ use crate::vector_tile::Tile;
 const BATCH_SIZE: usize = 8192;
 
 /// Provenance / structural column names reserved by the decoder.
-const RESERVED_COLUMNS: [&str; 4] = ["zoom", "layer", "mvt_id", "geometry"];
+const RESERVED_COLUMNS: [&str; 4] = [
+    "zoom",
+    "layer",
+    "mvt_id",
+    crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN,
+];
 
 // ============================================================================
 // Public API
@@ -231,7 +236,7 @@ pub enum DecodeError {
     Arrow(#[from] arrow_schema::ArrowError),
 
     #[error("Parquet error")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    Parquet(#[from] tylertoo_io::ParquetError),
 
     #[error("GeoParquet write failed: {0}")]
     Write(String),
@@ -305,7 +310,7 @@ pub fn decode_pmtiles(
     let geom_field = GeometryBuilder::new(GeometryType::new(Default::default()))
         .finish()
         .data_type()
-        .to_field("geometry", true);
+        .to_field(crate::resolved_schema::DEFAULT_GEOMETRY_COLUMN, true);
     let mut fields: Vec<Arc<Field>> = vec![
         Arc::new(Field::new("zoom", DataType::UInt8, false)),
         Arc::new(Field::new("layer", DataType::Utf8, false)),
@@ -327,7 +332,7 @@ pub fn decode_pmtiles(
     // only once it is complete, so an interrupted decode leaves a previous
     // output intact.
     let (file, pending) = crate::atomic_output::create(output_path.as_ref())?;
-    let mut writer = ArrowWriter::try_new(file, encoder.target_schema(), None)?;
+    let mut writer = tylertoo_io::batch_writer(file, encoder.target_schema())?;
 
     // ---- Pass B: decode again, batch rows, stream to the writer. ----------
     let mut report = DecodeReport {
@@ -438,50 +443,33 @@ fn file_range(
 /// file, its run fits the archive's expansion budget, and its last tile id
 /// is a real one.
 ///
+/// The walk itself is [`walk_directories`], the one every PMTiles reader
+/// shares with [`crate::archive_index::ArchiveIndex`] (#779): its section
+/// ceilings, leaf bounds and entry and leaf budgets are written once there.
+/// Only the per-entry checks below are decode's own, because decode refuses
+/// a corrupt archive before it reads a single tile.
+///
 /// O(directory entries), not O(tiles) (#462): a run of identical ocean
 /// tiles is one entry here however many tiles it covers.
 fn collect_entries<S: ArchiveBytes + ?Sized>(
     src: &S,
     header: &Header,
 ) -> Result<Vec<DirEntry>, DecodeError> {
-    // A directory's length is archive-supplied, and a positioned read
-    // allocates whatever it claims, so it is capped before the read with
-    // `read_all_entries_from`'s wording (#510). A compressed body larger
-    // than the ceiling it decompresses under cannot be a directory.
-    let section =
-        |offset: u64, length: u64, what: &str| -> Result<std::borrow::Cow<'_, [u8]>, DecodeError> {
-            if length > MAX_INTERNAL_BYTES {
-                return Err(DecodeError::InvalidArchive(format!(
-                    "{what} claims {length} bytes, which exceeds the {MAX_INTERNAL_BYTES}-byte \
-                 ceiling on an archive's internal sections"
-                )));
-            }
-            let (start, len) = file_range(offset, length, src.total_len(), what)?;
-            Ok(src.read_range(start, len)?)
-        };
-
-    let decode_dir =
-        |offset: u64, length: u64, what: &'static str| -> Result<Vec<_>, DecodeError> {
-            let raw = section(offset, length, what)?;
-            let plain = decompress_capped(&raw, header.internal_compression, MAX_INTERNAL_BYTES)
-                .map_err(|source| DecodeError::Decompress {
-                    what,
-                    offset,
-                    length,
-                    source,
-                })?;
-            decode_directory(&plain).ok_or_else(|| {
-                DecodeError::InvalidArchive(format!(
-                    "undecodable {what} at byte offset {offset} ({length} bytes)"
-                ))
-            })
-        };
-
-    let root = decode_dir(
-        header.root_dir_offset,
-        header.root_dir_length,
-        "root directory",
-    )?;
+    let entries = walk_directories(src, header).map_err(|e| match e {
+        DirWalkError::Decompress {
+            what,
+            offset,
+            length,
+            source,
+        } => DecodeError::Decompress {
+            what,
+            offset,
+            length,
+            source,
+        },
+        DirWalkError::Read(e) => DecodeError::Archive(e),
+        DirWalkError::Invalid(message) => DecodeError::InvalidArchive(message),
+    })?;
 
     // Entry offsets are relative to their section; the base is added here.
     // Both come from the archive, so the sum is checked rather than trusted.
@@ -490,11 +478,9 @@ fn collect_entries<S: ArchiveBytes + ?Sized>(
             .ok_or_else(|| DecodeError::InvalidArchive(format!("{what} offset overflow")))
     };
 
-    // An entry's `(offset, length)` must lie inside the section it is
-    // relative to, not merely inside the file: a leaf pointer aimed at the
-    // tile data would otherwise be parsed as a directory, and a tile entry
-    // aimed at the directories would be handed to the MVT decoder. Cheap
-    // defense in depth on top of the file-bounds check in `section` (#417).
+    // An entry's `(offset, length)` must lie inside the tile-data section,
+    // not merely inside the file: a tile entry aimed at the directories would
+    // otherwise be handed to the MVT decoder (#417).
     let within =
         |offset: u64, length: u64, section_len: u64, what: &str| -> Result<(), DecodeError> {
             match offset.checked_add(length) {
@@ -505,67 +491,7 @@ fn collect_entries<S: ArchiveBytes + ?Sized>(
                 ))),
             }
         };
-
-    // Two budgets, because one huge leaf and a million tiny ones are
-    // different attacks (#417). Accumulated entries are bounded by what the
-    // archive could legitimately address — the same denomination the
-    // run-length budget below spends — and the *number* of leaves visited is
-    // bounded separately, since an empty leaf costs no entries while still
-    // costing a `MAX_INTERNAL_BYTES` decompression apiece.
     let entry_limit = max_expanded_entries(header);
-    let mut entry_budget = entry_limit;
-    let mut leaves_visited = 0usize;
-
-    let mut entries = Vec::new();
-    for entry in root {
-        if entry.run_length == 0 {
-            leaves_visited += 1;
-            if leaves_visited > MAX_LEAF_DIRECTORIES {
-                return Err(DecodeError::InvalidArchive(format!(
-                    "archive's root directory points at more than {MAX_LEAF_DIRECTORIES} \
-                     leaf directories"
-                )));
-            }
-            within(
-                entry.offset,
-                u64::from(entry.length),
-                header.leaf_dirs_length,
-                "leaf directory",
-            )?;
-            // Leaf directory: offset is relative to the leaf-dirs section.
-            let leaf = decode_dir(
-                absolute(header.leaf_dirs_offset, entry.offset, "leaf directory")?,
-                u64::from(entry.length),
-                "leaf directory",
-            )?;
-            // The spec allows a leaf to point at further leaves; this walker
-            // is one level deep. Falling through would slice directory bytes
-            // as a tile, so say so instead.
-            if leaf.iter().any(|e| e.run_length == 0) {
-                return Err(DecodeError::InvalidArchive(
-                    "multi-level leaf directories are not supported".to_string(),
-                ));
-            }
-            // Spent before the extend, not after: a root full of pointers at
-            // one 16 MiB leaf body is a ~50 KB file that would otherwise
-            // accumulate entries until the process died.
-            entry_budget = entry_budget.checked_sub(leaf.len() as u64).ok_or_else(|| {
-                DecodeError::InvalidArchive(format!(
-                    "directory entries across this archive's leaf directories exceed its \
-                     limit of {entry_limit} entries"
-                ))
-            })?;
-            entries.extend(leaf);
-        } else {
-            entry_budget = entry_budget.checked_sub(1).ok_or_else(|| {
-                DecodeError::InvalidArchive(format!(
-                    "directory entries across this archive's directories exceed its \
-                     limit of {entry_limit} entries"
-                ))
-            })?;
-            entries.push(entry);
-        }
-    }
 
     // Run lengths are archive-controlled u32s: one entry claiming 0xFFFFFFFF
     // is 137 GB of TileRefs. The budget is what the archive could legitimately
@@ -1439,7 +1365,12 @@ mod tests {
         let bounds: TileBounds = tile_bounds(x, y, z);
         // encode_geometry returns the MVT GeomType alongside the commands;
         // feed both straight into the decoder, mirroring decode_tile_features.
-        let (commands, geom_type) = encode_geometry(geom, &bounds, 4096);
+        let (commands, geom_type) = encode_geometry(
+            geom,
+            &bounds,
+            4096,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let parts = parse_command_stream(&commands).unwrap();
         assemble_geometry(geom_type, &parts, |px, py| {
             tile_local_to_lonlat(z, x, y, 4096, px, py)

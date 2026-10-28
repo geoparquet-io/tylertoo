@@ -27,6 +27,10 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-archive byte accounting shared by positioned readers"
+)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::compression::{self, MAX_INTERNAL_BYTES};
@@ -71,6 +75,10 @@ pub fn usable_bounds(header: &Header) -> Option<TileBounds> {
 ///
 /// `decode` reads its input through this too (#462), so neither PMTiles
 /// reader holds more of an archive than its directories and one tile.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#779: per-archive byte accounting shared by positioned readers"
+)]
 pub(crate) struct FileBytes {
     file: File,
     len: u64,
@@ -79,6 +87,10 @@ pub(crate) struct FileBytes {
 
 impl FileBytes {
     /// Open `path` for positioned reads; nothing is read yet.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "#779: per-archive byte accounting shared by positioned readers"
+    )]
     pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();

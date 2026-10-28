@@ -46,7 +46,7 @@ fn load_antarctica() -> Option<MultiPolygon<f64>> {
 }
 
 #[test]
-#[ignore] // Run explicitly with: cargo test --release -p tylertoo-core --test debug_antarctica -- --ignored --nocapture
+#[ignore = "manual investigation requiring /tmp/antarctica.wkb"] // Run explicitly with: cargo test --release -p tylertoo-core --test debug_antarctica -- --ignored --nocapture
 fn find_problematic_tiles() {
     let mp = match load_antarctica() {
         Some(mp) => mp,
@@ -81,7 +81,11 @@ fn find_problematic_tiles() {
             }
 
             let start = Instant::now();
-            let _result = clip_multipolygon_ioverlay(&mp, &bounds);
+            let _result = clip_multipolygon_ioverlay(
+                &mp,
+                &bounds,
+                &tylertoo_core::diagnostics::Diagnostics::default(),
+            );
             let elapsed = start.elapsed();
 
             if elapsed > slow_threshold {
@@ -129,7 +133,7 @@ fn find_problematic_tiles() {
 
 /// Test a single specific tile to reproduce the issue
 #[test]
-#[ignore]
+#[ignore = "manual investigation requiring /tmp/antarctica.wkb"]
 fn test_single_tile() {
     let mp = match load_antarctica() {
         Some(mp) => mp,
@@ -144,7 +148,11 @@ fn test_single_tile() {
     println!("Testing z5/x0/y22: {:?}", bounds);
 
     let start = Instant::now();
-    let result = clip_multipolygon_ioverlay(&mp, &bounds);
+    let result = clip_multipolygon_ioverlay(
+        &mp,
+        &bounds,
+        &tylertoo_core::diagnostics::Diagnostics::default(),
+    );
     let elapsed = start.elapsed();
 
     println!("Completed in {:.3}s", elapsed.as_secs_f64());

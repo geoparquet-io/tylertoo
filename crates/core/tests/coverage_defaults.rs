@@ -13,7 +13,7 @@ use std::fs::File;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tylertoo_io::open_parquet;
 
 #[path = "../../../tests/support/fixture.rs"]
 mod fixture;
@@ -61,7 +61,7 @@ fn madagascar_adm4_keeps_every_polygon_at_z8_by_default() {
     )
     .expect("decode z8");
 
-    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&decoded).unwrap())
+    let reader = open_parquet(File::open(&decoded).unwrap())
         .unwrap()
         .build()
         .unwrap();

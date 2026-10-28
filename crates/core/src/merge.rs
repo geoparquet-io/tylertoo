@@ -286,7 +286,9 @@ pub fn merge_shards(
         // Only the metadata's `name`; `vector_layers` below is authoritative
         // for what a client actually reads.
         writer.set_layer_name(&first);
-        writer.set_vector_layers_json(vector_layers_json(layers).to_string());
+        writer.set_vector_layers_json(
+            vector_layers_json(layers, &crate::diagnostics::Diagnostics::default()).to_string(),
+        );
     }
 
     let mut per_zoom_tile_counts: BTreeMap<u8, u64> = BTreeMap::new();
@@ -323,7 +325,17 @@ pub fn merge_shards(
         // this tile to a stored body (#531).
         let hash = TileHasher::hash(&data);
         writer
-            .add_tile_precompressed(t.z, t.x, t.y, hash, &data, data.len(), 0)
+            .add_tile_precompressed(
+                crate::tile::TileCoord {
+                    z: t.z,
+                    x: t.x,
+                    y: t.y,
+                },
+                hash,
+                &data,
+                data.len(),
+                0,
+            )
             .map_err(|e| Error::PMTilesWrite(format!("failed to add tile: {e}")))?;
         *per_zoom_tile_counts.entry(t.z).or_insert(0) += 1;
         tiles_total += 1;
@@ -522,7 +534,12 @@ fn input_layers(idx: &ArchiveIndex, meta: Option<&Value>) -> (Vec<LayerMeta>, (u
                     let Some(id) = l.get("id").and_then(Value::as_str) else {
                         continue;
                     };
-                    let (minzoom, maxzoom) = layer_zoom_range(l, header, idx.path());
+                    let (minzoom, maxzoom) = layer_zoom_range(
+                        l,
+                        header,
+                        idx.path(),
+                        &crate::diagnostics::Diagnostics::default(),
+                    );
                     input_zooms.push((minzoom, maxzoom));
                     layers.push(LayerMeta {
                         id: id.to_string(),

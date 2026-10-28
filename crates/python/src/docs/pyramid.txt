@@ -1,0 +1,72 @@
+Build one PMTiles archive from per-zoom-band inputs.
+
+Each band names a zoom range, an input, and an MVT layer. Bands of
+different layers may share zooms, giving several layers per tile;
+bands of one layer must not overlap. The output is overwritten if
+it exists.
+
+Args:
+    bands: Band specs as `"LO-HI:INPUT"` or `"LO-HI:INPUT:LAYER"`,
+        such as `"0-7:countries.parquet:admin"`. `INPUT` is a
+        GeoParquet source or a PMTiles archive for zooms `LO` to
+        `HI`; `LAYER` defaults to the input's file stem. See the
+        [tuning reference](https://geoparquet-io.github.io/tylertoo/OVERVIEW_TUNING/)
+        for the `LO-HI=INPUT=LAYER` form.
+    output: PMTiles archive to write.
+    generalize: Generalize each GeoParquet band, as `overview()`
+        does. By default each band is tiled verbatim, keeping every
+        feature, for input already made for its zooms.
+    tile_size_limit: Maximum raw tile size in bytes for bands tiled
+        here; `"auto"`, `0` and `None` are no limit, so every
+        feature is kept.
+    feature_order: Paint order within a tile for GeoParquet bands;
+        see `export_pmtiles()`. A band without that column keeps
+        input order, with a warning.
+    work_dir: Directory for temporary per-band files, deleted after
+        the build, or `None` for the system temporary directory.
+    allow_missing_zooms: Accept a pre-tiled band with fewer zooms
+        than declared. Missing zooms render empty.
+    name: The output's tileset name. Unset, the PMTiles bands'
+        name is kept when they agree and left out when they don't.
+    description: Description for the output, inherited the same way.
+    attribution: Attribution text or HTML for the output, `""`
+        included. Unset, every PMTiles band's credit is kept, joined
+        with `" | "`; GeoParquet bands carry none.
+    max_compressed_tile_size: Maximum gzip-compressed tile size in
+        bytes for bands tiled here; `"auto"`, `0` and `None` are no
+        limit.
+    size_valve: See `export_pmtiles()`.
+    coverage_fill: See `export_pmtiles()`.
+    simple_clip_fastpath: See `export_pmtiles()`.
+    tile_buffer: See `export_pmtiles()`.
+    extent: See `export_pmtiles()`.
+    partition_wave: See `export_pmtiles()`.
+    feature_id: See `export_pmtiles()`. Every GeoParquet band must
+        have the column.
+    include_properties: Keep only these properties in the tiles of
+        GeoParquet bands. `[]` keeps none.
+    exclude_properties: Drop these properties from the tiles of
+        GeoParquet bands. `include_properties` overrides it.
+    exclude_all_properties: Drop every property from the tiles of
+        GeoParquet bands. `include_properties` overrides it.
+
+Returns:
+    Tile counts per band, with merge diagnostics and the metadata
+    written.
+
+Raises:
+    ConfigError: An option out of range or refused.
+    ValueError: A malformed band spec, overlapping bands of one
+        layer, or a missing band input.
+    RuntimeError: A band failed to convert, export, or merge.
+
+Example:
+    >>> report = pyramid(
+    ...     [
+    ...         "8-9:buildings.parquet:coarse",
+    ...         "10-12:buildings.parquet:fine",
+    ...     ],
+    ...     "pyramid.pmtiles",
+    ... )
+    >>> [band["layer"] for band in report["bands"]]
+    ['coarse', 'fine']

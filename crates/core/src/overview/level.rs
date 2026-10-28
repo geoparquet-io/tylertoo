@@ -30,6 +30,8 @@ pub const COGP_KEY: &str = "cogp";
 
 /// The spec version emitted by this implementation (semver MAJOR.MINOR.PATCH).
 pub const SPEC_VERSION: &str = "0.2.0";
+/// Overview major version understood by the reader and conformance validator.
+pub const SUPPORTED_MAJOR: u64 = 0;
 
 /// Web Mercator equatorial circumference in meters (§5.2).
 pub const WEBMERC_CIRCUMFERENCE_M: f64 = 40_075_016.69;
@@ -45,7 +47,7 @@ pub const METERS_PER_DEGREE: f64 = 111_320.0;
 /// v0.1 restricts overviews to these two CRSs. The variant governs how a
 /// meters-denominated GSD tolerance is expressed in the geometry's
 /// coordinate units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Crs {
     /// Geographic lon/lat degrees. Meters are divided by
     /// [`METERS_PER_DEGREE`] (equatorial approximation; high-latitude
@@ -115,6 +117,16 @@ pub enum Mode {
     Partitioning,
 }
 
+impl Mode {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Duplicating => "duplicating",
+            Mode::Partitioning => "partitioning",
+        }
+    }
+}
+
 impl std::str::FromStr for Mode {
     type Err = String;
 
@@ -153,6 +165,24 @@ pub enum MemoryProfile {
     /// Spill each output level's rows to a temporary Arrow IPC file and stream
     /// them back at write time, capping peak RAM.
     Bounded,
+}
+
+impl MemoryProfile {
+    /// The CLI / Python spelling, the inverse of [`FromStr`](std::str::FromStr).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryProfile::Auto => "auto",
+            MemoryProfile::Speed => "speed",
+            MemoryProfile::Bounded => "bounded",
+        }
+    }
+}
+
+/// The spelling [`MemoryProfile::as_str`] gives.
+impl std::fmt::Display for MemoryProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl std::str::FromStr for MemoryProfile {
@@ -604,6 +634,9 @@ pub enum OverviewValidationError {
         /// Previous level's value.
         previous: u8,
     },
+    /// The file uses an overview major version this reader cannot interpret.
+    #[error("unsupported overview MAJOR version in {0:?}")]
+    UnsupportedVersion(String),
     /// `duplicating` mode with `canonical_level` != `L-1` (§3.4).
     #[error("duplicating mode requires canonical_level = {expected} (L-1), got {actual:?}")]
     CanonicalLevelMismatch {
@@ -677,6 +710,12 @@ impl OverviewsMeta {
     pub fn validate(&self, num_row_groups: i64) -> Result<(), OverviewValidationError> {
         if !is_semver(&self.version) {
             return Err(OverviewValidationError::InvalidVersion(
+                self.version.clone(),
+            ));
+        }
+
+        if parse_semver_major(&self.version) != Some(SUPPORTED_MAJOR) {
+            return Err(OverviewValidationError::UnsupportedVersion(
                 self.version.clone(),
             ));
         }
@@ -805,6 +844,10 @@ pub(super) fn semver_parts(v: &str) -> Option<[&str; 3]> {
     (parts.next().is_none() && triple.iter().all(|p| numeric(p))).then_some(triple)
 }
 
+pub(super) fn parse_semver_major(v: &str) -> Option<u64> {
+    semver_parts(v)?[0].parse().ok()
+}
+
 /// Minimal `MAJOR.MINOR.PATCH` semver check (all numeric, three parts).
 fn is_semver(v: &str) -> bool {
     semver_parts(v).is_some()
@@ -840,6 +883,7 @@ mod tests {
     }
 
     /// Build a valid 3-level duplicating meta matching §9.1 for reuse.
+    #[cfg(test)]
     fn duplicating_example() -> OverviewsMeta {
         OverviewsMeta {
             version: "0.1.0".to_string(),
@@ -866,6 +910,7 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
     fn partitioning_example() -> OverviewsMeta {
         OverviewsMeta {
             version: "0.1.0".to_string(),

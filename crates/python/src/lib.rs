@@ -1,41 +1,52 @@
 //! Python bindings for tylertoo
 //!
 //! This module exposes the tylertoo-core functionality to Python via pyo3.
+//!
+//! Keywords deserialize into core option structs. Core owns defaults and
+//! validation; Python surfaces option refusals as `tylertoo.ConfigError`.
+//! `build.rs` generates runtime signatures from core defaults, and stubtest
+//! checks the full typed signatures against that runtime surface.
 
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
-use std::collections::BTreeMap;
+use pyo3::types::{PyDict, PyList, PyString};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "#445: process-wide Python logging bridge reset handle"
+)]
 use std::sync::OnceLock;
 use tylertoo_core::decode::{decode_pmtiles, DecodeError, DecodeOptions};
 use tylertoo_core::input_set::ConvertSource;
-use tylertoo_core::overview::assign::{
-    AssignConfig, BudgetKinds, DensityBudgetConfig, SortDirection,
-};
 use tylertoo_core::overview::auto_zoom::MaxZoom;
 use tylertoo_core::overview::check::validate_file;
-use tylertoo_core::overview::cluster::{AccumulateOp, AccumulateSpec};
+use tylertoo_core::overview::config::keywords as config_keywords;
 use tylertoo_core::overview::convert::{
-    convert_to_overviews, convert_to_overviews_sources, parse_entry_zoom,
-    parse_representation_spec, ClassRanking, ConvertError, ConvertOptions, ConvertReport,
-    GeneralizationOverrides, LevelPlan,
+    convert_to_overviews, convert_to_overviews_sources, ConvertError, ConvertOptions,
 };
 use tylertoo_core::overview::export::{
-    export_pmtiles as export_pmtiles_core, ExportError, ExportOptions, ExportReport, FeatureOrder,
-    SizeValve,
+    export_pmtiles as export_pmtiles_core, ExportError, ExportOptions,
 };
-use tylertoo_core::overview::ladder::{EntryZoomKind, EntryZoomSpec};
-use tylertoo_core::overview::level::{MemoryProfile, Mode};
-use tylertoo_core::overview::properties::PropertySelection;
-use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 use tylertoo_core::overview::tiles::{
-    convert_to_pmtiles, TilesError, TilesInput, TilesOptions, TilesOutcome,
+    convert_to_pmtiles, intermediate_space_preflight, SpaceRemedies, TilesError, TilesInput,
+    TilesOptions, TilesOutcome,
 };
-use tylertoo_core::pyramid::{build_pyramid, parse_bands, PyramidOptions};
+use tylertoo_core::pyramid::{build_pyramid, parse_bands};
+
+pyo3::create_exception!(
+    _tylertoo,
+    ConfigError,
+    PyValueError,
+    "An option value or combination refused before any input is read. The \
+     rules are the core library's, the same ones the CLI enforces."
+);
 
 /// The installed log bridge's cache handle (#445), set once at import.
+#[expect(
+    clippy::disallowed_types,
+    reason = "#445: process-wide Python logging bridge reset handle"
+)]
 static LOG_RESET: OnceLock<pyo3_log::ResetHandle> = OnceLock::new();
 
 /// Drop pyo3-log's cached Python loggers and levels, so a `logging`
@@ -51,67 +62,225 @@ fn refresh_log_levels() {
     }
 }
 
-/// `size_valve=` as the CLI spells `--size-valve`: `merge` or `drop` (#745).
-fn parse_size_valve(s: &str) -> PyResult<SizeValve> {
-    s.parse()
-        .map_err(|e: String| PyErr::new::<PyValueError, _>(format!("size_valve: {e}")))
+/// A keyword argument that does not translate (an unknown spelling), as
+/// `tylertoo.ConfigError`.
+fn config_err(message: impl std::fmt::Display) -> PyErr {
+    ConfigError::new_err(message.to_string())
 }
 
-/// Parse the `feature_order` kwarg into the core enum, surfacing a bad
-/// spelling as a Python `ValueError` rather than a panic (#361).
-fn parse_feature_order(s: &str) -> PyResult<FeatureOrder> {
-    s.parse::<FeatureOrder>()
-        .map_err(pyo3::exceptions::PyValueError::new_err)
+/// `Display` plus the `#[source]` chain, `": "`-joined — what the CLI shows
+/// through anyhow's `Caused by:` and what a Python message would otherwise
+/// drop (an I/O error's "Permission denied (os error 13)" lives in
+/// `source()`, which `Display` alone omits).
+fn with_sources(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        use std::fmt::Write as _;
+        let _ = write!(out, ": {c}");
+        cause = c.source();
+    }
+    out
 }
 
-/// The `include_properties` / `exclude_properties` / `exclude_all_properties`
-/// kwargs as core's [`PropertySelection`] (#445, #402). Core owns the
-/// precedence (an include list wins) and the validation; an empty include
-/// list keeps no properties, as core documents.
-fn property_selection(
-    include: Option<Vec<String>>,
-    exclude: Option<Vec<String>>,
-    exclude_all: bool,
-) -> PropertySelection {
-    PropertySelection {
-        include,
-        exclude: exclude.unwrap_or_default(),
-        exclude_all,
+// The public signatures and docstrings are generated from core defaults.
+include!(concat!(env!("OUT_DIR"), "/signatures.rs"));
+
+fn keywords(
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    if let Some(kwargs) = kwargs {
+        let mut deserializer = pythonize::Depythonizer::from_object(kwargs);
+        config_keywords::validate_rank_syntax(&mut deserializer).map_err(config_err)?;
+        let py = kwargs.py();
+        let fspath = py.import("os")?.getattr("fspath")?;
+        for (key, value) in kwargs.iter() {
+            let key = key.extract::<String>()?;
+            let value = if !value.is_instance_of::<PyString>() && value.hasattr("__fspath__")? {
+                fspath.call1((value,))?
+            } else {
+                value
+            };
+            let mut deserializer = pythonize::Depythonizer::from_object(&value);
+            let value =
+                config_keywords::deserialize_value(&key, &mut deserializer).map_err(config_err)?;
+            out.insert(key, value);
+        }
+    }
+    Ok(out)
+}
+
+/// Map a [`ConvertError`] to the Python exception type it deserves: a
+/// refused option ([`ConvertError::is_config`]) is `tylertoo.ConfigError`;
+/// other user-input problems (missing/mistyped columns, an input whose
+/// coordinates or CRS the tiler cannot work with) are `ValueError`; the #543
+/// pass-1 memory preflight is `MemoryError`; everything else (I/O, decode,
+/// writer) is `RuntimeError`.
+fn convert_error_to_py(e: ConvertError) -> PyErr {
+    if e.is_config() {
+        return config_err(e);
+    }
+    match e {
+        // The box is too small for this input (#543).
+        ConvertError::BudgetExceeded { .. } => PyMemoryError::new_err(e.to_string()),
+        // The input itself is the problem, not the run (#429).
+        ConvertError::AllFeaturesOutOfRange { .. }
+        | ConvertError::UnsupportedCrs { .. }
+        | ConvertError::SortKeyColumnMissing { .. }
+        | ConvertError::ClassRankColumnMissing { .. }
+        | ConvertError::ClassRankColumnNotString { .. }
+        | ConvertError::AccumulateColumnMissing { .. }
+        | ConvertError::AccumulateColumnNotNumeric { .. }
+        | ConvertError::AutoZoomNoSignal { .. }
+        | ConvertError::Properties(_) => PyValueError::new_err(e.to_string()),
+        other => PyRuntimeError::new_err(format!("overview conversion failed: {other}")),
     }
 }
+
+/// Map an [`ExportError`] to a Python exception: a refused option
+/// ([`ExportError::is_config`]) is `tylertoo.ConfigError`; a property
+/// selection the overview file cannot satisfy is `ValueError`; everything
+/// else keeps the `RuntimeError` it always was.
+fn export_error_to_py(e: ExportError) -> PyErr {
+    if e.is_config() {
+        return config_err(e);
+    }
+    match e {
+        ExportError::UnknownProperty { .. }
+        | ExportError::UnsupportedProperty { .. }
+        | ExportError::CoveringProperty { .. }
+        | ExportError::PropertyRequiredByKnob { .. } => PyValueError::new_err(e.to_string()),
+        other => PyRuntimeError::new_err(format!("export failed: {other}")),
+    }
+}
+
+/// Map a [`TilesError`] the way its halves map, with refused options as
+/// `tylertoo.ConfigError`.
+fn tiles_error_to_py(e: TilesError) -> PyErr {
+    match e {
+        TilesError::Convert(inner) => convert_error_to_py(inner),
+        TilesError::Export(inner) => export_error_to_py(inner),
+        e if e.is_config() => config_err(with_sources(&e)),
+        other => PyRuntimeError::new_err(with_sources(&other)),
+    }
+}
+
+/// Map a pyramid build's error: a refused option is `tylertoo.ConfigError`.
+fn pyramid_error_to_py(e: tylertoo_core::Error) -> PyErr {
+    match e {
+        e if e.is_config() => config_err(with_sources(&e)),
+        other => PyRuntimeError::new_err(format!("pyramid build failed: {}", with_sources(&other))),
+    }
+}
+
+/// Map a [`DecodeError`] to a Python exception: an inverted zoom range, a
+/// raster archive, or a property that collides with a provenance column is
+/// the caller's input problem (`ValueError`); a damaged or unreadable
+/// archive, or a failed write, is `RuntimeError`. The cause chain is kept,
+/// since `DecodeError` leaves it out of its own `Display` (#396).
+fn decode_error_to_py(e: DecodeError) -> PyErr {
+    match e {
+        DecodeError::InvalidZoomRange { .. }
+        | DecodeError::NotVectorTiles(_)
+        | DecodeError::ReservedColumn(_) => PyValueError::new_err(with_sources(&e)),
+        other => PyRuntimeError::new_err(format!("decode failed: {}", with_sources(&other))),
+    }
+}
+
+/// A core report as the dict it is: every report struct serializes as a
+/// map, keyed by its serde field names (the keys of the CLI's `--report`
+/// JSON), so the Python and CLI reports cannot drift.
+fn report_dict<T: serde::Serialize>(py: Python<'_>, report: &T) -> PyResult<Py<PyDict>> {
+    Ok(pythonize::pythonize(py, report)?
+        .cast_into::<PyDict>()?
+        .unbind())
+}
+
+/// Replace display-only JSON filenames with `PyO3`'s native filesystem paths.
+/// Keep every spill cleanup-managed until the entire result is ready.
+fn report_dict_with_losses(
+    py: Python<'_>,
+    report: &impl serde::Serialize,
+    losses: &[(&tylertoo_core::diagnostics::SourceLosses, Option<&str>)],
+) -> PyResult<Py<PyDict>> {
+    let dict = report_dict(py, report)?;
+    for (losses, section) in losses {
+        if let Some(path) = losses.python_path() {
+            let parent = if let Some(section) = section {
+                dict.bind(py)
+                    .get_item(section)?
+                    .ok_or_else(|| PyRuntimeError::new_err("missing report section"))?
+            } else {
+                dict.bind(py).clone().into_any()
+            };
+            parent.get_item("source_losses")?.set_item("path", path)?;
+        }
+    }
+    for (losses, _) in losses {
+        losses.publish_python();
+    }
+    Ok(dict)
+}
+
+fn check_keywords(
+    command: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> PyResult<()> {
+    let defaults = config_keywords::command_defaults(command);
+    for key in values.keys() {
+        if !defaults.contains_key(key) {
+            return Err(config_err(format!("unknown keyword {key}")));
+        }
+    }
+    Ok(())
+}
+
+fn overview_config(
+    values: serde_json::Map<String, serde_json::Value>,
+) -> PyResult<(MaxZoom, ConvertOptions)> {
+    config_with_max_zoom("overview", values, |values| {
+        config_keywords::convert(values, ConvertOptions::default()).map_err(convert_error_to_py)
+    })
+}
+
+fn tiles_config(
+    values: serde_json::Map<String, serde_json::Value>,
+) -> PyResult<(MaxZoom, TilesOptions)> {
+    config_with_max_zoom("convert", values, |values| {
+        config_keywords::tiles(values).map_err(tiles_error_to_py)
+    })
+}
+
+fn config_with_max_zoom<T>(
+    command: &str,
+    mut values: serde_json::Map<String, serde_json::Value>,
+    parse: impl FnOnce(serde_json::Map<String, serde_json::Value>) -> PyResult<T>,
+) -> PyResult<(MaxZoom, T)> {
+    check_keywords(command, &values)?;
+    let max_zoom = config_keywords::max_zoom(&mut values, command).map_err(config_err)?;
+    Ok((max_zoom, parse(values)?))
+}
+
+fn export_config(values: serde_json::Map<String, serde_json::Value>) -> PyResult<ExportOptions> {
+    check_keywords("export_pmtiles", &values)?;
+    config_keywords::export(values, ExportOptions::default()).map_err(config_err)
+}
+
+fn pyramid_config(
+    values: serde_json::Map<String, serde_json::Value>,
+) -> PyResult<tylertoo_core::pyramid::PyramidOptions> {
+    check_keywords("pyramid", &values)?;
+    config_keywords::pyramid(values).map_err(config_err)
+}
+
+// --- max_zoom --------------------------------------------------------------------
 
 /// Extract the `max_zoom` kwarg (#444): an `int` zoom, or the string
 /// `"auto"` (any case). Parsing and resolution belong to core
 /// ([`MaxZoom`]); this only maps Python types onto it with precise errors —
 /// an out-of-range int is a `ValueError`, not pyo3's generic extraction
 /// failure.
-fn extract_max_zoom(obj: &Bound<'_, PyAny>) -> PyResult<MaxZoom> {
-    if let Ok(s) = obj.extract::<String>() {
-        return match s.parse::<MaxZoom>() {
-            Ok(MaxZoom::Auto) => Ok(MaxZoom::Auto),
-            _ => Err(PyValueError::new_err(format!(
-                "max_zoom must be an int or \"auto\", got {s:?}"
-            ))),
-        };
-    }
-    if obj.is_instance_of::<pyo3::types::PyBool>() {
-        return Err(PyTypeError::new_err(
-            "max_zoom must be an int or \"auto\", got a bool",
-        ));
-    }
-    if let Ok(n) = obj.extract::<i64>() {
-        return u8::try_from(n).map(MaxZoom::Fixed).map_err(|_| {
-            PyValueError::new_err(format!(
-                "max_zoom must be between 0 and 255 (or \"auto\"), got {n}"
-            ))
-        });
-    }
-    Err(PyTypeError::new_err(format!(
-        "max_zoom must be an int or \"auto\", got {}",
-        obj.get_type().name()?
-    )))
-}
-
 /// Resolve `max_zoom="auto"` (#444) once `options` is built and every cheap
 /// check has passed ([`MaxZoom::resolve`] validates the options before
 /// reading anything). A fixed zoom returns without opening the input; for
@@ -136,573 +305,91 @@ fn resolve_max_zoom_py(
     .map_err(convert_error_to_py)
 }
 
-/// Native body of `tylertoo.convert()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-///
-/// Delegates the whole chain to core's tiles facade
-/// ([`tylertoo_core::overview::tiles::convert_to_pmtiles`], #439), so the
-/// policy — intermediate lifecycle and spill precedence, free-space
-/// preflight, knob guards, the #380 declaration, the combined report — can
-/// never drift from `tylertoo tiles`.
-#[pyfunction]
-#[pyo3(
-    signature = (input, output, min_zoom=0, max_zoom=MaxZoom::Fixed(14), layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=true, feature_order="input", spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=false, size_valve="merge", max_compressed_tile_size=512000, coverage_fill=false),
-    text_signature = "(input, output, min_zoom=0, max_zoom=14, layer_name=None, tile_size_limit=2097152, simple_clip_fastpath=True, feature_order='input', spill_dir=None, *, include_properties=None, exclude_properties=None, exclude_all_properties=False, size_valve='merge', max_compressed_tile_size=512000, coverage_fill=False)"
-)]
-#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
+// --- functions -------------------------------------------------------------------
+
+/// The #314 remedies as `convert()` spells them (#709).
+const PY_REMEDIES: SpaceRemedies<'static> = SpaceRemedies {
+    spill_dir: "spill_dir",
+    keep_overview: "keep_overview",
+};
+
+signature_convert! {
 fn convert(
     py: Python<'_>,
     input: &str,
     output: &str,
-    min_zoom: u8,
-    #[pyo3(from_py_with = extract_max_zoom)] max_zoom: MaxZoom,
-    layer_name: Option<String>,
-    tile_size_limit: Option<usize>,
-    simple_clip_fastpath: bool,
-    feature_order: &str,
-    spill_dir: Option<PathBuf>,
-    include_properties: Option<Vec<String>>,
-    exclude_properties: Option<Vec<String>>,
-    exclude_all_properties: bool,
-    size_valve: &str,
-    max_compressed_tile_size: usize,
-    coverage_fill: bool,
+    args: &Bound<'_, pyo3::types::PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let input_path = Path::new(input).to_path_buf();
-    let output_path = Path::new(output).to_path_buf();
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
 
-    // #444: built with `auto`'s placeholder, then resolved (a fixed zoom is
-    // its own placeholder and comes back verbatim, with no I/O).
-    let mut convert_options = ConvertOptions {
-        levels: LevelPlan::ZoomRange {
-            min_zoom,
-            max_zoom: max_zoom.plan_zoom(),
-        },
-        // #439: the scratch knob the CLI spells `--spill-dir`. It also picks
-        // where the intermediate overview lands (precedence: this, then
-        // `$TMPDIR`, then the output's directory), which is why this facade
-        // exposes it: `$TMPDIR` is tmpfs in many containers, and the
-        // intermediate is at least input-sized.
-        spill_dir,
-        // Applied at convert time, so unselected columns are never read; the
-        // facade's own export keeps every column the overview holds.
-        properties: property_selection(
-            include_properties,
-            exclude_properties,
-            exclude_all_properties,
-        ),
-        ..ConvertOptions::default()
-    };
+    let mut values = keywords(kwargs)?;
+    if args.len() > config_keywords::CONVERT_POSITIONAL.len() {
+        return Err(PyTypeError::new_err("convert received too many positional arguments"));
+    }
+    let positional = PyDict::new(py);
+    for (key, value) in config_keywords::CONVERT_POSITIONAL.iter().zip(args.iter()) {
+        if values.contains_key(*key) { return Err(PyTypeError::new_err(format!("multiple values for {key}"))); }
+        positional.set_item(*key, value)?;
+    }
+
+    values.extend(keywords(Some(&positional))?);
+    let (max_zoom, mut options) = tiles_config(values)?;
+    // #709/#779: core's whole preflight, before `max_zoom="auto"` reads the
+    // input; the facade runs it again.
+    options.validate().map_err(tiles_error_to_py)?;
     // Resolves `auto` and writes the chosen zoom back into `levels`, which
     // is where the facade reads the declared range from.
-    resolve_max_zoom_py(py, max_zoom, &mut convert_options, &output_path, || {
+    resolve_max_zoom_py(py, max_zoom, &mut options.convert, &output_path, || {
         ConvertSource::resolve_path(&input_path).map_err(ConvertError::from)
     })?;
 
-    let options = TilesOptions {
-        convert: convert_options,
-        // `None` lets core derive the layer name from the input: file stem
-        // for a single file, last path segment for a directory or
-        // `s3://`/`gs://` prefix, last literal segment for a glob (core owns
-        // the rules).
-        layer_name,
-        // #314: not exposed on this deprecated one-shot facade; use
-        // `overview()` + `export_pmtiles()` instead.
-        keep_overview: None,
-        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
-        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
-        // and `export-pmtiles --tile-range`.
-        shard: None,
-        tile_range: None,
-        tile_buffer: 8,
-        // 0 (or None) disables the cap; any positive value is the byte limit.
-        tile_size_limit: tile_size_limit.filter(|&n| n > 0),
-        // #745: tippecanoe's `-M`; 0 sets no compressed limit.
-        compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
-        size_valve: parse_size_valve(size_valve)?,
-        coverage_fill,
-        simple_clip_fastpath,
-        // Convenience wrapper: use the core auto default (core-sized wave).
-        partition_wave: tylertoo_core::overview::export::PARTITION_WAVE_AUTO,
-        feature_order: parse_feature_order(feature_order)?,
-        // #443: not exposed here; `export_pmtiles(..., feature_id=...)`.
-        feature_id: None,
-        // Publication metadata is not exposed on this deprecated facade.
-        metadata: Default::default(),
-    };
+    // #314/#709: core's free-space preflight, raised before the run starts
+    // (so it is heard on the failure it predicts) and naming the kwargs.
+    // Core also logs it, CLI-spelled, which reaches Python `logging` (#445).
+    let input = TilesInput::Path(input_path);
+    if let Some(msg) = intermediate_space_preflight(&input, &output_path, &options, PY_REMEDIES) {
+        PyErr::warn(py, &py.get_type::<PyUserWarning>(), &CString::new(msg)?, 1)?;
+    }
 
     // Release the GIL while the Rust pipelines run.
-    let outcome = py
-        .detach(|| convert_to_pmtiles(&TilesInput::Path(input_path), &output_path, &options))
-        .map_err(tiles_error_to_py)?;
-    let report = match outcome {
-        TilesOutcome::Converted(report) => report,
+    let outcome = py.detach(|| convert_to_pmtiles(&input, &output_path, &options));
+    match outcome.map_err(tiles_error_to_py)? {
+        // The combined report (#439): the two halves the two-step chain's own
+        // reports would carry, keyed like the CLI's `tiles --report` JSON.
+        TilesOutcome::Converted(mut report) => {
+            report.convert.source_losses = report.convert.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            report.export.source_losses = report.export.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            report_dict_with_losses(py, &*report, &[
+                (&report.convert.source_losses, Some("convert")),
+                (&report.export.source_losses, Some("export")),
+            ])
+        },
         // Unreachable without a shard job, which this facade never sets.
-        other => {
-            return Err(PyErr::new::<PyRuntimeError, _>(format!(
-                "unexpected tiles outcome: {other:?}"
-            )))
-        }
-    };
-
-    // #314: core logs this preflight as a `log::warn`, which reaches Python
-    // `logging` (#445) — but only for a caller who looks there, and a full
-    // disk mid-run is worth saying louder. Raise it as a `UserWarning` too,
-    // after the run (the warning is advisory; the convert either succeeded
-    // or already failed with its own error).
-    if let Some(msg) = &report.intermediate.space_warning {
-        PyErr::warn(
-            py,
-            &py.get_type::<PyUserWarning>(),
-            &CString::new(&**msg)?,
-            1,
-        )?;
-    }
-
-    // The combined report (#439): the two halves the two-step chain's own
-    // reports would carry, keyed like the CLI's `tiles --report` JSON.
-    let dict = PyDict::new(py);
-    dict.set_item("convert", convert_report_to_dict(py, &report.convert)?)?;
-    dict.set_item("export", export_report_to_dict(py, &report.export)?)?;
-    Ok(dict.into())
-}
-
-/// Map a [`TilesError`] to the Python exception type it deserves: the
-/// convert half keeps [`convert_error_to_py`]'s mapping; preflight refusals
-/// (a bad `keep_overview` directory, the #386/#443 knob guards) are
-/// `ValueError`; everything else is `RuntimeError`.
-fn tiles_error_to_py(e: TilesError) -> PyErr {
-    match e {
-        TilesError::Convert(inner) => convert_error_to_py(inner),
-        TilesError::KeepOverviewDirMissing { .. }
-        | TilesError::FeatureOrderColumnExcluded { .. }
-        | TilesError::FeatureIdColumnExcluded { .. }
-        | TilesError::FeatureIdAccumulated { .. } => {
-            PyErr::new::<PyValueError, _>(with_sources(&e))
-        }
-        other => PyErr::new::<PyRuntimeError, _>(with_sources(&other)),
+        other => Err(PyRuntimeError::new_err(format!(
+            "unexpected tiles outcome: {other:?}"
+        ))),
     }
 }
-
-/// `Display` plus the `#[source]` chain, `": "`-joined — what the CLI shows
-/// through anyhow's `Caused by:` and what a Python message would otherwise
-/// drop (an I/O error's "Permission denied (os error 13)" lives in
-/// `source()`, which `Display` alone omits).
-fn with_sources(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut cause = e.source();
-    while let Some(c) = cause {
-        use std::fmt::Write as _;
-        let _ = write!(out, ": {c}");
-        cause = c.source();
-    }
-    out
 }
 
-/// Map a [`ConvertError`] to the Python exception type it deserves:
-/// user-input problems (bad options, missing/mistyped columns, invalid level
-/// plans, an input whose coordinates or CRS the tiler cannot work with)
-/// become `ValueError`; the #543 pass-1 memory preflight becomes
-/// `MemoryError`; everything else (I/O, decode, writer) becomes
-/// `RuntimeError`.
-fn convert_error_to_py(e: ConvertError) -> PyErr {
-    match e {
-        // The box is too small for this input (#543).
-        ConvertError::Pass1MemoryFloorExceeded { .. } => {
-            PyErr::new::<PyMemoryError, _>(format!("{}", e))
-        }
-        // The input itself is the problem, not the run (#429).
-        ConvertError::AllFeaturesOutOfRange { .. }
-        | ConvertError::UnsupportedCrs { .. }
-        | ConvertError::InvalidLevels(_)
-        | ConvertError::InvalidConfig(_)
-        | ConvertError::RankingConflict
-        | ConvertError::ClusterPartitioningUnsupported
-        | ConvertError::VerbatimPartitioningUnsupported
-        | ConvertError::AccumulateWithoutCluster
-        | ConvertError::SortKeyColumnMissing { .. }
-        | ConvertError::ClassRankColumnMissing { .. }
-        | ConvertError::ClassRankColumnNotString { .. }
-        | ConvertError::AccumulateColumnMissing { .. }
-        | ConvertError::AccumulateColumnNotNumeric { .. }
-        | ConvertError::AutoZoomMinAboveCeiling { .. }
-        | ConvertError::AutoZoomNoSignal { .. }
-        | ConvertError::Properties(_) => PyErr::new::<PyValueError, _>(format!("{}", e)),
-        other => PyErr::new::<PyRuntimeError, _>(format!("overview conversion failed: {}", other)),
-    }
-}
-
-/// Convert a [`ConvertReport`] to a Python dict.
-fn convert_report_to_dict(py: Python<'_>, report: &ConvertReport) -> PyResult<Py<PyDict>> {
-    report_dict(pythonize::pythonize(py, report)?)
-}
-
-/// A pythonized core report as the dict it is: every report struct
-/// serializes as a map, keyed by its serde field names (the keys of the
-/// CLI's `--report` JSON), so the Python and CLI reports cannot drift.
-fn report_dict(value: Bound<'_, PyAny>) -> PyResult<Py<PyDict>> {
-    Ok(value.cast_into::<PyDict>()?.unbind())
-}
-
-/// The Python `accumulate_attributes` mapping as core's per-cluster
-/// aggregation specs, with the two clustering pre-checks the CLI also makes
-/// (core enforces both as well; raising here gives a Python-shaped error
-/// naming the keyword argument rather than the Rust option).
-fn accumulate_specs(
-    accumulate_attributes: Option<BTreeMap<String, String>>,
-    cluster: bool,
-    mode: Mode,
-) -> PyResult<Vec<AccumulateSpec>> {
-    let accumulate_attributes = accumulate_attributes.unwrap_or_default();
-    if !accumulate_attributes.is_empty() && !cluster {
-        return Err(PyErr::new::<PyValueError, _>(
-            "accumulate_attributes requires cluster=True",
-        ));
-    }
-    if cluster && mode == Mode::Partitioning {
-        return Err(PyErr::new::<PyValueError, _>(
-            "cluster=True requires mode=\"duplicating\": a partitioning-mode feature has \
-             one row read across many zoom prefixes, so a per-level point_count cannot \
-             be represented without double counting",
-        ));
-    }
-    accumulate_attributes
-        .into_iter()
-        .map(|(column, op)| {
-            let op = AccumulateOp::parse(&op).ok_or_else(|| {
-                PyErr::new::<PyValueError, _>(format!(
-                    "Invalid accumulate op '{}' for column '{}'. Valid ops: sum, max, min, mean",
-                    op, column
-                ))
-            })?;
-            Ok(AccumulateSpec { column, op })
-        })
-        .collect()
-}
-
-/// The `class_rank_column` / `class_ranks` / `class_rank_unknown` kwargs as
-/// core's [`ClassRanking`]. The pairing rules are Python-shaped (the CLI
-/// spells all three as one `--class-rank` string); the ranking rules — at
-/// least one class, finite ranks (#428), unknown defaulting below every
-/// class — are core's, shared with `--class-rank` through
-/// [`ClassRanking::new`].
-fn class_ranking_from_kwargs(
-    has_sort_key: bool,
-    class_rank_column: Option<String>,
-    class_ranks: Option<BTreeMap<String, f64>>,
-    class_rank_unknown: Option<f64>,
-) -> PyResult<Option<ClassRanking>> {
-    if has_sort_key && class_rank_column.is_some() {
-        return Err(PyErr::new::<PyValueError, _>(
-            "sort_key and class_rank_column are mutually exclusive; supply at most one",
-        ));
-    }
-    match (class_rank_column, class_ranks) {
-        (None, None) => Ok(None),
-        (Some(_), None) | (None, Some(_)) => Err(PyErr::new::<PyValueError, _>(
-            "class_rank_column and class_ranks must be supplied together",
-        )),
-        (Some(column), Some(ranks)) => {
-            ClassRanking::new(column, ranks.into_iter().collect(), class_rank_unknown)
-                .map(Some)
-                .map_err(|e| PyErr::new::<PyValueError, _>(format!("class_ranks: {e}")))
-        }
-    }
-}
-
-/// The entry-zoom ladder (#364, #445): derived from a column's values
-/// (`magnitude_ladder`, every `ladder_step` zooms), or spelled out as
-/// `COLUMN:VALUE=ZOOM,...` (`entry_zoom`, core's grammar, shared with the
-/// CLI's `--entry-zoom`). The two are mutually exclusive, which clap
-/// enforces for the CLI.
-fn entry_zoom_spec(
-    magnitude_ladder: Option<&str>,
-    ladder_step: u8,
-    entry_zoom: Option<&str>,
-) -> PyResult<Option<EntryZoomSpec>> {
-    match (magnitude_ladder, entry_zoom) {
-        (Some(_), Some(_)) => Err(PyErr::new::<PyValueError, _>(
-            "magnitude_ladder and entry_zoom are mutually exclusive; supply at most one",
-        )),
-        (Some(column), None) => Ok(Some(EntryZoomSpec {
-            column: column.to_string(),
-            kind: EntryZoomKind::DenseRank { step: ladder_step },
-        })),
-        (None, Some(spec)) => parse_entry_zoom(spec)
-            .map(Some)
-            .map_err(PyErr::new::<PyValueError, _>),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Native body of `tylertoo.overview()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-#[pyfunction]
-#[pyo3(
-    signature = (
-    input,
-    output,
-    *,
-    mode="duplicating",
-    min_zoom=0,
-    max_zoom=MaxZoom::Fixed(6),
-    gsds=None,
-    gsd_base=1024.0,
-    sort_key=None,
-    magnitude_ladder=None,
-    ladder_step=1,
-    entry_zoom=None,
-    sort_direction="desc",
-    class_rank_column=None,
-    class_ranks=None,
-    class_rank_unknown=None,
-    no_auto_rank=false,
-    verbatim=false,
-    simplify_factor=None,
-    collapse=false,
-    collapse_square=false,
-    no_collapse=false,
-    representation=None,
-    cascade=true,
-    point_thinning=None,
-    line_thinning=None,
-    polygon_thinning=None,
-    line_visibility=None,
-    polygon_visibility=None,
-    drop_rate=1.65,
-    drop_gamma=1.5,
-    density_drop=None,
-    drop_lines=false,
-    drop_polygons=false,
-    cluster=false,
-    accumulate_attributes=None,
-    coalesce_lines=None,
-    coalesce_snap=1.0,
-    coalesce_junction_angle=0.0,
-    coalesce_max_level_rows=2_000_000,
-    include_properties=None,
-    exclude_properties=None,
-    exclude_all_properties=false,
-    cogp_compat=false,
-    row_group_size=10_000,
-    full_column_stats=false,
-    streaming=true,
-    read_batch_size=8192,
-    bbox=None,
-    filter=None,
-    profile="auto",
-    in_flight_batches=0,
-    read_workers=0,
-    spill_dir=None,
-),
-    text_signature = "(input, output, *, mode='duplicating', min_zoom=0, max_zoom=6, gsds=None, gsd_base=1024.0, sort_key=None, magnitude_ladder=None, ladder_step=1, entry_zoom=None, sort_direction='desc', class_rank_column=None, class_ranks=None, class_rank_unknown=None, no_auto_rank=False, verbatim=False, simplify_factor=None, collapse=False, collapse_square=False, no_collapse=False, representation=None, cascade=True, point_thinning=None, line_thinning=None, polygon_thinning=None, line_visibility=None, polygon_visibility=None, drop_rate=1.65, drop_gamma=1.5, density_drop=None, drop_lines=False, drop_polygons=False, cluster=False, accumulate_attributes=None, coalesce_lines=None, coalesce_snap=1.0, coalesce_junction_angle=0.0, coalesce_max_level_rows=2000000, include_properties=None, exclude_properties=None, exclude_all_properties=False, cogp_compat=False, row_group_size=10000, full_column_stats=False, streaming=True, read_batch_size=8192, bbox=None, filter=None, profile='auto', in_flight_batches=0, read_workers=0, spill_dir=None)"
-)]
-#[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
+signature_overview! {
 fn overview(
     py: Python<'_>,
     input: &Bound<'_, PyAny>,
     output: &str,
-    mode: &str,
-    min_zoom: u8,
-    #[pyo3(from_py_with = extract_max_zoom)] max_zoom: MaxZoom,
-    gsds: Option<Vec<f64>>,
-    gsd_base: f64,
-    sort_key: Option<String>,
-    magnitude_ladder: Option<&str>,
-    ladder_step: u8,
-    entry_zoom: Option<&str>,
-    sort_direction: &str,
-    class_rank_column: Option<String>,
-    class_ranks: Option<BTreeMap<String, f64>>,
-    class_rank_unknown: Option<f64>,
-    no_auto_rank: bool,
-    verbatim: bool,
-    simplify_factor: Option<f64>,
-    collapse: bool,
-    collapse_square: bool,
-    no_collapse: bool,
-    representation: Option<String>,
-    cascade: bool,
-    point_thinning: Option<f64>,
-    line_thinning: Option<f64>,
-    polygon_thinning: Option<f64>,
-    line_visibility: Option<f64>,
-    polygon_visibility: Option<f64>,
-    drop_rate: f64,
-    drop_gamma: f64,
-    density_drop: Option<bool>,
-    drop_lines: bool,
-    drop_polygons: bool,
-    cluster: bool,
-    accumulate_attributes: Option<BTreeMap<String, String>>,
-    coalesce_lines: Option<bool>,
-    coalesce_snap: f64,
-    coalesce_junction_angle: f64,
-    coalesce_max_level_rows: usize,
-    include_properties: Option<Vec<String>>,
-    exclude_properties: Option<Vec<String>>,
-    exclude_all_properties: bool,
-    cogp_compat: bool,
-    row_group_size: usize,
-    full_column_stats: bool,
-    streaming: bool,
-    read_batch_size: usize,
-    bbox: Option<(f64, f64, f64, f64)>,
-    filter: Option<String>,
-    profile: &str,
-    in_flight_batches: usize,
-    read_workers: usize,
-    spill_dir: Option<PathBuf>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let mode: Mode = mode.parse().map_err(|_| {
-        PyValueError::new_err(format!(
-            "Invalid mode: '{mode}'. Valid options: duplicating, partitioning"
-        ))
-    })?;
-    let profile: MemoryProfile = profile.parse().map_err(|_| {
-        PyValueError::new_err(format!(
-            "Invalid profile: '{profile}'. Valid options: auto, speed, bounded"
-        ))
-    })?;
-    // Case-insensitive here, as it always was for this keyword.
-    let sort_direction: SortDirection = sort_direction.to_lowercase().parse().map_err(|_| {
-        PyValueError::new_err(format!(
-            "Invalid sort_direction: '{sort_direction}'. Valid options: desc, asc"
-        ))
-    })?;
-
-    // Explicit GSD list overrides the zoom range (like the CLI's --gsd).
-    let levels = match gsds {
-        Some(gsds) => LevelPlan::Gsds(gsds),
-        // #444: `auto`'s placeholder until it is resolved below.
-        None => LevelPlan::ZoomRange {
-            min_zoom,
-            max_zoom: max_zoom.plan_zoom(),
-        },
-    };
-
-    let class_ranking = class_ranking_from_kwargs(
-        sort_key.is_some(),
-        class_rank_column,
-        class_ranks,
-        class_rank_unknown,
-    )?;
-
-    // Below-tolerance collapse disposition (#279) + zoom-band representation
-    // selector (#317); mirrors the CLI flags. Structural validity of the
-    // bands against the level plan is enforced by core convert validation.
-    if [collapse, collapse_square, no_collapse]
-        .iter()
-        .filter(|&&b| b)
-        .count()
-        > 1
-    {
-        return Err(PyErr::new::<PyValueError, _>(
-            "collapse, collapse_square and no_collapse are mutually exclusive",
-        ));
-    }
-    // #745: placeholder squares are the default; `no_collapse` restores the
-    // drop disposition.
-    let collapse_mode = if collapse {
-        CollapseMode::Point
-    } else if no_collapse {
-        CollapseMode::Drop
-    } else if collapse_square {
-        CollapseMode::Square
-    } else {
-        CollapseMode::Auto
-    };
-    let representation_bands = match &representation {
-        Some(spec) => parse_representation_spec(spec)
-            .map_err(|e| PyErr::new::<PyValueError, _>(format!("representation: {e}")))?,
-        None => Vec::new(),
-    };
-
-    let accumulate = accumulate_specs(accumulate_attributes, cluster, mode)?;
-
-    // `None` is "not set": core resolves it to the normal default, or to
-    // off under `verbatim`, so an explicit value always wins (#445).
-    let overrides = GeneralizationOverrides {
-        point_thinning,
-        line_thinning,
-        polygon_thinning,
-        line_visibility,
-        polygon_visibility,
-        simplify_factor,
-        density_drop,
-        coalesce_lines,
-    };
-
-    let mut options = ConvertOptions {
-        mode,
-        levels,
-        assign: AssignConfig {
-            sort_direction,
-            ..AssignConfig::default()
-        },
-        sort_key,
-        entry_zoom: entry_zoom_spec(magnitude_ladder, ladder_step, entry_zoom)?,
-        class_ranking,
-        no_auto_rank,
-        simplify: SimplifyOptions {
-            collapse: collapse_mode,
-            cascade,
-            ..SimplifyOptions::default()
-        },
-        representation: representation_bands,
-        density: DensityBudgetConfig {
-            drop_rate,
-            gamma: drop_gamma,
-            // #745: points always; lines and polygons only when asked.
-            kinds: BudgetKinds {
-                points: true,
-                lines: drop_lines,
-                polygons: drop_polygons,
-            },
-            ..DensityBudgetConfig::default()
-        },
-        gsd_base,
-        cogp_compat_key: cogp_compat,
-        max_row_group_size: row_group_size,
-        row_group_size_policy: Default::default(),
-        full_column_stats,
-        streaming,
-        read_batch_size,
-        profile,
-        in_flight_batches,
-        read_workers,
-        cluster,
-        accumulate,
-        coalesce_snap,
-        coalesce_max_level_rows,
-        coalesce_junction_angle,
-        bbox: bbox.map(|(xmin, ymin, xmax, ymax)| [xmin, ymin, xmax, ymax]),
-        filter,
-        properties: property_selection(
-            include_properties,
-            exclude_properties,
-            exclude_all_properties,
-        ),
-        spill_dir,
-        // The convert plan artifact (--save-plan / --plan) is not on the
-        // Python surface yet; follow-up.
-        save_plan: None,
-        plan: None,
-        // Sharded builds (#498/#541): CLI + Rust API only, like their plan.
-        shard: None,
-        shard_plan_digest: None,
-        zoom_ceiling: None,
-        ..ConvertOptions::default()
-    }
-    // Last: the defaults read `cluster`, the logged summary `entry_zoom`.
-    .with_generalization(&overrides, verbatim)
-    .map_err(convert_error_to_py)?;
+    let (max_zoom, mut options) = overview_config(keywords(kwargs)?)?;
+    // #779: every rule that needs no input, before anything is read.
+    options.validate().map_err(convert_error_to_py)?;
 
     // `str` stays the single-input path (files, directories, globs, remote
     // URLs/prefixes — resolved by core); `list[str]` is an explicit ordered
@@ -722,7 +409,7 @@ fn overview(
             "input must be a str path/URL or a list[str] of paths/URLs",
         ));
     };
-    let output_path = Path::new(output).to_path_buf();
+    let output_path = PathBuf::from(output);
 
     // #444: every cheap check has passed; now estimate `auto` over a
     // dedicated source (skipped for an explicit `gsds` ladder).
@@ -734,7 +421,7 @@ fn overview(
     })?;
 
     // Release the GIL while the Rust pipeline runs.
-    let report = py
+    let mut report = py
         .detach(|| match &parsed {
             OverviewInput::Path(input_path) => {
                 convert_to_overviews(input_path, &output_path, &options)
@@ -746,111 +433,37 @@ fn overview(
         })
         .map_err(convert_error_to_py)?;
 
-    convert_report_to_dict(py, &report)
+    report.source_losses = report.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
+}
 }
 
-/// Native body of `tylertoo.export_pmtiles()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-#[pyfunction]
-#[pyo3(signature = (input, output, *, layer_name="overview", tile_buffer=8, extent=4096, tile_size_limit=2097152, simple_clip_fastpath=true, partition_wave=0, feature_order="input", min_zoom=None, include_properties=None, exclude_properties=None, exclude_all_properties=false, feature_id=None, spill_dir=None, name=None, description=None, attribution=None, size_valve="merge", max_compressed_tile_size=512000, coverage_fill=false))]
-#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
+signature_export_pmtiles! {
 fn export_pmtiles(
     py: Python<'_>,
     input: &str,
     output: &str,
-    layer_name: &str,
-    tile_buffer: u32,
-    extent: u32,
-    tile_size_limit: Option<usize>,
-    simple_clip_fastpath: bool,
-    partition_wave: usize,
-    feature_order: &str,
-    min_zoom: Option<u8>,
-    include_properties: Option<Vec<String>>,
-    exclude_properties: Option<Vec<String>>,
-    exclude_all_properties: bool,
-    feature_id: Option<String>,
-    spill_dir: Option<PathBuf>,
-    name: Option<String>,
-    description: Option<String>,
-    attribution: Option<String>,
-    size_valve: &str,
-    max_compressed_tile_size: usize,
-    coverage_fill: bool,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
-    let mut metadata = tylertoo_core::TilesetMetadata::new();
-    metadata.name = name;
-    metadata.description = description;
-    metadata.attribution = attribution;
-    let options = ExportOptions {
-        layer_name: layer_name.to_string(),
-        tile_buffer,
-        extent,
-        // 0 (or None) disables the cap; any positive value is the byte limit.
-        tile_size_limit: tile_size_limit.filter(|&n| n > 0),
-        // #745: tippecanoe's `-M`; 0 sets no compressed limit.
-        compressed_tile_size_limit: Some(max_compressed_tile_size).filter(|&n| n > 0),
-        size_valve: parse_size_valve(size_valve)?,
-        coverage_fill,
-        simple_clip_fastpath,
-        partition_wave,
-        feature_order: parse_feature_order(feature_order)?,
-        // #380: the declared minimum; None keeps the coarsest level's zoom.
-        min_zoom,
-        properties: property_selection(
-            include_properties,
-            exclude_properties,
-            exclude_all_properties,
-        ),
-        // Sharded builds (#498) are a CLI/Rust-API feature for now, like the
-        // convert plan they depend on: `tylertoo shard-plan`, `tiles --shard`
-        // and `export-pmtiles --tile-range`.
-        tile_range: None,
-        zoom_ceiling: None,
-        feature_id,
-        spill_dir,
-        metadata,
-    };
-    let input_path = Path::new(input).to_path_buf();
-    let output_path = Path::new(output).to_path_buf();
+    let options = export_config(keywords(kwargs)?)?;
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
 
-    let report = py
+    let mut report = py
         .detach(|| export_pmtiles_core(&input_path, &output_path, &options))
         .map_err(export_error_to_py)?;
 
-    export_report_to_dict(py, &report)
+    report.source_losses = report.source_losses
+                .for_python()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    report_dict_with_losses(py, &report, &[(&report.source_losses, None)])
+}
 }
 
-/// Map an [`ExportError`] to a Python exception: a property selection the
-/// overview file cannot satisfy, or publication metadata too large for an
-/// archive, is the caller's input problem, so `ValueError`; everything else
-/// keeps the `RuntimeError` it always was.
-fn export_error_to_py(e: ExportError) -> PyErr {
-    match e {
-        ExportError::UnknownProperty { .. }
-        | ExportError::UnsupportedProperty { .. }
-        | ExportError::CoveringProperty { .. }
-        | ExportError::PropertyRequiredByKnob { .. }
-        | ExportError::MetadataTooLarge(_) => PyErr::new::<PyValueError, _>(format!("{e}")),
-        other => PyErr::new::<PyRuntimeError, _>(format!("export failed: {other}")),
-    }
-}
-
-/// Convert an [`ExportReport`] to a Python dict (shared by
-/// `export_pmtiles()` and the `convert()` facade's combined report, #439).
-fn export_report_to_dict(py: Python<'_>, report: &ExportReport) -> PyResult<Py<PyDict>> {
-    report_dict(pythonize::pythonize(py, report)?)
-}
-
-/// Native body of `tylertoo.validate()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-#[pyfunction]
-#[pyo3(signature = (file))]
+signature_validate! {
 fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     let path = Path::new(file).to_path_buf();
@@ -871,141 +484,78 @@ fn validate(py: Python<'_>, file: &str) -> PyResult<Py<PyDict>> {
     dict.set_item("checks", checks)?;
     Ok(dict.into())
 }
+}
 
-/// Native body of `tylertoo.decode()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-#[pyfunction]
-#[pyo3(signature = (input, output, *, min_zoom=None, max_zoom=None, layer=None))]
+signature_decode! {
 fn decode(
     py: Python<'_>,
     input: &str,
     output: &str,
-    min_zoom: Option<u8>,
-    max_zoom: Option<u8>,
-    layer: Option<String>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
+    let values = keywords(kwargs)?;
+    let mut defaults = config_keywords::command_defaults("decode");
+    for key in values.keys() { if !defaults.contains_key(key) { return Err(config_err(format!("unknown keyword {key}"))); } }
+    defaults.extend(values);
     let options = DecodeOptions {
-        min_zoom,
-        max_zoom,
-        layer,
+        min_zoom: serde_json::from_value(defaults.remove("min_zoom").unwrap()).map_err(config_err)?,
+        max_zoom: serde_json::from_value(defaults.remove("max_zoom").unwrap()).map_err(config_err)?,
+        layer: serde_json::from_value(defaults.remove("layer").unwrap()).map_err(config_err)?,
     };
-    let input_path = Path::new(input).to_path_buf();
-    let output_path = Path::new(output).to_path_buf();
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
     let report = py
         .detach(|| decode_pmtiles(&input_path, &output_path, &options))
         .map_err(decode_error_to_py)?;
 
     // Keyed like the CLI's `decode --report` JSON (`DecodeReport`'s serde
     // names); `zoom_range` stays a tuple.
-    report_dict(pythonize::pythonize(py, &report)?)
+    report_dict(py, &report)
+}
 }
 
-/// Map a [`DecodeError`] to a Python exception: an inverted zoom range, a
-/// raster archive, or a property that collides with a provenance column is
-/// the caller's input problem (`ValueError`); a damaged or unreadable
-/// archive, or a failed write, is `RuntimeError`. The cause chain is kept,
-/// since `DecodeError` leaves it out of its own `Display` (#396).
-fn decode_error_to_py(e: DecodeError) -> PyErr {
-    match e {
-        DecodeError::InvalidZoomRange { .. }
-        | DecodeError::NotVectorTiles(_)
-        | DecodeError::ReservedColumn(_) => PyErr::new::<PyValueError, _>(with_sources(&e)),
-        other => {
-            PyErr::new::<PyRuntimeError, _>(format!("decode failed: {}", with_sources(&other)))
-        }
-    }
-}
-
-/// Native body of `tylertoo.pyramid()`.
-///
-/// The documented, typed Python API is `python/tylertoo/__init__.py`; it
-/// passes every argument here by keyword.
-#[pyfunction]
-#[pyo3(signature = (bands, output, *, generalize=false, tile_size_limit=None, feature_order="input", work_dir=None, allow_missing_zooms=false, name=None, description=None, attribution=None))]
-#[allow(clippy::too_many_arguments)] // mirrors the Python kwarg signature
+signature_pyramid! {
 fn pyramid(
     py: Python<'_>,
     bands: Vec<String>,
     output: &str,
-    generalize: bool,
-    tile_size_limit: Option<usize>,
-    feature_order: &str,
-    work_dir: Option<PathBuf>,
-    allow_missing_zooms: bool,
-    name: Option<String>,
-    description: Option<String>,
-    attribution: Option<String>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     refresh_log_levels();
     // Spec grammar, band-set rules and the input-exists check are core's,
     // shared with the CLI's `--band` (#445).
-    let bands = parse_bands(&bands).map_err(PyErr::new::<PyValueError, _>)?;
-    let mut metadata = tylertoo_core::TilesetMetadata::new();
-    metadata.name = name;
-    metadata.description = description;
-    metadata.attribution = attribution;
-    let mut options = PyramidOptions {
-        work_dir,
-        allow_missing_zooms,
-        metadata,
-        ..PyramidOptions::default()
-    };
-    // The default tiles each GeoParquet band verbatim (an aggregate band
-    // must keep every feature); `generalize` runs the normal ladder, as the
-    // CLI's `--generalize` does.
-    if generalize {
-        options.convert = ConvertOptions::default();
-    }
-    // 0 (or None) disables the cap; any positive value is the byte limit.
-    options.export.tile_size_limit = tile_size_limit.filter(|&n| n > 0);
-    options.export.feature_order = parse_feature_order(feature_order)?;
-    let output_path = Path::new(output).to_path_buf();
+    let options = pyramid_config(keywords(kwargs)?)?;
+    options.validate().map_err(pyramid_error_to_py)?;
+    let bands = parse_bands(&bands).map_err(config_err)?;
+    let output_path = PathBuf::from(output);
 
     let report = py
         .detach(|| build_pyramid(&bands, &output_path, &options))
-        .map_err(|e| {
-            PyErr::new::<PyRuntimeError, _>(format!("pyramid build failed: {}", with_sources(&e)))
-        })?;
+        .map_err(pyramid_error_to_py)?;
+    // The same shape as the CLI's `pyramid --report` JSON.
+    report_dict(py, &report)
+}
+}
 
-    let dict = PyDict::new(py);
-    dict.set_item("total_tiles", report.total_tiles)?;
-    let per_band = PyList::empty(py);
-    for (layer, min_zoom, max_zoom, tiles) in &report.per_band_tiles {
-        let d = PyDict::new(py);
-        d.set_item("layer", layer)?;
-        d.set_item("min_zoom", min_zoom)?;
-        d.set_item("max_zoom", max_zoom)?;
-        d.set_item("tiles", tiles)?;
-        per_band.append(d)?;
+/// Native body of `tylertoo._defaults()`: every keyword default of every
+/// function, keyed `{function: {keyword: default}}`, built from the core
+/// `Default` impls (#779), also used to generate native signatures.
+#[pyfunction]
+fn _defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    for name in ["convert", "overview", "export_pmtiles", "pyramid", "decode"] {
+        out.set_item(
+            name,
+            pythonize::pythonize(py, &config_keywords::command_defaults(name))?,
+        )?;
     }
-    dict.set_item("bands", per_band)?;
-    dict.set_item("skipped_tiles", report.skipped)?;
-    dict.set_item(
-        "bands_without_bounds",
-        PyList::new(py, &report.bands_without_bounds)?,
-    )?;
-    let metadata = PyDict::new(py);
-    metadata.set_item("name", &report.metadata.name)?;
-    metadata.set_item("description", &report.metadata.description)?;
-    metadata.set_item("attribution", &report.metadata.attribution)?;
-    dict.set_item("metadata", metadata)?;
-    dict.set_item(
-        "metadata_conflicts",
-        PyList::new(py, &report.metadata_conflicts)?,
-    )?;
-    dict.set_item(
-        "bands_without_metadata",
-        PyList::new(py, &report.bands_without_metadata)?,
-    )?;
-    Ok(dict.into())
+    Ok(out.unbind())
 }
 
 /// The compiled extension, imported as `tylertoo._tylertoo`.
 ///
-/// `python/tylertoo/__init__.py` wraps it with the public, typed API.
+/// `python/tylertoo/__init__.py` reexports the native functions directly.
 ///
 /// Importing it installs pyo3-log as the `log` backend (#445), so core's
 /// diagnostics reach Python's `logging` under `tylertoo_core.*` (the Rust
@@ -1022,11 +572,245 @@ fn _tylertoo(m: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         let _ = LOG_RESET.set(handle);
     }
+    m.add("ConfigError", m.py().get_type::<ConfigError>())?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(overview, m)?)?;
     m.add_function(wrap_pyfunction!(export_pmtiles, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(pyramid, m)?)?;
+    m.add_function(wrap_pyfunction!(_defaults, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod config_parity {
+    use super::*;
+    use clap::Parser;
+    use serde_json::{json, Value};
+    use tylertoo_core::overview::config::cli;
+    use tylertoo_core::overview::convert::LevelPlan;
+
+    fn native_keywords(value: Value) -> serde_json::Map<String, Value> {
+        Python::attach(|py| {
+            let value = pythonize::pythonize(py, &value).unwrap();
+            keywords(Some(value.cast::<PyDict>().unwrap())).unwrap()
+        })
+    }
+
+    #[test]
+    fn overview_cli_python_core_configs_are_equal() {
+        let defaults = cli::OverviewArgs::parse_from(["overview", "in", "out"]);
+        let cli_defaults = cli::overview_options(&defaults).unwrap();
+        let (_, python) = overview_config(native_keywords(json!({}))).unwrap();
+        let core = ConvertOptions::default()
+            .with_generalization(&Default::default(), false)
+            .unwrap();
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let args = cli::OverviewArgs::parse_from([
+            "overview",
+            "in",
+            "out",
+            "--min-zoom",
+            "1",
+            "--max-zoom",
+            "3",
+            "--row-group-size",
+            "1234",
+            "--no-cascade",
+            "--drop-lines",
+            "--sort-direction",
+            "asc",
+            "--include-property",
+            "id",
+        ]);
+        let cli = cli::overview_options(&args).unwrap();
+        let (_, python) = overview_config(native_keywords(json!({"min_zoom": 1, "max_zoom": 3, "row_group_size": 1234, "cascade": false, "drop_lines": true, "sort_direction": "asc", "include_properties": ["id"]}))).unwrap();
+        let mut core = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 1,
+                max_zoom: 3,
+            },
+            max_row_group_size: 1234,
+            ..Default::default()
+        };
+        core.simplify.cascade = false;
+        core.density.kinds.lines = true;
+        core.assign.sort_direction = tylertoo_core::overview::assign::SortDirection::Asc;
+        core.properties.include = Some(vec!["id".into()]);
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+    }
+
+    #[test]
+    fn tiles_cli_python_core_configs_are_equal() {
+        let defaults = cli::TilesArgs::parse_from(["tiles", "in", "out"]);
+        let cli_defaults = cli::tiles_options(&defaults).unwrap();
+        let (_, python) = tiles_config(native_keywords(json!({}))).unwrap();
+        let core = {
+            let mut options = TilesOptions::default();
+            options.convert = options
+                .convert
+                .with_generalization(&Default::default(), false)
+                .unwrap();
+            options
+        };
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let args = cli::TilesArgs::parse_from([
+            "tiles",
+            "in",
+            "out",
+            "--verbatim",
+            "--point-thinning",
+            "2",
+            "--extent",
+            "8192",
+            "--max-compressed-tile-size",
+            "1M",
+            "--layer-name",
+            "places",
+        ]);
+        let cli = cli::tiles_options(&args).unwrap();
+        let (_, python) = tiles_config(native_keywords(json!({"verbatim": true, "point_thinning": 2.0, "extent": 8192, "max_compressed_tile_size": 1048576, "layer_name": "places"}))).unwrap();
+        let mut core = TilesOptions::default();
+        core.convert = core.convert.verbatim();
+        core.convert.assign.point_thinning = 2.0;
+        core.export = core.export.verbatim();
+        core.export.extent = 8192;
+        core.export.compressed_tile_size_limit = Some(1048576);
+        core.layer_name = Some("places".into());
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+    }
+
+    #[test]
+    fn export_cli_python_core_configs_are_equal() {
+        let defaults = cli::ExportPmtilesArgs::parse_from(["export-pmtiles", "in", "out"]);
+        let cli_defaults = cli::export_options(&defaults).unwrap();
+        let python = export_config(native_keywords(json!({}))).unwrap();
+        let core = ExportOptions::default();
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let args = cli::ExportPmtilesArgs::parse_from([
+            "export-pmtiles",
+            "in",
+            "out",
+            "--extent",
+            "8192",
+            "--tile-buffer",
+            "4",
+            "--name",
+            "Example",
+            "--include-property",
+            "rank",
+            "--feature-order",
+            "rank:desc",
+            "--no-simple-clip-fastpath",
+        ]);
+        let cli = cli::export_options(&args).unwrap();
+        let python = export_config(native_keywords(json!({"extent": 8192, "tile_buffer": 4, "name": "Example", "include_properties": ["rank"], "feature_order": "rank:desc", "simple_clip_fastpath": false}))).unwrap();
+        let mut core = ExportOptions {
+            extent: 8192,
+            tile_buffer: 4,
+            simple_clip_fastpath: false,
+            feature_order: "rank:desc".parse().unwrap(),
+            ..Default::default()
+        };
+        core.metadata.name = Some("Example".into());
+        core.properties.include = Some(vec!["rank".into()]);
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+    }
+
+    #[test]
+    fn pyramid_cli_python_core_configs_are_equal() {
+        let defaults =
+            cli::PyramidArgs::parse_from(["pyramid", "out", "--band", "0-3:never-read.parquet"]);
+        let cli_defaults = cli::pyramid_options(&defaults);
+        let python = pyramid_config(native_keywords(json!({}))).unwrap();
+        let core = tylertoo_core::pyramid::PyramidOptions::default();
+        let expected = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli_defaults.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            expected
+        );
+        let args = cli::PyramidArgs::parse_from([
+            "pyramid",
+            "out",
+            "--band",
+            "0-3:never-read.parquet",
+            "--generalize",
+            "--max-tile-size",
+            "1M",
+            "--extent",
+            "8192",
+            "--name",
+            "Bands",
+            "--allow-missing-zooms",
+        ]);
+        let cli = cli::pyramid_options(&args);
+        let python = pyramid_config(native_keywords(json!({"generalize": true, "tile_size_limit": 1048576, "extent": 8192, "name": "Bands", "allow_missing_zooms": true}))).unwrap();
+        let mut core = tylertoo_core::pyramid::PyramidOptions::new(true);
+        core.export.tile_size_limit = Some(1048576);
+        core.export.extent = 8192;
+        core.metadata.name = Some("Bands".into());
+        core.allow_missing_zooms = true;
+        let core = serde_json::to_value(core.validate().unwrap().options()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cli.validate().unwrap().options()).unwrap(),
+            core
+        );
+        assert_eq!(
+            serde_json::to_value(python.validate().unwrap().options()).unwrap(),
+            core
+        );
+    }
 }

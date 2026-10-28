@@ -14,6 +14,10 @@
 //! declared `centroid` primary and export tiled the ungeneralized points.
 //! Every round trip here decodes the archive and checks the features are the
 //! input's polygons, not merely that some features came out.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,8 +33,8 @@ use geoarrow_array::GeoArrowArray;
 use geoparquet::writer::{
     GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
 
 use tylertoo_core::batch_processor::extract_geometries_from_array;
 
@@ -116,11 +120,7 @@ fn write_input(path: &Path, geom_name: &str, centroid: Option<&str>, geoms: &[Ge
 fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
     let file = std::fs::File::open(path).unwrap();
     let mut rows = Vec::new();
-    for batch in ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap()
-    {
+    for batch in open_parquet(file).unwrap().build().unwrap() {
         let batch = batch.unwrap();
         let schema = batch.schema();
         let zoom = batch
@@ -134,7 +134,12 @@ fn read_decoded(path: &Path) -> Vec<(u8, i64, Geometry<f64>)> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         for (i, g) in geoms.into_iter().enumerate() {
             rows.push((zoom.value(i), id.value(i), g));
         }

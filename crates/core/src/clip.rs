@@ -273,11 +273,12 @@ pub fn clip_geometry(
     geom: &Geometry<f64>,
     bounds: &TileBounds,
     buffer: f64,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Geometry<f64>> {
     // Backward-compatible entry point: validate simplicity per clip (the
     // pre-#237 behavior). Hot export paths should call `clip_geometry_simple`
     // with a per-feature `assume_simple` flag instead.
-    clip_geometry_simple(geom, bounds, buffer, false, false)
+    clip_geometry_simple(geom, bounds, buffer, false, false, diagnostics)
 }
 
 /// Clip a geometry to buffered tile bounds, with caller-supplied hints that skip
@@ -307,6 +308,7 @@ pub fn clip_geometry_simple(
     buffer: f64,
     assume_simple: bool,
     skip_boundary_fallback: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Geometry<f64>> {
     let buffered = TileBounds::new(
         bounds.lng_min - buffer,
@@ -317,15 +319,23 @@ pub fn clip_geometry_simple(
 
     match geom {
         Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
-        Geometry::LineString(ls) => clip_linestring(ls, &buffered),
-        Geometry::Polygon(poly) => {
-            clip_polygon(poly, &buffered, assume_simple, skip_boundary_fallback)
-        }
-        Geometry::MultiPolygon(mp) => {
-            clip_multipolygon(mp, &buffered, assume_simple, skip_boundary_fallback)
-                .map(Geometry::MultiPolygon)
-        }
-        Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
+        Geometry::LineString(ls) => clip_linestring(ls, &buffered, diagnostics),
+        Geometry::Polygon(poly) => clip_polygon(
+            poly,
+            &buffered,
+            assume_simple,
+            skip_boundary_fallback,
+            diagnostics,
+        ),
+        Geometry::MultiPolygon(mp) => clip_multipolygon(
+            mp,
+            &buffered,
+            assume_simple,
+            skip_boundary_fallback,
+            diagnostics,
+        )
+        .map(Geometry::MultiPolygon),
+        Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered, diagnostics),
         other => {
             // For other geometry types, use bounding box check
             if let Some(rect) = other.bounding_rect() {
@@ -363,48 +373,69 @@ fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
         && rect.min().y <= bounds.lat_max
 }
 
-/// Bounding rect over EVERY ring of a polygon.
+/// A polygon's bounding rect over every ring, and whether every coordinate
+/// is finite.
 ///
-/// `geo`'s `Polygon::bounding_rect` covers the exterior only. That is the
-/// right answer for valid input (holes lie inside the exterior), but the
-/// convert pass carries invalid input verbatim (#188), and a hole outside or
-/// across its exterior would otherwise ride the fully-inside fast path below
-/// into the tile unclipped — thousands of MVT units past the buffer (found by
-/// the #205 hostile-geometry harness). For valid polygons the result is the
-/// exterior's rect, so the fast path is byte-identical there.
-fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<Rect<f64>> {
-    let mut rect = poly.exterior().bounding_rect()?;
-    for hole in poly.interiors() {
-        if let Some(h) = hole.bounding_rect() {
-            rect = Rect::new(
-                Coord {
-                    x: rect.min().x.min(h.min().x),
-                    y: rect.min().y.min(h.min().y),
-                },
-                Coord {
-                    x: rect.max().x.max(h.max().x),
-                    y: rect.max().y.max(h.max().y),
-                },
-            );
+/// Over every ring, not just the exterior: `geo`'s `Polygon::bounding_rect`
+/// covers the exterior only, which is right for valid input (holes lie
+/// inside the exterior), but the convert pass carries invalid input verbatim
+/// (#188), and a hole outside or across its exterior would otherwise ride
+/// the fully-inside fast path below into the tile unclipped — thousands of
+/// MVT units past the buffer (found by the #205 hostile-geometry harness).
+/// For valid polygons the rect is the exterior's, so the fast path is
+/// byte-identical there.
+///
+/// And with a finiteness flag, from the same pass: `geo`'s min/max skip a
+/// NaN that is not a ring's first coordinate, so a NaN-bearing polygon could
+/// take the fully-inside fast path and never reach the `i_overlay` guard
+/// (#707). The callers refuse a non-finite polygon, counted, instead.
+fn polygon_rect_all_rings(poly: &Polygon<f64>) -> Option<(Rect<f64>, bool)> {
+    let rings = std::iter::once(poly.exterior()).chain(poly.interiors());
+    let first = rings.clone().find_map(|ring| ring.0.first())?;
+    let (mut min, mut max) = (*first, *first);
+    let mut finite = true;
+    // Keep the hot loop on a coordinate slice rather than advancing a
+    // flattened ring iterator per vertex. Finiteness and bounds share this
+    // pass, including singleton rings and holes outside their exterior.
+    for ring in rings {
+        for c in &ring.0 {
+            finite &= c.x.is_finite() & c.y.is_finite();
+            // Only finite bounds are used by callers. Ordered comparisons
+            // avoid NaN-aware min/max work for each accepted coordinate.
+            if c.x < min.x {
+                min.x = c.x;
+            }
+            if c.y < min.y {
+                min.y = c.y;
+            }
+            if c.x > max.x {
+                max.x = c.x;
+            }
+            if c.y > max.y {
+                max.y = c.y;
+            }
         }
     }
-    Some(rect)
+    Some((Rect::new(min, max), finite))
 }
 
 /// [`polygon_rect_all_rings`] over every part of a MultiPolygon.
-fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<Rect<f64>> {
+fn multipolygon_rect_all_rings(mp: &MultiPolygon<f64>) -> Option<(Rect<f64>, bool)> {
     let mut rects = mp.0.iter().filter_map(polygon_rect_all_rings);
     let first = rects.next()?;
-    Some(rects.fold(first, |acc, r| {
-        Rect::new(
-            Coord {
-                x: acc.min().x.min(r.min().x),
-                y: acc.min().y.min(r.min().y),
-            },
-            Coord {
-                x: acc.max().x.max(r.max().x),
-                y: acc.max().y.max(r.max().y),
-            },
+    Some(rects.fold(first, |(acc, acc_finite), (r, finite)| {
+        (
+            Rect::new(
+                Coord {
+                    x: acc.min().x.min(r.min().x),
+                    y: acc.min().y.min(r.min().y),
+                },
+                Coord {
+                    x: acc.max().x.max(r.max().x),
+                    y: acc.max().y.max(r.max().y),
+                },
+            ),
+            acc_finite && finite,
         )
     }))
 }
@@ -439,7 +470,11 @@ fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
 /// Same engine as the polygon fallback (`ioverlay_clip`), so lines and
 /// polygons never disagree about where the tile edge is. Was
 /// `geo::BooleanOps::clip`, the `i_overlay` 4.x copy `geo` vendors.
-fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+fn clip_linestring(
+    ls: &LineString<f64>,
+    bounds: &TileBounds,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
     // Quick rejection test
     if let Some(rect) = ls.bounding_rect() {
         if !intersects_bounds(&rect, bounds) {
@@ -449,7 +484,7 @@ fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry
 
     // Keep the parts INSIDE the bounds (not inverted).
     let mls = MultiLineString::new(vec![ls.clone()]);
-    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(&mls, bounds);
+    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(&mls, bounds, diagnostics);
 
     if clipped.0.is_empty() {
         None
@@ -461,7 +496,11 @@ fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry
 }
 
 /// Clip a multilinestring to bounds
-fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+fn clip_multilinestring(
+    mls: &MultiLineString<f64>,
+    bounds: &TileBounds,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
     // Quick rejection test
     if let Some(rect) = mls.bounding_rect() {
         if !intersects_bounds(&rect, bounds) {
@@ -469,7 +508,7 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
         }
     }
 
-    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(mls, bounds);
+    let clipped = ioverlay_clip::clip_multilinestring_ioverlay(mls, bounds, diagnostics);
 
     if clipped.0.is_empty() {
         None
@@ -483,11 +522,18 @@ fn clip_polygon(
     bounds: &TileBounds,
     assume_simple: bool,
     skip_boundary_fallback: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Geometry<f64>> {
     // Quick rejection test using bounding box. Over every ring, not just the
     // exterior, so an interior ring outside its exterior cannot take the
     // fully-inside fast path below unclipped (#205).
-    let poly_rect = polygon_rect_all_rings(poly)?;
+    let (poly_rect, finite) = polygon_rect_all_rings(poly)?;
+    if !finite {
+        // A NaN or infinite vertex: nothing to clip, and the fast path below
+        // would emit it unclipped. Dropped, and counted (#707).
+        ioverlay_clip::count_guard_drop(diagnostics);
+        return None;
+    }
     if !intersects_bounds(&poly_rect, bounds) {
         return None;
     }
@@ -507,7 +553,7 @@ fn clip_polygon(
     // If input has structural issues, go directly to i_overlay (skip S-H)
     // i_overlay handles self-intersecting polygons by splitting them into valid parts
     if input_has_issues {
-        return ioverlay_clip::clip_polygon_ioverlay(poly, bounds);
+        return ioverlay_clip::clip_polygon_ioverlay(poly, bounds, diagnostics);
     }
 
     // Primary path: Use Sutherland-Hodgman for O(n) rectangle clipping
@@ -531,7 +577,7 @@ fn clip_polygon(
             if geometry_has_structural_issues(sh_result.as_ref().unwrap(), assume_simple)
                 || (!skip_boundary && has_boundary_connecting_edges(p, bounds))
             {
-                ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
+                ioverlay_clip::clip_polygon_ioverlay(poly, bounds, diagnostics)
             } else {
                 sh_result
             }
@@ -543,7 +589,7 @@ fn clip_polygon(
                     || (!skip_boundary && has_boundary_connecting_edges(p, bounds))
             });
             if has_issues {
-                ioverlay_clip::clip_polygon_ioverlay(poly, bounds)
+                ioverlay_clip::clip_polygon_ioverlay(poly, bounds, diagnostics)
             } else {
                 sh_result
             }
@@ -565,10 +611,17 @@ fn clip_multipolygon(
     bounds: &TileBounds,
     assume_simple: bool,
     skip_boundary_fallback: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<MultiPolygon<f64>> {
     // Level 1: Quick rejection using overall MultiPolygon bbox (every ring,
     // see `polygon_rect_all_rings`).
-    let mp_rect = multipolygon_rect_all_rings(mp)?;
+    let (mp_rect, finite) = multipolygon_rect_all_rings(mp)?;
+    if !finite {
+        // One hostile vertex poisons the whole input, as in the i_overlay
+        // guard: dropped, and counted (#707).
+        ioverlay_clip::count_guard_drop(diagnostics);
+        return None;
+    }
     if !intersects_bounds(&mp_rect, bounds) {
         return None;
     }
@@ -586,8 +639,9 @@ fn clip_multipolygon(
     for poly in &mp.0 {
         // Per-polygon bbox filter: compute each polygon's bbox and check
         // intersection before calling into the clip pipeline
+        // Every part is finite: the whole MultiPolygon was checked above.
         let poly_rect = match polygon_rect_all_rings(poly) {
-            Some(r) => r,
+            Some((r, _)) => r,
             None => continue, // Degenerate polygon, skip
         };
 
@@ -611,7 +665,13 @@ fn clip_multipolygon(
         // fallback resolving an S-H bridge into its true parts) — keep every
         // piece. Discarding the MultiPolygon case here silently deleted
         // boundary-straddling parts from individual tiles (#244).
-        match clip_polygon(poly, bounds, assume_simple, skip_boundary_fallback) {
+        match clip_polygon(
+            poly,
+            bounds,
+            assume_simple,
+            skip_boundary_fallback,
+            diagnostics,
+        ) {
             Some(Geometry::Polygon(clipped)) => clipped_polys.push(clipped),
             Some(Geometry::MultiPolygon(pieces)) => clipped_polys.extend(pieces.0),
             Some(other) => debug_assert!(false, "polygon clip returned {other:?}"),
@@ -631,6 +691,45 @@ mod tests {
     use super::*;
     use geo::point;
 
+    // ========== Non-finite coordinates (issue #707) ==========
+
+    /// A simple square fully inside the tile with a NaN at its third vertex:
+    /// `geo`'s bounding rect skips a NaN that is not a ring's first
+    /// coordinate, so this rode the fully-inside fast path and came back
+    /// unclipped, never reaching the `i_overlay` guard.
+    #[test]
+    fn a_nan_vertex_cannot_take_the_fully_inside_fast_path() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+
+        let poly = Polygon::new(
+            LineString::from(vec![
+                (1.0, 1.0),
+                (2.0, 1.0),
+                (f64::NAN, 2.0),
+                (1.0, 2.0),
+                (1.0, 1.0),
+            ]),
+            vec![],
+        );
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for geom in [
+            Geometry::Polygon(poly.clone()),
+            Geometry::MultiPolygon(MultiPolygon::new(vec![poly])),
+        ] {
+            let before =
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 });
+            assert_eq!(
+                clip_geometry_simple(&geom, &bounds, 0.0, true, true, &diagnostics),
+                None
+            );
+            assert!(
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 })
+                    > before,
+                "the drop is counted"
+            );
+        }
+    }
+
     // ========== Interior rings outside their exterior (issue #205) ==========
 
     fn ring_square(min: f64, max: f64) -> LineString<f64> {
@@ -641,6 +740,89 @@ mod tests {
             (min, max),
             (min, min),
         ])
+    }
+
+    #[test]
+    fn non_finite_in_either_axis_of_any_ring_is_counted_once() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for axis in 0..2 {
+                for hole in [false, true] {
+                    for vertex in [0, 2] {
+                        let mut ring = ring_square(2.0, 3.0);
+                        if axis == 0 {
+                            ring.0[vertex].x = bad;
+                        } else {
+                            ring.0[vertex].y = bad;
+                        }
+                        let poly = if hole {
+                            Polygon::new(ring_square(1.0, 4.0), vec![ring])
+                        } else {
+                            Polygon::new(ring, vec![])
+                        };
+                        assert!(!polygon_rect_all_rings(&poly).unwrap().1);
+                        let diagnostics = crate::diagnostics::Diagnostics::default();
+                        assert_eq!(
+                            clip_geometry_simple(
+                                &Geometry::Polygon(poly),
+                                &bounds,
+                                0.0,
+                                true,
+                                true,
+                                &diagnostics,
+                            ),
+                            None,
+                        );
+                        assert_eq!(
+                            diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped {
+                                count: 0
+                            }),
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_in_any_multipolygon_part_poisons_the_whole_feature() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let clean = Polygon::new(ring_square(1.0, 4.0), vec![]);
+        for bad_part in 0..3 {
+            let mut parts = vec![clean.clone(); 3];
+            let mut hole = ring_square(2.0, 3.0);
+            hole.0[2].y = f64::NAN;
+            parts[bad_part] = Polygon::new(ring_square(1.0, 4.0), vec![hole]);
+            let mp = MultiPolygon::new(parts);
+            assert!(!multipolygon_rect_all_rings(&mp).unwrap().1);
+            let diagnostics = crate::diagnostics::Diagnostics::default();
+            assert_eq!(
+                clip_geometry_simple(
+                    &Geometry::MultiPolygon(mp),
+                    &bounds,
+                    0.0,
+                    true,
+                    true,
+                    &diagnostics,
+                ),
+                None,
+            );
+            assert_eq!(
+                diagnostics.count(&crate::diagnostics::Diagnostic::ClipGuardDropped { count: 0 }),
+                1,
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_single_coordinate_ring_has_no_closing_vertex_to_recheck() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (x, y) in [(bad, 1.0), (1.0, bad)] {
+                let poly = Polygon::new(LineString::from(vec![(x, y)]), vec![]);
+                assert!(!polygon_rect_all_rings(&poly).unwrap().1);
+            }
+        }
     }
 
     fn assert_within(g: &Geometry<f64>, b: &TileBounds, what: &str) {
@@ -673,6 +855,7 @@ mod tests {
                 0.0,
                 assume_simple,
                 fast,
+                &crate::diagnostics::Diagnostics::default(),
             )
             .expect("exterior overlaps the window");
             assert_within(&out, &window, "hole outside exterior");
@@ -683,6 +866,7 @@ mod tests {
                 0.0,
                 assume_simple,
                 fast,
+                &crate::diagnostics::Diagnostics::default(),
             )
             .expect("exterior overlaps the window");
             assert_within(&out, &window, "hole outside exterior (multipolygon)");
@@ -695,8 +879,15 @@ mod tests {
     fn hole_crossing_its_exterior_is_clipped_to_the_window() {
         let poly = Polygon::new(ring_square(0.0, 10.0), vec![ring_square(5.0, 15.0)]);
         let window = TileBounds::new(-1.0, -1.0, 11.0, 11.0);
-        let out = clip_geometry_simple(&Geometry::Polygon(poly), &window, 0.0, true, true)
-            .expect("exterior overlaps the window");
+        let out = clip_geometry_simple(
+            &Geometry::Polygon(poly),
+            &window,
+            0.0,
+            true,
+            true,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("exterior overlaps the window");
         assert_within(&out, &window, "hole crossing exterior");
     }
 
@@ -707,8 +898,15 @@ mod tests {
     fn valid_polygon_with_holes_still_takes_the_fast_path_verbatim() {
         let poly = Polygon::new(ring_square(0.0, 10.0), vec![ring_square(2.0, 4.0)]);
         let window = TileBounds::new(-1.0, -1.0, 11.0, 11.0);
-        let out = clip_geometry_simple(&Geometry::Polygon(poly.clone()), &window, 0.0, true, true)
-            .expect("inside the window");
+        let out = clip_geometry_simple(
+            &Geometry::Polygon(poly.clone()),
+            &window,
+            0.0,
+            true,
+            true,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("inside the window");
         assert_eq!(out, Geometry::Polygon(poly));
     }
 
@@ -716,6 +914,7 @@ mod tests {
 
     /// A one-part MultiPolygon whose part is a U: two vertical prongs
     /// (x ∈ [0,1] and x ∈ [3,4], rising to y=5) joined by a base (y ∈ [0,1]).
+    #[cfg(test)]
     fn u_multipolygon() -> MultiPolygon<f64> {
         MultiPolygon::new(vec![Polygon::new(
             LineString::from(vec![
@@ -743,13 +942,25 @@ mod tests {
         // them off along razor-straight tile-boundary lines).
         let mp = u_multipolygon();
         let window = TileBounds::new(-0.5, 3.0, 4.5, 6.0);
-        let clipped = clip_multipolygon(&mp, &window, false, false)
-            .expect("clip must not drop a genuinely-overlapping feature");
+        let clipped = clip_multipolygon(
+            &mp,
+            &window,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("clip must not drop a genuinely-overlapping feature");
         assert_eq!(clipped.0.len(), 2, "both prong pieces must survive");
         // Same through the public geometry entry point, simple-path flavor.
-        let via_public =
-            clip_geometry_simple(&Geometry::MultiPolygon(mp), &window, 0.0, true, false)
-                .expect("public entry point must keep the feature");
+        let via_public = clip_geometry_simple(
+            &Geometry::MultiPolygon(mp),
+            &window,
+            0.0,
+            true,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("public entry point must keep the feature");
         match via_public {
             Geometry::MultiPolygon(m) => assert_eq!(m.0.len(), 2),
             other => panic!("expected MultiPolygon, got {other:?}"),
@@ -786,8 +997,15 @@ mod tests {
         };
         let leaf = crate::tile::tile_bounds(2104, 1372, 12);
 
-        let direct = clip_geometry_simple(&geom, &leaf, buf(&leaf), simple, false)
-            .expect("direct leaf clip must keep the eastern sliver");
+        let direct = clip_geometry_simple(
+            &geom,
+            &leaf,
+            buf(&leaf),
+            simple,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("direct leaf clip must keep the eastern sliver");
         assert!(
             contains_hole(&direct),
             "clipped sliver must cover the reported hole point"
@@ -798,11 +1016,25 @@ mod tests {
         let mut cur = geom;
         for (x, y, z) in [(263u32, 171u32, 9u8), (526, 343, 10), (1052, 686, 11)] {
             let nb = crate::tile::tile_bounds(x, y, z);
-            cur = clip_geometry_simple(&cur, &nb, buf(&nb), simple, false)
-                .unwrap_or_else(|| panic!("cascade lost the feature at z{z} ({x},{y})"));
+            cur = clip_geometry_simple(
+                &cur,
+                &nb,
+                buf(&nb),
+                simple,
+                false,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap_or_else(|| panic!("cascade lost the feature at z{z} ({x},{y})"));
         }
-        let casc = clip_geometry_simple(&cur, &leaf, buf(&leaf), simple, false)
-            .expect("cascade leaf clip must keep the eastern sliver");
+        let casc = clip_geometry_simple(
+            &cur,
+            &leaf,
+            buf(&leaf),
+            simple,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .expect("cascade leaf clip must keep the eastern sliver");
         assert!(
             contains_hole(&casc),
             "cascade-clipped sliver must cover the reported hole point"
@@ -958,8 +1190,20 @@ mod tests {
         ];
         for g in cases {
             assert!(geometry_is_simple(&g));
-            let default = clip_geometry(&g, &bounds, buffer);
-            let fast = clip_geometry_simple(&g, &bounds, buffer, true, false);
+            let default = clip_geometry(
+                &g,
+                &bounds,
+                buffer,
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            let fast = clip_geometry_simple(
+                &g,
+                &bounds,
+                buffer,
+                true,
+                false,
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert_eq!(default, fast, "assume_simple output diverged for {g:?}");
         }
     }
@@ -1003,7 +1247,13 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds, false, false);
+        let result = clip_polygon(
+            &poly,
+            &bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some());
 
         // Extract the polygon (should be single polygon for this simple case)
@@ -1040,7 +1290,14 @@ mod tests {
             ]),
             vec![],
         );
-        assert!(clip_polygon(&poly, &bounds, false, false).is_none());
+        assert!(clip_polygon(
+            &poly,
+            &bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1057,7 +1314,13 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&poly, &bounds, false, false);
+        let result = clip_polygon(
+            &poly,
+            &bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some());
     }
 
@@ -1068,7 +1331,7 @@ mod tests {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let ls = LineString::from(vec![Coord { x: -5.0, y: 5.0 }, Coord { x: 15.0, y: 5.0 }]);
 
-        let result = clip_linestring(&ls, &bounds);
+        let result = clip_linestring(&ls, &bounds, &crate::diagnostics::Diagnostics::default());
         assert!(result.is_some());
     }
 
@@ -1077,7 +1340,7 @@ mod tests {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let ls = LineString::from(vec![Coord { x: 20.0, y: 20.0 }, Coord { x: 30.0, y: 30.0 }]);
 
-        let result = clip_linestring(&ls, &bounds);
+        let result = clip_linestring(&ls, &bounds, &crate::diagnostics::Diagnostics::default());
         assert!(result.is_none());
     }
 
@@ -1086,7 +1349,7 @@ mod tests {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let ls = LineString::from(vec![Coord { x: 2.0, y: 2.0 }, Coord { x: 8.0, y: 8.0 }]);
 
-        let result = clip_linestring(&ls, &bounds);
+        let result = clip_linestring(&ls, &bounds, &crate::diagnostics::Diagnostics::default());
         assert!(result.is_some());
     }
 
@@ -1119,7 +1382,12 @@ mod tests {
         assert!(clip_point(&point, &bounds).is_none());
 
         // With buffer via clip_geometry: should be inside
-        let result = clip_geometry(&Geometry::Point(point), &bounds, buffer);
+        let result = clip_geometry(
+            &Geometry::Point(point),
+            &bounds,
+            buffer,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some());
     }
 
@@ -1130,7 +1398,12 @@ mod tests {
         let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
         let point = Geometry::Point(point!(x: 5.0, y: 5.0));
 
-        let result = clip_geometry(&point, &bounds, 0.0);
+        let result = clip_geometry(
+            &point,
+            &bounds,
+            0.0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Geometry::Point(_)));
     }
@@ -1149,7 +1422,12 @@ mod tests {
             vec![],
         ));
 
-        let result = clip_geometry(&poly, &bounds, 0.0);
+        let result = clip_geometry(
+            &poly,
+            &bounds,
+            0.0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some());
     }
 
@@ -1171,11 +1449,21 @@ mod tests {
         ));
 
         // Without buffer: should be outside
-        let result_no_buffer = clip_geometry(&poly, &bounds, 0.0);
+        let result_no_buffer = clip_geometry(
+            &poly,
+            &bounds,
+            0.0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result_no_buffer.is_none());
 
         // With buffer: should clip to buffered bounds
-        let result_with_buffer = clip_geometry(&poly, &bounds, buffer);
+        let result_with_buffer = clip_geometry(
+            &poly,
+            &bounds,
+            buffer,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result_with_buffer.is_some());
     }
 
@@ -1240,7 +1528,13 @@ mod tests {
         let mp = MultiPolygon::new(polygons);
 
         // Clip to the tile
-        let result = clip_multipolygon(&mp, &tile_bounds, false, false);
+        let result = clip_multipolygon(
+            &mp,
+            &tile_bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
 
         // Should produce output (the 10 inside polygons)
         assert!(
@@ -1299,7 +1593,13 @@ mod tests {
             .collect();
 
         let mp = MultiPolygon::new(polygons);
-        let result = clip_multipolygon(&mp, &tile_bounds, false, false);
+        let result = clip_multipolygon(
+            &mp,
+            &tile_bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(
             result.is_none(),
             "All-outside multipolygon should return None"
@@ -1342,7 +1642,13 @@ mod tests {
         );
 
         // Clip to small tile
-        let result = clip_polygon(&large_poly, &tile_bounds, false, false);
+        let result = clip_polygon(
+            &large_poly,
+            &tile_bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some(), "Large polygon should intersect the tile");
 
         // Verify the clipped result is reasonable
@@ -1384,6 +1690,7 @@ mod tests {
     /// A polygon with vertices at lng ±179.9 — intended by the data author as
     /// a 0.2°-wide feature crossing the antimeridian, but stored (verbatim)
     /// as a 359.8°-wide rectangle.
+    #[cfg(test)]
     fn antimeridian_polygon() -> Geometry<f64> {
         Geometry::Polygon(Polygon::new(
             LineString::from(vec![
@@ -1403,7 +1710,12 @@ mod tests {
         // yet clipping yields content there because the stored rectangle
         // passes straight through it.
         let tile = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
-        let clipped = clip_geometry(&antimeridian_polygon(), &tile, 0.0);
+        let clipped = clip_geometry(
+            &antimeridian_polygon(),
+            &tile,
+            0.0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let clipped = clipped.expect(
             "PIN: prime-meridian tile receives geometry from an \
              antimeridian-crossing polygon (smearing)",
@@ -1421,7 +1733,12 @@ mod tests {
         // A tile adjacent to +180° also intersects — the geometry is present
         // where the author intended it, in addition to the world-row smear.
         let tile = TileBounds::new(178.0, -1.0, 180.0, 1.0);
-        let clipped = clip_geometry(&antimeridian_polygon(), &tile, 0.0);
+        let clipped = clip_geometry(
+            &antimeridian_polygon(),
+            &tile,
+            0.0,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(
             clipped.is_some(),
             "tile at the +180° edge intersects the stored rectangle"
@@ -1593,7 +1910,13 @@ mod tests {
             vec![],
         );
 
-        let result = clip_polygon(&u_shape, &bounds, false, false);
+        let result = clip_polygon(
+            &u_shape,
+            &bounds,
+            false,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         assert!(result.is_some(), "U-shape should intersect the band");
 
         // i_overlay correctly produces a MultiPolygon with 2 separate polygons
@@ -1657,6 +1980,7 @@ mod tests {
     /// intersection check — not the boundary gate — routes it to `i_overlay`. To
     /// isolate the boundary gate we need a clean simple U: solid base y∈[0,3]
     /// across x∈[0,10], arms x∈[0,3] and x∈[7,10] up to y=10, notch x∈[3,7].
+    #[cfg(test)]
     fn u_shape() -> Polygon<f64> {
         Polygon::new(
             LineString::from(vec![
@@ -1691,14 +2015,30 @@ mod tests {
 
         // Flag OFF (default): the boundary gate fires even at assume_simple=true,
         // so the fallback yields the clean 2-part split.
-        match clip_polygon(&u, &bounds, true, false).unwrap() {
+        match clip_polygon(
+            &u,
+            &bounds,
+            true,
+            false,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap()
+        {
             Geometry::MultiPolygon(mp) => assert_eq!(mp.0.len(), 2),
             other => panic!("flag off should split; got {other:?}"),
         }
 
         // Flag ON (#239): the boundary gate is skipped for this simple ring, so
         // S-H's single self-touching polygon is kept (no i_overlay).
-        match clip_polygon(&u, &bounds, true, true).unwrap() {
+        match clip_polygon(
+            &u,
+            &bounds,
+            true,
+            true,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap()
+        {
             Geometry::Polygon(_) => {}
             other => panic!("flag on should keep the S-H single polygon; got {other:?}"),
         }
@@ -1714,7 +2054,12 @@ mod tests {
         let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0);
 
         let sh = sutherland_hodgman::clip_polygon_sh(&u, &bounds).unwrap();
-        let io = ioverlay_clip::clip_polygon_ioverlay(&u, &bounds).unwrap();
+        let io = ioverlay_clip::clip_polygon_ioverlay(
+            &u,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
 
         // Notch center: inside the band, inside the mouth → NOT part of the U.
         let notch = Point::new(5.0, 5.0);
@@ -1764,7 +2109,12 @@ mod tests {
         );
 
         let sh = sutherland_hodgman::clip_polygon_sh(&comb, &bounds).unwrap();
-        let io = ioverlay_clip::clip_polygon_ioverlay(&comb, &bounds).unwrap();
+        let io = ioverlay_clip::clip_polygon_ioverlay(
+            &comb,
+            &bounds,
+            &crate::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         let notch1 = Point::new(4.5, 5.0);
         let notch2 = Point::new(10.5, 5.0);
         assert!(

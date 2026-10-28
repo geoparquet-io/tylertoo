@@ -27,16 +27,41 @@ use thiserror::Error;
 
 /// Include/exclude choice over property columns. Names are exact
 /// (parquet column names are case-sensitive).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct PropertySelection {
     /// When `Some`, only these properties are kept (`-y`), and `exclude` /
     /// `exclude_all` are ignored, as in tippecanoe. An empty list keeps
     /// none — the same as [`Self::exclude_all`].
+    #[serde(rename = "include_properties")]
+    #[cfg_attr(feature = "cli", arg(action = clap::ArgAction::Append, long = "include-property", id = "include_properties", value_name = "NAME"))]
+    #[cfg_attr(feature = "cli", arg(help = "Keep only these properties in the tiles (repeatable). The input keeps every column, and the `--feature-order` column must stay", long_help = None))]
     pub include: Option<Vec<String>>,
     /// Properties dropped (`-x`). Ignored when `include` is given.
+    #[serde(
+        rename = "exclude_properties",
+        serialize_with = "serialize_exclude",
+        deserialize_with = "deserialize_exclude"
+    )]
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "exclude-property",
+            id = "exclude_properties",
+            value_name = "NAME"
+        )
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Drop these properties from the tiles (repeatable). `--include-property` overrides it", long_help = None))]
     pub exclude: Vec<String>,
     /// Keep no properties at all (`-X`): geometry-only output. Ignored when
     /// `include` is given.
+    #[serde(rename = "exclude_all_properties")]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "exclude-all-properties", id = "exclude_all_properties")
+    )]
+    #[cfg_attr(feature = "cli", arg(help = "Drop every property, writing geometry-only tiles. `--include-property` overrides it", long_help = None))]
     pub exclude_all: bool,
 }
 
@@ -67,6 +92,25 @@ pub enum PropertySelectionError {
          drop the knob"
     )]
     RequiredByKnob { name: String, knob: String },
+}
+
+fn serialize_exclude<S: serde::Serializer>(
+    names: &[String],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::Serialize;
+    if names.is_empty() {
+        serializer.serialize_none()
+    } else {
+        names.serialize(serializer)
+    }
+}
+
+fn deserialize_exclude<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    use serde::Deserialize;
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl PropertySelection {
@@ -190,34 +234,10 @@ impl PropertySelection {
 /// The covering the schema's `geo` metadata declares for the geometry
 /// column counts under any name, as it does on export: parquet carries the
 /// file's key-value metadata into the Arrow schema.
-pub(crate) fn property_indices(schema: &Schema, geom_idx: usize) -> Vec<usize> {
-    let geom = schema.field(geom_idx).name().as_str();
-    let declared = declared_covering(schema, geom);
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|&(i, f)| {
-            i != geom_idx && !super::writer::is_covering_column(f, Some(geom), declared.as_deref())
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// The top-level struct name of the covering that `schema`'s `geo`
-/// metadata declares for `geom` (the spec paths are `["bbox","xmin"]` and so
-/// on). `None` when there is no `geo` key, it does not parse, or it
-/// declares no covering for `geom`.
-fn declared_covering(schema: &Schema, geom: &str) -> Option<String> {
-    let json = schema
-        .metadata()
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("geo"))
-        .map(|(_, v)| v)?;
-    crate::covering::parse_covering_metadata(json, Some(geom))
-        .ok()
-        .flatten()
-        .and_then(|spec| spec.xmin_path.first().cloned())
+pub(crate) fn property_indices(schema: &Schema, _geom_idx: usize) -> Vec<usize> {
+    crate::resolved_schema::ResolvedSchema::resolve(schema)
+        .map(|s| s.properties().to_vec())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

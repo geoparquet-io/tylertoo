@@ -168,3 +168,4 @@ WKB
 # "extract" is a noun here (a regional extract), not a wordy "remove";
 # listing it exempts it from Microsoft.Wordiness.
 [Ee]xtract
+[Jj]scpd

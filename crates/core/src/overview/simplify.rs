@@ -55,7 +55,6 @@
 //! [`simplify_for_level`] with no simplification, gating, or dropping — an
 //! explicit, tested identity path rather than an emergent one.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use geo::{
@@ -66,30 +65,6 @@ use geo::{
 use super::level::{zoom_for_gsd, WEBMERC_CIRCUMFERENCE_M};
 pub use super::level::{Crs, METERS_PER_DEGREE};
 use crate::mvt::{DEFAULT_EXTENT, MIN_SURVIVING_SQUARE_SIDE};
-
-/// Process-wide count of polygons that exhausted every epsilon-backoff retry
-/// (see [`simplify_polygon_impl_checked`]) and were kept at full resolution.
-///
-/// Callers (e.g. the streaming convert loop) log deltas of
-/// [`full_resolution_fallback_count`] at debug level to expose how often the
-/// last-resort path fires.
-static FULL_RES_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-wide full-resolution fallback counter.
-pub fn full_resolution_fallback_count() -> u64 {
-    FULL_RES_FALLBACKS.load(Ordering::Relaxed)
-}
-
-/// Process-wide count of RDP candidates that skipped the validity check
-/// because they exceeded `MAX_VALIDATION_VERTS` (#242). Logged as a delta
-/// alongside [`full_resolution_fallback_count`] by the streaming convert
-/// loop.
-static VALIDATION_SKIPS: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-wide capped-validation skip counter.
-pub fn validation_skip_count() -> u64 {
-    VALIDATION_SKIPS.load(Ordering::Relaxed)
-}
 
 /// Default simplification factor: `tolerance = factor * gsd`.
 ///
@@ -119,7 +94,7 @@ const MIN_LINESTRING_POINTS: usize = 2;
 ///   point, area-dithered so aggregate area stays truthful (tippecanoe's
 ///   tiny-polygon reduction). Type-preserving — `geometry_types` stays
 ///   `["Polygon"]`, so fill-styled renderers need no style changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CollapseMode {
     /// Omit the collapsed feature (the default before #745).
     Drop,
@@ -154,13 +129,22 @@ impl CollapseMode {
 }
 
 /// Options controlling per-level simplification.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+#[serde(default, deny_unknown_fields)]
 pub struct SimplifyOptions {
     /// Tolerance multiplier: `tolerance = factor * gsd`. See
     /// [`DEFAULT_SIMPLIFY_FACTOR`].
+    #[serde(rename = "simplify_factor")]
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().factor, long = "simplify-factor", id = "simplify_factor", help_heading = "Generalization"))]
+    #[cfg_attr(feature = "cli", arg(hide_default_value = true))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplification tolerance in multiples of each level's GSD (default 1.0, duplicating mode only). Lower values keep more vertices", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(value_name = "SIMPLIFY_FACTOR"))]
     pub factor: f64,
     /// Disposition of polygons that collapse below the visibility gate
     /// (default [`CollapseMode::Auto`]; see [`CollapseMode`]).
+    #[serde(rename = "collapse_mode")]
+    #[cfg_attr(feature = "cli", arg(skip = Self::default().collapse))]
     pub collapse: CollapseMode,
     /// Cascading simplification (#218, default **on**). When `true`:
     ///
@@ -176,6 +160,8 @@ pub struct SimplifyOptions {
     ///
     /// Output-changing: coarse-level geometry differs from the non-cascaded
     /// pipeline. `false` reproduces the pre-#218 output byte-for-byte.
+    #[cfg_attr(feature = "cli", arg(default_value_t = Self::default().cascade, action = clap::ArgAction::SetFalse, long = "no-cascade", help_heading = "Generalization"))]
+    #[cfg_attr(feature = "cli", arg(help = "Simplify each level from the source instead of from the next finer level. Slower, but each level stays within its own tolerance of the source", long_help = None))]
     pub cascade: bool,
 }
 
@@ -303,8 +289,9 @@ pub fn simplify_for_level(
     gsd_meters: f64,
     crs: Crs,
     opts: &SimplifyOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_for_level_checked(geom, gsd_meters, None, crs, opts).0
+    simplify_for_level_checked(geom, gsd_meters, None, crs, opts, diagnostics, geom).0
 }
 
 /// Like [`simplify_for_level`], but also reports whether the returned
@@ -328,6 +315,8 @@ pub(super) fn simplify_for_level_checked(
     zoom: Option<u8>,
     crs: Crs,
     opts: &SimplifyOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    source: &Geometry<f64>,
 ) -> (Simplified, bool) {
     let tol = world_tolerance(gsd_meters, crs, opts);
     // The placeholder side only matters to the square disposition; skip the
@@ -379,7 +368,19 @@ pub(super) fn simplify_for_level_checked(
         }
 
         Geometry::Polygon(poly) => {
-            simplify_polygon_impl_checked(poly, tol, side, opts.collapse, opts.cascade)
+            let original = match source {
+                Geometry::Polygon(p) => p,
+                _ => poly,
+            };
+            simplify_polygon_impl_checked(
+                poly,
+                tol,
+                side,
+                opts.collapse,
+                opts.cascade,
+                diagnostics,
+                original,
+            )
         }
 
         Geometry::MultiPolygon(mp) => {
@@ -398,8 +399,20 @@ pub(super) fn simplify_for_level_checked(
             };
             let mut kept: Vec<Polygon<f64>> = Vec::with_capacity(mp.0.len());
             let mut unchanged = true;
-            for p in &mp.0 {
-                match simplify_polygon_impl_checked(p, tol, side, part_mode, opts.cascade) {
+            for (part_index, p) in mp.0.iter().enumerate() {
+                let original = match source {
+                    Geometry::MultiPolygon(parts) => parts.0.get(part_index).unwrap_or(p),
+                    _ => p,
+                };
+                match simplify_polygon_impl_checked(
+                    p,
+                    tol,
+                    side,
+                    part_mode,
+                    opts.cascade,
+                    diagnostics,
+                    original,
+                ) {
                     (Simplified::Keep(Geometry::Polygon(poly)), part_unchanged) => {
                         unchanged &= part_unchanged;
                         kept.push(poly);
@@ -446,7 +459,7 @@ pub(super) fn simplify_for_level_checked(
 ///
 /// Kept an enum (never a boolean) in options, contexts, and cascade steps so
 /// further dispositions slot in without another plumbing change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Representation {
     /// Full (simplified) geometry — the normal path. Below-tolerance
     /// polygons follow the global [`CollapseMode`].
@@ -496,6 +509,10 @@ pub struct CascadeStep {
     /// square is floored at (#407); `None` derives the zoom from the GSD the
     /// way the exporter does.
     pub zoom: Option<u8>,
+    // #749's source-area stopgap changes retention relative to tippecanoe
+    // parity. The conversion planner enables it for density-reduced runs;
+    // unreduced runs retain the established working-geometry dither.
+    source_area_dither: bool,
 }
 
 impl CascadeStep {
@@ -505,6 +522,7 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Geometry,
             zoom: None,
+            source_area_dither: true,
         }
     }
 
@@ -514,6 +532,7 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Point,
             zoom: None,
+            source_area_dither: true,
         }
     }
 
@@ -523,6 +542,7 @@ impl CascadeStep {
             gsd_meters,
             repr: Representation::Square,
             zoom: None,
+            source_area_dither: true,
         }
     }
 
@@ -530,6 +550,22 @@ impl CascadeStep {
     #[must_use]
     pub fn with_zoom(self, zoom: Option<u8>) -> Self {
         Self { zoom, ..self }
+    }
+
+    /// Plan the dither policy once for all engines. Density-disabled runs
+    /// include quality-matched (`--verbatim --simplify-factor 1`) parity.
+    pub(crate) fn for_level(
+        gsd_meters: f64,
+        zoom: Option<u8>,
+        repr: Representation,
+        density_reduced: bool,
+    ) -> Self {
+        Self {
+            gsd_meters,
+            zoom,
+            repr,
+            source_area_dither: density_reduced,
+        }
     }
 }
 
@@ -595,8 +631,9 @@ pub fn simplify_step(
     crs: Crs,
     opts: &SimplifyOptions,
     repr: Representation,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_step_checked(geom, gsd_meters, None, crs, opts, repr).0
+    simplify_step_at(geom, gsd_meters, None, crs, opts, repr, diagnostics)
 }
 
 /// [`simplify_step`] for a level whose recorded zoom is known: the engines'
@@ -609,8 +646,9 @@ pub(crate) fn simplify_step_at(
     crs: Crs,
     opts: &SimplifyOptions,
     repr: Representation,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
-    simplify_step_checked(geom, gsd_meters, zoom, crs, opts, repr).0
+    simplify_step_checked(geom, gsd_meters, zoom, crs, opts, repr, diagnostics, geom).0
 }
 
 /// Like [`simplify_step`], but also reports whether the output is
@@ -623,6 +661,10 @@ pub(crate) fn simplify_step_at(
 /// points fall through to [`simplify_for_level_checked`], which passes them
 /// through untouched — matching the "coarser steps pass the point through
 /// untouched" cascade semantics documented on [`simplify_cascade`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "#749: the cascade must carry the source geometry for square dithering"
+)]
 pub(super) fn simplify_step_checked(
     geom: &Geometry<f64>,
     gsd_meters: f64,
@@ -630,14 +672,18 @@ pub(super) fn simplify_step_checked(
     crs: Crs,
     opts: &SimplifyOptions,
     repr: Representation,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    source: &Geometry<f64>,
 ) -> (Simplified, bool) {
     match repr {
-        Representation::Geometry => simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts),
+        Representation::Geometry => {
+            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts, diagnostics, source)
+        }
         Representation::Point => {
             if let Some(out) = polygonal_representative_point(geom) {
                 return (out, false);
             }
-            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts)
+            simplify_for_level_checked(geom, gsd_meters, zoom, crs, opts, diagnostics, source)
         }
         // Square (#279): normal simplification with the below-tolerance
         // disposition forced to area-dithered placeholder squares at this
@@ -647,7 +693,7 @@ pub(super) fn simplify_step_checked(
                 collapse: CollapseMode::Square,
                 ..*opts
             };
-            simplify_for_level_checked(geom, gsd_meters, zoom, crs, &opts)
+            simplify_for_level_checked(geom, gsd_meters, zoom, crs, &opts, diagnostics, source)
         }
     }
 }
@@ -697,6 +743,7 @@ pub fn simplify_cascade(
     steps_fine_to_coarse: &[CascadeStep],
     crs: Crs,
     opts: &SimplifyOptions,
+    diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Simplified {
     if steps_fine_to_coarse.is_empty() {
         return Simplified::Keep(geom.clone());
@@ -705,7 +752,7 @@ pub fn simplify_cascade(
     let mut fold = CascadeFold::new();
     let mut last = FoldStep::Dropped;
     for step in steps_fine_to_coarse {
-        last = fold.step(&canonical, step, crs, opts);
+        last = fold.step(&canonical, step, crs, opts, diagnostics);
     }
     // Release every other handle first, so the common case (the result is a
     // fresh step output, uniquely owned) unwraps without a copy.
@@ -775,6 +822,7 @@ impl CascadeFold {
         step: &CascadeStep,
         crs: Crs,
         opts: &SimplifyOptions,
+        diagnostics: &crate::diagnostics::Diagnostics,
     ) -> FoldStep {
         if !self.alive && step.repr == Representation::Geometry {
             // Monotone along geometry steps: once dropped, stays dropped.
@@ -794,6 +842,12 @@ impl CascadeFold {
             crs,
             opts,
             step.repr,
+            diagnostics,
+            if step.source_area_dither {
+                canonical.as_ref()
+            } else {
+                base.as_ref()
+            },
         );
         match out {
             Simplified::Keep(s) => {
@@ -1044,11 +1098,14 @@ const INVALID_RETRY_HALVINGS: u32 = 3;
 /// ring's detail, i.e. RDP removed few, near-collinear vertices from input
 /// we already assume valid — the *least* likely candidate to have acquired a
 /// crossing. The expensive-to-check case and the low-risk case coincide.
-/// The trade is the same as `clip.rs`: a giant candidate that *did* acquire
-/// a crossing ships unrepaired, which the overviews spec explicitly permits
-/// (geometry validity is not a conformance requirement, `OVERVIEWS_SPEC` §
-/// "validity") and matches tippecanoe, which never validates simplification
-/// output. Everything at or below the cap is validated exactly as before.
+/// A giant candidate that *did* acquire a crossing is stored in the level
+/// as is, which the overviews spec explicitly permits (geometry validity is
+/// not a conformance requirement, `OVERVIEWS_SPEC` § "validity") and matches
+/// tippecanoe, which never validates simplification output. It does not
+/// reach a tile invalid: every polygon is checked and repaired again in
+/// tile space after quantization (`mvt::tile_polygon`, #748), so this check
+/// is only a fast path that picks a tolerance needing no repair. Everything
+/// at or below the cap is validated exactly as before.
 const MAX_VALIDATION_VERTS: usize = 2_048;
 
 /// Total vertices across the polygon's exterior and interior rings.
@@ -1058,10 +1115,13 @@ fn polygon_vertex_count(poly: &Polygon<f64>) -> usize {
 
 /// `is_valid`, capped: candidates above [`MAX_VALIDATION_VERTS`] total
 /// vertices are assumed valid without running the O(V²) scan (#242).
-fn capped_is_valid(candidate: &Polygon<f64>) -> bool {
+fn capped_is_valid(
+    candidate: &Polygon<f64>,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> bool {
     let verts = polygon_vertex_count(candidate);
     if verts > MAX_VALIDATION_VERTS {
-        VALIDATION_SKIPS.fetch_add(1, Ordering::Relaxed);
+        diagnostics.record(crate::diagnostics::Diagnostic::ValidationSkipped { count: 1 });
         log::trace!(
             "overview simplify: skipping O(V²) validity check on {verts}-vertex \
              candidate (cap {MAX_VALIDATION_VERTS}); assuming valid"
@@ -1109,7 +1169,7 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
 ///     tolerance keeps more vertices and usually restores validity while
 ///     still shedding sub-tolerance detail. Only when every retry fails is
 ///     the original geometry kept verbatim (boundary-preserving last resort,
-///     counted in [`full_resolution_fallback_count`]).
+///     counted in [`crate::diagnostics::Diagnostic::FullResolutionFallback`]).
 ///   - `repair` **on** (cascade path, #218): no retries — the candidate's
 ///     self-crossings are resolved into their valid even-odd interpretation
 ///     ([`repair_polygon_ioverlay`]), with repaired parts re-gated. A
@@ -1135,7 +1195,16 @@ fn simplify_polygon_impl(
     mode: CollapseMode,
     repair: bool,
 ) -> Simplified {
-    simplify_polygon_impl_checked(poly, tol, tol, mode, repair).0
+    simplify_polygon_impl_checked(
+        poly,
+        tol,
+        tol,
+        mode,
+        repair,
+        &crate::diagnostics::Diagnostics::default(),
+        poly,
+    )
+    .0
 }
 
 /// Like `simplify_polygon_impl`, but also reports whether the kept
@@ -1155,9 +1224,14 @@ fn simplify_polygon_impl_checked(
     side: f64,
     mode: CollapseMode,
     repair: bool,
+    diagnostics: &crate::diagnostics::Diagnostics,
+    source: &Polygon<f64>,
 ) -> (Simplified, bool) {
     if polygon_diag(poly) < tol {
-        return (collapse_polygon(poly, mode, side), false);
+        return (
+            collapse_polygon(if mode.is_square() { source } else { poly }, mode, side),
+            false,
+        );
     }
 
     // Gates are level properties, so they stay at `tol` even when the RDP
@@ -1190,7 +1264,10 @@ fn simplify_polygon_impl_checked(
         if candidate.exterior().0.len() < MIN_POLYGON_RING_POINTS
             || candidate.unsigned_area() < min_area
         {
-            return (collapse_polygon(poly, mode, side), false);
+            return (
+                collapse_polygon(if mode.is_square() { source } else { poly }, mode, side),
+                false,
+            );
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
@@ -1198,16 +1275,17 @@ fn simplify_polygon_impl_checked(
             !unchanged || candidate == *poly,
             "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
         );
-        if unchanged || capped_is_valid(&candidate) {
+        if unchanged || capped_is_valid(&candidate, diagnostics) {
             return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
+        diagnostics.record(crate::diagnostics::Diagnostic::InvalidAfterSimplify { count: 1 });
         invalid_candidate = Some(candidate);
         eps *= 0.5;
     }
 
     if repair {
         let candidate = invalid_candidate.expect("loop ran at least once");
-        if let Some(repaired) = repair_candidate(&candidate, tol, min_area) {
+        if let Some(repaired) = repair_candidate(&candidate, tol, min_area, diagnostics) {
             log::trace!(
                 "overview simplify: repaired self-intersecting RDP candidate \
                  instead of keeping full resolution"
@@ -1215,12 +1293,15 @@ fn simplify_polygon_impl_checked(
             return (Simplified::Keep(repaired), false);
         }
         // Repair left nothing above the gates (self-canceling sliver).
-        return (collapse_polygon(poly, mode, side), false);
+        return (
+            collapse_polygon(if mode.is_square() { source } else { poly }, mode, side),
+            false,
+        );
     }
 
     // Every retry self-intersected: keep the original geometry rather than
     // emit an invalid ring.
-    FULL_RES_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    diagnostics.record(crate::diagnostics::Diagnostic::FullResolutionFallback { count: 1 });
     log::trace!(
         "overview simplify: RDP candidate invalid after {} epsilon retries; \
          keeping full-resolution geometry",
@@ -1233,15 +1314,21 @@ fn simplify_polygon_impl_checked(
 /// even-odd interpretation, re-applying the level gates per repaired part
 /// (a bowtie lobe can fall below the visibility gate its parent passed).
 /// Returns `None` when no part survives.
-fn repair_candidate(candidate: &Polygon<f64>, tol: f64, min_area: f64) -> Option<Geometry<f64>> {
-    let kept: Vec<Polygon<f64>> = match crate::ioverlay_clip::repair_polygon_ioverlay(candidate)? {
-        Geometry::Polygon(p) => vec![p],
-        Geometry::MultiPolygon(mp) => mp.0,
-        _ => return None,
-    }
-    .into_iter()
-    .filter(|p| polygon_diag(p) >= tol && p.unsigned_area() >= min_area)
-    .collect();
+fn repair_candidate(
+    candidate: &Polygon<f64>,
+    tol: f64,
+    min_area: f64,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Option<Geometry<f64>> {
+    let kept: Vec<Polygon<f64>> =
+        match crate::ioverlay_clip::repair_polygon_ioverlay(candidate, diagnostics)? {
+            Geometry::Polygon(p) => vec![p],
+            Geometry::MultiPolygon(mp) => mp.0,
+            _ => return None,
+        }
+        .into_iter()
+        .filter(|p| polygon_diag(p) >= tol && p.unsigned_area() >= min_area)
+        .collect();
     match kept.len() {
         0 => None,
         1 => Some(Geometry::Polygon(kept.into_iter().next().expect("len 1"))),
@@ -1515,6 +1602,7 @@ mod tests {
                 Crs::Epsg3857,
                 &opts,
                 Representation::Geometry,
+                &crate::diagnostics::Diagnostics::default(),
             ) {
                 let r = g.bounding_rect().unwrap();
                 assert!(
@@ -1544,6 +1632,7 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Geometry,
+            &crate::diagnostics::Diagnostics::default(),
         ) {
             assert!((g.bounding_rect().unwrap().width() - side).abs() < 1e-6);
         }
@@ -1558,7 +1647,15 @@ mod tests {
         let gsds = [10.0, 50.0, 100.0, 500.0, 2000.0];
         let counts: Vec<usize> = gsds
             .iter()
-            .map(|g| line_len(&simplify_for_level(&line, *g, Crs::Epsg3857, &opts)))
+            .map(|g| {
+                line_len(&simplify_for_level(
+                    &line,
+                    *g,
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default(),
+                ))
+            })
             .collect();
         // Monotonically non-increasing as GSD coarsens.
         for w in counts.windows(2) {
@@ -1599,8 +1696,20 @@ mod tests {
         ));
         let opts = SimplifyOptions::default();
         let gsd = 100.0;
-        let c_m = line_len(&simplify_for_level(&line_m, gsd, Crs::Epsg3857, &opts));
-        let c_deg = line_len(&simplify_for_level(&line_deg, gsd, Crs::Epsg4326, &opts));
+        let c_m = line_len(&simplify_for_level(
+            &line_m,
+            gsd,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
+        let c_deg = line_len(&simplify_for_level(
+            &line_deg,
+            gsd,
+            Crs::Epsg4326,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ));
         assert_eq!(
             c_m, c_deg,
             "CRS-converted tolerance should simplify identical shapes equally: {c_m} vs {c_deg}"
@@ -1614,7 +1723,13 @@ mod tests {
         let opts = SimplifyOptions::default();
         let p = Geometry::Point(Point::new(3.0, 4.0));
         assert_eq!(
-            simplify_for_level(&p, 5000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &p,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(p.clone())
         );
         let mp = Geometry::MultiPoint(MultiPoint::new(vec![
@@ -1622,7 +1737,13 @@ mod tests {
             Point::new(2.0, 2.0),
         ]));
         assert_eq!(
-            simplify_for_level(&mp, 5000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &mp,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(mp.clone())
         );
     }
@@ -1634,12 +1755,24 @@ mod tests {
         let opts = SimplifyOptions::default();
         let line = Geometry::LineString(wiggly_line(50, 30.0));
         // gsd == 0 => canonical => bit-identical clone.
-        match simplify_for_level(&line, 0.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &line,
+            0.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(g) => assert_eq!(g, line),
             Simplified::Dropped => panic!("canonical level must not drop"),
         }
         let poly = Geometry::Polygon(square(0.0, 0.0, 1000.0));
-        match simplify_for_level(&poly, 0.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &poly,
+            0.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(g) => assert_eq!(g, poly),
             Simplified::Dropped => panic!("canonical level must not drop"),
         }
@@ -1656,12 +1789,24 @@ mod tests {
             Coord { x: 10.0, y: 0.0 },
         ]));
         assert_eq!(
-            simplify_for_level(&tiny, 1000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &tiny,
+                1000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
         // The same line at a fine 1m GSD survives.
         assert!(matches!(
-            simplify_for_level(&tiny, 1.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &tiny,
+                1.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(_)
         ));
     }
@@ -1671,7 +1816,13 @@ mod tests {
         let opts = SimplifyOptions::default();
         let degen = Geometry::LineString(LineString::new(vec![Coord { x: 5.0, y: 5.0 }]));
         assert_eq!(
-            simplify_for_level(&degen, 1.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &degen,
+                1.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
         // Two identical points (< 2 distinct) also degenerate.
@@ -1680,7 +1831,13 @@ mod tests {
             Coord { x: 5.0, y: 5.0 },
         ]));
         assert_eq!(
-            simplify_for_level(&dup, 1.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &dup,
+                1.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -1690,7 +1847,13 @@ mod tests {
         let opts = SimplifyOptions::default();
         let empty = Geometry::LineString(LineString::new(vec![]));
         assert_eq!(
-            simplify_for_level(&empty, 1.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &empty,
+                1.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -1711,7 +1874,13 @@ mod tests {
             })
             .collect();
         let poly = Geometry::Polygon(Polygon::new(LineString::new(coords), vec![]));
-        match simplify_for_level(&poly, 500.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &poly,
+            500.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Polygon(p)) => {
                 assert!(p.exterior().0.len() >= MIN_POLYGON_RING_POINTS);
                 assert_eq!(
@@ -1752,7 +1921,13 @@ mod tests {
             Coord { x: 100.0, y: 100.0 },
         ]);
         let poly = Geometry::Polygon(Polygon::new(exterior, vec![tiny_hole]));
-        match simplify_for_level(&poly, 1000.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &poly,
+            1000.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Polygon(p)) => {
                 assert_eq!(p.interiors().len(), 0, "collapsed hole must be dropped");
                 assert!(p.is_valid());
@@ -1769,7 +1944,13 @@ mod tests {
         // Default: dropped.
         let drop_opts = SimplifyOptions::default();
         assert_eq!(
-            simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &drop_opts),
+            simplify_for_level(
+                &poly,
+                5000.0,
+                Crs::Epsg3857,
+                &drop_opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
 
@@ -1778,7 +1959,13 @@ mod tests {
             collapse: CollapseMode::Point,
             ..Default::default()
         };
-        match simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &collapse_opts) {
+        match simplify_for_level(
+            &poly,
+            5000.0,
+            Crs::Epsg3857,
+            &collapse_opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Point(pt)) => {
                 assert!((pt.x() - 1000.0).abs() < 1.0);
                 assert!((pt.y() - 2000.0).abs() < 1.0);
@@ -1801,7 +1988,13 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            simplify_for_level(&Geometry::Polygon(sliver), 100.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &Geometry::Polygon(sliver),
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -1856,7 +2049,13 @@ mod tests {
             cascade: false,
             ..SimplifyOptions::default()
         };
-        match simplify_for_level(&Geometry::Polygon(poly), 4.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &Geometry::Polygon(poly),
+            4.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Polygon(p)) => {
                 assert!(
                     p.is_valid(),
@@ -1876,6 +2075,8 @@ mod tests {
 
     #[test]
     fn test_invalid_rdp_candidate_repaired_when_cascade() {
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+
         let poly = notch_finger_polygon();
         let orig_len = poly.exterior().0.len();
         assert!(
@@ -1886,8 +2087,15 @@ mod tests {
         // cascade on (default): the invalid candidate is repaired in one
         // pass instead of epsilon-retried or kept at full resolution.
         let opts = SimplifyOptions::default();
-        let fallbacks_before = full_resolution_fallback_count();
-        match simplify_for_level(&Geometry::Polygon(poly), 4.0, Crs::Epsg3857, &opts) {
+        let fallbacks_before =
+            diagnostics.count(&crate::diagnostics::Diagnostic::FullResolutionFallback { count: 0 });
+        match simplify_for_level(
+            &Geometry::Polygon(poly),
+            4.0,
+            Crs::Epsg3857,
+            &opts,
+            &diagnostics,
+        ) {
             Simplified::Keep(g) => {
                 assert!(g.is_valid(), "repaired output must be valid, got {g:?}");
                 let out_len: usize = match &g {
@@ -1904,7 +2112,7 @@ mod tests {
             other => panic!("expected Keep, got {other:?}"),
         }
         assert_eq!(
-            full_resolution_fallback_count(),
+            diagnostics.count(&crate::diagnostics::Diagnostic::FullResolutionFallback { count: 0 }),
             fallbacks_before,
             "repair path must never count a full-resolution fallback"
         );
@@ -1926,7 +2134,13 @@ mod tests {
     fn test_cascade_empty_chain_is_identity() {
         let g = Geometry::LineString(wiggly_line(50, 10.0));
         assert_eq!(
-            simplify_cascade(&g, &[], Crs::Epsg3857, &SimplifyOptions::default()),
+            simplify_cascade(
+                &g,
+                &[],
+                Crs::Epsg3857,
+                &SimplifyOptions::default(),
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(g.clone())
         );
     }
@@ -1936,8 +2150,20 @@ mod tests {
         let g = Geometry::LineString(wiggly_line(200, 30.0));
         let opts = SimplifyOptions::default();
         assert_eq!(
-            simplify_cascade(&g, &geom_steps(&[100.0]), Crs::Epsg3857, &opts),
-            simplify_for_level(&g, 100.0, Crs::Epsg3857, &opts)
+            simplify_cascade(
+                &g,
+                &geom_steps(&[100.0]),
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
+            simplify_for_level(
+                &g,
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            )
         );
     }
 
@@ -1949,7 +2175,13 @@ mod tests {
         let canonical_set: Vec<Coord<f64>> = canonical.0.clone();
         let g = Geometry::LineString(canonical);
         let opts = SimplifyOptions::default();
-        match simplify_cascade(&g, &geom_steps(&[25.0, 50.0, 100.0]), Crs::Epsg3857, &opts) {
+        match simplify_cascade(
+            &g,
+            &geom_steps(&[25.0, 50.0, 100.0]),
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::LineString(out)) => {
                 assert!(out.0.len() < canonical_set.len(), "chain must simplify");
                 for c in &out.0 {
@@ -1973,7 +2205,13 @@ mod tests {
         ]));
         let opts = SimplifyOptions::default();
         assert_eq!(
-            simplify_cascade(&tiny, &geom_steps(&[1000.0, 5000.0]), Crs::Epsg3857, &opts),
+            simplify_cascade(
+                &tiny,
+                &geom_steps(&[1000.0, 5000.0]),
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -1987,7 +2225,14 @@ mod tests {
         // point-representation step — the band is unconditional, not tied to
         // the visibility gate like --collapse.
         let poly = Geometry::Polygon(square(1000.0, 2000.0, 5000.0));
-        match simplify_step(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Point) {
+        match simplify_step(
+            &poly,
+            100.0,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Point,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Point(pt)) => {
                 assert!((pt.x() - 1000.0).abs() < 1e-9);
                 assert!((pt.y() - 2000.0).abs() < 1e-9);
@@ -1996,8 +2241,21 @@ mod tests {
         }
         // point_repr = false is exactly simplify_for_level.
         assert_eq!(
-            simplify_step(&poly, 100.0, Crs::Epsg3857, &opts, Representation::Geometry),
-            simplify_for_level(&poly, 100.0, Crs::Epsg3857, &opts)
+            simplify_step(
+                &poly,
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                Representation::Geometry,
+                &crate::diagnostics::Diagnostics::default()
+            ),
+            simplify_for_level(
+                &poly,
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            )
         );
     }
 
@@ -2008,7 +2266,14 @@ mod tests {
             square(0.0, 0.0, 1000.0),
             square(4000.0, 0.0, 1000.0),
         ]));
-        match simplify_step(&mp, 100.0, Crs::Epsg3857, &opts, Representation::Point) {
+        match simplify_step(
+            &mp,
+            100.0,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Point,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::Point(pt)) => {
                 assert!((pt.x() - 2000.0).abs() < 1e-9, "centroid x, got {}", pt.x());
                 assert!(pt.y().abs() < 1e-9);
@@ -2025,11 +2290,24 @@ mod tests {
         let opts = SimplifyOptions::default();
         let tiny = Geometry::Polygon(square(50.0, 50.0, 10.0));
         assert_eq!(
-            simplify_for_level(&tiny, 5000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &tiny,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
         assert!(matches!(
-            simplify_step(&tiny, 5000.0, Crs::Epsg3857, &opts, Representation::Point),
+            simplify_step(
+                &tiny,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                Representation::Point,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(Geometry::Point(_))
         ));
     }
@@ -2041,13 +2319,33 @@ mod tests {
         // POLYGON representation only).
         let line = Geometry::LineString(wiggly_line(200, 50.0));
         assert_eq!(
-            simplify_step(&line, 100.0, Crs::Epsg3857, &opts, Representation::Point),
-            simplify_for_level(&line, 100.0, Crs::Epsg3857, &opts)
+            simplify_step(
+                &line,
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                Representation::Point,
+                &crate::diagnostics::Diagnostics::default()
+            ),
+            simplify_for_level(
+                &line,
+                100.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            )
         );
         // Points pass through untouched.
         let p = Geometry::Point(Point::new(3.0, 4.0));
         assert_eq!(
-            simplify_step(&p, 5000.0, Crs::Epsg3857, &opts, Representation::Point),
+            simplify_step(
+                &p,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                Representation::Point,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Keep(p.clone())
         );
     }
@@ -2065,8 +2363,20 @@ mod tests {
             CascadeStep::point(200.0),
             CascadeStep::point(400.0),
         ];
-        let at_boundary = simplify_cascade(&poly, &steps[..3], Crs::Epsg3857, &opts);
-        let at_coarser = simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts);
+        let at_boundary = simplify_cascade(
+            &poly,
+            &steps[..3],
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let at_coarser = simplify_cascade(
+            &poly,
+            &steps,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         match (&at_boundary, &at_coarser) {
             (Simplified::Keep(Geometry::Point(a)), Simplified::Keep(Geometry::Point(b))) => {
                 assert_eq!(a, b, "band levels must share the boundary point");
@@ -2090,12 +2400,24 @@ mod tests {
             CascadeStep::point(20_000.0),
         ];
         assert_eq!(
-            simplify_cascade(&poly, &steps[..1], Crs::Epsg3857, &opts),
+            simplify_cascade(
+                &poly,
+                &steps[..1],
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped,
             "precondition: geometry step drops the tiny polygon"
         );
         for chain in [&steps[..2], &steps[..3]] {
-            match simplify_cascade(&poly, chain, Crs::Epsg3857, &opts) {
+            match simplify_cascade(
+                &poly,
+                chain,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            ) {
                 Simplified::Keep(Geometry::Point(pt)) => {
                     assert!((pt.x() - 500.0).abs() < 1e-9);
                     assert!((pt.y() - 700.0).abs() < 1e-9);
@@ -2121,11 +2443,23 @@ mod tests {
             let poly = Geometry::Polygon(square(cx, cy, 2_000.0));
             let steps = [CascadeStep::geom(5_000.0), CascadeStep::square(8_000.0)];
             assert_eq!(
-                simplify_cascade(&poly, &steps[..1], Crs::Epsg3857, &opts),
+                simplify_cascade(
+                    &poly,
+                    &steps[..1],
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default()
+                ),
                 Simplified::Dropped,
                 "precondition: geometry step drops it"
             );
-            match simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts) {
+            match simplify_cascade(
+                &poly,
+                &steps,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            ) {
                 Simplified::Keep(Geometry::Polygon(sq)) => {
                     let r = sq.bounding_rect().unwrap();
                     assert!((r.width() - 8_000.0).abs() < 1e-6, "side = step tol");
@@ -2157,7 +2491,13 @@ mod tests {
             let (cx, cy) = (1000.0 + i as f64 * 3137.0, -2000.0 + i as f64 * 911.0);
             // Area = (2·1000)² = 4e6; threshold = tol² = 2.5e7 → p ≈ 0.16.
             let poly = Geometry::Polygon(square(cx, cy, 1000.0));
-            match simplify_for_level(&poly, tol, Crs::Epsg3857, &opts) {
+            match simplify_for_level(
+                &poly,
+                tol,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            ) {
                 Simplified::Keep(Geometry::Polygon(sq)) => {
                     let ring = &sq.exterior().0;
                     assert_eq!(ring.len(), 5, "closed 5-coordinate square ring");
@@ -2186,8 +2526,20 @@ mod tests {
         };
         for i in 0..50 {
             let poly = Geometry::Polygon(square(i as f64 * 731.0, i as f64 * 197.0, 500.0));
-            let a = simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &opts);
-            let b = simplify_for_level(&poly, 5000.0, Crs::Epsg3857, &opts);
+            let a = simplify_for_level(
+                &poly,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            );
+            let b = simplify_for_level(
+                &poly,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            );
             assert_eq!(a, b);
         }
     }
@@ -2211,9 +2563,13 @@ mod tests {
             let (cx, cy) = (i as f64 * 17_077.0, (i % 613) as f64 * 12_923.0);
             let poly = square(cx, cy, half);
             true_area += poly.unsigned_area();
-            if let Simplified::Keep(Geometry::Polygon(sq)) =
-                simplify_for_level(&Geometry::Polygon(poly), tol, Crs::Epsg3857, &opts)
-            {
+            if let Simplified::Keep(Geometry::Polygon(sq)) = simplify_for_level(
+                &Geometry::Polygon(poly),
+                tol,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default(),
+            ) {
                 emitted_area += sq.unsigned_area();
             }
         }
@@ -2234,8 +2590,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            simplify_for_level(&big, 1000.0, Crs::Epsg3857, &square_opts),
-            simplify_for_level(&big, 1000.0, Crs::Epsg3857, &drop_opts)
+            simplify_for_level(
+                &big,
+                1000.0,
+                Crs::Epsg3857,
+                &square_opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
+            simplify_for_level(
+                &big,
+                1000.0,
+                Crs::Epsg3857,
+                &drop_opts,
+                &crate::diagnostics::Diagnostics::default()
+            )
         );
     }
 
@@ -2254,7 +2622,13 @@ mod tests {
             .map(|i| square(i as f64 * 40_000.0, i as f64 * 23_000.0, 2000.0))
             .collect();
         let mp = Geometry::MultiPolygon(MultiPolygon::new(parts));
-        match simplify_for_level(&mp, tol, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &mp,
+            tol,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::MultiPolygon(out)) => {
                 assert!(out.0.len() > 1, "several parts should dither through");
                 assert!(out.0.len() < 40, "some parts should dither out");
@@ -2275,16 +2649,35 @@ mod tests {
         let opts = SimplifyOptions::default();
         let poly = Geometry::Polygon(square(731.0, -1911.0, 800.0));
         // Direct step vs single-step cascade must agree.
-        let direct = simplify_step(&poly, 5000.0, Crs::Epsg3857, &opts, Representation::Square);
+        let direct = simplify_step(
+            &poly,
+            5000.0,
+            Crs::Epsg3857,
+            &opts,
+            Representation::Square,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         let steps = [CascadeStep::square(5000.0)];
         assert_eq!(
             direct,
-            simplify_cascade(&poly, &steps, Crs::Epsg3857, &opts)
+            simplify_cascade(
+                &poly,
+                &steps,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            )
         );
         // Monotone: if dropped at the fine square step, a longer chain
         // through a coarser square step is dropped too.
         let chain = [CascadeStep::square(5000.0), CascadeStep::square(10_000.0)];
-        let coarser = simplify_cascade(&poly, &chain, Crs::Epsg3857, &opts);
+        let coarser = simplify_cascade(
+            &poly,
+            &chain,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        );
         if matches!(direct, Simplified::Dropped) {
             assert_eq!(coarser, Simplified::Dropped, "drops are monotone");
         }
@@ -2299,7 +2692,13 @@ mod tests {
         let big = square(0.0, 0.0, 5000.0);
         let tiny = square(20000.0, 20000.0, 10.0);
         let mp = Geometry::MultiPolygon(MultiPolygon::new(vec![big, tiny]));
-        match simplify_for_level(&mp, 1000.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &mp,
+            1000.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::MultiPolygon(m)) => {
                 assert_eq!(m.0.len(), 1, "tiny part should be dropped");
                 assert!(m.0[0].is_valid());
@@ -2316,7 +2715,13 @@ mod tests {
             square(100.0, 100.0, 8.0),
         ]));
         assert_eq!(
-            simplify_for_level(&mp, 5000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &mp,
+                5000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -2327,7 +2732,13 @@ mod tests {
         let long = LineString::new(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 10000.0, y: 0.0 }]);
         let short = LineString::new(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 5.0, y: 0.0 }]);
         let mls = Geometry::MultiLineString(MultiLineString::new(vec![long, short]));
-        match simplify_for_level(&mls, 1000.0, Crs::Epsg3857, &opts) {
+        match simplify_for_level(
+            &mls,
+            1000.0,
+            Crs::Epsg3857,
+            &opts,
+            &crate::diagnostics::Diagnostics::default(),
+        ) {
             Simplified::Keep(Geometry::MultiLineString(m)) => {
                 assert_eq!(m.0.len(), 1, "short part should be dropped");
             }
@@ -2343,7 +2754,13 @@ mod tests {
             LineString::new(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 3.0, y: 0.0 }]),
         ]));
         assert_eq!(
-            simplify_for_level(&mls, 1000.0, Crs::Epsg3857, &opts),
+            simplify_for_level(
+                &mls,
+                1000.0,
+                Crs::Epsg3857,
+                &opts,
+                &crate::diagnostics::Diagnostics::default()
+            ),
             Simplified::Dropped
         );
     }
@@ -2477,6 +2894,8 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Geometry,
+            &crate::diagnostics::Diagnostics::default(),
+            &poly,
         );
         assert!(unchanged, "minimal ring should report no removal");
         match out {
@@ -2498,6 +2917,8 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Geometry,
+            &crate::diagnostics::Diagnostics::default(),
+            &line,
         );
         assert!(!unchanged, "coarse GSD should remove vertices");
         assert!(line_len(&out) < 200);
@@ -2516,6 +2937,8 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Geometry,
+            &crate::diagnostics::Diagnostics::default(),
+            &line,
         );
         assert!(unchanged);
         assert_eq!(line_len(&out), 200);
@@ -2537,6 +2960,8 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Point,
+            &crate::diagnostics::Diagnostics::default(),
+            &poly,
         );
         assert!(
             !first_unchanged,
@@ -2552,6 +2977,8 @@ mod tests {
             Crs::Epsg3857,
             &opts,
             Representation::Point,
+            &crate::diagnostics::Diagnostics::default(),
+            &point_geom,
         );
         assert!(
             second_unchanged,
@@ -2760,7 +3187,7 @@ mod rdp_tests {
     /// (that is the bug); run it deliberately:
     /// `cargo test --lib geo_rdp_overflows -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "#575: upstream recursive RDP aborts on stack overflow; manual negative control"]
     fn geo_rdp_overflows_the_same_small_stack() {
         let amp = 0.0002_f64;
         let ls = zigzag(SMALL_STACK_ZIGZAG, amp, 0.0004);
@@ -2772,7 +3199,7 @@ mod rdp_tests {
     }
 
     #[test]
-    #[ignore] // measurement, not an assertion (#575)
+    #[ignore = "#575: manual timing and scaling measurement"] // measurement, not an assertion (#575)
     fn probe_rdp_scaling() {
         // `geo`'s recursive side needs one frame per retained vertex, so at
         // n = 12,000 it overflows the default 2 MiB test thread (release
@@ -3020,8 +3447,20 @@ mod rdp_tests {
         let handle = std::thread::Builder::new()
             .stack_size(SMALL_STACK_BYTES)
             .spawn(move || {
-                let l = simplify_for_level(&line, gsd, Crs::Epsg3857, &opts);
-                let p = simplify_for_level(&poly, gsd, Crs::Epsg3857, &opts);
+                let l = simplify_for_level(
+                    &line,
+                    gsd,
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+                let p = simplify_for_level(
+                    &poly,
+                    gsd,
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
                 (l, p)
             })
             .expect("spawn");
@@ -3042,5 +3481,86 @@ mod rdp_tests {
             ),
             other => panic!("ring should survive as a Polygon, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod source_area_regression {
+    use super::*;
+
+    #[test]
+    fn cascade_square_dither_uses_source_area() {
+        let opts = SimplifyOptions {
+            collapse: CollapseMode::Square,
+            ..Default::default()
+        };
+        let fine = CascadeStep::for_level(2.0, None, Representation::Square, true);
+        let coarse = CascadeStep::for_level(8.0, None, Representation::Square, true);
+        let mut checked = 0;
+        for i in 0..2000 {
+            let anchor = Point::new(i as f64 * 10.0, 0.0);
+            let geom = Geometry::Polygon(placeholder_square(anchor, 1.0));
+            if matches!(
+                simplify_cascade(
+                    &geom,
+                    &[fine],
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default()
+                ),
+                Simplified::Keep(_)
+            ) {
+                checked += 1;
+                let cascaded = simplify_cascade(
+                    &geom,
+                    &[fine, coarse],
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+                let direct = simplify_cascade(
+                    &geom,
+                    &[coarse],
+                    Crs::Epsg3857,
+                    &opts,
+                    &crate::diagnostics::Diagnostics::default(),
+                );
+                assert_eq!(
+                    cascaded, direct,
+                    "cascade must dither on the original area, anchor {anchor:?}"
+                );
+            }
+        }
+        assert!(checked > 20);
+    }
+
+    #[test]
+    fn unreduced_cascade_retains_working_geometry_dither() {
+        let opts = SimplifyOptions::default();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let fine = CascadeStep::for_level(2.0, None, Representation::Geometry, false);
+        let coarse = CascadeStep::for_level(8.0, None, Representation::Geometry, false);
+        let mut checked = 0;
+        let mut differs_from_source = 0;
+        for i in 0..2000 {
+            let geom = Geometry::Polygon(placeholder_square(Point::new(i as f64 * 10.0, 0.0), 1.0));
+            let Simplified::Keep(working) =
+                simplify_cascade(&geom, &[fine], Crs::Epsg3857, &opts, &diagnostics)
+            else {
+                continue;
+            };
+            checked += 1;
+            let cascaded =
+                simplify_cascade(&geom, &[fine, coarse], Crs::Epsg3857, &opts, &diagnostics);
+            let expected = simplify_for_level(&working, 8.0, Crs::Epsg3857, &opts, &diagnostics);
+            assert_eq!(cascaded, expected);
+            let source = simplify_for_level(&geom, 8.0, Crs::Epsg3857, &opts, &diagnostics);
+            differs_from_source += usize::from(cascaded != source);
+        }
+        assert!(checked > 20);
+        assert!(
+            differs_from_source > 0,
+            "the two retention policies conflict"
+        );
     }
 }

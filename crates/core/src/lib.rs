@@ -1,4 +1,16 @@
 #![recursion_limit = "256"]
+// #779: clippy.toml's disallowed-methods name the single owner of parquet
+// and IPC reads and of output-file creation. `#[cfg(test)]` code reads and
+// writes its own trusted fixtures, so the lint is off in the test build
+// only; production code is still linted by the non-test build that
+// `cargo clippy --all-targets` also checks.
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "#779: tests construct trusted fixtures; production is checked by the non-test build"
+    )
+)] // #779: test build only
 //! Core library for GeoParquet multi-resolution overviews and PMTiles export.
 //!
 //! The product pipeline lives in [`overview`]: convert a (gpio-sorted)
@@ -46,6 +58,7 @@ pub mod compression;
 pub mod covering;
 pub mod decode;
 pub mod dedup;
+pub mod diagnostics;
 pub mod fs_probe;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -60,6 +73,7 @@ mod pmtiles_metadata;
 pub mod pmtiles_writer;
 pub mod pyramid;
 pub mod quality;
+pub mod resolved_schema;
 pub mod shard;
 pub mod stats;
 pub mod sutherland_hodgman;
@@ -79,6 +93,9 @@ pub use quality::{extract_crs, validate_wgs84, CrsInfo};
 /// Errors that can occur while reading GeoParquet or writing PMTiles.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Source loss accounting failed.
+    #[error(transparent)]
+    Accounting(#[from] crate::diagnostics::AccountingError),
     #[error("Failed to read GeoParquet file: {0}")]
     GeoParquetRead(String),
 
@@ -103,6 +120,49 @@ pub enum Error {
     /// The output cannot be written (#452: checked before any work).
     #[error(transparent)]
     Output(#[from] atomic_output::OutputNotWritable),
+
+    /// An option refused before any work
+    /// ([`pyramid::PyramidOptions::validate`], #779).
+    #[error(transparent)]
+    Config(#[from] overview::config::ConfigError),
+}
+
+impl Error {
+    /// Whether this is an option the caller must fix, refused before any
+    /// work (#779), as `ConvertError::is_config` and its siblings classify
+    /// theirs.
+    pub fn is_config(&self) -> bool {
+        matches!(self, Error::Config(_) | Error::InvalidConfig(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_configuration_errors_are_classified_as_config() {
+        assert!(
+            Error::Config(overview::config::ConfigError::InvalidExtent { extent: 0 }).is_config()
+        );
+        assert!(Error::InvalidConfig("invalid band options".into()).is_config());
+        for error in [
+            Error::GeoParquetRead("invalid footer".into()),
+            Error::PMTilesRead("invalid header".into()),
+            Error::PMTilesWrite("disk full".into()),
+            Error::InvalidGeometry {
+                feature_id: 7,
+                reason: "invalid ring".into(),
+            },
+            Error::MvtEncoding("invalid property".into()),
+            Error::Io(std::io::Error::other("disk full")),
+            Error::Accounting(diagnostics::AccountingError::Io(std::io::Error::other(
+                "spill failed",
+            ))),
+        ] {
+            assert!(!error.is_config(), "runtime error misclassified: {error}");
+        }
+    }
+}

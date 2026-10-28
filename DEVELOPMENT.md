@@ -115,6 +115,18 @@ Plain `cargo test` ignores `nextest.toml`. It runs every test in the
 target you name, slow ones included, with no timeout. Use it for
 targeted runs, and use `cargo nextest run` for the tiers.
 
+Plain `cargo test` also runs a binary's tests as threads of one process,
+and nextest runs each test in its own process. That matters for one
+`tylertoo-core` unit-test hook: `untrusted::scale_byte_array_limit`
+lowers the byte-array ceiling to a few KiB for the whole process while
+its guard lives, which is up to about 15 seconds. A parquet read that
+another test starts in that window gets the same low ceiling, and can
+fail with "index overflow decoding byte array". If a plain `cargo test`
+run of the core library fails that way, rerun the test alone, or run the
+library under `cargo nextest run`. Integration tests that set
+`TYLERTOO_BYTE_ARRAY_LIMIT_BYTES` set it per child process, so they don't
+have this problem.
+
 CI mirrors the tiers. The Test job runs `quick`, and the Slow Tests job
 runs the set that `quick` excludes, in three shards split by test binary:
 `heavy`, `determinism`, and `rest`. A pull request runs Test on Ubuntu
@@ -401,7 +413,8 @@ the script's inline metadata.
 ## CI gates — and how to run them locally
 
 Branch protection requires every gate below on every PR, and each one
-runs locally.
+runs locally. [`ci/README.md`](ci/README.md) lists every gate in one
+table: what each asserts, its scope, and the command that reproduces it.
 
 ### Rust
 
@@ -422,11 +435,11 @@ cargo fmt --all --check
 cargo install cargo-shear   # once
 cargo shear
 
-# Duplicated code (hard gate: zero pairs at >=0.95)
-cargo install similarity-rs   # once
-similarity-rs --threshold 0.95 --min-lines 10 \
-  --skip-test crates/core/src crates/cli/src \
-  crates/python/src
+# Rust function similarity and Rust/Python token clones
+cargo install similarity-rs --version 0.5.0 --locked
+similarity-rs --threshold 0.95 --min-lines 10 --skip-test \
+  --fail-on-duplicates crates/core/src crates/cli/src crates/python/src
+npx --yes jscpd@4.0.5 --config .jscpd.json
 
 # Public API surface against the baseline in
 # crates/core/api/tylertoo-core.txt. The Public API
@@ -466,33 +479,28 @@ python3 benchmarks/overview/ci_guard.py --check
 cargo test --release -p tylertoo-core \
   --test convert_guard_golden
 
-# Coverage: CI fails below the floor in the Coverage job's
-# "Coverage floor" step, then uploads to Codecov (report only)
+# Coverage: Codecov native project targets in codecov.yml
 cargo install cargo-llvm-cov    # once
 rustup component add llvm-tools-preview
 cargo llvm-cov nextest --all-features --workspace \
   --exclude tylertoo-python \
   --lcov --output-path lcov.info
-python3 scripts/coverage_gate.py --check lcov.info --min 94
 ```
 
 The breaking-change check (`cargo semver-checks`) stays off until the
 `tylertoo-core` API freeze. The Public API check still surfaces each API
 change in review.
 
-Some thresholds are **ratchets**, set at the current code's level and
-marked `RATCHET` in the source. They are cognitive complexity 30 and
-too-many-lines 200 in `clippy.toml`, the similarity-rs threshold 0.95,
-and xenon's max-absolute C. Lower them as the code improves, and never
-raise them. The line-coverage floor in `ci.yml` (94%) is a ratchet in
-the other direction: raise it as coverage grows, and never lower it.
+Clippy thresholds live in `clippy.toml`; token-clone limits live in
+`.jscpd.json`. Codecov project targets are 94% for the workspace and core,
+and 81.9% for the CLI. Python vulture scans package code and tests at 60%
+confidence; its configuration is in `crates/python/pyproject.toml`.
 
 `cargo shear` also inspects `[workspace.dependencies]`. To keep a
 dependency that no code references, such as a transitive version pin,
 list it under `[package.metadata.cargo-shear]` in the crate that owns it.
 
-similarity-rs has no baseline file and no per-pair suppression, so you
-must refactor away any new finding at or above 0.95. When the API gate
+When the API gate
 fires on an intended change, regenerate the baseline in the same PR, as
 `crates/core/api/README.md` describes.
 
@@ -509,6 +517,21 @@ The command rewrites `tests/fixtures/guard/br-clip-divergence.golden.txt`
 and then fails, so a regeneration never passes for a green run. A golden
 diff on a **dependency bump** is not a cue to regenerate. See
 [Dependency updates](#dependency-updates).
+
+### Structure and duplication
+
+Clippy uses `clippy.toml` to reject calls that bypass the reader and
+output owners. Cargo-deny checks licenses, advisories, sources and duplicate
+dependency versions against `deny.toml`.
+
+Jscpd scans Rust and Python for token clones, including copies across files.
+Similarity-rs scans every production Rust source directory and fails on
+functions above its configured similarity threshold. Version 0.5.0 compares
+functions within files; jscpd supplies cross-file token-clone detection.
+
+The blocking mutation check runs cargo-mutants directly with `--in-diff`
+for core and CLI. A missed mutant or a failed baseline fails the check.
+Run it locally with `scripts/mutants-diff.sh origin/main`.
 
 ### Python (`crates/python`)
 
@@ -627,9 +650,8 @@ uv run benchmarks/e2e/compare_tippecanoe.py \
   --json /tmp/cmp/parity.json
 ```
 
-The bands are a ratchet, like the convert guard baseline. When a change
-moves a ratio on purpose, edit the band in the same PR and record the new
-measured value in its comment.
+The comparison reads its per-zoom ratio bands from
+`benchmarks/e2e/tippecanoe_tolerances.toml`.
 
 The Test and Coverage jobs build the same pinned tippecanoe, so that
 `decode_golden_against_tippecanoe_decode` in `decode_roundtrip.rs` runs.
@@ -755,7 +777,13 @@ around it rather than for the whole file:
 
 ```bash
 # CI config lint (action refs must stay SHA-pinned)
-uvx zizmor --min-severity low .github/workflows
+uvx zizmor==1.26.1 --min-severity low .github/workflows .github/actions
+# Workflow syntax and expressions (not a CI gate)
+uvx --from actionlint-py actionlint
+
+# The gate helpers in scripts/ci/ (CI: the Gate scripts job)
+uv run --no-project --with pytest==8.3.4 --with pyyaml==6.0.2 \
+  pytest scripts/ci/tests
 ```
 
 ### Version consistency
@@ -774,33 +802,60 @@ The Version Consistency job checks all five. Move versions only with
 
 ## Scheduled and advisory jobs
 
-These jobs never block a merge.
+These jobs don't block a merge, with one exception: the Mutation gate
+blocks every code PR.
 
 ### Mutation testing
 
-Every PR gets a diff-scoped run (`.github/workflows/mutation-diff.yml`,
-check "Mutation score (diff-scoped)"). It runs
-`cargo mutants --package tylertoo-core --in-diff` on the PR's diff
-against `origin/main`, so it tests only the mutants inside changed core
-lines. The mutants are split across up to four runners, about twelve
-each, so a diff of up to ~50 mutants finishes in about 15 minutes. One
-runner used to take 40 minutes for 65 mutants and time out past ~130.
-A bigger diff gets a random sample instead: each runner takes its share
-from across the whole diff in shuffled order and stops after 20 minutes,
-and the summary says how many of the planned mutants ran.
+The CI plan calls `.github/workflows/mutation-diff.yml` for code PRs.
+Its "Mutants (workspace diff, shard N)" jobs run
+`scripts/mutants-diff.sh HEAD^1`: the diff is against the first parent
+of the checked-out PR merge commit. The script selects the whole
+workspace, including the I/O owner and Python bindings, with all features
+and locked dependencies. It uses `.cargo/mutants-cli.toml`, whose build
+arguments have no package-specific test targets, and passes `--workspace`
+to Cargo so the baseline and each mutant build and run every consumer's
+Rust tests.
+Only mutation sites on changed lines are selected by `--in-diff`.
+CI adds `--cap-lints true` so a mutation that leaves an unused variable
+reaches the tests instead of failing on the repository's strict lints.
+The ordinary clippy gate still denies warnings.
 
-The score and the missed mutants (`file:line`) go to the job summary. A
-same-repo PR with missed mutants also gets one sticky comment, updated
-on every push. Missed mutants from a sampled run are posted too. A PR that touches no Rust under `crates/core/` skips the
-run, and a diff with no mutation site reports "no mutants in this diff".
+The plan job lists that set with `scripts/mutants-diff.sh HEAD^1 --list --json`
+and the gate's flags, without compiling. It cuts a nonempty set into
+`N = ceil(mutants / 40)` round-robin slices (`--sharding round-robin
+--shard k/N`, zero-based) and runs at most four of them, two workers
+each: the organization runs 20 jobs at once across every PR, and a core
+PR's CI already holds about 13. Up to 160 mutants, that is the whole
+diff. Past 160, slices 0–3 run: a fixed sample spread across the whole
+diff by the round-robin split, identical on every run, which the plan
+job's summary reports as "running slices [0,1,2,3] of N". The weekly
+`mutation-tests.yml` sweep covers the rest. `cargo-mutants` is pinned to
+27.1.0 in both planning and testing so every shard enumerates the same
+set. Each job has a 90-minute limit, including setup and the baseline.
+Fail-fast is disabled so one failed shard does not cancel the others.
 
-`scripts/mutants-diff.sh` is the local twin. It also covers uncommitted
-changes and new `.rs` files, and it exits 1 on a missed mutant, so you
-can use it as a gate:
+The direct cargo-mutants exit status gates every code PR through
+"CI passed", regardless of title. Missed mutants, timeouts, baseline
+failures and cancelled jobs cannot produce a passing gate. The script and
+workflow do not interpret issue-linked equivalent-mutant comments. Each shard uploads its
+`mutants.out/` directory as `mutation-diff-N`, even after failure when
+results are available. The workflow adds no score summary or PR comment.
+An empty mutation selection starts no shard runners. The final "Mutation gate"
+job reports "No mutants in this diff" and succeeds only after successful
+planning; failed or cancelled planning or mutation jobs fail the gate.
+
+`scripts/mutants-diff.sh` also runs locally. It defaults to `origin/main`
+and uses `git diff --no-ext-diff --no-renames BASE`, including tracked
+uncommitted changes. The diff omits untracked files; stage
+them or use `git add -N` first. Extra arguments go directly to
+cargo-mutants, whose exit status is preserved (2 for missed mutants,
+3 for timeouts):
 
 ```bash
 scripts/mutants-diff.sh              # vs origin/main
-scripts/mutants-diff.sh main -- -j 2 # base, extra args
+scripts/mutants-diff.sh main -j 2    # base, extra cargo-mutants args
+scripts/mutants-diff.sh main --cap-lints true --sharding round-robin --shard 0/64 -j 2
 ```
 
 The weekly job (`.github/workflows/mutation-tests.yml`, Sundays) runs
@@ -810,8 +865,9 @@ inherits `quick`'s filter, so marking a test slow also drops it from
 every mutant's test run. Missed mutants and timeouts show up as the
 score in the job summary, not as a red run. If a failed baseline or a
 timed-out shard leaves part of the run unmeasured, the job opens or
-updates a pinned `mutation-tests` issue. To test a workflow fix
-without a full sweep, dispatch a subset of shards:
+updates a pinned `mutation-tests` issue. Close that issue only after a
+full green scheduled run, never after a subset (#677). To test a
+workflow fix without a full sweep, dispatch a subset of shards:
 
 ```bash
 gh workflow run mutation-tests.yml -f shard_list=0,1
@@ -829,7 +885,7 @@ To reproduce locally, with the submodule and fixtures in place:
 cargo install cargo-mutants cargo-nextest --locked
 # What would mutate
 cargo mutants --package tylertoo-core --list
-# One file, in minutes
+# Narrow mutations to one file
 cargo mutants --package tylertoo-core \
   -f crates/core/src/overview/simplify.rs
 # One function's mutants
@@ -837,7 +893,7 @@ cargo mutants --package tylertoo-core -F 'fn_name'
 # Only code this branch touched
 cargo mutants --package tylertoo-core \
   --in-diff <(git diff main...HEAD)
-# The full sweep, about one CPU-day
+# The full core sweep
 cargo mutants --package tylertoo-core
 ```
 
@@ -848,7 +904,7 @@ dependencies at `opt-level = 3`. For a short local run, add
 `target/`, and restores each file at the end, so leave the tree alone
 while it runs.
 
-cargo-mutants can't narrow the tests to the mutated file. Narrowing them
+cargo-mutants does not automatically select tests by mutated file. Narrowing them
 by hand loses catches. In a 30-mutant sample, 11 of 28 catches came from
 a test in *another* module or an integration binary. Run the whole
 `mutants` set, and narrow the *mutants* with `-f`, `-F`, or `--in-diff`
@@ -868,7 +924,10 @@ third-party bytes:
 - the `--filter` grammar
 
 A crash uploads the reproducer as the `fuzz-artifacts-<target>` artifact
-and opens or updates a pinned `fuzz` issue. `fuzz/README.md` lists the
+and opens or updates a pinned `fuzz` issue. Targets held out of the
+nightly are listed, with their issues, in `FUZZ_HOLDOUTS` in
+`fuzz.yml`.
+`fuzz/README.md` lists the
 targets and shows how to run one and how to turn a crash into a
 regression test. The fuzz crate is its own workspace and stays out of
 the per-PR build.

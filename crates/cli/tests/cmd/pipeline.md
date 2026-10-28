@@ -11,7 +11,7 @@ $ tylertoo overture-names.parquet names.pmtiles --max-zoom 6 --keep-overview nam
   intermediate overview: names-ov.parquet ([..], retained)
 ✓ Converted overture-names.parquet → names.pmtiles
   8 tiles across z0..z6 in [..]s
-  1 property column not exported (no MVT encoding for the type): "raw" (Binary)
+  property "raw" (Binary) skipped: no MVT encoding
 
 ```
 
@@ -66,7 +66,7 @@ Exporting ov.parquet → out.pmtiles
   z6  (level 6):       1 tiles,        20 features
 
 ✓ 8 tiles, 44 features, 0 oversized tiles in [..]s
-  1 property column not exported (no MVT encoding for the type): "raw" (Binary)
+  property "raw" (Binary) skipped: no MVT encoding
 
 ```
 

@@ -23,6 +23,10 @@
 //! `write_input`/`write_input_with_f64` come from `overview::testutil`,
 //! included by `#[path]` below (that module is `pub(crate)`, so it cannot be
 //! imported through the crate's public API).
+#![expect(
+    clippy::disallowed_methods,
+    reason = "#779: trusted fixture construction"
+)] // #779: test code; reads and writes its own trusted fixtures
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,9 +34,9 @@ use std::sync::Arc;
 use arrow_array::{BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use geo::{Geometry, GeometryCollection, LineString, Point, Polygon};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::KeyValue;
+use tylertoo_io::open_parquet;
+use tylertoo_io::test_support::ArrowWriter;
+use tylertoo_io::KeyValue;
 
 use tylertoo_core::overview::check::validate_file;
 use tylertoo_core::overview::convert::{
@@ -48,7 +52,10 @@ use tylertoo_core::overview::simplify::{CollapseMode, SimplifyOptions};
 // to this integration-test crate), but it depends only on std and external
 // crates, so `#[path]` can include the same source here and the two can't
 // drift. Not every helper in it is used by this binary.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "#779: this test binary uses a subset of the shared fixture writers"
+)]
 #[path = "../src/overview/testutil.rs"]
 mod testutil;
 
@@ -102,7 +109,12 @@ fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> 
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(
             geoms.len(),
             batch.num_rows(),
@@ -121,7 +133,7 @@ fn read_level_ids_geoms(path: &Path, level: usize) -> Vec<(i64, Geometry<f64>)> 
 /// footers).
 fn rewrite_with_tampered_footer(src: &Path, dst: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let file = std::fs::File::open(src).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let schema = builder.schema().clone();
     let kvs = builder
         .metadata()
@@ -246,6 +258,92 @@ fn partial_null_geometry_rows_skipped_with_aligned_attributes() {
 // ============================================================================
 // Class 2: invalid / degenerate source geometries
 // ============================================================================
+
+/// #707, end to end: an overview file with one `+inf` vertex in a polygon
+/// exports without a panic, and the left-out feature is counted rather than
+/// vanishing from every tile in silence.
+#[test]
+fn export_counts_a_non_finite_overview_vertex() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid = dir.path().join("valid.parquet");
+    make_valid_overview(&valid);
+
+    // Rewrite the overview row group by row group (the level bands must
+    // keep their row groups), with row 0's geometry replaced by a square
+    // carrying one infinite vertex.
+    let mut hostile_wkb = vec![1u8, 3, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0];
+    for (x, y) in [
+        (0.0f64, 0.0f64),
+        (1.0, 0.0),
+        (f64::INFINITY, 1.0),
+        (0.0, 1.0),
+        (0.0, 0.0),
+    ] {
+        hostile_wkb.extend_from_slice(&x.to_le_bytes());
+        hostile_wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    let hostile = dir.path().join("hostile.parquet");
+    let open = || open_parquet(std::fs::File::open(&valid).unwrap());
+    let probe = open().unwrap();
+    let schema = probe.schema().clone();
+    let kvs = probe
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .clone();
+    let geom_idx = schema.index_of("geometry").unwrap();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&hostile).unwrap(),
+        schema.clone(),
+        None,
+    )
+    .unwrap();
+    let mut first = true;
+    for rg in 0..probe.metadata().num_row_groups() {
+        for batch in open().unwrap().with_row_groups(vec![rg]).build().unwrap() {
+            let mut batch = batch.unwrap();
+            if std::mem::take(&mut first) {
+                let geoms = batch
+                    .column(geom_idx)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                let values: Vec<Option<&[u8]>> = (0..batch.num_rows())
+                    .map(|i| {
+                        Some(if i == 0 {
+                            &hostile_wkb[..]
+                        } else {
+                            geoms.value(i)
+                        })
+                    })
+                    .collect();
+                let mut columns = batch.columns().to_vec();
+                columns[geom_idx] = Arc::new(BinaryArray::from(values));
+                batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            }
+            writer.write(&batch).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    for kv in kvs {
+        if kv.key != "ARROW:schema" {
+            writer.append_key_value_metadata(kv);
+        }
+    }
+    writer.close().unwrap();
+
+    let report = export_pmtiles(
+        &hostile,
+        dir.path().join("out.pmtiles"),
+        &ExportOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        report.diagnostics.iter().any(|d| matches!(d, tylertoo_core::diagnostics::Diagnostic::NonFiniteGeometry { count } if *count > 0)),
+        "the non-finite feature is counted"
+    );
+}
 
 #[test]
 fn nonfinite_coordinate_rows_skipped() {
@@ -728,7 +826,7 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
     use tylertoo_core::batch_processor::extract_geometries_from_array;
 
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     let mut out = Vec::new();
     for batch in builder.build().unwrap() {
         let batch = batch.unwrap();
@@ -744,7 +842,12 @@ fn read_decoded_rows(path: &Path) -> Vec<(u8, Option<i64>, Geometry<f64>)> {
         let gidx = schema.index_of("geometry").unwrap();
         let garr = from_arrow_array(batch.column(gidx).as_ref(), schema.field(gidx)).unwrap();
         let mut geoms = Vec::new();
-        extract_geometries_from_array(garr.as_ref(), &mut geoms).unwrap();
+        extract_geometries_from_array(
+            garr.as_ref(),
+            &mut geoms,
+            &tylertoo_core::diagnostics::Diagnostics::default(),
+        )
+        .unwrap();
         assert_eq!(geoms.len(), batch.num_rows(), "decoded rows have geometry");
         for (i, g) in geoms.into_iter().enumerate() {
             let id = (!ids.is_null(i)).then(|| ids.value(i));
@@ -1066,7 +1169,7 @@ fn coalesce_nan_knobs_rejected() {
 /// Field names of an overview output file, in schema order.
 fn output_column_names(path: &Path) -> Vec<String> {
     let file = std::fs::File::open(path).unwrap();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let builder = open_parquet(file).unwrap();
     builder
         .schema()
         .fields()
@@ -2082,9 +2185,7 @@ fn empty_coarse_levels_omitted_with_clustering() {
 fn export_names_an_overview_file_without_geometry() {
     let tovr = tempfile::NamedTempFile::new().unwrap();
     make_valid_overview(tovr.path());
-    let open = || {
-        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(tovr.path()).unwrap()).unwrap()
-    };
+    let open = || open_parquet(std::fs::File::open(tovr.path()).unwrap()).unwrap();
     let source = open();
     let kvs = source
         .metadata()
@@ -2117,10 +2218,7 @@ fn export_names_an_overview_file_without_geometry() {
 
     let tout = tempfile::NamedTempFile::new().unwrap();
     let err = export_pmtiles(tbad.path(), tout.path(), &ExportOptions::default()).unwrap_err();
-    assert!(
-        matches!(err, ExportError::NoGeometryColumn { .. }),
-        "got: {err:?}"
-    );
+    assert!(matches!(err, ExportError::Reader(_)), "got: {err:?}");
     let msg = err.to_string();
     assert!(msg.contains(&tbad.path().display().to_string()), "{msg}");
 }

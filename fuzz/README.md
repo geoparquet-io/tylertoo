@@ -19,7 +19,7 @@ tylertoo reads outside data and the target that covers it.
 | `footer_json` | `overview::level::OverviewsMeta::from_json` — the `overviews` footer JSON read verbatim from any input file — then `validate` against a row-group count taken from the first input byte | a row-group count byte and the footer JSON of two overview files |
 | `wkb` | `wkb::wkb_to_geometry` — the WKB coalesce lines stored in a saved `--plan` file. GeoParquet geometry columns are decoded by geoarrow and the `wkb` crate instead, which this target does not reach | one of each of the seven OGC types, a ZM point, and #623's oversized-count crash |
 | `geo_metadata` | `overview::convert::fuzz_geo_metadata` — the GeoParquet `geo` JSON through CRS detection (`detect_crs_from_kv` → `quality::crs_info_from_kv_metadata`, `classify_crs_info`, `classify_crs_identifier`/`_projjson`), `covering::parse_covering_metadata` and `convert::find_geometry_column` | the `geo` JSON of eight real files, and the CRS shapes the unit tests pin (Pseudo-Mercator PROJJSON, a name-only PROJJSON, `ESRI:102100`, UTM, `crs: null` with a bbox) |
-| `plan_file` † | `overview::fuzz_convert_plan` → `ConvertPlan::load` + `into_winner_tables` — a saved `--plan` file. The input is the Arrow IPC payload; the hook writes a valid magic and checksum in front, so mutations reach the decoder instead of stopping at the checksum (#512) | two plans from `tiles --save-plan --plan-only`, the 16-byte header stripped |
+| `plan_file` † | `overview::fuzz_convert_plan` → `ConvertPlan::load` + `into_winner_tables` — a saved `--plan` file. The input is the v6 loss partition and Arrow IPC payload; the shared writer restores magic and checksum, so mutations reach the decoder instead of stopping at the checksum (#512) | two plans from `tiles --save-plan --plan-only`, the 16-byte header stripped |
 | `decode_archive` | `decode::fuzz_decode_archive` — `decode_pmtiles` on an in-memory archive short of writing GeoParquet: header, directory walk and budgets, capped tile decompression, MVT decode, the reserved-column check and the property type union | `open-buildings.pmtiles` and a 29 KB archive tiled from `overture-names.parquet` |
 | `archive_index` | `fuzz::fuzz_archive_index` → `ArchiveIndex::open`, metadata, every tile body, `stats::compute_stats` — an archive handed to `stats` or `merge`. Unlike `band_archive`, an archive that is not gzip MVT gets past the open | as `decode_archive` |
 | `layer_zooms` | `pyramid::fuzz_layer_zooms` — an input archive's `vector_layers` as `pyramid` (`parse_layers`) and `merge` (`layer_zoom_range`, `declared_zoom_range`, `vector_layers_json`) read it; two leading bytes are the header's zoom range. Panics if a range comes back out of order or past z31 | the header zooms and metadata of the three golden archives |
@@ -107,8 +107,14 @@ and from tylertoo's own output on them: `geo_metadata` is a file's `geo`
 key-value string; `parquet_footer` is the thrift footer (the `N` bytes before
 the trailing 4-byte length `N` and `PAR1`); `remote_footer` and
 `overview_file` are whole small files; `plan_file` is a
-`tiles --save-plan --plan-only` file without its first 16 bytes; `shard_plan`
-is `tylertoo shard-plan` output as written.
+v6 `tiles INPUT --save-plan FILE --plan-only` file without its first 16 bytes
+(magic and checksum). Keep the length-prefixed JSON Lines loss partition and
+the following Arrow IPC bytes: the hook restores only the header through the
+production writer. Regenerate `seed-grid.arrow` from
+`tests/fixtures/streaming/sharding-grid.parquet` and `seed-names.arrow` from
+`tests/fixtures/properties/overture-names.parquet`, using default flags.
+The crafted IPC seeds have an empty loss partition (eight zero bytes) before
+their IPC payloads. `shard_plan` is `tylertoo shard-plan` output as written.
 
 ## Running locally
 
