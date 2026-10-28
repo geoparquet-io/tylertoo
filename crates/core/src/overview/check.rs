@@ -665,7 +665,19 @@ pub(crate) fn check_cluster_sum_invariant(
                     ),
                 );
             } else {
-                report.fail("cluster_sum_invariant", problems.join("; "));
+                let mut message = problems.join("; ");
+                if footer_value(metadata, crate::resolved_schema::RESOLVED_SCHEMA_KEY).is_none()
+                    && footer_value(metadata, crate::resolved_schema::SOURCE_SUBSET_KEY).is_none()
+                {
+                    message.push_str(&format!(
+                        "; legacy clustered overview (overview format {}): tylertoo 0.8.x \
+                         and earlier did not record spatial-subset provenance, so a cropped \
+                         shard cannot be distinguished from invalid cluster counts. Recreate \
+                         this overview from the original GeoParquet with current tylertoo",
+                        meta.version
+                    ));
+                }
+                report.fail("cluster_sum_invariant", message);
             }
         }
     }
@@ -1297,6 +1309,15 @@ mod tests {
         level_ids: &[Vec<i64>],
         point_counts: Option<&[Vec<i64>]>,
     ) {
+        write_cluster_fixture_with_subset(path, level_ids, point_counts, false);
+    }
+
+    fn write_cluster_fixture_with_subset(
+        path: &std::path::Path,
+        level_ids: &[Vec<i64>],
+        point_counts: Option<&[Vec<i64>]>,
+        source_is_subset: bool,
+    ) {
         use crate::overview::level::{AccumulatedColumn, ClusteringProvenance, Generalization};
         use arrow_array::Int64Array as I64;
 
@@ -1317,6 +1338,7 @@ mod tests {
             })
             .collect();
         let mut opts = OverviewWriterOptions::new(Mode::Duplicating, specs);
+        opts.source_is_subset = source_is_subset;
         opts.generalization = Some(Generalization {
             engine: "tylertoo test".to_string(),
             gsd_base: None,
@@ -1363,6 +1385,100 @@ mod tests {
             );
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn legacy_clustered_shard_has_versioned_actionable_error() {
+        use crate::overview::{
+            export::{export_pmtiles, ExportOptions},
+            reader::OverviewReader,
+        };
+        use crate::resolved_schema::{RESOLVED_SCHEMA_KEY, SOURCE_SUBSET_KEY};
+        use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.parquet");
+        let legacy = dir.path().join("legacy.parquet");
+        // A boundary cluster carries an out-of-shard point at level 0;
+        // canonical cropping retains only one of its source points.
+        write_cluster_fixture_with_subset(
+            &current,
+            &[vec![0], vec![0]],
+            Some(&[vec![2], vec![1]]),
+            true,
+        );
+        assert!(validate_file(&current).unwrap().is_valid());
+        OverviewReader::open(&current).unwrap();
+        export_pmtiles(
+            &current,
+            dir.path().join("current.pmtiles"),
+            &ExportOptions::default(),
+        )
+        .unwrap();
+
+        let builder = tylertoo_io::open_parquet(File::open(&current).unwrap()).unwrap();
+        let mut metadata = builder.schema().metadata().clone();
+        metadata.remove(RESOLVED_SCHEMA_KEY);
+        metadata.remove(SOURCE_SUBSET_KEY);
+        let schema = Arc::new(Schema::new_with_metadata(
+            builder.schema().fields().clone(),
+            metadata,
+        ));
+        let kvs = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .filter(|kv| {
+                ![RESOLVED_SCHEMA_KEY, SOURCE_SUBSET_KEY, "ARROW:schema"].contains(&kv.key.as_str())
+            })
+            .cloned()
+            .collect();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(kvs))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&legacy).unwrap(), schema.clone(), Some(props))
+                .unwrap();
+        let groups = builder.metadata().num_row_groups();
+        for rg in 0..groups {
+            for batch in tylertoo_io::open_parquet(File::open(&current).unwrap())
+                .unwrap()
+                .with_row_groups(vec![rg])
+                .build()
+                .unwrap()
+            {
+                writer
+                    .write(
+                        &RecordBatch::try_new(schema.clone(), batch.unwrap().columns().to_vec())
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let report = validate_file(&legacy).unwrap();
+        let failure = report
+            .failures()
+            .find(|c| c.name == "cluster_sum_invariant")
+            .unwrap();
+        assert!(failure.message.contains("0.8.x"), "{}", failure.message);
+        assert!(failure.message.contains("Recreate"), "{}", failure.message);
+        let error = OverviewReader::open(&legacy).unwrap_err().to_string();
+        assert!(
+            error.contains("0.8.x") && error.contains("Recreate"),
+            "{error}"
+        );
+        let archive = dir.path().join("legacy.pmtiles");
+        let error = export_pmtiles(&legacy, &archive, &ExportOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("0.8.x") && error.contains("Recreate"),
+            "{error}"
+        );
+        assert!(!archive.exists());
     }
 
     #[test]
