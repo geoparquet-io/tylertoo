@@ -10,7 +10,7 @@
 
 use std::io::{self, Write};
 
-mod tile_gzip;
+pub(crate) mod tile_gzip;
 pub(crate) use tile_gzip::compress as compress_tile_gzip;
 
 /// Compression algorithm for PMTiles.

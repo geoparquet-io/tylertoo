@@ -64,7 +64,6 @@ pub(super) enum MemoryPhase {
     /// Export's tile collection (track E1).
     ExportCollect,
     /// Export's concurrent tile encodes (track E1).
-    #[expect(dead_code, reason = "#788: track E1 grants export encodes under it")]
     ExportEncode,
     /// Coverage fill (track F).
     #[expect(dead_code, reason = "#788: track F grants coverage fill under it")]
@@ -115,10 +114,6 @@ impl MemoryPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PriceBasis {
     /// Measured on data this run already holds (a built batch, a sample).
-    #[expect(
-        dead_code,
-        reason = "#788: measured prices arrive with C1's sink and C2 step 2"
-    )]
     Measured,
     /// Read from the parquet footers before any page is decoded.
     Footer,

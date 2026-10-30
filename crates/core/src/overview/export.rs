@@ -2264,6 +2264,22 @@ fn export_pmtiles_validated(
         1,
     );
     let store_ram = usize::try_from(store_grant.bytes()).unwrap_or(usize::MAX);
+    // #733: the tile-gzip cache's payload, granted once before any tile is
+    // encoded, in slices of one shard's share of the 8 MiB the Madagascar
+    // repeats were measured to need. A tighter budget gets fewer slices,
+    // down to one.
+    let gzip_grant = budget.fit(
+        MemoryPhase::ExportEncode,
+        Price::new(
+            crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES as u64,
+            PriceBasis::Measured,
+        ),
+        crate::compression::tile_gzip::PAYLOAD_SLICES,
+        1,
+    );
+    crate::compression::tile_gzip::configure_payload_cap(
+        usize::try_from(gzip_grant.bytes()).unwrap_or(usize::MAX),
+    );
     let mut store = if single_read {
         let backing = knobs.backing_override.unwrap_or_else(|| {
             auto_fill_backing(&scans, num_levels, budget.available(), mean_member_bytes)
@@ -2352,6 +2368,7 @@ fn export_pmtiles_validated(
     )?);
 
     budget.release(store_grant);
+    budget.release(gzip_grant);
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
     progress.enter_phase("finalize");
 
