@@ -588,7 +588,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -980,6 +980,19 @@ pub fn resolve_read_workers(requested: usize) -> usize {
 /// read through the same ordered reader, but their consumers' CPU demand
 /// differs, so the auto count is resolved per pass. An explicit value applies
 /// to both.
+///
+/// Pass 2 keeps the quarter rule. Pass 1's consumer (decode and key
+/// extraction) is light, so its read is the bottleneck. It takes HALF the
+/// cores, at least 2 when there are 2, clamped to `READ_WORKERS_MAX`. Swept
+/// with `taskset` (`.788/PROFILE-LOG.md`, z0-8, 2 runs each), pass 1 times:
+///
+/// | cores | readers | Moldova | NZ parcels |
+/// | --- | --- | --- | --- |
+/// | 2 | 1 → 2 | 0.66 → 0.63 s | 3.0 → 2.8 s |
+/// | 4 | 1 → 2 | 0.66 → 0.36 s | 2.3 → 1.5 s |
+/// | 8 | 2 → 4 | 0.36 → 0.23 s | 1.3-1.5 → 1.0-1.2 s |
+///
+/// Pass 2 was flat or faster at the same counts.
 pub(super) fn resolve_pass_read_workers(pass: ReadPass, requested: usize) -> usize {
     resolve_read_workers_with_cores(
         pass,
@@ -999,8 +1012,8 @@ pub(super) fn resolve_read_workers_with_cores(
         return requested;
     }
     match pass {
-        // #723: both passes still take pass 2's quarter rule.
-        ReadPass::Scan | ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Scan => (cores / 2).max(cores.min(2)).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
     }
 }
 
@@ -12253,7 +12266,6 @@ mod tests {
     /// took pass 1 from 0.72-0.75 s to 0.45-0.48 s while pass 2 stayed flat,
     /// yet auto gives both passes `4 / 4 = 1` reader.
     #[test]
-    #[ignore = "#723: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
     fn pass1_and_pass2_auto_reader_counts_resolve_independently() {
         use super::super::read::ReadPass;
         let auto = |pass, cores| resolve_read_workers_with_cores(pass, READ_WORKERS_AUTO, cores);

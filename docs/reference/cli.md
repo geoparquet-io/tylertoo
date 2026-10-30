@@ -413,7 +413,7 @@ These options apply to both `tylertoo tiles` and `tylertoo overview`.
 | `--read-batch-size <ROWS>` | Rows per Arrow read batch. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory>. Default: `8192`. |
 | `--profile <PROFILE>` | Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>. Default: `auto`. Possible values: `auto`, `speed`, `bounded`. |
 | `--in-flight-batches <N\|auto>` | Read batches in flight at once, or `auto` to size it to the cores. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |
-| `--read-workers <N\|auto>` | Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |
+| `--read-workers <N\|auto>` | Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>. Default: `auto`. |
 | `--spill-dir <PATH>` | Directory for spill files: staged remote input, and on `tiles` the intermediate overview. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>. |
 | `--save-plan <PATH>` | Save the convert plan to PATH and continue converting. Reuse it with `--plan`; sharded builds share one plan. |
 | `--plan <PATH>` | Reuse a convert plan, skipping the first pass and level assignment. Its fingerprint must match this run's version, flags, and inputs. |

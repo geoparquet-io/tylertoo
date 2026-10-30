@@ -70,8 +70,10 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
   Each pass logs its choice. Pass 2 processes up to half of them at the same
   time. More batches keep more cores busy and consume more memory. The passes
   do not overlap.
-- **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses a
-  quarter of the cores, at most 4. tylertoo honors an explicit value up to
+- **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses
+  half the cores in pass 1, whose per-batch work is light, and a quarter in
+  pass 2, whose readers share the cores with simplification, at most 4 in
+  each. tylertoo honors an explicit value up to
   twice the core count, as far as the profile's memory allows; `bounded`
   reads with at most 4. Remote inputs always use one reader, even when staged
   to disk: concurrent readers would evict each other's shared chunk cache.
