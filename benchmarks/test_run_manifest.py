@@ -274,3 +274,16 @@ def test_resume_with_other_binaries_is_refused(tmp_path, given):
     with pytest.raises(rm.ManifestError, match="new --name"):
         rm.check_resume(saved, given)
 
+
+def test_a_run_whose_gate_timed_out_stays_out_of_the_medians():
+    bins = [{"label": "a", "allocator": "glibc"}]
+
+    def run(wall: float, gate: str) -> dict:
+        return {"binary": "a", "status": "ok", "wall_s": wall, "cpu_s": 1.0, "peak_rss_kib": 1024,
+                "foreign_cores": 0.0, "gate": {"gate": gate}, "profile": {},
+                "output": {"sha256": "aa", "bytes": 5}}
+
+    summ = rm.summarize([run(1.0, "quiet"), run(3.0, "quiet"), run(50.0, "TIMED_OUT")], bins)
+    assert summ["a"]["wall_s"]["n"] == 2  # noqa: PLR2004
+    assert summ["a"]["wall_s"]["median"] == 2.0  # noqa: PLR2004
+    assert summ["a"]["statuses"] == ["GATE_TIMED_OUT", "ok"]
