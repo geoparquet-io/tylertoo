@@ -867,6 +867,43 @@ mod read_tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
+    /// A parallel read says when its largest segment holds more rows than a
+    /// reader's queue can buffer ahead, and only then.
+    #[test]
+    fn a_read_says_when_a_segment_outgrows_a_readers_queue() {
+        let logging = crate::test_log::install();
+        // `read_all`'s tuning at four workers.
+        let shape = resolve_read_shape(ReadTuning {
+            budget: MemoryBudget::with_available(Some(256 << 30)),
+            batch_size: 96,
+            workers: 4,
+            avg_geom_bytes: Some(8),
+            footer: None,
+            profile: MemoryProfile::Auto,
+        });
+        let queue = shape.depth * 96;
+        let said = |rg_rows: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("in.parquet");
+            write_input(&path, 3 * rg_rows as i64, rg_rows);
+            let source = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+            crate::test_log::take_thread_lines();
+            read_all(&source, 96, 4, None);
+            assert!(
+                LAST_READ_WORKERS.with(std::cell::Cell::get) > 1,
+                "a parallel read"
+            );
+            crate::test_log::take_thread_lines()
+                .iter()
+                .filter(|l| l.contains("largest segment"))
+                .count()
+        };
+        let (fits, exact, over) = (said(queue / 2), said(queue), said(queue + 1));
+        if logging {
+            assert_eq!((fits, exact, over), (0, 0, 1), "queue of {queue} rows");
+        }
+    }
+
     /// An empty batch is never queued: a batch that already lines up with
     /// the request is still handed back as is, not copied (#494).
     #[test]
