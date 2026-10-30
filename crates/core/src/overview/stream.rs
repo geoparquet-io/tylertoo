@@ -2128,12 +2128,8 @@ fn preflight_with_memory_limit(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Preflight, ConvertError> {
     diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
-    diagnostics.set_python_loss_budget(
-        MemoryBudget {
-            limit: memory_limit,
-        }
-        .python_loss_allowance(),
-    );
+    diagnostics
+        .set_python_loss_budget(MemoryBudget::from_limit(memory_limit).python_loss_allowance());
     // Schema checks (level column, geometry column) — footer-only reads.
     // (For a remote source, #210, the footer is range-fetched once here and
     // cached across the passes below. For a multi-partition source the
@@ -2283,9 +2279,7 @@ fn preflight_with_memory_limit(
     options.read_batch_size = read_batch_rows;
     Ok(Preflight {
         descriptor,
-        budget: MemoryBudget {
-            limit: memory_limit,
-        },
+        budget: MemoryBudget::from_limit(memory_limit),
         options,
         crs,
         geom_idx,
@@ -5834,7 +5828,7 @@ fn write_level_streaming(
     // the borrow and leave `level_timers` owned here for the post-scope read
     // and the return value below.
     let (read_depth, window) = split_in_flight(in_flight);
-    let window = read_tuning.budget.compute_window(
+    let window = { read_tuning.budget }.compute_window(
         read_tuning.profile,
         window,
         read_tuning.batch_size,
