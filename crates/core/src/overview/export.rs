@@ -3513,13 +3513,70 @@ struct LevelScan {
 struct Partition {
     key_lo: u64,
     key_hi: u64,
-    /// Union of the partition's tile bounds plus a one-tile margin, used to
-    /// prune row groups on the partition's read pass. Pruning is conservative:
-    /// a feature assigned to a tile in this partition has a bbox intersecting
-    /// that tile's bounds, hence intersecting this rectangle.
-    bbox: TileBounds,
+    /// The partition's tile bounds plus a one-tile margin, used to prune row
+    /// groups on the partition's read pass. Pruning is conservative: a
+    /// feature assigned to a tile in this partition has a bbox intersecting
+    /// that tile's bounds, hence intersecting this region.
+    bbox: PruneRegion,
     /// Summed member count (for balancing).
     members: usize,
+}
+
+/// The region a read prunes row groups to: the union of tile bounds west
+/// of the prime meridian and the union east of it, kept apart. A partition
+/// whose tiles sit on both sides of the antimeridian (the Chatham Islands
+/// and the NZ mainland, adjacent in tile order) is then two narrow
+/// rectangles, where one union rectangle spans every longitude and selects
+/// every row group at those latitudes. Splitting at the prime meridian
+/// instead of at ±180 handles both: a region across the prime meridian is
+/// two rectangles that meet, covering what its union did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PruneRegion {
+    west: Option<TileBounds>,
+    east: Option<TileBounds>,
+}
+
+impl PruneRegion {
+    fn of(bounds: TileBounds) -> Self {
+        let mut region = PruneRegion {
+            west: None,
+            east: None,
+        };
+        region.add(&bounds);
+        region
+    }
+    /// Add one tile's bounds to the side it lies on. A tile lies on one
+    /// side at every zoom but 0, whose one tile goes east.
+    fn add(&mut self, bounds: &TileBounds) {
+        let side = if bounds.lng_max <= 0.0 {
+            &mut self.west
+        } else {
+            &mut self.east
+        };
+        match side {
+            Some(b) => b.expand(bounds),
+            None => *side = Some(*bounds),
+        }
+    }
+    fn expand(&mut self, other: &PruneRegion) {
+        for b in other.rects() {
+            self.add(&b);
+        }
+    }
+    /// Grow each rectangle by `margin` degrees on every side.
+    fn grow(&mut self, margin: f64) {
+        for b in [&mut self.west, &mut self.east].into_iter().flatten() {
+            *b = TileBounds::new(
+                b.lng_min - margin,
+                b.lat_min - margin,
+                b.lng_max + margin,
+                b.lat_max + margin,
+            );
+        }
+    }
+    fn rects(&self) -> impl Iterator<Item = TileBounds> {
+        self.west.into_iter().chain(self.east)
+    }
 }
 
 /// Shared per-level context for partition processing.
@@ -5170,14 +5227,14 @@ fn plan_partitions(
         match cur.as_mut() {
             Some(p) => {
                 p.key_hi = key;
-                p.bbox.expand(&tb);
+                p.bbox.add(&tb);
                 p.members += count;
             }
             None => {
                 cur = Some(Partition {
                     key_lo: key,
                     key_hi: key,
-                    bbox: tb,
+                    bbox: PruneRegion::of(tb),
                     members: count,
                 });
             }
@@ -5191,12 +5248,7 @@ fn plan_partitions(
     // row-group bbox statistics; over-inclusion only reads an extra row group.
     let margin = 360.0 / 2f64.powi(zoom as i32);
     for p in &mut out {
-        p.bbox = TileBounds::new(
-            p.bbox.lng_min - margin,
-            p.bbox.lat_min - margin,
-            p.bbox.lng_max + margin,
-            p.bbox.lat_max + margin,
-        );
+        p.bbox.grow(margin);
     }
     out
 }
@@ -5356,19 +5408,26 @@ fn collect_into(
     // Row-group pruning is only valid when the file's coordinates (and thus its
     // row-group bbox statistics) are lon/lat. For 3857 files the stats are in
     // meters; skip pruning (correct, just unpruned). Prune to the *union* of the
-    // wave's partition bboxes, and of that union shifted ±360°: the export
+    // wave's partition regions (each side of the prime meridian on its own,
+    // see [`PruneRegion`]), and of that union shifted ±360°: the export
     // draws a feature stored one world width away at its wrapped position
     // (#342, `wrap_shifts`), so its row group's stats sit there, not over the
     // wave's tiles.
     let bboxes = match ctx.crs {
         Crs::Epsg4326 => {
-            let mut b = wave[0].bbox;
+            let mut region = wave[0].bbox;
             for p in &wave[1..] {
-                b.expand(&p.bbox);
+                region.expand(&p.bbox);
             }
             Some(
-                [0.0, -360.0, 360.0]
-                    .map(|shift| [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]),
+                region
+                    .rects()
+                    .flat_map(|b| {
+                        [0.0, -360.0, 360.0].map(|shift| {
+                            [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             )
         }
         Crs::Epsg3857 => None,
@@ -5397,7 +5456,7 @@ fn collect_into(
     // where each one starts and which band it belongs to.
     let selected = ctx
         .reader
-        .selected_row_groups_any(ctx.level_idx, bboxes.as_ref().map(|b| b.as_slice()))?;
+        .selected_row_groups_any(ctx.level_idx, bboxes.as_deref())?;
     let mut rows = WaveRows {
         read: 0,
         gaps: RowGapCursor::new(ctx.reader.row_group_bands(&selected))
@@ -5411,7 +5470,7 @@ fn collect_into(
             let mut batch_reader = ExportTimers::time(&timers.band_read, || {
                 ctx.reader.read_level_any_bbox_batched(
                     ctx.level_idx,
-                    bboxes.as_ref().map(|b| b.as_slice()),
+                    bboxes.as_deref(),
                     EXPORT_BATCH_SIZE,
                 )
             })?;
@@ -9558,7 +9617,7 @@ mod tests {
             .map(|(i, &m)| Partition {
                 key_lo: i as u64,
                 key_hi: i as u64,
-                bbox: TileBounds::new(0.0, 0.0, 0.0, 0.0),
+                bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
                 members: m,
             })
             .collect()
@@ -10284,6 +10343,62 @@ mod tests {
             tight.work.level_spill_bytes.values().any(|&b| b > 0),
             "a level the budget cannot hold must spill: {:?}",
             tight.work.level_spill_bytes
+        );
+    }
+
+    /// A partition whose tiles sit on both sides of the antimeridian (the
+    /// Chatham Islands at -176.5 and the NZ mainland at 174.8) must prune its
+    /// read to those two regions, not to a union spanning every longitude
+    /// that also selects the row group at 140 in between. One row per row group, so
+    /// rows read count the row groups each wave selects.
+    #[test]
+    fn antimeridian_partition_prunes_to_both_sides_only() {
+        let chatham = Geometry::Point(Point::new(-176.5, -43.9));
+        let mainland = Geometry::Point(Point::new(174.8, -41.3));
+        let between = Geometry::Point(Point::new(140.0, -42.0));
+        let rows = vec![chatham, mainland, between];
+        let input = tempfile::NamedTempFile::new().unwrap();
+        write_mode_fixture(
+            input.path(),
+            &[
+                (vec![0, 1, 2], rows.clone()),
+                (vec![0, 1, 2], rows.clone()),
+                (vec![0, 1, 2], rows),
+            ],
+            Mode::Duplicating,
+            1,
+        );
+        // The fixture's levels are z2, z4 and z6.
+        let (level, zoom) = (2, 6);
+        let key = |x: f64, y: f64| {
+            let t = crate::tile::lng_lat_to_tile(x, y, zoom);
+            tile_key(t.x, t.y, zoom)
+        };
+        let (c, m, b) = (key(-176.5, -43.9), key(174.8, -41.3), key(140.0, -42.0));
+        assert!(
+            !(c.min(m)..=c.max(m)).contains(&b),
+            "the fixture needs Chatham and the mainland adjacent in tile order"
+        );
+        // A target of two members puts Chatham and the mainland in one
+        // partition and the row in between in another.
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let legacy = export_pmtiles_run(
+            input.path(),
+            out.path(),
+            &opts,
+            2,
+            &knobs(true, None, false),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.work.band_rows_read.get(&level),
+            Some(&3),
+            "z{zoom}: each of the level's three row groups is read once, by the wave over its tiles"
         );
     }
 
