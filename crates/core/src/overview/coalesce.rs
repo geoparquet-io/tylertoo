@@ -561,6 +561,12 @@ fn build_chains<'a>(
     chains
 }
 
+#[cfg(test)]
+thread_local! {
+    // Pairs examined and qualifying candidates materialized.
+    static JUNCTION_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// One round of endpoint joining over `pieces`, with node keys produced by
 /// `key(group, endpoint)`.
 ///
@@ -629,6 +635,11 @@ fn join_pieces<'a>(
             // straightest pair first. Each node's pairing is independent of
             // every other node's (an end belongs to exactly one node), so
             // the order the nodes are visited in cannot affect the result.
+            #[cfg(test)]
+            JUNCTION_WORK.with(|w| {
+                let (pairs, candidates) = w.get();
+                w.set((pairs + (d as u64 * (d as u64 - 1)) / 2, candidates));
+            });
             let dirs: Vec<Option<(f64, f64)>> = (0..d)
                 .map(|k| {
                     let (pi, e) = inc(k);
@@ -644,6 +655,11 @@ fn join_pieces<'a>(
                     if let (Some(a), Some(b)) = (dirs[i], dirs[j]) {
                         let dev = continuation_deviation_deg(a, b);
                         if dev <= junction_angle_deg {
+                            #[cfg(test)]
+                            JUNCTION_WORK.with(|w| {
+                                let (pairs, candidates) = w.get();
+                                w.set((pairs, candidates + 1));
+                            });
                             cands.push((dev, i, j));
                         }
                     }
@@ -1477,5 +1493,140 @@ mod golden_digest {
             h, 0x98cb_5976_7524_9af4,
             "chain builder output changed against the pre-#570 golden digest"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase1_cost_tests {
+    use super::*;
+
+    fn junction(d: usize) -> Vec<Geometry<f64>> {
+        (0..d)
+            .map(|i| {
+                let theta = std::f64::consts::TAU * i as f64 / d as f64;
+                Geometry::LineString(LineString::from(vec![(0., 0.), (theta.cos(), theta.sin())]))
+            })
+            .collect()
+    }
+
+    fn measure_junction(d: usize) -> u64 {
+        let geoms = junction(d);
+        let lines: Vec<_> = geoms
+            .iter()
+            .enumerate()
+            .map(|(index, geom)| CoalesceInput {
+                index,
+                geom,
+                sort_key: None,
+                group: 0,
+            })
+            .collect();
+        JUNCTION_WORK.with(|w| w.set((0, 0)));
+        let chains = build_chains(&lines, 0., 30.);
+        let (pairs, candidates) = JUNCTION_WORK.with(std::cell::Cell::get);
+        eprintln!(
+            "JUNCTION degree={d} pairs={pairs} candidates={candidates} chains={}",
+            chains.len()
+        );
+        pairs
+    }
+
+    #[test]
+    fn phase1_junction_candidate_growth_bound() {
+        for d in [100usize, 1_000, 10_000] {
+            let work = measure_junction(d);
+            let bound = 8 * d as u64 * u64::from(d.ilog2() + 1);
+            assert!(work <= bound, "#608 d={d}: {work} pairs exceed {bound}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual optimized junction profile"]
+    fn phase1_profile_junction() {
+        let sizes = std::env::var("PHASE1_N")
+            .map_or_else(|_| vec![100, 1_000, 10_000], |v| vec![v.parse().unwrap()]);
+        for d in sizes {
+            measure_junction(d);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes generated profiling inputs under .bench-out"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "trusted manual profiling fixture construction"
+    )]
+    fn phase1_generate_inputs() {
+        use geoarrow_array::GeoArrowArray;
+        use geoparquet::writer::{
+            GeoParquetRecordBatchEncoder, GeoParquetWriterEncoding, GeoParquetWriterOptionsBuilder,
+        };
+        use std::sync::Arc;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let out = root.join(".bench-out");
+        std::fs::create_dir_all(&out).unwrap();
+        let write = |name: &str, geoms: Vec<Geometry<f64>>| {
+            let mut builder = geoarrow::array::GeometryBuilder::new(
+                geoarrow::datatypes::GeometryType::new(Default::default()),
+            );
+            builder.extend_from_iter(geoms.iter().map(Some));
+            let array = builder.finish();
+            let schema = Arc::new(arrow_schema::Schema::new(vec![array
+                .data_type()
+                .to_field("geometry", true)]));
+            let batch =
+                arrow_array::RecordBatch::try_new(schema.clone(), vec![array.to_array_ref()])
+                    .unwrap();
+            let options = GeoParquetWriterOptionsBuilder::default()
+                .set_encoding(GeoParquetWriterEncoding::WKB)
+                .build();
+            let mut encoder = GeoParquetRecordBatchEncoder::try_new(&schema, &options).unwrap();
+            let mut writer = tylertoo_io::test_support::ArrowWriter::try_new(
+                std::fs::File::create(out.join(name)).unwrap(),
+                encoder.target_schema(),
+                None,
+            )
+            .unwrap();
+            writer
+                .write(&encoder.encode_record_batch(&batch).unwrap())
+                .unwrap();
+            writer.append_key_value_metadata(encoder.into_keyvalue().unwrap());
+            writer.close().unwrap();
+        };
+        for d in [1_000, 3_000, 10_000] {
+            write(&format!("junction-{d}.parquet"), junction(d));
+        }
+        // A road grid gives degree-four exact nodes and coarse snapped nodes
+        // with growing degree; 100 x 100 intersections, 19,800 segments.
+        let mut grid = Vec::new();
+        for x in 0..100 {
+            for y in 0..100 {
+                let (a, b) = (x as f64 * 0.001, y as f64 * 0.001);
+                if x < 99 {
+                    grid.push(Geometry::LineString(LineString::from(vec![
+                        (a, b),
+                        ((x + 1) as f64 * 0.001, b),
+                    ])));
+                }
+                if y < 99 {
+                    grid.push(Geometry::LineString(LineString::from(vec![
+                        (a, b),
+                        (a, (y + 1) as f64 * 0.001),
+                    ])));
+                }
+            }
+        }
+        write("grid-100.parquet", grid);
+        // z14 epsilon is ~0.000086 degrees; amplitude just above it.
+        let amp = 40_075_016.685_578_5 / (256.0 * 16384.0 * 111_320.0) / 0.99;
+        for n in [1_000, 10_000, 100_000] {
+            let coords: Vec<_> = (0..n)
+                .map(|i| (i as f64 * 0.00001, if i % 2 == 0 { 0.0 } else { amp }))
+                .collect();
+            write(
+                &format!("rdp-{n}.parquet"),
+                vec![Geometry::LineString(LineString::from(coords))],
+            );
+        }
     }
 }
