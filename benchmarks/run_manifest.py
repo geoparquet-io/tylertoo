@@ -1,0 +1,893 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+run_manifest.py — wall time and peak RSS for the workloads in
+benchmarks/manifest.toml, base against head, interleaved (#734).
+
+    uv run python -I benchmarks/run_manifest.py fetch --data ~/bench-data/788
+    uv run python -I benchmarks/run_manifest.py run --name window1 \\
+        --data ~/bench-data/788 \\
+        --bin main=.788/bin/tylertoo-main-glibc --bin head=target/release/tylertoo
+    uv run python -I benchmarks/run_manifest.py report --name window1 \\
+        --data ~/bench-data/788
+
+Standard library only. What one `run` does, cell by cell:
+
+  inputs    each input resolved under <data>/inputs (or an --input-dir) and
+            checked against its sha256; a `<file>.sha256` beside it caches
+            the check. `fetch` downloads the ones that are missing.
+  setup     a cell's untimed `setup` command (an overview to export, a plan
+            to replay) runs once per cell with the FIRST binary, in the
+            cell's scratch under .bench-out/, deleted when the cell ends.
+  rounds    `pairs` rounds (manifest, at least 3 unless --dry-run); each
+            round runs every binary once, and the order flips every round
+            (A B, B A, A B...) so drift on the host cancels.
+  each run  waits for a quiet host (load gate below), runs the command under
+            `/usr/bin/time -v` with a fresh TYLERTOO_PROFILE_JSON, records
+            wall, CPU, peak RSS, the profile lines, output size and sha256,
+            the CPU other processes used while it ran and the peak size of
+            its scratch, then deletes its outputs (.bench-out/), whatever
+            the outcome, and runs `sync`. Only the result row, the profile
+            JSONL and the log (stdout + `time -v`) are kept. A run stops at
+            `wall_s`, `rss_gib` or `scratch_gib` (status TIMEOUT, RSS_CAP,
+            SCRATCH_CAP), and the whole run stops before any command when
+            the disk has less than `min_free_gb` free.
+  resume    every run writes <results>/<cell>/<binary>-r<i>.json; a rerun
+            skips runs whose file exists, and cells whose summary.json
+            exists, unless --force.
+  report    results.jsonl (one line per run) and report.md (median and
+            spread per cell and binary) in <results>.
+
+The load gate: the 1-minute load average must be under --load-max (3). Our
+own previous run holds that average up for minutes after it exits, so within
+LOAD_OWN_S of a run of ours the gate instead samples /proc/stat for
+GATE_SAMPLE_S: fewer than --load-max busy cores while nothing of ours runs
+means the host is quiet. Every wait is logged.
+
+A cell with `memory_max` runs in a transient systemd scope
+(`systemd-run --user --scope -p MemoryMax=...`, or `sudo -n systemd-run` when
+the user manager is unavailable); an OOM kill there is the result, not an
+error. A cell with `serve` reads its inputs over HTTP from
+benchmarks/overview/logging_server.py with the given TTFB, and records the
+bytes and requests the server saw.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+MANIFEST = HERE / "manifest.toml"
+LOGGING_SERVER = HERE / "overview" / "logging_server.py"
+
+LOAD_OWN_S = 240.0  # how long our own run keeps the 1-min load average up
+GATE_SAMPLE_S = 3.0
+GATE_POLL_S = 15.0
+MIN_PAIRS = 3
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+# --- manifest ---------------------------------------------------------------
+
+
+class ManifestError(ValueError):
+    """The manifest is malformed: a missing field or a dangling reference."""
+
+
+CELL_KEYS = {
+    "label", "tickets", "input", "inputs", "command", "args", "zoom", "flags",
+    "output", "setup", "pairs", "allocator", "wall_s", "rss_gib", "memory_max",
+    "serve", "env", "heavy", "notes", "scratch_gib",
+}
+INPUT_KEYS = {"file", "path", "url", "sha256", "bytes", "rows", "geometry", "notes"}
+
+
+def load_manifest(path: Path = MANIFEST) -> dict:
+    """Parse and validate the manifest; every cell gets its defaults filled."""
+    with path.open("rb") as f:
+        m = tomllib.load(f)
+    defaults = m.get("defaults", {})
+    inputs = m.get("inputs", {})
+    cells = m.get("cells", {})
+    for name, inp in inputs.items():
+        extra = set(inp) - INPUT_KEYS
+        if extra:
+            raise ManifestError(f"input {name}: unknown keys {sorted(extra)}")
+        if ("file" in inp) == ("path" in inp):
+            raise ManifestError(f"input {name}: exactly one of file/path")
+        if not re.fullmatch(r"[0-9a-f]{64}", inp.get("sha256", "")):
+            raise ManifestError(f"input {name}: sha256 missing or malformed")
+    for name, cell in cells.items():
+        extra = set(cell) - CELL_KEYS
+        if extra:
+            raise ManifestError(f"cell {name}: unknown keys {sorted(extra)}")
+        for key in ("command", "args", "output"):
+            if key not in cell:
+                raise ManifestError(f"cell {name}: missing {key}")
+        names = cell_input_names(cell)
+        if not names:
+            raise ManifestError(f"cell {name}: no input")
+        for i in names:
+            if i not in inputs:
+                raise ManifestError(f"cell {name}: unknown input {i}")
+        for key in ("pairs", "allocator", "wall_s", "rss_gib", "scratch_gib"):
+            cell.setdefault(key, defaults.get(key))
+        cell.setdefault("flags", [])
+        cell.setdefault("env", {})
+        cell.setdefault("heavy", False)
+        if "zoom" in cell and len(cell["zoom"]) != 2:  # noqa: PLR2004
+            raise ManifestError(f"cell {name}: zoom is [min, max]")
+    for name, members in m.get("sets", {}).items():
+        for c in members:
+            if c not in cells:
+                raise ManifestError(f"set {name}: unknown cell {c}")
+    return m
+
+
+def cell_input_names(cell: dict) -> list[str]:
+    """A cell names one `input` or a list of `inputs` (a multi-part read)."""
+    if "inputs" in cell:
+        return list(cell["inputs"])
+    return [cell["input"]] if "input" in cell else []
+
+
+def zoom_flags(spec: dict) -> list[str]:
+    """`zoom = [a, b]` as the CLI's --min-zoom/--max-zoom."""
+    if "zoom" not in spec:
+        return []
+    lo, hi = spec["zoom"]
+    return ["--min-zoom", str(lo), "--max-zoom", str(hi)]
+
+
+def expand(template: list[str], subs: dict[str, str]) -> list[str]:
+    """Fill `{input}`, `{files_from}`, `{out}` and `{setup}` in each argument."""
+    out = []
+    for arg in template:
+        for key, val in subs.items():
+            arg = arg.replace("{" + key + "}", val)
+        if re.search(r"\{[a-z_]+\}", arg):
+            raise ManifestError(f"unfilled placeholder in {arg!r}")
+        out.append(arg)
+    return out
+
+
+def build_argv(spec: dict, subs: dict[str, str]) -> list[str]:
+    """The subcommand, its positional arguments, the zoom range, the flags."""
+    return [spec["command"], *expand(spec["args"], subs), *zoom_flags(spec),
+            *expand(spec.get("flags", []), subs)]
+
+
+def round_order(labels: list[str], round_index: int) -> list[str]:
+    """Every binary once per round; even rounds forward, odd rounds reversed."""
+    return list(labels) if round_index % 2 == 0 else list(reversed(labels))
+
+
+# --- inputs -----------------------------------------------------------------
+
+
+def sha256_file(path: Path) -> str:
+    """Hex sha256 of a file, read in 1 MiB chunks."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def candidates(inp: dict, data: Path, input_dirs: list[Path]) -> list[Path]:
+    """Where an input may live: a repo path, or <data>/inputs, then --input-dir."""
+    if "path" in inp:
+        return [ROOT / inp["path"]]
+    return [d / inp["file"] for d in [data / "inputs", *input_dirs]]
+
+
+def verified(path: Path, want: str) -> bool:
+    """True when path hashes to `want`; a matching `.sha256` sidecar newer
+    than the file stands in for rehashing it."""
+    if not path.is_file():
+        return False
+    side = path.with_name(path.name + ".sha256")
+    if side.is_file() and side.stat().st_mtime >= path.stat().st_mtime:
+        return side.read_text().split()[0] == want
+    got = sha256_file(path)
+    if got == want and os.access(path.parent, os.W_OK):
+        side.write_text(f"{got}  {path.name}\n")
+    return got == want
+
+
+def resolve_input(name: str, inp: dict, data: Path, input_dirs: list[Path]) -> Path:
+    """The verified local copy of an input, or ManifestError naming the fix."""
+    for p in candidates(inp, data, input_dirs):
+        if p.is_file():
+            if verified(p, inp["sha256"]):
+                return p
+            raise ManifestError(f"input {name}: {p} does not match its sha256")
+    raise ManifestError(f"input {name}: not found; run `fetch` (looked in "
+                        f"{[str(p) for p in candidates(inp, data, input_dirs)]})")
+
+
+def fetch(manifest: dict, data: Path, input_dirs: list[Path], names: list[str]) -> None:
+    """Download each missing input with a URL into <data>/inputs and verify it."""
+    for name in names:
+        inp = manifest["inputs"][name]
+        try:
+            print(f"ok    {name}: {resolve_input(name, inp, data, input_dirs)}")
+            continue
+        except ManifestError as e:
+            if "url" not in inp or "path" in inp:
+                print(f"MISS  {name}: {e}")
+                continue
+        dst = data / "inputs" / inp["file"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".part")
+        print(f"get   {name}: {inp['url']}")
+        with urllib.request.urlopen(inp["url"]) as r, tmp.open("wb") as f:  # noqa: S310
+            shutil.copyfileobj(r, f, 1 << 20)
+        tmp.replace(dst)
+        if not verified(dst, inp["sha256"]):
+            raise ManifestError(f"input {name}: download does not match its sha256")
+        print(f"ok    {name}: {dst}")
+
+
+# --- host -------------------------------------------------------------------
+
+
+def loadavg1() -> float:
+    """The 1-minute load average."""
+    return float(Path("/proc/loadavg").read_text().split()[0])
+
+
+def cpu_busy_jiffies() -> tuple[int, int]:
+    """(busy, total) jiffies over every CPU, from /proc/stat's `cpu` line."""
+    fields = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # noqa: PLR2004
+    total = sum(fields[:8])
+    return total - idle, total
+
+
+def busy_cores(seconds: float) -> float:
+    """Cores busy over a short window, by /proc/stat."""
+    b0, _ = cpu_busy_jiffies()
+    t0 = time.monotonic()
+    time.sleep(seconds)
+    b1, _ = cpu_busy_jiffies()
+    return (b1 - b0) / CLK_TCK / (time.monotonic() - t0)
+
+
+class Gate:
+    """Wait for a quiet host before each run (see the module docstring)."""
+
+    def __init__(self, load_max: float, wait_s: float, log: Path, enforce: bool = True) -> None:
+        """Gate below `load_max`, waiting at most `wait_s`, logging to `log`;
+        with `enforce` off it only records what it saw (dry runs)."""
+        self.enforce = enforce
+        self.load_max = load_max
+        self.wait_s = wait_s
+        self.log = log
+        self.last_own_end = 0.0
+
+    def wait(self) -> dict:
+        """Block until quiet (or the wait cap); return what the gate saw."""
+        t0 = time.monotonic()
+        while True:
+            load = loadavg1()
+            own_recent = time.monotonic() - self.last_own_end < LOAD_OWN_S
+            busy = busy_cores(GATE_SAMPLE_S)
+            quiet = busy < self.load_max and (load < self.load_max or own_recent)
+            waited = time.monotonic() - t0
+            if quiet or waited > self.wait_s or not self.enforce:
+                verdict = "quiet" if quiet else "NOT_ENFORCED" if not self.enforce else "TIMED_OUT"
+                rec = {"load1": load, "busy_cores": round(busy, 2),
+                       "waited_s": round(waited, 1), "own_recent": own_recent,
+                       "gate": verdict}
+                if waited > GATE_SAMPLE_S * 2 or not quiet:
+                    self._log(rec)
+                return rec
+            self._log({"load1": load, "busy_cores": round(busy, 2), "waiting_s": round(waited)})
+            time.sleep(GATE_POLL_S)
+
+    def _log(self, rec: dict) -> None:
+        line = json.dumps({"t": time.strftime("%FT%T"), **rec})
+        print(f"  gate {line}", flush=True)
+        with self.log.open("a") as f:
+            f.write(line + "\n")
+
+
+def require_disk(path: Path, min_free_gb: float) -> None:
+    """Stop the whole run when the disk under `path` is below the floor."""
+    free = shutil.disk_usage(path).free / (1 << 30)
+    if free < min_free_gb:
+        raise SystemExit(f"stopping: {free:.0f} GB free under {path}, below the "
+                         f"{min_free_gb:.0f} GB floor (min_free_gb)")
+
+
+def detect_allocator(binary: Path) -> str:
+    """`mimalloc` when the binary links it (its option strings are in the
+    image, stripped or not), else `glibc` (the gnu target's default)."""
+    data = binary.read_bytes()
+    return "mimalloc" if b"mimalloc" in data and b"mi_option" in data else "glibc"
+
+
+def parse_bin(spec: str) -> dict:
+    """`label=path` or `label=allocator:path` (the allocator is checked)."""
+    label, _, rest = spec.partition("=")
+    if not label or not rest:
+        raise ManifestError(f"--bin {spec!r}: want label=path or label=allocator:path")
+    claimed, _, path = rest.partition(":") if ":" in rest else ("", "", rest)
+    p = Path(path).expanduser().resolve()
+    if not os.access(p, os.X_OK):
+        raise ManifestError(f"--bin {label}: {p} is not executable")
+    found = detect_allocator(p)
+    if claimed and claimed != found:
+        raise ManifestError(f"--bin {label}: claimed {claimed} but the binary links {found}")
+    return {"label": label, "path": str(p), "allocator": found, "sha256": sha256_file(p)}
+
+
+def scope_prefix(memory_max: str) -> list[str]:
+    """A transient systemd scope with a hard memory cap and no swap."""
+    props = ["-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0"]
+    probe = ["systemd-run", "--user", "--scope", "--quiet", *props, "--", "/bin/true"]
+    if subprocess.run(probe, capture_output=True, check=False).returncode == 0:
+        return ["systemd-run", "--user", "--scope", "--quiet", *props, "--"]
+    uid, gid = str(os.getuid()), str(os.getgid())
+    sudo = ["sudo", "-n", "systemd-run", "--scope", "--quiet", f"--uid={uid}", f"--gid={gid}", *props, "--"]
+    if subprocess.run([*sudo, "/bin/true"], capture_output=True, check=False).returncode == 0:
+        return sudo
+    raise ManifestError("memory_max needs systemd-run --user or sudo -n systemd-run")
+
+
+class Server:
+    """logging_server.py on a free localhost port, serving a directory of
+    symlinks to the cell's inputs (wherever each input was found)."""
+
+    def __init__(self, root: Path, files: list[Path], serve: dict, log: Path) -> None:
+        """Link `files` into `root` and serve it with the cell's TTFB and
+        bandwidth emulation."""
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        for f in files:
+            (root / f.name).symlink_to(f)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        env = {**os.environ, "TTFB_MS": str(serve.get("ttfb_ms", 0)),
+               "CONN_BW_MBPS": str(serve.get("conn_bw_mbps", 0))}
+        self.proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-I", str(LOGGING_SERVER), str(root), str(self.port)],
+            env=env, stdout=log.open("a"), stderr=subprocess.STDOUT)
+        for _ in range(50):
+            try:
+                self.get("/__stats")
+                return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("logging_server did not start")
+
+    def url(self, rel: str) -> str:
+        """The served URL of a file under the root."""
+        return f"http://127.0.0.1:{self.port}/{rel}"
+
+    def get(self, path: str) -> dict:
+        """GET a control endpoint (never counted by the server)."""
+        with urllib.request.urlopen(self.url(path.lstrip("/")), timeout=5) as r:  # noqa: S310
+            body = r.read()
+        return json.loads(body) if body.strip().startswith(b"{") else {}
+
+    def stop(self) -> None:
+        """Terminate the server."""
+        self.proc.terminate()
+        self.proc.wait(timeout=10)
+
+
+# --- one run ----------------------------------------------------------------
+
+
+def tree_rss_kib(pid: int) -> int:
+    """Resident KiB of pid and every descendant."""
+    total, stack = 0, [pid]
+    while stack:
+        p = stack.pop()
+        try:
+            for line in Path(f"/proc/{p}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    total += int(line.split()[1])
+                    break
+            for task in Path(f"/proc/{p}/task").iterdir():
+                stack.extend(int(c) for c in (task / "children").read_text().split())
+        except (OSError, ValueError):
+            pass
+    return total
+
+
+def parse_gnu_time(stderr: str) -> dict:
+    """Wall, CPU, peak RSS and exit status from `/usr/bin/time -v`."""
+    def grab(pattern: str) -> str | None:
+        m = re.search(pattern + r":\s*([\d.:]+)", stderr)
+        return m.group(1) if m else None
+
+    wall = grab(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\)")
+    secs = None
+    if wall:
+        secs = 0.0
+        for part in wall.split(":"):
+            secs = secs * 60 + float(part)
+    user, sys_t = grab(r"User time \(seconds\)"), grab(r"System time \(seconds\)")
+    rss = grab(r"Maximum resident set size \(kbytes\)")
+    status = grab("Exit status")
+    return {
+        "wall_s": secs,
+        "cpu_s": round(float(user) + float(sys_t), 2) if user and sys_t else None,
+        "peak_rss_kib": int(rss) if rss else None,
+        "exit_status": int(status) if status else None,
+    }
+
+
+def read_profile(path: Path) -> dict:
+    """The convert and export lines of a fresh TYLERTOO_PROFILE_JSON file,
+    reduced to what the report compares."""
+    out: dict = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("phase") == "export":
+            ex = rec.get("export", {})
+            out["export"] = {
+                "mode": ex.get("mode"),
+                "phase_walls": ex.get("phase_walls"),
+                "stage_secs": ex.get("stage_secs"),
+                "true_peak_mib": (ex.get("rss_sampler") or {}).get("true_peak_mib"),
+                "true_anon_peak_mib": (ex.get("rss_sampler") or {}).get("true_anon_peak_mib"),
+                "tiles": sum(z.get("tiles", 0) for z in ex.get("per_zoom", [])),
+                "threads": ex.get("threads"),
+            }
+        else:
+            out["convert"] = {
+                "phase_walls": rec.get("phase_walls"),
+                "pass1_rows": (rec.get("pass1") or {}).get("rows"),
+                "pass2_rows": (rec.get("pass2") or {}).get("rows"),
+                "true_peak_mib": (rec.get("rss_sampler") or {}).get("true_peak_mib"),
+                "true_anon_peak_mib": (rec.get("rss_sampler") or {}).get("true_anon_peak_mib"),
+                "memory_profile": rec.get("memory_profile"),
+                "threads": rec.get("threads"),
+            }
+    return out
+
+
+def dir_bytes(path: Path) -> int:
+    """Bytes of every file under path (files may vanish while we walk)."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path) -> dict:
+    """Run argv (already wrapped in GNU time). A wall, RSS or scratch-disk
+    cap (`caps`: wall_s, rss_gib, scratch_gib) kills the process group and
+    is reported as the status, not raised."""
+    cap_kib = int(caps["rss_gib"] * 1024 * 1024)
+    wall_s = caps["wall_s"]
+    scratch_cap = int(caps["scratch_gib"] * (1 << 30))
+    b0, _ = cpu_busy_jiffies()
+    t0 = time.monotonic()
+    with log.open("w") as logf:
+        proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.PIPE, text=True,  # noqa: S603
+                                env=env, start_new_session=True)
+        outcome = {"cap": None, "peak_poll_kib": 0, "scratch_peak": 0}
+
+        def watch() -> None:
+            tick = 0
+            while proc.poll() is None:
+                rss = tree_rss_kib(proc.pid)
+                outcome["peak_poll_kib"] = max(outcome["peak_poll_kib"], rss)
+                if tick % 10 == 0:  # the scratch walk every ~2 s
+                    outcome["scratch_peak"] = max(outcome["scratch_peak"], dir_bytes(scratch))
+                tick += 1
+                elapsed = time.monotonic() - t0
+                reason = ("RSS_CAP" if rss > cap_kib else "TIMEOUT" if elapsed > wall_s
+                          else "SCRATCH_CAP" if outcome["scratch_peak"] > scratch_cap else None)
+                if reason:
+                    outcome["cap"] = reason
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return
+                time.sleep(0.2)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        _, stderr = proc.communicate()
+        watcher.join()
+        logf.write("\n--- stderr ---\n" + stderr)
+    wall_poll = time.monotonic() - t0
+    b1, _ = cpu_busy_jiffies()
+    gt = parse_gnu_time(stderr)
+    if outcome["cap"]:
+        status = outcome["cap"]
+    elif proc.returncode == 0:
+        status = "ok"
+    elif gt["exit_status"] is None or proc.returncode in (-9, 137) or "Killed" in stderr:
+        status = "KILLED"
+    else:
+        status = "FAILED"
+    wall = gt["wall_s"] if status == "ok" and gt["wall_s"] else wall_poll
+    busy_s = (b1 - b0) / CLK_TCK
+    foreign = max(0.0, busy_s - (gt["cpu_s"] or 0.0)) / max(wall_poll, 1e-6)
+    return {
+        "status": status,
+        "returncode": proc.returncode,
+        "wall_s": round(wall, 3),
+        "cpu_s": gt["cpu_s"],
+        "peak_rss_kib": gt["peak_rss_kib"] if gt["peak_rss_kib"] else outcome["peak_poll_kib"],
+        "peak_poll_kib": outcome["peak_poll_kib"],
+        "foreign_cores": round(foreign, 2),
+        "scratch_peak_mib": round(outcome["scratch_peak"] / (1 << 20)),
+        "stderr_tail": stderr[-2500:] if status != "ok" else None,
+    }
+
+
+def output_digest(out_dir: Path, output: str) -> dict:
+    """Size and sha256 of the cell's output (a file, or every file of a dir)."""
+    target = out_dir / output
+    if target.is_file():
+        return {"bytes": target.stat().st_size, "sha256": sha256_file(target)}
+    if target.is_dir():
+        h, size = hashlib.sha256(), 0
+        for f in sorted(p for p in target.rglob("*") if p.is_file()):
+            h.update(f.relative_to(target).as_posix().encode())
+            h.update(sha256_file(f).encode())
+            size += f.stat().st_size
+        return {"bytes": size, "sha256": h.hexdigest()}
+    return {"bytes": None, "sha256": None}
+
+
+# --- cells ------------------------------------------------------------------
+
+
+class Runner:
+    """One `run` invocation: a manifest, binaries, a results directory."""
+
+    def __init__(self, args: argparse.Namespace, manifest: dict) -> None:
+        """Resolve directories and binaries; nothing runs yet."""
+        self.args = args
+        self.m = manifest
+        self.data = Path(args.data).expanduser().resolve()
+        self.input_dirs = [Path(d).expanduser().resolve() for d in args.input_dir]
+        self.results = results_dir(args)
+        self.results.mkdir(parents=True, exist_ok=True)
+        self.bench_out = Path(args.bench_out).expanduser().resolve()
+        # Scratch never outlives a run: clear what an interrupted one left.
+        shutil.rmtree(self.bench_out / args.name, ignore_errors=True)
+        self.min_free_gb = manifest.get("defaults", {}).get("min_free_gb", 30)
+        self.bins = [parse_bin(b) for b in args.bin]
+        labels = [b["label"] for b in self.bins]
+        if len(set(labels)) != len(labels):
+            raise ManifestError("--bin labels must be distinct")
+        if len(self.bins) < 2 and not args.dry_run:  # noqa: PLR2004
+            raise ManifestError("a timing run compares at least two --bin (or pass --dry-run)")
+        defaults = manifest.get("defaults", {})
+        self.gate = Gate(args.load_max or defaults.get("load_max", 3.0),
+                         defaults.get("load_wait_s", 3600), self.results / "gate.log",
+                         enforce=not args.no_gate)
+        (self.results / "binaries.json").write_text(json.dumps(self.bins, indent=2))
+
+    def cells(self) -> list[str]:
+        """The cells this run covers: --cells, else --set, else every light cell."""
+        cells = self.m["cells"]
+        if self.args.cells:
+            names = self.args.cells.split(",")
+        elif self.args.set:
+            names = self.m["sets"][self.args.set]
+        else:
+            names = [c for c, v in cells.items() if not v["heavy"]]
+        for n in names:
+            if n not in cells:
+                raise ManifestError(f"unknown cell {n}")
+        return names
+
+    def pairs(self, cell: dict) -> int:
+        """Rounds for a cell: 1 on a dry run, else the manifest's (at least 3,
+    except for a heavy cell, which may name fewer)."""
+        if self.args.dry_run:
+            return 1
+        n = self.args.pairs or cell["pairs"] or MIN_PAIRS
+        if n < MIN_PAIRS and not cell["heavy"]:
+            raise ManifestError(f"pairs={n}: a timing run needs at least {MIN_PAIRS}")
+        return n
+
+    def run_all(self) -> None:
+        """Every selected cell in manifest order, then the report."""
+        for name in self.cells():
+            self.run_cell(name)
+        write_report(self.results)
+
+    def run_cell(self, name: str) -> None:
+        """Setup, then the interleaved rounds; skip what is already recorded."""
+        cell = self.m["cells"][name]
+        cdir = self.results / name
+        if self.args.force and cdir.exists():
+            shutil.rmtree(cdir)
+        if (cdir / "summary.json").exists():
+            print(f"skip  {name} (summary.json exists; --force reruns it)")
+            return
+        cdir.mkdir(parents=True, exist_ok=True)
+        local = [resolve_input(i, self.m["inputs"][i], self.data, self.input_dirs)
+                 for i in cell_input_names(cell)]
+        scratch = self.bench_out / self.args.name / name
+        server = None
+        if "serve" in cell:
+            root = self.bench_out / self.args.name / name / "served"
+            server = Server(root, local, cell["serve"], cdir / "server.log")
+        try:
+            subs = self.substitutions(name, local, server)
+            if "setup" in cell:
+                subs["setup"] = str(self.setup(name, cell, subs, scratch / "setup"))
+            prefix = scope_prefix(cell["memory_max"]) if "memory_max" in cell else []
+            labels = [b["label"] for b in self.bins]
+            for r in range(self.pairs(cell)):
+                for label in round_order(labels, r):
+                    self.run_one(name, cell, r, label, subs, prefix, server)
+        finally:
+            if server:
+                server.stop()
+            shutil.rmtree(scratch, ignore_errors=True)
+        summary = summarize(load_runs(cdir), self.bins)
+        (cdir / "summary.json").write_text(json.dumps(summary, indent=2))
+        write_report(self.results)
+
+    def substitutions(self, name: str, local: list[Path], server: Server | None) -> dict:
+        """`{input}` and `{files_from}`: local paths, or served URLs."""
+        if server:
+            refs = [server.url(p.name) for p in local]
+        else:
+            refs = [str(p) for p in local]
+        lists = self.results / name / "files_from.txt"
+        lists.write_text("".join(r + "\n" for r in refs))
+        return {"input": refs[0], "files_from": str(lists)}
+
+    def setup(self, name: str, cell: dict, subs: dict, sdir: Path) -> Path:
+        """Run the cell's untimed setup with the first binary, in the cell's
+        scratch (deleted with the cell, so it is rebuilt on a resume)."""
+        base = self.bins[0]
+        require_disk(self.bench_out, self.min_free_gb)
+        shutil.rmtree(sdir, ignore_errors=True)
+        (sdir / "tmp").mkdir(parents=True)
+        argv = [base["path"], *build_argv(cell["setup"], {**subs, "setup": str(sdir), "out": str(sdir)})]
+        print(f"setup {name}: {' '.join(argv)}", flush=True)
+        t0 = time.monotonic()
+        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()}, "TMPDIR": str(sdir / "tmp")}
+        res = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)  # noqa: S603
+        (self.results / name / "setup.log").write_text(
+            " ".join(argv) + "\n" + res.stdout + "\n--- stderr ---\n" + res.stderr)
+        if res.returncode != 0:
+            raise RuntimeError(f"setup {name} failed ({res.returncode}): {res.stderr[-1500:]}")
+        shutil.rmtree(sdir / "tmp", ignore_errors=True)
+        print(f"setup {name}: done in {time.monotonic() - t0:.1f}s, "
+              f"{dir_bytes(sdir) >> 20} MiB", flush=True)
+        return sdir
+
+    def run_one(self, name: str, cell: dict, r: int, label: str, subs: dict,
+                prefix: list[str], server: Server | None) -> None:
+        """One timed run of one binary; writes <cell>/<label>-r<r>.json."""
+        cdir = self.results / name
+        rec_path = cdir / f"{label}-r{r}.json"
+        if rec_path.exists():
+            return
+        b = next(x for x in self.bins if x["label"] == label)
+        out = self.bench_out / self.args.name / name / f"{label}-r{r}"
+        if out.exists():
+            shutil.rmtree(out)
+        (out / "tmp").mkdir(parents=True)
+        prof = cdir / f"{label}-r{r}.profile.jsonl"
+        prof.unlink(missing_ok=True)
+        argv = [b["path"], *build_argv(cell, {**subs, "out": str(out)})]
+        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()},
+               "TYLERTOO_PROFILE_JSON": str(prof), "TMPDIR": str(out / "tmp")}
+        require_disk(self.bench_out, self.min_free_gb)
+        gate = self.gate.wait()
+        if server:
+            server.get("/__reset")
+        print(f"run   {name} {label} r{r}: {' '.join(argv[1:])}", flush=True)
+        try:
+            res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], cell, env,
+                             cdir / f"{label}-r{r}.log", out)
+            output = output_digest(out, cell["output"])
+        finally:
+            # Only the result row, the profile JSONL and the log survive a run.
+            shutil.rmtree(out, ignore_errors=True)
+        self.gate.last_own_end = time.monotonic()
+        if "memory_max" in cell and res["status"] == "KILLED":
+            res["status"] = "OOM"
+        rec = {
+            "run": self.args.name, "cell": name, "binary": label, "round": r,
+            "allocator": b["allocator"], "allocator_expected": cell["allocator"],
+            "binary_sha256": b["sha256"], "argv": argv, "dry_run": self.args.dry_run,
+            "started": time.strftime("%FT%T"), "gate": gate, **res,
+            "load1_after": loadavg1(),
+            "output": output,
+            "profile": read_profile(prof),
+            "served": server.get("/__stats") if server else None,
+            "memory_max": cell.get("memory_max"),
+        }
+        subprocess.run(["sync"], check=False)
+        rec_path.write_text(json.dumps(rec, indent=2))
+        with (self.results / "results.jsonl").open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        rss = (rec["peak_rss_kib"] or 0) / 1024
+        print(f"      {res['status']} wall {res['wall_s']:.2f}s cpu {res['cpu_s']}s "
+              f"rss {rss:.0f} MiB foreign {res['foreign_cores']} cores", flush=True)
+
+
+def results_dir(args: argparse.Namespace) -> Path:
+    """<data>/results/<name> unless --results says otherwise."""
+    if args.results:
+        return Path(args.results).expanduser().resolve()
+    return Path(args.data).expanduser().resolve() / "results" / args.name
+
+
+# --- summary and report -----------------------------------------------------
+
+
+def load_runs(cdir: Path) -> list[dict]:
+    """Every run record of a cell."""
+    return [json.loads(p.read_text()) for p in sorted(cdir.glob("*-r*.json"))]
+
+
+def spread(values: list[float]) -> dict:
+    """Median, min, max and (max-min)/median of a sample."""
+    if not values:
+        return {"n": 0, "median": None, "min": None, "max": None, "spread": None}
+    med = statistics.median(values)
+    return {"n": len(values), "median": round(med, 3), "min": round(min(values), 3),
+            "max": round(max(values), 3),
+            "spread": round((max(values) - min(values)) / med, 4) if med else None}
+
+
+def phase_total(run: dict, phase: str) -> float | None:
+    """`phase_walls.total` of the convert or export line, if the run wrote one."""
+    walls = (run.get("profile", {}).get(phase) or {}).get("phase_walls") or {}
+    return walls.get("total")
+
+
+def summarize(runs: list[dict], bins: list[dict]) -> dict:
+    """Per binary: wall, CPU, peak RSS and phase totals over its ok runs."""
+    out = {}
+    for b in bins:
+        mine = [r for r in runs if r["binary"] == b["label"]]
+        ok = [r for r in mine if r["status"] == "ok"]
+        out[b["label"]] = {
+            "allocator": b["allocator"],
+            "statuses": sorted({r["status"] for r in mine}),
+            "wall_s": spread([r["wall_s"] for r in ok]),
+            "cpu_s": spread([r["cpu_s"] for r in ok if r["cpu_s"] is not None]),
+            "peak_rss_mib": spread([r["peak_rss_kib"] / 1024 for r in ok if r["peak_rss_kib"]]),
+            "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
+            "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),
+            "foreign_cores_max": max((r["foreign_cores"] for r in mine), default=None),
+            "outputs": sorted({r["output"]["sha256"] or "-" for r in ok}),
+            "output_bytes": sorted({r["output"]["bytes"] for r in ok if r["output"]["bytes"]}),
+        }
+    return out
+
+
+def fmt(s: dict, unit: str = "") -> str:
+    """`median unit (±spread%)` or a dash."""
+    if not s or not s["n"]:
+        return "—"
+    pct = f" ±{s['spread'] * 50:.1f}%" if s["spread"] is not None and s["n"] > 1 else ""
+    return f"{s['median']:.2f}{unit}{pct}"
+
+
+def write_report(results: Path) -> None:
+    """report.md: one row per cell and binary, ratios against the first binary."""
+    bins_path = results / "binaries.json"
+    if not bins_path.exists():
+        return
+    bins = json.loads(bins_path.read_text())
+    lines = [f"# Benchmark run `{results.name}`", "",
+             "Medians over ok runs; ± is half the min–max range over the median.",
+             "`foreign` is the most cores other processes used during any run of the row.", "",
+             "Binaries: " + ", ".join(f"`{b['label']}` ({b['allocator']}, {b['sha256'][:12]})" for b in bins),
+             "", "| cell | binary | runs | status | wall | vs first | convert | export | CPU s | peak RSS MiB | foreign | output |",
+             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
+        runs = load_runs(cdir)
+        if not runs:
+            continue
+        summ = summarize(runs, bins)
+        base = summ[bins[0]["label"]]["wall_s"]["median"]
+        shas = {s for v in summ.values() for s in v["outputs"]}
+        for b in bins:
+            s = summ[b["label"]]
+            if not s["statuses"]:
+                continue
+            med = s["wall_s"]["median"]
+            ratio = f"{med / base:.3f}" if med and base and b is not bins[0] else ""
+            same = "same" if len(shas) == 1 else "DIFFERS" if len(shas) > 1 else ""
+            lines.append(
+                f"| {cdir.name} | {b['label']} | {s['wall_s']['n']} | {','.join(s['statuses'])} "
+                f"| {fmt(s['wall_s'], ' s')} | {ratio} | {fmt(s['convert_s'])} | {fmt(s['export_s'])} "
+                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {s['foreign_cores_max']} "
+                f"| {same} {s['output_bytes'][0] if s['output_bytes'] else ''} |")
+    (results / "report.md").write_text("\n".join(lines) + "\n")
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Subcommands: list, fetch, run, report."""
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--manifest", default=str(MANIFEST))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="cells, inputs and sets")
+    for name in ("fetch", "run", "report"):
+        p = sub.add_parser(name)
+        p.add_argument("--data", default="~/bench-data/manifest", help="inputs/, setup/, results/")
+        p.add_argument("--input-dir", action="append", default=[], help="more places to find inputs")
+        if name != "fetch":
+            p.add_argument("--name", required=True, help="the run's name; results/<name> resumes it")
+            p.add_argument("--results", help="results directory (default <data>/results/<name>)")
+    run = sub.choices["run"]
+    run.add_argument("--bin", action="append", required=True, help="label=path or label=allocator:path; first is the base")
+    run.add_argument("--cells", help="comma-separated cells (default: every cell not marked heavy)")
+    run.add_argument("--set", help="a [sets] entry of the manifest")
+    run.add_argument("--pairs", type=int, help=f"rounds per cell (at least {MIN_PAIRS})")
+    run.add_argument("--dry-run", action="store_true", help="one round, one binary allowed; not a baseline")
+    run.add_argument("--force", action="store_true", help="rerun cells that already have results")
+    run.add_argument("--load-max", type=float, help="load gate threshold (manifest default)")
+    run.add_argument("--no-gate", action="store_true",
+                     help="record the load but never wait (dry runs on a busy host)")
+    run.add_argument("--bench-out", default=str(ROOT / ".bench-out"), help="scratch for outputs, emptied per run")
+    args = ap.parse_args(argv)
+    manifest = load_manifest(Path(args.manifest))
+    if args.cmd == "list":
+        for name, c in manifest["cells"].items():
+            heavy = " [heavy]" if c["heavy"] else ""
+            print(f"{name:22} {c['command']:15} {','.join(cell_input_names(c)):28} "
+                  f"zoom={c.get('zoom', '-')} pairs={c['pairs']}{heavy}  {c.get('label', '')}")
+        for name, members in manifest.get("sets", {}).items():
+            print(f"set {name}: {', '.join(members)}")
+        return 0
+    if args.cmd == "fetch":
+        fetch(manifest, Path(args.data).expanduser(), [Path(d).expanduser() for d in args.input_dir],
+              list(manifest["inputs"]))
+        return 0
+    if args.cmd == "report":
+        write_report(results_dir(args))
+        print((results_dir(args) / "report.md").read_text())
+        return 0
+    Runner(args, manifest).run_all()
+    print((results_dir(args) / "report.md").read_text())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

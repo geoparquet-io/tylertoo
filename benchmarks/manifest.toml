@@ -1,0 +1,421 @@
+# The workload manifest (#734): every timed workload of the benchmark lane,
+# pinned so that two runs of a cell on two binaries compare like for like.
+# benchmarks/run_manifest.py reads it; its docstring says how a run goes.
+#
+# An input is a `file` under <data>/inputs (or an --input-dir), fetched from
+# `url`, or a repo `path`; either way it must hash to `sha256`. Overture
+# releases leave the bucket after a few months (#696), so for the Overture
+# inputs the cached copy is the reference and the URL is provenance only.
+#
+# A cell runs `tylertoo <command> <args> --min-zoom a --max-zoom b <flags>`.
+# Placeholders: {input} (the first input, a path or a served URL),
+# {files_from} (a list of every input, for --files-from), {out} (the run's
+# scratch directory under .bench-out/, deleted after the run) and {setup}
+# (the cell's setup directory). `output` is the file under {out} whose size
+# and sha256 are recorded. `allocator` is the allocator the cell's numbers
+# are expected from; the runner records the one each binary links.
+# `heavy` cells run only when named (--cells or a set).
+
+[defaults]
+pairs = 3
+allocator = "glibc"
+wall_s = 1800
+# Peak RSS cap per run: the box is shared (123 GiB), so a runaway run is
+# stopped long before it can take the host down.
+rss_gib = 32
+# A run's scratch (outputs, spill, the intermediate overview) may not grow
+# past this; nothing starts with less than min_free_gb free on the disk.
+scratch_gib = 30
+min_free_gb = 30
+load_max = 3.0
+load_wait_s = 3600
+
+# ---------------------------------------------------------------------------
+# Inputs
+
+# The coalesce benchmark's inputs (benchmarks/coalesce/bench.toml), the same
+# assets of the bench-coalesce-v1 release.
+[inputs.madagascar-adm4]
+file = "madagascar-adm4-hilbert.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/madagascar-adm4-hilbert.parquet"
+sha256 = "6f666e18e06a87eeb219dfd6c1ef407fb9bce0e72c4cd7736fdd1c245c72f0b9"
+bytes = 17899512
+rows = 17465
+geometry = "MultiPolygon"
+notes = "FieldMaps adm4, Hilbert-sorted, 58 columns (flat strings)."
+
+[inputs.moldova]
+file = "moldova-hilbert.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/moldova-hilbert.parquet"
+sha256 = "06bddb7a42283812c1032d85a6b138daf198b1b46592ba96ad84cbe09a12e5f5"
+bytes = 105052005
+rows = 631910
+geometry = "Polygon"
+notes = "FTW Moldova fields, Hilbert-sorted, 13 row groups."
+
+[inputs.nz-parcels]
+file = "nz-parcels-hilbert.parquet"
+url = "https://github.com/geoparquet-io/tylertoo/releases/download/bench-coalesce-v1/nz-parcels-hilbert.parquet"
+sha256 = "3a8336ce71d623c44eee44e1226ce87052e13950d2918f4e91a9b75e80bb7998"
+bytes = 1001727145
+rows = 4343547
+geometry = "MultiPolygon"
+
+# Overture 2026-10-21.0, the first part file of each type, as published
+# (spatially clustered, bbox covering, 128-256 row groups, nested columns).
+# The cells cut them with --bbox to Mexico City (-101,19,-98,21) or, for
+# the sparser segments, central Mexico (-104,17,-96,22), reading only the
+# row groups that reach the box: the whole place file at z14 spilled more
+# than 24 GB of scratch.
+[inputs.overture-place]
+file = "overture-2026-10-21.0-place-p00000.parquet"
+url = "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=places/type=place/part-00000-a0a9949b-7e8e-59fe-803b-6cc55b17f790-c000.zstd.parquet"
+sha256 = "833f4aa09ba8ce4b7ee181f0a8b52263218c57eafa89e180ade35bb89e6fbcfe"
+bytes = 729511821
+rows = 5526143
+geometry = "Point"
+notes = "Mexico, Central America and the Pacific coast of South America; names, addresses, sources and taxonomy are nested."
+
+[inputs.overture-address]
+file = "overture-2026-10-21.0-address-p00000.parquet"
+url = "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=addresses/type=address/part-00000-c44357eb-9a65-5104-b485-af7f0be62da4-c000.zstd.parquet"
+sha256 = "00f157eae326e794b4667c7ffbff5450a9a4dc724c9f4fc19afdcc04572c3cec"
+bytes = 396310089
+rows = 7481964
+geometry = "Point"
+notes = "Mexican address points, 1.17M of them in the Mexico City box: the densest point layer Overture has."
+
+[inputs.overture-segment]
+file = "overture-2026-10-21.0-segment-p00000.parquet"
+url = "s3://overturemaps-us-west-2/release/2026-10-21.0/theme=transportation/type=segment/part-00000-3d581eb0-9c48-505d-9fe2-9e8192fa15dc-c000.zstd.parquet"
+sha256 = "fcec0772700a76d12768e1a4765fd593a60768ef91a99964e6f8ccccd8c61229"
+bytes = 490150425
+rows = 2815136
+geometry = "LineString"
+notes = "Road and rail segments, 128 row groups, 21 columns (most nested)."
+
+# FTW (alpha) Brazil, one file per state: 55,499,514 fields in 27 files,
+# 11.6 GB. Together they are the "Brazil 55.5M" input of #535 and #734. Only
+# MT, GO and MS are kept on disk between windows; `fetch` brings the other 24
+# back (sha256-checked) before a brazil-55m run.
+[inputs.ftw-br-ac]
+file = "ftw-br/BR_AC.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_AC.parquet"
+sha256 = "67016343da636a3b90a8506fecf5a77f66d3e206eec98956e65e1238efd14d70"
+bytes = 16551325
+
+[inputs.ftw-br-al]
+file = "ftw-br/BR_AL.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_AL.parquet"
+sha256 = "ef4300f369d47481907d0a281a74b670760a532db5e88d631cf76c1155ed0a13"
+bytes = 177516725
+
+[inputs.ftw-br-am]
+file = "ftw-br/BR_AM.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_AM.parquet"
+sha256 = "85c39ba147a1bcb2f039db59bb5a97d0703329435d70c214827fb50b74963c94"
+bytes = 101066549
+
+[inputs.ftw-br-ap]
+file = "ftw-br/BR_AP.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_AP.parquet"
+sha256 = "c17babff9754345c328e59a79a1fd836bab965dc8487823afcac513de319de73"
+bytes = 47863471
+
+[inputs.ftw-br-ba]
+file = "ftw-br/BR_BA.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_BA.parquet"
+sha256 = "d1af60b89934738661d694d8a0ff392566bafc937037d8588e3992451b2cfecd"
+bytes = 1872107922
+
+[inputs.ftw-br-ce]
+file = "ftw-br/BR_CE.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_CE.parquet"
+sha256 = "517cffd7e499a1a7bc655e16e50abff94d9ad737026bdeda86e7da775d9595ae"
+bytes = 249663566
+
+[inputs.ftw-br-df]
+file = "ftw-br/BR_DF.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_DF.parquet"
+sha256 = "1ecbf2a385bf9db18b1aac83f0335846b5024705b3600137af88789decc4d679"
+bytes = 16219415
+
+[inputs.ftw-br-es]
+file = "ftw-br/BR_ES.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_ES.parquet"
+sha256 = "826928e044a303754f7fbd8c885811b13a4e17b69014060d231edd2e6918be66"
+bytes = 67603748
+
+[inputs.ftw-br-go]
+file = "ftw-br/BR_GO.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_GO.parquet"
+sha256 = "10c9f47b490fe8c6fce597c3dbd8494ed5e8a400cbd57abbf82202ec94ec6d49"
+bytes = 931153732
+
+[inputs.ftw-br-ma]
+file = "ftw-br/BR_MA.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_MA.parquet"
+sha256 = "254136b11429e2ea47fe301ad002ea23c81bae4cc6a203f076255e6dc427d265"
+bytes = 527798720
+
+[inputs.ftw-br-mg]
+file = "ftw-br/BR_MG.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_MG.parquet"
+sha256 = "15b7fceaeda73bc8d07157de446865166b50190c9e2398eb754b758ec04f8976"
+bytes = 1109675899
+
+[inputs.ftw-br-ms]
+file = "ftw-br/BR_MS.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_MS.parquet"
+sha256 = "dda4664771e125f2fd8f88e8f18a81a27b9ca586bd42d069be93a3d36f9c5197"
+bytes = 1009310085
+
+[inputs.ftw-br-mt]
+file = "ftw-br/BR_MT.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_MT.parquet"
+sha256 = "ddd65369f461896bc8aa5497dae0f18fed06cd079013e5157a0d054b34ad1108"
+bytes = 1193432862
+
+[inputs.ftw-br-pa]
+file = "ftw-br/BR_PA.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_PA.parquet"
+sha256 = "efcc256fd60faac87936219cf3b816810005af1ca3cd00e66e9aeb2818ba49d1"
+bytes = 295377017
+
+[inputs.ftw-br-pb]
+file = "ftw-br/BR_PB.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_PB.parquet"
+sha256 = "5de97cf615a7a840bd1260bbdf83905fdc5f6faa9f60f6b7d088b877725b5d8c"
+bytes = 221698238
+
+[inputs.ftw-br-pe]
+file = "ftw-br/BR_PE.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_PE.parquet"
+sha256 = "bcf77b091eb95db52a44267e212eaa9a59049623de573c54efeef769c5bf31b2"
+bytes = 554234100
+
+[inputs.ftw-br-pi]
+file = "ftw-br/BR_PI.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_PI.parquet"
+sha256 = "c8112fd10348c9a187c9a36980b9d29d92586621306285bf2635858ea66b4125"
+bytes = 651934638
+
+[inputs.ftw-br-pr]
+file = "ftw-br/BR_PR.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_PR.parquet"
+sha256 = "49ddd6a78b1ef23c448ddf1f69d8c0a6cd69a81ae577dc3746548635077924af"
+bytes = 272954018
+
+[inputs.ftw-br-rj]
+file = "ftw-br/BR_RJ.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_RJ.parquet"
+sha256 = "5b85821325bcf57fb70a46bf3e135bb9e1018a919c8d1bfb39f1e596fe7b0e14"
+bytes = 20496014
+
+[inputs.ftw-br-rn]
+file = "ftw-br/BR_RN.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_RN.parquet"
+sha256 = "09b2dd57366ad59c7691dec71275afd7a6911473cb98fe35e9b333def82cc62e"
+bytes = 144050269
+
+[inputs.ftw-br-ro]
+file = "ftw-br/BR_RO.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_RO.parquet"
+sha256 = "d65c4cb2ba133b7991d2d1b5e9b297d79d822a0dae58ca5dbd09050be45c2336"
+bytes = 162464145
+
+[inputs.ftw-br-rr]
+file = "ftw-br/BR_RR.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_RR.parquet"
+sha256 = "bbe4e33d0d737990373c4cc2fa31d0bc819d17944016bb4bef79d6ba6d7dbca5"
+bytes = 126484514
+
+[inputs.ftw-br-rs]
+file = "ftw-br/BR_RS.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_RS.parquet"
+sha256 = "be72c027faa05308395e99d38d6052a2cfe3559b2e174d43cf3c6505883398a8"
+bytes = 435384604
+
+[inputs.ftw-br-sc]
+file = "ftw-br/BR_SC.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_SC.parquet"
+sha256 = "601d0930403d2bfcf7d38d142c5b44bf6371aa067bf35078f7acf5dd5d362b1d"
+bytes = 135699656
+
+[inputs.ftw-br-se]
+file = "ftw-br/BR_SE.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_SE.parquet"
+sha256 = "1ad48ec46d411cd8a26efb0d2e8a946025d30aeee8f5783993254bc1fa50e441"
+bytes = 171492765
+
+[inputs.ftw-br-sp]
+file = "ftw-br/BR_SP.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_SP.parquet"
+sha256 = "f8ac7e3b818bae29928638126ba55ddb0273f96295cdf416c9cc60df3d94a952"
+bytes = 570693438
+
+[inputs.ftw-br-to]
+file = "ftw-br/BR_TO.parquet"
+url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/results-by-admin-conf/admin:country_code=BR/BR_TO.parquet"
+sha256 = "77860d57ee6b9d8e217d01510ced60798fe198b9b88c7066e63282bc47166293"
+bytes = 514124545
+
+# ---------------------------------------------------------------------------
+# Cells
+
+[cells.points]
+label = "Points: Overture places, Mexico City, geometry only"
+input = "overture-place"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+flags = ["--bbox=-101,19,-98,21", "--exclude-all-properties"]
+
+[cells.points-dense]
+label = "Dense points: Overture addresses, Mexico City"
+input = "overture-address"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+flags = ["--bbox=-101,19,-98,21"]
+
+[cells.lines]
+label = "Lines: Overture segments, central Mexico"
+input = "overture-segment"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 13]
+flags = ["--bbox=-104,17,-96,22"]
+
+[cells.polygons]
+label = "Polygons: FTW Moldova"
+input = "moldova"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+
+[cells.polygons-mt]
+label = "Polygons at scale: FTW Mato Grosso, bounded (the #734 flags on one state)"
+tickets = [734]
+input = "ftw-br-mt"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 13]
+flags = ["--profile", "bounded"]
+
+[cells.wide-props]
+label = "Wide properties: Overture places, Mexico City, every nested column kept"
+input = "overture-place"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 14]
+flags = ["--bbox=-101,19,-98,21"]
+
+[cells.verbatim]
+label = "Verbatim: Madagascar adm4, every feature at every zoom"
+input = "madagascar-adm4"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--verbatim"]
+
+[cells.coverage-fill]
+label = "Coverage fill: FTW Moldova, --coverage-fill"
+input = "moldova"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--coverage-fill"]
+
+# The Brazil tutorial's extract (examples/brazil-fields/01-extract.sh), on a
+# 1-degree box around Sorriso instead of its 20 km one (which ran in under
+# 2 s): three states as one dataset over HTTP, from a host with 100 ms to
+# first byte. The served bytes and requests are in each result row.
+[cells.remote-multipart]
+label = "Remote multi-part: three FTW states over HTTP, 100 ms TTFB, 1-degree bbox + filter"
+inputs = ["ftw-br-mt", "ftw-br-go", "ftw-br-ms"]
+command = "overview"
+args = ["{out}/fields-ov.parquet"]
+output = "fields-ov.parquet"
+zoom = [0, 14]
+flags = ["--files-from", "{files_from}", "--bbox=-56,-13,-55,-12",
+         "--filter", "\"metrics:area\" >= 10000"]
+serve = { ttfb_ms = 100 }
+
+[cells.memory-capped]
+label = "Memory-capped: FTW Mato Grosso, bounded, in a 4 GiB cgroup"
+input = "ftw-br-mt"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 13]
+flags = ["--profile", "bounded"]
+memory_max = "4G"
+
+# Resume: replay a saved convert plan, skipping pass 1 and the assignment.
+[cells.resume]
+label = "Resume: FTW Moldova overview from a saved plan"
+input = "moldova"
+command = "overview"
+args = ["{input}", "{out}/ov.parquet"]
+output = "ov.parquet"
+zoom = [0, 12]
+flags = ["--plan", "{setup}/convert.plan"]
+setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 12], flags = ["--save-plan", "{setup}/convert.plan"] }
+
+# Export alone, from an overview the first binary builds once. These are the
+# cells of the allocator A/B (#739): any allocator is expected.
+[cells.export-moldova]
+label = "Export: FTW Moldova z0-12 overview"
+input = "moldova"
+command = "export-pmtiles"
+args = ["{setup}/ov.parquet", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+allocator = "any"
+setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 12] }
+
+[cells.export-mt]
+label = "Export: FTW Mato Grosso z0-13 overview (the #731 stress case)"
+tickets = [731, 739]
+input = "ftw-br-mt"
+command = "export-pmtiles"
+args = ["{setup}/ov.parquet", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+allocator = "any"
+setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 13] }
+
+# #734: the convert/export split at the scale #535 measured. Hours, not
+# minutes: one round unless the lead asks for more.
+[cells.brazil-55m]
+label = "Brazil 55.5M: every FTW state, tiles z0-13, bounded (#535 / #734)"
+tickets = [734]
+inputs = ["ftw-br-ac", "ftw-br-al", "ftw-br-am", "ftw-br-ap", "ftw-br-ba", "ftw-br-ce",
+          "ftw-br-df", "ftw-br-es", "ftw-br-go", "ftw-br-ma", "ftw-br-mg", "ftw-br-ms",
+          "ftw-br-mt", "ftw-br-pa", "ftw-br-pb", "ftw-br-pe", "ftw-br-pi", "ftw-br-pr",
+          "ftw-br-rj", "ftw-br-rn", "ftw-br-ro", "ftw-br-rr", "ftw-br-rs", "ftw-br-sc",
+          "ftw-br-se", "ftw-br-sp", "ftw-br-to"]
+command = "tiles"
+args = ["{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 13]
+flags = ["--files-from", "{files_from}", "--profile", "bounded"]
+wall_s = 14400
+pairs = 1
+heavy = true
+
+# ---------------------------------------------------------------------------
+# Sets
+
+[sets]
+window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",
+           "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
+           "export-moldova", "export-mt"]
+export-ab = ["export-moldova", "export-mt"]
