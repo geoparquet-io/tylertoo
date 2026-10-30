@@ -639,6 +639,7 @@ pub fn estimate_max_zoom(
         AUTO_MAX_ZOOM_CEILING,
         options.bbox.as_ref(),
         options.filter.as_deref(),
+        options.profile,
     )
 }
 
@@ -649,6 +650,7 @@ pub(crate) fn estimate_with(
     ceiling: u8,
     bbox: Option<&[f64; 4]>,
     filter: Option<&str>,
+    profile: super::level::MemoryProfile,
 ) -> Result<AutoZoomEvidence, ConvertError> {
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
@@ -739,13 +741,11 @@ pub(crate) fn estimate_with(
             let staged = source
                 .staging_plan_for(plan.row_groups, plan.projection)
                 .and_then(|staging| {
-                    // The sample has no conversion options; it stages
-                    // under the default profile's grant.
                     super::stream::stage_granted(
                         source,
                         &staging,
                         &mut super::memory::MemoryBudget::probe(),
-                        super::level::MemoryProfile::Auto,
+                        profile,
                     )
                 });
             match staged {
@@ -859,6 +859,7 @@ pub(crate) fn estimate_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::level::MemoryProfile;
     use super::*;
     use crate::input_set::ConvertSource;
     use geo::{Geometry, LineString, MultiPolygon, Point, Polygon};
@@ -909,7 +910,14 @@ mod tests {
     }
 
     fn estimate(source: &ConvertSource, min_zoom: u8) -> Result<AutoZoomEvidence, ConvertError> {
-        estimate_with(source, min_zoom, AUTO_MAX_ZOOM_CEILING, None, None)
+        estimate_with(
+            source,
+            min_zoom,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            None,
+            MemoryProfile::default(),
+        )
     }
 
     /// Like [`write`], but with a bbox covering column generated and declared
@@ -1265,8 +1273,8 @@ mod tests {
         let plain = write(&dir, "plain.parquet", &geoms);
         let bbox = Some([-0.1, -0.1, 1.0, 1.0]);
         assert_eq!(
-            estimate_with(&stale, 0, 16, bbox.as_ref(), None).unwrap(),
-            estimate_with(&plain, 0, 16, bbox.as_ref(), None).unwrap(),
+            estimate_with(&stale, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
+            estimate_with(&plain, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
             "rejecting the sidecar must retain both row groups"
         );
         for streaming in [true, false] {
@@ -1515,20 +1523,48 @@ mod tests {
         let plain = write(&dir, "plain.parquet", &geoms);
 
         let bbox = Some([9.5, 9.5, 12.0, 12.0]);
-        let cov_bbox =
-            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
-        let plain_bbox =
-            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
+        let cov_bbox = estimate_with(
+            &covered,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            bbox.as_ref(),
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        let plain_bbox = estimate_with(
+            &plain,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            bbox.as_ref(),
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert!(cov_bbox.sampled_from_covering);
         assert_eq!(cov_bbox.sampled_count, 100);
         let mut normalized = cov_bbox;
         normalized.sampled_from_covering = false;
         assert_eq!(normalized, plain_bbox);
 
-        let cov_filter =
-            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
-        let plain_filter =
-            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        let cov_filter = estimate_with(
+            &covered,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        let plain_filter = estimate_with(
+            &plain,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert!(cov_filter.sampled_from_covering);
         assert_eq!(cov_filter.sampled_count, 100);
         let mut normalized = cov_filter;
@@ -1742,6 +1778,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[9.5, 9.5, 12.0, 12.0]),
             None,
+            MemoryProfile::default(),
         )
         .unwrap();
         assert_eq!(sparse.sampled_count, 100);
@@ -1774,6 +1811,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[-161.0, -1.0, -158.0, 2.0]),
             None,
+            MemoryProfile::default(),
         )
         .unwrap();
         assert_eq!(wrapped.sampled_count, 100);
@@ -1792,8 +1830,15 @@ mod tests {
             })
         }));
         let source = write(&dir, "filter.parquet", &geoms);
-        let sparse =
-            estimate_with(&source, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        let sparse = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert_eq!(sparse.sampled_count, 100);
         assert!(sparse.chosen_zoom < estimate(&source, 0).unwrap().chosen_zoom);
     }

@@ -10795,9 +10795,16 @@ mod tests {
             assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
         }
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let msg = super::super::auto_zoom::estimate_with(&source, 0, 16, None, None)
-            .unwrap_err()
-            .to_string();
+        let msg = super::super::auto_zoom::estimate_with(
+            &source,
+            0,
+            16,
+            None,
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
     }
 
