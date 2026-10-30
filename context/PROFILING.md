@@ -137,6 +137,15 @@ not "the run was not profiled".
     "limit_bytes": 34359738368,     // the probed figure; null if unprobed
     "limit_source": "available memory (MemAvailable)"
   },
+  "pass0": {                        // #788: remote staging; null for a local
+    "stage_secs": 1.2,              // input or a staging that stopped on an
+    "requests": 13,                 // error
+    "bytes_to_stage": 105060035,
+    "bytes_fetched": 105060035,
+    "max_in_flight": 8,
+    "failed_requests": 0,
+    "unstaged_bytes": 0
+  },
   "levels": [                       // per WRITTEN level, writer order
     { "rows": 1000, "spill_bytes": 0 }
   ],
@@ -219,6 +228,30 @@ the batches are held, so neither is subtracted.
 See `docs/guides/scaling.md` (*Sizing the coarse job's memory*) for how to turn `bytes_per_row`
 into a box size.
 
+### `pass0` (#788)
+
+Pass 0 stages a remote input's selected row groups to the local disk spill
+before pass 1, so both passes read from disk. The record says what it did:
+
+- `stage_secs`: wall seconds from planning to the last landed request.
+- `bytes_to_stage`: the plan's footprint, the compressed size of every
+  selected row group's chunks of the columns the conversion reads, summed
+  over the remote parts. The `#272` spill-space preflight compares this
+  figure against free space.
+- `requests`, `bytes_fetched`: range requests that landed and the bytes
+  they returned. Staging never fetches an excluded column or a pruned row
+  group, so with no earlier staging `bytes_fetched` equals `bytes_to_stage`
+  (a coalescing window can add the gap bytes between merged chunks).
+- `max_in_flight`: the most requests in flight at once, across all parts.
+  It is capped by `TYLERTOO_STAGING_CONCURRENCY` and by the memory budget.
+- `failed_requests`, `unstaged_bytes`: a failed request is retried once,
+  split into its row groups. These count the requests that failed twice and
+  the chunk bytes they kept out of the spill. The passes read those chunks
+  over the network, one request per chunk.
+
+`null` means a local input, or a staging that stopped on an error no retry
+fixes (the object changed or is unreadable); the run's warnings say which.
+
 ### `peak_rss_mib` vs `rss_sampler` (#571)
 
 `peak_rss_mib` only ever samples RSS **at the five phase boundaries** above
@@ -244,7 +277,9 @@ boundary sample behind `peak_rss_mib`. It reports:
   `pass1 scan` and `assignment+budget (winner tables)`, or `plan load` in
   their place on a `--plan` run, then `pre-pass2 (winner tables freed)`,
   `pass2 (output sink)` and `writer.finish`. The object's key order carries
-  no meaning; read the order from this list.
+  no meaning; read the order from this list. A remote input adds
+  `pass0 staging` inside `preflight`: the run enters it after the checks
+  and returns to `preflight` for the in-memory load that follows.
 
 A spike shorter than `interval_ms` that falls between two samples is still
 missed, so `true_peak_mib` is a lower bound on the real high-water mark,

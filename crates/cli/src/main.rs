@@ -632,33 +632,20 @@ fn tiles_input(spec: &InputSpec) -> tylertoo_core::overview::tiles::TilesInput {
 
 /// One line naming which half of the tile space this job owns (#498), logged
 /// before any work so a fleet's logs say what each task was for.
-fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: u8) {
+fn log_shard_job(job: &ShardJob, min_zoom: u8, max_zoom: MaxZoom) {
+    // `auto` is resolved inside the facade, which logs the pick (#444).
+    let finest = match max_zoom {
+        MaxZoom::Fixed(z) => format!("z{z}"),
+        MaxZoom::Auto => "the auto max zoom".to_string(),
+    };
     log::info!(
         "[tiles] shard job {}: {}",
         job.role,
         match job.range {
-            Some(r) => format!("zooms z{}..=z{max_zoom} of tile range {r}", job.pivot),
+            Some(r) => format!("zooms z{}..={finest} of tile range {r}", job.pivot),
             None => format!("zooms z{min_zoom}..=z{}", job.pivot.saturating_sub(1)),
         }
     );
-}
-
-/// Resolve `--max-zoom auto` (#444) for a run whose `options` were built with
-/// [`MaxZoom::plan_zoom`] and whose cheap checks have all passed. Core owns
-/// the whole rule ([`MaxZoom::resolve`]); a `Fixed` zoom returns verbatim
-/// without opening the input. For `auto` a dedicated source is resolved, so
-/// the conversion's own source (and any column selection on it) is untouched.
-fn resolve_max_zoom(
-    max_zoom: MaxZoom,
-    spec: &InputSpec,
-    options: &mut tylertoo_core::overview::convert::ConvertOptions,
-) -> Result<u8> {
-    if !max_zoom.is_auto() {
-        return Ok(max_zoom.plan_zoom());
-    }
-    let source = resolve_convert_source(spec)?;
-    // `None`: the caller ran `config::check_output` on the output first.
-    Ok(max_zoom.resolve(&source, options, None)?)
 }
 
 /// Which job of a sharded fleet this `tiles` run is, and the slice of the
@@ -672,9 +659,11 @@ struct ShardJob {
     pivot: u8,
     /// `ShardPlan::cut_digest_hex` — the fleet-wide identity of the cut.
     cut_digest: String,
-    /// The bound plan, kept so a `--max-zoom auto` run can re-check the
-    /// pivot once the real zoom is known (#444).
+    /// The loaded plan and its path: the facade verifies it against the
+    /// input it opens and re-checks the pivot once `--max-zoom auto` is
+    /// resolved (#444), on that same source.
     plan: tylertoo_core::shard::ShardPlan,
+    plan_path: PathBuf,
 }
 
 impl ShardJob {
@@ -687,6 +676,10 @@ impl ShardJob {
             range: self.range,
             pivot_zoom: self.pivot,
             cut_digest: self.cut_digest.clone(),
+            binding: Some(tylertoo_core::overview::tiles::ShardBinding {
+                plan: self.plan.clone(),
+                path: self.plan_path.clone(),
+            }),
         }
     }
 }
@@ -698,7 +691,6 @@ impl ShardJob {
 /// for a different (or since-rewritten) file is an error in milliseconds
 /// rather than a fleet of jobs that each tile something slightly different.
 fn resolve_shard_job(
-    spec: &InputSpec,
     shard: Option<&str>,
     shard_plan: Option<&Path>,
     max_zoom: u8,
@@ -720,11 +712,10 @@ fn resolve_shard_job(
     let plan_path = shard_plan.expect("clap requires --shard-plan alongside --shard");
     let role = ShardRole::parse(shard)?;
 
-    // Bind the plan to the input, the same way the convert plan binds itself:
-    // a plan cut for a different (or since-rewritten) file is an error here
-    // rather than a fleet that each tiles something slightly different.
-    let source = resolve_convert_source(spec)?;
-    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, Some(&source))?;
+    // The plan is bound to the input by the facade, on the source it
+    // converts (#788: one source per run): a plan cut for a different (or
+    // since-rewritten) file is refused there before any row is read.
+    let (plan, range) = tylertoo_core::shard::resolve_range(plan_path, role, None)?;
 
     // Core owns the pivot-vs-finest-zoom rule (inclusive: pivot == max_zoom
     // leaves every shard exactly one zoom, which is legal), so the Rust API
@@ -744,6 +735,7 @@ fn resolve_shard_job(
         // every data shard (which must present the same cut).
         cut_digest: plan.cut_digest_hex(),
         plan,
+        plan_path: plan_path.to_path_buf(),
     }))
 }
 
@@ -760,15 +752,12 @@ fn resolve_convert_source(spec: &InputSpec) -> Result<tylertoo_core::input_set::
     })
 }
 
-/// The run-time half of a `tiles` configuration, which reads the input:
-/// the sharded-fleet job (#498) and `--max-zoom auto` (#444). Each step
-/// re-runs core's validation first, so everything that can fail without
-/// reading fails before the next read.
-fn resolve_tiles_job(
-    args: &TilesArgs,
-    spec: &InputSpec,
-    options: &mut TilesOptions,
-) -> Result<Option<ShardJob>> {
+/// The sharded-fleet half of a `tiles` configuration (#498): load the shard
+/// plan, check it against the build without reading the input, and hand the
+/// job to the facade, which binds it to the input it opens and resolves
+/// `--max-zoom auto` there (#444, #788). Core's validation runs before and
+/// after.
+fn resolve_tiles_job(args: &TilesArgs, options: &mut TilesOptions) -> Result<Option<ShardJob>> {
     let validate = |options: &TilesOptions| {
         if args.plan_only {
             options.validate_plan_only()
@@ -778,12 +767,7 @@ fn resolve_tiles_job(
     };
     validate(options)?;
     let max_zoom = args.max_zoom.plan_zoom();
-    let shard = resolve_shard_job(
-        spec,
-        args.shard.as_deref(),
-        args.shard_plan.as_deref(),
-        max_zoom,
-    )?;
+    let shard = resolve_shard_job(args.shard.as_deref(), args.shard_plan.as_deref(), max_zoom)?;
     if let Some(job) = &shard {
         // The fleet-wide selection now, so `--max-zoom auto` estimates over
         // the rows this job reads; the facade applies the rest (#439).
@@ -792,13 +776,9 @@ fn resolve_tiles_job(
         options.shard = Some(tiles_shard);
         validate(options)?;
     }
-    // #444: every cheap check has passed; now estimate `auto` (a fixed zoom
-    // comes back verbatim, no I/O). A shard plan was bound against the
-    // placeholder, so its pivot is re-checked against the real value.
-    let max_zoom = resolve_max_zoom(args.max_zoom, spec, &mut options.convert)?;
-    if let (Some(job), Some(plan_path)) = (&shard, args.shard_plan.as_deref()) {
-        job.plan.check_max_zoom(max_zoom, plan_path)?;
-    }
+    // #444/#788: `--max-zoom auto` is estimated by the facade over the
+    // source it converts (the shard plan is verified, and its pivot
+    // re-checked against the resolved zoom, on that same source).
     if let Some(job) = &shard {
         if args.plan_only {
             // The coarse job's usual line names the zooms it builds; this one
@@ -810,7 +790,7 @@ fn resolve_tiles_job(
                 job.pivot
             );
         } else {
-            log_shard_job(job, args.min_zoom, max_zoom);
+            log_shard_job(job, args.min_zoom, args.max_zoom);
         }
     }
     Ok(shard)
@@ -853,7 +833,7 @@ fn run_plan_only(args: TilesArgs) -> Result<()> {
     // #600: export flags are ignored here, but not unchecked: core validates
     // the same `TilesOptions` the full coarse job runs with.
     let mut options = tiles_options(&args)?;
-    let shard = resolve_tiles_job(&args, &spec, &mut options)?;
+    let shard = resolve_tiles_job(&args, &mut options)?;
     // #600: the fleet recipe is the coarse job's line plus this flag, and that
     // line carries export-only flags. They cannot move the plan, so they are
     // tolerated, and said so once, now that every refusal has run. Core names
@@ -1038,7 +1018,7 @@ fn run_tiles(args: TilesArgs) -> Result<()> {
     // which on a large input runs for minutes before the export would
     // otherwise refuse a knob; core re-checks inside the facade.
     let mut tiles_options = tiles_options(&args)?;
-    resolve_tiles_job(&args, &spec, &mut tiles_options)?;
+    resolve_tiles_job(&args, &mut tiles_options)?;
     let squares = makes_placeholder_squares(&tiles_options.convert);
     let input = tiles_input(&spec);
 
@@ -1226,11 +1206,10 @@ fn run_overview(args: OverviewArgs) -> Result<()> {
         .collect();
     preflight_report(args.report.as_deref(), &named)?;
 
-    let mut options = overview_options(&args)?;
-    // #444/#779: every rule that needs no input, then the estimate (which
-    // reads the input) last.
+    let options = overview_options(&args)?;
+    // #779: every rule that needs no input. `--max-zoom auto` is estimated
+    // by the conversion over its own source (#444, #788).
     options.validate()?;
-    resolve_max_zoom(args.max_zoom, &spec, &mut options)?;
 
     let report = run_convert(&spec, &output, &options)?;
 
@@ -1981,9 +1960,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shards.json");
         plan.save(&path).unwrap();
-        let spec = InputSpec::Path(input);
-        assert!(resolve_shard_job(&spec, None, None, 6).unwrap().is_none());
-        assert!(resolve_shard_job(&spec, None, Some(&path), 6).is_err());
+        assert!(resolve_shard_job(None, None, 6).unwrap().is_none());
+        assert!(resolve_shard_job(None, Some(&path), 6).is_err());
         for (selector, role, range) in [
             ("coarse", ShardRole::Coarse, None),
             (
@@ -1995,7 +1973,7 @@ mod tests {
                 Some((plan.ranges[0].lo, plan.ranges[0].hi)),
             ),
         ] {
-            let job = resolve_shard_job(&spec, Some(selector), Some(&path), 6)
+            let job = resolve_shard_job(Some(selector), Some(&path), 6)
                 .unwrap()
                 .expect("a requested shard must not become an unsharded run");
             assert_eq!(job.role, role);
@@ -2004,7 +1982,7 @@ mod tests {
             assert_eq!(job.cut_digest, plan.cut_digest_hex());
             assert_eq!(job.plan.cut_digest_hex(), plan.cut_digest_hex());
         }
-        assert!(resolve_shard_job(&spec, Some("0/2"), Some(&path), 2).is_err());
+        assert!(resolve_shard_job(Some("0/2"), Some(&path), 2).is_err());
     }
 
     /// Every subcommand clap knows is left alone by the bare-form rewrite,
@@ -3207,21 +3185,24 @@ mod tests {
         assert_eq!(parse_tiles(&[]).max_zoom, MaxZoom::Fixed(14));
     }
 
-    /// #444: a `Fixed` `--max-zoom` resolves to the exact same number with
-    /// **zero I/O** — the input does not even exist — and leaves the options
-    /// untouched: the numeric path hands core the same `u8` it always did.
+    /// #444/#788: `--max-zoom` becomes the options' level plan and auto flag
+    /// with zero I/O; the conversion resolves `auto` over its own source.
     #[test]
-    fn resolve_max_zoom_fixed_is_pure_and_does_not_touch_the_input() {
-        let spec = InputSpec::Path(PathBuf::from("/nonexistent/definitely-not-a-file.parquet"));
-        for z in [0u8, 6, 14, 30] {
-            let mut options = tylertoo_core::overview::convert::ConvertOptions::default();
-            let before = format!("{:?}", options.levels);
-            assert_eq!(
-                resolve_max_zoom(MaxZoom::Fixed(z), &spec, &mut options).unwrap(),
-                z
-            );
-            assert_eq!(format!("{:?}", options.levels), before);
-        }
+    fn max_zoom_sets_the_plan_and_the_auto_flag_without_reading() {
+        use tylertoo_core::overview::convert::LevelPlan;
+        let fixed = tiles_options(&parse_tiles(&["--max-zoom", "9"])).unwrap();
+        assert!(!fixed.convert.auto_max_zoom);
+        assert!(matches!(
+            fixed.convert.levels,
+            LevelPlan::ZoomRange { max_zoom: 9, .. }
+        ));
+        let auto = tiles_options(&parse_tiles(&["--max-zoom", "auto"])).unwrap();
+        assert!(auto.convert.auto_max_zoom);
+        assert!(matches!(
+            auto.convert.levels,
+            LevelPlan::ZoomRange { max_zoom, .. }
+                if max_zoom == MaxZoom::Auto.plan_zoom()
+        ));
     }
 
     #[test]

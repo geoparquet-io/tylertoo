@@ -191,34 +191,129 @@ pub(crate) enum Pass2Strategy {
 /// Pass 0 (#286/#287): stage the selected row groups to local disk up front so
 /// the two passes below read from the spill, not the network.
 ///
-/// A row group's column chunks are a contiguous span, so each is fetched as ONE
-/// coalesced range request (several in flight per part) and spilled. This
-/// removes the per-column-chunk serial re-fetch (#287) and the cold pass-2
-/// re-fetch of the property columns pass 1's projection skips (#286).
-/// Best-effort and no-op for local input: a staging error is logged and the
-/// passes fall back to the reader's lazy network path (the same bytes, just
-/// uncoalesced), so staging never regresses correctness.
+/// One plan (#788) covers every part: the selected row groups' chunks of the
+/// columns the conversion reads, fetched as range requests that are in
+/// flight across parts at once, and sliced into the spill. This removes the
+/// per-column-chunk serial re-fetch (#287) and the cold pass-2 re-fetch of
+/// the property columns pass 1's projection skips (#286), and fetches no
+/// excluded column (#400). Best-effort and no-op for local input: a failed
+/// request is retried as its row groups, and what still fails is read by the
+/// passes over the reader's lazy network path (the same bytes, uncoalesced),
+/// so staging never regresses correctness.
+///
+/// The requests in flight hold their bytes in memory until they land, so
+/// they are granted from the run's `budget` ([`stage_granted`]).
+///
+/// Returns the `pass0` record of the profile dump: `None` for local input,
+/// or when staging stopped on an error (the warning says which).
 fn stage_input_pass0(
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
     row_groups_read: usize,
+    (budget, profile): (&mut MemoryBudget, super::level::MemoryProfile),
     diagnostics: &crate::diagnostics::Diagnostics,
-) {
+) -> Option<Pass0Record> {
     if !source.is_remote() {
-        return;
+        return None;
     }
     let t_stage = Instant::now();
-    match source.stage_selected(selected_row_groups) {
-        Ok(()) => log::info!(
-            "[convert] staged {row_groups_read} selected row group(s) to local \
-             disk in {:.1}s",
-            t_stage.elapsed().as_secs_f64()
-        ),
-        Err(e) => diagnostics.warn(format!(
-            "[convert] input staging failed ({e}); passes will read over the \
-             network (uncoalesced)"
-        )),
+    let staged = source.staging_plan(selected_row_groups).and_then(|plan| {
+        let report = stage_granted(source, &plan, budget, profile)?;
+        Ok((plan.bytes_to_stage(), report))
+    });
+    match staged {
+        Ok((bytes_to_stage, report)) => {
+            let stage_secs = t_stage.elapsed().as_secs_f64();
+            log::info!(
+                "[convert] staged {row_groups_read} selected row group(s) to local \
+                 disk in {stage_secs:.1}s ({} request(s), {} B, up to {} in flight)",
+                report.requests,
+                report.bytes_fetched,
+                report.max_in_flight
+            );
+            if report.failed_requests > 0 {
+                diagnostics.warn(format!(
+                    "[convert] input staging left {} B in {} request(s) unstaged ({}); \
+                     the passes read those chunks over the network",
+                    report.unstaged_bytes,
+                    report.failed_requests,
+                    report.first_error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+            Some(Pass0Record {
+                stage_secs,
+                bytes_to_stage,
+                report,
+            })
+        }
+        Err(e) => {
+            diagnostics.warn(format!(
+                "[convert] input staging failed ({e}); passes will read over the \
+                 network (uncoalesced)"
+            ));
+            None
+        }
     }
+}
+
+/// Fetch `plan` with its requests in flight granted from `budget` (#788,
+/// [`MemoryPhase::Stage`]): units of the plan's largest request (a footer
+/// price), up to the concurrency ceiling, or what
+/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` fits when that is set, never fewer
+/// than one, granted under `profile` as every phase is
+/// ([`MemoryBudget::fit`]). The grant is released when staging ends. Pass 0 and the
+/// `--max-zoom auto` sample both stage through it.
+pub(super) fn stage_granted(
+    source: &ConvertSource,
+    plan: &crate::input_set::StagingPlan,
+    budget: &mut MemoryBudget,
+    profile: super::level::MemoryProfile,
+) -> Result<crate::input::StagingReport, crate::input::InputError> {
+    use super::memory::{Price, PriceBasis};
+    let largest = plan.largest_request().max(1);
+    let (ceiling, budget_override) = crate::input::staging_want();
+    let want = budget_override.map_or(ceiling, |bytes| {
+        usize::try_from(bytes / largest)
+            .unwrap_or(usize::MAX)
+            .clamp(1, ceiling.max(1))
+    });
+    let grant = budget.fit(
+        profile,
+        MemoryPhase::Stage,
+        Price::new(largest, PriceBasis::Footer),
+        want,
+        1,
+    );
+    let report = source.stage_within(plan, grant.bytes());
+    budget.release(grant);
+    report
+}
+
+/// What pass 0 did (#788): the `pass0` record of the `TYLERTOO_PROFILE_JSON`
+/// dump.
+#[derive(Debug, Clone)]
+struct Pass0Record {
+    /// Wall seconds from planning to the last landed request.
+    stage_secs: f64,
+    /// The plan's projected footprint ([`ConvertSource::bytes_to_stage`]).
+    bytes_to_stage: u64,
+    report: crate::input::StagingReport,
+}
+
+/// The `pass0` object of the dump; `null` for local input, or when staging
+/// stopped on an error.
+fn pass0_json(record: Option<&Pass0Record>) -> serde_json::Value {
+    record.map_or(serde_json::Value::Null, |r| {
+        serde_json::json!({
+            "stage_secs": r.stage_secs,
+            "requests": r.report.requests,
+            "bytes_to_stage": r.bytes_to_stage,
+            "bytes_fetched": r.report.bytes_fetched,
+            "max_in_flight": r.report.max_in_flight,
+            "failed_requests": r.report.failed_requests,
+            "unstaged_bytes": r.report.unstaged_bytes,
+        })
+    })
 }
 
 /// Resolve an in-flight depth (auto-sizing from available cores when the
@@ -2380,6 +2475,9 @@ struct Preflight {
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// What pass 0 staged (#788), for the dump's `pass0` record; filled by
+    /// `run_front_half` after the preflight.
+    pass0: Option<Pass0Record>,
 }
 
 fn preflight(
@@ -2528,14 +2626,8 @@ fn preflight_with_memory_limit(
         diagnostics,
     );
 
-    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
-    // passes below read from the spill, not the network.
-    stage_input_pass0(
-        source,
-        selected_row_groups.as_ref(),
-        row_groups_read,
-        diagnostics,
-    );
+    // (Pass 0, staging, runs right after this preflight, in
+    // `run_front_half`, inside its own `pass0 staging` RSS phase.)
 
     // (Reserved-column collisions, #288, were resolved above, before the
     // row-group selection: any input column named `level` / `point_count` /
@@ -2570,6 +2662,7 @@ fn preflight_with_memory_limit(
         row_groups_read,
         crs_assumed_wgs84,
         pass1_memory,
+        pass0: None,
     })
 }
 
@@ -2700,6 +2793,21 @@ fn run_front_half(
         return Err(ConvertError::RankingConflict);
     }
     let mut preflight = preflight(source, options, diagnostics)?;
+    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
+    // passes below read from the spill, not the network. Its own RSS phase
+    // for a remote input (#788); the in-memory load below is still
+    // "preflight", as before.
+    if source.is_remote() {
+        rss.enter_phase("pass0 staging");
+        preflight.pass0 = stage_input_pass0(
+            source,
+            preflight.selected_row_groups.as_ref(),
+            preflight.row_groups_read,
+            (&mut preflight.budget, options.profile),
+            diagnostics,
+        );
+        rss.enter_phase("preflight");
+    }
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
@@ -3267,6 +3375,7 @@ pub(crate) fn run_stages(
         row_groups_read,
         crs_assumed_wgs84,
         pass1_memory: preflight_report,
+        pass0,
     } = preflight;
     let options = &resolved_options;
     let PlanState {
@@ -3501,6 +3610,7 @@ pub(crate) fn run_stages(
             sink_measurement,
             spill_reservation,
             pass1_memory: preflight_report,
+            pass0,
         },
         diagnostics,
     );
@@ -3607,6 +3717,8 @@ struct ProfileJsonContext<'a> {
     spill_reservation: SpillReservation,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// #788: what pass 0 staged; `None` for local input.
+    pass0: Option<Pass0Record>,
 }
 
 /// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] and hand it to
@@ -3640,6 +3752,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
             sink_measurement: ctx.sink_measurement,
             spill_reservation: ctx.spill_reservation,
             pass1_memory: ctx.pass1_memory,
+            pass0: ctx.pass0,
         },
         diagnostics,
     );
@@ -3698,6 +3811,9 @@ struct ProfileJsonInputs<'a> {
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict
     /// (`pass1_memory_preflight` in the dump).
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// #788: what pass 0 staged (`pass0` in the dump; `null` for local
+    /// input).
+    pass0: Option<Pass0Record>,
 }
 
 /// Validate `TYLERTOO_PROFILE_JSON` at option-validation time (#517 S2), if
@@ -3874,6 +3990,7 @@ fn write_profile_json(
         // #543 + #626: the pre-scan pass-1 memory verdict. A run that was
         // warned here and then OOM-killed leaves the warning in the record.
         "pass1_memory_preflight": pass1_memory_json(inputs.pass1_memory),
+        "pass0": pass0_json(inputs.pass0.as_ref()),
         "levels": levels_json,
         "peak_rss_mib": inputs.peak_rss_mib,
         "rss_sampler": rss_sampler_json(&inputs.rss_sampler_report),
@@ -6709,6 +6826,64 @@ mod tests {
         feats.iter().collect()
     }
     use super::*;
+
+    /// #788: pass 0's requests in flight are granted from the run's memory
+    /// budget and released when staging ends. A budget that affords one of
+    /// the plan's largest requests stages one at a time; a roomy one reaches
+    /// the concurrency ceiling.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn staging_in_flight_is_granted_from_the_run_memory_budget() {
+        use crate::input::probe_store::ProbeStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rg.parquet");
+        let n = 400;
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
+            .map(|i| Some(geo::Geometry::Point(geo::Point::new(i as f64 * 0.001, 0.0))))
+            .collect();
+        let values: Vec<f64> = (0..n).map(f64::from).collect();
+        super::super::testutil::write_input_with_f64_row_groups(
+            &path,
+            &geoms,
+            "v",
+            &values,
+            Some(50),
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::silent();
+        let run = |budget: &mut MemoryBudget| {
+            let store = ProbeStore::new(
+                &[("rg.parquet", bytes.clone())],
+                std::time::Duration::from_millis(50),
+            );
+            let source = ConvertSource::single(store.source("rg.parquet"));
+            let largest = source.staging_plan(None).unwrap().largest_request();
+            let record = stage_input_pass0(
+                &source,
+                None,
+                8,
+                (budget, MemoryProfile::Auto),
+                &diagnostics,
+            )
+            .unwrap();
+            assert_eq!(record.report.requests, 8, "one request per row group");
+            (largest, record.report.max_in_flight)
+        };
+
+        let mut roomy = MemoryBudget::with_available(Some(1 << 40));
+        let before = roomy.remaining();
+        let (_, in_flight) = run(&mut roomy);
+        assert_eq!(in_flight, 8, "a roomy budget reaches the ceiling");
+        assert_eq!(roomy.remaining(), before, "the grant is released");
+
+        let (largest, _) = run(&mut MemoryBudget::with_available(Some(1 << 40)));
+        let mut tight = MemoryBudget::with_available(Some(largest));
+        let (_, in_flight) = run(&mut tight);
+        assert_eq!(
+            in_flight, 1,
+            "a budget that fits one request stages one at a time"
+        );
+    }
 
     use geo::{LineString, Point, Polygon};
 

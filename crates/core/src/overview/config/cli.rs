@@ -770,10 +770,11 @@ pub fn tiles_options(args: &TilesArgs) -> Result<TilesOptions, TilesError> {
     )?;
     // Overviews for PMTiles are always duplicating (partitioning can't be
     // exported to per-tile MVT).
-    let convert = args
+    let mut convert = args
         .tuning
         .build_convert_options(Mode::Duplicating, levels, bbox, false)
         .map_err(TilesError::Convert)?;
+    convert.auto_max_zoom = args.max_zoom.is_auto();
     let export = args
         .export
         .apply(TilesOptions::export_defaults(args.tuning.syntax.verbatim));
@@ -814,12 +815,14 @@ pub fn overview_options(args: &OverviewArgs) -> Result<ConvertOptions, ConvertEr
         args.max_zoom,
         args.tuning.options.bbox,
     )?;
-    args.tuning.build_convert_options(
+    let mut options = args.tuning.build_convert_options(
         args.tuning.options.mode,
         levels,
         bbox,
         args.tuning.options.cogp_compat_key,
-    )
+    )?;
+    options.auto_max_zoom = args.max_zoom.is_auto();
+    Ok(options)
 }
 
 ///

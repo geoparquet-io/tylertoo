@@ -198,6 +198,10 @@ values turn out to be unusable all take the geometry path. The covering is
 taken on trust, so a stale one — a file whose reprojection left the bbox
 struct untouched — moves the pick.
 
+The estimate reads the same input the conversion then reads. On remote input
+it fetches the sampled column's chunks concurrently and keeps them in the
+disk spill, so the conversion does not fetch them again.
+
 It picks the zoom where one pixel of a 256 px tile resolves about half the
 smaller of two measures, in Web Mercator meters:
 
@@ -1805,7 +1809,7 @@ processed at once, and how many row groups the writer encodes at once.
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
 | `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
-| `--read-workers N\|auto` | cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
+| `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
 - **`speed`** sets no limit. Each level's rows stay in RAM, and every knob
   runs at its maximum: every requested reader at the full read-ahead depth,
