@@ -1436,14 +1436,6 @@ impl LayerBuilder {
         self.quantized
     }
 
-    #[cfg(test)]
-    fn get_or_insert_value(&mut self, value: &PropertyValue) -> u32 {
-        self.index
-            .value(value, &|s| std::borrow::Cow::Owned(s.to_owned()), |v| {
-                self.values.push(v.to_mvt_value())
-            })
-    }
-
     /// Add a feature to the layer.
     ///
     /// A `GeometryCollection` is split with [`flatten_geometry_collection`]
@@ -3316,14 +3308,19 @@ mod tests {
             })
             .collect();
 
-        let mut layer = LayerBuilder::new("l");
+        let mut index = tag_index::TagIndex::default();
+        let mut interned = Vec::new();
         let got: Vec<u32> = values
             .iter()
-            .map(|v| layer.get_or_insert_value(v))
+            .map(|v| {
+                index.value(v, &|s| std::borrow::Cow::Owned(s.to_owned()), |v| {
+                    interned.push(v.to_mvt_value())
+                })
+            })
             .collect();
         assert_eq!(got, expected, "value indexes diverged from the Debug key");
         assert_eq!(
-            layer.values.len(),
+            interned.len(),
             reference_next as usize,
             "value table length diverged"
         );
