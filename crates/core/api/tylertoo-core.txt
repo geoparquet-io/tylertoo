@@ -816,6 +816,7 @@ pub enum tylertoo_core::input_set::ConvertSource
 pub tylertoo_core::input_set::ConvertSource::Multi(tylertoo_core::input_set::MultiSource)
 pub tylertoo_core::input_set::ConvertSource::Single(tylertoo_core::input_set::SingleSource)
 impl tylertoo_core::input_set::ConvertSource
+pub fn tylertoo_core::input_set::ConvertSource::bytes_to_stage(&self, core::option::Option<&tylertoo_core::input_set::RowGroupSelection>) -> core::result::Result<u64, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::column_projection(&self) -> core::option::Option<&[usize]>
 pub fn tylertoo_core::input_set::ConvertSource::display_name(&self) -> alloc::string::String
 pub fn tylertoo_core::input_set::ConvertSource::fetch_stats(&self) -> core::option::Option<tylertoo_core::input::FetchStats>
@@ -1626,7 +1627,6 @@ pub fn tylertoo_core::overview::config::keywords::convert(serde_json::map::Map<a
 pub fn tylertoo_core::overview::config::keywords::defaults<T: serde_core::ser::Serialize>(T) -> serde_json::map::Map<alloc::string::String, serde_json::value::Value>
 pub fn tylertoo_core::overview::config::keywords::deserialize_value<'de>(&str, impl serde_core::de::Deserializer<'de>) -> core::result::Result<serde_json::value::Value, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::keywords::export(serde_json::map::Map<alloc::string::String, serde_json::value::Value>, tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportOptions, tylertoo_core::overview::config::ConfigError>
-pub fn tylertoo_core::overview::config::keywords::max_zoom(&mut serde_json::map::Map<alloc::string::String, serde_json::value::Value>, &str) -> core::result::Result<tylertoo_core::overview::auto_zoom::MaxZoom, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::keywords::pyramid(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::pyramid::PyramidOptions, tylertoo_core::overview::config::ConfigError>
 pub fn tylertoo_core::overview::config::keywords::tiles(serde_json::map::Map<alloc::string::String, serde_json::value::Value>) -> core::result::Result<tylertoo_core::overview::tiles::TilesOptions, tylertoo_core::overview::tiles::TilesError>
 pub fn tylertoo_core::overview::config::keywords::validate_rank_syntax<'de>(impl serde_core::de::Deserializer<'de>) -> core::result::Result<(), tylertoo_core::overview::config::ConfigError>
@@ -1935,6 +1935,7 @@ impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::convert::
 pub struct tylertoo_core::overview::convert::ConvertOptions
 pub tylertoo_core::overview::convert::ConvertOptions::accumulate: alloc::vec::Vec<tylertoo_core::overview::cluster::AccumulateSpec>
 pub tylertoo_core::overview::convert::ConvertOptions::assign: tylertoo_core::overview::assign::AssignConfig
+pub tylertoo_core::overview::convert::ConvertOptions::auto_max_zoom: bool
 pub tylertoo_core::overview::convert::ConvertOptions::bbox: core::option::Option<[f64; 4]>
 pub tylertoo_core::overview::convert::ConvertOptions::class_ranking: core::option::Option<tylertoo_core::overview::convert::ClassRanking>
 pub tylertoo_core::overview::convert::ConvertOptions::cluster: bool
@@ -2229,6 +2230,10 @@ pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::available: u64
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::needed: u64
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::phase: &'static str
 pub tylertoo_core::overview::export::ExportError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::export::ExportError::CoveringProperty
@@ -2557,7 +2562,6 @@ pub const tylertoo_core::overview::export::DEFAULT_COMPRESSED_TILE_SIZE_LIMIT: u
 pub const tylertoo_core::overview::export::DEFAULT_TILE_SIZE_LIMIT: usize
 pub const tylertoo_core::overview::export::MAX_TILE_BUFFER_PX: u32
 pub const tylertoo_core::overview::export::PARTITION_WAVE_AUTO: usize
-pub const tylertoo_core::overview::export::PARTITION_WAVE_FALLBACK_MAX: usize
 pub const tylertoo_core::overview::export::PARTITION_WAVE_MIN: usize
 pub fn tylertoo_core::overview::export::export_pmtiles(impl core::convert::AsRef<std::path::Path>, impl core::convert::AsRef<std::path::Path>, &tylertoo_core::overview::export::ExportOptions) -> core::result::Result<tylertoo_core::overview::export::ExportReport, tylertoo_core::overview::export::ExportError>
 pub fn tylertoo_core::overview::export::resolve_partition_wave(usize) -> usize
@@ -3494,6 +3498,7 @@ pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::dir: std::path::PathBuf
 pub tylertoo_core::overview::tiles::TilesError::IntermediateCreate::source: core::io::error::Error
 pub tylertoo_core::overview::tiles::TilesError::Output(tylertoo_core::atomic_output::OutputNotWritable)
+pub tylertoo_core::overview::tiles::TilesError::Shard(tylertoo_core::shard::ShardError)
 impl tylertoo_core::overview::tiles::TilesError
 pub fn tylertoo_core::overview::tiles::TilesError::is_config(&self) -> bool
 impl core::convert::From<tylertoo_core::atomic_output::OutputNotWritable> for tylertoo_core::overview::tiles::TilesError
@@ -3596,6 +3601,24 @@ impl core::marker::Unpin for tylertoo_core::overview::tiles::IntermediateOvervie
 impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::IntermediateOverview
+pub struct tylertoo_core::overview::tiles::ShardBinding
+pub tylertoo_core::overview::tiles::ShardBinding::path: std::path::PathBuf
+pub tylertoo_core::overview::tiles::ShardBinding::plan: tylertoo_core::shard::ShardPlan
+impl core::clone::Clone for tylertoo_core::overview::tiles::ShardBinding
+pub fn tylertoo_core::overview::tiles::ShardBinding::clone(&self) -> tylertoo_core::overview::tiles::ShardBinding
+impl core::cmp::Eq for tylertoo_core::overview::tiles::ShardBinding
+impl core::cmp::PartialEq for tylertoo_core::overview::tiles::ShardBinding
+pub fn tylertoo_core::overview::tiles::ShardBinding::eq(&self, &tylertoo_core::overview::tiles::ShardBinding) -> bool
+impl core::fmt::Debug for tylertoo_core::overview::tiles::ShardBinding
+pub fn tylertoo_core::overview::tiles::ShardBinding::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for tylertoo_core::overview::tiles::ShardBinding
+impl core::marker::Freeze for tylertoo_core::overview::tiles::ShardBinding
+impl core::marker::Send for tylertoo_core::overview::tiles::ShardBinding
+impl core::marker::Sync for tylertoo_core::overview::tiles::ShardBinding
+impl core::marker::Unpin for tylertoo_core::overview::tiles::ShardBinding
+impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::ShardBinding
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::ShardBinding
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::ShardBinding
 pub struct tylertoo_core::overview::tiles::SpaceRemedies<'a>
 pub tylertoo_core::overview::tiles::SpaceRemedies::keep_overview: &'a str
 pub tylertoo_core::overview::tiles::SpaceRemedies::spill_dir: &'a str
@@ -3659,6 +3682,7 @@ impl core::marker::UnsafeUnpin for tylertoo_core::overview::tiles::TilesReport
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_core::overview::tiles::TilesReport
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_core::overview::tiles::TilesReport
 pub struct tylertoo_core::overview::tiles::TilesShard
+pub tylertoo_core::overview::tiles::TilesShard::binding: core::option::Option<tylertoo_core::overview::tiles::ShardBinding>
 pub tylertoo_core::overview::tiles::TilesShard::cut_digest: alloc::string::String
 pub tylertoo_core::overview::tiles::TilesShard::pivot_zoom: u8
 pub tylertoo_core::overview::tiles::TilesShard::range: core::option::Option<tylertoo_core::shard::TileRange>

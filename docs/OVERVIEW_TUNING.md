@@ -198,6 +198,10 @@ values turn out to be unusable all take the geometry path. The covering is
 taken on trust, so a stale one — a file whose reprojection left the bbox
 struct untouched — moves the pick.
 
+The estimate reads the same input the conversion then reads. On remote input
+it fetches the sampled column's chunks concurrently and keeps them in the
+disk spill, so the conversion does not fetch them again.
+
 It picks the zoom where one pixel of a 256 px tile resolves about half the
 smaller of two measures, in Web Mercator meters:
 
@@ -1803,9 +1807,9 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
-| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export. Export's member store, level stores and wave width follow it as below |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
-| `--read-workers N\|auto` | cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
+| `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
 - **`speed`** sets no limit. Each level's rows stay in RAM, and every knob
   runs at its maximum: every requested reader at the full read-ahead depth,
@@ -1816,8 +1820,9 @@ processed at once, and how many row groups the writer encodes at once.
   IPC files and stream back at write time. Every other phase keeps the caps
   `bounded` always had, and the allowance can only shrink them: at most 4
   readers, each at most 16 batches deep, and at most 4 concurrent row-group
-  encodes. The compute window takes what `--in-flight-batches` asks for,
-  within the allowance. Its peak never exceeds what `bounded` used before
+  encodes. Remote staging holds at most 256 MiB of requests in flight, or
+  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
+  what `--in-flight-batches` asks for, within the allowance. Its peak never exceeds what `bounded` used before
   the run budget existed (#788), whatever the machine.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
   inside one allowance: 60% of available memory, or of
@@ -1827,7 +1832,16 @@ processed at once, and how many row groups the writer encodes at once.
   only what the earlier ones left (#716, #545). Output rows stay in RAM when
   their estimate fits and spill when it does not, and a run that starts in
   RAM keeps measuring and switches to spilling mid-pass if it outgrows the
-  allowance.
+  allowance. Both checks use what the earlier grants left. When those grants
+  take the whole allowance, as the writer's encodes can for wide rows under a
+  small limit, output rows spill from the start.
+
+Export applies the same rule. `speed` keeps every level's tile members in
+RAM and sizes the partition wave from the cores alone; `bounded` spills them
+and keeps the wave caps export always had; `auto` keeps them in RAM when they
+fit the allowance and narrows the wave to fit it. Under every profile, export
+still refuses a tile that alone needs more than the machine's memory
+([Export waves](guides/scaling.md#export-waves)).
 
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
@@ -1850,6 +1864,21 @@ Release binaries use the mimalloc allocator, which is faster than the
 system allocator but can keep freed memory mapped, so a run's RSS can sit
 above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
 remains the setting for memory-constrained machines.
+
+`bounded` keeps main's footprint for the same allocator. The release CLI
+uses mimalloc by default, which adds a fixed floor of about 600 MiB that
+shows on small inputs: under `bounded`, Madagascar (z0-12) peaks at 1,254 MiB
+against 685 MiB with the system allocator, and Moldova at 2,792 against
+2,509 MiB, while running faster (Madagascar 1.4 s against 3.0 s). The floor comes from transparent huge pages on
+mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
+back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
+environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
+most of the speed (Madagascar 2.0 s, Moldova 12.4 s against 9.3 s). A build
+with `--no-default-features` uses the system allocator.
+
+`bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
+`speed` keep raw IPC, including an `auto` downgrade to disk.
+`pass2.sink.spill_codec` records the selected codec.
 
 ### Automatic memory estimate
 
@@ -1937,7 +1966,7 @@ chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|
 | `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
-| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest span)` |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | When set, caps the requests in flight for every profile. Unset, `auto` and `speed` are sized by the run budget, and `bounded` by the 256 MiB default |
 | `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
 | `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |
 

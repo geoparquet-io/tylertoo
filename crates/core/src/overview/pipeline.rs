@@ -56,6 +56,7 @@ use crossbeam_channel::{Receiver, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use tempfile::NamedTempFile;
+use tylertoo_io::IpcCompression;
 use tylertoo_io::IpcStreamReader as StreamReader;
 use tylertoo_io::IpcStreamWriter as StreamWriter;
 
@@ -86,6 +87,21 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
+/// Run-local spill encoding policy, resolved once with the sink backing.
+const fn spill_codec_for_profile(profile: MemoryProfile) -> IpcCompression {
+    match profile {
+        MemoryProfile::Bounded => IpcCompression::Lz4,
+        MemoryProfile::Auto | MemoryProfile::Speed => IpcCompression::None,
+    }
+}
+
+pub(super) const fn spill_codec_name(codec: IpcCompression) -> &'static str {
+    match codec {
+        IpcCompression::None => "raw",
+        IpcCompression::Lz4 => "lz4",
+    }
+}
+
 /// Buffered-row count above which `Auto` always spills partitioning's
 /// full-resolution geometry, regardless of the RAM estimate. Preserves the
 /// pre-#294 partitioning safety floor as a strict lower bound (partitioning
@@ -95,24 +111,20 @@ const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
 ///
-/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds a
-/// fraction of available RAM — a function of `feature_count × level_count ×
+/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds
+/// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
+/// and grant already charged to it — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
 pub(super) fn auto_backing(
+    memory: &MemoryBudget,
     mode: Mode,
     buffered_rows: usize,
-    available_ram_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = MemoryBudget::with_available(available_ram_bytes).sink_estimate(
-        mode,
-        buffered_rows,
-        avg_geom_bytes,
-    );
-    let budget = MemoryBudget::with_available(available_ram_bytes).allowance(MemoryProfile::Auto);
-    let ram_gate_spill = estimate > budget;
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
     if ram_gate_spill || abs_gate_spill {
@@ -139,8 +151,8 @@ pub(super) fn auto_backing(
 ///    non-reclaimable part of the cgroup's current usage is subtracted — the
 ///    same sense as the machine term's `MemAvailable` (#485);
 /// 3. `None` (callers fall back to a fixed conservative budget — see
-///    [`AUTO_FALLBACK_BUDGET_BYTES`] and
-///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
+///    [`MemoryBudget::remaining`]'s fallback allowance, which export's
+///    wave sizing shares).
 ///
 /// The result is computed once per process and cached: the probe is called ~5×
 /// per run (convert's pass-1 grid budget and pass-2 backing decision, export's
@@ -595,13 +607,32 @@ fn read_proc_mem_available() -> Option<u64> {
     None
 }
 
+/// The [`SinkBacking`] `profile` gives the pass-2 sinks, without logging:
+/// `speed` keeps them in RAM, `bounded` spills, and `auto` decides with
+/// [`auto_backing`]. The one owner of that rule: [`resolve_backing`] logs
+/// it, and the spill page-cache reservation (`stream::reserve_spill_cache`)
+/// asks it ahead of the decision.
+pub(super) fn sink_backing(
+    memory: &MemoryBudget,
+    profile: MemoryProfile,
+    mode: Mode,
+    buffered_rows: usize,
+    avg_geom_bytes: Option<u64>,
+) -> SinkBacking {
+    match profile {
+        MemoryProfile::Speed => SinkBacking::Ram,
+        MemoryProfile::Bounded => SinkBacking::Spill,
+        MemoryProfile::Auto => auto_backing(memory, mode, buffered_rows, avg_geom_bytes),
+    }
+}
+
 /// Resolve the [`MemoryProfile`] (including [`MemoryProfile::Auto`]) to a
-/// concrete [`SinkBacking`], logging the decision.
+/// concrete [`SinkBacking`] with [`sink_backing`], logging the decision.
 ///
 /// `buffered_rows` is the total winner count of the levels the engine buffers
 /// (all but the streamed finest level). For `Auto` the choice is workload-based
 /// (#294): the estimated buffered output (`f(buffered_rows, mode)`) is compared
-/// against a fraction of *available* RAM, so large duplicating runs prefer the
+/// against the run budget's allowance, so large duplicating runs prefer the
 /// bounded spill path instead of the old unconditional RAM buffering. An
 /// explicit profile always wins.
 pub(super) fn resolve_backing(
@@ -611,43 +642,32 @@ pub(super) fn resolve_backing(
     buffered_rows: usize,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    match profile {
-        MemoryProfile::Speed => {
-            log::debug!(
-                "pass2 memory profile Speed + {mode:?} (buffered ~{buffered_rows} rows) → Ram"
-            );
-            SinkBacking::Ram
-        }
-        MemoryProfile::Bounded => {
-            log::debug!(
-                "pass2 memory profile Bounded + {mode:?} (buffered ~{buffered_rows} rows) → Spill"
-            );
-            SinkBacking::Spill
-        }
-        MemoryProfile::Auto => {
-            let available = memory.available();
-            let backing = auto_backing(mode, buffered_rows, available, avg_geom_bytes);
-            let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
-            let budget = memory.allowance(MemoryProfile::Auto);
-            let avail_mib = available.map_or_else(
-                || "unknown".to_string(),
-                |b| format!("{} MiB", b / (1024 * 1024)),
-            );
-            let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
-                || "unmeasured (calibrated constants)".to_string(),
-                |b| format!("measured avg geom {b} B/row"),
-            );
-            // Info-level: the auto decision drives peak RAM and is the primary
-            // diagnostic for #294 / #295 (paired with the [rss] phase logs).
-            log::info!(
-                "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
-                 {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
-                estimate / (1024 * 1024),
-                budget / (1024 * 1024),
-            );
-            backing
-        }
+    let backing = sink_backing(&memory, profile, mode, buffered_rows, avg_geom_bytes);
+    if !matches!(profile, MemoryProfile::Auto) {
+        log::debug!(
+            "pass2 memory profile {profile:?} + {mode:?} (buffered ~{buffered_rows} rows) → {backing:?}"
+        );
+        return backing;
     }
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let budget = memory.allowance(MemoryProfile::Auto);
+    let avail_mib = memory.available().map_or_else(
+        || "unknown".to_string(),
+        |b| format!("{} MiB", b / (1024 * 1024)),
+    );
+    let geom = avg_geom_bytes.filter(|&b| b > 0).map_or_else(
+        || "unmeasured (calibrated constants)".to_string(),
+        |b| format!("measured avg geom {b} B/row"),
+    );
+    // Info-level: the auto decision drives peak RAM and is the primary
+    // diagnostic for #294 / #295 (paired with the [rss] phase logs).
+    log::info!(
+        "[convert] pass2 auto + {mode:?}: buffered ~{buffered_rows} rows, \
+         {geom}, est {} MiB vs budget {} MiB (avail {avail_mib}) → {backing:?}",
+        estimate / (1024 * 1024),
+        budget / (1024 * 1024),
+    );
+    backing
 }
 
 // ============================================================================
@@ -664,6 +684,8 @@ const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 /// regression is visible without an RSS trace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkMeasurement {
+    /// The run's private spill encoding, including an auto downgrade.
+    pub(super) codec: IpcCompression,
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
@@ -813,6 +835,7 @@ impl SinkAutoTuner {
 
     fn report(&self) -> SinkMeasurement {
         SinkMeasurement {
+            codec: IpcCompression::None,
             bytes_per_row: self.bytes_per_row(),
             sampled_rows: self.rows,
             projected_bytes: self.projected_bytes(),
@@ -856,14 +879,26 @@ enum LevelSink {
 }
 
 impl LevelSink {
+    #[cfg(test)]
     fn new(
         backing: SinkBacking,
         out_schema: &Schema,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ConvertError> {
+        Self::with_codec(backing, out_schema, spill_dir, IpcCompression::None)
+    }
+
+    fn with_codec(
+        backing: SinkBacking,
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: IpcCompression,
+    ) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema, spill_dir)?),
+            SinkBacking::Spill => {
+                LevelSink::Spill(SpillState::with_codec(out_schema, spill_dir, codec)?)
+            }
         })
     }
 
@@ -911,6 +946,16 @@ impl LevelSink {
         *self = LevelSink::Spill(state);
         Ok(bytes)
     }
+}
+
+/// Keep the retention measurement at the same boundary as the sink's payload.
+fn buffer_batch(
+    sink: &mut LevelSink,
+    tuner: &mut SinkAutoTuner,
+    batch: RecordBatch,
+) -> Result<u64, ConvertError> {
+    tuner.observe(&batch);
+    sink.push(batch)
 }
 
 /// A pass-2 spill file under `spill_dir`, or the process temp dir when none
@@ -963,6 +1008,8 @@ struct SpillState {
     /// `Pass2Timers::spill_write` at join time, since the thread cannot borrow
     /// the driver's timers).
     handle: Option<std::thread::JoinHandle<Result<SpillWriterDone, ConvertError>>>,
+    #[cfg(test)]
+    materialized_rows: u64,
 }
 
 /// What a finished spill-writer thread hands back.
@@ -976,12 +1023,25 @@ impl SpillState {
     /// `spill_dir` is where the spill file goes (#427: `--spill-dir`, the one
     /// scratch knob); `None` is the process temp dir, as before.
     fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
+        // RAM can downgrade only under auto, whose codec stays raw.
+        Self::with_codec(out_schema, spill_dir, IpcCompression::None)
+    }
+
+    fn with_codec(
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: IpcCompression,
+    ) -> Result<Self, ConvertError> {
         let temp = spill_temp_file(spill_dir)?;
         let write_handle = temp.reopen()?;
         // Constructed on the caller's thread so a broken spill directory or an
         // unwritable temp file fails the conversion here, with the caller's
         // error handling, rather than inside a thread nobody has joined yet.
-        let writer = StreamWriter::try_new(BufWriter::new(write_handle), out_schema)?;
+        let writer = StreamWriter::try_new_with_compression(
+            BufWriter::new(write_handle),
+            out_schema,
+            codec,
+        )?;
         Self::spawn(writer, temp)
     }
 
@@ -1015,6 +1075,8 @@ impl SpillState {
         Ok(SpillState {
             tx: Some(tx),
             handle: Some(handle),
+            #[cfg(test)]
+            materialized_rows: 0,
         })
     }
 
@@ -1029,6 +1091,10 @@ impl SpillState {
     /// never the symptom).
     fn push(&mut self, batch: RecordBatch) -> Result<u64, ConvertError> {
         let bytes = batch.get_array_memory_size() as u64;
+        #[cfg(test)]
+        let rows = batch.column_by_name("geometry").map_or(0, |geometry| {
+            (geometry.len() - geometry.null_count()) as u64
+        });
         let Some(tx) = &self.tx else {
             return Err(internal("spill sink pushed after it was closed"));
         };
@@ -1039,6 +1105,10 @@ impl SpillState {
                             // stream still open, which it cannot do.
             self.join()?;
             return Err(internal("spill writer stopped without reporting an error"));
+        }
+        #[cfg(test)]
+        {
+            self.materialized_rows += rows;
         }
         Ok(bytes)
     }
@@ -1069,6 +1139,8 @@ impl SpillState {
         let done = self
             .join()?
             .ok_or_else(|| internal("spill writer joined twice"))?;
+        #[cfg(test)]
+        spill_tests::record_spill(&done.temp, self.materialized_rows);
         Pass2Timers::add_dur(timers.spill_write_cell(), done.write_time);
         let read_handle = done.temp.reopen()?;
         let reader = StreamReader::try_new(BufReader::new(read_handle), None)?;
@@ -1147,9 +1219,12 @@ pub(super) fn run_pass2_buffered(
     let t_engine = Instant::now();
     let timers = Pass2Timers::default();
 
+    let codec = spill_codec_for_profile(profile);
     let mut sinks: Vec<LevelSink> = Vec::with_capacity(num_levels);
     for _ in 0..num_levels {
-        sinks.push(LevelSink::new(backing, out_schema, spill_dir)?);
+        sinks.push(LevelSink::with_codec(
+            backing, out_schema, spill_dir, codec,
+        )?);
     }
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
@@ -1247,8 +1322,8 @@ pub(super) fn run_pass2_buffered(
                         if let Some((out, v)) = out {
                             rows_ref[li] += out.num_rows();
                             verts_ref[li] += v;
-                            tuner_ref.observe(&out);
-                            spill_bytes_ref[li] += sinks_ref[li].push(out)?;
+                            spill_bytes_ref[li] +=
+                                buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
                         }
                     }
                     if tuner_ref.should_downgrade() {
@@ -1332,7 +1407,10 @@ pub(super) fn run_pass2_buffered(
     Ok(Pass2EngineResult {
         levels,
         timers,
-        sink: tuner.report(),
+        sink: SinkMeasurement {
+            codec,
+            ..tuner.report()
+        },
     })
 }
 
@@ -1394,9 +1472,190 @@ fn drain_sink(
 #[cfg(test)]
 mod spill_tests {
     use super::*;
+    use crate::input_set::ConvertSource;
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
+
+    // Observe completed files at the spill owner, rather than treating
+    // get_array_memory_size (the existing profile counter) as disk bytes.
+    // Unique directories isolate simultaneous nextest/plain-cargo tests.
+    type SpillObservations = std::collections::BTreeMap<std::path::PathBuf, Vec<(u64, u64)>>;
+    static OBSERVED: std::sync::Mutex<SpillObservations> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(super) fn record_spill(temp: &NamedTempFile, rows: u64) {
+        if let Some(observations) = OBSERVED
+            .lock()
+            .unwrap()
+            .get_mut(temp.path().parent().unwrap())
+        {
+            observations.push((rows, temp.as_file().metadata().unwrap().len()));
+        }
+    }
+
+    fn measure_verbatim_spill(dir: &Path) -> Vec<(u64, u64)> {
+        use super::super::convert::{
+            convert_to_overviews, ConvertOptions, GeneralizationOverrides, LevelPlan,
+        };
+        use geo::{Geometry, LineString, Polygon};
+
+        const ROWS: usize = 128;
+        let input = dir.join("input.parquet");
+        let output = dir.join("output.parquet");
+        let geoms: Vec<_> = (0..ROWS)
+            .map(|i| {
+                let x = (i % 16) as f64 * 0.1;
+                let y = (i / 16) as f64 * 0.1;
+                Some(Geometry::Polygon(Polygon::new(
+                    LineString::from(vec![
+                        (x, y),
+                        (x + 0.01, y),
+                        (x + 0.01, y + 0.01),
+                        (x, y + 0.01),
+                        (x, y),
+                    ]),
+                    vec![],
+                )))
+            })
+            .collect();
+        super::super::testutil::write_input(&input, &geoms, false, None);
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 9,
+                max_zoom: 13,
+            },
+            profile: MemoryProfile::Bounded,
+            spill_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+        .with_generalization(&GeneralizationOverrides::default(), true)
+        .unwrap();
+        OBSERVED
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), Vec::new());
+        let report = convert_to_overviews(&input, &output, &options).unwrap();
+        assert_eq!(report.levels.len(), 5);
+        assert!(report
+            .levels
+            .iter()
+            .all(|level| level.feature_count == ROWS));
+        let observations = OBSERVED.lock().unwrap().remove(dir).unwrap();
+        assert!(
+            !observations.is_empty(),
+            "bounded workload must exercise spill"
+        );
+        assert!(observations.iter().all(|&(_, bytes)| bytes > 0));
+        eprintln!(
+            "phase1 verbatim: rows/files={observations:?}, output_bytes={}",
+            std::fs::metadata(output).unwrap().len()
+        );
+        observations
+    }
+
+    /// #715: a fixed compressible batch must not consume its full raw payload
+    /// on disk. The bound leaves room for IPC framing and either candidate
+    /// encoding; it is independent of elapsed time and allocator capacity.
+    #[test]
+    fn phase1_spill_bytes_per_level_are_below_raw_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = schema("id");
+        let mut sink = SpillState::with_codec(
+            &s,
+            Some(dir.path()),
+            spill_codec_for_profile(MemoryProfile::Bounded),
+        )
+        .unwrap();
+        const ROWS: usize = 65536;
+        sink.push(batch(&s, vec![0; ROWS])).unwrap();
+        let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+        let disk_bytes = temp.as_file().metadata().unwrap().len();
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+        assert!(
+            disk_bytes <= (ROWS * size_of::<i64>() / 2) as u64,
+            "#715: one level wrote {disk_bytes} disk bytes for {} raw bytes",
+            ROWS * size_of::<i64>()
+        );
+    }
+
+    #[test]
+    fn auto_and_speed_spill_remain_raw() {
+        assert_eq!(
+            spill_codec_for_profile(MemoryProfile::Bounded),
+            IpcCompression::Lz4
+        );
+        for profile in [MemoryProfile::Auto, MemoryProfile::Speed] {
+            let codec = spill_codec_for_profile(profile);
+            assert_eq!(codec, IpcCompression::None);
+            let dir = tempfile::tempdir().unwrap();
+            let schema = schema("id");
+            let mut sink = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+            const ROWS: usize = 65536;
+            sink.push(batch(&schema, vec![0; ROWS])).unwrap();
+            let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+            assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+            assert!(temp.as_file().metadata().unwrap().len() >= (ROWS * size_of::<i64>()) as u64);
+        }
+    }
+
+    /// The current preflight ignores even a measured pass-2 footprint for a
+    /// local source. The injected free-space probe avoids filling a volume.
+    #[test]
+    fn phase1_local_preflight_covers_actual_pass2_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let actual_bytes: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
+        let available = actual_bytes / 2;
+        let disk = measured_disk_footprint(dir.path());
+        assert!(
+            disk.spill_bytes() >= actual_bytes,
+            "the pass-2 component must cover the measured spill"
+        );
+        let warning = disk.warning_with(super::super::tiles::CLI_REMEDIES, |_| {
+            Some(("one volume".into(), available))
+        });
+        assert!(warning.is_some(),
+            "local preflight returned no warning for {actual_bytes} measured spill bytes with only {available} bytes available");
+    }
+
+    fn measured_disk_footprint(dir: &Path) -> super::super::disk::DiskFootprint {
+        use super::super::convert::{ConvertOptions, LevelPlan};
+        let source = ConvertSource::resolve_path(&dir.join("input.parquet")).unwrap();
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 9,
+                max_zoom: 13,
+            },
+            profile: MemoryProfile::Bounded,
+            spill_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        super::super::disk::DiskFootprint::conversion(
+            &source,
+            None,
+            &options,
+            Some(&dir.join("output.parquet")),
+        )
+        .unwrap()
+    }
+
+    /// Bound pessimism on the fixed workload even after encoding changes.
+    /// The estimate uses raw sizing and must cover actual bytes without a
+    /// compression assumption. Its permitted overestimate is at most 32x.
+    #[test]
+    fn disk_estimate_covers_fixed_spill_within_factor_32() {
+        let dir = tempfile::tempdir().unwrap();
+        let observations = measure_verbatim_spill(dir.path());
+        let actual: u64 = observations.iter().map(|&(_, bytes)| bytes).sum();
+        let estimate = measured_disk_footprint(dir.path()).spill_bytes();
+        eprintln!("raw disk estimate={estimate}, actual spill={actual}");
+        assert!(estimate >= actual, "estimate {estimate} < actual {actual}");
+        assert!(
+            estimate <= actual.saturating_mul(32),
+            "estimate {estimate} > 32 × actual {actual}"
+        );
+    }
 
     fn schema(name: &str) -> Schema {
         Schema::new(vec![Field::new(name, DataType::Int64, false)])
@@ -1472,6 +1731,47 @@ mod spill_tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// #709's error path, using the real OS error instead of a string stand-in.
+    /// Both private encodings preserve the OS cause and remove the temp file.
+    #[cfg(unix)]
+    #[test]
+    fn phase1_spill_enospc_preserves_the_os_error() {
+        struct FullVolume(FailsAfter);
+        impl std::io::Write for FullVolume {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .write(buf)
+                    .map_err(|_| std::io::Error::from_raw_os_error(28))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let s = schema("id");
+        for codec in [IpcCompression::None, IpcCompression::Lz4] {
+            let writer = StreamWriter::try_new_with_compression(
+                FullVolume(FailsAfter { remaining: 512 }),
+                &s,
+                codec,
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink =
+                SpillState::spawn(writer, spill_temp_file(Some(dir.path())).unwrap()).unwrap();
+            // A compressible zero batch might fit on the simulated full volume.
+            let ids = (0..4096u64)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) as i64)
+                .collect();
+            sink.push(batch(&s, ids)).unwrap();
+            let error = sink.into_reader(&Pass2Timers::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("No space left on device"),
+                "{codec:?}: {error}"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         }
     }
 
@@ -1583,6 +1883,47 @@ mod backing_tests {
         assert_ne!(limit.source, MemoryLimitSource::CgroupHigh);
     }
 
+    /// ARCH-REVIEW §1: `auto` decides on the run budget's own allowance,
+    /// `0.6 × (limit − reserved) − grants`, once pass 2's read-ahead and
+    /// window are granted. Re-wrapping `available()` in a fresh budget gave
+    /// `0.6 × (limit − reserved − grants)`, 0.4 × grants more, so a sink
+    /// sized between the two stayed in RAM past the allowance the grants
+    /// were fitted to.
+    #[test]
+    fn auto_decides_on_the_charged_budgets_allowance() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(10 * GIB));
+        let _grant = memory.fit(
+            MemoryProfile::Speed,
+            MemoryPhase::Compute,
+            Price::new(GIB, PriceBasis::Model),
+            2,
+            2,
+        );
+        let allowance = memory.allowance(MemoryProfile::Auto);
+        assert_eq!(allowance, (0.6 * (10 * GIB) as f64) as u64 - 2 * GIB);
+        let rewrapped = (0.6 * memory.available().unwrap() as f64) as u64;
+        // A duplicating sink of unmeasured rows (8 KiB each) between the two.
+        let between = ((allowance + rewrapped) / 2 / 8192) as usize;
+        let estimate = memory.sink_estimate(Mode::Duplicating, between, None);
+        assert!(allowance < estimate && estimate < rewrapped);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                between,
+                None
+            ),
+            SinkBacking::Spill
+        ));
+        let under = (allowance / 8192) as usize - 1;
+        assert!(matches!(
+            resolve_backing(memory, MemoryProfile::Auto, Mode::Duplicating, under, None),
+            SinkBacking::Ram
+        ));
+    }
+
     #[test]
     fn explicit_profiles_ignore_workload() {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.
@@ -1612,7 +1953,12 @@ mod backing_tests {
     fn auto_duplicating_small_stays_in_ram() {
         // A tiny buffered set is safe in RAM on a normal box.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1622,7 +1968,12 @@ mod backing_tests {
         // The #294 fix: a large duplicating buffered set flips to Spill instead
         // of the old unconditional RAM. 10M rows * 8 KiB = 80 GiB > 0.6*54.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
     }
@@ -1633,14 +1984,24 @@ mod backing_tests {
         let rows = 5_000_000; // 5M * 8 KiB = 40 GiB estimate
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(4 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(4 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Spill
             ),
             "small box must spill"
         );
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(256 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(256 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Ram
             ),
             "huge box may keep it in RAM"
@@ -1652,11 +2013,21 @@ mod backing_tests {
         // Even with effectively unlimited RAM, partitioning still spills above
         // the historical 2M-row floor (strict superset of pre-#294 behavior).
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Partitioning,
+                100_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1665,11 +2036,21 @@ mod backing_tests {
     fn auto_uses_fallback_budget_when_ram_unknown() {
         // Unknown RAM → conservative fixed budget, still spilling huge sets.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 100_000_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                100_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                1_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1742,11 +2123,21 @@ mod backing_tests {
         // measured tiny-geometry corpus (points/small lines, ~100 B/row →
         // ~4.3 KiB/row → 20 GiB) fits and stays in RAM.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), Some(100)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                Some(100)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1757,11 +2148,21 @@ mod backing_tests {
         // (8 KiB/row → 7.6 GiB) keeps RAM, but an adm4-like measured average
         // (11 534 B/row → ~27 KiB/row → 25 GiB) correctly flips to Spill.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                None
+            ),
             SinkBacking::Ram
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), Some(11_534)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                Some(11_534)
+            ),
             SinkBacking::Spill
         ));
     }
@@ -1773,11 +2174,21 @@ mod backing_tests {
         // (983 B/row → ~8 KiB/row → 7.5 GiB) fits and stays in RAM. Below the
         // 2M-row ceiling, so only the RAM gate is in play.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), Some(983)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                Some(983)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1787,7 +2198,12 @@ mod backing_tests {
         // The historical 2M-row partitioning floor holds even when measurement
         // says the geometries are tiny.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), Some(8)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                Some(8)
+            ),
             SinkBacking::Spill
         ));
     }
@@ -1893,6 +2309,39 @@ mod sink_sample_tests {
         // And the old constant-based model is what it is being contrasted
         // with: 4 KiB/row would have blown the same budget.
         assert!(50_000_000u64 * 4_096 > budget);
+    }
+
+    /// #788: grants can use the whole allowance before pass 2 starts. In
+    /// `sink_downgrade.rs`'s skewed fixture under a 180 MB limit, the
+    /// writer's encode floor alone is 4 x 250.6 MB. A saturated allowance
+    /// never leaves a RAM sink unguarded: `auto` spills up front, and a
+    /// RAM sink armed against a zero allowance downgrades on its first
+    /// sample.
+    #[test]
+    fn a_saturated_allowance_spills_and_never_disarms() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(180_000_000));
+        let _encodes = memory.fit(
+            MemoryProfile::Auto,
+            MemoryPhase::Encode,
+            Price::new(250_600_000, PriceBasis::Footer),
+            64,
+            4,
+        );
+        assert_eq!(memory.allowance(MemoryProfile::Auto), 0);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                59_689,
+                Some(26)
+            ),
+            SinkBacking::Spill
+        ));
+        let mut tuner = SinkAutoTuner::new(MemoryProfile::Auto, SinkBacking::Ram, ROWS, memory);
+        tuner.observe(&sample_batch(0));
+        assert!(tuner.should_downgrade(), "a zero allowance must downgrade");
     }
 
     /// `bounded` and `speed` are instructions, not estimates: the tuner still

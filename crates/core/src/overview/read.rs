@@ -29,7 +29,8 @@ pub(super) struct ReadTuning {
     pub(super) workers: usize,
     /// Average encoded-geometry bytes per input row (#305), from the footers
     /// (#717), used only to size the read-ahead against the memory budget.
-    /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
+    /// `None` falls back to the per-row model
+    /// ([`MemoryBudget::estimate`]).
     pub(super) avg_geom_bytes: Option<u64>,
     /// What the footers say this read decodes ([`footer_price`]): what
     /// prices a read batch and a reader's own row group. `None` falls back to
@@ -100,8 +101,8 @@ struct ReadShape {
 
 /// What one resident read batch costs (#716).
 ///
-/// From the footers when [`ReadTuning::row_bytes`] is known
-/// ([`footer_row_bytes`]), and never past [`tylertoo_io::decoded_batch_limit`],
+/// From the footers when [`ReadTuning::footer`] is known
+/// ([`footer_price`]), and never past [`tylertoo_io::decoded_batch_limit`],
 /// the most the reader builds into one batch. Measured
 /// (`.788/PROFILE-LOG.md`, dhat): Moldova's 8,192-row batches hold 7.6 MiB
 /// live, priced at 17 MiB this way where the model below charged 64 MiB.
@@ -181,6 +182,10 @@ pub(super) fn grant_read_ahead(
 /// byte-array chunks without the statistic) 1.9×. Priced at the worse one.
 const DECODED_PER_FOOTER_BYTE: u64 = 2;
 
+/// Bytes a decoded column adds to each row beyond its footer bytes: its
+/// offsets and validity (#716).
+const DECODED_BYTES_PER_COLUMN: u64 = 8;
+
 /// What the footers say a read decodes (#716).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FooterPrice {
@@ -194,7 +199,7 @@ pub(super) struct FooterPrice {
 /// Decoded bytes per row over `columns` of the selected row groups, from the
 /// footers: each column's uncompressed size, or its unencoded byte-array
 /// size when larger ([`ConvertSource::selected_column_bytes`]), times
-/// [`DECODED_PER_FOOTER_BYTE`], plus 8 bytes per column for the offsets and
+/// [`DECODED_PER_FOOTER_BYTE`], plus [`DECODED_BYTES_PER_COLUMN`] for the offsets and
 /// validity a decoded column adds; and the largest selected row group's
 /// rows. `None` without rows.
 pub(super) fn footer_price(
@@ -229,7 +234,7 @@ pub(super) fn footer_price(
         row_bytes: bytes
             .div_ceil(rows)
             .saturating_mul(DECODED_PER_FOOTER_BYTE)
-            .saturating_add(count.saturating_mul(8))
+            .saturating_add(count.saturating_mul(DECODED_BYTES_PER_COLUMN))
             .max(1),
         group_rows,
     }))
@@ -298,6 +303,25 @@ enum SegMsg {
     Err(ConvertError),
 }
 
+/// The parallel-read gate (#544): more than one worker, and a read that
+/// needs no network ([`ConvertSource::reads_locally`]: a local input, or a
+/// remote one whose every chunk the read touches is staged).
+fn reads_in_parallel(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    projection: Option<&[usize]>,
+    shape: ReadShape,
+) -> bool {
+    shape.workers > 1 && source.reads_locally(row_groups, projection)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Reader threads the calling thread's last [`read_in_order`] used: 1
+    /// for a sequential read (test counter, #544).
+    static LAST_READ_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Deliver every selected input row to `on_batch`, in exact read order, in
 /// batches of at most `tuning.batch_size` rows, preserving the I/O owner's
 /// memory and offset bounds with either sequential or concurrent readers.
@@ -320,14 +344,14 @@ enum SegMsg {
 /// single reader would have produced. Batches that already line up are passed
 /// through untouched; only the batch straddling a worker seam is copied.
 ///
-/// **Gating.** Remote inputs read sequentially regardless of `workers`:
-/// `SourceStream` releases a part's in-memory read cache when it finishes that
-/// part, so concurrent readers over one remote source would evict each other's
-/// fetched chunks. This holds even after pass-0 staging: staging fills the
-/// remote source's own chunk cache and disk spill, it does not turn the
-/// `InputSource` into a `Local` one, so `is_remote()` stays true and a remote
-/// convert's pass-2 read is ALWAYS sequential. Only inputs that were local to
-/// begin with take the parallel path.
+/// **Gating** ([`reads_in_parallel`], #544). A remote input reads
+/// sequentially unless every chunk this read touches is already in its
+/// parts' disk spill (pass-0 staging):
+/// `SourceStream` releases a part's in-memory read cache when it finishes
+/// that part, so concurrent readers fetching over one remote source would
+/// evict each other's chunks. A fully staged read fetches nothing, so it
+/// reads in parallel like a local one
+/// ([`ConvertSource::reads_locally`]).
 ///
 /// `projection` is a [`ReadPlan::projection`]: root columns of the schema the
 /// source exposes, `None` for all of them. Every worker reads the same one.
@@ -345,13 +369,15 @@ where
 {
     let batch_size = tuning.batch_size.max(1);
     let shape = resolve_read_shape(tuning);
-    let parallel = shape.workers > 1 && !source.is_remote();
-    if tuning.workers > 1 && source.is_remote() {
+    let parallel = reads_in_parallel(source, row_groups, projection, shape);
+    if shape.workers > 1 && !parallel {
         log::info!(
-            "[convert] reading sequentially — parallel reads are local-only \
-             (a remote source's parts share one chunk cache)"
+            "[convert] reading sequentially: remote input not fully staged \
+             (parallel readers would evict each other's fetched chunks)"
         );
     }
+    #[cfg(test)]
+    LAST_READ_WORKERS.with(|w| w.set(1));
     if !parallel {
         return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
     }
@@ -360,6 +386,8 @@ where
         return read_sequentially(source, row_groups, projection, batch_size, &mut on_batch);
     }
     let workers = shape.workers.min(segments.len());
+    #[cfg(test)]
+    LAST_READ_WORKERS.with(|w| w.set(workers));
     log::info!(
         "[convert] read: {workers} reader thread(s) over {} segment(s) \
          (~{} row(s) each, {} read-ahead batch(es) per reader)",
@@ -436,7 +464,7 @@ pub(super) fn parallel_read_segments(
     tuning: ReadTuning,
 ) -> usize {
     let shape = resolve_read_shape(tuning);
-    if shape.workers < 2 || source.is_remote() {
+    if !reads_in_parallel(source, row_groups, None, shape) {
         return 0;
     }
     match plan_segments(source, row_groups, shape) {
@@ -1003,6 +1031,89 @@ mod read_tests {
             "one row group per segment: 6300 rows / (4 workers × 4) is under a row group"
         );
         assert_eq!(parallel_read_segments(&source, None, tuning), 9);
+    }
+
+    /// #544: a remote source whose read is fully staged to the local spill
+    /// reads in parallel like a local one; one that is not yet staged, or
+    /// staged for other columns, still reads sequentially. Both reproduce the
+    /// sequential reader's batches. On main every remote source read
+    /// sequentially, staged or not (`!source.is_remote()`).
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_fully_staged_remote_source_reads_in_parallel() {
+        let s = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("twice", DataType::Int64, false),
+        ]));
+        let ids: Vec<i64> = (0..3000).collect();
+        let batch = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    ids.iter().map(|i| i * 2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(250))
+            .build();
+        let mut bytes = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut bytes, s, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        // A fresh source per case: a read fills the spill as it fetches.
+        let fresh = || {
+            ConvertSource::single(crate::input::test_memory_source(
+                bytes.clone(),
+                "staged.parquet",
+            ))
+        };
+        let read = |source: &ConvertSource, workers: usize, projection: Option<&[usize]>| {
+            let mut out: Vec<(usize, Vec<i64>)> = Vec::new();
+            read_in_order(
+                source,
+                None,
+                projection,
+                ReadTuning {
+                    budget: MemoryBudget::with_available(Some(256 << 30)),
+                    batch_size: 96,
+                    workers,
+                    avg_geom_bytes: Some(8),
+                    footer: None,
+                    profile: MemoryProfile::Auto,
+                },
+                |batch, offset, _dur| {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    out.push((offset, col.values().to_vec()));
+                    Ok(ReadFlow::Continue)
+                },
+            )
+            .unwrap();
+            (out, LAST_READ_WORKERS.with(std::cell::Cell::get))
+        };
+        let stage_first_column = || {
+            let source = fresh();
+            let plan = source.staging_plan_for(None, Some(&[0])).unwrap();
+            source
+                .stage_within(&plan, crate::input::unbudgeted_stage_admission())
+                .unwrap();
+            source
+        };
+
+        let (sequential, workers) = read(&fresh(), 4, None);
+        assert_eq!(workers, 1, "nothing staged: sequential");
+        // Column 0 staged: a full read still needs column 1 from the network.
+        assert_eq!(read(&stage_first_column(), 4, None).1, 1);
+        // A read of column 0 alone needs nothing more.
+        let (projected, workers) = read(&stage_first_column(), 4, Some(&[0]));
+        assert!(workers > 1, "a fully staged read used {workers} reader(s)");
+        assert_eq!(projected, sequential);
     }
 
     /// Pass 1 reads a projection — the geometry plus the columns its flags

@@ -207,6 +207,30 @@ impl MaxZoom {
     }
 }
 
+/// Resolve `options.auto_max_zoom` (#444) over `source`, the conversion's own
+/// source: `None` when it is not set, else a copy of `options` whose level
+/// plan carries the estimated zoom and whose flag is cleared
+/// ([`MaxZoom::resolve`]). The one place a conversion turns `auto` into a
+/// zoom, so the CLI, Python and the tiles facade never open a source of
+/// their own for it.
+///
+/// # Errors
+///
+/// [`MaxZoom::resolve`]'s.
+pub(crate) fn resolve_auto_max_zoom(
+    source: &ConvertSource,
+    options: &ConvertOptions,
+    output: Option<&std::path::Path>,
+) -> Result<Option<ConvertOptions>, ConvertError> {
+    if !options.auto_max_zoom {
+        return Ok(None);
+    }
+    let mut resolved = options.clone();
+    resolved.auto_max_zoom = false;
+    MaxZoom::Auto.resolve(source, &mut resolved, output)?;
+    Ok(Some(resolved))
+}
+
 /// The chosen zoom plus the measurements that produced it, so a user can
 /// second-guess the pick (issue #444: "log the chosen zoom and its evidence").
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -615,6 +639,7 @@ pub fn estimate_max_zoom(
         AUTO_MAX_ZOOM_CEILING,
         options.bbox.as_ref(),
         options.filter.as_deref(),
+        options.profile,
     )
 }
 
@@ -625,6 +650,7 @@ pub(crate) fn estimate_with(
     ceiling: u8,
     bbox: Option<&[f64; 4]>,
     filter: Option<&str>,
+    profile: super::level::MemoryProfile,
 ) -> Result<AutoZoomEvidence, ConvertError> {
     check_auto_min_zoom(min_zoom, ceiling)?;
     let schema = source.schema()?;
@@ -700,11 +726,38 @@ pub(crate) fn estimate_with(
             .expect("the sampled bbox column is projected");
         let proj = |c: usize| cols.binary_search(&c).expect("filter column is projected");
 
-        let stream = source.open_stream(&ReadPlan {
+        let plan = ReadPlan {
             batch_size: AUTO_ZOOM_BATCH_ROWS,
             projection: Some(&cols),
             row_groups: selection.as_ref(),
-        })?;
+        };
+        // A remote sample would otherwise fetch each sampled column chunk
+        // on its own, one at a time (#788: 52 serial requests for moldova's
+        // covering). Stage them first, concurrently, granted from a memory
+        // budget like pass 0's; best-effort, since the read below fetches
+        // whatever staging missed. The conversion that follows reads the same
+        // source, so its pass 0 skips the chunks staged here.
+        if source.is_remote() {
+            let staged = source
+                .staging_plan_for(plan.row_groups, plan.projection)
+                .and_then(|staging| {
+                    super::stream::stage_granted(
+                        source,
+                        &staging,
+                        &mut super::memory::MemoryBudget::probe(),
+                        profile,
+                    )
+                });
+            match staged {
+                Ok(r) => log::debug!(
+                    "[auto-zoom] staged the sample columns: {} request(s), {} B",
+                    r.requests,
+                    r.bytes_fetched
+                ),
+                Err(e) => log::debug!("[auto-zoom] staging the sample columns failed ({e})"),
+            }
+        }
+        let stream = source.open_stream(&plan)?;
 
         let mut diags_m: Vec<f64> = Vec::new();
         let mut centers: Vec<(f64, f64)> = Vec::new();
@@ -806,6 +859,7 @@ pub(crate) fn estimate_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::level::MemoryProfile;
     use super::*;
     use crate::input_set::ConvertSource;
     use geo::{Geometry, LineString, MultiPolygon, Point, Polygon};
@@ -856,7 +910,14 @@ mod tests {
     }
 
     fn estimate(source: &ConvertSource, min_zoom: u8) -> Result<AutoZoomEvidence, ConvertError> {
-        estimate_with(source, min_zoom, AUTO_MAX_ZOOM_CEILING, None, None)
+        estimate_with(
+            source,
+            min_zoom,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            None,
+            MemoryProfile::default(),
+        )
     }
 
     /// Like [`write`], but with a bbox covering column generated and declared
@@ -1006,6 +1067,120 @@ mod tests {
         assert_eq!(normalized, plain);
     }
 
+    /// A 100-point grid with a declared f64 covering, in row groups of 10
+    /// rows: the remote-staging fixture for `auto` (#788).
+    #[cfg(feature = "remote")]
+    fn covered_row_groups(dir: &tempfile::TempDir) -> (std::path::PathBuf, ConvertSource) {
+        let geoms = point_grid(10, 0.01);
+        let covered = write_covered(dir, "covered.parquet", &geoms);
+        // The same file, cut into row groups of 10 rows.
+        let path = dir.path().join("groups.parquet");
+        {
+            use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+            let builder = covered.parts()[0].open().unwrap();
+            let kv = builder
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .cloned();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(10))
+                .set_key_value_metadata(kv)
+                .build();
+            let schema = builder.schema().clone();
+            let mut writer =
+                ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))
+                    .unwrap();
+            for batch in builder.build().unwrap() {
+                writer.write(&batch.unwrap()).unwrap();
+            }
+            writer.close().unwrap();
+        }
+        let local = ConvertSource::resolve_path(&path).unwrap();
+        assert!(
+            crate::resolved_schema::ResolvedSchema::auto_zoom_covering(
+                local.resolved_schemas().unwrap(),
+                &Diagnostics::default(),
+            )
+            .is_some(),
+            "fixture declares a usable covering"
+        );
+        (path, local)
+    }
+
+    /// #788: `auto_max_zoom` is resolved by the conversion over its own
+    /// source, so a remote input's covering is fetched once (by the
+    /// estimate's staging) and pass 0 skips it: no byte range is fetched
+    /// twice. The zoom is the one the estimate picks on a local copy.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn an_auto_convert_estimates_on_its_own_source_and_fetches_each_chunk_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, local) = covered_row_groups(&dir);
+        let want = estimate(&local, 0).unwrap().chosen_zoom;
+        let remote = ConvertSource::single(crate::input::test_memory_source(
+            std::fs::read(&path).unwrap(),
+            "groups.parquet",
+        ));
+        let options = ConvertOptions {
+            levels: LevelPlan::ZoomRange {
+                min_zoom: 0,
+                max_zoom: MaxZoom::Auto.plan_zoom(),
+            },
+            auto_max_zoom: true,
+            ..Default::default()
+        };
+        let output = dir.path().join("out.parquet");
+        let report =
+            super::super::convert::convert_to_overviews_sources(&remote, &output, &options)
+                .unwrap();
+        let finest = report.levels.iter().filter_map(|l| l.zoom).max();
+        assert_eq!(
+            finest,
+            Some(want),
+            "the conversion resolved auto to the estimate's zoom"
+        );
+
+        let mut ranges = remote.parts()[0].fetched_ranges().unwrap();
+        ranges.sort_by_key(|r| r.start);
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "{:?} and {:?} overlap: a chunk was fetched twice",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// #788: a remote sample stages its columns before reading them. The
+    /// four covering leaves of a row group are contiguous, so staging fetches
+    /// each row group's covering as one request, where the lazy read fetched
+    /// each leaf on its own (four requests per row group, one at a time).
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_remote_sample_stages_the_covering_one_request_per_row_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, local) = covered_row_groups(&dir);
+        let bytes = std::fs::read(&path).unwrap();
+        let row_groups = tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone()))
+            .unwrap()
+            .num_row_groups();
+        assert!(row_groups >= 5, "fixture has {row_groups} row group(s)");
+        let remote =
+            ConvertSource::single(crate::input::test_memory_source(bytes, "groups.parquet"));
+        let part = &remote.parts()[0];
+        let _ = part.open().unwrap();
+        let before = part.fetch_stats().unwrap().requests;
+        let got = estimate(&remote, 0).unwrap();
+        let requests = part.fetch_stats().unwrap().requests - before;
+        assert_eq!(got, estimate(&local, 0).unwrap());
+        assert_eq!(
+            requests, row_groups as u64,
+            "one staged request per row group's covering"
+        );
+    }
+
     fn rewrite_covering(source: &ConvertSource, path: &Path, declare: bool) {
         use arrow_array::RecordBatch;
         use arrow_schema::Schema;
@@ -1098,8 +1273,8 @@ mod tests {
         let plain = write(&dir, "plain.parquet", &geoms);
         let bbox = Some([-0.1, -0.1, 1.0, 1.0]);
         assert_eq!(
-            estimate_with(&stale, 0, 16, bbox.as_ref(), None).unwrap(),
-            estimate_with(&plain, 0, 16, bbox.as_ref(), None).unwrap(),
+            estimate_with(&stale, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
+            estimate_with(&plain, 0, 16, bbox.as_ref(), None, MemoryProfile::default()).unwrap(),
             "rejecting the sidecar must retain both row groups"
         );
         for streaming in [true, false] {
@@ -1348,20 +1523,48 @@ mod tests {
         let plain = write(&dir, "plain.parquet", &geoms);
 
         let bbox = Some([9.5, 9.5, 12.0, 12.0]);
-        let cov_bbox =
-            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
-        let plain_bbox =
-            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, bbox.as_ref(), None).unwrap();
+        let cov_bbox = estimate_with(
+            &covered,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            bbox.as_ref(),
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        let plain_bbox = estimate_with(
+            &plain,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            bbox.as_ref(),
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert!(cov_bbox.sampled_from_covering);
         assert_eq!(cov_bbox.sampled_count, 100);
         let mut normalized = cov_bbox;
         normalized.sampled_from_covering = false;
         assert_eq!(normalized, plain_bbox);
 
-        let cov_filter =
-            estimate_with(&covered, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
-        let plain_filter =
-            estimate_with(&plain, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        let cov_filter = estimate_with(
+            &covered,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
+        let plain_filter = estimate_with(
+            &plain,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert!(cov_filter.sampled_from_covering);
         assert_eq!(cov_filter.sampled_count, 100);
         let mut normalized = cov_filter;
@@ -1575,6 +1778,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[9.5, 9.5, 12.0, 12.0]),
             None,
+            MemoryProfile::default(),
         )
         .unwrap();
         assert_eq!(sparse.sampled_count, 100);
@@ -1607,6 +1811,7 @@ mod tests {
             AUTO_MAX_ZOOM_CEILING,
             Some(&[-161.0, -1.0, -158.0, 2.0]),
             None,
+            MemoryProfile::default(),
         )
         .unwrap();
         assert_eq!(wrapped.sampled_count, 100);
@@ -1625,8 +1830,15 @@ mod tests {
             })
         }));
         let source = write(&dir, "filter.parquet", &geoms);
-        let sparse =
-            estimate_with(&source, 0, AUTO_MAX_ZOOM_CEILING, None, Some("id >= 400")).unwrap();
+        let sparse = estimate_with(
+            &source,
+            0,
+            AUTO_MAX_ZOOM_CEILING,
+            None,
+            Some("id >= 400"),
+            MemoryProfile::default(),
+        )
+        .unwrap();
         assert_eq!(sparse.sampled_count, 100);
         assert!(sparse.chosen_zoom < estimate(&source, 0).unwrap().chosen_zoom);
     }

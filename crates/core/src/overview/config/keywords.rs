@@ -205,12 +205,24 @@ pub fn convert(
         .transpose()
         .map_err(|e| error("min_zoom", e))?
         .unwrap_or(min);
+    // `"auto"` builds the plan with the placeholder zoom and leaves the
+    // estimate to the conversion, over its own source (#444, #788).
+    //
+    // LOCKSTEP: `max_zoom` lands in two fields that must agree, the plan's
+    // `ZoomRange { max_zoom }` (`MaxZoom::plan_zoom`, a placeholder for
+    // `auto`) and `ConvertOptions::auto_max_zoom`. The flag is `serde(skip)`,
+    // so every serde round trip drops it and four sites set it by hand: here
+    // and in `tiles` below (keywords), and `overview_options`/`tiles_options`
+    // in `config/cli.rs` (flags). `max_zoom_auto_survives_the_keyword_round_trips`
+    // pins the keyword side, and the CLI's
+    // `max_zoom_sets_the_plan_and_the_auto_flag_without_reading` the flags.
     let max_zoom = values
         .remove("max_zoom")
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| error("max_zoom", e))?
-        .unwrap_or(max);
+        .map(max_zoom_value)
+        .transpose()?
+        .unwrap_or(crate::overview::auto_zoom::MaxZoom::Fixed(max));
+    let auto_max_zoom = max_zoom.is_auto();
+    let max_zoom = max_zoom.plan_zoom();
     if let Some(gsds) = gsds {
         base.levels = LevelPlan::Gsds(gsds);
     } else if matches!(base.levels, LevelPlan::ZoomRange { .. }) {
@@ -218,7 +230,11 @@ pub fn convert(
     }
     // The core-default value in a Python signature is informational; omitted
     // arguments stay absent, preserving cluster and verbatim precedence.
-    deserialize(base, values).map_err(ConvertError::from)
+    let mut options: ConvertOptions = deserialize(base, values).map_err(ConvertError::from)?;
+    // Set after the merge: the flag is not a keyword of its own, so the
+    // serde round trip in `deserialize` drops it.
+    options.auto_max_zoom = auto_max_zoom;
+    Ok(options)
 }
 
 /// Resolve automatic size caps against this command's core defaults.
@@ -377,33 +393,20 @@ pub fn command_defaults(command: &str) -> Map<String, Value> {
     out
 }
 
-/// Parse the Python auto-zoom syntax before validation, without reading input.
-///
-/// # Errors
-/// Returns a diagnostic naming `max_zoom` for a value other than a zoom or `auto`.
-pub fn max_zoom(
-    values: &mut Map<String, Value>,
-    command: &str,
-) -> Result<crate::overview::auto_zoom::MaxZoom, ConfigError> {
+/// Parse a `max_zoom` keyword (#444): an int zoom, or `"auto"` in any case.
+fn max_zoom_value(value: Value) -> Result<crate::overview::auto_zoom::MaxZoom, ConvertError> {
     use crate::overview::auto_zoom::MaxZoom;
-    let value = values
-        .remove("max_zoom")
-        .unwrap_or_else(|| command_defaults(command)["max_zoom"].clone());
-    let max_zoom = if let Some(s) = value.as_str() {
+    if let Some(s) = value.as_str() {
         if !s.eq_ignore_ascii_case("auto") {
-            return Err(error("max_zoom", "must be an int or \"auto\""));
+            return Err(error("max_zoom", "must be an int or \"auto\"").into());
         }
-        MaxZoom::Auto
-    } else if let Some(n) = value.as_u64().and_then(|n| u8::try_from(n).ok()) {
-        MaxZoom::Fixed(n)
-    } else {
-        return Err(error(
-            "max_zoom",
-            "must be an int between 0 and 255 or \"auto\"",
-        ));
-    };
-    values.insert("max_zoom".into(), max_zoom.plan_zoom().into());
-    Ok(max_zoom)
+        return Ok(MaxZoom::Auto);
+    }
+    value
+        .as_u64()
+        .and_then(|n| u8::try_from(n).ok())
+        .map(MaxZoom::Fixed)
+        .ok_or_else(|| error("max_zoom", "must be an int between 0 and 255 or \"auto\"").into())
 }
 
 /// Build the complete tiles configuration from a flat keyword call.
@@ -444,6 +447,9 @@ pub fn tiles(
         ),
         TilesOptions::export_defaults(verbatim),
     )?;
+    // The auto flag is not a keyword, so the serde round trip below drops
+    // it; carried across by hand (see LOCKSTEP in `convert`).
+    let auto_max_zoom = convert.auto_max_zoom;
     values.insert(
         "convert".into(),
         serde_json::to_value(convert).map_err(|e| error("convert", e))?,
@@ -452,7 +458,10 @@ pub fn tiles(
         "export".into(),
         serde_json::to_value(export).map_err(|e| error("export", e))?,
     );
-    serde_json::from_value(Value::Object(values)).map_err(|e| error("convert", e).into())
+    let mut options: TilesOptions =
+        serde_json::from_value(Value::Object(values)).map_err(|e| error("convert", e))?;
+    options.convert.auto_max_zoom = auto_max_zoom;
+    Ok(options)
 }
 
 /// Build the pyramid options, including verbatim band defaults and metadata.
@@ -584,5 +593,49 @@ impl Default for ConvertSyntax {
             representation: None,
             explicit_coalesce_lines: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_max_zoom_tests {
+    use super::*;
+
+    fn keywords(v: Value) -> Map<String, Value> {
+        v.as_object().expect("an object").clone()
+    }
+
+    /// #444/#788: `max_zoom="auto"` reaches the options as the auto flag
+    /// with the placeholder zoom, through both serde round trips; a number
+    /// clears it.
+    #[test]
+    fn max_zoom_auto_survives_the_keyword_round_trips() {
+        use crate::overview::auto_zoom::MaxZoom;
+        let auto = convert(
+            keywords(serde_json::json!({"max_zoom": "AUTO"})),
+            ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(auto.auto_max_zoom);
+        assert!(matches!(
+            auto.levels,
+            LevelPlan::ZoomRange { max_zoom, .. } if max_zoom == MaxZoom::Auto.plan_zoom()
+        ));
+        let fixed = convert(
+            keywords(serde_json::json!({"max_zoom": 9})),
+            ConvertOptions::default(),
+        )
+        .unwrap();
+        assert!(!fixed.auto_max_zoom);
+        assert!(
+            tiles(keywords(serde_json::json!({"max_zoom": "auto"})))
+                .unwrap()
+                .convert
+                .auto_max_zoom
+        );
+        assert!(convert(
+            keywords(serde_json::json!({"max_zoom": "nope"})),
+            ConvertOptions::default()
+        )
+        .is_err());
     }
 }

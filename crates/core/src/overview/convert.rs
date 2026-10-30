@@ -401,6 +401,19 @@ pub struct ConvertOptions {
     /// How levels are specified (zoom range or explicit GSDs).
     #[cfg_attr(feature = "cli", arg(skip = Self::default().levels))]
     pub levels: LevelPlan,
+    /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
+    /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
+    /// `max_zoom` before anything else reads the plan
+    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
+    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
+    /// (with a log line) for an explicit GSD list.
+    ///
+    /// The estimate reads the same source the conversion then reads, so a
+    /// remote input's sampled chunks are fetched once (#788). Not a keyword
+    /// of its own: callers set it from `max_zoom="auto"` / `--max-zoom auto`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub auto_max_zoom: bool,
     /// Thinning / visibility / sort configuration for level assignment.
     #[serde(flatten)]
     #[cfg_attr(feature = "cli", command(flatten))]
@@ -547,7 +560,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build adds a fixed allocator floor of about 600 MiB that shows on small inputs; a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -588,7 +601,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -980,6 +993,19 @@ pub fn resolve_read_workers(requested: usize) -> usize {
 /// read through the same ordered reader, but their consumers' CPU demand
 /// differs, so the auto count is resolved per pass. An explicit value applies
 /// to both.
+///
+/// Pass 2 keeps the quarter rule. Pass 1's consumer (decode and key
+/// extraction) is light, so its read is the bottleneck. It takes HALF the
+/// cores, at least 2 when there are 2, clamped to `READ_WORKERS_MAX`. Swept
+/// with `taskset` (`.788/PROFILE-LOG.md`, z0-8, 2 runs each), pass 1 times:
+///
+/// | cores | readers | Moldova | NZ parcels |
+/// | --- | --- | --- | --- |
+/// | 2 | 1 → 2 | 0.66 → 0.63 s | 3.0 → 2.8 s |
+/// | 4 | 1 → 2 | 0.66 → 0.36 s | 2.3 → 1.5 s |
+/// | 8 | 2 → 4 | 0.36 → 0.23 s | 1.3-1.5 → 1.0-1.2 s |
+///
+/// Pass 2 was flat or faster at the same counts.
 pub(super) fn resolve_pass_read_workers(pass: ReadPass, requested: usize) -> usize {
     resolve_read_workers_with_cores(
         pass,
@@ -999,8 +1025,8 @@ pub(super) fn resolve_read_workers_with_cores(
         return requested;
     }
     match pass {
-        // #723: both passes still take pass 2's quarter rule.
-        ReadPass::Scan | ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Scan => (cores / 2).max(cores.min(2)).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
     }
 }
 
@@ -1389,6 +1415,7 @@ impl Default for ConvertOptions {
                 min_zoom: 0,
                 max_zoom: 6,
             },
+            auto_max_zoom: false,
             assign: AssignConfig::default(),
             entry_zoom: None,
             sort_key: None,
@@ -2789,13 +2816,14 @@ pub fn write_convert_plan_sources(
         ));
     }
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options, diagnostics)? {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+    let options: &ConvertOptions =
+        match normalize_convert_options(source, options, None, diagnostics)? {
+            Some(adjusted) => {
+                inert_options = adjusted;
+                &inert_options
+            }
+            None => options,
+        };
     // #517's rule, applied to the other run that writes no dump: the profile
     // covers pass 2 and the export, neither of which a plan-only run reaches.
     // Said up front rather than exiting 0 with an empty (or untouched) file.
@@ -3663,16 +3691,23 @@ pub(super) fn build_verified_cluster_tables(
 fn normalize_convert_options(
     source: &ConvertSource,
     options: &ConvertOptions,
+    output: Option<&Path>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<ConvertOptions>, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
+    // #272: place the remote-input disk spill (#219) where the caller asked
+    // (no-op for local inputs, which never spill). Before the `auto`
+    // estimate, whose staged sample lands in the same spill.
+    source.set_spill_dir(options.spill_dir.as_deref());
+    // #444: `--max-zoom auto` estimates over this same source, before the
+    // property selection narrows it (the estimate reads the covering or the
+    // geometry, which the selection may drop).
+    let resolved = super::auto_zoom::resolve_auto_max_zoom(source, options, output)?;
+    let options = resolved.as_ref().unwrap_or(options);
     // #386: narrow the source to the requested property columns before any
     // schema index is derived, so both pipelines see the projected layout.
     apply_property_selection(source, options, diagnostics)?;
-    // #272: place the remote-input disk spill (#219) where the caller asked
-    // (no-op for local inputs, which never spill).
-    source.set_spill_dir(options.spill_dir.as_deref());
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
@@ -3680,7 +3715,7 @@ fn normalize_convert_options(
     // is on by default, so partitioning conversions silently proceed
     // without it (no column, no provenance); the CLI rejects an EXPLICIT
     // request instead.
-    Ok(adjusted_for_ladder_and_mode(options))
+    Ok(adjusted_for_ladder_and_mode(options).or(resolved))
 }
 
 pub(crate) fn convert_to_overviews_source_strategy(
@@ -3706,7 +3741,7 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
-    let adjusted = normalize_convert_options(source, options, diagnostics)?;
+    let adjusted = normalize_convert_options(source, options, Some(output_path), diagnostics)?;
     let options = adjusted.as_ref().unwrap_or(options);
     let validated = options.validate()?;
     convert_to_overviews_validated(source, output_path, &validated, strategy, diagnostics)
@@ -4676,92 +4711,6 @@ pub(super) fn warn_full_file_remote(
     if let Some(msg) =
         full_file_remote_warning(remote_parts, row_groups_read, row_groups_total, object_size)
     {
-        diagnostics.warn(msg);
-    }
-}
-
-/// #272 spill-preflight safety margin: warn when the spill volume's free
-/// space is below the projected spill size plus 1/20th (5%) of it — spill
-/// bookkeeping is exact but the volume is shared with everything else the
-/// process (and host) writes during the convert.
-const SPILL_MARGIN_DENOM: u64 = 20;
-
-/// #272 decision + message (pure, so it is unit-testable without touching
-/// a filesystem). Returns the warning to emit when the projected input
-/// spill (≈ the selected input bytes, see
-/// [`crate::input::selected_compressed_bytes`]) plus a 5% safety margin
-/// exceeds `available_bytes` on the spill volume, or `None` when it fits.
-pub(super) fn spill_space_warning(
-    estimated_spill_bytes: u64,
-    available_bytes: u64,
-    spill_dir: &Path,
-) -> Option<String> {
-    // Saturating: the estimate is footer-declared and may itself be
-    // saturated (#686).
-    let need = estimated_spill_bytes.saturating_add(estimated_spill_bytes / SPILL_MARGIN_DENOM);
-    if available_bytes >= need {
-        return None;
-    }
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    Some(format!(
-        "projected input spill (≈{:.1} GiB — the selected input bytes are \
-         staged on local disk so later passes stay off the network, #219) may \
-         not fit: {} has {:.1} GiB free ({:.1} GiB short, including a 5% \
-         margin). If the volume fills mid-convert the spill degrades to \
-         network re-fetch; pass --spill-dir (spill_dir) to place it on a \
-         roomier volume, or free up space first.",
-        gib(estimated_spill_bytes),
-        spill_dir.display(),
-        gib(available_bytes),
-        gib(need - available_bytes),
-    ))
-}
-
-/// #272 preflight gate over [`spill_space_warning`], with the free-space
-/// probe injected so the gating is unit-testable with a fake probe. Only a
-/// remote input spills, so for local inputs (and an empty selection) the
-/// probe is never even called; a failed probe (`None` — unsupported
-/// filesystem, permission error) stays quiet rather than crying wolf.
-pub(super) fn spill_space_check(
-    is_remote: bool,
-    estimated_spill_bytes: u64,
-    spill_dir: &Path,
-    probe: impl FnOnce(&Path) -> Option<u64>,
-) -> Option<String> {
-    if !is_remote || estimated_spill_bytes == 0 {
-        return None;
-    }
-    let available = probe(spill_dir)?;
-    spill_space_warning(estimated_spill_bytes, available, spill_dir)
-}
-
-/// Free bytes available to the current user on the volume holding `dir`
-/// (statvfs / `GetDiskFreeSpaceEx` via `fs4`), or `None` if the probe fails.
-/// Unconditional since #439: the tiles facade's #314 preflight guards a
-/// LOCAL intermediate, so the probe can no longer ride the `remote` feature
-/// (`fs4` is a plain dependency now). Shared with that preflight
-/// ([`crate::overview::tiles`]).
-pub(crate) fn probe_available_space(dir: &Path) -> Option<u64> {
-    fs4::available_space(dir).ok()
-}
-
-/// Emit the #272 spill free-space preflight warning, if warranted. Thin
-/// logging wrapper over [`spill_space_check`] with the real filesystem
-/// probe; `spill_dir = None` means the process temp dir, exactly where the
-/// spill file would go.
-pub(super) fn warn_spill_space(
-    source: &ConvertSource,
-    estimated_spill_bytes: u64,
-    spill_dir: Option<&Path>,
-    diagnostics: &crate::diagnostics::Diagnostics,
-) {
-    let dir = spill_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
-    if let Some(msg) = spill_space_check(
-        source.is_remote(),
-        estimated_spill_bytes,
-        &dir,
-        probe_available_space,
-    ) {
         diagnostics.warn(msg);
     }
 }
@@ -7520,66 +7469,6 @@ mod tests {
         );
         // Summed size below the threshold stays quiet regardless of count.
         assert!(full_file_remote_warning(20, 40, 40, 500 << 20).is_none());
-    }
-
-    /// #272: the spill free-space preflight warns when the projected spill
-    /// (≈ the selected input bytes, plus a 5% safety margin) exceeds the
-    /// free space on the spill volume — naming the directory, the shortfall,
-    /// and the `--spill-dir` escape hatch.
-    #[test]
-    fn spill_space_warning_names_dir_and_shortfall() {
-        let dir = Path::new("/mnt/scratch");
-        let msg = spill_space_warning(10 << 30, 1 << 30, dir).expect("shortfall should warn");
-        assert!(
-            msg.contains("/mnt/scratch"),
-            "warning names the spill dir: {msg}"
-        );
-        assert!(
-            msg.contains("--spill-dir"),
-            "warning suggests --spill-dir: {msg}"
-        );
-        // need = 10 GiB + 5% = 10.5 GiB; available 1 GiB → 9.5 GiB short.
-        assert!(
-            msg.contains("9.5 GiB"),
-            "warning states the shortfall: {msg}"
-        );
-    }
-
-    /// #272: ample space stays quiet, and the margin boundary is exact —
-    /// available == estimated + 5% is enough, one byte less is not.
-    #[test]
-    fn spill_space_warning_quiet_with_ample_space() {
-        let dir = Path::new("/tmp");
-        assert!(spill_space_warning(1 << 30, 20 << 30, dir).is_none());
-        let est: u64 = 20 << 20;
-        let need = est + est / 20;
-        assert!(spill_space_warning(est, need, dir).is_none());
-        assert!(spill_space_warning(est, need - 1, dir).is_some());
-    }
-
-    /// #686: the estimate is a sum of footer-declared sizes, saturated at
-    /// `u64::MAX` for a footer that claims more; adding the margin to it must
-    /// not overflow (a panic in release, #432).
-    #[test]
-    fn spill_space_warning_survives_a_saturated_estimate() {
-        let dir = Path::new("/tmp");
-        assert!(spill_space_warning(u64::MAX, u64::MAX - 1, dir).is_some());
-        assert!(spill_space_warning(u64::MAX, 0, dir).is_some());
-    }
-
-    /// #272: local inputs never spill, so the free-space probe must not
-    /// even run for them; a failed probe (None) stays quiet rather than
-    /// crying wolf; a zero estimate (empty selection) stays quiet too.
-    #[test]
-    fn spill_space_check_gating() {
-        let dir = Path::new("/tmp");
-        assert!(spill_space_check(false, 10 << 30, dir, |_| panic!(
-            "free-space probe must not run for local inputs"
-        ))
-        .is_none());
-        assert!(spill_space_check(true, 10 << 30, dir, |_| None).is_none());
-        assert!(spill_space_check(true, 0, dir, |_| Some(0)).is_none());
-        assert!(spill_space_check(true, 10 << 30, dir, |_| Some(1)).is_some());
     }
 
     /// #543: [`PASS1_BYTES_PER_ROW`] must track what a filled
@@ -10760,9 +10649,16 @@ mod tests {
             assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
         }
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let msg = super::super::auto_zoom::estimate_with(&source, 0, 16, None, None)
-            .unwrap_err()
-            .to_string();
+        let msg = super::super::auto_zoom::estimate_with(
+            &source,
+            0,
+            16,
+            None,
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
     }
 
@@ -12253,7 +12149,6 @@ mod tests {
     /// took pass 1 from 0.72-0.75 s to 0.45-0.48 s while pass 2 stayed flat,
     /// yet auto gives both passes `4 / 4 = 1` reader.
     #[test]
-    #[ignore = "#723: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
     fn pass1_and_pass2_auto_reader_counts_resolve_independently() {
         use super::super::read::ReadPass;
         let auto = |pass, cores| resolve_read_workers_with_cores(pass, READ_WORKERS_AUTO, cores);
