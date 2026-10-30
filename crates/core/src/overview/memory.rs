@@ -6,9 +6,18 @@
 //! and fails with [`ConvertError::BudgetExceeded`] when it cannot fit. A phase
 //! whose footprint is a choice (how many read-ahead batches, how wide the
 //! pass-2 window, how many row groups the drain encodes at once) asks
-//! [`fit`](MemoryBudget::fit) how many units of its [`Price`] it may hold,
-//! within its share of the allowance. Both charge the budget, so every phase
-//! sized afterwards sees only what is left.
+//! [`fit`](MemoryBudget::fit) how many units of its [`Price`] it may hold.
+//! Both charge the budget, so every phase sized afterwards sees only what is
+//! left.
+//!
+//! The [`MemoryProfile`] decides what `fit` grants, the same way for every
+//! phase:
+//!
+//! - `bounded` takes the phase's floor: the smallest footprint, never more
+//!   than main's (#788).
+//! - `auto` takes what the phase's share of the allowance affords, clamped
+//!   to the phase's floor and what it wants.
+//! - `speed` takes what it wants.
 
 use super::assign::FeatureTable;
 use super::convert::ConvertError;
@@ -48,7 +57,10 @@ pub(super) enum MemoryPhase {
     Scan,
     Assign,
     /// Remote staging: `STAGE_MEM_BUDGET`, `CHUNK_CACHE_MAX_BYTES` (track R).
-    #[expect(dead_code, reason = "#788: track R grants remote staging under it")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#788: track R grants remote staging under it")
+    )]
     Stage,
     Read,
     Compute,
@@ -60,13 +72,22 @@ pub(super) enum MemoryPhase {
     /// spilling pass 2 reads its spill back through (#716).
     Spill,
     /// Export's tile collection (track E1).
-    #[expect(dead_code, reason = "#788: track E1 grants export collection under it")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#788: track E1 grants export collection under it")
+    )]
     ExportCollect,
     /// Export's concurrent tile encodes (track E1).
-    #[expect(dead_code, reason = "#788: track E1 grants export encodes under it")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#788: track E1 grants export encodes under it")
+    )]
     ExportEncode,
     /// Coverage fill (track F).
-    #[expect(dead_code, reason = "#788: track F grants coverage fill under it")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#788: track F grants coverage fill under it")
+    )]
     Fill,
 }
 
@@ -264,25 +285,46 @@ impl MemoryBudget {
             }))
         }
     }
-    /// Units of `price` that `phase`'s share of the current allowance can
-    /// hold, at least 1. A query: it charges nothing.
-    pub(super) fn affordable(&self, phase: MemoryPhase, price: Price) -> usize {
-        let ceiling = (self.remaining() as f64 * phase.share()) as u64;
-        usize::try_from(ceiling / price.bytes.max(1))
-            .unwrap_or(usize::MAX)
-            .max(1)
+    /// Units of `price` that `phase` may hold under `profile`, at least 1. A
+    /// query: it charges nothing. `bounded` affords 1, so a caller that
+    /// sizes itself from this lands on its own floor; `speed` affords
+    /// everything; `auto` affords what `phase`'s share of the current
+    /// allowance holds.
+    pub(super) fn affordable(
+        &self,
+        profile: MemoryProfile,
+        phase: MemoryPhase,
+        price: Price,
+    ) -> usize {
+        match profile {
+            MemoryProfile::Bounded => 1,
+            MemoryProfile::Speed => usize::MAX,
+            MemoryProfile::Auto => {
+                let ceiling = (self.remaining() as f64 * phase.share()) as u64;
+                usize::try_from(ceiling / price.bytes.max(1))
+                    .unwrap_or(usize::MAX)
+                    .max(1)
+            }
+        }
     }
-    /// Grant `phase` up to `want` units of `price` from its share of the
-    /// allowance, and never fewer than `floor` (a phase that cannot run below
-    /// it). The grant is charged to this budget.
+    /// Grant `phase` units of `price` under `profile`, never fewer than
+    /// `floor` (a phase that cannot run below it): `bounded` gets `floor`,
+    /// `auto` what its share of the allowance affords within `[floor, want]`,
+    /// `speed` `want`. The grant is charged to this budget whatever the
+    /// profile, so every later phase sees it.
     pub(super) fn fit(
         &mut self,
+        profile: MemoryProfile,
         phase: MemoryPhase,
         price: Price,
         want: usize,
         floor: usize,
     ) -> Grant {
-        let units = self.affordable(phase, price).min(want).max(floor);
+        let units = match profile {
+            MemoryProfile::Bounded => floor,
+            MemoryProfile::Speed => want.max(floor),
+            MemoryProfile::Auto => self.affordable(profile, phase, price).min(want).max(floor),
+        };
         let grant = Grant {
             phase,
             units,
@@ -324,29 +366,21 @@ impl MemoryBudget {
             ),
         }
     }
-    /// The pass-2 compute window (#494, #716): up to `requested` batches of
-    /// `price`, fitted into the window's share and charged. `speed` takes
-    /// what it asked for, still charged so later phases see it.
+    /// The pass-2 compute window (#494, #716): `requested` batches of
+    /// `price` wanted, one at the floor, granted per [`fit`](Self::fit).
     pub(super) fn compute_window(
         &mut self,
         profile: MemoryProfile,
         requested: usize,
         price: Price,
     ) -> Grant {
-        let requested = requested.max(1);
-        match profile {
-            MemoryProfile::Speed => self.fit(MemoryPhase::Compute, price, requested, requested),
-            MemoryProfile::Auto | MemoryProfile::Bounded => {
-                self.fit(MemoryPhase::Compute, price, requested, 1)
-            }
-        }
+        self.fit(profile, MemoryPhase::Compute, price, requested.max(1), 1)
     }
-    /// Row groups the writer may encode at once (#296, #545): as many as the
-    /// pool has threads, if the encode share affords that many of `price`
-    /// (one row group held as Arrow plus its encoded chunks); never fewer
-    /// than [`ENCODE_FLOOR`] (#545's measured floor) or more than the pool.
-    /// `speed` takes the pool. The grant stays charged for the run: the
-    /// writer encodes until it finishes.
+    /// Row groups the writer may encode at once (#296, #545), per
+    /// [`fit`](Self::fit): the pool's threads wanted, [`ENCODE_FLOOR`]
+    /// (#545's measured floor, main's `bounded` cap) at the floor, priced at
+    /// one row group held as Arrow plus its encoded chunks. The grant stays
+    /// charged for the run: the writer encodes until it finishes.
     pub(super) fn encode_concurrency(
         &mut self,
         profile: MemoryProfile,
@@ -354,13 +388,13 @@ impl MemoryBudget {
         price: Price,
     ) -> Grant {
         let threads = threads.max(1);
-        let floor = threads.min(ENCODE_FLOOR);
-        match profile {
-            MemoryProfile::Speed => self.fit(MemoryPhase::Encode, price, threads, threads),
-            MemoryProfile::Auto | MemoryProfile::Bounded => {
-                self.fit(MemoryPhase::Encode, price, threads, floor)
-            }
-        }
+        self.fit(
+            profile,
+            MemoryPhase::Encode,
+            price,
+            threads,
+            threads.min(ENCODE_FLOOR),
+        )
     }
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
@@ -375,9 +409,6 @@ impl MemoryBudget {
         Ok(())
     }
 
-    /// Data that must be resident (the retained input stays resident across
-    /// every later phase): charge it all or fail. Charged before any
-    /// allowance is calculated from this budget.
     /// Reserve up to `bytes` for `phase`, as much as is available, and never
     /// fail: a working set the run is better off holding than not (the
     /// spill's page cache under a cgroup limit). Nothing when unprobed.
@@ -389,6 +420,9 @@ impl MemoryBudget {
         taken
     }
 
+    /// Data that must be resident (the retained input stays resident across
+    /// every later phase): charge it all or fail. Charged before any
+    /// allowance is calculated from this budget.
     pub(super) fn reserve(&mut self, phase: MemoryPhase, bytes: u64) -> Result<(), ConvertError> {
         self.require(phase, bytes)?;
         let slot = &mut self.reserved[phase as usize];
@@ -442,7 +476,7 @@ mod tests {
     ) -> usize {
         let price = budget.window_price(batch_rows, None, 0.0, levels, Some(600));
         budget
-            .compute_window(MemoryProfile::Bounded, requested, price)
+            .compute_window(MemoryProfile::Auto, requested, price)
             .units
     }
 
@@ -479,25 +513,47 @@ mod tests {
         let mut budget = MemoryBudget::with_available(Some(10_000));
         // Allowance 6,000; the read share is 10% = 600 → 6 units of 100.
         let price = Price::model(100);
-        assert_eq!(budget.affordable(MemoryPhase::Read, price), 6);
+        assert_eq!(
+            budget.affordable(MemoryProfile::Auto, MemoryPhase::Read, price),
+            6
+        );
         assert_eq!(budget.available(), Some(10_000), "a query charges nothing");
-        let grant = budget.fit(MemoryPhase::Read, price, 4, 1);
+        let grant = budget.fit(MemoryProfile::Auto, MemoryPhase::Read, price, 4, 1);
         assert_eq!((grant.units, grant.bytes()), (4, 400), "capped by want");
         assert_eq!(budget.available(), Some(9_600));
         // (6,000 − 400) × 10% = 560 → 5 units now.
-        assert_eq!(budget.fit(MemoryPhase::Compute, price, 100, 1).units, 5);
+        assert_eq!(
+            budget
+                .fit(MemoryProfile::Auto, MemoryPhase::Compute, price, 100, 1)
+                .units,
+            5
+        );
         assert_eq!(budget.available(), Some(9_100));
         // The floor wins over the share: a phase cannot run below it.
         assert_eq!(
             budget
-                .fit(MemoryPhase::Read, Price::model(1 << 40), 8, 2)
+                .fit(
+                    MemoryProfile::Auto,
+                    MemoryPhase::Read,
+                    Price::model(1 << 40),
+                    8,
+                    2
+                )
                 .units,
             2
         );
         // A zero price cannot divide by zero, and want 0 with floor 0 grants
         // nothing.
         assert_eq!(
-            budget.fit(MemoryPhase::Read, Price::model(0), 0, 0).units,
+            budget
+                .fit(
+                    MemoryProfile::Auto,
+                    MemoryPhase::Read,
+                    Price::model(0),
+                    0,
+                    0
+                )
+                .units,
             0
         );
     }
@@ -508,26 +564,31 @@ mod tests {
     fn an_unprobed_budget_grants_from_the_fallback_allowance() {
         let mut budget = MemoryBudget::with_available(None);
         let unit = (FALLBACK_ALLOWANCE_BYTES as f64 * READ_SHARE) as u64 / 4;
-        assert_eq!(budget.affordable(MemoryPhase::Read, Price::model(unit)), 4);
+        assert_eq!(
+            budget.affordable(MemoryProfile::Auto, MemoryPhase::Read, Price::model(unit)),
+            4
+        );
         budget.reserve(MemoryPhase::EagerInput, u64::MAX).unwrap();
         assert_eq!(budget.remaining(), FALLBACK_ALLOWANCE_BYTES);
         assert_eq!(budget.available(), None);
     }
 
-    /// #545: the writer's encode concurrency comes from the budget, not a
-    /// fixed cap. On main, `bounded` encoded at most 4 row groups at once
-    /// whatever the budget. Profiled (`.788/PROFILE-LOG.md`, 64 threads,
-    /// glibc): the drain is 38% of pass 2's wall on Moldova and 39% on NZ
-    /// parcels under `bounded`, against 14% under `auto` (full pool) on the
-    /// same Moldova output, while the drain thread itself holds 1.1% of the
-    /// CPU samples: it waits on the capped encodes. #545's own A/B kept 4 as
-    /// the floor and asked for the cap to come from the memory probe instead.
+    /// #545: under `auto` the writer's encode concurrency comes from the
+    /// budget, not a fixed figure. On main, `bounded` encoded at most 4 row
+    /// groups at once and `auto` the whole pool, whatever the budget.
+    /// Profiled (`.788/PROFILE-LOG.md`, 64 threads, glibc): the drain is 38%
+    /// of pass 2's wall on Moldova and 39% on NZ parcels at 4 encodes,
+    /// against 14% at the full pool on the same Moldova output, while the
+    /// drain thread itself holds 1.1% of the CPU samples: it waits on the
+    /// capped encodes. #545's own A/B kept 4 as the floor and asked for the
+    /// count to come from the memory probe. `bounded` keeps main's 4
+    /// (`every_profile_grants_by_one_rule`).
     #[test]
     fn bounded_encode_concurrency_comes_from_the_budget() {
         let resolve = |mut budget: MemoryBudget, threads: usize, row_group_bytes: u64| {
             budget
                 .encode_concurrency(
-                    MemoryProfile::Bounded,
+                    MemoryProfile::Auto,
                     threads,
                     Price::new(row_group_bytes, PriceBasis::Footer),
                 )
@@ -579,7 +640,13 @@ mod tests {
         assert_eq!(budget.remaining(), 3_600);
         assert_eq!(budget.reserve_up_to(MemoryPhase::Spill, u64::MAX), 6_000);
         assert_eq!((budget.available(), budget.remaining()), (Some(0), 0));
-        let floor = budget.fit(MemoryPhase::Read, Price::model(10), 8, 2);
+        let floor = budget.fit(
+            MemoryProfile::Auto,
+            MemoryPhase::Read,
+            Price::model(10),
+            8,
+            2,
+        );
         assert_eq!(floor.units, 2, "grants fall to their floors");
         assert_eq!(
             MemoryBudget::with_available(None).reserve_up_to(MemoryPhase::Spill, 9),
@@ -593,5 +660,84 @@ mod tests {
         let estimate = budget.estimate(MemoryPhase::Scan, u64::MAX, None);
         assert_eq!(estimate, u64::MAX);
         budget.require(MemoryPhase::Scan, estimate).unwrap();
+    }
+
+    /// #788: one rule for every phase. `bounded` grants the floor (main's
+    /// shape, the smallest footprint), `auto` never more than the phase's
+    /// share of the allowance unless its floor needs it, `speed` what it
+    /// wants; each charges the budget.
+    #[test]
+    fn every_profile_grants_by_one_rule() {
+        let phases = [
+            MemoryPhase::EagerInput,
+            MemoryPhase::Scan,
+            MemoryPhase::Assign,
+            MemoryPhase::Stage,
+            MemoryPhase::Read,
+            MemoryPhase::Compute,
+            MemoryPhase::Encode,
+            MemoryPhase::Write,
+            MemoryPhase::Spill,
+            MemoryPhase::ExportCollect,
+            MemoryPhase::ExportEncode,
+            MemoryPhase::Fill,
+        ];
+        assert_eq!(phases.len(), MemoryPhase::COUNT);
+        let price = Price::model(1_000);
+        for available in [10_000u64, 1 << 20, 1 << 30, 64 << 30] {
+            for phase in phases {
+                for (want, floor) in [(64usize, 4usize), (8, 1), (1, 1), (100_000_000, 2)] {
+                    let fresh = MemoryBudget::with_available(Some(available));
+                    let mut budget = fresh;
+                    let bounded = budget.fit(MemoryProfile::Bounded, phase, price, want, floor);
+                    assert_eq!(bounded.units, floor, "{phase:?} bounded");
+                    assert_eq!(budget.remaining(), fresh.remaining() - bounded.bytes());
+
+                    let mut budget = fresh;
+                    let auto = budget.fit(MemoryProfile::Auto, phase, price, want, floor);
+                    let share = (fresh.remaining() as f64 * phase.share()) as u64;
+                    assert!(auto.units >= floor && auto.units <= want, "{phase:?} auto");
+                    assert!(
+                        auto.units == floor || auto.bytes() <= share,
+                        "{phase:?} auto: {} B over a {share} B share",
+                        auto.bytes()
+                    );
+                    assert!(auto.bytes() <= fresh.remaining() || auto.units == floor);
+
+                    let mut budget = fresh;
+                    let speed = budget.fit(MemoryProfile::Speed, phase, price, want, floor);
+                    assert_eq!(speed.units, want, "{phase:?} speed");
+                    assert_eq!(
+                        budget.remaining(),
+                        fresh.remaining().saturating_sub(speed.bytes())
+                    );
+                }
+            }
+        }
+        // The named grants follow the same rule.
+        let mut budget = MemoryBudget::with_available(Some(64 << 30));
+        let encode = Price::model(1 << 20);
+        assert_eq!(
+            budget
+                .encode_concurrency(MemoryProfile::Bounded, 64, encode)
+                .units,
+            ENCODE_FLOOR
+        );
+        assert_eq!(
+            budget
+                .encode_concurrency(MemoryProfile::Speed, 64, encode)
+                .units,
+            64
+        );
+        assert_eq!(
+            budget
+                .compute_window(MemoryProfile::Bounded, 8, encode)
+                .units,
+            1
+        );
+        assert_eq!(
+            budget.compute_window(MemoryProfile::Speed, 8, encode).units,
+            8
+        );
     }
 }

@@ -48,6 +48,39 @@ Consequences: #102 (row-group bbox filtering for the tiles pipeline) lost
 its remaining scope; the legacy pipeline's architecture notes were moved to
 [`context/archive/LEGACY_TILES_ARCHITECTURE.md`](https://github.com/geoparquet-io/tylertoo/blob/main/context/archive/LEGACY_TILES_ARCHITECTURE.md).
 
+## Decision Record: Memory Profiles and the Run Budget (#788, 2026-10-30)
+
+One `MemoryBudget` (`overview/memory.rs`) per conversion probes memory once
+(MemAvailable, `TYLERTOO_AUTO_MEM_LIMIT_BYTES`, or the cgroup limit) and sets
+one allowance: 60% of the probed figure less hard reservations (the eager
+input, and under a cgroup limit the spill's page cache when it fits). Every
+elastic phase asks `MemoryBudget::fit(profile, phase, price, want, floor)`
+for units of a price read from the Parquet footers, and each grant is
+charged, so a phase sized later sees only what earlier ones left. Before
+this, the read-ahead, the compute window and the encodes each took their own
+slice of the same allowance and nothing summed them (#716).
+
+The profile decides the grant the same way for every phase. The user
+confirmed this decision:
+
+| Profile | Grant | Meaning |
+| --- | --- | --- |
+| `speed` | `want` | No limit: everything in RAM, every knob at its maximum |
+| `bounded` | `floor` | Smallest footprint: always spill, one reader at the minimum depth, a window of one batch, at most 4 encodes, and export and fill at their floors. Never above main's peak |
+| `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
+
+`auto` is a third shape, not a router between the other two. Before #788 it
+copied `speed` for the read-ahead depth cap and the encode count. A first
+cut of #788 also sized `bounded` from the allowance, which on a 123 GiB box
+doubled Moldova's pass-2 peak (2.0 to 3.9 GiB). That was reverted: `bounded`
+promises the smallest footprint, and `auto` is the profile that uses the
+machine.
+
+DIVERGENCE FROM TIPPECANOE: tippecanoe has no memory profile. It always
+writes its features to temporary files and sizes its in-memory sort from the
+machine's physical memory. Its behavior is closest to `bounded` with an
+`auto`-sized sort.
+
 ## Design Principles
 
 1. **Overview-first**: the product is the `geo:overviews` GeoParquet format;

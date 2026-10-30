@@ -35,9 +35,10 @@ pub(super) struct ReadTuning {
     /// prices a read batch and a reader's own row group. `None` falls back to
     /// the per-row model floored at a whole decoded batch.
     pub(super) footer: Option<FooterPrice>,
-    /// The run's requested memory profile. `Bounded` means the caller asked
-    /// for memory over speed, so a worker's read-ahead queue is capped lower
-    /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
+    /// The run's memory profile, which decides the shape the way
+    /// [`MemoryBudget::fit`] does for every phase: `bounded` reads with one
+    /// worker at the minimum depth, `auto` with what the read share affords,
+    /// `speed` with every requested worker at the full depth.
     pub(super) profile: MemoryProfile,
 }
 
@@ -59,20 +60,6 @@ pub(super) enum ReadFlow {
     /// real one is reported by whoever owns the downstream.
     Stop,
 }
-
-/// Ceiling on a worker's read-ahead under an explicit `bounded` profile: the
-/// caller asked for memory over speed, so a rich machine does not get to build
-/// the full [`READ_AHEAD_MAX_BATCHES`] queue per worker.
-///
-/// This caps the *generous* end and nothing else. Halving the budget slice
-/// instead — the other obvious way to make the read-ahead profile-aware — was
-/// measured and rejected: with the calibrated per-row cost below, halving took
-/// a 58-column fixture from 3 reader threads to none under `bounded`, and
-/// `bounded` is the profile this whole parallel read exists to speed up (#494's
-/// Brazil measurement is a `--profile bounded` run). A ceiling on depth never
-/// costs a worker, and it only binds when `affordable / workers` was already
-/// above it.
-const READ_AHEAD_BOUNDED_MAX_BATCHES: usize = READ_AHEAD_MAX_BATCHES / 2;
 
 /// Floor on a worker's read-ahead, in batches. Below this a worker cannot hold
 /// even a small segment, so it stalls mid-segment and its read does not
@@ -159,6 +146,7 @@ pub(super) fn grant_read_ahead(
         .saturating_mul(shape.depth.saturating_add(reader_batches(tuning)))
         .saturating_add(channel);
     budget.fit(
+        tuning.profile,
         MemoryPhase::Read,
         read_batch_price(tuning),
         batches,
@@ -244,16 +232,18 @@ pub(super) fn footer_price(
 /// can hold [`READ_AHEAD_MIN_BATCHES`], and the depth is what is left over.
 fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let batch_size = tuning.batch_size.max(1);
-    // The read-ahead's share of the allowance (`memory::READ_SHARE`), in
-    // batches of `read_batch_price`. It bounds `workers × depth × price`.
-    let affordable = tuning
-        .budget
-        .affordable(MemoryPhase::Read, read_batch_price(tuning));
+    // What the profile affords in batches of `read_batch_price`
+    // (`MemoryBudget::affordable`): 1 under `bounded`, so the shape below
+    // lands on its floor (one worker, the minimum depth); everything under
+    // `speed`, so every requested worker at the full depth; under `auto` the
+    // read share of the allowance (`memory::READ_SHARE`), which bounds
+    // `workers × (depth + reader) × price`.
+    let affordable =
+        tuning
+            .budget
+            .affordable(tuning.profile, MemoryPhase::Read, read_batch_price(tuning));
     let reader = reader_batches(tuning);
-    let max_depth = match tuning.profile {
-        MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
-        MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
-    };
+    let max_depth = READ_AHEAD_MAX_BATCHES;
 
     // Closed form of "drop workers until each one can hold the floor":
     // `affordable / w >= READ_AHEAD_MIN_BATCHES` ⟺ `w <= affordable /
@@ -1310,7 +1300,7 @@ mod read_tests {
                 row_bytes: 1_000,
                 group_rows: 8192,
             }),
-            profile: MemoryProfile::Bounded,
+            profile: MemoryProfile::Auto,
         };
         // 0.10 × 0.6 × 2 GiB is 15 batches of 8,192,000 B: a one-batch row
         // group leaves 3 workers of 4 + 1, as unpriced (15 / 4).
@@ -1330,6 +1320,21 @@ mod read_tests {
         let mut budget = large.budget;
         let grant = grant_read_ahead(&mut budget, large, 3);
         assert_eq!(grant.units, shape.workers * (shape.depth + 8) + 3);
+        // `bounded` reads at its floor and `speed` at its maximum, whatever
+        // the budget affords (#788).
+        let bounded = resolve_read_shape(ReadTuning {
+            profile: MemoryProfile::Bounded,
+            ..small
+        });
+        assert_eq!(
+            (bounded.workers, bounded.depth),
+            (1, READ_AHEAD_MIN_BATCHES)
+        );
+        let speed = resolve_read_shape(ReadTuning {
+            profile: MemoryProfile::Speed,
+            ..large
+        });
+        assert_eq!((speed.workers, speed.depth), (4, READ_AHEAD_MAX_BATCHES));
         // Without footers there is nothing to price a reader with.
         assert_eq!(
             reader_batches(ReadTuning {
