@@ -246,7 +246,9 @@ def fetch(manifest: dict, data: Path, input_dirs: list[Path], names: list[str]) 
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".part")
         print(f"get   {name}: {inp['url']}")
-        with urllib.request.urlopen(inp["url"]) as r, tmp.open("wb") as f:  # noqa: S310
+        # source.coop answers Python-urllib's default User-Agent with 403.
+        req = urllib.request.Request(inp["url"], headers={"User-Agent": "tylertoo-bench/1"})
+        with urllib.request.urlopen(req) as r, tmp.open("wb") as f:  # noqa: S310
             shutil.copyfileobj(r, f, 1 << 20)
         tmp.replace(dst)
         if not verified(dst, inp["sha256"]):

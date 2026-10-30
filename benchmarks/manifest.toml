@@ -405,12 +405,12 @@ zoom = [0, 12]
 flags = ["--verbatim"]
 
 [cells.coverage-fill]
-label = "Coverage fill: FTW Moldova, --coverage-fill"
+label = "Coverage fill: FTW Moldova z0-14, --coverage-fill (track F's claim)"
 input = "moldova"
 command = "tiles"
 args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
-zoom = [0, 12]
+zoom = [0, 14]
 flags = ["--coverage-fill"]
 
 # The Brazil tutorial's extract (examples/brazil-fields/01-extract.sh), on a
@@ -591,12 +591,12 @@ watch = "tmp"
 # (4) F's coverage fill under bounded (main failed at the 32 MiB floor:
 # FAILED is the result there).
 [cells.coverage-fill-bounded]
-label = "Coverage fill: FTW Moldova, --coverage-fill, bounded"
+label = "Coverage fill: FTW Moldova z0-14, --coverage-fill, bounded"
 input = "moldova"
 command = "tiles"
 args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
-zoom = [0, 12]
+zoom = [0, 14]
 flags = ["--coverage-fill", "--profile", "bounded"]
 watch = "tmp"
 
@@ -714,5 +714,5 @@ spill-codec = ["spill-codec"]
 final-gate = ["lz4-mad-bounded", "lz4-mol-bounded", "spill-codec"]
 final-held = ["memory-capped", "memory-capped-auto", "coverage-fill", "coverage-fill-bounded",
               "remote-mol-auto", "remote-mp13-auto", "remote-mp13"]
-final-sweep = ["wave-nz-cg-auto", "wave-nz-cg-8", "wave-nz-cg-16", "wave-nz-cg-32", "wave-nz-cg-64"]
+final-sweep = ["wave-nz-cg-auto", "wave-nz-cg-16", "wave-nz-cg-64"]
 export-740 = ["export-nz", "polygons-mt", "export-moldova", "export-moldova-w8"]
