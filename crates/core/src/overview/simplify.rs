@@ -298,10 +298,9 @@ pub fn simplify_for_level(
 /// geometry is value-identical to `geom` (#499, the compute side of the
 /// ladder amplification issue): `unchanged == true` means the output is a
 /// value-identical clone of the input — no vertex was dropped, no ring
-/// collapsed, no disposition changed. Cheap: every case below is decided
-/// from a `Vec::len()` comparison the simplification call already computed
-/// ([`polygon_unchanged`], [`simplify_linestring_checked`]), never a
-/// coordinate-by-coordinate diff.
+/// collapsed, no disposition changed. The checked line and polygon owners
+/// use counts as a prefilter, then verify value equality before authorizing
+/// allocation sharing ([`polygon_unchanged`], [`simplify_linestring_checked`]).
 ///
 /// Callers that fold a geometry through several levels (the cascade fold,
 /// [`super::stream::process_batch_cascade`]) use `unchanged == true` to skip
@@ -1062,12 +1061,9 @@ fn polygon_diag(poly: &Polygon<f64>) -> f64 {
 
 /// Simplify a single LineString, returning `None` when it should be dropped:
 /// degenerate (`< 2` points or all coincident) or below the visibility gate.
-/// Also reports whether RDP removed any vertices (`unchanged == false` when
-/// it did) — cheap, since `geo`'s RDP output is always an ordered subsequence
-/// of the input (endpoints included), so equal vertex counts imply an
-/// identical linestring, a `Vec::len()` comparison rather than a
-/// coordinate-by-coordinate diff (mirrors [`polygon_unchanged`]'s reasoning
-/// for rings, #499).
+/// Also reports whether the result is value-identical to the input. Vertex
+/// counts prefilter the comparison; equality is checked in release builds
+/// before the cascade is allowed to share the input's allocation (#556).
 ///
 /// Adapted from `crate::simplify`'s degenerate-linestring guard (which returns
 /// the input unchanged for `< 2` points to avoid a `geo::Simplify` panic);
@@ -1086,11 +1082,7 @@ fn simplify_linestring_checked(ls: &LineString<f64>, tol: f64) -> Option<(LineSt
     if simplified.0.len() < MIN_LINESTRING_POINTS || linestring_diag(&simplified) <= 0.0 {
         return None;
     }
-    let unchanged = simplified.0.len() == ls.0.len();
-    debug_assert!(
-        !unchanged || simplified == *ls,
-        "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
-    );
+    let unchanged = simplified.0.len() == ls.0.len() && simplified == *ls;
     Some((simplified, unchanged))
 }
 
@@ -1152,19 +1144,11 @@ fn capped_is_valid(
     candidate.is_valid()
 }
 
-/// `true` when RDP removed nothing: the candidate has the same ring count and
-/// per-ring vertex counts as the original. RDP output vertices are always an
-/// ordered subset of the input (endpoints included), so equal counts imply an
-/// identical geometry — validation of the candidate is then redundant (the
-/// input is assumed valid, and re-checking it is exactly the H3(c) profile's
-/// dominant cost at fine GSDs).
-///
-/// Since #499 this result also decides whether the cascade fold shares one
-/// `Arc<Geometry<f64>>` across ladder levels, so it must never be `true`
-/// unless the candidate is value-identical to `original`. That rests entirely
-/// on the RDP ordered-subsequence premise above — a `geo` upgrade that ever
-/// moved or replaced a retained vertex would break it, which is why both
-/// checked paths carry a `debug_assert!` comparing the values outright.
+/// Whether the candidate is value-identical to the original. Ring and
+/// vertex counts reject changed shapes cheaply; value equality then guards
+/// both the redundant-validation shortcut and cascade allocation sharing
+/// in release builds (#556). The comparison is computed once and reused by
+/// the caller and [`CascadeFold::step`].
 fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool {
     candidate.exterior().0.len() == original.exterior().0.len()
         && candidate.interiors().len() == original.interiors().len()
@@ -1173,6 +1157,7 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
             .iter()
             .zip(original.interiors())
             .all(|(a, b)| a.0.len() == b.0.len())
+        && candidate == original
 }
 
 /// Simplify a Polygon in world space with ring-validity guards.
@@ -1292,10 +1277,6 @@ fn simplify_polygon_impl_checked(
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
-        debug_assert!(
-            !unchanged || candidate == *poly,
-            "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
-        );
         if unchanged || capped_is_valid(&candidate, diagnostics) {
             return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
