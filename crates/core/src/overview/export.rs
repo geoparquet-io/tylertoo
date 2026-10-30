@@ -6348,20 +6348,19 @@ impl FillFeature {
         id: Option<u64>,
         source_row: u64,
         props: SharedProps,
-        polys: &[coverage_fill::FillPolygon],
+        polys: &[&coverage_fill::FillPolygon],
         diagnostics: &crate::diagnostics::Diagnostics,
     ) -> Self {
-        log::debug!("[fill-geometry-work] polygons={}", polys.len());
         #[cfg(test)]
         coverage_fill::cost_probe::update(|c| c.fill_polygons_encoded += polys.len());
         Self {
             id,
             source_row,
             props,
-            cmds: crate::mvt::encode_tile_unit_polygons(polys, diagnostics),
+            cmds: crate::mvt::encode_tile_unit_polygons(polys.iter().copied(), diagnostics),
             polygons: polys.len(),
-            vertices: polys.iter().flatten().map(Vec::len).sum(),
-            area: polys.iter().map(coverage_fill::poly_area).sum(),
+            vertices: polys.iter().flat_map(|p| p.iter()).map(Vec::len).sum(),
+            area: polys.iter().map(|p| coverage_fill::poly_area(p)).sum(),
         }
     }
 }
@@ -6392,12 +6391,11 @@ fn fill_features(
         return (Vec::new(), FillTally::default());
     }
     let (kept, shed) = coverage_fill::within_budget(polys, fill_budget(opts));
-    let polys: Vec<coverage_fill::FillPolygon> =
-        kept.into_iter().map(|i| polys[i].clone()).collect();
+    let polys: Vec<&coverage_fill::FillPolygon> = kept.into_iter().map(|i| &polys[i]).collect();
     let polys = polys.as_slice();
     let tally = FillTally {
         polygons: polys.len(),
-        vertices: polys.iter().flatten().map(Vec::len).sum(),
+        vertices: polys.iter().flat_map(|p| p.iter()).map(Vec::len).sum(),
         shed,
     };
     let proj = crate::mvt::TileProjector::new(tb, opts.extent);
@@ -6417,10 +6415,14 @@ fn fill_features(
             None => [f64::INFINITY; 4],
         })
         .collect();
-    let mut groups: std::collections::BTreeMap<usize, Vec<coverage_fill::FillPolygon>> =
+    let mut groups: std::collections::BTreeMap<usize, Vec<&coverage_fill::FillPolygon>> =
         std::collections::BTreeMap::new();
-    for (poly, host) in polys.iter().zip(coverage_fill::assign_hosts(polys, &hosts)) {
-        groups.entry(host).or_default().push(poly.clone());
+    for (poly, host) in polys
+        .iter()
+        .copied()
+        .zip(coverage_fill::assign_hosts(polys.iter().copied(), &hosts))
+    {
+        groups.entry(host).or_default().push(poly);
     }
     let feats = groups
         .into_iter()
@@ -6435,13 +6437,7 @@ fn fill_features(
         })
         .filter(|f| !f.cmds.is_empty())
         .collect();
-    log::debug!(
-        "[fill-tile-work] input={} kept={} polygon_clones={} rebuilt={} reused=0",
-        polys.len() + shed,
-        polys.len(),
-        polys.len() * 2,
-        polys.len()
-    );
+
     (feats, tally)
 }
 
@@ -6542,6 +6538,26 @@ fn encode_tile(
 /// before it writes the tile without one.
 const MAX_FILL_PASSES: u32 = 4;
 
+/// Temporary adapter until E2's fit owner accepts cached gzip bytes.
+/// `fitted` is the unchanged output already checked by the base size valve.
+/// A missing cache still uses the fit owner's normal error/compression path.
+fn base_fit_for_fill(fitted: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
+    let Some((limit, gzip)) = opts
+        .compressed_tile_size_limit
+        .filter(|&l| l > 0)
+        .zip(fitted.gzip.as_ref())
+    else {
+        return tile_fit(fitted, opts);
+    };
+    let raw_fit = opts
+        .tile_size_limit
+        .filter(|&l| l > 0)
+        .map_or(f64::INFINITY, |limit| {
+            limit as f64 / fitted.data.len() as f64
+        });
+    Ok(raw_fit.min(limit as f64 / gzip.len() as f64))
+}
+
 /// The tile the size valve fitted (`fitted`) with as much of its #750 fill
 /// as fits in the room left, re-encoding the same features with a subset of
 /// the fill through `encode` (the merge valve's cached encode, so a heavily
@@ -6574,11 +6590,7 @@ fn with_fill(
     }
     #[cfg(test)]
     let base_gzip_before = fitted.gzip.as_ref().map(|g| g.as_ptr());
-    let gzip_check = usize::from(opts.compressed_tile_size_limit.is_some_and(|l| l > 0));
-    log::debug!(
-        "[fill-base-check] gzip_calls={gzip_check} cached={}",
-        fitted.gzip.is_some()
-    );
+
     // Drawn and shed, from the fill features themselves.
     let total: usize = fill.iter().map(|f| f.polygons).sum();
     let no_fill = |tally: &mut FillTally, fitted: TileMvt| {
@@ -6587,7 +6599,7 @@ fn with_fill(
         tally.vertices = 0;
         fitted
     };
-    if tile_fit(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
+    if base_fit_for_fill(&mut fitted, opts).unwrap_or(f64::INFINITY) < 1.0 {
         #[cfg(test)]
         note_gzip(base_gzip_before, &fitted);
         return no_fill(tally, fitted);
@@ -6605,11 +6617,7 @@ fn with_fill(
         kept.sort_unstable();
         let subset: Vec<&FillFeature> = kept.iter().map(|&i| &fill[i]).collect();
         let mut mvt = encode(&subset);
-        log::debug!(
-            "[fill-pass] pass={pass} gzip_calls={gzip_check} features={} polygons={}",
-            subset.len(),
-            subset.iter().map(|f| f.polygons).sum::<usize>()
-        );
+
         #[cfg(test)]
         coverage_fill::cost_probe::update(|c| {
             c.fill_passes += 1;
@@ -10450,7 +10458,7 @@ mod tests {
             Some(id),
             id,
             Arc::new(Vec::new()),
-            &[vec![vec![
+            &[&vec![vec![
                 (x, y),
                 (x + side, y),
                 (x + side, y + side),
