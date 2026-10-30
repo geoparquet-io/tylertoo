@@ -4,11 +4,11 @@
 //! serial order. Equal raw bytes can share compression regardless of which
 //! Rayon worker reaches them first: gzip is deterministic.
 
-use std::io::{self, Write};
+use std::io;
 use std::sync::Mutex;
 #[expect(
     clippy::disallowed_types,
-    reason = "#733: bounded gzip cache owns process-wide memoization and its trace handle"
+    reason = "#733: bounded gzip cache owns process-wide memoization"
 )]
 use std::sync::OnceLock;
 
@@ -71,7 +71,7 @@ impl Shard {
         }
         // Hold only this shard's lock through compression. Concurrent copies
         // of one payload do the work once; unrelated shards remain parallel.
-        let gzip = uncached(raw)?;
+        let gzip = super::compress(raw, super::Compression::Gzip)?;
         let charge = raw.len() + gzip.len() + ALLOCATION_CHARGE;
         if charge > payload_budget() / SHARDS {
             return Ok(gzip);
@@ -108,7 +108,7 @@ impl Shard {
 
 pub(crate) fn compress(raw: &[u8]) -> io::Result<Vec<u8>> {
     if raw.len() > MAX_RAW_BYTES {
-        return uncached(raw);
+        return super::compress(raw, super::Compression::Gzip);
     }
     #[expect(
         clippy::disallowed_types,
@@ -121,38 +121,6 @@ pub(crate) fn compress(raw: &[u8]) -> io::Result<Vec<u8>> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .compress(hash, raw)
-}
-
-fn uncached(raw: &[u8]) -> io::Result<Vec<u8>> {
-    let gzip = super::compress(raw, super::Compression::Gzip)?;
-    // Best-effort diagnostics, like TYLERTOO_PROFILE_JSON. Count physical tile
-    // gzip calls only (not cache hits or archive directory/metadata gzip).
-    #[expect(
-        clippy::disallowed_types,
-        reason = "profiling-only trace handle belongs to the gzip owner"
-    )]
-    static TRACE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    if let Some(file) = TRACE.get_or_init(|| {
-        let path = std::env::var_os("TYLERTOO_TILE_GZIP_TRACE")?;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-            .map(Mutex::new)
-    }) {
-        let mut file = file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writeln!(
-            file,
-            "{} {} {}",
-            TileHasher::hash(raw),
-            raw.len(),
-            gzip.len()
-        );
-    }
-    Ok(gzip)
 }
 
 #[cfg(test)]
