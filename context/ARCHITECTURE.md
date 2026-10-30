@@ -119,6 +119,14 @@ default (the `mimalloc` feature; `--no-default-features` opts out), and on
 musl unconditionally; the `dhat-heap` build excludes it. The Python wheel
 keeps the system allocator on glibc (an opt-in `mimalloc` feature until a
 wheel benchmark decides) and uses mimalloc on musllinux (#739, #480).
+Profile footprints therefore compare for one allocator: `bounded` keeps
+main's shape for the same allocator, and mimalloc adds a fixed floor of
+about 600 MiB that shows on small inputs (Madagascar `bounded` 685 → 1,254
+MiB peak RSS; Moldova 2,509 → 2,792). It is transparent huge pages on
+mimalloc v3's eagerly committed arenas plus its 1 s purge delay;
+`MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` removes it at a wall-time
+cost, so the default keeps mimalloc's settings and the docs name the
+opt-outs.
 
 `auto` is a third shape, not a router between the other two. Before #788 it
 copied `speed` for the read-ahead depth cap and the encode count. A first

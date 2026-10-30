@@ -98,6 +98,9 @@ Args:
     profile: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles):
         `"speed"` holds everything in RAM, `"bounded"` uses disk and
         holds the least, and `"auto"` sizes to the machine's memory.
+        Footprints compare for one allocator: the musl (Alpine) wheel uses
+        mimalloc, which adds a fixed floor of about 600 MiB on small
+        inputs; other wheels use the system allocator.
     in_flight_batches: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),
         or `0` to size from the CPU count.
     read_workers: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency),

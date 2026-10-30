@@ -558,7 +558,9 @@ pub struct ExportOptions {
     /// a tile that alone needs more than the machine's memory (#665): no
     /// profile makes one tile smaller. `tiles` passes its own `--profile`
     /// through. Changes speed and peak memory only; output is
-    /// byte-identical across profiles. Default [`MemoryProfile::Auto`].
+    /// byte-identical across profiles. Footprints compare for one allocator:
+    /// see [`MemoryProfile`] on the CLI's mimalloc floor. Default
+    /// [`MemoryProfile::Auto`].
     #[serde(with = "super::config::spelled")]
     #[cfg_attr(feature = "cli", arg(
         long,
@@ -566,7 +568,7 @@ pub struct ExportOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. The default mimalloc build adds a fixed allocator floor of about 600 MiB that shows on small inputs; a `--no-default-features` build uses the system allocator. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub profile: MemoryProfile,
     /// Top-level `name`, `description` and `attribution` written to the
