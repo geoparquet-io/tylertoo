@@ -175,3 +175,17 @@ def test_report_resumes_from_run_files(tmp_path):
     rm.write_report(tmp_path)
     report = (tmp_path / "report.md").read_text()
     assert "| cell | a | 1 | ok | 2.00 s |" in report
+
+
+def test_parse_cpus():
+    assert rm.parse_cpus("0-3") == {0, 1, 2, 3}
+    assert rm.parse_cpus("0,2,4-5") == {0, 2, 4, 5}
+
+
+def test_busy_jiffies_of_a_cpu_set_add_up():
+    cpus = rm.all_cpus()
+    half = frozenset(sorted(cpus)[: len(cpus) // 2])
+    whole_busy, whole_total = rm.cpu_busy_jiffies(cpus)
+    part_busy, part_total = rm.cpu_busy_jiffies(half)
+    assert 0 < part_total < whole_total
+    assert part_busy <= whole_busy

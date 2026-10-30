@@ -45,7 +45,10 @@ The load gate: the 1-minute load average must be under --load-max (3). Our
 own previous run holds that average up for minutes after it exits, so within
 LOAD_OWN_S of a run of ours the gate instead samples /proc/stat for
 GATE_SAMPLE_S: fewer than --load-max busy cores while nothing of ours runs
-means the host is quiet. Every wait is logged.
+means the host is quiet. Every wait is logged. On a host where the other
+work is pinned away from a CPU set (`taskset -c 0-31 ... --gate-cpus 0-31`),
+the gate is instead busy cores on that set only, and each run records the
+CPU others used on that set (`foreign_cores`) and on the rest (`context_cores`).
 
 A cell with `memory_max` runs in a transient systemd scope
 (`systemd-run --user --scope -p MemoryMax=...`, or `sudo -n systemd-run` when
@@ -256,30 +259,62 @@ def loadavg1() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def cpu_busy_jiffies() -> tuple[int, int]:
-    """(busy, total) jiffies over every CPU, from /proc/stat's `cpu` line."""
-    fields = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
-    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # noqa: PLR2004
-    total = sum(fields[:8])
-    return total - idle, total
+def parse_cpus(spec: str) -> frozenset[int]:
+    """A taskset-style CPU list (`0-31`, `0,2,4-7`) as a set of CPU ids."""
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return frozenset(cpus)
 
 
-def busy_cores(seconds: float) -> float:
-    """Cores busy over a short window, by /proc/stat."""
-    b0, _ = cpu_busy_jiffies()
+def cpu_busy_jiffies(cpus: frozenset[int] | None = None) -> tuple[int, int]:
+    """(busy, total) jiffies from /proc/stat: the aggregate `cpu` line, or
+    the sum of the `cpuN` lines for N in `cpus`."""
+    busy = total = 0
+    for line in Path("/proc/stat").read_text().splitlines():
+        name, *vals = line.split()
+        if not name.startswith("cpu"):
+            break
+        if (cpus is None) != (name == "cpu"):
+            continue
+        if cpus is not None and int(name[3:]) not in cpus:
+            continue
+        fields = [int(x) for x in vals]
+        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)  # noqa: PLR2004
+        busy += sum(fields[:8]) - idle
+        total += sum(fields[:8])
+    return busy, total
+
+
+def busy_cores(seconds: float, cpus: frozenset[int] | None = None) -> float:
+    """Cores busy over a short window (of `cpus` only, if given), by /proc/stat."""
+    b0, _ = cpu_busy_jiffies(cpus)
     t0 = time.monotonic()
     time.sleep(seconds)
-    b1, _ = cpu_busy_jiffies()
+    b1, _ = cpu_busy_jiffies(cpus)
     return (b1 - b0) / CLK_TCK / (time.monotonic() - t0)
+
+
+def all_cpus() -> frozenset[int]:
+    """Every CPU id /proc/stat lists."""
+    return frozenset(int(ln.split()[0][3:]) for ln in Path("/proc/stat").read_text().splitlines()
+                     if ln.startswith("cpu") and ln[3].isdigit())
 
 
 class Gate:
     """Wait for a quiet host before each run (see the module docstring)."""
 
-    def __init__(self, load_max: float, wait_s: float, log: Path, enforce: bool = True) -> None:
+    def __init__(self, load_max: float, wait_s: float, log: Path, enforce: bool = True,
+                 cpus: frozenset[int] | None = None) -> None:
         """Gate below `load_max`, waiting at most `wait_s`, logging to `log`;
-        with `enforce` off it only records what it saw (dry runs)."""
+        with `enforce` off it only records what it saw (dry runs). With
+        `cpus` (an isolated CPU set the runs are pinned to) the gate is
+        busy cores on that set only, below `load_max`; the load average and
+        the other CPUs are recorded as context."""
         self.enforce = enforce
+        self.cpus = cpus
+        self.others = all_cpus() - cpus if cpus else None
         self.load_max = load_max
         self.wait_s = wait_s
         self.log = log
@@ -291,18 +326,28 @@ class Gate:
         while True:
             load = loadavg1()
             own_recent = time.monotonic() - self.last_own_end < LOAD_OWN_S
-            busy = busy_cores(GATE_SAMPLE_S)
-            quiet = busy < self.load_max and (load < self.load_max or own_recent)
+            context = {}
+            if self.cpus:
+                b0, b0o = cpu_busy_jiffies(self.cpus)[0], cpu_busy_jiffies(self.others)[0]
+                time.sleep(GATE_SAMPLE_S)
+                busy = (cpu_busy_jiffies(self.cpus)[0] - b0) / CLK_TCK / GATE_SAMPLE_S
+                other = (cpu_busy_jiffies(self.others)[0] - b0o) / CLK_TCK / GATE_SAMPLE_S
+                context = {"busy_other_cpus": round(other, 2)}
+                quiet = busy < self.load_max
+            else:
+                busy = busy_cores(GATE_SAMPLE_S)
+                quiet = busy < self.load_max and (load < self.load_max or own_recent)
             waited = time.monotonic() - t0
             if quiet or waited > self.wait_s or not self.enforce:
                 verdict = "quiet" if quiet else "NOT_ENFORCED" if not self.enforce else "TIMED_OUT"
-                rec = {"load1": load, "busy_cores": round(busy, 2),
+                rec = {"load1": load, "busy_cores": round(busy, 2), **context,
                        "waited_s": round(waited, 1), "own_recent": own_recent,
                        "gate": verdict}
                 if waited > GATE_SAMPLE_S * 2 or not quiet:
                     self._log(rec)
                 return rec
-            self._log({"load1": load, "busy_cores": round(busy, 2), "waiting_s": round(waited)})
+            self._log({"load1": load, "busy_cores": round(busy, 2), **context,
+                       "waiting_s": round(waited)})
             time.sleep(GATE_POLL_S)
 
     def _log(self, rec: dict) -> None:
@@ -488,14 +533,19 @@ def dir_bytes(path: Path) -> int:
     return total
 
 
-def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path) -> dict:
+def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
+               cpus: frozenset[int] | None = None) -> dict:
     """Run argv (already wrapped in GNU time). A wall, RSS or scratch-disk
     cap (`caps`: wall_s, rss_gib, scratch_gib) kills the process group and
-    is reported as the status, not raised."""
+    is reported as the status, not raised. `foreign_cores` is the CPU other
+    processes used during the run: on `cpus` when given (the isolated set the
+    run is pinned to; the rest is `context_cores`), else on the whole host."""
+    others = all_cpus() - cpus if cpus else None
+    o0 = cpu_busy_jiffies(others)[0] if cpus else 0
     cap_kib = int(caps["rss_gib"] * 1024 * 1024)
     wall_s = caps["wall_s"]
     scratch_cap = int(caps["scratch_gib"] * (1 << 30))
-    b0, _ = cpu_busy_jiffies()
+    b0, _ = cpu_busy_jiffies(cpus)
     t0 = time.monotonic()
     with log.open("w") as logf:
         proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.PIPE, text=True,  # noqa: S603
@@ -528,7 +578,8 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path)
         watcher.join()
         logf.write("\n--- stderr ---\n" + stderr)
     wall_poll = time.monotonic() - t0
-    b1, _ = cpu_busy_jiffies()
+    b1, _ = cpu_busy_jiffies(cpus)
+    context = (cpu_busy_jiffies(others)[0] - o0) / CLK_TCK / max(wall_poll, 1e-6) if cpus else None
     gt = parse_gnu_time(stderr)
     if outcome["cap"]:
         status = outcome["cap"]
@@ -549,6 +600,7 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path)
         "peak_rss_kib": gt["peak_rss_kib"] if gt["peak_rss_kib"] else outcome["peak_poll_kib"],
         "peak_poll_kib": outcome["peak_poll_kib"],
         "foreign_cores": round(foreign, 2),
+        "context_cores": round(context, 2) if context is not None else None,
         "scratch_peak_mib": round(outcome["scratch_peak"] / (1 << 20)),
         "stderr_tail": stderr[-2500:] if status != "ok" else None,
     }
@@ -592,9 +644,16 @@ class Runner:
         if len(set(labels)) != len(labels):
             raise ManifestError("--bin labels must be distinct")
         defaults = manifest.get("defaults", {})
+        self.cpus = parse_cpus(args.gate_cpus) if args.gate_cpus else None
+        affinity = frozenset(os.sched_getaffinity(0))
+        if self.cpus and not affinity <= self.cpus:
+            raise ManifestError(f"--gate-cpus {args.gate_cpus}: the runner may run on "
+                                f"{sorted(affinity)}; start it under `taskset -c {args.gate_cpus}`")
+        for b in self.bins:
+            b["affinity_cpus"] = len(affinity)
         self.gate = Gate(args.load_max or defaults.get("load_max", 3.0),
                          defaults.get("load_wait_s", 3600), self.results / "gate.log",
-                         enforce=not args.no_gate)
+                         enforce=not args.no_gate, cpus=self.cpus)
         (self.results / "binaries.json").write_text(json.dumps(self.bins, indent=2))
 
     def cells(self) -> list[str]:
@@ -716,7 +775,7 @@ class Runner:
         print(f"run   {name} {label} r{r}: {' '.join(argv[1:])}", flush=True)
         try:
             res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], cell, env,
-                             cdir / f"{label}-r{r}.log", out)
+                             cdir / f"{label}-r{r}.log", out, self.cpus)
             output = output_digest(out, cell["output"])
         finally:
             # Only the result row, the profile JSONL and the log survive a run.
@@ -769,6 +828,13 @@ def spread(values: list[float]) -> dict:
             "spread": round((max(values) - min(values)) / med, 4) if med else None}
 
 
+def true_peak(run: dict) -> float | None:
+    """The sampler's true peak RSS (MiB): the largest of the run's phases."""
+    peaks = [(run.get("profile", {}).get(ph) or {}).get("true_peak_mib") for ph in ("convert", "export")]
+    peaks = [p for p in peaks if p is not None]
+    return max(peaks) if peaks else None
+
+
 def phase_total(run: dict, phase: str) -> float | None:
     """`phase_walls.total` of the convert or export line, if the run wrote one."""
     walls = (run.get("profile", {}).get(phase) or {}).get("phase_walls") or {}
@@ -789,7 +855,9 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
             "peak_rss_mib": spread([r["peak_rss_kib"] / 1024 for r in ok if r["peak_rss_kib"]]),
             "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
             "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),
+            "true_peak_mib": spread([v for r in ok if (v := true_peak(r)) is not None]),
             "foreign_cores_max": max((r["foreign_cores"] for r in mine), default=None),
+            "context_cores": spread([r["context_cores"] for r in mine if r.get("context_cores") is not None]),
             "outputs": sorted({r["output"]["sha256"] or "-" for r in ok}),
             "output_bytes": sorted({r["output"]["bytes"] for r in ok if r["output"]["bytes"]}),
         }
@@ -812,16 +880,19 @@ def write_report(results: Path) -> None:
     bins = json.loads(bins_path.read_text())
     lines = [f"# Benchmark run `{results.name}`", "",
              "Medians over ok runs; ± is half the min–max range over the median.",
-             "`foreign` is the most cores other processes used during any run of the row.", "",
+             "`foreign` is the most cores other processes used during any run of the row (on the "
+             "--gate-cpus set when given); `context` is the median busy cores on the other CPUs.", "",
              "Binaries: " + ", ".join(f"`{b['label']}` ({b['allocator']}, {b['sha256'][:12]})" for b in bins),
-             "", "| cell | binary | runs | status | wall | vs first | convert | export | CPU s | peak RSS MiB | foreign | output |",
-             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+             "", "| cell | binary | runs | status | wall | vs first | convert | export | CPU s | peak RSS MiB "
+             "| true peak MiB | RSS vs first | foreign | context | output |",
+             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
         runs = load_runs(cdir)
         if not runs:
             continue
         summ = summarize(runs, bins)
         base = summ[bins[0]["label"]]["wall_s"]["median"]
+        base_rss = summ[bins[0]["label"]]["peak_rss_mib"]["median"]
         shas = {s for v in summ.values() for s in v["outputs"]}
         for b in bins:
             s = summ[b["label"]]
@@ -829,11 +900,14 @@ def write_report(results: Path) -> None:
                 continue
             med = s["wall_s"]["median"]
             ratio = f"{med / base:.3f}" if med and base and b is not bins[0] else ""
+            rss = s["peak_rss_mib"]["median"]
+            rss_ratio = f"{rss / base_rss:.3f}" if rss and base_rss and b is not bins[0] else ""
             same = "same" if len(shas) == 1 else "DIFFERS" if len(shas) > 1 else ""
             lines.append(
                 f"| {cdir.name} | {b['label']} | {s['wall_s']['n']} | {','.join(s['statuses'])} "
                 f"| {fmt(s['wall_s'], ' s')} | {ratio} | {fmt(s['convert_s'])} | {fmt(s['export_s'])} "
-                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {s['foreign_cores_max']} "
+                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {fmt(s['true_peak_mib'])} | {rss_ratio} "
+                f"| {s['foreign_cores_max']} | {fmt(s['context_cores'])} "
                 f"| {same} {s['output_bytes'][0] if s['output_bytes'] else ''} |")
     (results / "report.md").write_text("\n".join(lines) + "\n")
 
@@ -862,6 +936,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--dry-run", action="store_true", help="one round per cell; not a baseline")
     run.add_argument("--force", action="store_true", help="rerun cells that already have results")
     run.add_argument("--load-max", type=float, help="load gate threshold (manifest default)")
+    run.add_argument("--gate-cpus", help="an isolated CPU set the run is pinned to (taskset -c): "
+                     "gate on busy cores there (< --load-max) instead of the load average, "
+                     "and count foreign CPU there only")
     run.add_argument("--no-gate", action="store_true",
                      help="record the load but never wait (dry runs on a busy host)")
     run.add_argument("--bench-out", default=str(ROOT / ".bench-out"), help="scratch for outputs, emptied per run")

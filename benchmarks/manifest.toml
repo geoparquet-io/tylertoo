@@ -94,6 +94,12 @@ rows = 2815136
 geometry = "LineString"
 notes = "Road and rail segments, 128 row groups, 21 columns (most nested)."
 
+[inputs.nz-overview-z14]
+file = "nz-overview-z14-e1.parquet"
+sha256 = "242608275bee5fbc3c7314e98799ccccf0597f4b30f7f992adb8401bbcf150f0"
+bytes = 2921880105
+notes = "An overview, not a GeoParquet source: built by track E1 (788-E1/.bench-out/nz.parquet), no URL."
+
 # FTW (alpha) Brazil, one file per state: 55,499,514 fields in 27 files,
 # 11.6 GB. Together they are the "Brazil 55.5M" input of #535 and #734. Only
 # MT, GO and MS are kept on disk between windows; `fetch` brings the other 24
@@ -392,6 +398,19 @@ output = "out.pmtiles"
 allocator = "any"
 setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 13] }
 
+# NZ parcels' z0-14 overview as track E1 built it for #739
+# (`tylertoo overview nz-parcels-hilbert.parquet --min-zoom 0 --max-zoom 14`,
+# glibc build of cb1bdfc): E1 saw export RSS move one way on Moldova and the
+# other on NZ, so the allocator decision needs both.
+[cells.export-nz]
+label = "Export: NZ parcels z0-14 overview (E1's #739 input)"
+tickets = [739]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+allocator = "any"
+
 # #734: the convert/export split at the scale #535 measured. Hours, not
 # minutes: one round unless the lead asks for more.
 [cells.brazil-55m]
@@ -417,5 +436,5 @@ heavy = true
 [sets]
 window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",
            "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
-           "export-moldova", "export-mt"]
-export-ab = ["export-moldova", "export-mt"]
+           "export-moldova", "export-mt", "export-nz"]
+export-ab = ["export-moldova", "export-nz"]
