@@ -205,3 +205,18 @@ def test_warmup_records_stay_out_of_the_summary(tmp_path):
     (cdir / "warmup" / "a-w0.json").write_text(json.dumps(rec))
     (cdir / "a-r0.json").write_text(json.dumps({**rec, "wall_s": 1.0}))
     assert [r["wall_s"] for r in rm.load_runs(cdir)] == [1.0]
+
+
+def test_report_splits_three_binaries_against_first_and_previous(tmp_path):
+    bins = [{"label": n, "allocator": "glibc", "sha256": str(i) * 64}
+            for i, n in enumerate(["main", "head-glibc", "head"])]
+    (tmp_path / "binaries.json").write_text(json.dumps(bins))
+    cdir = tmp_path / "cell"
+    cdir.mkdir()
+    for name, wall in [("main", 10.0), ("head-glibc", 8.0), ("head", 6.0)]:
+        rec = {"binary": name, "status": "ok", "wall_s": wall, "cpu_s": 1.0, "peak_rss_kib": 1024,
+               "foreign_cores": 0.0, "output": {"sha256": "aa", "bytes": 5}, "profile": {}}
+        (cdir / f"{name}-r0.json").write_text(json.dumps(rec))
+    rm.write_report(tmp_path)
+    row = next(ln for ln in (tmp_path / "report.md").read_text().splitlines() if "| head |" in ln)
+    assert "| 0.600 | 0.750 |" in row

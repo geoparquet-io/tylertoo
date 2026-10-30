@@ -453,6 +453,12 @@ heavy = true
 
 # ---------------------------------------------------------------------------
 # Sets
+#
+# The final window compares three binaries, in this order, so the report's
+# `vs prev` columns split the gain (#739 made mimalloc the gnu default):
+#   --bin main=glibc:<origin/main release>          the baseline
+#   --bin head-glibc=glibc:<head, glibc opt-out>    the tracks' code changes
+#   --bin head=mimalloc:<head, default features>    plus the allocator
 
 [sets]
 window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",

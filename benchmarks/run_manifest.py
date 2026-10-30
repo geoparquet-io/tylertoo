@@ -895,7 +895,10 @@ def fmt(s: dict, unit: str = "") -> str:
 
 
 def write_report(results: Path) -> None:
-    """report.md: one row per cell and binary, ratios against the first binary."""
+    """report.md: one row per cell and binary, wall and RSS ratios against the
+    first binary and against the binary before it. With three binaries in
+    order (origin/main glibc, head glibc, head mimalloc) `vs prev` splits a
+    change into the code's gain and the allocator's."""
     bins_path = results / "binaries.json"
     if not bins_path.exists():
         return
@@ -905,30 +908,33 @@ def write_report(results: Path) -> None:
              "`foreign` is the most cores other processes used during any run of the row (on the "
              "--gate-cpus set when given); `context` is the median busy cores on the other CPUs.", "",
              "Binaries: " + ", ".join(f"`{b['label']}` ({b['allocator']}, {b['sha256'][:12]})" for b in bins),
-             "", "| cell | binary | runs | status | wall | vs first | convert | export | CPU s | peak RSS MiB "
-             "| true peak MiB | RSS vs first | foreign | context | output |",
-             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+             "", "| cell | binary | runs | status | wall | vs first | vs prev | convert | export | CPU s "
+             "| peak RSS MiB | true peak MiB | RSS vs first | RSS vs prev | foreign | context | output |",
+             "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
         runs = load_runs(cdir)
         if not runs:
             continue
         summ = summarize(runs, bins)
-        base = summ[bins[0]["label"]]["wall_s"]["median"]
-        base_rss = summ[bins[0]["label"]]["peak_rss_mib"]["median"]
         shas = {s for v in summ.values() for s in v["outputs"]}
-        for b in bins:
+
+        def ratio(i: int, j: int, key: str) -> str:
+            num = summ[bins[i]["label"]][key]["median"]
+            den = summ[bins[j]["label"]][key]["median"]
+            return f"{num / den:.3f}" if i != j and num and den else ""
+
+        for i, b in enumerate(bins):
             s = summ[b["label"]]
             if not s["statuses"]:
                 continue
-            med = s["wall_s"]["median"]
-            ratio = f"{med / base:.3f}" if med and base and b is not bins[0] else ""
-            rss = s["peak_rss_mib"]["median"]
-            rss_ratio = f"{rss / base_rss:.3f}" if rss and base_rss and b is not bins[0] else ""
+            prev = max(i - 1, 0)
             same = "same" if len(shas) == 1 else "DIFFERS" if len(shas) > 1 else ""
             lines.append(
                 f"| {cdir.name} | {b['label']} | {s['wall_s']['n']} | {','.join(s['statuses'])} "
-                f"| {fmt(s['wall_s'], ' s')} | {ratio} | {fmt(s['convert_s'])} | {fmt(s['export_s'])} "
-                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {fmt(s['true_peak_mib'])} | {rss_ratio} "
+                f"| {fmt(s['wall_s'], ' s')} | {ratio(i, 0, 'wall_s')} | {ratio(i, prev, 'wall_s')} "
+                f"| {fmt(s['convert_s'])} | {fmt(s['export_s'])} "
+                f"| {fmt(s['cpu_s'])} | {fmt(s['peak_rss_mib'])} | {fmt(s['true_peak_mib'])} "
+                f"| {ratio(i, 0, 'peak_rss_mib')} | {ratio(i, prev, 'peak_rss_mib')} "
                 f"| {s['foreign_cores_max']} | {fmt(s['context_cores'])} "
                 f"| {same} {s['output_bytes'][0] if s['output_bytes'] else ''} |")
     (results / "report.md").write_text("\n".join(lines) + "\n")
