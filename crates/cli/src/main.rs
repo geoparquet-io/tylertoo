@@ -12,8 +12,10 @@
 /// that way, so the musl release binary uses it instead.
 ///
 /// On musl it is unconditional. On every other target it is the `mimalloc`
-/// Cargo feature (#739): glibc malloc measured ~45% slower than mimalloc on a
-/// 64-core export, so a gnu build can opt in (or out) without a code change.
+/// Cargo feature, on by default (#739): against glibc malloc, export took
+/// 0.68-0.79x the wall time and total CPU 0.83x on the #788 benchmark lane,
+/// with peak RSS from +30% to -23% by dataset. `--no-default-features` builds
+/// on the platform allocator instead.
 /// The Python extension module never routes through this crate — a pyo3
 /// `cdylib` must leave the host interpreter's allocator arrangements alone.
 ///
@@ -1876,6 +1878,28 @@ fn print_stats_table(report: &tylertoo_core::stats::StatsReport) {
 /// (`HumanCount`'s `Display` ignores width).
 fn format_number(n: u64) -> String {
     HumanCount(n).to_string()
+}
+
+/// #739: the gnu CLI links mimalloc by default. Checked at build time
+/// against the manifest's default feature list, and, in any build with the
+/// feature on and dhat off, against the type of the installed allocator.
+#[cfg(test)]
+mod allocator_default {
+    #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
+    const _: &mimalloc::MiMalloc = &super::GLOBAL;
+
+    #[test]
+    fn mimalloc_is_a_default_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("default ="))
+            .expect("crates/cli/Cargo.toml declares default features");
+        assert!(
+            default.contains("\"mimalloc\""),
+            "mimalloc must stay a default feature of the CLI: {default}"
+        );
+    }
 }
 
 #[cfg(test)]

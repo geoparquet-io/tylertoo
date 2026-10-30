@@ -5,6 +5,11 @@
 //! Rayon worker reaches them first: gzip is deterministic.
 
 use std::io;
+#[expect(
+    clippy::disallowed_types,
+    reason = "#733: the bounded gzip cache's configured cap belongs to its process-wide owner"
+)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 #[expect(
     clippy::disallowed_types,
@@ -20,17 +25,36 @@ use crate::dedup::TileHasher;
 const MAX_RAW_BYTES: usize = 1536;
 const SHARDS: usize = 32;
 const ENTRIES_PER_SHARD: usize = 128;
-/// Process-wide cache payload budget. Charge two allocator headers/padding
-/// conservatively as 64 B per entry. In addition, at most
-/// `SHARDS * ENTRIES_PER_SHARD * size_of::<Entry>()` bytes back the fixed-capacity slot
-/// vectors, plus the static mutexes. With the current Entry this is < 8.25 MiB
-/// total. The cache is lazy, lasts across waves/exports, and will move onto
-/// `MemoryBudget` when the export context owns this resource.
+/// The payload cap a caller asks for, and the cap before any caller
+/// configures one: 8 MiB.
+const DEFAULT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+/// The cache's payload in [`SHARDS`] equal slices, the unit an export's
+/// `MemoryBudget` grants it in (#788 E1): one shard's share of the
+/// default cap.
+pub(crate) const PAYLOAD_SLICE_BYTES: usize = DEFAULT_PAYLOAD_BYTES / SHARDS;
+/// Slices in the default cap.
+pub(crate) const PAYLOAD_SLICES: usize = SHARDS;
+#[expect(
+    clippy::disallowed_types,
+    reason = "#733: the bounded gzip cache's configured cap belongs to its process-wide owner"
+)]
+static PAYLOAD_CAP: AtomicUsize = AtomicUsize::new(DEFAULT_PAYLOAD_BYTES);
+
+/// Set the cache payload cap to what the caller's `MemoryBudget` granted
+/// (#788 E1). The cache keeps no sizing policy of its own; a lowered cap
+/// evicts down to it as each shard next stores an entry.
+pub(crate) fn configure_payload_cap(bytes: usize) {
+    PAYLOAD_CAP.store(bytes, Ordering::Relaxed);
+}
+
+/// Process-wide cache payload budget: the configured cap. Charge two
+/// allocator headers/padding conservatively as 64 B per entry. In addition,
+/// at most `SHARDS * ENTRIES_PER_SHARD * size_of::<Entry>()` bytes back the
+/// fixed-capacity slot vectors, plus the static mutexes. With the current
+/// Entry this is < 8.25 MiB total at the default cap. The cache is lazy and
+/// lasts across waves/exports.
 fn payload_budget() -> usize {
-    // #788 E2: export has no shared mutable MemoryBudget yet. Keep the
-    // fallback in one place until E1 provides its once-per-export grant;
-    // then the cache will accept that configured cap instead of policy.
-    8 * 1024 * 1024
+    PAYLOAD_CAP.load(Ordering::Relaxed)
 }
 const ALLOCATION_CHARGE: usize = 64;
 
