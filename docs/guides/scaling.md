@@ -75,8 +75,11 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
   pass 2, whose readers share the cores with simplification, at most 4 in
   each. tylertoo honors an explicit value up to
   twice the core count, as far as the profile's memory allows; `bounded`
-  reads with at most 4. Remote inputs always use one reader, even when staged
-  to disk: concurrent readers would evict each other's shared chunk cache.
+  reads with at most 4. A remote input uses one reader while any chunk the
+  pass reads is still on the network, because concurrent readers would evict
+  each other's shared chunk cache. Once staging has copied every chunk the
+  pass reads to disk, it reads like a local file. The log says
+  "remote input not fully staged" when it reads sequentially.
 
 Resident batches include those in flight, each worker's read-ahead queue,
 and, when spilling, up to three per level in spill writers. Under `auto` and
