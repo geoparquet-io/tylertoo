@@ -17958,6 +17958,36 @@ mod tests {
         assert!(grants.is_empty());
     }
 
+    /// A level its grant covers only in part spills, keeping the granted
+    /// bytes resident.
+    #[test]
+    fn a_partly_granted_level_store_keeps_its_grant_resident() {
+        let plan = LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[1000, 1000]),
+            wave: 1,
+        };
+        let read = LevelRead {
+            forced: None,
+            ram_budget: 7,
+            member_bytes: Some(100),
+            profile: MemoryProfile::Auto,
+        };
+        // A 300 kB budget grants the 1,000-member wave and 666 of the
+        // level's 2,000 members.
+        let mut budget = MemoryBudget::with_available(Some(300_000));
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        assert!(matches!(
+            backing,
+            StoreBacking {
+                backing: SinkBacking::Spill,
+                ram_budget: 7,
+                resident: 66_600
+            }
+        ));
+        assert_eq!(grants[1].bytes(), 66_600);
+    }
+
     /// A flushed bucket is written as whole [`SPILL_SEGMENT_MEMBERS`]-member
     /// segments, whatever the pool's thread count.
     #[test]
