@@ -6246,7 +6246,7 @@ fn encode_members(
             let raw_len = mvt.data.len();
             let compressed = match mvt.gzip {
                 Some(gz) => gz,
-                None => match compression::compress(&mvt.data, Compression::Gzip) {
+                None => match compression::compress_tile_gzip(&mvt.data) {
                     Ok(c) => c,
                     Err(e) => return Some(Err(ExportError::from(e))),
                 },
@@ -6634,7 +6634,7 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
     }
     if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
-        let gz = compression::compress(&mvt.data, Compression::Gzip)?;
+        let gz = compression::compress_tile_gzip(&mvt.data)?;
         fit = fit.min(limit as f64 / gz.len() as f64);
         mvt.gzip = Some(gz);
     }
