@@ -129,7 +129,7 @@ use crate::TilesetMetadata;
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
 use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
-use super::memory::{MemoryBudget, MemoryPhase, Price, PriceBasis};
+use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
     auto_backing, available_memory_bytes, probe_oom_memory_limit, MemoryLimit, MemoryLimitSource,
@@ -1933,6 +1933,7 @@ fn export_pmtiles_impl(
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
             memory_limit: None,
+            budget_available: None,
         },
     )
     .map(|run| run.report)
@@ -1956,6 +1957,9 @@ struct Pass2Knobs {
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
+    /// The probed figure the run's [`MemoryBudget`] starts from. `None`
+    /// probes ([`export_budget`]); tests inject one.
+    budget_available: Option<u64>,
 }
 
 /// What [`export_pmtiles_run`] returns: the report, plus the level schedule
@@ -1984,7 +1988,9 @@ fn export_pmtiles_run(
     knobs: &Pass2Knobs,
 ) -> Result<Pass2Run, ExportError> {
     let validated = options.validate()?;
-    let mut budget = export_budget();
+    let mut budget = knobs
+        .budget_available
+        .map_or_else(export_budget, |b| MemoryBudget::with_available(Some(b)));
     export_pmtiles_validated(
         input_path,
         output_path,
@@ -2276,6 +2282,7 @@ fn export_pmtiles_validated(
             StoreBacking {
                 backing,
                 ram_budget: store_ram,
+                resident: 0,
             },
             diagnostics,
         )?;
@@ -2292,14 +2299,15 @@ fn export_pmtiles_validated(
     let t_levels = Instant::now();
     // #740: without the export-wide store, a level split into several waves
     // reads its band once into a one-level store instead of once per wave.
-    // Spill by default: in RAM the read would hold every wave of the level
-    // (up to 5.7 waves' members on NZ z14) where the wave sizing budgets for
-    // one, so the store keeps only its granted buffer during the read and
-    // the drain holds one wave, as the per-wave reads did. The forced legacy
-    // read keeps the per-wave reads (the tests' oracle).
-    let level_read = (store.is_none() && !knobs.force_legacy_pass2).then(|| StoreBacking {
-        backing: knobs.backing_override.unwrap_or(SinkBacking::Spill),
+    // The store holds every wave of the level (up to 5.7 waves' members on
+    // NZ z14) where the wave sizing budgets for one, so its backing is the
+    // budget's: in RAM when the level fits, otherwise spilling what the
+    // grant does not cover ([`level_read_backing`]). The forced legacy read
+    // keeps the per-wave reads (the tests' oracle).
+    let level_read = (store.is_none() && !knobs.force_legacy_pass2).then_some(LevelRead {
+        forced: knobs.backing_override,
         ram_budget: store_ram,
+        member_bytes,
     });
     #[cfg(test)]
     let work = Mutex::new(ExportWorkTally::default());
@@ -2326,7 +2334,10 @@ fn export_pmtiles_validated(
     let level_groups = plan_level_groups(&plans, group_cap);
     zooms.extend(export_level_groups(
         &mut writer,
-        store.as_mut(),
+        LevelMemory {
+            store: store.as_mut(),
+            budget: &mut *budget,
+        },
         &levels,
         &level_groups,
         &CheckpointCtx {
@@ -2808,9 +2819,9 @@ struct ExportLevelCtx<'a> {
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
     /// How a level of several waves reads its band when no export-wide
-    /// member store is filled: once, into a one-level [`MemberStore`] with
-    /// this backing (#740), or, `None`, once per wave.
-    level_read: Option<StoreBacking>,
+    /// member store is filled: once, into a one-level [`MemberStore`]
+    /// (#740), or, `None`, once per wave.
+    level_read: Option<LevelRead>,
     /// The export's test-only work counts (#788).
     #[cfg(test)]
     work: &'a Mutex<ExportWorkTally>,
@@ -2846,6 +2857,7 @@ fn export_level(
     writer: &mut StreamingPmtilesWriter,
     mut store: Option<&mut MemberStore>,
     level: &ExportLevelCtx<'_>,
+    budget: &mut MemoryBudget,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ZoomReport, ExportError> {
@@ -2869,11 +2881,15 @@ fn export_level(
     // stuck, so emit a throttled wave counter. If it advances the level is
     // slow; if it freezes the level is stuck — diagnosable in minutes.
     let mut last_wave_log = Instant::now();
-    let mut level_store = match level.level_read {
-        Some(backing) if store.is_none() && total_waves > 1 => {
-            Some(fill_level_store(&ctx, plan, backing, diagnostics)?)
+    let (mut level_store, level_grants) = match level.level_read {
+        Some(read) if store.is_none() && total_waves > 1 => {
+            let (backing, grants) = level_read_backing(read, plan, budget);
+            (
+                Some(fill_level_store(&ctx, plan, backing, diagnostics)?),
+                grants,
+            )
         }
-        _ => None,
+        _ => (None, Vec::new()),
     };
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
         let results: Vec<Vec<EncodedTile>> = match (level_store.as_mut(), store.as_deref_mut()) {
@@ -2896,6 +2912,9 @@ fn export_level(
             );
             last_wave_log = Instant::now();
         }
+    }
+    for grant in level_grants {
+        budget.release(grant);
     }
     Ok(finish_level(
         level,
@@ -2942,12 +2961,20 @@ fn build_fills_if_asked(
     coverage_fill::build_fill_map(last, first.plan.zoom, timers, diagnostics).map(Some)
 }
 
+/// The memory the levels draw on: the export-wide member store (#235), when
+/// one was filled, and the run's budget, which grants a multi-wave level's
+/// own store (#740).
+struct LevelMemory<'s> {
+    store: Option<&'s mut MemberStore>,
+    budget: &'s mut MemoryBudget,
+}
+
 /// Export every level, one [`plan_level_groups`] group at a time. Each level
 /// is followed by a throttled salvage checkpoint (#229) once its tiles are
 /// written, inside a group too (#647).
 fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
-    mut store: Option<&mut MemberStore>,
+    mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
     groups: &[std::ops::Range<usize>],
     ckpt: &CheckpointCtx<'_>,
@@ -2962,11 +2989,15 @@ fn export_level_groups(
             ..*l
         })
         .collect();
+    let LevelMemory { mut store, budget } = mem;
     let mut zooms = Vec::with_capacity(levels.len());
     for group in groups {
         zooms.extend(export_level_group(
             writer,
-            store.as_deref_mut(),
+            LevelMemory {
+                store: store.as_deref_mut(),
+                budget: &mut *budget,
+            },
             &levels[group.clone()],
             ckpt,
             progress.fail_level,
@@ -3019,16 +3050,17 @@ fn injected_fault(
 /// written and, when due, checkpointed.
 fn export_level_group(
     writer: &mut StreamingPmtilesWriter,
-    mut store: Option<&mut MemberStore>,
+    mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
     ckpt: &CheckpointCtx<'_>,
     fail_level: Option<usize>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<ZoomReport>, ExportError> {
+    let LevelMemory { mut store, budget } = mem;
     if let [level] = levels {
         injected_fault(level, fail_level)?;
-        let report = export_level(writer, store, level, progress, diagnostics)?;
+        let report = export_level(writer, store, level, budget, progress, diagnostics)?;
         checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
         return Ok(vec![report]);
     }
@@ -3506,6 +3538,8 @@ struct ExportWorkTally {
     /// on the wave's consumer thread, outside the Rayon pool, so that no
     /// other core could share it (#740).
     serial_collect_rows: u64,
+    /// Bytes each multi-wave level's one-level member store spilled (#740).
+    level_spill_bytes: BTreeMap<usize, u64>,
 }
 
 struct LevelCtx<'a> {
@@ -3595,11 +3629,84 @@ struct LevelPlan {
 const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 
 /// How a [`MemberStore`] holds its members: in RAM, or spilled with
-/// `ram_budget` bytes of not-yet-flushed buckets.
+/// `ram_budget` bytes of not-yet-flushed buckets, of which up to `resident`
+/// stay in RAM after the fill instead of spilling.
 #[derive(Debug, Clone, Copy)]
 struct StoreBacking {
     backing: SinkBacking,
     ram_budget: usize,
+    resident: usize,
+}
+
+/// How a level of several waves reads its band when no export-wide member
+/// store is filled (#740): once, into a one-level [`MemberStore`].
+#[derive(Debug, Clone, Copy)]
+struct LevelRead {
+    /// A backing the caller forced (tests), or `None` for the budget's
+    /// choice ([`level_read_backing`]).
+    forced: Option<SinkBacking>,
+    /// The fill buffer of a spilling store: the run's store grant.
+    ram_budget: usize,
+    /// Resident bytes of one member (a footer price, see
+    /// [`member_resident_bytes`]), when known.
+    member_bytes: Option<u64>,
+}
+
+/// Choose a multi-wave level's store backing under `budget` (#740): RAM
+/// when the level's planned members fit [`MemoryPhase::ExportCollect`]
+/// after the drain's widest wave, otherwise spill, keeping as many bytes
+/// resident as the grant covers and spilling only the remainder. Members
+/// are priced at the footer's per-member bytes. Spills whole when RAM or
+/// the member size is unknown. Returns the grants the level holds until
+/// its last wave is written.
+fn level_read_backing(
+    read: LevelRead,
+    plan: &LevelPlan,
+    budget: &mut MemoryBudget,
+) -> (StoreBacking, Vec<Grant>) {
+    let spill = StoreBacking {
+        backing: SinkBacking::Spill,
+        ram_budget: read.ram_budget,
+        resident: 0,
+    };
+    if let Some(backing) = read.forced {
+        return (StoreBacking { backing, ..spill }, Vec::new());
+    }
+    let (Some(per_member), Some(_)) = (read.member_bytes.filter(|&b| b > 0), budget.limit) else {
+        return (spill, Vec::new());
+    };
+    let price = Price::new(per_member, PriceBasis::Footer);
+    let members = |ps: &[Partition]| ps.iter().map(|p| p.members).sum::<usize>();
+    let level_members = members(&plan.partitions);
+    let wave_members = plan
+        .partitions
+        .chunks(plan.wave.max(1))
+        .map(members)
+        .max()
+        .unwrap_or(0);
+    // The wave the drain holds while it encodes, which the wave width was
+    // sized to fit; the level's members share what is left.
+    let wave = budget.fit(
+        MemoryPhase::ExportCollect,
+        price,
+        wave_members,
+        wave_members,
+    );
+    let level = budget.fit(MemoryPhase::ExportCollect, price, level_members, 0);
+    let backing = if level.units >= level_members {
+        StoreBacking {
+            backing: SinkBacking::Ram,
+            ..spill
+        }
+    } else {
+        let resident = usize::try_from(level.bytes()).unwrap_or(usize::MAX);
+        StoreBacking {
+            ram_budget: read.ram_budget.saturating_add(resident),
+            resident,
+            ..spill
+        }
+    };
+    (backing, vec![wave, level])
 }
 
 /// Bounded-channel depth between the band reader thread and the clip/route
@@ -4068,6 +4175,10 @@ struct MemberStore {
     /// the bytes of the run's [`MemoryPhase::ExportCollect`] grant priced at
     /// [`MEMBER_STORE_RAM_BUDGET`].
     ram_budget: usize,
+    /// Bytes of buckets the fill leaves in RAM instead of spilling them
+    /// (#740): a multi-wave level's grant beyond the fill buffer. Zero for
+    /// the export-wide store, whose drain holds one wave at a time.
+    resident: usize,
     /// Profiling only (#535): cumulative time spent in [`Self::flush_bucket`]
     /// (serialize + write of spill segments). Read by the fill to charge it
     /// to `spill_write` rather than to the routing that triggered it.
@@ -4116,8 +4227,14 @@ impl MemberStore {
             buffered_bytes: 0,
             spill,
             ram_budget,
+            resident: 0,
             flush_time: Duration::ZERO,
         })
+    }
+
+    /// Bytes written to the spill file so far.
+    fn spilled_bytes(&self) -> u64 {
+        self.spill.as_ref().map_or(0, |s| s.offset)
     }
 
     fn push(&mut self, level: usize, wave: usize, m: Member) -> Result<(), ExportError> {
@@ -4126,7 +4243,10 @@ impl MemberStore {
         self.bucket_bytes[level][wave] += est;
         self.buffered_bytes += est;
         if self.spill.is_some() && self.buffered_bytes > self.ram_budget {
-            self.flush_largest_until(self.ram_budget / 2)?;
+            // Flush at most half of the fill buffer at a time, so a store
+            // with a large resident grant spills only what does not fit.
+            let headroom = (self.ram_budget / 2).min(MEMBER_STORE_RAM_BUDGET / 2);
+            self.flush_largest_until(self.ram_budget - headroom)?;
         }
         Ok(())
     }
@@ -4198,16 +4318,22 @@ impl MemberStore {
         Ok(())
     }
 
-    /// Finish the fill phase. Under spill backing every remaining bucket is
-    /// flushed (the store was chosen *because* the buffered set is large; the
-    /// tail is negligible and this keeps the drain's RAM at one wave) and the
-    /// writer is flushed so `take_wave` reads observe every segment.
+    /// Finish the fill phase. Under spill backing the buckets above the
+    /// store's resident grant are flushed, the largest first, and with no
+    /// grant every bucket is (the store was chosen *because* the buffered
+    /// set is large; the tail is negligible and this keeps the drain's RAM
+    /// at one wave). The writer is then flushed so `take_wave` reads observe
+    /// every segment.
     fn finish_fill(&mut self) -> Result<(), ExportError> {
         use std::io::Write;
         if self.spill.is_some() {
-            for li in 0..self.buckets.len() {
-                for wi in 0..self.buckets[li].len() {
-                    self.flush_bucket(li, wi)?;
+            if self.resident > 0 {
+                self.flush_largest_until(self.resident)?;
+            } else {
+                for li in 0..self.buckets.len() {
+                    for wi in 0..self.buckets[li].len() {
+                        self.flush_bucket(li, wi)?;
+                    }
                 }
             }
             let t_flush = Instant::now();
@@ -5186,6 +5312,7 @@ fn fill_level_store(
         backing.ram_budget,
         ctx.opts.spill_dir.as_deref(),
     )?;
+    store.resident = backing.resident;
     let rows_read = collect_into(
         ctx,
         &plan.partitions,
@@ -5197,14 +5324,21 @@ fn fill_level_store(
     )?;
     store.finish_fill()?;
     super::stream::add_nanos(&ctx.timers.spill_write, store.flush_time);
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        *work.level_spill_bytes.entry(ctx.level_idx).or_default() += store.spilled_bytes();
+    }
     log::debug!(
         "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
-         collect={:.2}s ({:?})",
+         collect={:.2}s ({:?}, resident {} MiB, spilled {} MiB)",
         ctx.zoom,
         plan.partitions.len(),
         plan.partitions.len().div_ceil(plan.wave.max(1)),
         t_collect.elapsed().as_secs_f64(),
         backing.backing,
+        backing.resident >> 20,
+        store.spilled_bytes() >> 20,
     );
     Ok(store)
 }
@@ -10004,6 +10138,7 @@ mod tests {
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
             memory_limit: None,
+            budget_available: None,
         }
     }
 
@@ -10100,6 +10235,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #740: a multi-wave level's one-level store keeps the level in RAM
+    /// when the run's budget affords it, spilling nothing, and spills what
+    /// the budget cannot hold. Both write the per-wave reads' archive.
+    #[test]
+    fn multi_wave_level_store_spills_only_what_the_budget_cannot_hold() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let run = |force_legacy: bool, budget_available: Option<u64>| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    budget_available,
+                    ..knobs(force_legacy, None, false)
+                },
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (legacy, _) = run(true, None);
+
+        let (bytes, roomy) = run(false, Some(100 << 30));
+        assert_eq!(bytes, legacy, "the in-RAM level store diverges");
+        assert!(
+            !roomy.work.level_spill_bytes.is_empty(),
+            "the fixture must give some level several waves"
+        );
+        assert!(
+            roomy.work.level_spill_bytes.values().all(|&b| b == 0),
+            "a level the budget affords spilled: {:?}",
+            roomy.work.level_spill_bytes
+        );
+
+        let (bytes, tight) = run(false, Some(1 << 20));
+        assert_eq!(bytes, legacy, "the spilling level store diverges");
+        assert!(
+            tight.work.level_spill_bytes.values().any(|&b| b > 0),
+            "a level the budget cannot hold must spill: {:?}",
+            tight.work.level_spill_bytes
+        );
     }
 
     /// #740 (parallelism): the per-row collect work (geometry decode,
