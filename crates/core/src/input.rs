@@ -442,7 +442,7 @@ impl InputSource {
     /// to the spill fails.
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
         let plan = self.plan_staging(selected, None)?;
-        self.stage_planned(&plan)
+        stage_parts(&[(self, &plan)]).map(|_| ())
     }
 
     /// This part's share of a pass-0 staging plan (#788): the column chunks
@@ -480,25 +480,53 @@ impl InputSource {
             }
         }
     }
+}
 
-    /// Fetch `plan`'s requests into the disk spill (see
-    /// [`Self::stage_row_groups`]). No-op for a local part.
-    #[cfg_attr(
-        not(feature = "remote"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "only a remote part can fail to stage"
-        )
-    )]
-    pub(crate) fn stage_planned(&self, plan: &PartStaging) -> Result<(), InputError> {
-        #[cfg(not(feature = "remote"))]
-        let _ = plan;
-        match self {
-            InputSource::Local(_) => Ok(()),
-            #[cfg(feature = "remote")]
-            InputSource::Remote(r) => r.stage_plan(&plan.remote),
-        }
+/// Fetch every part's staging requests into its disk spill (pass 0,
+/// #286/#287, #788), concurrently across parts (see
+/// `remote::stage_parts`). Local parts are skipped.
+///
+/// # Errors
+///
+/// Returns an [`InputError`] if a fetch fails.
+#[cfg_attr(
+    not(feature = "remote"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only a remote part can fail to stage"
+    )
+)]
+pub(crate) fn stage_parts(
+    parts: &[(&InputSource, &PartStaging)],
+) -> Result<StagingReport, InputError> {
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = parts;
+        Ok(StagingReport::default())
     }
+    #[cfg(feature = "remote")]
+    {
+        let remote: Vec<(&remote::RemoteSource, &remote::PartPlan)> = parts
+            .iter()
+            .filter_map(|&(source, plan)| match source {
+                InputSource::Remote(r) => Some((r, &plan.remote)),
+                InputSource::Local(_) => None,
+            })
+            .collect();
+        remote::stage_parts(&remote)
+    }
+}
+
+/// What one pass-0 staging did (#788): the `pass0` record of the profile
+/// dump.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct StagingReport {
+    /// Range requests that landed.
+    pub(crate) requests: u64,
+    /// Bytes those requests returned.
+    pub(crate) bytes_fetched: u64,
+    /// Most requests in flight at once, across every part.
+    pub(crate) max_in_flight: u64,
 }
 
 /// One part's share of a pass-0 staging plan (#788, see
@@ -1213,98 +1241,50 @@ pub(crate) mod remote {
             })
         }
 
-        /// Fetch `plan`'s requests into the spill (pass 0).
-        pub(crate) fn stage_plan(&self, plan: &PartPlan) -> Result<(), InputError> {
-            self.stage_plan_with(plan, staging_tunables::effective())
-        }
-
+        /// Fetch `plan`'s requests into the spill (pass 0): a one-part
+        /// [`stage_parts`].
+        #[cfg(test)]
         fn stage_plan_with(
             &self,
             plan: &PartPlan,
             tunables: &staging_tunables::StagingTunables,
         ) -> Result<(), InputError> {
-            if plan.requests.is_empty() {
-                return Ok(());
-            }
-            // Bound in-flight (resident) spans by the memory budget: holding
-            // one row group transiently matches the L1 cache ceiling, so never
-            // hold more than the budget's worth at once.
-            let max_span = plan
-                .requests
-                .iter()
-                .map(|r| r.span.end - r.span.start)
-                .max()
-                .unwrap_or(0);
-            let concurrency = match max_span {
-                0 => 1,
-                s => ((tunables.mem_budget / s).max(1) as usize).min(tunables.max_concurrency),
-            };
-            staging_tunables::log_live_concurrency(tunables, concurrency, max_span);
-            log::debug!(
-                "[stage] fetching {} span(s), {concurrency} in flight \
-                 (largest span {max_span} B)",
-                plan.requests.len()
-            );
+            stage_parts_with(&[(self, plan)], tunables).map(|_| ())
+        }
 
-            let store = Arc::clone(&self.store);
-            let location = self.location.clone();
-            let spill = Arc::clone(&self.spill);
-            let shared = Arc::clone(&self.shared);
-            let object_meta = self.object_meta.clone();
-
-            runtime().block_on(async move {
-                use futures_util::stream::StreamExt;
-                let mut inflight = futures_util::stream::iter(plan.requests.iter().map(|rg| {
-                    let store = Arc::clone(&store);
-                    let location = location.clone();
-                    let object_meta = object_meta.clone();
-                    async move {
-                        let bytes = object_meta
-                            .get_range(store.as_ref(), &location, rg.span.clone())
-                            .await
-                            .map_err(|e| ParquetError::External(Box::new(e)))?;
-                        Ok::<(&StagedSpan, Bytes), ParquetError>((rg, bytes))
-                    }
-                }))
-                .buffer_unordered(concurrency);
-
-                while let Some(result) = inflight.next().await {
-                    let (rg, bytes) = result?;
-                    // Count the coalesced request (mirrors `fetch`).
-                    shared.requests.fetch_add(1, Ordering::Relaxed);
-                    shared
-                        .bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    shared
-                        .ranges
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(rg.span.clone());
-                    // Slice into per-column-chunk spill entries. Guard the
-                    // slice bounds: a well-behaved store returns exactly the
-                    // requested span, but a short read must fall back to the
-                    // reader's network path (skip spilling), never panic.
-                    let base = rg.span.start;
-                    let mut spill = spill
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for &(chunk_start, len) in &rg.chunks {
-                        // Checked (#430): a wrapped `off + len` would pass the
-                        // bound and panic inside `slice`.
-                        let slice = chunk_start
-                            .checked_sub(base)
-                            .and_then(|off| usize::try_from(off).ok())
-                            .and_then(|off| off.checked_add(len).map(|end| off..end))
-                            .filter(|r| r.end <= bytes.len());
-                        if let Some(r) = slice {
-                            spill.put(chunk_start, &bytes.slice(r));
-                        }
-                    }
+        /// Record one landed request: the fetch counters (it counts as one
+        /// request, so callers observe the coalesced pattern) and its column
+        /// chunks, sliced into their spill slots. A short read is guarded:
+        /// a well-behaved store returns exactly the requested span, but a
+        /// short one must leave the chunk to the reader's network path
+        /// (skip spilling it), never panic.
+        fn land(&self, request: &StagedSpan, bytes: &Bytes) {
+            self.shared.requests.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.span.clone());
+            let base = request.span.start;
+            let mut spill = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for &(chunk_start, len) in &request.chunks {
+                // Checked (#430): a wrapped `off + len` would pass the
+                // bound and panic inside `slice`.
+                let slice = chunk_start
+                    .checked_sub(base)
+                    .and_then(|off| usize::try_from(off).ok())
+                    .and_then(|off| off.checked_add(len).map(|end| off..end))
+                    .filter(|r| r.end <= bytes.len());
+                if let Some(r) = slice {
+                    spill.put(chunk_start, &bytes.slice(r));
                 }
-                Ok::<(), ParquetError>(())
-            })?;
-
-            Ok(())
+            }
         }
 
         /// Snapshot of the fetch counters.
@@ -1942,6 +1922,91 @@ pub(crate) mod remote {
             out.push(next);
         }
         out
+    }
+
+    /// Stage several remote parts' plans at once (pass 0, #727 §2).
+    ///
+    /// Every request of every part goes into ONE queue, in part then file
+    /// order, so concurrency spans parts: a prefix of many small parts no
+    /// longer pays one round trip per part in series. A request is admitted
+    /// while fewer than the concurrency ceiling are in flight and the bytes
+    /// in flight stay within the memory budget, and always when nothing is
+    /// in flight (so a request larger than the budget still runs, alone).
+    /// This replaces the per-part `budget / largest span` concurrency, under
+    /// which one large span throttled every other span of its part.
+    pub(crate) fn stage_parts(
+        parts: &[(&RemoteSource, &PartPlan)],
+    ) -> Result<super::StagingReport, InputError> {
+        stage_parts_with(parts, staging_tunables::effective())
+    }
+
+    fn stage_parts_with(
+        parts: &[(&RemoteSource, &PartPlan)],
+        tunables: &staging_tunables::StagingTunables,
+    ) -> Result<super::StagingReport, InputError> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let mut queue: std::collections::VecDeque<(&RemoteSource, &StagedSpan)> = parts
+            .iter()
+            .flat_map(|&(source, plan)| plan.requests.iter().map(move |r| (source, r)))
+            .collect();
+        let mut report = super::StagingReport::default();
+        if queue.is_empty() {
+            return Ok(report);
+        }
+        let largest = queue
+            .iter()
+            .map(|(_, r)| r.span.end - r.span.start)
+            .max()
+            .unwrap_or(0);
+        log::debug!(
+            "[stage] fetching {} span(s) over {} part(s), up to {} in flight \
+             (largest span {largest} B, budget {} B)",
+            queue.len(),
+            parts.iter().filter(|(_, p)| !p.requests.is_empty()).count(),
+            tunables.max_concurrency,
+            tunables.mem_budget
+        );
+        runtime().block_on(async {
+            let mut inflight = FuturesUnordered::new();
+            let mut inflight_bytes = 0u64;
+            loop {
+                while let Some(&(source, request)) = queue.front() {
+                    let len = request.span.end - request.span.start;
+                    let admit = inflight.is_empty()
+                        || (inflight.len() < tunables.max_concurrency
+                            && inflight_bytes.saturating_add(len) <= tunables.mem_budget);
+                    if !admit {
+                        break;
+                    }
+                    queue.pop_front();
+                    inflight_bytes += len;
+                    inflight.push(async move {
+                        let got = source
+                            .object_meta
+                            .get_range(
+                                source.store.as_ref(),
+                                &source.location,
+                                request.span.clone(),
+                            )
+                            .await;
+                        (source, request, got)
+                    });
+                    report.max_in_flight = report.max_in_flight.max(inflight.len() as u64);
+                }
+                let Some((source, request, got)) = inflight.next().await else {
+                    break;
+                };
+                inflight_bytes -= request.span.end - request.span.start;
+                let bytes = got.map_err(|e| ParquetError::External(Box::new(e)))?;
+                source.land(request, &bytes);
+                report.requests += 1;
+                report.bytes_fetched += bytes.len() as u64;
+            }
+            Ok::<(), InputError>(())
+        })?;
+        staging_tunables::log_live_concurrency(tunables, report.max_in_flight as usize, largest);
+        Ok(report)
     }
 
     /// On-disk overflow for fetched column chunks (issue #219).

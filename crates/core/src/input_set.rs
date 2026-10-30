@@ -1062,11 +1062,12 @@ impl ConvertSource {
     /// # Errors
     ///
     /// Returns an [`InputError`] if a fetch fails.
-    pub(crate) fn stage(&self, plan: &StagingPlan) -> Result<(), InputError> {
-        for (part, staging) in self.parts().iter().zip(&plan.parts) {
-            part.stage_planned(staging)?;
-        }
-        Ok(())
+    pub(crate) fn stage(
+        &self,
+        plan: &StagingPlan,
+    ) -> Result<crate::input::StagingReport, InputError> {
+        let parts: Vec<_> = self.parts().iter().zip(&plan.parts).collect();
+        crate::input::stage_parts(&parts)
     }
 
     /// Stage every part's selected row groups to local disk up front (pass 0,
@@ -1085,7 +1086,7 @@ impl ConvertSource {
     /// writing them to the spill fails.
     pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
         let plan = self.staging_plan(selection)?;
-        self.stage(&plan)
+        self.stage(&plan).map(|_| ())
     }
 
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
