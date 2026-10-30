@@ -26,7 +26,12 @@ const ENTRIES_PER_SHARD: usize = 128;
 /// vectors, plus the static mutexes. With the current Entry this is < 8.25 MiB
 /// total. The cache is lazy, lasts across waves/exports, and will move onto
 /// `MemoryBudget` when the export context owns this resource.
-const PAYLOAD_BUDGET: usize = 8 * 1024 * 1024;
+fn payload_budget() -> usize {
+    // #788 E2: export has no shared mutable MemoryBudget yet. Keep the
+    // fallback in one place until E1 provides its once-per-export grant;
+    // then the cache will accept that configured cap instead of policy.
+    8 * 1024 * 1024
+}
 const ALLOCATION_CHARGE: usize = 64;
 
 struct Entry {
@@ -68,11 +73,11 @@ impl Shard {
         // of one payload do the work once; unrelated shards remain parallel.
         let gzip = uncached(raw)?;
         let charge = raw.len() + gzip.len() + ALLOCATION_CHARGE;
-        if charge > PAYLOAD_BUDGET / SHARDS {
+        if charge > payload_budget() / SHARDS {
             return Ok(gzip);
         }
         while !self.entries.is_empty()
-            && (self.used + charge > PAYLOAD_BUDGET / SHARDS
+            && (self.used + charge > payload_budget() / SHARDS
                 || self.entries.len() == ENTRIES_PER_SHARD)
         {
             // Keep frequent uniform tiles through the stream of one-off
@@ -174,12 +179,12 @@ mod tests {
                 cache.used,
                 cache.entries.iter().map(Entry::charge).sum::<usize>()
             );
-            assert!(cache.used <= PAYLOAD_BUDGET / SHARDS);
+            assert!(cache.used <= payload_budget() / SHARDS);
             assert!(cache.entries.len() <= ENTRIES_PER_SHARD);
             assert_eq!(cache.entries.capacity(), ENTRIES_PER_SHARD);
         }
         assert!(
-            PAYLOAD_BUDGET + SHARDS * ENTRIES_PER_SHARD * std::mem::size_of::<Entry>()
+            payload_budget() + SHARDS * ENTRIES_PER_SHARD * std::mem::size_of::<Entry>()
                 < 33 * 1024 * 1024 / 4
         );
     }
