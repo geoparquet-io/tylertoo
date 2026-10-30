@@ -1417,16 +1417,11 @@ fn project_polygon(p: &geo::Polygon<f64>, proj: &crate::mvt::TileProjector) -> S
 
 fn require_fill_bytes(needed: usize, available: usize) -> Result<(), super::ExportError> {
     if needed > available {
-        // Preserve the existing typed BudgetExceeded source through export's
-        // I/O carrier until the shared budget exposes an export error wrapper.
-        return Err(
-            std::io::Error::other(super::super::convert::ConvertError::BudgetExceeded {
-                phase: "coverage fill",
-                needed: needed as u64,
-                available: available as u64,
-            })
-            .into(),
-        );
+        return Err(super::ExportError::BudgetExceeded {
+            phase: "coverage fill",
+            needed: needed as u64,
+            available: available as u64,
+        });
     }
     Ok(())
 }
@@ -2128,21 +2123,30 @@ mod tests {
     }
 
     #[test]
+    fn fill_workspace_budget_error_is_not_io() {
+        let error = require_fill_bytes(33, 32).unwrap_err();
+        assert_eq!(error.to_string(), "io error: coverage fill needs 33 bytes but only 32 bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.");
+        assert!(matches!(
+            error,
+            super::super::ExportError::BudgetExceeded {
+                phase: "coverage fill",
+                needed: 33,
+                available: 32,
+            }
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
     fn oversized_union_component_returns_a_budget_error() {
         let error = union_within_workspace(vec![square(0.0, 0.0, 10.0)], 32).unwrap_err();
-        let super::super::ExportError::Io(error) = error else {
-            panic!("typed budget carrier")
-        };
         assert!(matches!(
-            error
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<super::super::super::convert::ConvertError>(),
-            Some(super::super::super::convert::ConvertError::BudgetExceeded {
+            error,
+            super::super::ExportError::BudgetExceeded {
                 phase: "coverage fill",
                 available: 32,
                 ..
-            })
+            }
         ));
     }
 
@@ -2157,19 +2161,13 @@ mod tests {
         let mut runs = SpillBuckets::new(&opts, workspace);
         runs.append(9, &[square(0.0, 0.0, 10.0)], &[], 0).unwrap();
         runs.budget = 32;
-        let super::super::ExportError::Io(error) = runs.pop_first(0).unwrap_err() else {
-            panic!("budget error carrier")
-        };
         assert!(matches!(
-            error
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<super::super::super::convert::ConvertError>(),
-            Some(super::super::super::convert::ConvertError::BudgetExceeded {
+            runs.pop_first(0).unwrap_err(),
+            super::super::ExportError::BudgetExceeded {
                 phase: "coverage fill",
                 available: 32,
                 ..
-            })
+            }
         ));
     }
 
@@ -2284,15 +2282,13 @@ mod tests {
         let error = writer
             .append(1, &vec![vec![vec![(0, 0), (1, 0), (0, 1)]]], 0, 32)
             .unwrap_err();
-        let super::super::ExportError::Io(error) = error else {
-            panic!("typed budget carrier")
-        };
         assert!(matches!(
-            error
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<super::super::super::convert::ConvertError>(),
-            Some(super::super::super::convert::ConvertError::BudgetExceeded { available: 32, .. })
+            error,
+            super::super::ExportError::BudgetExceeded {
+                phase: "coverage fill",
+                available: 32,
+                ..
+            }
         ));
         assert!(writer.index.is_empty());
     }
