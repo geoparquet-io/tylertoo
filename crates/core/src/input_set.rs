@@ -144,6 +144,38 @@ pub struct MultiSource {
     projection: std::sync::OnceLock<Vec<usize>>,
 }
 
+/// A pass-0 staging plan (#788, [`ConvertSource::staging_plan`]): one
+/// [`PartStaging`] per part, in part order (empty for a local part).
+#[derive(Debug)]
+pub(crate) struct StagingPlan {
+    parts: Vec<crate::input::PartStaging>,
+}
+
+impl StagingPlan {
+    /// See [`ConvertSource::bytes_to_stage`].
+    pub(crate) fn bytes_to_stage(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(crate::input::PartStaging::bytes_to_stage)
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Bytes of the largest request across every part (0 when nothing is
+    /// left to fetch).
+    pub(crate) fn largest_request(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(crate::input::PartStaging::largest_request)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// No part has anything left to fetch.
+    fn is_staged(&self) -> bool {
+        self.parts.iter().all(|p| p.request_count() == 0)
+    }
+}
+
 /// Per-part row-group selection.
 ///
 /// This is the multi-file analogue of the single-file
@@ -607,8 +639,8 @@ impl ConvertSource {
     /// columns of the file schema, sorted ascending (#386). Applied once,
     /// before anything derives column indices from the schema, so every
     /// downstream index is already relative to the projected layout and the
-    /// excluded columns are never decoded (a remote input still stages every
-    /// chunk of a row group; only the decode is skipped). A second call is a
+    /// excluded columns are never decoded, and a remote input never stages
+    /// their chunks (#400, [`Self::staging_plan`]). A second call is a
     /// programming error.
     ///
     /// # Errors
@@ -983,24 +1015,35 @@ impl ConvertSource {
         total
     }
 
-    /// Stage every part's selected row groups to local disk up front (pass 0,
-    /// #286/#287) so the streaming passes read from disk, not the network.
-    ///
-    /// Each remote part coalesces its selected row groups into one parallel
-    /// range request per row group (a row group is a contiguous byte span);
-    /// local parts are no-ops. Parts are staged in order so resident memory
-    /// stays bounded by one part's in-flight spans. `selection` (`None` = all
-    /// row groups) is the per-part bbox pruning the passes will honor, so
-    /// pruned groups are never fetched and total network traffic stays ≈1×
-    /// the input (#219). Errors are the caller's to handle; the streaming
-    /// pipeline treats staging as best-effort (a network error here is one the
-    /// passes would hit anyway).
+    /// The pass-0 staging plan (#788) for `selection` (`None` = every row
+    /// group of every part): per remote part, range requests for the
+    /// selected row groups' chunks of the columns this source reads
+    /// ([`Self::column_projection`], every column when unset). Built from
+    /// the footers alone. Pruned row groups and excluded columns are never
+    /// part of a request, whatever the coalescing window.
     ///
     /// # Errors
     ///
-    /// Returns an [`InputError`] if fetching a remote part's row groups or
-    /// writing them to the spill fails.
-    pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
+    /// Returns an [`InputError`] if a part's footer cannot be read or
+    /// declares a column chunk outside its object.
+    pub(crate) fn staging_plan(
+        &self,
+        selection: Option<&RowGroupSelection>,
+    ) -> Result<StagingPlan, InputError> {
+        self.staging_plan_for(selection, None)
+    }
+
+    /// [`Self::staging_plan`] for a read narrower than the source's
+    /// projection: `projection` indexes this source's (possibly restricted)
+    /// schema, exactly as a [`ReadPlan`]'s does (`None` = every column the
+    /// source exposes).
+    pub(crate) fn staging_plan_for(
+        &self,
+        selection: Option<&RowGroupSelection>,
+        projection: Option<&[usize]>,
+    ) -> Result<StagingPlan, InputError> {
+        let roots = self.file_roots(projection);
+        let roots = roots.as_deref();
         let parts = self.parts();
         if let Some(sel) = selection {
             debug_assert_eq!(
@@ -1009,10 +1052,102 @@ impl ConvertSource {
                 "row-group selection must cover every part"
             );
         }
-        for (i, part) in parts.iter().enumerate() {
-            part.stage_row_groups(selection.map(|s| s.0[i].as_slice()))?;
+        let parts = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| part.plan_staging(selection.map(|s| s.0[i].as_slice()), roots))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(StagingPlan { parts })
+    }
+
+    /// Bytes pass 0 stages to the local disk spill for `selection` (`None` =
+    /// every row group of every part): the compressed size of every column
+    /// chunk the conversion reads from a remote part, i.e. the selected row
+    /// groups' chunks of the projected columns ([`Self::restrict_columns`]).
+    /// Local parts contribute 0. This is the spill footprint the #272
+    /// free-space preflight compares against, and (staging never fetches
+    /// an excluded chunk or a pruned row group) the bytes staging fetches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a part's footer cannot be read or
+    /// declares a column chunk outside its object.
+    pub fn bytes_to_stage(&self, selection: Option<&RowGroupSelection>) -> Result<u64, InputError> {
+        Ok(self.staging_plan(selection)?.bytes_to_stage())
+    }
+
+    /// Fetch `plan` into each remote part's disk spill, holding at most
+    /// `budget` bytes of requests in flight (the caller's memory-budget
+    /// grant, #788).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a fetch fails in a way a retry cannot
+    /// fix.
+    pub(crate) fn stage_within(
+        &self,
+        plan: &StagingPlan,
+        budget: u64,
+    ) -> Result<crate::input::StagingReport, InputError> {
+        let parts: Vec<_> = self.parts().iter().zip(&plan.parts).collect();
+        crate::input::stage_parts(&parts, budget)
+    }
+
+    /// Whether a read of `row_groups` (`None` = all) and `projection` (as in
+    /// a [`ReadPlan`]) is served without the network: every part is local,
+    /// or every chunk the read touches is already in its part's disk spill
+    /// (staged by pass 0, #286/#788). Such a read takes no network locks and
+    /// no request latency, so it can run on parallel readers like a local
+    /// one (#544). `false` when a footer cannot be read, or when the spill
+    /// is disabled (it then holds nothing).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the #544 parallel-read gate in overview/read.rs (track C2) calls it"
+        )
+    )]
+    pub(crate) fn reads_locally(
+        &self,
+        row_groups: Option<&RowGroupSelection>,
+        projection: Option<&[usize]>,
+    ) -> bool {
+        !self.is_remote()
+            || self
+                .staging_plan_for(row_groups, projection)
+                .is_ok_and(|plan| plan.is_staged())
+    }
+
+    /// Compose a projection over this source's (possibly restricted) schema
+    /// with the source's own column projection into the file-root indices a
+    /// reader and the staging plan take (`None` = every column).
+    fn file_roots(&self, projection: Option<&[usize]>) -> Option<Vec<usize>> {
+        match (self.column_projection(), projection) {
+            (None, None) => None,
+            (None, Some(cols)) => Some(cols.to_vec()),
+            (Some(base), None) => Some(base.to_vec()),
+            (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
         }
-        Ok(())
+    }
+
+    /// Stage every part's selected row groups to local disk up front (pass 0,
+    /// #286/#287) so the streaming passes read from disk, not the network:
+    /// [`Self::staging_plan`] then [`Self::stage`]. `selection` (`None` = all
+    /// row groups) is the per-part bbox pruning the passes will honor, so
+    /// pruned groups are never fetched and total network traffic stays ≈1×
+    /// the bytes read (#219); only the projected columns are fetched (#400).
+    /// Errors are the caller's to handle; the streaming pipeline treats
+    /// staging as best-effort (a network error here is one the passes would
+    /// hit anyway).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if fetching a remote part's row groups or
+    /// writing them to the spill fails.
+    pub fn stage_selected(&self, selection: Option<&RowGroupSelection>) -> Result<(), InputError> {
+        let plan = self.staging_plan(selection)?;
+        self.stage_within(&plan, crate::input::unbudgeted_stage_admission())
+            .map(|_| ())
     }
 
     /// Open a sequential batch stream over all parts (see [`SourceStream`]).
@@ -1031,13 +1166,8 @@ impl ConvertSource {
             );
         }
         // A plan's projection indexes the (possibly restricted) schema this
-        // source exposes; the reader wants file-root indices. Compose the two.
-        let projection = match (self.column_projection(), plan.projection) {
-            (None, None) => None,
-            (None, Some(cols)) => Some(cols.to_vec()),
-            (Some(base), None) => Some(base.to_vec()),
-            (Some(base), Some(cols)) => Some(cols.iter().map(|&c| base[c]).collect()),
-        };
+        // source exposes; the reader wants file-root indices.
+        let projection = self.file_roots(plan.projection);
         // Footers are parsed once per source (lazily for `Single`, at
         // construction for `Multi`); every reader this stream opens reuses
         // them rather than re-decoding O(row_groups × columns) of thrift.
@@ -2950,5 +3080,435 @@ b.parquet
             tylertoo_io::largest_byte_array_column(meta, None, |root| root == 2).is_none(),
             "a column holding no bytes is not a largest column"
         );
+    }
+}
+
+/// Remote staging counters (#788 track R: #400, #727, #544). Each test pins
+/// one count the single staging plan must hit; on `origin/main` (cb1bdfc) the
+/// first four fail and the last passes (it is the premise #544 rests on).
+#[cfg(all(test, feature = "remote"))]
+mod staging_counter_tests {
+    use super::*;
+    use crate::input::probe_store::ProbeStore;
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::DataType;
+    use std::ops::Range;
+    use std::time::Duration;
+    use tylertoo_io::test_support::{ArrowWriter, WriterProperties};
+
+    const COALESCE_VAR: &str = "TYLERTOO_STAGING_COALESCE_BYTES";
+    const CONCURRENCY_VAR: &str = "TYLERTOO_STAGING_CONCURRENCY";
+
+    /// Runs the named test of this module alone in a child process with
+    /// `vars` set, so the process-wide staging tunables (read once from the
+    /// environment) are exactly these. Returns `true` inside that child,
+    /// where the caller runs its body, and `false` in the parent once the
+    /// child has passed. Same shape as `run_in_child` in `input::remote`.
+    fn run_in_child(test: &str, vars: &[(&str, &str)]) -> bool {
+        const CHILD: &str = "TYLERTOO_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let (_, module) = module_path!().split_once("::").expect("crate::module path");
+        let name = format!("{module}::{test}");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .envs(vars.iter().copied())
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{name} failed in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    /// `groups` row groups of `rows` rows, columns `a: Int64`, `b: Utf8`,
+    /// `c: Int64` (roots 0, 1, 2), so `b`'s chunk sits between the other two
+    /// in every row group.
+    fn three_column_parquet(rows: usize, groups: usize) -> Vec<u8> {
+        let n = rows * groups;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("row-{i:08}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| i * 7).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        buf
+    }
+
+    /// Byte range of every column chunk, as `[row_group][root]` (the schema is
+    /// flat, so leaf index == root index).
+    fn chunk_ranges(bytes: &[u8]) -> Vec<Vec<Range<u64>>> {
+        let md = tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.to_vec())).unwrap();
+        md.row_groups()
+            .iter()
+            .map(|rg| {
+                rg.columns()
+                    .iter()
+                    .map(|c| {
+                        let (s, len) = c.byte_range();
+                        s..s + len
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Requests and bytes `f` adds to `src`'s fetch counters.
+    fn counted(src: &ConvertSource, f: impl FnOnce()) -> (u64, u64, Vec<Range<u64>>) {
+        let before = src.fetch_stats().unwrap();
+        let ranges_before: usize = src
+            .parts()
+            .iter()
+            .map(|p| p.fetched_ranges().unwrap().len())
+            .sum();
+        f();
+        let after = src.fetch_stats().unwrap();
+        let ranges: Vec<Range<u64>> = src
+            .parts()
+            .iter()
+            .flat_map(|p| p.fetched_ranges().unwrap())
+            .skip(ranges_before)
+            .collect();
+        (
+            after.requests - before.requests,
+            after.bytes_fetched - before.bytes_fetched,
+            ranges,
+        )
+    }
+
+    /// Read every selected row of `src` through its (projected) stream.
+    fn read_all(src: &ConvertSource) -> usize {
+        let plan = ReadPlan {
+            batch_size: 1024,
+            projection: None,
+            row_groups: None,
+        };
+        src.open_stream(&plan)
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum()
+    }
+
+    /// #400: under a property selection, staging fetches only the chunks of
+    /// the kept columns. Main fetches every chunk of every selected row group
+    /// (one span per row group): 5 requests, all bytes.
+    #[test]
+    fn staging_fetches_only_the_projected_column_chunks() {
+        if !run_in_child(
+            "staging_fetches_only_the_projected_column_chunks",
+            &[(COALESCE_VAR, "0")],
+        ) {
+            return;
+        }
+        let bytes = three_column_parquet(1000, 5);
+        let chunks = chunk_ranges(&bytes);
+        let needed: u64 = chunks
+            .iter()
+            .flat_map(|rg| [&rg[0], &rg[2]])
+            .map(|r| r.end - r.start)
+            .sum();
+        let excluded: Vec<Range<u64>> = chunks.iter().map(|rg| rg[1].clone()).collect();
+
+        let src = ConvertSource::single(crate::input::test_memory_source(bytes, "p.parquet"));
+        src.restrict_columns(vec![0, 2]).unwrap();
+        src.num_row_groups_total().unwrap(); // footer first, so it is not counted
+
+        let (requests, fetched, ranges) = counted(&src, || src.stage_selected(None).unwrap());
+        for r in &ranges {
+            assert!(
+                excluded
+                    .iter()
+                    .all(|x| r.end <= x.start || r.start >= x.end),
+                "staging fetched {r:?}, which overlaps an excluded column chunk"
+            );
+        }
+        assert_eq!(
+            fetched, needed,
+            "staging must fetch the kept chunks' {needed} bytes, nothing else"
+        );
+        // Window 0: one request per contiguous run of kept chunks in a row
+        // group; `b` splits each row group into `a` and `c`.
+        assert_eq!(requests, 10, "two kept runs in each of five row groups");
+
+        // And the staged chunks serve the whole projected read.
+        let (after, _, _) = counted(&src, || assert_eq!(read_all(&src), 5000));
+        assert_eq!(after, 0, "the projected read must come from the spill");
+    }
+
+    /// #400 / C1's interface: `bytes_to_stage` is the projected footprint of
+    /// the selected row groups of the remote parts. Without a projection it
+    /// equals the selected compressed bytes; a local source stages nothing.
+    #[test]
+    fn bytes_to_stage_is_the_projected_remote_footprint() {
+        let bytes = three_column_parquet(1000, 5);
+        let chunks = chunk_ranges(&bytes);
+        let len = |r: &Range<u64>| r.end - r.start;
+        let kept: u64 = chunks.iter().flat_map(|rg| [&rg[0], &rg[2]]).map(len).sum();
+        let kept_rg1: u64 = len(&chunks[1][0]) + len(&chunks[1][2]);
+
+        let full =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "f.parquet"));
+        assert_eq!(
+            full.bytes_to_stage(None).unwrap(),
+            full.selected_input_bytes(None).unwrap()
+        );
+        let src =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "b.parquet"));
+        src.restrict_columns(vec![0, 2]).unwrap();
+        assert_eq!(src.bytes_to_stage(None).unwrap(), kept);
+        let sel = RowGroupSelection::from_parts(vec![vec![1]]);
+        assert_eq!(src.bytes_to_stage(Some(&sel)).unwrap(), kept_rg1);
+        // Planning is footer-only: nothing was fetched past the footer.
+        let (requests, _, _) = counted(&src, || {
+            src.bytes_to_stage(None).unwrap();
+        });
+        assert_eq!(requests, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+        let local = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            local.bytes_to_stage(None).unwrap(),
+            0,
+            "local parts never stage"
+        );
+    }
+
+    /// #544's gate: a remote read counts as local only once every chunk it
+    /// touches is in the spill. Staging a projection makes reads of that
+    /// projection (or a narrower one, or fewer row groups) local, not a
+    /// read of a column it skipped; a local source always reads locally.
+    #[test]
+    fn reads_locally_once_every_chunk_the_read_touches_is_staged() {
+        let bytes = three_column_parquet(1000, 5);
+        let src =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "s.parquet"));
+        let rg1 = RowGroupSelection::from_parts(vec![vec![1]]);
+        assert!(!src.reads_locally(None, None), "nothing staged yet");
+
+        let plan = src.staging_plan_for(None, Some(&[0, 2])).unwrap();
+        src.stage_within(&plan, crate::input::unbudgeted_stage_admission())
+            .unwrap();
+        assert!(src.reads_locally(None, Some(&[0, 2])));
+        assert!(src.reads_locally(None, Some(&[2])));
+        assert!(src.reads_locally(Some(&rg1), Some(&[0])));
+        assert!(!src.reads_locally(None, None), "column b was not staged");
+        assert!(!src.reads_locally(Some(&rg1), Some(&[1])));
+
+        // And `reads_locally` is footer-only: it fetches nothing itself.
+        let (requests, _, _) = counted(&src, || {
+            src.reads_locally(None, None);
+        });
+        assert_eq!(requests, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+        let local = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        assert!(local.reads_locally(None, None));
+    }
+
+    /// #400 + #290: a coalescing window merges byte-adjacent kept chunks
+    /// across row groups (`c` of one group and `a` of the next) but never
+    /// bridges an excluded chunk, so the bytes stay the projected bytes.
+    /// Main merges all five row groups, excluded chunks included, into ONE
+    /// request of every byte.
+    #[test]
+    fn a_window_merges_kept_chunks_but_never_fetches_an_excluded_one() {
+        if !run_in_child(
+            "a_window_merges_kept_chunks_but_never_fetches_an_excluded_one",
+            &[(COALESCE_VAR, "268435456")],
+        ) {
+            return;
+        }
+        let bytes = three_column_parquet(1000, 5);
+        let chunks = chunk_ranges(&bytes);
+        let needed: u64 = chunks
+            .iter()
+            .flat_map(|rg| [&rg[0], &rg[2]])
+            .map(|r| r.end - r.start)
+            .sum();
+        // Sanity on the fixture: `c` of group i ends where `a` of i+1 starts.
+        for w in chunks.windows(2) {
+            assert_eq!(w[0][2].end, w[1][0].start, "fixture layout changed");
+        }
+
+        let src = ConvertSource::single(crate::input::test_memory_source(bytes, "w.parquet"));
+        src.restrict_columns(vec![0, 2]).unwrap();
+        src.num_row_groups_total().unwrap();
+
+        let (requests, fetched, _) = counted(&src, || src.stage_selected(None).unwrap());
+        assert_eq!(fetched, needed, "only the kept chunks' bytes");
+        // a0 | c0+a1 | c1+a2 | c2+a3 | c3+a4 | c4
+        assert_eq!(requests, 6, "kept runs merged across row-group seams");
+    }
+
+    /// #727 §2: parts stage concurrently under one in-flight budget. Four
+    /// parts of two row groups each (eight spans) at the default ceiling of
+    /// eight: every span is in flight at once. Main stages one part at a
+    /// time, so at most that part's two spans are ever in flight.
+    #[test]
+    fn staging_keeps_spans_of_several_parts_in_flight_at_once() {
+        if !run_in_child(
+            "staging_keeps_spans_of_several_parts_in_flight_at_once",
+            &[(COALESCE_VAR, "0"), (CONCURRENCY_VAR, "8")],
+        ) {
+            return;
+        }
+        let objects: Vec<(String, Vec<u8>)> = (0..4)
+            .map(|i| (format!("part-{i}.parquet"), three_column_parquet(500, 2)))
+            .collect();
+        let named: Vec<(&str, Vec<u8>)> = objects
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        let store = ProbeStore::new(&named, Duration::from_millis(100));
+        let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
+        let src = ConvertSource::from_parts("memory://", parts).unwrap();
+        src.num_row_groups_total().unwrap();
+        store.take_max_in_flight(); // footers do not count
+
+        let (requests, _, _) = counted(&src, || src.stage_selected(None).unwrap());
+        assert_eq!(requests, 8, "one span per row group");
+        assert_eq!(
+            store.take_max_in_flight(),
+            8,
+            "all eight spans, across four parts, must be in flight together"
+        );
+    }
+
+    /// #727 §1: one failed request costs only its own chunks. Part 0's GETs
+    /// all fail; parts 1 and 2 are still staged, and their reads then need no
+    /// network. Main returns on the first error, so parts 1 and 2 are never
+    /// staged (zero requests).
+    #[test]
+    fn a_failed_part_does_not_stop_the_other_parts_staging() {
+        if !run_in_child(
+            "a_failed_part_does_not_stop_the_other_parts_staging",
+            &[(COALESCE_VAR, "0")],
+        ) {
+            return;
+        }
+        let objects: Vec<(String, Vec<u8>)> = (0..3)
+            .map(|i| (format!("f-{i}.parquet"), three_column_parquet(500, 2)))
+            .collect();
+        let named: Vec<(&str, Vec<u8>)> = objects
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        let store = ProbeStore::new(&named, Duration::ZERO);
+        let parts = objects.iter().map(|(n, _)| store.source(n)).collect();
+        let src = ConvertSource::from_parts("memory://", parts).unwrap();
+        src.num_row_groups_total().unwrap();
+        store.fail_next_gets("f-0.parquet", usize::MAX);
+        let before: Vec<u64> = src
+            .parts()
+            .iter()
+            .map(|p| p.fetch_stats().unwrap().requests)
+            .collect();
+
+        let _ = src.stage_selected(None); // best-effort: the verdict is the counters
+        assert!(store.failed() > 0, "the injected failure must have fired");
+        for (i, part) in src.parts().iter().enumerate().skip(1) {
+            assert_eq!(
+                part.fetch_stats().unwrap().requests - before[i],
+                2,
+                "part {i} must be staged (one request per row group) despite part 0 failing"
+            );
+        }
+    }
+
+    /// #727 §1: a coalesced request that fails is retried as its row groups
+    /// instead of abandoning staging. One merged span of five row groups fails
+    /// once; staging still succeeds and the read needs no network. Main
+    /// returns the error and stages nothing.
+    #[test]
+    fn a_failed_coalesced_span_is_retried_per_row_group() {
+        if !run_in_child(
+            "a_failed_coalesced_span_is_retried_per_row_group",
+            &[(COALESCE_VAR, "268435456")],
+        ) {
+            return;
+        }
+        let bytes = three_column_parquet(1000, 5);
+        let store = ProbeStore::new(&[("r.parquet", bytes)], Duration::ZERO);
+        let src = ConvertSource::single(store.source("r.parquet"));
+        src.num_row_groups_total().unwrap();
+        store.fail_next_gets("r.parquet", 1);
+
+        let (requests, _, _) = counted(&src, || {
+            src.stage_selected(None)
+                .expect("one transient failure must not fail staging");
+        });
+        assert_eq!(store.failed(), 1);
+        assert_eq!(
+            requests, 5,
+            "the failed merged span, retried as 5 row groups"
+        );
+        let (after, _, _) = counted(&src, || assert_eq!(read_all(&src), 5000));
+        assert_eq!(after, 0, "every row group staged after the retry");
+    }
+
+    /// #544's premise, which already holds on main: once every selected
+    /// chunk is staged, concurrent readers over disjoint row groups of one
+    /// remote part are served from the spill and never touch the network,
+    /// so the shared chunk cache cannot make them evict each other into
+    /// re-fetches. What keeps pass 2 single-threaded is the read layer's
+    /// `!source.is_remote()` gate, not this.
+    #[test]
+    fn staged_remote_rows_serve_concurrent_readers_without_the_network() {
+        let bytes = three_column_parquet(1000, 4);
+        let src = ConvertSource::single(crate::input::test_memory_source(bytes, "c.parquet"));
+        src.num_row_groups_total().unwrap();
+        src.stage_selected(None).unwrap();
+        let (requests, _, _) = counted(&src, || {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..4)
+                    .map(|rg| {
+                        let src = &src;
+                        s.spawn(move || {
+                            let sel = RowGroupSelection::from_parts(vec![vec![rg]]);
+                            let plan = ReadPlan {
+                                batch_size: 128,
+                                projection: None,
+                                row_groups: Some(&sel),
+                            };
+                            src.open_stream(&plan)
+                                .unwrap()
+                                .map(|b| b.unwrap().num_rows())
+                                .sum::<usize>()
+                        })
+                    })
+                    .collect();
+                let rows: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                assert_eq!(rows, 4000);
+            });
+        });
+        assert_eq!(requests, 0, "four concurrent readers, all from the spill");
     }
 }

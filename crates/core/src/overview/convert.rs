@@ -66,6 +66,7 @@ use super::level::{
 };
 use super::pipeline::{gib, MemoryLimit, MemoryLimitSource};
 use super::properties::{PropertySelection, PropertySelectionError};
+use super::read::ReadPass;
 use super::simplify::{
     simplify_for_level, CollapseMode, Representation, Simplified, SimplifyOptions,
 };
@@ -400,6 +401,19 @@ pub struct ConvertOptions {
     /// How levels are specified (zoom range or explicit GSDs).
     #[cfg_attr(feature = "cli", arg(skip = Self::default().levels))]
     pub levels: LevelPlan,
+    /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
+    /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
+    /// `max_zoom` before anything else reads the plan
+    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
+    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
+    /// (with a log line) for an explicit GSD list.
+    ///
+    /// The estimate reads the same source the conversion then reads, so a
+    /// remote input's sampled chunks are fetched once (#788). Not a keyword
+    /// of its own: callers set it from `max_zoom="auto"` / `--max-zoom auto`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub auto_max_zoom: bool,
     /// Thinning / visibility / sort configuration for level assignment.
     #[serde(flatten)]
     #[cfg_attr(feature = "cli", command(flatten))]
@@ -972,13 +986,34 @@ pub fn read_workers_ceiling() -> usize {
 /// in-order merge, and the `--read-workers 1` vs `4` byte comparison in
 /// `crates/cli/tests/thread_count_determinism.rs`.
 pub fn resolve_read_workers(requested: usize) -> usize {
-    if requested == READ_WORKERS_AUTO {
-        std::thread::available_parallelism()
-            .map(|n| n.get() / 4)
-            .unwrap_or(1)
-            .clamp(1, READ_WORKERS_MAX)
-    } else {
-        requested
+    resolve_pass_read_workers(ReadPass::Build, requested)
+}
+
+/// [`resolve_read_workers`] for one pass's read (#723). Pass 1 and pass 2
+/// read through the same ordered reader, but their consumers' CPU demand
+/// differs, so the auto count is resolved per pass. An explicit value applies
+/// to both.
+pub(super) fn resolve_pass_read_workers(pass: ReadPass, requested: usize) -> usize {
+    resolve_read_workers_with_cores(
+        pass,
+        requested,
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )
+}
+
+/// [`resolve_pass_read_workers`], parameterized on the detected core count
+/// (test seam, as [`resolve_in_flight_batches_with_cores`]).
+pub(super) fn resolve_read_workers_with_cores(
+    pass: ReadPass,
+    requested: usize,
+    cores: usize,
+) -> usize {
+    if requested != READ_WORKERS_AUTO {
+        return requested;
+    }
+    match pass {
+        // #723: both passes still take pass 2's quarter rule.
+        ReadPass::Scan | ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
     }
 }
 
@@ -1367,6 +1402,7 @@ impl Default for ConvertOptions {
                 min_zoom: 0,
                 max_zoom: 6,
             },
+            auto_max_zoom: false,
             assign: AssignConfig::default(),
             entry_zoom: None,
             sort_key: None,
@@ -2767,13 +2803,14 @@ pub fn write_convert_plan_sources(
         ));
     }
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options, diagnostics)? {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+    let options: &ConvertOptions =
+        match normalize_convert_options(source, options, None, diagnostics)? {
+            Some(adjusted) => {
+                inert_options = adjusted;
+                &inert_options
+            }
+            None => options,
+        };
     // #517's rule, applied to the other run that writes no dump: the profile
     // covers pass 2 and the export, neither of which a plan-only run reaches.
     // Said up front rather than exiting 0 with an empty (or untouched) file.
@@ -3641,16 +3678,23 @@ pub(super) fn build_verified_cluster_tables(
 fn normalize_convert_options(
     source: &ConvertSource,
     options: &ConvertOptions,
+    output: Option<&Path>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<ConvertOptions>, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
+    // #272: place the remote-input disk spill (#219) where the caller asked
+    // (no-op for local inputs, which never spill). Before the `auto`
+    // estimate, whose staged sample lands in the same spill.
+    source.set_spill_dir(options.spill_dir.as_deref());
+    // #444: `--max-zoom auto` estimates over this same source, before the
+    // property selection narrows it (the estimate reads the covering or the
+    // geometry, which the selection may drop).
+    let resolved = super::auto_zoom::resolve_auto_max_zoom(source, options, output)?;
+    let options = resolved.as_ref().unwrap_or(options);
     // #386: narrow the source to the requested property columns before any
     // schema index is derived, so both pipelines see the projected layout.
     apply_property_selection(source, options, diagnostics)?;
-    // #272: place the remote-input disk spill (#219) where the caller asked
-    // (no-op for local inputs, which never spill).
-    source.set_spill_dir(options.spill_dir.as_deref());
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
@@ -3658,7 +3702,7 @@ fn normalize_convert_options(
     // is on by default, so partitioning conversions silently proceed
     // without it (no column, no provenance); the CLI rejects an EXPLICIT
     // request instead.
-    Ok(adjusted_for_ladder_and_mode(options))
+    Ok(adjusted_for_ladder_and_mode(options).or(resolved))
 }
 
 pub(crate) fn convert_to_overviews_source_strategy(
@@ -3684,7 +3728,7 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
-    let adjusted = normalize_convert_options(source, options, diagnostics)?;
+    let adjusted = normalize_convert_options(source, options, Some(output_path), diagnostics)?;
     let options = adjusted.as_ref().unwrap_or(options);
     let validated = options.validate()?;
     convert_to_overviews_validated(source, output_path, &validated, strategy, diagnostics)
@@ -3944,6 +3988,55 @@ pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
     match profile {
         MemoryProfile::Bounded => threads.min(BOUNDED_ENCODE_CONCURRENCY_CAP),
         MemoryProfile::Speed | MemoryProfile::Auto => threads,
+    }
+}
+
+/// #545: the `bounded` drain's encode concurrency.
+#[cfg(test)]
+mod encode_concurrency_tests {
+    use super::*;
+    use crate::overview::memory::MemoryBudget;
+
+    /// Under `bounded` the drain encodes at most 4 row groups at once whatever
+    /// the budget. Profiled (`.788/PROFILE-LOG.md`, 64 threads, glibc): the
+    /// drain is 38% of pass 2's wall on Moldova and 39% on NZ parcels under
+    /// `bounded`, against 14% under `auto` (full pool) on the same Moldova
+    /// output, while the drain thread itself holds 1.1% of the CPU samples:
+    /// it waits on the capped encodes. #545's own A/B kept 4 as the floor and
+    /// asked for the cap to come from the memory probe instead.
+    ///
+    /// The closure is the phase-1 stand-in for the budget-aware owner: today's
+    /// rule reads neither the budget nor the row-group size.
+    #[test]
+    #[ignore = "#545: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
+    fn bounded_encode_concurrency_comes_from_the_budget() {
+        let resolve = |budget: MemoryBudget, threads: usize, row_group_bytes: u64| {
+            let _unused_on_main = (budget, row_group_bytes);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| encode_concurrency_for(MemoryProfile::Bounded))
+        };
+        let row_group = 64 << 20;
+        // Ample memory: the pool, not the constant, is the limit.
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(64 << 30)), 16, row_group),
+            16
+        );
+        // Tight memory: never below #545's measured floor of 4 ...
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(256 << 20)), 16, row_group),
+            4
+        );
+        // ... and between the two, what the budget affords.
+        let mid = resolve(MemoryBudget::with_available(Some(4 << 30)), 16, row_group);
+        assert!((4..16).contains(&mid), "4 GiB, 64 MiB row groups: {mid}");
+        // Never more than the pool.
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(64 << 30)), 2, row_group),
+            2
+        );
     }
 }
 
@@ -12239,6 +12332,42 @@ mod tests {
             resolve_in_flight_batches(IN_FLIGHT_BATCHES_MAX + 100),
             IN_FLIGHT_BATCHES_MAX + 100
         );
+    }
+
+    /// #723: pass 1 and pass 2 resolve their auto reader counts
+    /// independently. Profiled on Moldova (632k rows, 13 row groups, z0-14,
+    /// `.788/PROFILE-LOG.md`): pass 1's readers do 0.88 core-s of read against
+    /// 0.76 core-s of consumer work (decode + scan), pass 2's 1.94 against
+    /// 12.4 (decode + simplify + build). Pinned to 4 cores, `--read-workers 2`
+    /// took pass 1 from 0.72-0.75 s to 0.45-0.48 s while pass 2 stayed flat,
+    /// yet auto gives both passes `4 / 4 = 1` reader.
+    #[test]
+    #[ignore = "#723: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
+    fn pass1_and_pass2_auto_reader_counts_resolve_independently() {
+        use super::super::read::ReadPass;
+        let auto = |pass, cores| resolve_read_workers_with_cores(pass, READ_WORKERS_AUTO, cores);
+        // Pass 2 keeps the quarter rule it was swept for.
+        for cores in [1, 2, 4, 8, 16, 64] {
+            assert_eq!(
+                auto(ReadPass::Build, cores),
+                (cores / 4).clamp(1, READ_WORKERS_MAX)
+            );
+        }
+        // Pass 1's light consumer affords more readers than pass 2's on the
+        // same box, and never fewer.
+        assert!(
+            auto(ReadPass::Scan, 4) >= 2,
+            "4 cores: pass 1 gets {} reader(s)",
+            auto(ReadPass::Scan, 4)
+        );
+        for cores in [1, 2, 4, 8, 16, 64] {
+            assert!(auto(ReadPass::Scan, cores) >= auto(ReadPass::Build, cores));
+            assert!(auto(ReadPass::Scan, cores) <= READ_WORKERS_MAX.max(cores));
+        }
+        // An explicit count applies to both passes.
+        for pass in [ReadPass::Scan, ReadPass::Build] {
+            assert_eq!(resolve_read_workers_with_cores(pass, 3, 4), 3);
+        }
     }
 
     /// The `--read-workers` resolution contract (#494): auto stays inside the

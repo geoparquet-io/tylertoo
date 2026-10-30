@@ -111,6 +111,7 @@ use crossbeam_channel::{Receiver, Sender};
 use geo::{BoundingRect, CoordsIter, Geometry, MapCoords};
 use geoarrow::array::from_arrow_array;
 use geoarrow_array::GeoArrowArray;
+#[cfg(test)]
 use prost::Message;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -120,7 +121,9 @@ use crate::batch_processor::extract_geometries_from_array;
 use crate::clip::{clip_geometry_simple, geometry_is_simple};
 use crate::compression::{self, Compression};
 use crate::dedup::TileHasher;
-use crate::mvt::{EncodedFeatureGeometry, LayerBuilder, PropertyValue, TileBuilder};
+use crate::mvt::{EncodedFeatureGeometry, PropertyValue};
+#[cfg(test)]
+use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::pmtiles_writer::StreamingPmtilesWriter;
 use crate::tile::{tile_ranges_for_bbox, BboxTileRanges, TileBounds, TileCoord, MAX_ZOOM};
 use crate::vector_tile::tile::GeomType;
@@ -6246,7 +6249,7 @@ fn encode_members(
             let raw_len = mvt.data.len();
             let compressed = match mvt.gzip {
                 Some(gz) => gz,
-                None => match compression::compress(&mvt.data, Compression::Gzip) {
+                None => match compression::compress_tile_gzip(&mvt.data) {
                     Ok(c) => c,
                     Err(e) => return Some(Err(ExportError::from(e))),
                 },
@@ -6267,6 +6270,10 @@ fn encode_members(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "export/encode_cost_tests.rs"]
+mod encode_cost_tests;
 
 /// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
 /// side. Clipping such a feature to the buffered tile is a geometric no-op, so
@@ -6677,7 +6684,7 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
     }
     if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
-        let gz = compression::compress(&mvt.data, Compression::Gzip)?;
+        let gz = compression::compress_tile_gzip(&mvt.data)?;
         fit = fit.min(limit as f64 / gz.len() as f64);
         mvt.gzip = Some(gz);
     }
@@ -7069,7 +7076,7 @@ fn build_mvt_with<M: TileFeature>(
             }
         }
     };
-    let mut layer = LayerBuilder::new(opts.layer_name.clone()).with_extent(opts.extent);
+    let mut layer = crate::mvt::StreamingLayerBuilder::new(&opts.layer_name, opts.extent);
     // #750: the coverage fill comes first, so a renderer draws it under the
     // tile's own features. Each fill feature carries its host's id and tags.
     for f in fill {
@@ -7078,10 +7085,17 @@ fn build_mvt_with<M: TileFeature>(
         layer.add_encoded_feature(f.id, geom, &f.props);
     }
     if encode_in_parallel(members) {
-        let encoded: Vec<EncodedFeatureGeometry> = members.par_iter().map(&encode).collect();
-        for (i, (m, geom)) in members.iter().zip(encoded).enumerate() {
-            track(m.feature_id().map(|_| m.source_row()), &geom);
-            layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+        // Bound the geometry staging buffer as well as the serialized layer.
+        // Intern and emit each chunk in original member order; only geometry
+        // projection runs in parallel, exactly as before.
+        const GEOMETRY_CHUNK_MEMBERS: usize = 4096;
+        for (chunk_index, chunk) in members.chunks(GEOMETRY_CHUNK_MEMBERS).enumerate() {
+            let encoded: Vec<EncodedFeatureGeometry> = chunk.par_iter().map(&encode).collect();
+            for (offset, (m, geom)) in chunk.iter().zip(encoded).enumerate() {
+                let i = chunk_index * GEOMETRY_CHUNK_MEMBERS + offset;
+                track(m.feature_id().map(|_| m.source_row()), &geom);
+                layer.add_encoded_feature(id_of(i, m), geom, m.properties());
+            }
         }
     } else {
         for (i, m) in members.iter().enumerate() {
@@ -7095,12 +7109,10 @@ fn build_mvt_with<M: TileFeature>(
     let features = layer.feature_count() - fill.len();
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
-    let mut tb_builder = TileBuilder::new();
-    tb_builder.add_layer(layer.build());
     TileMvt {
         source_ids,
         source_losses,
-        data: tb_builder.build().encode_to_vec(),
+        data: layer.build(),
         gzip: None,
         features,
         unencodable,

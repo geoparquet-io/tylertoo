@@ -131,6 +131,49 @@ pub struct TilesShard {
     /// is bound to one `shards.json` by construction. The coarse job writes
     /// it into the plan; every data shard must present the same one.
     pub cut_digest: String,
+    /// The shard plan this job was cut from, when the caller loaded one: the
+    /// facade verifies it against the input it opens (the parts the plan
+    /// was cut for) and, once `--max-zoom auto` is resolved on that same
+    /// input, checks the pivot against the finest zoom. `None` skips both
+    /// (a caller that verified the plan itself, or a test).
+    pub binding: Option<ShardBinding>,
+}
+
+/// A loaded shard plan and the path it was read from, for
+/// [`TilesShard::binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardBinding {
+    /// The plan ([`crate::shard::ShardPlan::load`]).
+    pub plan: crate::shard::ShardPlan,
+    /// Where it was read from, for the error messages.
+    pub path: PathBuf,
+}
+
+impl TilesShard {
+    /// Verify the job's shard plan against `source`, the input the facade
+    /// opened (#498): a plan cut for different parts is refused before any
+    /// row is read.
+    fn verify_source(&self, source: &ConvertSource) -> Result<(), TilesError> {
+        match &self.binding {
+            Some(b) => b
+                .plan
+                .verify_source(source, &b.path)
+                .map_err(TilesError::Shard),
+            None => Ok(()),
+        }
+    }
+
+    /// The pivot must not be finer than the build's finest zoom, which is
+    /// only known once `--max-zoom auto` is resolved.
+    fn check_max_zoom(&self, levels: &LevelPlan) -> Result<(), TilesError> {
+        match (&self.binding, levels) {
+            (Some(b), LevelPlan::ZoomRange { max_zoom, .. }) => b
+                .plan
+                .check_max_zoom(*max_zoom, &b.path)
+                .map_err(TilesError::Shard),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl TilesShard {
@@ -180,10 +223,9 @@ impl TilesShard {
 ///
 /// The declared zoom range (#380) is read from `convert.levels`: a
 /// [`LevelPlan::ZoomRange`]'s requested minimum is declared even when the
-/// coarsest levels generalized to nothing, and its (resolved — `--max-zoom
-/// auto` is the caller's to resolve first, via
-/// [`super::auto_zoom::MaxZoom::resolve`], which writes the chosen zoom back
-/// into the plan) maximum declares an empty data shard's archive. A GSD
+/// coarsest levels generalized to nothing, and its maximum declares an
+/// empty data shard's archive. With [`ConvertOptions::auto_max_zoom`] the
+/// facade resolves that maximum first, over the source it converts. A GSD
 /// ladder declares no requested range.
 ///
 /// The facade derives a few export fields itself, so they must be left at
@@ -608,6 +650,10 @@ pub enum TilesError {
     /// Writing an empty coarse job's archive failed (#541).
     #[error("failed to write the empty coarse archive: {0}")]
     EmptyCoarseArchive(ExportError),
+    /// The job's shard plan does not fit the input or the build (#498):
+    /// cut for other parts, or a pivot finer than the resolved finest zoom.
+    #[error(transparent)]
+    Shard(crate::shard::ShardError),
 }
 
 /// `prefix`, unless the error is a refused option, which names no step.
@@ -706,7 +752,36 @@ pub fn write_plan(input: &TilesInput, options: &TilesOptions) -> Result<PlanRepo
         None => Cow::Borrowed(&options.convert),
     };
     let source = input.source().map_err(TilesError::Convert)?;
+    let convert = resolve_on_source(&source, options.shard.as_ref(), convert)?;
     write_convert_plan_sources(&source, &convert).map_err(TilesError::Convert)
+}
+
+/// The facade's one input-reading preamble, on the source it then converts:
+/// verify the shard plan against it, resolve `--max-zoom auto` over it
+/// ([`super::auto_zoom::resolve_auto_max_zoom`], so the estimate and the
+/// conversion share one source and a remote sample is fetched once, #788),
+/// then check the shard pivot against the resolved finest zoom.
+fn resolve_on_source<'a>(
+    source: &ConvertSource,
+    shard: Option<&TilesShard>,
+    convert: Cow<'a, ConvertOptions>,
+) -> Result<Cow<'a, ConvertOptions>, TilesError> {
+    if let Some(job) = shard {
+        job.verify_source(source)?;
+    }
+    // The estimate's staged sample lands in the spill; place it where the
+    // conversion will (#272) before the first chunk creates the file.
+    source.set_spill_dir(convert.spill_dir.as_deref());
+    let convert = match super::auto_zoom::resolve_auto_max_zoom(source, &convert, None)
+        .map_err(TilesError::Convert)?
+    {
+        Some(resolved) => Cow::Owned(resolved),
+        None => convert,
+    };
+    if let Some(job) = shard {
+        job.check_max_zoom(&convert.levels)?;
+    }
+    Ok(convert)
 }
 
 /// Convert GeoParquet to a PMTiles archive in one call, with the default
@@ -774,6 +849,11 @@ fn convert_to_pmtiles_validated(
         }
         None => Cow::Borrowed(&options.convert),
     };
+    // The input is opened once: the shard binding, the `auto` estimate and
+    // the conversion all read this source. Before the declared zoom range
+    // below, which needs the resolved finest zoom.
+    let source = input.source().map_err(TilesError::Convert)?;
+    let convert_options = resolve_on_source(&source, options.shard.as_ref(), convert_options)?;
 
     // The declared zoom range (#380): only a zoom plan has one. `None` for a
     // GSD ladder — it declares no requested range, and the empty-archive
@@ -834,7 +914,6 @@ fn convert_to_pmtiles_validated(
     }
 
     let diagnostics = crate::diagnostics::Diagnostics::default();
-    let source = input.source().map_err(TilesError::Convert)?;
     let convert_report = match super::convert::convert_to_overviews_source_diagnostics(
         &source,
         &overview_path,
@@ -1266,6 +1345,7 @@ mod tests {
                 range: Some(range),
                 pivot_zoom: 4,
                 cut_digest: digest,
+                binding: None,
             }),
             export: ExportOptions {
                 metadata: grid_metadata(),
@@ -1342,6 +1422,7 @@ mod tests {
                 range: None,
                 pivot_zoom: 3,
                 cut_digest: "0123456789abcdef".to_string(),
+                binding: None,
             }),
             export: ExportOptions {
                 metadata: grid_metadata(),
@@ -1407,6 +1488,7 @@ mod tests {
                     range: None,
                     pivot_zoom: 3,
                     cut_digest: "0123456789abcdef".into(),
+                    binding: None,
                 }),
                 ..zoomed_options(0, 3)
             },
@@ -1448,6 +1530,7 @@ mod tests {
             range: None,
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         };
         assert_eq!(
             resolve_tile_range(Some(&coarse), Some(explicit)),
@@ -1466,6 +1549,7 @@ mod tests {
             range: Some(shard_range),
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         };
         assert_eq!(
             resolve_tile_range(Some(&data), Some(explicit)),
@@ -1491,6 +1575,7 @@ mod tests {
             range: None,
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         }
         .apply_to_convert(&mut filled, true);
         assert_eq!(
@@ -1513,6 +1598,7 @@ mod tests {
             range: None,
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         };
         coarse.apply_to_convert(&mut convert, false);
         assert_eq!(convert.shard, None, "the coarse job prunes no rows");
@@ -1541,6 +1627,7 @@ mod tests {
             range: Some(range),
             pivot_zoom: 5,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         }
         .apply_to_convert(&mut convert, false);
         assert_eq!(convert.shard, Some(range));
@@ -1930,6 +2017,7 @@ mod tests {
             range,
             pivot_zoom,
             cut_digest: "deadbeef".to_string(),
+            binding: None,
         }
     }
 

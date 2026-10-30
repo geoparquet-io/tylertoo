@@ -441,14 +441,161 @@ impl InputSource {
     /// Returns an [`InputError`] if fetching a remote row group or writing it
     /// to the spill fails.
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
+        let plan = self.plan_staging(selected, None)?;
+        stage_parts(&[(self, &plan)], unbudgeted_stage_admission()).map(|_| ())
+    }
+
+    /// This part's share of a pass-0 staging plan (#788): the column chunks
+    /// of the `selected` row groups (`None` = all) whose root column is in
+    /// `roots` (`None` = every column), as range requests. Built from the
+    /// footer alone; empty for a local part, which never stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputError`] if a remote footer cannot be read or
+    /// declares a column chunk outside the object (#430).
+    #[cfg_attr(
+        not(feature = "remote"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only a remote part can fail to plan"
+        )
+    )]
+    pub(crate) fn plan_staging(
+        &self,
+        selected: Option<&[usize]>,
+        roots: Option<&[usize]>,
+    ) -> Result<PartStaging, InputError> {
         #[cfg(not(feature = "remote"))]
-        let _ = selected;
+        let _ = (selected, roots);
         match self {
-            InputSource::Local(_) => Ok(()),
+            InputSource::Local(_) => Ok(PartStaging::default()),
             #[cfg(feature = "remote")]
-            InputSource::Remote(r) => r.stage_row_groups(selected),
+            InputSource::Remote(r) => {
+                let remote = r.plan_staging(selected, roots)?;
+                Ok(PartStaging {
+                    bytes_to_stage: remote.bytes_to_stage(),
+                    requests: remote.request_count(),
+                    largest_request: remote.largest_request(),
+                    remote,
+                })
+            }
         }
     }
+}
+
+/// Fetch every part's staging requests into its disk spill (pass 0,
+/// #286/#287, #788), concurrently across parts (see
+/// `remote::stage_parts`). Local parts are skipped.
+///
+/// # Errors
+///
+/// Returns an [`InputError`] if a fetch fails.
+#[cfg_attr(
+    not(feature = "remote"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only a remote part can fail to stage"
+    )
+)]
+pub(crate) fn stage_parts(
+    parts: &[(&InputSource, &PartStaging)],
+    budget: u64,
+) -> Result<StagingReport, InputError> {
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = (parts, budget);
+        Ok(StagingReport::default())
+    }
+    #[cfg(feature = "remote")]
+    {
+        let remote: Vec<(&remote::RemoteSource, &remote::PartPlan)> = parts
+            .iter()
+            .filter_map(|&(source, plan)| match source {
+                InputSource::Remote(r) => Some((r, &plan.remote)),
+                InputSource::Local(_) => None,
+            })
+            .collect();
+        remote::stage_parts(&remote, budget)
+    }
+}
+
+/// What one pass-0 staging did (#788): the `pass0` record of the profile
+/// dump.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct StagingReport {
+    /// Range requests that landed.
+    pub(crate) requests: u64,
+    /// Bytes those requests returned.
+    pub(crate) bytes_fetched: u64,
+    /// Most requests in flight at once, across every part.
+    pub(crate) max_in_flight: u64,
+    /// Requests that failed twice (once, then retried as their units); their
+    /// chunks are read over the network when the passes touch them.
+    pub(crate) failed_requests: u64,
+    /// Column-chunk bytes those failed requests left unstaged.
+    pub(crate) unstaged_bytes: u64,
+    /// The first such failure, for the warning.
+    pub(crate) first_error: Option<String>,
+}
+
+/// One part's share of a pass-0 staging plan (#788, see
+/// [`InputSource::plan_staging`]). Empty for a local part.
+#[derive(Debug, Default)]
+pub(crate) struct PartStaging {
+    bytes_to_stage: u64,
+    requests: usize,
+    largest_request: u64,
+    #[cfg(feature = "remote")]
+    remote: remote::PartPlan,
+}
+
+impl PartStaging {
+    /// Compressed bytes of the column chunks this part stages: the selected
+    /// row groups' projected chunks, whether or not an earlier staging
+    /// already spilled some of them. It is the part's spill footprint, and
+    /// with no earlier staging also the bytes the plan fetches (an excluded
+    /// chunk or a pruned row group is never fetched, whatever the window).
+    pub(crate) fn bytes_to_stage(&self) -> u64 {
+        self.bytes_to_stage
+    }
+
+    /// Range requests the plan would make: 0 when every chunk it covers is
+    /// already in the part's disk spill (or the part is local).
+    pub(crate) fn request_count(&self) -> usize {
+        self.requests
+    }
+
+    /// Bytes of the plan's largest request: what one request in flight
+    /// holds in memory until it lands.
+    pub(crate) fn largest_request(&self) -> u64 {
+        self.largest_request
+    }
+}
+
+/// The staging admission's byte budget for a caller that holds no run
+/// memory budget: `TYLERTOO_STAGING_MEM_BUDGET_BYTES`, else the fixed
+/// default. The ONLY remaining un-budgeted admission (#788): the public
+/// [`crate::input_set::ConvertSource::stage_selected`] and
+/// [`InputSource::stage_row_groups`] stage through it. A conversion's pass 0
+/// and the `--max-zoom auto` sample are granted from the run's
+/// `MemoryBudget` instead. Replacing this with a grant is a one-line change
+/// here once those entry points have a budget to ask.
+pub(crate) fn unbudgeted_stage_admission() -> u64 {
+    #[cfg(feature = "remote")]
+    return remote::unbudgeted_stage_admission();
+    #[cfg(not(feature = "remote"))]
+    0
+}
+
+/// How many staging requests a run wants in flight, and the byte budget
+/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` sets when it is set. The run's memory
+/// budget grants the staging admission from these (#788).
+pub(crate) fn staging_want() -> (usize, Option<u64>) {
+    #[cfg(feature = "remote")]
+    return remote::staging_want();
+    #[cfg(not(feature = "remote"))]
+    (1, None)
 }
 
 /// Sum of the compressed byte sizes of the selected input row groups.
@@ -1001,9 +1148,9 @@ pub(crate) mod remote {
         }
 
         /// Pass 0 (#286/#287): stage the selected row groups to the disk spill
-        /// up front — ONE coalesced range request per row group, several in
-        /// flight at once — so both later passes read entirely from local
-        /// disk.
+        /// up front, several range requests in flight at once, so both later
+        /// passes read entirely from local disk. Every column, no projection:
+        /// the [`super::InputSource::stage_row_groups`] entry point.
         ///
         /// A row group's column chunks form a contiguous byte span, so each
         /// row group is fetched as a single large GET and sliced back into the
@@ -1024,44 +1171,74 @@ pub(crate) mod remote {
         /// space, #272) simply falls back to the reader's network path on
         /// first touch, so a spill write is never fatal — only an actual fetch
         /// error, which the passes would hit anyway, is surfaced.
-        pub(crate) fn stage_row_groups(
-            &self,
-            selected: Option<&[usize]>,
-        ) -> Result<(), InputError> {
-            self.stage_row_groups_with(selected, staging_tunables::effective())
-        }
-
-        /// [`Self::stage_row_groups`] with explicit tunables: the test seam,
-        /// so a test can pin the window or concurrency without touching the
-        /// process environment that [`staging_tunables::effective`] reads.
+        #[cfg(test)]
         fn stage_row_groups_with(
             &self,
             selected: Option<&[usize]>,
             tunables: &staging_tunables::StagingTunables,
         ) -> Result<(), InputError> {
-            let metadata = self.load_footer()?;
-            let row_groups = metadata.metadata().row_groups();
+            let plan = self.plan_staging_with(selected, None, tunables)?;
+            self.stage_plan_with(&plan, tunables)
+        }
 
+        /// This part's staging requests (#788): see
+        /// [`super::InputSource::plan_staging`].
+        pub(crate) fn plan_staging(
+            &self,
+            selected: Option<&[usize]>,
+            roots: Option<&[usize]>,
+        ) -> Result<PartPlan, InputError> {
+            self.plan_staging_with(selected, roots, staging_tunables::effective())
+        }
+
+        /// [`Self::plan_staging`] with explicit tunables (the test seam).
+        ///
+        /// Each selected row group contributes one span per run of kept
+        /// chunks: a chunk of an excluded column (outside `roots`) ends the
+        /// run and, like a pruned row group, blocks every merge across it.
+        /// A chunk already in the spill (an earlier staging, or a lazy read)
+        /// is not fetched again and blocks merges too. The coalescing window
+        /// then merges neighbouring spans whose gap holds no blocked byte, so
+        /// with a window `c` of one row group joins `a` of the next while an
+        /// excluded `b` between them is never fetched.
+        fn plan_staging_with(
+            &self,
+            selected: Option<&[usize]>,
+            roots: Option<&[usize]>,
+            tunables: &staging_tunables::StagingTunables,
+        ) -> Result<PartPlan, InputError> {
+            let metadata = self.load_footer()?;
+            let md = metadata.metadata();
+            let mask = roots.map(|r| {
+                tylertoo_io::ProjectionMask::roots(
+                    md.file_metadata().schema_descr(),
+                    r.iter().copied(),
+                )
+            });
+            let row_groups = md.row_groups();
             let mut is_selected = vec![selected.is_none(); row_groups.len()];
             for &i in selected.unwrap_or_default() {
                 if let Some(s) = is_selected.get_mut(i) {
                     *s = true;
                 }
             }
-            let mut plan: Vec<StagedSpan> = Vec::new();
-            // Spans of the unselected row groups: a coalesced request must
-            // never reach into one (#219/#210 — pruned bytes stay unfetched).
+            let spill = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cap = STAGE_MAX_REQUEST_BYTES.min(tunables.mem_budget);
+            let mut units: Vec<StagedSpan> = Vec::new();
             let mut blocked: Vec<Range<u64>> = Vec::new();
+            let mut bytes_to_stage = 0u64;
             for (rg, &keep) in row_groups.iter().zip(&is_selected) {
-                let mut start = u64::MAX;
-                let mut end = 0u64;
+                // (start, end, len, kept) per chunk, in file order.
                 let mut chunks = Vec::with_capacity(rg.columns().len());
-                for col in rg.columns() {
+                for (leaf, col) in rg.columns().iter().enumerate() {
                     let (s, len) = col.byte_range();
                     // Checked (#430): `load_footer` validated these for every
                     // row group, pruned or not, but a wrapped span here would
                     // fetch the wrong bytes.
-                    let chunk_end = s
+                    let (end, len) = s
                         .checked_add(len)
                         .filter(|e| *e <= self.object_meta.size)
                         .zip(usize::try_from(len).ok())
@@ -1073,105 +1250,94 @@ pub(crate) mod remote {
                                 self.location
                             ))
                         })?;
-                    start = start.min(s);
-                    end = end.max(chunk_end.0);
-                    chunks.push((s, chunk_end.1));
+                    let kept = mask.as_ref().is_none_or(|m| m.leaf_included(leaf));
+                    chunks.push((s, end, len, kept));
                 }
-                if end <= start {
+                chunks.sort_by_key(|c| c.0);
+                if !keep {
+                    if let (Some(first), Some(end)) =
+                        (chunks.first(), chunks.iter().map(|c| c.1).max())
+                    {
+                        blocked.push(first.0..end);
+                    }
                     continue;
                 }
-                if keep {
-                    plan.push(StagedSpan {
-                        span: start..end,
-                        chunks,
-                    });
-                } else {
-                    blocked.push(start..end);
-                }
-            }
-            if plan.is_empty() {
-                return Ok(());
-            }
-            let plan = coalesce_spans(plan, &blocked, tunables.coalesce_window);
-
-            // Bound in-flight (resident) spans by the memory budget: holding
-            // one row group transiently matches the L1 cache ceiling, so never
-            // hold more than the budget's worth at once.
-            let max_span = plan
-                .iter()
-                .map(|r| r.span.end - r.span.start)
-                .max()
-                .unwrap_or(0);
-            let concurrency = match max_span {
-                0 => 1,
-                s => ((tunables.mem_budget / s).max(1) as usize).min(tunables.max_concurrency),
-            };
-            staging_tunables::log_live_concurrency(tunables, concurrency, max_span);
-            log::debug!(
-                "[stage] fetching {} span(s), {concurrency} in flight \
-                 (largest span {max_span} B)",
-                plan.len()
-            );
-
-            let store = Arc::clone(&self.store);
-            let location = self.location.clone();
-            let spill = Arc::clone(&self.spill);
-            let shared = Arc::clone(&self.shared);
-            let object_meta = self.object_meta.clone();
-
-            runtime().block_on(async move {
-                use futures_util::stream::StreamExt;
-                let mut inflight = futures_util::stream::iter(plan.into_iter().map(|rg| {
-                    let store = Arc::clone(&store);
-                    let location = location.clone();
-                    let object_meta = object_meta.clone();
-                    async move {
-                        let bytes = object_meta
-                            .get_range(store.as_ref(), &location, rg.span.clone())
-                            .await
-                            .map_err(|e| ParquetError::External(Box::new(e)))?;
-                        Ok::<(StagedSpan, Bytes), ParquetError>((rg, bytes))
+                let mut run: Vec<Piece> = Vec::new();
+                for (start, end, len, kept) in chunks {
+                    if end <= start {
+                        continue;
                     }
-                }))
-                .buffer_unordered(concurrency);
-
-                while let Some(result) = inflight.next().await {
-                    let (rg, bytes) = result?;
-                    // Count the coalesced request (mirrors `fetch`).
-                    shared.requests.fetch_add(1, Ordering::Relaxed);
-                    shared
-                        .bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    shared
-                        .ranges
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(rg.span.clone());
-                    // Slice into per-column-chunk spill entries. Guard the
-                    // slice bounds: a well-behaved store returns exactly the
-                    // requested span, but a short read must fall back to the
-                    // reader's network path (skip spilling), never panic.
-                    let base = rg.span.start;
-                    let mut spill = spill
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for (chunk_start, len) in rg.chunks {
-                        // Checked (#430): a wrapped `off + len` would pass the
-                        // bound and panic inside `slice`.
-                        let slice = chunk_start
-                            .checked_sub(base)
-                            .and_then(|off| usize::try_from(off).ok())
-                            .and_then(|off| off.checked_add(len).map(|end| off..end))
-                            .filter(|r| r.end <= bytes.len());
-                        if let Some(r) = slice {
-                            spill.put(chunk_start, &bytes.slice(r));
+                    if kept {
+                        bytes_to_stage = bytes_to_stage.saturating_add(len as u64);
+                    }
+                    if !kept || spill.holds(start) {
+                        blocked.push(start..end);
+                        if !run.is_empty() {
+                            units.extend(split_unit(
+                                StagedSpan::unit(std::mem::take(&mut run)),
+                                cap,
+                            ));
                         }
+                        continue;
                     }
+                    run.push(Piece::whole(start, len));
                 }
-                Ok::<(), ParquetError>(())
-            })?;
+                if !run.is_empty() {
+                    units.extend(split_unit(StagedSpan::unit(run), cap));
+                }
+            }
+            drop(spill);
+            Ok(PartPlan {
+                requests: coalesce_spans(units, &blocked, tunables.coalesce_window),
+                bytes_to_stage,
+            })
+        }
 
-            Ok(())
+        /// Fetch `plan`'s requests into the spill (pass 0): a one-part
+        /// [`stage_parts`].
+        #[cfg(test)]
+        fn stage_plan_with(
+            &self,
+            plan: &PartPlan,
+            tunables: &staging_tunables::StagingTunables,
+        ) -> Result<(), InputError> {
+            stage_parts_with(&[(self, plan)], tunables).map(|_| ())
+        }
+
+        /// Record one landed request: the fetch counters (it counts as one
+        /// request, so callers observe the coalesced pattern) and its pieces,
+        /// written into their spill slots. [`stage_parts`] lands only a
+        /// response of the requested length; the slice bounds are checked
+        /// anyway, so a bad one leaves the chunk to the reader's network path
+        /// instead of panicking.
+        fn land(&self, request: &StagedSpan, bytes: &Bytes) {
+            self.shared.requests.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.shared
+                .ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.span.clone());
+            let base = request.span.start;
+            let mut spill = self
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for piece in &request.chunks {
+                // Checked (#430): a wrapped `off + len` would pass the
+                // bound and panic inside `slice`.
+                let slice = piece
+                    .start()
+                    .checked_sub(base)
+                    .and_then(|off| usize::try_from(off).ok())
+                    .and_then(|off| off.checked_add(piece.len).map(|end| off..end))
+                    .filter(|r| r.end <= bytes.len());
+                if let Some(r) = slice {
+                    spill.put_piece(*piece, &bytes[r]);
+                }
+            }
         }
 
         /// Snapshot of the fetch counters.
@@ -1484,6 +1650,16 @@ pub(crate) mod remote {
     /// ([`staging_tunables`]).
     const STAGE_COALESCE_WINDOW: u64 = 0;
 
+    /// Largest single staging request a row group's run of chunks is fetched
+    /// as (#727 §1), before coalescing: a bigger run, or a bigger chunk, is
+    /// fetched as sub-range requests of at most this size (and of at most
+    /// the memory budget). One request then never has to move more than
+    /// this inside the client timeout (30 s by default: 64 MiB needs about
+    /// 2.2 MB/s), and a failure costs one piece. A coalescing window can
+    /// still merge pieces into larger requests; a failed merged request is
+    /// retried as its pieces.
+    const STAGE_MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+
     /// Pass-0 staging tunables (#290): the staging constants above, each
     /// overridable through a `TYLERTOO_STAGING_*` environment variable so the
     /// #290 parameter sweep can vary them per run without rebuilding.
@@ -1743,9 +1919,137 @@ pub(crate) mod remote {
     /// plus the `(chunk_start, len)` of every column chunk inside it — keyed
     /// exactly how the L2 spill and [`RemoteReader::chunk_data`] look chunks
     /// up (`chunk.start`), so a staged slice is a drop-in L2 hit.
+    #[derive(Debug, Clone)]
     struct StagedSpan {
         span: Range<u64>,
-        chunks: Vec<(u64, usize)>,
+        chunks: Vec<Piece>,
+        /// Where each pre-coalesce unit (one run of kept chunks of one row
+        /// group, or one sub-range piece of it) starts in `chunks`; a failed
+        /// request is retried as these units ([`stage_parts`]).
+        seams: Vec<usize>,
+    }
+
+    impl StagedSpan {
+        /// One unit over `pieces` (non-empty, in file order).
+        fn unit(pieces: Vec<Piece>) -> Self {
+            let start = pieces.first().map_or(0, Piece::start);
+            let end = pieces.iter().map(Piece::end).max().unwrap_or(start);
+            Self {
+                span: start..end,
+                chunks: pieces,
+                seams: vec![0],
+            }
+        }
+
+        /// The units a coalesced request merged, each its own request.
+        fn units(&self) -> Vec<StagedSpan> {
+            let mut bounds = self.seams.clone();
+            bounds.push(self.chunks.len());
+            bounds
+                .windows(2)
+                .filter(|w| w[0] < w[1])
+                .map(|w| StagedSpan::unit(self.chunks[w[0]..w[1]].to_vec()))
+                .collect()
+        }
+
+        /// Bytes of column chunk this request carries (its unowned gap
+        /// bytes excluded).
+        fn chunk_bytes(&self) -> u64 {
+            self.chunks.iter().map(|p| p.len as u64).sum()
+        }
+    }
+
+    /// A column chunk, or the part of one a sub-range request carries
+    /// (#727 §1): `len` bytes at offset `at` of the `chunk_len`-byte chunk
+    /// starting at `chunk_start`. The spill slot is keyed by `chunk_start`,
+    /// exactly how [`RemoteReader::chunk_data`] looks chunks up, and fills in
+    /// once every piece of the chunk has landed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Piece {
+        chunk_start: u64,
+        chunk_len: usize,
+        at: usize,
+        len: usize,
+    }
+
+    impl Piece {
+        fn whole(chunk_start: u64, len: usize) -> Self {
+            Self {
+                chunk_start,
+                chunk_len: len,
+                at: 0,
+                len,
+            }
+        }
+
+        fn start(&self) -> u64 {
+            self.chunk_start + self.at as u64
+        }
+
+        fn end(&self) -> u64 {
+            self.start() + self.len as u64
+        }
+    }
+
+    /// Cut a unit larger than `cap` bytes into sub-range units of at most
+    /// `cap` (#727 §1): a 1.3 GiB geometry chunk becomes many concurrent
+    /// requests instead of one that must finish inside the client timeout,
+    /// and a failure costs one piece, not the chunk.
+    fn split_unit(unit: StagedSpan, cap: u64) -> Vec<StagedSpan> {
+        if unit.span.end - unit.span.start <= cap {
+            return vec![unit];
+        }
+        let step = usize::try_from(cap).unwrap_or(usize::MAX).max(1);
+        let mut out = Vec::new();
+        let mut cur: Vec<Piece> = Vec::new();
+        for p in unit.chunks {
+            let mut at = p.at;
+            while at < p.at + p.len {
+                let piece = Piece {
+                    at,
+                    len: (p.at + p.len - at).min(step),
+                    ..p
+                };
+                if cur.first().is_some_and(|f| piece.end() - f.start() > cap) {
+                    out.push(StagedSpan::unit(std::mem::take(&mut cur)));
+                }
+                cur.push(piece);
+                at += piece.len;
+            }
+        }
+        if !cur.is_empty() {
+            out.push(StagedSpan::unit(cur));
+        }
+        out
+    }
+
+    /// One remote part's staging plan (#788): its requests, and the bytes of
+    /// every projected chunk of its selected row groups.
+    #[derive(Debug, Default)]
+    pub(crate) struct PartPlan {
+        requests: Vec<StagedSpan>,
+        bytes_to_stage: u64,
+    }
+
+    impl PartPlan {
+        /// See [`super::PartStaging::bytes_to_stage`].
+        pub(crate) fn bytes_to_stage(&self) -> u64 {
+            self.bytes_to_stage
+        }
+
+        /// See [`super::PartStaging::request_count`].
+        pub(crate) fn request_count(&self) -> usize {
+            self.requests.len()
+        }
+
+        /// See [`super::PartStaging::largest_request`].
+        pub(crate) fn largest_request(&self) -> u64 {
+            self.requests
+                .iter()
+                .map(|r| r.span.end - r.span.start)
+                .max()
+                .unwrap_or(0)
+        }
     }
 
     /// Merge adjacent row-group spans into fewer, larger requests (#290
@@ -1786,6 +2090,8 @@ pub(crate) mod remote {
                 let fits = next.span.end.saturating_sub(cur.span.start) <= window;
                 if fits && gap.start <= gap.end && gap_is_clear(&gap) {
                     cur.span.end = next.span.end;
+                    let offset = cur.chunks.len();
+                    cur.seams.extend(next.seams.iter().map(|s| s + offset));
                     cur.chunks.extend(next.chunks);
                     continue;
                 }
@@ -1793,6 +2099,170 @@ pub(crate) mod remote {
             out.push(next);
         }
         out
+    }
+
+    /// Stage several remote parts' plans at once (pass 0, #727 §2).
+    ///
+    /// Every request of every part goes into ONE queue, in part then file
+    /// order, so concurrency spans parts: a prefix of many small parts no
+    /// longer pays one round trip per part in series. A request is admitted
+    /// while fewer than the concurrency ceiling are in flight and the bytes
+    /// in flight stay within the memory budget, and always when nothing is
+    /// in flight (so a request larger than the budget still runs, alone).
+    /// This replaces the per-part `budget / largest span` concurrency, under
+    /// which one large span throttled every other span of its part.
+    /// `budget` (a memory-budget grant, #788, or
+    /// [`super::unbudgeted_stage_admission`]) is the admission's byte budget.
+    pub(crate) fn stage_parts(
+        parts: &[(&RemoteSource, &PartPlan)],
+        budget: u64,
+    ) -> Result<super::StagingReport, InputError> {
+        stage_parts_with(
+            parts,
+            &staging_tunables::StagingTunables {
+                mem_budget: budget,
+                ..*staging_tunables::effective()
+            },
+        )
+    }
+
+    /// See [`super::unbudgeted_stage_admission`].
+    pub(crate) fn unbudgeted_stage_admission() -> u64 {
+        staging_tunables::effective().mem_budget
+    }
+
+    /// See [`super::staging_want`].
+    pub(crate) fn staging_want() -> (usize, Option<u64>) {
+        let tunables = staging_tunables::effective();
+        let budget_set = std::env::var_os(staging_tunables::MEM_BUDGET_VAR).is_some();
+        (
+            tunables.max_concurrency,
+            budget_set.then_some(tunables.mem_budget),
+        )
+    }
+
+    /// An error retrying cannot fix: the object changed under the footer
+    /// (#430 etag), vanished, or is not ours to read. The passes would fail
+    /// the same way, so staging stops and reports it.
+    fn fatal_fetch_error(e: &object_store::Error) -> bool {
+        use object_store::Error as E;
+        matches!(
+            e,
+            E::NotFound { .. }
+                | E::Precondition { .. }
+                | E::NotModified { .. }
+                | E::PermissionDenied { .. }
+                | E::Unauthenticated { .. }
+                | E::InvalidPath { .. }
+                | E::NotSupported { .. }
+                | E::NotImplemented { .. }
+        )
+    }
+
+    fn stage_parts_with(
+        parts: &[(&RemoteSource, &PartPlan)],
+        tunables: &staging_tunables::StagingTunables,
+    ) -> Result<super::StagingReport, InputError> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        // (source, request, already retried once)
+        let mut queue: std::collections::VecDeque<(&RemoteSource, StagedSpan, bool)> = parts
+            .iter()
+            .flat_map(|&(source, plan)| {
+                plan.requests
+                    .iter()
+                    .map(move |r| (source, r.clone(), false))
+            })
+            .collect();
+        let mut report = super::StagingReport::default();
+        if queue.is_empty() {
+            return Ok(report);
+        }
+        let largest = queue
+            .iter()
+            .map(|(_, r, _)| r.span.end - r.span.start)
+            .max()
+            .unwrap_or(0);
+        log::debug!(
+            "[stage] fetching {} span(s) over {} part(s), up to {} in flight \
+             (largest span {largest} B, budget {} B)",
+            queue.len(),
+            parts.iter().filter(|(_, p)| !p.requests.is_empty()).count(),
+            tunables.max_concurrency,
+            tunables.mem_budget
+        );
+        runtime().block_on(async {
+            let mut inflight = FuturesUnordered::new();
+            let mut inflight_bytes = 0u64;
+            loop {
+                while let Some((_, request, _)) = queue.front() {
+                    let len = request.span.end - request.span.start;
+                    let admit = inflight.is_empty()
+                        || (inflight.len() < tunables.max_concurrency
+                            && inflight_bytes.saturating_add(len) <= tunables.mem_budget);
+                    if !admit {
+                        break;
+                    }
+                    let Some((source, request, retried)) = queue.pop_front() else {
+                        break;
+                    };
+                    inflight_bytes += len;
+                    inflight.push(async move {
+                        let got = source
+                            .object_meta
+                            .get_range(
+                                source.store.as_ref(),
+                                &source.location,
+                                request.span.clone(),
+                            )
+                            .await;
+                        (source, request, retried, got)
+                    });
+                    report.max_in_flight = report.max_in_flight.max(inflight.len() as u64);
+                }
+                let Some((source, request, retried, got)) = inflight.next().await else {
+                    break;
+                };
+                let len = request.span.end - request.span.start;
+                inflight_bytes -= len;
+                let failure = match got {
+                    Ok(bytes) if bytes.len() as u64 == len => {
+                        source.land(&request, &bytes);
+                        report.requests += 1;
+                        report.bytes_fetched += bytes.len() as u64;
+                        continue;
+                    }
+                    Ok(bytes) => format!(
+                        "{}: short read, {} of {len} bytes for {:?}",
+                        source.url,
+                        bytes.len(),
+                        request.span
+                    ),
+                    Err(e) if fatal_fetch_error(&e) => {
+                        return Err(InputError::Parquet(ParquetError::External(Box::new(e))));
+                    }
+                    Err(e) => format!("{}: {e}", source.url),
+                };
+                // #727 §1: a transient failure costs only this request's
+                // chunks. Retry it once, as its units (a coalesced request
+                // splits back into its row groups' runs and pieces), ahead of
+                // the rest of the queue; a second failure leaves its chunks
+                // to the reader's lazy network path and staging goes on.
+                log::debug!("[stage] request {:?} failed ({failure})", request.span);
+                if retried {
+                    report.failed_requests += 1;
+                    report.unstaged_bytes += request.chunk_bytes();
+                    report.first_error.get_or_insert(failure);
+                } else {
+                    for unit in request.units().into_iter().rev() {
+                        queue.push_front((source, unit, true));
+                    }
+                }
+            }
+            Ok::<(), InputError>(())
+        })?;
+        staging_tunables::log_live_concurrency(tunables, report.max_in_flight as usize, largest);
+        Ok(report)
     }
 
     /// On-disk overflow for fetched column chunks (issue #219).
@@ -1830,6 +2300,10 @@ pub(crate) mod remote {
         /// #272. `None` follows the process temp dir (`$TMPDIR`). Honored
         /// at file creation, i.e. on the first spilled chunk.
         dir: Option<PathBuf>,
+        /// Chunks staged as sub-range pieces (#727 §1) that are still
+        /// missing bytes: `chunk.start` → (reserved offset, bytes missing).
+        /// A chunk joins `index` only once all of its pieces have landed.
+        pending: std::collections::HashMap<u64, (u64, usize)>,
     }
 
     /// #273: the warning to emit when `dir` (the resolved spill directory)
@@ -1850,6 +2324,12 @@ pub(crate) mod remote {
     }
 
     impl DiskSpill {
+        /// Whether the chunk starting at `chunk_start` is already spilled
+        /// (and the spill still serves reads).
+        fn holds(&self, chunk_start: u64) -> bool {
+            !self.disabled && self.index.contains_key(&chunk_start)
+        }
+
         /// Serve a previously spilled chunk, if present. `None` means "not
         /// spilled — fetch it over the network"; a read error disables the
         /// spill and also returns `None` so the caller falls back to fetch.
@@ -1877,51 +2357,84 @@ pub(crate) mod remote {
         /// the spill is disabled or already holds this chunk; a create/write
         /// error disables the spill.
         fn put(&mut self, chunk_start: u64, data: &Bytes) {
-            if self.disabled || self.index.contains_key(&chunk_start) {
+            self.put_piece(Piece::whole(chunk_start, data.len()), data);
+        }
+
+        /// Write one piece of a chunk into the chunk's reserved slot; the
+        /// chunk is served once all of its bytes are in (#727 §1). A whole
+        /// chunk is a single piece. A short `data` is ignored.
+        fn put_piece(&mut self, piece: Piece, data: &[u8]) {
+            if self.disabled
+                || self.index.contains_key(&piece.chunk_start)
+                || data.len() != piece.len
+            {
                 return;
             }
-            if self.file.is_none() {
-                // #273: warn once (the spill file is created exactly once) when
-                // the resolved directory is RAM-backed. `tempfile()` follows
-                // `std::env::temp_dir()` ($TMPDIR or /tmp) when no dir is set.
-                let resolved = self.dir.clone().unwrap_or_else(std::env::temp_dir);
-                if let Some(msg) = ram_backed_spill_warning(&resolved) {
-                    log::warn!("{msg}");
-                }
-                let created = match self.dir.as_deref() {
-                    Some(d) => tempfile::tempfile_in(d),
-                    None => tempfile::tempfile(),
-                };
-                match created {
-                    Ok(f) => self.file = Some(f),
-                    Err(e) => {
-                        let dir = self
-                            .dir
-                            .clone()
-                            .unwrap_or_else(std::env::temp_dir)
-                            .display()
-                            .to_string();
-                        log::warn!(
-                            "could not create input spill file in {dir} ({e}); remote \
-                             re-reads will re-fetch over the network"
-                        );
-                        self.disabled = true;
-                        return;
-                    }
-                }
+            if !self.ensure_file() {
+                return;
             }
-            let offset = self.write_offset;
+            let offset = match self.pending.get(&piece.chunk_start) {
+                Some(&(offset, _)) => offset,
+                None => {
+                    let offset = self.write_offset;
+                    self.write_offset += piece.chunk_len as u64;
+                    self.pending
+                        .insert(piece.chunk_start, (offset, piece.chunk_len));
+                    offset
+                }
+            };
             let file = self.file.as_mut().expect("spill file present");
             if let Err(e) = file
-                .seek(SeekFrom::Start(offset))
+                .seek(SeekFrom::Start(offset + piece.at as u64))
                 .and_then(|_| file.write_all(data))
             {
                 log::warn!("input spill write failed ({e}); falling back to network re-fetch");
                 self.disabled = true;
                 return;
             }
-            self.write_offset += data.len() as u64;
-            self.index.insert(chunk_start, (offset, data.len()));
+            let Some(missing) = self.pending.get_mut(&piece.chunk_start) else {
+                return;
+            };
+            missing.1 = missing.1.saturating_sub(piece.len);
+            if missing.1 == 0 {
+                self.pending.remove(&piece.chunk_start);
+                self.index
+                    .insert(piece.chunk_start, (offset, piece.chunk_len));
+            }
+        }
+
+        /// Create the spill file on first use; `false` once the spill is
+        /// disabled (creation failed, or an earlier I/O error).
+        fn ensure_file(&mut self) -> bool {
+            if self.file.is_some() {
+                return true;
+            }
+            // #273: warn once (the spill file is created exactly once) when
+            // the resolved directory is RAM-backed. `tempfile()` follows
+            // `std::env::temp_dir()` ($TMPDIR or /tmp) when no dir is set.
+            let resolved = self.dir.clone().unwrap_or_else(std::env::temp_dir);
+            if let Some(msg) = ram_backed_spill_warning(&resolved) {
+                log::warn!("{msg}");
+            }
+            let created = match self.dir.as_deref() {
+                Some(d) => tempfile::tempfile_in(d),
+                None => tempfile::tempfile(),
+            };
+            match created {
+                Ok(f) => {
+                    self.file = Some(f);
+                    true
+                }
+                Err(e) => {
+                    let dir = resolved.display().to_string();
+                    log::warn!(
+                        "could not create input spill file in {dir} ({e}); remote \
+                         re-reads will re-fetch over the network"
+                    );
+                    self.disabled = true;
+                    false
+                }
+            }
         }
     }
 
@@ -2437,7 +2950,7 @@ pub(crate) mod remote {
         //! request up to a window, never across a pruned row group.
 
         use super::staging_tunables::StagingTunables;
-        use super::{coalesce_spans, StagedSpan};
+        use super::{coalesce_spans, Piece, StagedSpan};
         use crate::input::InputSource;
         use std::ops::Range;
 
@@ -2446,9 +2959,10 @@ pub(crate) mod remote {
             let mid = range.start + (range.end - range.start) / 2;
             StagedSpan {
                 chunks: vec![
-                    (range.start, (mid - range.start) as usize),
-                    (mid, (range.end - mid) as usize),
+                    Piece::whole(range.start, (mid - range.start) as usize),
+                    Piece::whole(mid, (range.end - mid) as usize),
                 ],
+                seams: vec![0],
                 span: range,
             }
         }
@@ -2478,8 +2992,8 @@ pub(crate) mod remote {
             assert_eq!(spans(&out), vec![4..204, 204..404, 404..504]);
             // Every chunk survives the merge, in file order.
             assert_eq!(out[0].chunks.len(), 4);
-            assert_eq!(out[0].chunks[0], (4, 50));
-            assert_eq!(out[0].chunks[3], (154, 50));
+            assert_eq!(out[0].chunks[0], Piece::whole(4, 50));
+            assert_eq!(out[0].chunks[3], Piece::whole(154, 50));
         }
 
         #[test]
@@ -2528,7 +3042,7 @@ pub(crate) mod remote {
             let plan = vec![span(204..304), span(4..104), span(104..204)];
             let out = coalesce_spans(plan, &[], u64::MAX);
             assert_eq!(spans(&out), vec![4..304]);
-            let starts: Vec<u64> = out[0].chunks.iter().map(|c| c.0).collect();
+            let starts: Vec<u64> = out[0].chunks.iter().map(|c| c.chunk_start).collect();
             assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
         }
 
@@ -2677,6 +3191,85 @@ pub(crate) mod remote {
             let source = crate::input::test_memory_source(bytes, "w0.parquet");
             let (requests, _) = stage(&source, None, 0);
             assert_eq!(requests, 5);
+        }
+
+        /// #727 §1: a chunk larger than the request cap (here the 1 MiB
+        /// budget floor) is fetched as sub-range requests whose pieces
+        /// reassemble into one spill slot, and the read is served from it.
+        #[test]
+        fn an_oversized_chunk_is_fetched_in_pieces_and_reassembled() {
+            use arrow_array::{Int64Array, RecordBatch};
+            use std::sync::Arc;
+            use tylertoo_io::test_support::WriterProperties;
+
+            // One row group, one uncompressed, non-dictionary 2.4 MB chunk.
+            let n = 300_000i64;
+            let values: Vec<i64> = (0..n)
+                .map(|i| i.wrapping_mul(0x5851_F42D_4C95_7F2D))
+                .collect();
+            let batch = RecordBatch::try_from_iter([(
+                "v",
+                Arc::new(Int64Array::from(values.clone())) as _,
+            )])
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_max_row_group_row_count(Some(n as usize))
+                .build();
+            let mut bytes = Vec::new();
+            let mut w = tylertoo_io::test_support::ArrowWriter::try_new(
+                &mut bytes,
+                batch.schema(),
+                Some(props),
+            )
+            .unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            let md =
+                tylertoo_io::read_parquet_metadata(&bytes::Bytes::from(bytes.clone())).unwrap();
+            let chunk_len = md.row_group(0).column(0).byte_range().1;
+            let budget = 1024 * 1024u64;
+            assert!(
+                chunk_len > 2 * budget,
+                "fixture chunk {chunk_len} B too small"
+            );
+
+            let source = crate::input::test_memory_source(bytes, "big.parquet");
+            let InputSource::Remote(r) = &source else {
+                unreachable!()
+            };
+            let _ = source.open().unwrap();
+            let before = source.fetch_stats().unwrap().requests;
+            let tunables = StagingTunables {
+                mem_budget: budget,
+                ..StagingTunables::default()
+            };
+            r.stage_row_groups_with(None, &tunables).unwrap();
+            let requests = source.fetch_stats().unwrap().requests - before;
+            assert_eq!(
+                requests,
+                chunk_len.div_ceil(budget),
+                "one request per 1 MiB piece"
+            );
+
+            let before = source.fetch_stats().unwrap().requests;
+            let reader = source.open().unwrap().build().unwrap();
+            let mut got = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                got.extend(col.values().iter().copied());
+            }
+            assert_eq!(got, values, "pieces reassemble into the exact chunk");
+            assert_eq!(
+                source.fetch_stats().unwrap().requests,
+                before,
+                "the reassembled chunk is served from the spill"
+            );
         }
 
         #[test]
@@ -3095,6 +3688,177 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     InputSource::Remote(
         remote::RemoteSource::from_store(store, location, format!("memory://{name}")).unwrap(),
     )
+}
+
+/// Test-only object store for the staging counters (#788 track R: #727,
+/// #544): an in-memory store whose range GETs each take `delay`, that records
+/// the most GETs it ever had in flight at once, and that fails the next N
+/// GETs of a chosen object on demand (the stand-in for one request hitting
+/// the client timeout).
+#[cfg(all(test, feature = "remote"))]
+pub(crate) mod probe_store {
+    use std::fmt;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
+
+    use super::{remote::RemoteSource, InputSource};
+
+    #[derive(Debug, Default)]
+    struct Counters {
+        in_flight: usize,
+        max_in_flight: usize,
+        /// `(object, remaining)`: fail this many more GETs of `object`.
+        fail: Vec<(Path, usize)>,
+        failed: usize,
+    }
+
+    /// See the module docs.
+    #[derive(Debug)]
+    pub(crate) struct ProbeStore {
+        inner: ThrottledStore<InMemory>,
+        counters: Mutex<Counters>,
+    }
+
+    impl fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ProbeStore")
+        }
+    }
+
+    impl ProbeStore {
+        /// A store holding `objects` (`(name, bytes)`), each GET taking `delay`.
+        pub(crate) fn new(objects: &[(&str, Vec<u8>)], delay: Duration) -> Arc<Self> {
+            let mem = InMemory::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for (name, bytes) in objects {
+                rt.block_on(mem.put(&Path::from(*name), bytes.clone().into()))
+                    .unwrap();
+            }
+            let config = ThrottleConfig {
+                wait_get_per_call: delay,
+                ..ThrottleConfig::default()
+            };
+            Arc::new(Self {
+                inner: ThrottledStore::new(mem, config),
+                counters: Mutex::default(),
+            })
+        }
+
+        /// A remote [`InputSource`] over object `name` of this store.
+        pub(crate) fn source(self: &Arc<Self>, name: &str) -> InputSource {
+            InputSource::Remote(
+                RemoteSource::from_store(
+                    Arc::clone(self) as Arc<dyn ObjectStore>,
+                    Path::from(name),
+                    format!("memory://{name}"),
+                )
+                .unwrap(),
+            )
+        }
+
+        fn counters(&self) -> std::sync::MutexGuard<'_, Counters> {
+            self.counters.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Fail the next `n` GETs of object `name`.
+        pub(crate) fn fail_next_gets(&self, name: &str, n: usize) {
+            self.counters().fail.push((Path::from(name), n));
+        }
+
+        /// The most GETs ever in flight at once, then reset it to zero.
+        pub(crate) fn take_max_in_flight(&self) -> usize {
+            std::mem::take(&mut self.counters().max_in_flight)
+        }
+
+        /// How many GETs were failed on purpose.
+        pub(crate) fn failed(&self) -> usize {
+            self.counters().failed
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            let fail = {
+                let mut c = self.counters();
+                let hit = c
+                    .fail
+                    .iter_mut()
+                    .find(|(p, n)| p == location && *n > 0)
+                    .map(|(_, n)| *n -= 1)
+                    .is_some();
+                c.failed += usize::from(hit);
+                c.in_flight += 1;
+                c.max_in_flight = c.max_in_flight.max(c.in_flight);
+                hit
+            };
+            let out = if fail {
+                Err(object_store::Error::Generic {
+                    store: "ProbeStore",
+                    source: "injected failure (stands in for a request timeout)".into(),
+                })
+            } else {
+                self.inner.get_opts(location, options).await
+            };
+            self.counters().in_flight -= 1;
+            out
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 }
 
 /// Fuzz hook (#633): read `bytes` as a remote GeoParquet object, through the

@@ -298,10 +298,9 @@ pub fn simplify_for_level(
 /// geometry is value-identical to `geom` (#499, the compute side of the
 /// ladder amplification issue): `unchanged == true` means the output is a
 /// value-identical clone of the input — no vertex was dropped, no ring
-/// collapsed, no disposition changed. Cheap: every case below is decided
-/// from a `Vec::len()` comparison the simplification call already computed
-/// ([`polygon_unchanged`], [`simplify_linestring_checked`]), never a
-/// coordinate-by-coordinate diff.
+/// collapsed, no disposition changed. The checked line and polygon owners
+/// use counts as a prefilter, then verify value equality before authorizing
+/// allocation sharing ([`polygon_unchanged`], [`simplify_linestring_checked`]).
 ///
 /// Callers that fold a geometry through several levels (the cascade fold,
 /// [`super::stream::process_batch_cascade`]) use `unchanged == true` to skip
@@ -895,6 +894,12 @@ const RDP_MIN_LINE: usize = 2;
 /// (`geo`'s `POLYGON_INITIAL_MIN`).
 const RDP_MIN_RING: usize = 4;
 
+#[cfg(test)]
+thread_local! {
+    // Distance evaluations and stack pushes, local to each test worker.
+    static RDP_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Ramer–Douglas–Peucker, with the recursion on the heap (#575).
 ///
 /// # Why this is not `geo::Simplify`
@@ -954,6 +959,11 @@ fn rdp_coords(
         return coords.to_vec();
     }
 
+    #[cfg(test)]
+    RDP_WORK.with(|work| {
+        let (visits, pushes) = work.get();
+        work.set((visits, pushes + 1));
+    });
     let mut keep = vec![true; coords.len()];
     let mut retained = coords.len();
     let mut stack: Vec<(usize, usize)> = vec![(0, coords.len() - 1)];
@@ -961,6 +971,11 @@ fn rdp_coords(
         if b <= a + 1 {
             continue; // nothing between the endpoints: geo's 2-element base case
         }
+        #[cfg(test)]
+        RDP_WORK.with(|work| {
+            let (visits, pushes) = work.get();
+            work.set((visits + (b - a - 1) as u64, pushes));
+        });
         let chord = geo::Line::new(coords[a], coords[b]);
         // Seeded exactly as geo's fold: index `a` ("local 0"), distance 0.
         let mut farthest = a;
@@ -976,6 +991,11 @@ fn rdp_coords(
         debug_assert_ne!(farthest, a, "an interior vertex is always the farthest");
         if farthest_dist > epsilon {
             // Right first so the left subproblem pops (and culls) first.
+            #[cfg(test)]
+            RDP_WORK.with(|work| {
+                let (visits, pushes) = work.get();
+                work.set((visits, pushes + 2));
+            });
             stack.push((farthest, b));
             stack.push((a, farthest));
             continue;
@@ -1041,12 +1061,9 @@ fn polygon_diag(poly: &Polygon<f64>) -> f64 {
 
 /// Simplify a single LineString, returning `None` when it should be dropped:
 /// degenerate (`< 2` points or all coincident) or below the visibility gate.
-/// Also reports whether RDP removed any vertices (`unchanged == false` when
-/// it did) — cheap, since `geo`'s RDP output is always an ordered subsequence
-/// of the input (endpoints included), so equal vertex counts imply an
-/// identical linestring, a `Vec::len()` comparison rather than a
-/// coordinate-by-coordinate diff (mirrors [`polygon_unchanged`]'s reasoning
-/// for rings, #499).
+/// Also reports whether the result is value-identical to the input. Vertex
+/// counts prefilter the comparison; equality is checked in release builds
+/// before the cascade is allowed to share the input's allocation (#556).
 ///
 /// Adapted from `crate::simplify`'s degenerate-linestring guard (which returns
 /// the input unchanged for `< 2` points to avoid a `geo::Simplify` panic);
@@ -1065,11 +1082,7 @@ fn simplify_linestring_checked(ls: &LineString<f64>, tol: f64) -> Option<(LineSt
     if simplified.0.len() < MIN_LINESTRING_POINTS || linestring_diag(&simplified) <= 0.0 {
         return None;
     }
-    let unchanged = simplified.0.len() == ls.0.len();
-    debug_assert!(
-        !unchanged || simplified == *ls,
-        "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
-    );
+    let unchanged = simplified.0.len() == ls.0.len() && simplified == *ls;
     Some((simplified, unchanged))
 }
 
@@ -1131,19 +1144,11 @@ fn capped_is_valid(
     candidate.is_valid()
 }
 
-/// `true` when RDP removed nothing: the candidate has the same ring count and
-/// per-ring vertex counts as the original. RDP output vertices are always an
-/// ordered subset of the input (endpoints included), so equal counts imply an
-/// identical geometry — validation of the candidate is then redundant (the
-/// input is assumed valid, and re-checking it is exactly the H3(c) profile's
-/// dominant cost at fine GSDs).
-///
-/// Since #499 this result also decides whether the cascade fold shares one
-/// `Arc<Geometry<f64>>` across ladder levels, so it must never be `true`
-/// unless the candidate is value-identical to `original`. That rests entirely
-/// on the RDP ordered-subsequence premise above — a `geo` upgrade that ever
-/// moved or replaced a retained vertex would break it, which is why both
-/// checked paths carry a `debug_assert!` comparing the values outright.
+/// Whether the candidate is value-identical to the original. Ring and
+/// vertex counts reject changed shapes cheaply; value equality then guards
+/// both the redundant-validation shortcut and cascade allocation sharing
+/// in release builds (#556). The comparison is computed once and reused by
+/// the caller and [`CascadeFold::step`].
 fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool {
     candidate.exterior().0.len() == original.exterior().0.len()
         && candidate.interiors().len() == original.interiors().len()
@@ -1152,6 +1157,7 @@ fn polygon_unchanged(candidate: &Polygon<f64>, original: &Polygon<f64>) -> bool 
             .iter()
             .zip(original.interiors())
             .all(|(a, b)| a.0.len() == b.0.len())
+        && candidate == original
 }
 
 /// Simplify a Polygon in world space with ring-validity guards.
@@ -1271,10 +1277,6 @@ fn simplify_polygon_impl_checked(
         }
 
         let unchanged = polygon_unchanged(&candidate, poly);
-        debug_assert!(
-            !unchanged || candidate == *poly,
-            "RDP subsequence invariant broken: unchanged must mean value identity (#499)"
-        );
         if unchanged || capped_is_valid(&candidate, diagnostics) {
             return (Simplified::Keep(Geometry::Polygon(candidate)), unchanged);
         }
@@ -3561,6 +3563,228 @@ mod source_area_regression {
         assert!(
             differs_from_source > 0,
             "the two retention policies conflict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase1_cost_tests {
+    use super::*;
+    use std::hint::black_box;
+
+    fn sawtooth_ring(n: usize) -> Vec<geo::Coord<f64>> {
+        let mut coords: Vec<_> = (0..n - 3)
+            .map(|i| geo::Coord {
+                x: i as f64,
+                y: if i % 2 == 0 { 0.0 } else { 1.0 },
+            })
+            .collect();
+        coords.push(geo::Coord {
+            x: (n - 4) as f64,
+            y: -2.0,
+        });
+        coords.push(geo::Coord { x: 0.0, y: -2.0 });
+        coords.push(coords[0]);
+        coords
+    }
+
+    fn measure_ring(n: usize) -> u64 {
+        let coords = sawtooth_ring(n);
+        RDP_WORK.with(|w| w.set((0, 0)));
+        let result = rdp_coords(black_box(&coords), black_box(0.99), RDP_MIN_RING);
+        let (visits, pushes) = RDP_WORK.with(std::cell::Cell::get);
+        eprintln!(
+            "RDP n={n} visits={visits} pushes={pushes} retained={}",
+            result.len()
+        );
+        visits
+    }
+
+    #[test]
+    #[ignore = "#580 kept open: RDP distance scans are quadratic on sawtooth rings (exponent 2.004); the exact path-hull attempt cost +1.5% instructions on real data and was reverted (see #788 track A)"]
+    fn phase1_rdp_work_growth_bound() {
+        for n in [1_000, 10_000, 100_000] {
+            let work = measure_ring(n);
+            let bound = 8 * n as u64 * u64::from(n.ilog2() + 1);
+            assert!(
+                work <= bound,
+                "#580 n={n}: {work} distance visits exceed {bound}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual optimized profile; 100k adversarial ring does quadratic work"]
+    fn phase1_profile_rdp() {
+        let sizes = std::env::var("PHASE1_N").map_or_else(
+            |_| vec![1_000, 10_000, 100_000],
+            |v| vec![v.parse().unwrap()],
+        );
+        for n in sizes {
+            measure_ring(n);
+        }
+    }
+
+    fn real_geometries(path: &std::path::Path) -> Vec<Geometry<f64>> {
+        let builder = tylertoo_io::open_parquet(std::fs::File::open(path).unwrap()).unwrap();
+        let schema = builder.schema().clone();
+        let idx = schema.index_of("geometry").unwrap();
+        let field = schema.field(idx);
+        let mut geoms = Vec::new();
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let array =
+                geoarrow::array::from_arrow_array(batch.column(idx).as_ref(), field).unwrap();
+            crate::batch_processor::extract_geometries_from_array(
+                array.as_ref(),
+                &mut geoms,
+                &crate::diagnostics::Diagnostics::default(),
+            )
+            .unwrap();
+        }
+        geoms
+    }
+
+    // perf stat --delay=-1 --control=fifo:CONTROL,ACK excludes fixture loading.
+    fn perf_control(command: &str) {
+        use std::io::{Read, Write};
+        if let Ok(path) = std::env::var("PHASE1_PERF_CONTROL") {
+            let mut control = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            writeln!(control, "{command}").unwrap();
+            let mut ack = std::fs::File::open(std::env::var("PHASE1_PERF_ACK").unwrap()).unwrap();
+            let mut byte = [0];
+            while ack.read_exact(&mut byte).is_ok() {
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn compare_geometry(a: &Geometry<f64>, b: &Geometry<f64>) -> bool {
+        a == b
+    }
+
+    #[inline(never)]
+    fn clone_geometry(a: &Geometry<f64>) -> Geometry<f64> {
+        a.clone()
+    }
+
+    #[test]
+    #[ignore = "manual #556 real-data cost measurement; env selects data and operation"]
+    fn phase1_profile_identity() {
+        let path = std::env::var("PHASE1_INPUT").unwrap();
+        let geoms = real_geometries(std::path::Path::new(&path));
+        let opts = SimplifyOptions::default();
+        let diagnostics = crate::diagnostics::Diagnostics::default();
+        let mode = std::env::var("PHASE1_MODE").unwrap_or_else(|_| "simplify".into());
+        let repeats: usize = std::env::var("PHASE1_REPEATS")
+            .unwrap_or_else(|_| "1".into())
+            .parse()
+            .unwrap();
+        // Production-shaped z14..z3 cascade, collecting precisely the pairs
+        // for which the current flag authorizes allocation sharing.
+        let mut shared = Vec::new();
+        let mut steps = 0;
+        let mut simplify_ns = 0;
+        for source in &geoms {
+            let mut current = source.clone();
+            for z in (3..=14).rev() {
+                let gsd = 40_075_016.685_578_5 / (256.0 * f64::from(1u32 << z));
+                let start = std::time::Instant::now();
+                let (out, unchanged) = simplify_for_level_checked(
+                    &current,
+                    gsd,
+                    Some(z),
+                    Crs::Epsg4326,
+                    &opts,
+                    &diagnostics,
+                    source,
+                );
+                simplify_ns += start.elapsed().as_nanos();
+                steps += 1;
+                match out {
+                    Simplified::Keep(next) => {
+                        if unchanged {
+                            shared.push((current.clone(), next.clone()));
+                        }
+                        current = next;
+                    }
+                    Simplified::Dropped => break,
+                }
+            }
+        }
+        eprintln!(
+            "IDENTITY input={path} rows={} steps={steps} shared={} prep_simplify_ns={simplify_ns}",
+            geoms.len(),
+            shared.len()
+        );
+        perf_control("enable");
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            match mode.as_str() {
+                "equal" => {
+                    for (a, b) in &shared {
+                        assert!(compare_geometry(black_box(a), black_box(b)));
+                    }
+                }
+                "clone" => {
+                    for (a, _) in &shared {
+                        black_box(clone_geometry(black_box(a)));
+                    }
+                }
+                "count" => {
+                    for (a, b) in &shared {
+                        if let (Geometry::Polygon(a), Geometry::Polygon(b)) = (a, b) {
+                            black_box(polygon_unchanged(black_box(a), black_box(b)));
+                        } else {
+                            black_box((a, b));
+                        }
+                    }
+                }
+                "simplify" => {
+                    for source in &geoms {
+                        let mut current = source.clone();
+                        for z in (3..=14).rev() {
+                            let gsd = 40_075_016.685_578_5 / (256.0 * f64::from(1u32 << z));
+                            let (out, _) = simplify_for_level_checked(
+                                black_box(&current),
+                                gsd,
+                                Some(z),
+                                Crs::Epsg4326,
+                                &opts,
+                                &diagnostics,
+                                source,
+                            );
+                            match out {
+                                Simplified::Keep(next) => current = next,
+                                Simplified::Dropped => break,
+                            }
+                        }
+                    }
+                }
+                _ => panic!("unknown operation"),
+            }
+        }
+        let elapsed = start.elapsed().as_nanos();
+        perf_control("disable");
+        eprintln!("IDENTITY mode={mode} repeats={repeats} elapsed_ns={elapsed}");
+    }
+
+    #[test]
+    fn phase1_unchanged_rejects_equal_count_changed_values() {
+        let original = Polygon::new(
+            LineString::from(vec![(0., 0.), (2., 0.), (2., 2.), (0., 0.)]),
+            vec![],
+        );
+        let candidate = Polygon::new(
+            LineString::from(vec![(0., 0.), (3., 0.), (2., 2.), (0., 0.)]),
+            vec![],
+        );
+        assert!(
+            !polygon_unchanged(&candidate, &original),
+            "#556 sharing predicate must check values in release too"
         );
     }
 }

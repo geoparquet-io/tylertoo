@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::convert::{check_in_memory_byte_array_total, ConvertError};
 use super::memory::MemoryPhase;
-use super::pipeline::{read_in_order, ReadFlow, ReadTuning};
+use super::read::{read_in_order, ReadFlow, ReadTuning};
 use crate::input_set::{ConvertSource, RowGroupSelection};
 use arrow_array::RecordBatch;
 
