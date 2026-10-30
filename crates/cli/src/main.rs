@@ -7,8 +7,8 @@
 /// musl's `mallocng` deterministically fails *small* allocations once a large
 /// live heap has been fragmented by many threads: a 38.7M-polygon `tiles` run
 /// aborted with `memory allocation of 148448 bytes failed` at the identical
-/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted —
-/// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
+/// input row across two runs, at 28.6 GB RSS on a node with 240 GB granted,
+/// over 200 GB of headroom. mimalloc's segment/page allocator does not degrade
 /// that way, so the musl release binary uses it instead.
 ///
 /// On musl it is unconditional. On every other target it is the `mimalloc`

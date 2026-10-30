@@ -1807,7 +1807,7 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
-| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export. Export's member store, level stores and wave width follow it as below |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
@@ -1820,8 +1820,9 @@ processed at once, and how many row groups the writer encodes at once.
   IPC files and stream back at write time. Every other phase keeps the caps
   `bounded` always had, and the allowance can only shrink them: at most 4
   readers, each at most 16 batches deep, and at most 4 concurrent row-group
-  encodes. The compute window takes what `--in-flight-batches` asks for,
-  within the allowance. Its peak never exceeds what `bounded` used before
+  encodes. Remote staging holds at most 256 MiB of requests in flight, or
+  `TYLERTOO_STAGING_MEM_BUDGET_BYTES` when set. The compute window takes
+  what `--in-flight-batches` asks for, within the allowance. Its peak never exceeds what `bounded` used before
   the run budget existed (#788), whatever the machine.
 - **`auto`**, the default, sizes the run to the machine. Every phase fits
   inside one allowance: 60% of available memory, or of
@@ -1832,6 +1833,13 @@ processed at once, and how many row groups the writer encodes at once.
   their estimate fits and spill when it does not, and a run that starts in
   RAM keeps measuring and switches to spilling mid-pass if it outgrows the
   allowance.
+
+Export applies the same rule. `speed` keeps every level's tile members in
+RAM and sizes the partition wave from the cores alone; `bounded` spills them
+and keeps the wave caps export always had; `auto` keeps them in RAM when they
+fit the allowance and narrows the wave to fit it. Under every profile, export
+still refuses a tile that alone needs more than the machine's memory
+([Export waves](guides/scaling.md#export-waves)).
 
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
@@ -1856,23 +1864,8 @@ above its live heap. That gap is allocator retention, not a leak. `--profile bou
 remains the setting for memory-constrained machines.
 
 `bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
-`speed` keep raw IPC, including an `auto` downgrade to disk. The IO facade
-caps LZ4 blocks at 64 KiB and releases codec scratch between writes. This
-bounds active scratch independently of input size and avoids a per-level
-idle workspace floor, while preserving the original
-Arrow batch boundaries on drain. Saved-plan files keep their existing format.
-
-The benchmark lane measured the earlier Arrow-buffer LZ4 variant on Moldova
-verbatim forced spill at 0.25× disk bytes and 0.81× peak RSS, with 1.052× total
-wall time when uncapped. For Mato Grosso bounded under a 4 GiB memory cap,
-pass 2 fell from 91 to 52 seconds median (0.58×), total wall time was 0.83×,
-and RSS and output were unchanged. That capped result uses two noisy rounds;
-these wall figures describe the earlier body codec, not the fixed-block
-stream framing. With transient framing, live heap is neutral and measured
-RSS is within run-to-run noise, not proven at-or-below raw; the isolated
-benchmark lane checks the bounded RSS envelope before merge.
-Disk preflight sums conservative raw components and assumes
-no compression savings. `pass2.sink.spill_codec` records the selected codec.
+`speed` keep raw IPC, including an `auto` downgrade to disk.
+`pass2.sink.spill_codec` records the selected codec.
 
 ### Automatic memory estimate
 
@@ -1960,7 +1953,7 @@ chose to keep the defaults, is in `benchmarks/staging/RESULTS.md`.
 | Variable | Default | Bounds | Effect |
 |----------|---------|--------|--------|
 | `TYLERTOO_STAGING_CONCURRENCY` | 8 | 1–128 | Ceiling on range requests in flight per part |
-| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | Transient budget for in-flight spans; live concurrency is `min(ceiling, budget ÷ largest span)` |
+| `TYLERTOO_STAGING_MEM_BUDGET_BYTES` | 268435456 (256 MiB) | ≥ 1 MiB | When set, caps the requests in flight for every profile. Unset, `auto` and `speed` are sized by the run budget, and `bounded` by the 256 MiB default |
 | `TYLERTOO_STAGING_COALESCE_BYTES` | 0 (off) | 0–1 GiB, and ≤ the budget | Merge adjacent selected row groups into one request while the merged span fits the window. A pruned row group always splits a merge, so pruned bytes are never fetched |
 | `TYLERTOO_HTTP_<KEY>` | unset | see below | Sets `object_store` client option `<key>` on every remote store |
 

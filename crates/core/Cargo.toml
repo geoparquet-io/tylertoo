@@ -156,6 +156,10 @@ name = "simplify_cascade"
 harness = false
 
 [[bench]]
+name = "algorithmic"
+harness = false
+
+[[bench]]
 name = "mvt_encode"
 harness = false
 

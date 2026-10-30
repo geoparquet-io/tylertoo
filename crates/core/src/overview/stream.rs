@@ -257,33 +257,15 @@ fn stage_input_pass0(
 }
 
 /// Fetch `plan` with its requests in flight granted from `budget` (#788,
-/// [`MemoryPhase::Stage`]): units of the plan's largest request (a footer
-/// price), up to the concurrency ceiling, or what
-/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` fits when that is set, never fewer
-/// than one, granted under `profile` as every phase is
-/// ([`MemoryBudget::fit`]). The grant is released when staging ends. Pass 0 and the
-/// `--max-zoom auto` sample both stage through it.
+/// [`MemoryBudget::stage_requests`]). The grant is released when staging
+/// ends. Pass 0 and the `--max-zoom auto` sample both stage through it.
 pub(super) fn stage_granted(
     source: &ConvertSource,
     plan: &crate::input_set::StagingPlan,
     budget: &mut MemoryBudget,
     profile: super::level::MemoryProfile,
 ) -> Result<crate::input::StagingReport, crate::input::InputError> {
-    use super::memory::{Price, PriceBasis};
-    let largest = plan.largest_request().max(1);
-    let (ceiling, budget_override) = crate::input::staging_want();
-    let want = budget_override.map_or(ceiling, |bytes| {
-        usize::try_from(bytes / largest)
-            .unwrap_or(usize::MAX)
-            .clamp(1, ceiling.max(1))
-    });
-    let grant = budget.fit(
-        profile,
-        MemoryPhase::Stage,
-        Price::new(largest, PriceBasis::Footer),
-        want,
-        1,
-    );
+    let grant = budget.stage_requests(profile, plan.largest_request());
     let report = source.stage_within(plan, grant.bytes());
     budget.release(grant);
     report
@@ -1281,19 +1263,16 @@ fn reserve_spill_cache(
         emitted.len()
     };
     let buffered_rows: usize = emitted[..buffered].iter().map(|e| e.hint).sum();
-    let spills = match options.profile {
-        super::level::MemoryProfile::Speed => false,
-        super::level::MemoryProfile::Bounded => true,
-        super::level::MemoryProfile::Auto => matches!(
-            pipeline::auto_backing(
-                options.mode,
-                buffered_rows,
-                budget.available(),
-                avg_geom_bytes
-            ),
-            pipeline::SinkBacking::Spill
+    let spills = matches!(
+        pipeline::sink_backing(
+            budget,
+            options.profile,
+            options.mode,
+            buffered_rows,
+            avg_geom_bytes
         ),
-    };
+        pipeline::SinkBacking::Spill
+    );
     if !spills || buffered_rows == 0 {
         return skip("nothing spills");
     }
@@ -4017,7 +3996,7 @@ fn write_profile_json(
 /// probe it — the backing is an instruction there, not an estimate.
 fn sink_json(m: pipeline::SinkMeasurement) -> serde_json::Value {
     serde_json::json!({
-        "spill_codec": m.codec.as_str(),
+        "spill_codec": pipeline::spill_codec_name(m.codec),
         "bytes_per_row": m.bytes_per_row,
         "sampled_rows": m.sampled_rows,
         "projected_bytes": m.projected_bytes,

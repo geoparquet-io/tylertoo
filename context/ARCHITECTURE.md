@@ -50,7 +50,7 @@ its remaining scope; the legacy pipeline's architecture notes were moved to
 
 ## Decision Record: Memory Profiles and the Run Budget (#788, 2026-10-30)
 
-One `MemoryBudget` (`overview/memory.rs`) per conversion probes memory once
+One `MemoryBudget` (`overview/memory.rs`) per operation probes memory once
 (MemAvailable, `TYLERTOO_AUTO_MEM_LIMIT_BYTES`, or the cgroup limit) and sets
 one allowance: 60% of the probed figure less hard reservations (the eager
 input, and under a cgroup limit the spill's page cache when it fits). Every
@@ -58,7 +58,32 @@ elastic phase asks `MemoryBudget::fit(profile, phase, price, want, floor)`
 for units of a price read from the Parquet footers, and each grant is
 charged, so a phase sized later sees only what earlier ones left. Before
 this, the read-ahead, the compute window and the encodes each took their own
-slice of the same allowance and nothing summed them (#716).
+slice of the same allowance and nothing summed them (#716). Every decision
+reads the one budget's own figures: `auto`'s RAM-or-spill choice for the
+pass-2 sinks and export's fill store compares its estimate with
+`budget.allowance(Auto)` after the grants already charged, the same figure
+the runtime downgrade (#626) checks (`pipeline::auto_backing`).
+
+"Once per operation", not once per process. A `tiles` run probes four
+times, through three probes in `pipeline.rs`, each for a reason:
+
+- **convert:** `MemoryBudget::probe()` in `preflight()`, uncached, before
+  pass 1 reads anything;
+- **export:** `export_budget()`, from `available_memory_bytes()`. That
+  figure is cached process-wide on its first call after convert's pass 1,
+  so it is the cgroup's headroom with pass 1's usage already charged
+  (#485). The widths of export's waves have used it since #303;
+- **export's dense-tile refusal** (`check_levels_fit`, #665): it uses
+  `probe_oom_memory_limit()`, fresh and without `memory.high`, because that
+  check measures what would kill the process, not what the run may hold;
+- **export's diagnostics:** the cap on the Python loss list comes from its
+  own `MemoryBudget::probe()`. It sizes a report, never the archive.
+
+`--max-zoom auto` also stages its sample through a throwaway
+`MemoryBudget::probe()` (`auto_zoom.rs`), before `preflight()` builds the
+conversion's budget. That grant is released before the conversion starts.
+Only the order of the calls ties them: `auto_max_zoom` resolves the zoom
+that `preflight()` prices.
 
 The profile decides the grant the same way for every phase. The user
 confirmed this decision:
@@ -70,11 +95,30 @@ confirmed this decision:
 | `auto` (default) | what the phase's share affords, within `[floor, want]` | Sized to the machine: every decision fits the allowance, spilling when the output does not, re-checked at runtime (#626) |
 
 In one sentence: **`bounded` keeps main's caps per phase; the allowance can
-only shrink them** (`MemoryPhase::bounded_cap`, plus the read shape's worker
-and depth caps in `read.rs`). A cut that granted `bounded` only each phase's
+only shrink them** (`MemoryPhase::bounded_cap`, which also holds remote
+staging to main's 256 MiB in-flight budget through
+`MemoryBudget::stage_requests`, plus the read shape's worker and depth caps
+in `read.rs`). A cut that granted `bounded` only each phase's
 floor (one reader, 4 deep) was reverted the same day. It went below main's
 shape, and cost `bounded` wall time for no memory main had not already
 accepted.
+
+Export takes the same profile (`ExportOptions::profile`; `tiles` passes
+convert's). Its #235 member store's backing goes through convert's
+`resolve_backing` (`speed` RAM, `bounded` spill, `auto` the estimate), and the
+partition wave, the #311 per-level density guard and the #647 level-group cap
+ask `affordable(profile, ExportCollect, ..)`: unlimited under `speed`, main's
+memory-safe cap under `bounded` and `auto`. With RAM unknown they price
+against the budget's 4 GiB fallback allowance like every other phase; the
+fixed 16-partition fallback (`PARTITION_WAVE_FALLBACK_MAX`) is gone. The one
+check every profile keeps is #665's refusal of a tile that alone exceeds the
+machine's memory: a refusal, not a cap, since no profile makes a tile smaller.
+
+The release CLI links mimalloc as its global allocator on gnu targets by
+default (the `mimalloc` feature; `--no-default-features` opts out), and on
+musl unconditionally; the `dhat-heap` build excludes it. The Python wheel
+keeps the system allocator on glibc (an opt-in `mimalloc` feature until a
+wheel benchmark decides) and uses mimalloc on musllinux (#739, #480).
 
 `auto` is a third shape, not a router between the other two. Before #788 it
 copied `speed` for the read-ahead depth cap and the encode count. A first
@@ -1378,6 +1422,8 @@ crates/core/src/
 │   ├── config/keywords.rs # Shared keyword syntax and core-derived runtime defaults
 │   ├── convert.rs      #   convert_to_overviews() orchestration
 │   ├── export.rs       #   Overview GeoParquet → PMTiles export
+│   ├── export/tile_data.rs #   A tile's MVT bytes and the gzip cached for exactly them
+│   ├── disk.rs         #   One conservative disk footprint per conversion, per volume
 │   ├── hostile.rs      #   Hostile-input hardening tests
 │   ├── level.rs        #   Footer metadata model, SPEC_VERSION
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
@@ -1447,6 +1493,8 @@ crates/core/src/
 │                       # several archives both share (one look-ahead each)
 ├── pmtiles_writer.rs   # PMTiles v3 writer (StreamingPmtilesWriter)
 ├── compression.rs      # gzip/brotli/zstd compression
+├── compression/tile_gzip.rs # Bounded memo of tile gzip (#733): equal raw bytes
+│                       # share one compression; the cap is export's grant
 ├── dedup.rs            # Tile deduplication (XXH3)
 ├── quality.rs          # CRS extraction + WGS84 validation
 └── wkb.rs              # WKB round-trip helpers

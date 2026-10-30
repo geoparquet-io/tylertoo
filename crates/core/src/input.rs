@@ -573,29 +573,42 @@ impl PartStaging {
     }
 }
 
+/// The staging admission's resolved knobs (#290, #788), read once from the
+/// `TYLERTOO_STAGING_*` environment. The run's memory budget grants pass 0
+/// and the `--max-zoom auto` sample from them (`MemoryBudget::stage_requests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StageAdmission {
+    /// Requests a run wants in flight (`TYLERTOO_STAGING_CONCURRENCY`, else 8).
+    pub(crate) max_concurrency: usize,
+    /// Main's in-flight byte budget: `TYLERTOO_STAGING_MEM_BUDGET_BYTES`,
+    /// else 256 MiB.
+    pub(crate) mem_budget: u64,
+    /// Whether `TYLERTOO_STAGING_MEM_BUDGET_BYTES` set [`Self::mem_budget`].
+    pub(crate) mem_budget_set: bool,
+}
+
+/// The one accessor of the staging admission's knobs ([`StageAdmission`]).
+pub(crate) fn stage_admission() -> StageAdmission {
+    #[cfg(feature = "remote")]
+    return remote::stage_admission();
+    #[cfg(not(feature = "remote"))]
+    StageAdmission {
+        max_concurrency: 1,
+        mem_budget: 0,
+        mem_budget_set: false,
+    }
+}
+
 /// The staging admission's byte budget for a caller that holds no run
-/// memory budget: `TYLERTOO_STAGING_MEM_BUDGET_BYTES`, else the fixed
-/// default. The ONLY remaining un-budgeted admission (#788): the public
+/// memory budget: [`StageAdmission::mem_budget`]. The ONLY remaining
+/// un-budgeted admission (#788): the public
 /// [`crate::input_set::ConvertSource::stage_selected`] and
 /// [`InputSource::stage_row_groups`] stage through it. A conversion's pass 0
 /// and the `--max-zoom auto` sample are granted from the run's
 /// `MemoryBudget` instead. Replacing this with a grant is a one-line change
 /// here once those entry points have a budget to ask.
 pub(crate) fn unbudgeted_stage_admission() -> u64 {
-    #[cfg(feature = "remote")]
-    return remote::unbudgeted_stage_admission();
-    #[cfg(not(feature = "remote"))]
-    0
-}
-
-/// How many staging requests a run wants in flight, and the byte budget
-/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` sets when it is set. The run's memory
-/// budget grants the staging admission from these (#788).
-pub(crate) fn staging_want() -> (usize, Option<u64>) {
-    #[cfg(feature = "remote")]
-    return remote::staging_want();
-    #[cfg(not(feature = "remote"))]
-    (1, None)
+    stage_admission().mem_budget
 }
 
 /// Sum of the compressed byte sizes of the selected input row groups.
@@ -1714,6 +1727,10 @@ pub(crate) mod remote {
             /// false; it exists to decide the log level of the effective
             /// and live-concurrency lines.
             pub(super) overridden: bool,
+            /// Was [`MEM_BUDGET_VAR`] set? Only [`effective`] knows, as for
+            /// `overridden`; the run budget then sizes staging by it for
+            /// every profile (#788).
+            pub(super) mem_budget_set: bool,
         }
 
         impl Default for StagingTunables {
@@ -1723,6 +1740,7 @@ pub(crate) mod remote {
                     mem_budget: STAGE_MEM_BUDGET,
                     coalesce_window: STAGE_COALESCE_WINDOW,
                     overridden: false,
+                    mem_budget_set: false,
                 }
             }
         }
@@ -1780,6 +1798,7 @@ pub(crate) mod remote {
                     mem_budget,
                     coalesce_window,
                     overridden: false,
+                    mem_budget_set: false,
                 },
                 warnings,
             )
@@ -1863,8 +1882,10 @@ pub(crate) mod remote {
                 let overridden = [CONCURRENCY_VAR, MEM_BUDGET_VAR, COALESCE_VAR]
                     .iter()
                     .any(|v| lookup(v).is_some());
+                let mem_budget_set = lookup(MEM_BUDGET_VAR).is_some();
                 let (mut tunables, warnings) = resolve(lookup);
                 tunables.overridden = overridden;
+                tunables.mem_budget_set = mem_budget_set;
                 for w in &warnings {
                     log::warn!("[stage] {w}");
                 }
@@ -2126,19 +2147,14 @@ pub(crate) mod remote {
         )
     }
 
-    /// See [`super::unbudgeted_stage_admission`].
-    pub(crate) fn unbudgeted_stage_admission() -> u64 {
-        staging_tunables::effective().mem_budget
-    }
-
-    /// See [`super::staging_want`].
-    pub(crate) fn staging_want() -> (usize, Option<u64>) {
+    /// See [`super::stage_admission`].
+    pub(crate) fn stage_admission() -> super::StageAdmission {
         let tunables = staging_tunables::effective();
-        let budget_set = std::env::var_os(staging_tunables::MEM_BUDGET_VAR).is_some();
-        (
-            tunables.max_concurrency,
-            budget_set.then_some(tunables.mem_budget),
-        )
+        super::StageAdmission {
+            max_concurrency: tunables.max_concurrency,
+            mem_budget: tunables.mem_budget,
+            mem_budget_set: tunables.mem_budget_set,
+        }
     }
 
     /// An error retrying cannot fix: the object changed under the footer
