@@ -170,8 +170,8 @@ pub(super) fn auto_backing(
 ///    non-reclaimable part of the cgroup's current usage is subtracted — the
 ///    same sense as the machine term's `MemAvailable` (#485);
 /// 3. `None` (callers fall back to a fixed conservative budget — see
-///    [`MemoryBudget::remaining`]'s fallback allowance and
-///    [`super::export::PARTITION_WAVE_FALLBACK_MAX`]).
+///    [`MemoryBudget::remaining`]'s fallback allowance, which export's
+///    wave sizing shares).
 ///
 /// The result is computed once per process and cached: the probe is called ~5×
 /// per run (convert's pass-1 grid budget and pass-2 backing decision, export's

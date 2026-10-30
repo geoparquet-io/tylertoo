@@ -53,6 +53,15 @@ batches processed at once, and the row groups the writer encodes at once.
 `auto` is its own shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`.
 
+Export follows the same profile. `tiles` passes its `--profile` to the export,
+and a two-step build sets it with `export-pmtiles --profile speed|bounded|auto`.
+Under `speed`, export keeps every level's tile members in RAM and sizes its
+[waves](#export-waves) from the core count alone. Under `bounded`, it spills
+them and keeps the wave caps it always had. Under `auto`, it keeps them in RAM
+when they fit the allowance and narrows the waves to fit it. One check holds
+under every profile: export refuses a tile that alone needs more than the
+machine's memory, because no profile can make one tile smaller.
+
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
 jobs use this limit to size buffers. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides
@@ -115,8 +124,10 @@ Every archive is at least 16 KiB, the prefix every PMTiles client fetches first.
 
 `--partition-wave N|auto` sets how many partitions export holds at once.
 `auto` uses the core count, capped by how many estimated per-partition working
-sets fit in a fraction of available RAM, with a floor of 6, or a cap of 16
-when tylertoo cannot probe RAM. Export logs its choice at start. Pass a smaller
+sets fit in a fraction of available RAM, with a floor of 6. When tylertoo
+cannot probe RAM, it assumes the same 4 GiB allowance every other phase does.
+Under `--profile speed` the core count alone decides. Export logs its choice
+at start. Pass a smaller
 number on a shared machine, or a larger one to keep more cores busy.
 
 Coarse zooms are too small to fill the cores one at a time, so export runs
