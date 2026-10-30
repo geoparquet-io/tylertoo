@@ -63,13 +63,13 @@ use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
 use super::memory::{MemoryBudget, MemoryPhase};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
-#[cfg(test)]
-use super::pipeline::read_in_order;
-use super::pipeline::{ReadFlow, ReadTuning};
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
 use super::procmem::{
     cgroup_json, proc_status_json, read_cgroup_mem, read_proc_status, CgroupMem, ProcStatusMem,
 };
+#[cfg(test)]
+use super::read::read_in_order;
+use super::read::{ReadFlow, ReadTuning};
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
@@ -6892,7 +6892,7 @@ mod tests {
         };
 
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let segments = super::super::pipeline::parallel_read_segments(
+        let segments = super::super::read::parallel_read_segments(
             &source,
             None,
             ReadTuning {

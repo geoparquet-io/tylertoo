@@ -259,8 +259,9 @@ verbatim (spec §2.4).
    `min(cores / 4, 4)`) round-robin, each with its own bounded read-ahead
    channel sized against a modelled slice of the memory budget. The producer
    thread **merges** the workers' output in segment order and re-chunks it
-   (`Regrouper`) into exactly the batch sequence one sequential reader would
-   have produced — batch boundaries are load-bearing, because the writer issues
+   (`Regrouper`, in `overview/read.rs` since #538) into exactly the batch
+   sequence one sequential reader would have produced — batch boundaries are
+   load-bearing, because the writer issues
    one column-writer call per slice and parquet checks its page limits per
    call — then pushes it through the same bounded pipe to the consumer. On the
    sink side each level's `bounded`-profile spill is written by its own
@@ -1340,6 +1341,8 @@ crates/core/src/
 │   ├── reader.rs       #   Overview file reader (level-banded row groups)
 │   ├── simplify.rs     #   World-space RDP simplification (GSD tolerance)
 │   ├── pipeline.rs     #   Single-read pass-2 engine (#213): fans each batch to all levels
+│   ├── read.rs         #   Ordered input reading (#494, #538): sequential, or reader
+│   │                   #   workers over row-group segments merged back in order
 │   ├── plan_state.rs   #   Convert plan artifact (--save-plan/--plan): the persisted
 │   │                   #   pass-1 + assignment result, Arrow IPC + fingerprint
 │   ├── stream.rs       #   Two-pass streaming orchestration (pass-1 scan; pass-2 → pipeline.rs)

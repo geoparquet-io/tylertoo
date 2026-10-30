@@ -11,16 +11,20 @@
 /// >200 GB of headroom. mimalloc's segment/page allocator does not degrade
 /// that way, so the musl release binary uses it instead.
 ///
-/// Scoped to `target_env = "musl"` on purpose: glibc, macOS and Windows builds
-/// keep the platform allocator (nothing to fix there), and the Python
-/// extension module never routes through this crate — a pyo3 `cdylib` must
-/// leave the host interpreter's allocator arrangements alone.
+/// On musl it is unconditional. On every other target it is the `mimalloc`
+/// Cargo feature (#739): glibc malloc measured ~45% slower than mimalloc on a
+/// 64-core export, so a gnu build can opt in (or out) without a code change.
+/// The Python extension module never routes through this crate — a pyo3
+/// `cdylib` must leave the host interpreter's allocator arrangements alone.
 ///
 /// Excluded under `dhat-heap`: dhat installs its own `#[global_allocator]`
 /// in tylertoo-core (it must own the allocator to count anything), and rustc
 /// allows only one in the crate graph. Heap-profiling a musl binary therefore
 /// runs on dhat's allocator and loses this fix for the duration.
-#[cfg(all(target_env = "musl", not(feature = "dhat-heap")))]
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
