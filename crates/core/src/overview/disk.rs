@@ -110,13 +110,8 @@ impl DiskFootprint {
     ) -> Result<Self, ConvertError> {
         let mut footprint = Self::default();
         let scratch = options.spill_dir.clone().unwrap_or_else(std::env::temp_dir);
-        // The sole staging adapter: replace this call with bytes_to_stage(selection)
-        // when track R publishes it. Keep the current all-column figure until then.
-        let staged = if source.is_remote() {
-            source.selected_input_bytes(selection)?
-        } else {
-            0
-        };
+        // The staging owner accounts for projected columns and selected row groups.
+        let staged = source.bytes_to_stage(selection)?;
         footprint.add(&scratch, "staged input", staged);
         if let Some(output) = overview {
             let levels = options.levels.resolve(options.gsd_base)?;
