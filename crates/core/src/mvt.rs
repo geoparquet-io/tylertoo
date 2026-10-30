@@ -19,7 +19,10 @@ use geo::CoordsIter;
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
 
+mod streaming_layer;
+mod tag_index;
 mod tile_polygon;
+pub(crate) use streaming_layer::StreamingLayerBuilder;
 
 /// Default tile extent (4096 as per MVT spec)
 pub const DEFAULT_EXTENT: u32 = 4096;
@@ -1299,7 +1302,7 @@ impl ScalarKey {
     fn of(value: &PropertyValue) -> Self {
         match value {
             PropertyValue::String(_) => {
-                unreachable!("string values are indexed by LayerBuilder::string_index")
+                unreachable!("string values are indexed by tag_index::TagIndex")
             }
             PropertyValue::Float(f) => Self::Float(if f.is_nan() {
                 f32::NAN.to_bits()
@@ -1376,13 +1379,8 @@ pub struct LayerBuilder {
     extent: u32,
     features: Vec<Feature>,
     keys: Vec<String>,
-    key_index: HashMap<String, u32>,
+    index: tag_index::TagIndex<'static>,
     values: Vec<Value>,
-    /// Dedup index for string values, keyed on the string itself so a repeat
-    /// lookup borrows instead of allocating.
-    string_index: HashMap<String, u32>,
-    /// Dedup index for every other value ([`ScalarKey`]).
-    scalar_index: HashMap<ScalarKey, u32>,
     /// Input features that produced no MVT feature and had no coordinates to
     /// begin with (see [`Self::dropped_features`]).
     unencodable: usize,
@@ -1399,10 +1397,8 @@ impl LayerBuilder {
             extent: DEFAULT_EXTENT,
             features: Vec::new(),
             keys: Vec::new(),
-            key_index: HashMap::new(),
+            index: tag_index::TagIndex::default(),
             values: Vec::new(),
-            string_index: HashMap::new(),
-            scalar_index: HashMap::new(),
             unencodable: 0,
             quantized: 0,
         }
@@ -1438,55 +1434,6 @@ impl LayerBuilder {
     /// warning.
     pub fn quantized_features(&self) -> usize {
         self.quantized
-    }
-
-    /// Get or insert a key, returning its index.
-    fn get_or_insert_key(&mut self, key: &str) -> u32 {
-        if let Some(&idx) = self.key_index.get(key) {
-            idx
-        } else {
-            let idx = self.keys.len() as u32;
-            self.keys.push(key.to_string());
-            self.key_index.insert(key.to_string(), idx);
-            idx
-        }
-    }
-
-    /// Get or insert a value, returning its index.
-    ///
-    /// Both indexes address the one shared `values` table, so first-encounter
-    /// order — and hence every emitted value index — is exactly what the
-    /// single `format!`-keyed map produced.
-    fn get_or_insert_value(&mut self, value: &PropertyValue) -> u32 {
-        match value {
-            PropertyValue::String(s) => match self.string_index.get(s.as_str()) {
-                Some(&idx) => idx,
-                None => {
-                    let idx = self.push_value(value);
-                    self.string_index.insert(s.clone(), idx);
-                    idx
-                }
-            },
-            _ => {
-                let key = ScalarKey::of(value);
-                match self.scalar_index.get(&key) {
-                    Some(&idx) => idx,
-                    None => {
-                        let idx = self.push_value(value);
-                        self.scalar_index.insert(key, idx);
-                        idx
-                    }
-                }
-            }
-        }
-    }
-
-    /// Append `value` to the layer's value table and return its index.
-    #[inline]
-    fn push_value(&mut self, value: &PropertyValue) -> u32 {
-        let idx = self.values.len() as u32;
-        self.values.push(value.to_mvt_value());
-        idx
     }
 
     /// Add a feature to the layer.
@@ -1555,14 +1502,12 @@ impl LayerBuilder {
 
     /// Encode tags as `[key_idx, value_idx, key_idx, value_idx, ...]`.
     fn encode_tags<K: AsRef<str>>(&mut self, properties: &[(K, PropertyValue)]) -> Vec<u32> {
-        let mut tags = Vec::with_capacity(properties.len() * 2);
-        for (key, value) in properties {
-            let key_idx = self.get_or_insert_key(key.as_ref());
-            let value_idx = self.get_or_insert_value(value);
-            tags.push(key_idx);
-            tags.push(value_idx);
-        }
-        tags
+        self.index.tags(
+            properties,
+            |s| std::borrow::Cow::Owned(s.to_owned()),
+            |key| self.keys.push(key.to_owned()),
+            |v| self.values.push(v.to_mvt_value()),
+        )
     }
 
     /// Build the MVT Layer.
@@ -3363,14 +3308,19 @@ mod tests {
             })
             .collect();
 
-        let mut layer = LayerBuilder::new("l");
+        let mut index = tag_index::TagIndex::default();
+        let mut interned = Vec::new();
         let got: Vec<u32> = values
             .iter()
-            .map(|v| layer.get_or_insert_value(v))
+            .map(|v| {
+                index.value(v, &|s| std::borrow::Cow::Owned(s.to_owned()), |v| {
+                    interned.push(v.to_mvt_value())
+                })
+            })
             .collect();
         assert_eq!(got, expected, "value indexes diverged from the Debug key");
         assert_eq!(
-            layer.values.len(),
+            interned.len(),
             reference_next as usize,
             "value table length diverged"
         );
