@@ -270,6 +270,73 @@ url = "https://data.source.coop/ftw/global-data/predictions/vectors/alpha/result
 sha256 = "77860d57ee6b9d8e217d01510ced60798fe198b9b88c7066e63282bc47166293"
 bytes = 514124545
 
+# Track R's 13-part Moldova split (788-R .788/suite.sh `mp13`); local only,
+# run with --input-dir ~/bench-data/r788/moldova-parts.
+
+[inputs.moldova-part-000]
+file = "part-000.parquet"
+sha256 = "0ba1b6c1c68d756573a1c99f5470ef4213eff8af47325e1211e3b9574b5af5a7"
+bytes = 7772205
+
+[inputs.moldova-part-001]
+file = "part-001.parquet"
+sha256 = "fd58803bcd1a7dea70abc6b8445422eba9f8408ae5bd9f6a76c1d68dcbbf5e8a"
+bytes = 10703145
+
+[inputs.moldova-part-002]
+file = "part-002.parquet"
+sha256 = "c26e863c14d8a781632931fbbff6f14145fbc311fa1836cdf87c158b8f1ae5f2"
+bytes = 12143376
+
+[inputs.moldova-part-003]
+file = "part-003.parquet"
+sha256 = "33adb8d03834163873229e1f09788b35b4b72329719028ee7d80afc17b0ed6d8"
+bytes = 6147322
+
+[inputs.moldova-part-004]
+file = "part-004.parquet"
+sha256 = "62d80d889a77f420906da8e345da451ae788bfcbfb6ba4ef03edd5901f05dff5"
+bytes = 7838936
+
+[inputs.moldova-part-005]
+file = "part-005.parquet"
+sha256 = "0bcaedded11308cb3ffbedb934fa9ba79425f0f8150c19fa07889739a2852011"
+bytes = 3579449
+
+[inputs.moldova-part-006]
+file = "part-006.parquet"
+sha256 = "6dd4a86ff11c39e93db0ca57bc834f73fdaffb6ad912b36b151e8fb892fce990"
+bytes = 4060315
+
+[inputs.moldova-part-007]
+file = "part-007.parquet"
+sha256 = "81cd61b66d2f4dd63c16c280c473e41324be98b575f0d67fbf1125949b078b96"
+bytes = 8218972
+
+[inputs.moldova-part-008]
+file = "part-008.parquet"
+sha256 = "47b7621c765aaab4a1cbf49d34ef636533702276265a785f899dffb5ffbcd207"
+bytes = 8004367
+
+[inputs.moldova-part-009]
+file = "part-009.parquet"
+sha256 = "a05fc0a319715587610751aa638e712bc1116e7d0a4d02aa7ea3e4c39f4e66f6"
+bytes = 11519877
+
+[inputs.moldova-part-010]
+file = "part-010.parquet"
+sha256 = "e866987a8ef9ebd60fbf0310788808b3a8b79d8ff6b6730c87b957dca8f14cba"
+bytes = 8915483
+
+[inputs.moldova-part-011]
+file = "part-011.parquet"
+sha256 = "fbaa7d5d2ccba4c49307638eb824e3a2fca5979506ae0959a1a63493bb990a32"
+bytes = 8119344
+
+[inputs.moldova-part-012]
+file = "part-012.parquet"
+sha256 = "712e36d7f44f239a311856f4d831d705b8b30ab943a7a12e4768708aeded49b4"
+bytes = 8095056
 # ---------------------------------------------------------------------------
 # Cells
 
@@ -483,6 +550,160 @@ heavy = true
 #   --bin head-glibc=glibc:<head, glibc opt-out>    the tracks' code changes
 #   --bin head=mimalloc:<head, default features>    plus the allocator
 
+# ---------------------------------------------------------------------------
+# Final-window cells: the held questions (LEAD-NOTES "Final-window additions").
+
+# (7) The #715 gate: LZ4 spill under bounded must not raise peak RSS over
+# main's beyond run-to-run spread, else "revert #715". Run with spill-codec.
+[cells.lz4-mad-bounded]
+label = "LZ4 gate: Madagascar adm4, bounded"
+tickets = [715]
+input = "madagascar-adm4"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--profile", "bounded"]
+watch = "tmp"
+
+[cells.lz4-mol-bounded]
+label = "LZ4 gate: FTW Moldova, bounded"
+tickets = [715]
+input = "moldova"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--profile", "bounded"]
+watch = "tmp"
+
+# (1) C2's reader price under a cap: memory-capped's twin under auto.
+[cells.memory-capped-auto]
+label = "Memory-capped: FTW Mato Grosso, auto, in a 4 GiB cgroup"
+input = "ftw-br-mt"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 13]
+memory_max = "4G"
+watch = "tmp"
+
+# (4) F's coverage fill under bounded (main failed at the 32 MiB floor:
+# FAILED is the result there).
+[cells.coverage-fill-bounded]
+label = "Coverage fill: FTW Moldova, --coverage-fill, bounded"
+input = "moldova"
+command = "tiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+zoom = [0, 12]
+flags = ["--coverage-fill", "--profile", "bounded"]
+watch = "tmp"
+
+# (6) Track R's remote cases (788-R .788/suite.sh) at TTFB 300 ms, auto profile.
+[cells.remote-mol-auto]
+label = "Remote: Moldova over HTTP, --max-zoom auto (R's mol-auto)"
+tickets = [727]
+input = "moldova"
+command = "overview"
+args = ["{input}", "{out}/ov.parquet"]
+output = "ov.parquet"
+flags = ["--max-zoom", "auto"]
+serve = { ttfb_ms = 300 }
+
+[cells.remote-mp13-auto]
+label = "Remote: Moldova in 13 parts over HTTP, --max-zoom auto (R's mp13-auto)"
+tickets = [727]
+inputs = ["moldova-part-000", "moldova-part-001", "moldova-part-002", "moldova-part-003", "moldova-part-004", "moldova-part-005", "moldova-part-006", "moldova-part-007", "moldova-part-008", "moldova-part-009", "moldova-part-010", "moldova-part-011", "moldova-part-012"]
+command = "overview"
+args = ["--files-from", "{files_from}", "{out}/ov.parquet"]
+output = "ov.parquet"
+flags = ["--max-zoom", "auto"]
+serve = { ttfb_ms = 300 }
+
+[cells.remote-mp13]
+label = "Remote: Moldova in 13 parts over HTTP (R's mp13)"
+tickets = [727]
+# main's default zoom range, spelled out so a changed default cannot move it
+zoom = [0, 6]
+inputs = ["moldova-part-000", "moldova-part-001", "moldova-part-002", "moldova-part-003", "moldova-part-004", "moldova-part-005", "moldova-part-006", "moldova-part-007", "moldova-part-008", "moldova-part-009", "moldova-part-010", "moldova-part-011", "moldova-part-012"]
+command = "overview"
+args = ["--files-from", "{files_from}", "{out}/ov.parquet"]
+output = "ov.parquet"
+serve = { ttfb_ms = 300 }
+
+# (5) #732: export wave width under a cgroup, head only. `auto` must pick a
+# width that fits; the fixed widths show the trade.
+[cells.wave-nz-cg-auto]
+label = "#732: NZ export, --partition-wave auto, in a 4 GiB cgroup"
+tickets = [732]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "auto"]
+allocator = "any"
+memory_max = "4G"
+watch = "tmp"
+heavy = true
+pairs = 2
+
+[cells.wave-nz-cg-8]
+label = "#732: NZ export, --partition-wave 8, in a 4 GiB cgroup"
+tickets = [732]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "8"]
+allocator = "any"
+memory_max = "4G"
+watch = "tmp"
+heavy = true
+pairs = 2
+
+[cells.wave-nz-cg-16]
+label = "#732: NZ export, --partition-wave 16, in a 4 GiB cgroup"
+tickets = [732]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "16"]
+allocator = "any"
+memory_max = "4G"
+watch = "tmp"
+heavy = true
+pairs = 2
+
+[cells.wave-nz-cg-32]
+label = "#732: NZ export, --partition-wave 32, in a 4 GiB cgroup"
+tickets = [732]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "32"]
+allocator = "any"
+memory_max = "4G"
+watch = "tmp"
+heavy = true
+pairs = 2
+
+[cells.wave-nz-cg-64]
+label = "#732: NZ export, --partition-wave 64, in a 4 GiB cgroup"
+tickets = [732]
+input = "nz-overview-z14"
+command = "export-pmtiles"
+args = ["{input}", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "64"]
+allocator = "any"
+memory_max = "4G"
+watch = "tmp"
+heavy = true
+pairs = 2
+
 [sets]
 window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",
            "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
@@ -490,4 +711,8 @@ window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-p
 export-ab = ["export-moldova", "export-nz"]
 spill-codec = ["spill-codec"]
 # #740 step 1 (parallel collect) against step 2 (one band read per level).
+final-gate = ["lz4-mad-bounded", "lz4-mol-bounded", "spill-codec"]
+final-held = ["memory-capped", "memory-capped-auto", "coverage-fill", "coverage-fill-bounded",
+              "remote-mol-auto", "remote-mp13-auto", "remote-mp13"]
+final-sweep = ["wave-nz-cg-auto", "wave-nz-cg-8", "wave-nz-cg-16", "wave-nz-cg-32", "wave-nz-cg-64"]
 export-740 = ["export-nz", "polygons-mt", "export-moldova", "export-moldova-w8"]

@@ -400,10 +400,12 @@ def require_disk(path: Path, min_free_gb: float) -> None:
 
 
 def detect_allocator(binary: Path) -> str:
-    """`mimalloc` when the binary links it (its option strings are in the
-    image, stripped or not), else `glibc` (the gnu target's default)."""
+    """`mimalloc` when the binary links it, else `glibc` (the gnu target's
+    default). The library's own option-parsing message survives a stripped
+    release build; `mi_option` symbols only an unstripped one."""
     data = binary.read_bytes()
-    return "mimalloc" if b"mimalloc" in data and b"mi_option" in data else "glibc"
+    linked = b'environment option "mimalloc_' in data or (b"mimalloc" in data and b"mi_option" in data)
+    return "mimalloc" if linked else "glibc"
 
 
 def parse_bin(spec: str) -> dict:

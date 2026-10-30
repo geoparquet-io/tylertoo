@@ -38,7 +38,8 @@ def test_every_cell_expands_to_a_complete_argv(manifest):
 
 def test_every_cell_names_its_zoom_or_reads_an_overview(manifest):
     for name, cell in manifest["cells"].items():
-        assert "zoom" in cell or cell["command"] == "export-pmtiles", name
+        assert ("zoom" in cell or "--max-zoom" in cell["flags"]
+                or cell["command"] == "export-pmtiles"), name
 
 
 def test_light_cells_run_at_least_three_pairs(manifest):
@@ -47,9 +48,12 @@ def test_light_cells_run_at_least_three_pairs(manifest):
             assert cell["pairs"] >= rm.MIN_PAIRS, name
 
 
-def test_window1_covers_every_light_cell(manifest):
+def test_the_final_window_covers_every_light_cell(manifest):
     light = {n for n, c in manifest["cells"].items() if not c["heavy"]}
-    assert set(manifest["sets"]["window1"]) == light
+    sets = manifest["sets"]
+    final = set(sets["window1"]) | set(sets["final-gate"]) | set(sets["final-held"])
+    assert final >= light
+    assert not set(sets["window1"]) & set(sets["final-gate"])
 
 
 def test_brazil_55m_is_the_whole_country(manifest):
@@ -134,6 +138,12 @@ def test_detect_allocator(tmp_path):
     mi.write_bytes(b"\x7fELF mimalloc: option mi_option_verbose")
     assert rm.detect_allocator(plain) == "glibc"
     assert rm.detect_allocator(mi) == "mimalloc"
+    stripped = tmp_path / "stripped"
+    stripped.write_bytes(b'\x7fELF environment option "mimalloc_%s" is deprecated')
+    assert rm.detect_allocator(stripped) == "mimalloc"
+    docs = tmp_path / "docs"
+    docs.write_bytes(b"\x7fELF --help: mimalloc is the default allocator")
+    assert rm.detect_allocator(docs) == "glibc"
 
 
 def test_sidecar_stands_in_for_rehash(tmp_path):
