@@ -317,6 +317,7 @@ args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 zoom = [0, 13]
 flags = ["--profile", "bounded"]
+watch = "tmp"
 
 [cells.wide-props]
 label = "Wide properties: Overture places, Mexico City, every nested column kept"
@@ -393,6 +394,21 @@ args = ["{setup}/ov.parquet", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 allocator = "any"
 setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 12] }
+watch = "tmp"
+
+# #740: the default wave width makes Moldova's levels single-wave, which
+# leaves the multi-wave band read untouched; 8 partitions per wave do not.
+[cells.export-moldova-w8]
+label = "Export: FTW Moldova z0-12 overview, 8 partitions per wave (#740 multi-wave)"
+tickets = [740]
+input = "moldova"
+command = "export-pmtiles"
+args = ["{setup}/ov.parquet", "{out}/out.pmtiles"]
+output = "out.pmtiles"
+flags = ["--partition-wave", "8"]
+allocator = "any"
+setup = { command = "overview", args = ["{input}", "{setup}/ov.parquet"], zoom = [0, 12] }
+watch = "tmp"
 
 [cells.export-mt]
 label = "Export: FTW Mato Grosso z0-13 overview (the #731 stress case)"
@@ -416,6 +432,8 @@ command = "export-pmtiles"
 args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 allocator = "any"
+# The #740 level store spills to $TMPDIR (about 13 GB here).
+watch = "tmp"
 
 # #715: the spill codec. Moldova verbatim z7-13 with spill forced, track C1's
 # workload: a 1 MiB auto memory limit, --profile bounded and an explicit
@@ -468,6 +486,8 @@ heavy = true
 [sets]
 window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-props",
            "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
-           "export-moldova", "export-mt", "export-nz"]
+           "export-moldova", "export-moldova-w8", "export-mt", "export-nz"]
 export-ab = ["export-moldova", "export-nz"]
 spill-codec = ["spill-codec"]
+# #740 step 1 (parallel collect) against step 2 (one band read per level).
+export-740 = ["export-nz", "polygons-mt", "export-moldova", "export-moldova-w8"]
