@@ -1244,6 +1244,38 @@ mod tests {
         assert!(out.iter().all(|l| l.count == 1));
     }
 
+    /// The index's best partner is the leaf's own direction, wherever that
+    /// leaf sits in the angular order: here the straight continuation of
+    /// east is west, the last of four directions by angle.
+    #[test]
+    fn junction_index_finds_the_straight_continuation_partner() {
+        let dirs = [
+            Some((1.0, 0.0)),
+            Some((0.0, 1.0)),
+            Some((-1.0, 0.0)),
+            Some((0.0, -1.0)),
+        ];
+        let best = JunctionIndex::new(&dirs)
+            .best(0, &[0, 1, 2, 3], 30.0)
+            .expect("west continues east");
+        assert_eq!((best.i, best.j, best.owner), (0, 2, 0));
+        assert_eq!(best.deviation, 0.0);
+    }
+
+    /// Equality agrees with the ordering the heap pops candidates in.
+    #[test]
+    fn junction_candidates_equal_exactly_when_they_order_equal() {
+        let at = |deviation, owner| JunctionCandidate {
+            deviation,
+            i: 1,
+            j: 2,
+            owner,
+        };
+        assert_eq!(at(5.0, 1), at(5.0, 1));
+        assert_ne!(at(5.0, 1), at(5.0, 2));
+        assert_ne!(at(5.0, 1), at(6.0, 1));
+    }
+
     // --- junction continuation (stroke building) ------------------------------
 
     /// T-junction with the junction knob on: the collinear pair chains

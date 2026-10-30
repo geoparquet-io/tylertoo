@@ -122,6 +122,7 @@ pub(super) mod cost_probe {
         pub(crate) box_comparisons: usize,
         pub(crate) host_entries: usize,
         pub(crate) host_occupied: usize,
+        pub(crate) large_host_visits: usize,
         pub(crate) fill_polygons_encoded: usize,
         pub(crate) fill_passes: usize,
         pub(crate) fill_gzip_calls: usize,
@@ -1107,6 +1108,8 @@ pub(super) fn assign_hosts<'a>(
                         || (hy0 <= y0 && y0 <= hy1)
                         || (hy0 <= y1 && y1 <= hy1);
                     if intersects && boundary {
+                        #[cfg(test)]
+                        cost_probe::update(|c| c.large_host_visits += 1);
                         consider(&mut best, h);
                     }
                 }
@@ -2453,6 +2456,146 @@ mod tests {
             }
         ));
         assert!(writer.index.is_empty());
+    }
+
+    #[test]
+    fn shape_bytes_price_every_vector_slot() {
+        let shapes = vec![square(0.0, 0.0, 4.0)];
+        assert_eq!(
+            shape_capacity_bytes(&shapes),
+            std::mem::size_of::<Shape>()
+                + std::mem::size_of::<Ring>()
+                + 4 * std::mem::size_of::<[f64; 2]>()
+        );
+    }
+
+    #[test]
+    fn credit_cells_price_their_index_pages_and_keys() {
+        let mut cells = CreditCells::with_side(4.0);
+        cells.add(0, 0, 1.0);
+        // 1024 cells a side: a 64 × 64 page index, one page, four key slots.
+        assert_eq!(
+            cells.capacity_bytes(),
+            64 * 64 * std::mem::size_of::<Option<Box<CreditPage>>>()
+                + std::mem::size_of::<CreditPage>()
+                + 4 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn a_corner_cells_spill_stays_inside_the_tile() {
+        // Three squares' worth in the top-right cell: the spill takes the
+        // free cells beside it inside the tile, never the column past it.
+        let out = squares_for_collapsed(
+            &[Collapsed {
+                area: 48.0,
+                at: [FILL_EXTENT, 0.0],
+            }],
+            4.0,
+        );
+        assert_eq!(
+            out,
+            vec![
+                square(4092.0, 0.0, 4.0),
+                square(4088.0, 0.0, 4.0),
+                square(4088.0, 4.0, 4.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fill_polygon_outside_every_box_reaches_a_large_box_to_its_left() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let hosts = [
+            [3900.0, 2000.0, 4000.0, 2100.0],
+            [0.0, 0.0, 640.0, FILL_EXTENT],
+        ];
+        assert_eq!(assign_hosts(&polys, &hosts), vec![1]);
+    }
+
+    /// The nearest-box search visits a large box only once its rings reach
+    /// it: boxes beyond the ring that settles the search cost nothing.
+    #[test]
+    fn phase1_far_large_hosts_are_not_visited() {
+        let polys = vec![vec![vec![(2000, 2000), (2010, 2000), (2010, 2010)]]];
+        let mut hosts = vec![[0.0, 0.0, 1700.0, FILL_EXTENT]];
+        hosts.extend([[3500.0, 0.0, 3560.0, FILL_EXTENT]; 8]);
+        cost_probe::take();
+        assert_eq!(assign_hosts(&polys, &hosts), vec![0]);
+        assert_eq!(cost_probe::take().large_host_visits, 1);
+    }
+
+    #[test]
+    fn a_zoom_writer_reserves_its_index_growth_before_appending() {
+        let opts = super::super::ExportOptions::default();
+        let polys = vec![vec![vec![(0, 0), (1, 0), (0, 1)]]];
+        // The first append grows the empty index to four entries.
+        let needed = ZOOM_WRITER_FIXED_BYTES
+            + 4 * std::mem::size_of::<FillEntry>()
+            + polygon_capacity_bytes(&polys);
+        let mut writer = ZoomBuilder::new(&opts).unwrap();
+        assert!(matches!(
+            writer.append(1, &polys, 0, needed - 1),
+            Err(super::super::ExportError::BudgetExceeded { .. })
+        ));
+        writer.append(1, &polys, 0, needed).unwrap();
+        assert_eq!(writer.index.len(), 1);
+    }
+
+    #[test]
+    fn fill_workspace_fits_exactly_at_its_budget() {
+        require_fill_bytes(32, 32).unwrap();
+    }
+
+    /// The seed charges a feature's collapsed credits as well as its shapes:
+    /// a 400 px sliver that collapses whole is a hundred credits.
+    #[test]
+    fn the_seed_charges_a_collapsed_slivers_credits() {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+        let sliver = geo::Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::from(vec![(1.0, 1.0), (3.2, 1.0), (3.2, 1.005), (1.0, 1.005)]),
+            vec![],
+        ));
+        let mut builder =
+            GeometryBuilder::new(GeometryType::new(Default::default())).with_prefer_multi(false);
+        builder.extend_from_iter(std::iter::once(Some(&sliver)));
+        let array = builder.finish();
+        let field = array.data_type().to_field("geometry", true);
+        let batch = super::super::RecordBatch::try_new(
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![field])),
+            vec![array.to_array_ref()],
+        )
+        .unwrap();
+        let opts = super::super::ExportOptions {
+            tile_buffer: 0,
+            ..Default::default()
+        };
+        let mut buckets = SpillBuckets::new(&opts, 0);
+        let mut features = 0;
+        let error = seed_batch(
+            &batch,
+            FillSeed {
+                geometry: Some("geometry"),
+                crs: super::super::Crs::Epsg4326,
+                seed_zoom: 4,
+                opts: &opts,
+                timers: &super::super::ExportTimers::default(),
+                diagnostics: &crate::diagnostics::Diagnostics::default(),
+            },
+            &mut buckets,
+            &mut features,
+        )
+        .unwrap_err();
+        let super::super::ExportError::BudgetExceeded { needed, .. } = error else {
+            panic!("expected a budget error, got {error:?}");
+        };
+        assert!(
+            needed >= 100 * std::mem::size_of::<Collapsed>() as u64,
+            "needed {needed}"
+        );
+        assert_eq!(features, 1);
     }
 
     fn square(x: f64, y: f64, side: f64) -> Shape {

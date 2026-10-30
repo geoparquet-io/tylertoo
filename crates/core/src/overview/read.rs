@@ -867,6 +867,80 @@ mod read_tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
+    /// An empty batch is never queued: a batch that already lines up with
+    /// the request is still handed back as is, not copied (#494).
+    #[test]
+    fn an_empty_batch_does_not_cost_the_next_one_its_zero_copy_take() {
+        let mut regroup = Regrouper::default();
+        let ids = |v: Vec<i64>| {
+            RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(v)) as ArrayRef]).unwrap()
+        };
+        let batch = ids((0..5).collect());
+        regroup.push(ids(Vec::new()));
+        regroup.push(batch.clone());
+        let taken = regroup.take(5).unwrap();
+        assert!(
+            Arc::ptr_eq(taken.column(0), batch.column(0)),
+            "a lined-up batch must come back uncopied"
+        );
+        assert!(regroup.take_all().unwrap().is_none());
+    }
+
+    /// #544: only a read that wanted several readers and was held to one
+    /// (a remote input not yet staged) says it reads sequentially. A
+    /// one-reader read and a parallel local read say nothing.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn only_a_read_held_to_one_reader_says_it_reads_sequentially() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.parquet");
+        write_input(&path, 3000, 250);
+        let local = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        let mut w = ArrowWriter::try_new(
+            &mut bytes,
+            schema(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(250))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        w.write(
+            &RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from((0..3000).collect::<Vec<i64>>())) as ArrayRef],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        w.close().unwrap();
+        let remote =
+            ConvertSource::single(crate::input::test_memory_source(bytes, "unstaged.parquet"));
+        let said = |source: &ConvertSource, workers: usize| {
+            crate::test_log::take_thread_lines();
+            read_all(source, 96, workers, None);
+            let readers = LAST_READ_WORKERS.with(std::cell::Cell::get);
+            let lines = crate::test_log::take_thread_lines();
+            (
+                readers,
+                lines
+                    .iter()
+                    .filter(|l| l.contains("reading sequentially"))
+                    .count(),
+            )
+        };
+        let (one, local_many, remote_many) = (said(&local, 1), said(&local, 4), said(&remote, 4));
+        assert_eq!(one.0, 1);
+        assert!(local_many.0 > 1, "the local read must run in parallel");
+        assert_eq!(remote_many.0, 1, "an unstaged remote read is sequential");
+        if logging {
+            assert_eq!((one.1, local_many.1, remote_many.1), (0, 0, 1));
+        }
+    }
+
     /// Write `rows` sequentially-numbered rows into `path`, `rg_rows` per row
     /// group — the shape that decides how the input can be split.
     fn write_input(path: &std::path::Path, rows: i64, rg_rows: usize) {

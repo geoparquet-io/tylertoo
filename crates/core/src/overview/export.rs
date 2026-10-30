@@ -1898,13 +1898,13 @@ fn plan_levels(
                 );
                 if w < ceiling_wave {
                     let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    let budget_mib = export_collect_bytes(profile, &budget) / (1024 * 1024);
                     log::info!(
                         "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
                          (densest partition {densest} members × ~{} B/member resident, \
-                         {budget_mib} MiB budget) — #311 density guard",
+                         {} MiB budget) — #311 density guard",
                         level_idx + 1,
                         member_bytes.unwrap_or(0),
+                        export_collect_bytes(profile, &budget) / (1024 * 1024),
                     );
                 }
                 w
@@ -17874,6 +17874,197 @@ mod tests {
         let err = write_empty_archive(&out, "parks", 0, 4, &opts.metadata).unwrap_err();
         assert!(err.to_string().contains("description"), "{err}");
         assert!(!out.exists() && !out.with_extension("pmtiles.partial").exists());
+    }
+
+    /// #750: the coverage fill seeded one zoom below the finest level is
+    /// lifted zoom by zoom to the coarsest level, and every coarser level
+    /// draws it. The pyramid's per-zoom line reports the area it built.
+    #[test]
+    fn coverage_fill_is_lifted_to_every_coarser_level() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overview.parquet");
+        let host = Geometry::Point(Point::new(12.0, 42.0));
+        let field = Geometry::Polygon(
+            geo::Rect::new(
+                geo::coord! { x: 10.0, y: 40.0 },
+                geo::coord! { x: 15.0, y: 45.0 },
+            )
+            .to_polygon(),
+        );
+        // Levels at z2, z4 and z6: the fill seeds at z5 from the z6 field.
+        write_fixture(
+            &path,
+            &[
+                (vec![0], vec![host.clone()]),
+                (vec![0], vec![host]),
+                (vec![1], vec![field]),
+            ],
+        );
+        crate::test_log::take_thread_lines();
+        let report = export_pmtiles(
+            &path,
+            dir.path().join("out.pmtiles"),
+            &ExportOptions {
+                coverage_fill: true,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let fill = |zoom: u8| {
+            report
+                .zooms
+                .iter()
+                .find(|z| z.zoom == zoom)
+                .map(|z| z.fill_polygons)
+        };
+        assert!(fill(2) > Some(0), "{:?}", report.zooms);
+        assert!(fill(4) > Some(0), "{:?}", report.zooms);
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            let z2 = lines
+                .iter()
+                .find(|l| l.contains("coverage fill z2:"))
+                .expect("the pyramid logs z2");
+            assert!(!z2.contains("area 0 "), "{z2}");
+        }
+    }
+
+    /// A level store backing the caller forced is used as is, and the
+    /// budget grants it nothing.
+    #[test]
+    fn a_forced_level_store_backing_is_used_as_is() {
+        let plan = LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10, 10]),
+            wave: 1,
+        };
+        let mut budget = MemoryBudget::with_available(Some(1 << 30));
+        let read = LevelRead {
+            forced: Some(SinkBacking::Ram),
+            ram_budget: 7,
+            member_bytes: Some(100),
+            profile: MemoryProfile::Bounded,
+        };
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        assert!(matches!(
+            backing,
+            StoreBacking {
+                backing: SinkBacking::Ram,
+                ram_budget: 7,
+                resident: 0
+            }
+        ));
+        assert!(grants.is_empty());
+    }
+
+    /// A level its grant covers only in part spills, keeping the granted
+    /// bytes resident.
+    #[test]
+    fn a_partly_granted_level_store_keeps_its_grant_resident() {
+        let plan = LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[1000, 1000]),
+            wave: 1,
+        };
+        let read = LevelRead {
+            forced: None,
+            ram_budget: 7,
+            member_bytes: Some(100),
+            profile: MemoryProfile::Auto,
+        };
+        // A 300 kB budget grants the 1,000-member wave and 666 of the
+        // level's 2,000 members.
+        let mut budget = MemoryBudget::with_available(Some(300_000));
+        let (backing, grants) = level_read_backing(read, &plan, &mut budget);
+        assert!(matches!(
+            backing,
+            StoreBacking {
+                backing: SinkBacking::Spill,
+                ram_budget: 7,
+                resident: 66_600
+            }
+        ));
+        assert_eq!(grants[1].bytes(), 66_600);
+    }
+
+    /// A flushed bucket is written as whole [`SPILL_SEGMENT_MEMBERS`]-member
+    /// segments, whatever the pool's thread count.
+    #[test]
+    fn a_flush_writes_whole_segments_on_any_pool() {
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let segments = pool.install(|| {
+                let plans = vec![LevelPlan {
+                    zoom: 4,
+                    partitions: partitions_with_members(&[10]),
+                    wave: 1,
+                }];
+                let mut store =
+                    MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None)
+                        .unwrap();
+                store.buckets[0][0] = (0..2 * SPILL_SEGMENT_MEMBERS as u64)
+                    .map(|seq| Member {
+                        key: 0,
+                        seq,
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        props: Arc::new(Vec::new()),
+                        id: None,
+                        gap: GAP_NONE,
+                        band: 0,
+                    })
+                    .collect();
+                store.flush_bucket(0, 0).unwrap();
+                store.spill.as_ref().unwrap().segments[0][0]
+                    .iter()
+                    .map(|s| s.members)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                segments, [SPILL_SEGMENT_MEMBERS; 2],
+                "{threads} pool thread(s)"
+            );
+        }
+    }
+
+    /// With no `--feature-id`, a feature's id is its member index, in the
+    /// parallel encode's later chunks too.
+    #[test]
+    fn build_mvt_numbers_members_past_the_first_parallel_chunk() {
+        let tb = TileCoord::new(0, 0, 1).bounds();
+        let n = 4096 + 3;
+        let members: Vec<Member> = (0..n)
+            .map(|i| Member {
+                key: 0,
+                seq: i as u64,
+                geom: Geometry::Point(Point::new(
+                    -170.0 + (i % 300) as f64 * 0.5,
+                    10.0 + (i / 300) as f64 * 0.5,
+                )),
+                props: Arc::new(Vec::new()),
+                id: None,
+                gap: GAP_NONE,
+                band: 0,
+            })
+            .collect();
+        assert!(encode_in_parallel(&members));
+        let built = build_mvt(
+            &test_gzip_cache(),
+            &members,
+            &tb,
+            &ExportOptions::default(),
+            &[],
+            &crate::diagnostics::Diagnostics::default(),
+        );
+        let ids: Vec<Option<u64>> = decode_tile(&built.data).layers[0]
+            .features
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, (0..n as u64).map(Some).collect::<Vec<_>>());
     }
 }
 
