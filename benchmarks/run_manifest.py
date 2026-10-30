@@ -40,7 +40,9 @@ Standard library only. What one `run` does, cell by cell:
             the disk has less than `min_free_gb` free.
   resume    every run writes <results>/<cell>/<binary>-r<i>.json; a rerun
             skips runs whose file exists, and cells whose summary.json
-            exists, unless --force.
+            exists, unless --force. A resume whose binaries differ from
+            the saved binaries.json (hash, allocator, --bin-env, CPU count)
+            is refused, so one median never mixes two builds.
   report    results.jsonl (one line per run) and report.md (median and
             spread per cell and binary) in <results>.
 
@@ -425,6 +427,24 @@ def parse_bin(spec: str) -> dict:
     return {"label": label, "path": str(p), "allocator": found, "sha256": sha256_file(p)}
 
 
+BUILD_KEYS = ("label", "sha256", "allocator", "env", "affinity_cpus")
+
+
+def check_resume(saved: Path, bins: list[dict]) -> None:
+    """Refuse to resume a run whose saved binaries (`binaries.json`) differ
+    from these in hash, allocator, per-binary environment or CPU count: the
+    saved results would be reported under the new build, and a partial
+    resume would mix two builds in one median."""
+    if not saved.exists():
+        return
+    old = [{k: b.get(k) for k in BUILD_KEYS} for b in json.loads(saved.read_text())]
+    new = [{k: b.get(k) for k in BUILD_KEYS} for b in bins]
+    if old != new:
+        raise ManifestError(f"{saved.parent} holds results of other binaries or settings "
+                            f"(saved {old}, given {new}); resume with the same --bin and "
+                            "--bin-env, or start a new --name")
+
+
 def scope_prefix(memory_max: str) -> list[str]:
     """A transient systemd scope with a hard memory cap and no swap."""
     props = ["-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0"]
@@ -726,6 +746,7 @@ class Runner:
                          defaults.get("load_wait_s", 3600), self.results / "gate.log",
                          enforce=not args.no_gate, cpus=self.cpus, disk=self.disk,
                          disk_write_max=args.disk_write_max)
+        check_resume(self.results / "binaries.json", self.bins)
         (self.results / "binaries.json").write_text(json.dumps(self.bins, indent=2))
 
     def cells(self) -> list[str]:

@@ -251,3 +251,26 @@ def test_report_lists_pass2_writer_finish_spill_and_disk(tmp_path):
     rm.write_report(tmp_path)
     row = [ln for ln in (tmp_path / "report.md").read_text().splitlines() if ln.startswith("| spill-codec | lz4")][-1]
     assert row == "| spill-codec | lz4 | 7.00 | 0.50 | 100.00 | 3.50 | 50.00 |"
+
+
+def _bins(sha: str = "1" * 64, env: dict | None = None) -> list[dict]:
+    return [{"label": "a", "path": "/x/a", "allocator": "glibc", "sha256": sha,
+             "env": env or {}, "affinity_cpus": 8}]
+
+
+def test_resume_with_the_same_binaries_is_allowed(tmp_path):
+    saved = tmp_path / "binaries.json"
+    rm.check_resume(saved, _bins())  # nothing saved yet
+    saved.write_text(json.dumps(_bins()))
+    moved = [{**_bins()[0], "path": "/y/a"}]  # same build, another path
+    rm.check_resume(saved, moved)
+
+
+@pytest.mark.parametrize("given", [_bins(sha="2" * 64), _bins(env={"K": "V"}),
+                                   [{**_bins()[0], "allocator": "mimalloc"}]])
+def test_resume_with_other_binaries_is_refused(tmp_path, given):
+    saved = tmp_path / "binaries.json"
+    saved.write_text(json.dumps(_bins()))
+    with pytest.raises(rm.ManifestError, match="new --name"):
+        rm.check_resume(saved, given)
+
