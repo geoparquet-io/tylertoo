@@ -2011,6 +2011,16 @@ impl LevelSink {
     }
 }
 
+/// Keep the retention measurement at the same boundary as the sink's payload.
+fn buffer_batch(
+    sink: &mut LevelSink,
+    tuner: &mut SinkAutoTuner,
+    batch: RecordBatch,
+) -> Result<u64, ConvertError> {
+    tuner.observe(&batch);
+    sink.push(batch)
+}
+
 /// An invariant this module owns was broken — never reachable from user input,
 /// so it carries no advice, only the broken invariant.
 fn internal(what: &str) -> ConvertError {
@@ -2369,8 +2379,8 @@ pub(super) fn run_pass2_buffered(
                         if let Some((out, v)) = out {
                             rows_ref[li] += out.num_rows();
                             verts_ref[li] += v;
-                            tuner_ref.observe(&out);
-                            spill_bytes_ref[li] += sinks_ref[li].push(out)?;
+                            spill_bytes_ref[li] +=
+                                buffer_batch(&mut sinks_ref[li], tuner_ref, out)?;
                         }
                     }
                     if tuner_ref.should_downgrade() {
@@ -3130,6 +3140,60 @@ mod sink_sample_tests {
     /// Rows per synthetic batch. Comfortably over [`SINK_SAMPLE_MIN_ROWS`], so
     /// one batch is already a decision-grade sample.
     const ROWS: usize = 4_096;
+
+    /// A property-less point still needs only 21 WKB bytes. Tiny input
+    /// batches must not retain/persist every empty mixed-geometry child.
+    #[test]
+    fn tiny_propertyless_points_have_bounded_sink_cost() {
+        use geoarrow::array::GeometryBuilder;
+        use geoarrow::datatypes::GeometryType;
+        use geoarrow_array::GeoArrowArray;
+
+        const POINTS: usize = 512;
+        const WKB_POINT_BYTES: u64 = 21;
+        let dir = tempfile::tempdir().unwrap();
+        let field = super::super::convert::mixed_geometry_field("geometry", Default::default());
+        let schema = Arc::new(Schema::new(vec![field]));
+        let mut sink = LevelSink::new(SinkBacking::Spill, &schema, Some(dir.path())).unwrap();
+        let mut tuner = SinkAutoTuner::with_budget(false, POINTS, 0);
+        for i in (0..POINTS).step_by(2) {
+            let mut builder = GeometryBuilder::new(GeometryType::new(Default::default()));
+            for row in i..i + 2 {
+                builder
+                    .push_geometry(Some(&geo::Geometry::Point(geo::Point::new(
+                        -99.2 + row as f64 * 0.00001,
+                        19.4,
+                    ))))
+                    .unwrap();
+            }
+            let geometry = builder.finish().to_array_ref();
+            if i == 0 {
+                eprintln!(
+                    "two-point native: array={} buffers={}",
+                    geometry.get_array_memory_size(),
+                    geometry.get_buffer_memory_size()
+                );
+            }
+            let batch = RecordBatch::try_new(schema.clone(), vec![geometry]).unwrap();
+            buffer_batch(&mut sink, &mut tuner, batch).unwrap();
+        }
+        let LevelSink::Spill(state) = sink else {
+            panic!("bounded sink must spill");
+        };
+        let (reader, temp) = state.into_reader(&Pass2Timers::default()).unwrap();
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), POINTS);
+        let disk_bytes = temp.as_file().metadata().unwrap().len();
+        let per_row = tuner.bytes_per_row().unwrap();
+        eprintln!("tiny points: retained={per_row} B/row, physical={disk_bytes} B");
+        assert!(
+            per_row <= 32 * WKB_POINT_BYTES,
+            "{per_row} B/row exceeds 32 times a {WKB_POINT_BYTES}-byte WKB point"
+        );
+        assert!(
+            disk_bytes <= POINTS as u64 * 32 * WKB_POINT_BYTES,
+            "{disk_bytes} physical bytes for {POINTS} property-less points"
+        );
+    }
 
     /// A batch of `ROWS` rows: one WKB-ish geometry column of 8-byte values
     /// plus `props` `Float64` property columns — the shape a buffered output
