@@ -1884,6 +1884,44 @@ mod tests {
         }
     }
 
+    /// A bound shard plan refuses a zoom-range build whose finest zoom is
+    /// coarser than the plan's pivot; without a plan there is nothing to check.
+    #[test]
+    fn a_bound_plan_refuses_a_max_zoom_below_its_pivot() {
+        let plan = crate::shard::ShardPlan {
+            format: "tylertoo-shard-plan".to_string(),
+            version: crate::shard::SHARD_PLAN_VERSION,
+            pivot_zoom: 9,
+            ranges: Vec::new(),
+            inputs: Vec::new(),
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        let bound = TilesShard {
+            binding: Some(ShardBinding {
+                plan,
+                path: PathBuf::from("shards.json"),
+            }),
+            ..shard_job(None, 9)
+        };
+        let up_to = |max_zoom| LevelPlan::ZoomRange {
+            min_zoom: 0,
+            max_zoom,
+        };
+        assert!(matches!(
+            bound.check_max_zoom(&up_to(8)),
+            Err(TilesError::Shard(
+                crate::shard::ShardError::PivotNotCoarser {
+                    pivot: 9,
+                    max_zoom: 8,
+                    ..
+                }
+            ))
+        ));
+        assert!(bound.check_max_zoom(&up_to(9)).is_ok());
+        assert!(shard_job(None, 9).check_max_zoom(&up_to(8)).is_ok());
+    }
+
     /// #779: every rule the CLI and the Python bindings used to hold their
     /// own copy of is `TilesOptions::validate`'s, typed, and runs before any
     /// input is read — the input below does not exist, and the facade

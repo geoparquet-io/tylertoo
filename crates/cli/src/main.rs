@@ -1904,6 +1904,52 @@ mod tests {
     use tylertoo_core::overview::export::FeatureOrder;
     use tylertoo_core::overview::level::MemoryProfile;
 
+    /// #498: a sharded `tiles` job names the slice of the tile space it
+    /// owns before any work, so a fleet's logs say what each task was for.
+    #[test]
+    fn a_shard_job_logs_the_zooms_it_owns() {
+        use std::sync::Mutex;
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                LINES.lock().unwrap().push(record.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        // Process-global: under a shared `cargo test` process another test
+        // may own the logger, and only nextest's own process can check.
+        if log::set_logger(&Capture).is_err() {
+            return;
+        }
+        log::set_max_level(log::LevelFilter::Info);
+        let plan = tylertoo_core::shard::ShardPlan {
+            format: "tylertoo-shard-plan".to_string(),
+            version: 1,
+            pivot_zoom: 6,
+            ranges: Vec::new(),
+            inputs: Vec::new(),
+            estimated_rows_total: 0,
+            unplaced_rows: 0,
+        };
+        let job = ShardJob {
+            role: tylertoo_core::shard::ShardRole::Coarse,
+            range: None,
+            pivot: 6,
+            cut_digest: plan.cut_digest_hex(),
+            plan,
+            plan_path: PathBuf::from("shards.json"),
+        };
+        log_shard_job(&job, 2, MaxZoom::Fixed(10));
+        assert_eq!(
+            *LINES.lock().unwrap(),
+            ["[tiles] shard job coarse: zooms z2..=z5"]
+        );
+    }
+
     #[cfg(feature = "gen-docs")]
     #[test]
     fn generated_reference_matches_committed_documentation() {
