@@ -86,6 +86,37 @@ pub(super) enum SinkBacking {
     Spill,
 }
 
+/// Run-local spill encoding policy, resolved once with the sink backing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SpillCodec {
+    #[default]
+    Raw,
+    Lz4,
+}
+
+impl SpillCodec {
+    const fn for_profile(profile: MemoryProfile) -> Self {
+        match profile {
+            MemoryProfile::Bounded => Self::Lz4,
+            MemoryProfile::Auto | MemoryProfile::Speed => Self::Raw,
+        }
+    }
+
+    const fn ipc(self) -> tylertoo_io::IpcCompression {
+        match self {
+            Self::Raw => tylertoo_io::IpcCompression::None,
+            Self::Lz4 => tylertoo_io::IpcCompression::Lz4,
+        }
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Lz4 => "lz4",
+        }
+    }
+}
+
 /// Buffered-row count above which `Auto` always spills partitioning's
 /// full-resolution geometry, regardless of the RAM estimate. Preserves the
 /// pre-#294 partitioning safety floor as a strict lower bound (partitioning
@@ -664,6 +695,8 @@ const SINK_SAMPLE_MIN_ROWS: usize = 1_024;
 /// regression is visible without an RSS trace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkMeasurement {
+    /// The run's private spill encoding, including an auto downgrade.
+    pub(super) codec: SpillCodec,
     /// Measured retained bytes per buffered output row — the Arrow array
     /// bytes (geometry + every kept property column) of every batch handed to
     /// the sinks, averaged over the whole pass, plus
@@ -813,6 +846,7 @@ impl SinkAutoTuner {
 
     fn report(&self) -> SinkMeasurement {
         SinkMeasurement {
+            codec: SpillCodec::Raw,
             bytes_per_row: self.bytes_per_row(),
             sampled_rows: self.rows,
             projected_bytes: self.projected_bytes(),
@@ -856,14 +890,26 @@ enum LevelSink {
 }
 
 impl LevelSink {
+    #[cfg(test)]
     fn new(
         backing: SinkBacking,
         out_schema: &Schema,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ConvertError> {
+        Self::with_codec(backing, out_schema, spill_dir, SpillCodec::Raw)
+    }
+
+    fn with_codec(
+        backing: SinkBacking,
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: SpillCodec,
+    ) -> Result<Self, ConvertError> {
         Ok(match backing {
             SinkBacking::Ram => LevelSink::Ram(Vec::new()),
-            SinkBacking::Spill => LevelSink::Spill(SpillState::new(out_schema, spill_dir)?),
+            SinkBacking::Spill => {
+                LevelSink::Spill(SpillState::with_codec(out_schema, spill_dir, codec)?)
+            }
         })
     }
 
@@ -988,12 +1034,25 @@ impl SpillState {
     /// `spill_dir` is where the spill file goes (#427: `--spill-dir`, the one
     /// scratch knob); `None` is the process temp dir, as before.
     fn new(out_schema: &Schema, spill_dir: Option<&Path>) -> Result<Self, ConvertError> {
+        // RAM can downgrade only under auto, whose codec stays raw.
+        Self::with_codec(out_schema, spill_dir, SpillCodec::Raw)
+    }
+
+    fn with_codec(
+        out_schema: &Schema,
+        spill_dir: Option<&Path>,
+        codec: SpillCodec,
+    ) -> Result<Self, ConvertError> {
         let temp = spill_temp_file(spill_dir)?;
         let write_handle = temp.reopen()?;
         // Constructed on the caller's thread so a broken spill directory or an
         // unwritable temp file fails the conversion here, with the caller's
         // error handling, rather than inside a thread nobody has joined yet.
-        let writer = StreamWriter::try_new(BufWriter::new(write_handle), out_schema)?;
+        let writer = StreamWriter::try_new_with_compression(
+            BufWriter::new(write_handle),
+            out_schema,
+            codec.ipc(),
+        )?;
         Self::spawn(writer, temp)
     }
 
@@ -1170,9 +1229,12 @@ pub(super) fn run_pass2_buffered(
     let t_engine = Instant::now();
     let timers = Pass2Timers::default();
 
+    let codec = SpillCodec::for_profile(profile);
     let mut sinks: Vec<LevelSink> = Vec::with_capacity(num_levels);
     for _ in 0..num_levels {
-        sinks.push(LevelSink::new(backing, out_schema, spill_dir)?);
+        sinks.push(LevelSink::with_codec(
+            backing, out_schema, spill_dir, codec,
+        )?);
     }
     let mut rows = vec![0usize; num_levels];
     let mut verts = vec![0usize; num_levels];
@@ -1360,7 +1422,10 @@ pub(super) fn run_pass2_buffered(
     Ok(Pass2EngineResult {
         levels,
         timers,
-        sink: tuner.report(),
+        sink: SinkMeasurement {
+            codec,
+            ..tuner.report()
+        },
     })
 }
 
@@ -1508,11 +1573,15 @@ mod spill_tests {
     /// on disk. The bound leaves room for IPC framing and either candidate
     /// encoding; it is independent of elapsed time and allocator capacity.
     #[test]
-    #[ignore = "#788: raw IPC retained; LZ4 RSS neutrality remains unproven on Madagascar and Moldova"]
     fn phase1_spill_bytes_per_level_are_below_raw_payload() {
         let dir = tempfile::tempdir().unwrap();
         let s = schema("id");
-        let mut sink = SpillState::new(&s, Some(dir.path())).unwrap();
+        let mut sink = SpillState::with_codec(
+            &s,
+            Some(dir.path()),
+            SpillCodec::for_profile(MemoryProfile::Bounded),
+        )
+        .unwrap();
         const ROWS: usize = 65536;
         sink.push(batch(&s, vec![0; ROWS])).unwrap();
         let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
@@ -1523,6 +1592,26 @@ mod spill_tests {
             "#715: one level wrote {disk_bytes} disk bytes for {} raw bytes",
             ROWS * size_of::<i64>()
         );
+    }
+
+    #[test]
+    fn auto_and_speed_spill_remain_raw() {
+        assert_eq!(
+            SpillCodec::for_profile(MemoryProfile::Bounded),
+            SpillCodec::Lz4
+        );
+        for profile in [MemoryProfile::Auto, MemoryProfile::Speed] {
+            let codec = SpillCodec::for_profile(profile);
+            assert_eq!(codec, SpillCodec::Raw);
+            let dir = tempfile::tempdir().unwrap();
+            let schema = schema("id");
+            let mut sink = SpillState::with_codec(&schema, Some(dir.path()), codec).unwrap();
+            const ROWS: usize = 65536;
+            sink.push(batch(&schema, vec![0; ROWS])).unwrap();
+            let (reader, temp) = sink.into_reader(&Pass2Timers::default()).unwrap();
+            assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), ROWS);
+            assert!(temp.as_file().metadata().unwrap().len() >= (ROWS * size_of::<i64>()) as u64);
+        }
     }
 
     /// #499: count non-null geometry payloads handed to completed spill files on the real
@@ -1675,8 +1764,7 @@ mod spill_tests {
     }
 
     /// #709's error path, using the real OS error instead of a string stand-in.
-    /// The Python regression separately checks that the warning was already
-    /// raised before this cause crosses the frontend error mapping.
+    /// Both private encodings preserve the OS cause and remove the temp file.
     #[cfg(unix)]
     #[test]
     fn phase1_spill_enospc_preserves_the_os_error() {
@@ -1692,17 +1780,28 @@ mod spill_tests {
             }
         }
         let s = schema("id");
-        let writer = StreamWriter::try_new(FullVolume(FailsAfter { remaining: 512 }), &s).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let mut sink =
-            SpillState::spawn(writer, spill_temp_file(Some(dir.path())).unwrap()).unwrap();
-        sink.push(batch(&s, vec![0; 4096])).unwrap();
-        let error = sink.into_reader(&Pass2Timers::default()).unwrap_err();
-        assert!(
-            error.to_string().contains("No space left on device"),
-            "{error}"
-        );
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        for codec in [SpillCodec::Raw, SpillCodec::Lz4] {
+            let writer = StreamWriter::try_new_with_compression(
+                FullVolume(FailsAfter { remaining: 512 }),
+                &s,
+                codec.ipc(),
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink =
+                SpillState::spawn(writer, spill_temp_file(Some(dir.path())).unwrap()).unwrap();
+            // A compressible zero batch might fit on the simulated full volume.
+            let ids = (0..4096u64)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) as i64)
+                .collect();
+            sink.push(batch(&s, ids)).unwrap();
+            let error = sink.into_reader(&Pass2Timers::default()).unwrap_err();
+            assert!(
+                error.to_string().contains("No space left on device"),
+                "{codec:?}: {error}"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
 
     /// A writer that fails mid-stream must surface ITS error, not a derived
