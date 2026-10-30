@@ -37,7 +37,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 
-use super::pipeline::ReadFlow;
+use super::read::ReadFlow;
 
 /// Run `produce` on a scoped thread feeding a bounded channel of depth
 /// `depth`, and `consume` on the calling thread, draining it.
