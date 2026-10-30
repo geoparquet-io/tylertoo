@@ -3097,6 +3097,177 @@ pub(crate) fn test_memory_source(bytes: Vec<u8>, name: &str) -> InputSource {
     )
 }
 
+/// Test-only object store for the staging counters (#788 track R: #727,
+/// #544): an in-memory store whose range GETs each take `delay`, that records
+/// the most GETs it ever had in flight at once, and that fails the next N
+/// GETs of a chosen object on demand (the stand-in for one request hitting
+/// the client timeout).
+#[cfg(all(test, feature = "remote"))]
+pub(crate) mod probe_store {
+    use std::fmt;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
+
+    use super::{remote::RemoteSource, InputSource};
+
+    #[derive(Debug, Default)]
+    struct Counters {
+        in_flight: usize,
+        max_in_flight: usize,
+        /// `(object, remaining)`: fail this many more GETs of `object`.
+        fail: Vec<(Path, usize)>,
+        failed: usize,
+    }
+
+    /// See the module docs.
+    #[derive(Debug)]
+    pub(crate) struct ProbeStore {
+        inner: ThrottledStore<InMemory>,
+        counters: Mutex<Counters>,
+    }
+
+    impl fmt::Display for ProbeStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "ProbeStore")
+        }
+    }
+
+    impl ProbeStore {
+        /// A store holding `objects` (`(name, bytes)`), each GET taking `delay`.
+        pub(crate) fn new(objects: &[(&str, Vec<u8>)], delay: Duration) -> Arc<Self> {
+            let mem = InMemory::new();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for (name, bytes) in objects {
+                rt.block_on(mem.put(&Path::from(*name), bytes.clone().into()))
+                    .unwrap();
+            }
+            let config = ThrottleConfig {
+                wait_get_per_call: delay,
+                ..ThrottleConfig::default()
+            };
+            Arc::new(Self {
+                inner: ThrottledStore::new(mem, config),
+                counters: Mutex::default(),
+            })
+        }
+
+        /// A remote [`InputSource`] over object `name` of this store.
+        pub(crate) fn source(self: &Arc<Self>, name: &str) -> InputSource {
+            InputSource::Remote(
+                RemoteSource::from_store(
+                    Arc::clone(self) as Arc<dyn ObjectStore>,
+                    Path::from(name),
+                    format!("memory://{name}"),
+                )
+                .unwrap(),
+            )
+        }
+
+        fn counters(&self) -> std::sync::MutexGuard<'_, Counters> {
+            self.counters.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Fail the next `n` GETs of object `name`.
+        pub(crate) fn fail_next_gets(&self, name: &str, n: usize) {
+            self.counters().fail.push((Path::from(name), n));
+        }
+
+        /// The most GETs ever in flight at once, then reset it to zero.
+        pub(crate) fn take_max_in_flight(&self) -> usize {
+            std::mem::take(&mut self.counters().max_in_flight)
+        }
+
+        /// How many GETs were failed on purpose.
+        pub(crate) fn failed(&self) -> usize {
+            self.counters().failed
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ProbeStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            let fail = {
+                let mut c = self.counters();
+                let hit = c
+                    .fail
+                    .iter_mut()
+                    .find(|(p, n)| p == location && *n > 0)
+                    .map(|(_, n)| *n -= 1)
+                    .is_some();
+                c.failed += usize::from(hit);
+                c.in_flight += 1;
+                c.max_in_flight = c.max_in_flight.max(c.in_flight);
+                hit
+            };
+            let out = if fail {
+                Err(object_store::Error::Generic {
+                    store: "ProbeStore",
+                    source: "injected failure (stands in for a request timeout)".into(),
+                })
+            } else {
+                self.inner.get_opts(location, options).await
+            };
+            self.counters().in_flight -= 1;
+            out
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+}
+
 /// Fuzz hook (#633): read `bytes` as a remote GeoParquet object, through the
 /// same [`remote::RemoteSource`] a `s3://`/`gs://`/`https://` input uses, with
 /// an in-memory object store standing in for the network.
