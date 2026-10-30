@@ -3774,7 +3774,18 @@ fn level_read_backing(
         wave_members,
         wave_members,
     );
+    let affordable = budget.affordable(MemoryPhase::ExportCollect, price);
     let level = budget.fit(MemoryPhase::ExportCollect, price, level_members, 0);
+    log::debug!(
+        "[profile]     z{} level store grants: wave {} MiB ({wave_members} members), \
+         level {} of {} MiB wanted ({level_members} members at {per_member} B), \
+         {} MiB was affordable",
+        plan.zoom,
+        wave.bytes() >> 20,
+        level.bytes() >> 20,
+        (level_members as u64).saturating_mul(per_member) >> 20,
+        (affordable as u64).saturating_mul(per_member) >> 20,
+    );
     let backing = if level.units >= level_members {
         StoreBacking {
             backing: SinkBacking::Ram,
