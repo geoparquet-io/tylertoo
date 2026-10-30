@@ -401,6 +401,19 @@ pub struct ConvertOptions {
     /// How levels are specified (zoom range or explicit GSDs).
     #[cfg_attr(feature = "cli", arg(skip = Self::default().levels))]
     pub levels: LevelPlan,
+    /// `--max-zoom auto` (#444): the conversion estimates the finest zoom
+    /// from its own input and writes it into a [`LevelPlan::ZoomRange`]'s
+    /// `max_zoom` before anything else reads the plan
+    /// ([`super::auto_zoom::MaxZoom::resolve`]). Build the plan with
+    /// [`super::auto_zoom::MaxZoom::plan_zoom`] as the placeholder. Ignored
+    /// (with a log line) for an explicit GSD list.
+    ///
+    /// The estimate reads the same source the conversion then reads, so a
+    /// remote input's sampled chunks are fetched once (#788). Not a keyword
+    /// of its own: callers set it from `max_zoom="auto"` / `--max-zoom auto`.
+    #[serde(skip)]
+    #[cfg_attr(feature = "cli", arg(skip = false))]
+    pub auto_max_zoom: bool,
     /// Thinning / visibility / sort configuration for level assignment.
     #[serde(flatten)]
     #[cfg_attr(feature = "cli", command(flatten))]
@@ -1402,6 +1415,7 @@ impl Default for ConvertOptions {
                 min_zoom: 0,
                 max_zoom: 6,
             },
+            auto_max_zoom: false,
             assign: AssignConfig::default(),
             entry_zoom: None,
             sort_key: None,
@@ -2802,13 +2816,14 @@ pub fn write_convert_plan_sources(
         ));
     }
     let inert_options: ConvertOptions;
-    let options: &ConvertOptions = match normalize_convert_options(source, options, diagnostics)? {
-        Some(adjusted) => {
-            inert_options = adjusted;
-            &inert_options
-        }
-        None => options,
-    };
+    let options: &ConvertOptions =
+        match normalize_convert_options(source, options, None, diagnostics)? {
+            Some(adjusted) => {
+                inert_options = adjusted;
+                &inert_options
+            }
+            None => options,
+        };
     // #517's rule, applied to the other run that writes no dump: the profile
     // covers pass 2 and the export, neither of which a plan-only run reaches.
     // Said up front rather than exiting 0 with an empty (or untouched) file.
@@ -3676,16 +3691,23 @@ pub(super) fn build_verified_cluster_tables(
 fn normalize_convert_options(
     source: &ConvertSource,
     options: &ConvertOptions,
+    output: Option<&Path>,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<ConvertOptions>, ConvertError> {
     // Knob sanity (H4), shared by both pipelines.
     validate_options(options)?;
+    // #272: place the remote-input disk spill (#219) where the caller asked
+    // (no-op for local inputs, which never spill). Before the `auto`
+    // estimate, whose staged sample lands in the same spill.
+    source.set_spill_dir(options.spill_dir.as_deref());
+    // #444: `--max-zoom auto` estimates over this same source, before the
+    // property selection narrows it (the estimate reads the covering or the
+    // geometry, which the selection may drop).
+    let resolved = super::auto_zoom::resolve_auto_max_zoom(source, options, output)?;
+    let options = resolved.as_ref().unwrap_or(options);
     // #386: narrow the source to the requested property columns before any
     // schema index is derived, so both pipelines see the projected layout.
     apply_property_selection(source, options, diagnostics)?;
-    // #272: place the remote-input disk spill (#219) where the caller asked
-    // (no-op for local inputs, which never spill).
-    source.set_spill_dir(options.spill_dir.as_deref());
     // Coalescing is INERT in partitioning mode (Q3, spec §13.5): a merged
     // chain is a new geometry replacing several source rows, which the
     // feature-once/verbatim contract of §2.3 cannot represent, and removing
@@ -3693,7 +3715,7 @@ fn normalize_convert_options(
     // is on by default, so partitioning conversions silently proceed
     // without it (no column, no provenance); the CLI rejects an EXPLICIT
     // request instead.
-    Ok(adjusted_for_ladder_and_mode(options))
+    Ok(adjusted_for_ladder_and_mode(options).or(resolved))
 }
 
 pub(crate) fn convert_to_overviews_source_strategy(
@@ -3719,7 +3741,7 @@ pub(crate) fn convert_to_overviews_source_diagnostics(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ConvertReport, ConvertError> {
     options.validate()?;
-    let adjusted = normalize_convert_options(source, options, diagnostics)?;
+    let adjusted = normalize_convert_options(source, options, Some(output_path), diagnostics)?;
     let options = adjusted.as_ref().unwrap_or(options);
     let validated = options.validate()?;
     convert_to_overviews_validated(source, output_path, &validated, strategy, diagnostics)

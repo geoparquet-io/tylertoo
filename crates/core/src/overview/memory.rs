@@ -58,11 +58,7 @@ pub(super) enum MemoryPhase {
     EagerInput,
     Scan,
     Assign,
-    /// Remote staging: `STAGE_MEM_BUDGET`, `CHUNK_CACHE_MAX_BYTES` (track R).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#788: track R grants remote staging under it")
-    )]
+    /// Remote staging's requests in flight (pass 0, track R).
     Stage,
     Read,
     Compute,

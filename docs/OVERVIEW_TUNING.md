@@ -198,6 +198,10 @@ values turn out to be unusable all take the geometry path. The covering is
 taken on trust, so a stale one — a file whose reprojection left the bbox
 struct untouched — moves the pick.
 
+The estimate reads the same input the conversion then reads. On remote input
+it fetches the sampled column's chunks concurrently and keeps them in the
+disk spill, so the conversion does not fetch them again.
+
 It picks the zoom where one pixel of a 256 px tile resolves about half the
 smaller of two measures, in Web Mercator meters:
 
