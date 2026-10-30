@@ -5069,10 +5069,40 @@ fn route_partition(wave: &[Partition], key: u64) -> usize {
     idx
 }
 
+/// Rows per parallel chunk of a batch's per-row collect work (#740): one
+/// chunk per pool thread, but at least [`MIN_COLLECT_CHUNK_ROWS`] rows, so the
+/// per-chunk setup (column slices, buckets) stays small next to the rows. The
+/// chunking never shows in the output: every chunk's results are put back in
+/// row order.
+fn collect_chunk_rows(rows: usize) -> usize {
+    rows.div_ceil(rayon::current_num_threads())
+        .max(MIN_COLLECT_CHUNK_ROWS)
+        .min(rows.max(1))
+}
+
+/// The smallest [`collect_chunk_rows`] chunk of a batch larger than it. One
+/// row under test, so the small test batches still split into chunks at
+/// nonzero offsets and every byte-identity test covers the merge.
+const MIN_COLLECT_CHUNK_ROWS: usize = if cfg!(test) { 1 } else { 128 };
+
+/// The row ranges [`collect_chunk_rows`] splits a batch of `rows` into, in
+/// row order.
+fn collect_chunks(rows: usize) -> impl IndexedParallelIterator<Item = std::ops::Range<usize>> {
+    let chunk = collect_chunk_rows(rows);
+    (0..rows.div_ceil(chunk))
+        .into_par_iter()
+        .map(move |i| i * chunk..((i + 1) * chunk).min(rows))
+}
+
 /// Decode a batch's geometry column to `geo::Geometry` (geoarrow, no WKB
 /// round trip), reprojecting EPSG:3857 input to lon/lat — shared by both
-/// pass-2 paths. #535: charged to `decode`, the serial decode as one window
-/// and the reprojection per geometry inside its `par_iter` (core-seconds).
+/// pass-2 paths. #535: charged to `decode`, per chunk (core-seconds).
+///
+/// PERF (#740): the decode runs over row chunks in the pool. It used to be
+/// one serial pass on the wave's consumer thread, about 28% of that
+/// thread's time on a 64-core Moldova export, while the pool waited for it.
+/// Each chunk decodes a zero-copy slice of the column, and the chunks are
+/// concatenated in row order, so the result is the serial one.
 fn decode_batch_geometries(
     batch: &RecordBatch,
     schema: &Schema,
@@ -5081,30 +5111,46 @@ fn decode_batch_geometries(
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Geometry<f64>>, ExportError> {
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    ExportTimers::time(&timers.decode, || -> Result<(), ExportError> {
-        let geom_field = schema.field(geom_idx).clone();
-        let garr: Arc<dyn GeoArrowArray> =
-            from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-                .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        let mut rows = Vec::with_capacity(batch.num_rows());
-        crate::batch_processor::extract_geometries_opt_from_array(
-            garr.as_ref(),
-            &mut rows,
-            diagnostics,
-        )?;
-        geoms.extend(rows.into_iter().map(|row| {
-            row.unwrap_or_else(|| Geometry::GeometryCollection(geo::GeometryCollection::default()))
-        }));
-        Ok(())
-    })?;
-    if matches!(crs, Crs::Epsg3857) {
-        geoms = geoms
-            .par_iter()
-            .map(|g| ExportTimers::time(&timers.decode, || reproject_3857_to_4326(g)))
-            .collect();
-    }
-    Ok(geoms)
+    let geom_field = schema.field(geom_idx).clone();
+    let garr: Arc<dyn GeoArrowArray> =
+        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let chunks: Vec<Vec<Geometry<f64>>> = collect_chunks(batch.num_rows())
+        .map(|range| {
+            ExportTimers::time(&timers.decode, || {
+                decode_geometry_chunk(garr.as_ref(), range, crs, diagnostics)
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+/// One chunk of [`decode_batch_geometries`]: rows `range` of `garr`.
+fn decode_geometry_chunk(
+    garr: &dyn GeoArrowArray,
+    range: std::ops::Range<usize>,
+    crs: Crs,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Vec<Geometry<f64>>, ExportError> {
+    let slice = garr.slice(range.start, range.len());
+    let mut rows = Vec::with_capacity(range.len());
+    crate::batch_processor::extract_geometries_opt_from_array(
+        slice.as_ref(),
+        &mut rows,
+        diagnostics,
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let g = row.unwrap_or_else(|| {
+                Geometry::GeometryCollection(geo::GeometryCollection::default())
+            });
+            match crs {
+                Crs::Epsg3857 => reproject_3857_to_4326(&g),
+                Crs::Epsg4326 => g,
+            }
+        })
+        .collect())
 }
 
 /// Decode one record batch and append its members to the wave's per-partition
@@ -5113,6 +5159,13 @@ fn decode_batch_geometries(
 /// attach shared per-feature properties in band order. `rows` restores the
 /// original overview addresses after pruning, keeping identity stable between
 /// waves while preserving the relative within-tile feature order.
+///
+/// PERF (#740): property extraction, member materialization and routing run
+/// over row chunks in the pool ([`collect_member_chunk`]); only appending
+/// each chunk's buckets, in chunk order, stays on this thread. On a 64-core
+/// Moldova export this thread used to do all of it serially while about 8
+/// cores were busy. The chunks are merged in row order, so every bucket
+/// holds the same members in the same order as the serial loop gave.
 fn collect_wave_members(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
@@ -5132,36 +5185,50 @@ fn collect_wave_members(
     let row_gaps = ExportTimers::time(&timers.decode, || rows.gaps.batch(&geoms));
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
-    // range. #535: `clip` is timed per geometry inside the closure.
-    let row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
-        .par_iter()
+    // range. #535: `clip` is timed per geometry inside the closure. Each
+    // decoded geometry is consumed, so it is freed in the pool too (#740).
+    let mut row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
+        .into_par_iter()
         .map(|g| {
             ExportTimers::time(&timers.clip, || {
-                feature_tile_members(g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
+                feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
             })
         })
         .collect();
-    drop(geoms);
-    // #535: the rest of this batch (property extraction + routing) is `decode`.
-    let _decode = ExportTimers::scope(&timers.decode);
 
-    // Extract property columns once per batch; materialize per-feature props
-    // only for rows that produced members.
-    #[cfg(test)]
-    if rayon::current_thread_index().is_none() {
-        ctx.work
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .serial_collect_rows += batch.num_rows() as u64;
-    }
-    let mut attrs =
-        AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
-    for (row, items) in row_members.into_iter().enumerate() {
-        let source_row = rows.locator.global_row(rows.read as usize).ok_or_else(|| {
-            crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
-        })?;
-        let (props, id) = attrs.row(row)?;
-        if let Some(id) = id {
+    // Property extraction and member routing, per chunk in the pool. #535:
+    // `decode`, timed per chunk and around the merge below.
+    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id);
+    let chunk_rows = collect_chunk_rows(batch.num_rows());
+    let chunk = ChunkInput {
+        #[cfg(test)]
+        work: ctx.work,
+        wave,
+        batch,
+        attrs: &attrs,
+        row_gaps: &row_gaps,
+        locator: &rows.locator,
+        first_read: rows.read as usize,
+    };
+    let chunks: Vec<Result<ChunkMembers, ExportError>> = row_members
+        .par_chunks_mut(chunk_rows)
+        .enumerate()
+        .map(|(i, items)| {
+            ExportTimers::time(&timers.decode, || {
+                collect_member_chunk(&chunk, i * chunk_rows, items)
+            })
+        })
+        .collect();
+    drop(row_members);
+
+    let _decode = ExportTimers::scope(&timers.decode);
+    for chunk in chunks {
+        let ChunkMembers {
+            buckets: chunk_buckets,
+            losses,
+        } = chunk?;
+        // Recorded here, in row order, as the serial loop recorded them.
+        for (source_row, id) in losses {
             diagnostics.source_member_loss(
                 source_row,
                 id,
@@ -5169,13 +5236,78 @@ fn collect_wave_members(
                 crate::diagnostics::SourceLossCause::ClipDropped,
             )?;
         }
+        for (bucket, mut members) in buckets.iter_mut().zip(chunk_buckets) {
+            bucket.append(&mut members);
+        }
+    }
+    rows.read += batch.num_rows() as u64;
+    Ok(())
+}
+
+/// What every chunk of one batch's [`collect_member_chunk`] reads.
+struct ChunkInput<'a> {
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
+    wave: &'a [Partition],
+    batch: &'a RecordBatch,
+    attrs: &'a AttrColumns<'a>,
+    /// Every row's `(gap, band)`, from the wave's [`RowGapCursor`].
+    row_gaps: &'a [(u64, u16)],
+    locator: &'a crate::input_set::StreamRowLocator,
+    /// The wave's read position at the batch's first row.
+    first_read: usize,
+}
+
+/// One chunk's members, bucketed per wave partition, and the
+/// `(source row, feature id)` of each of its rows that carries a
+/// `--feature-id`, in row order.
+struct ChunkMembers {
+    buckets: Vec<Vec<Member>>,
+    losses: Vec<(u64, u64)>,
+}
+
+/// Materialize the members of the rows `first..first + items.len()` of a
+/// batch: each row's properties (once per row, shared via `Arc`) attached to
+/// each of its clipped `(key, geometry)` items, routed to the item's wave
+/// partition. Takes the items out of `items`.
+fn collect_member_chunk(
+    input: &ChunkInput<'_>,
+    first: usize,
+    items: &mut [Vec<(u64, Geometry<f64>)>],
+) -> Result<ChunkMembers, ExportError> {
+    #[cfg(test)]
+    if rayon::current_thread_index().is_none() {
+        input
+            .work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serial_collect_rows += items.len() as u64;
+    }
+    let columns = input.batch.slice(first, items.len());
+    let mut attrs = input.attrs.extract(&columns);
+    let mut out = ChunkMembers {
+        buckets: (0..input.wave.len()).map(|_| Vec::new()).collect(),
+        losses: Vec::new(),
+    };
+    for (i, items) in items.iter_mut().enumerate() {
+        let row = first + i;
+        let source_row = input
+            .locator
+            .global_row(input.first_read + row)
+            .ok_or_else(|| {
+                crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
+            })?;
+        let (props, id) = attrs.row(i)?;
+        if let Some(id) = id {
+            out.losses.push((source_row, id));
+        }
         if items.is_empty() {
-            rows.read += 1;
             continue;
         }
-        let (gap, band) = row_gaps[row];
-        for (key, geom) in items {
-            buckets[route_partition(wave, key)].push(Member {
+        let (gap, band) = input.row_gaps[row];
+        for (key, geom) in std::mem::take(items) {
+            out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
                 geom,
@@ -5185,9 +5317,8 @@ fn collect_wave_members(
                 band,
             });
         }
-        rows.read += 1;
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Clip (or fast-path pass through) one feature into every tile it intersects
@@ -8145,6 +8276,21 @@ fn json_property_column(col: &dyn Array) -> Vec<Option<PropertyValue>> {
         .collect()
 }
 
+/// A list or map column's value offsets rebased to its first row, and the
+/// span of its child values its rows address. A sliced column (#740's
+/// per-chunk extraction) keeps its whole child array, so resolving only the
+/// span keeps a chunk's work proportional to its own rows.
+fn rebased_offsets<O: arrow_array::OffsetSizeTrait>(
+    offsets: &[O],
+) -> (Vec<usize>, std::ops::Range<usize>) {
+    let first = offsets.first().map_or(0, |o| o.as_usize());
+    let last = offsets.last().map_or(first, |o| o.as_usize());
+    (
+        offsets.iter().map(|o| o.as_usize() - first).collect(),
+        first..last,
+    )
+}
+
 /// One nested Arrow array, ready to be written row by row as JSON.
 enum JsonNode {
     /// A scalar leaf, already extracted for the whole array. An unsupported
@@ -8191,18 +8337,24 @@ impl JsonNode {
             }
             DataType::List(_) => {
                 let a = col.as_list::<i32>();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::List {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             DataType::LargeList(_) => {
                 let a = col.as_list::<i64>();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::List {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             DataType::FixedSizeList(_, _) => {
@@ -8216,16 +8368,21 @@ impl JsonNode {
             }
             DataType::Map(_, _) => {
                 let a = col.as_map();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::Map {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
                     // Decided once from the key TYPE, not from the values:
                     // every row of the batch (and every batch of the column)
                     // then takes the same shape, and a key type with no
                     // rendering (binary) cannot masquerade as strings.
                     string_keys: is_string_type(a.keys().data_type()),
-                    keys: Box::new(JsonNode::resolve(a.keys().as_ref())),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    keys: Box::new(JsonNode::resolve(
+                        a.keys().slice(span.start, span.len()).as_ref(),
+                    )),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             // Unwrapped HERE, not through the leaf's own dictionary arm: a
@@ -12973,6 +13130,72 @@ mod tests {
             None,
             "a dictionary over an unsupported value type is unsupported"
         );
+    }
+
+    /// #740: the collect extracts properties per row chunk, from zero-copy
+    /// slices of the batch's columns. A slice of a nested column must render
+    /// exactly the rows the whole column renders there, for every nested
+    /// kind: a list or map slice keeps its whole child array, which the
+    /// rendering rebases onto the slice.
+    #[test]
+    fn sliced_nested_columns_render_like_the_whole_column() {
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
+            StringBuilder,
+        };
+        use arrow_array::StructArray;
+
+        let mut list = ListBuilder::new(Int32Builder::new());
+        let mut large = LargeListBuilder::new(StringBuilder::new());
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        let mut fixed = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        for row in 0..7i32 {
+            if row % 3 == 1 {
+                list.append_null();
+                large.append_null();
+                map.append(false).unwrap();
+            } else {
+                for v in 0..row {
+                    list.values().append_value(row * 10 + v);
+                    large.values().append_value(format!("r{row}v{v}"));
+                    map.keys().append_value(format!("k{v}"));
+                    map.values().append_value(v);
+                }
+                list.append(true);
+                large.append(true);
+                map.append(true).unwrap();
+            }
+            fixed.values().append_value(row);
+            fixed.values().append_value(-row);
+            fixed.append(row % 2 == 0);
+        }
+        let list: ArrayRef = Arc::new(list.finish());
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("l", list.data_type().clone(), true)),
+            Arc::clone(&list),
+        )]);
+        let columns: Vec<ArrayRef> = vec![
+            list,
+            Arc::new(large.finish()),
+            Arc::new(map.finish()),
+            Arc::new(fixed.finish()),
+            Arc::new(nested),
+        ];
+        for column in &columns {
+            let whole = extract_property_column(column.as_ref());
+            assert!(whole.iter().any(Option::is_some));
+            for offset in 0..column.len() {
+                for len in 0..=column.len() - offset {
+                    assert_eq!(
+                        extract_property_column(column.slice(offset, len).as_ref()),
+                        whole[offset..offset + len],
+                        "{:?} rows {offset}..{}",
+                        column.data_type(),
+                        offset + len
+                    );
+                }
+            }
+        }
     }
 
     #[test]
