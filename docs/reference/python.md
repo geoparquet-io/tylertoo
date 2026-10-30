@@ -150,7 +150,7 @@ Build a GeoParquet overview file: one generalized level per zoom.
 * `read_batch_size`: Rows per [read batch](https://geoparquet-io.github.io/tylertoo/guides/scaling/#how-streaming-bounds-memory).
 * `bbox`: Keep features that intersect this lon/lat box, also one ±360° wrap away, as for 0..360 data.
 * `filter`: SQL-style predicate, such as `"confidence > 0.8"`.
-* `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds output in RAM, `"bounded"` uses disk, and `"auto"` chooses per run.
+* `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: the musl (Alpine) wheel uses mimalloc, which adds a fixed floor of about 600 MiB on small inputs; other wheels use the system allocator.
 * `in_flight_batches`: [Concurrent batches](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
 * `read_workers`: [Reader threads](https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency), or `0` to size from the CPU count.
 * `spill_dir`: [Staging directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) for remote input.
@@ -229,7 +229,7 @@ Export an overview file to a PMTiles archive, one zoom per level.
 * `exclude_all_properties`: Drop every property, writing geometry-only tiles. `include_properties` overrides it.
 * `feature_id`: Integer column to use as the MVT feature ID.
 * `spill_dir`: [Spill directory](https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files) used when memory runs short.
-* `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"auto"`, `"speed"` or `"bounded"`. Output is identical across profiles.
+* `profile`: [Memory profile](https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles): `"speed"` holds everything in RAM, `"bounded"` uses disk and holds the least, and `"auto"` sizes to the machine's memory. Footprints compare for one allocator: the musl (Alpine) wheel uses mimalloc, which adds a fixed floor of about 600 MiB on small inputs; other wheels use the system allocator. Output is identical across profiles.
 * `name`: Human-readable tileset name, stored in the metadata.
 * `description`: Description of the tileset, stored in the metadata.
 * `attribution`: Attribution text or HTML stored in the archive metadata; MapLibre shows it in its attribution control. Each value is stored as given, and `""` is kept as `""`.

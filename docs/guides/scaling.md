@@ -62,6 +62,17 @@ when they fit the allowance and narrows the waves to fit it. One check holds
 under every profile: export refuses a tile that alone needs more than the
 machine's memory, because no profile can make one tile smaller.
 
+`bounded` keeps main's footprint for the same allocator. The release CLI
+uses mimalloc by default, which adds a fixed floor of about 600 MiB that
+shows on small inputs: under `bounded`, Madagascar (z0-12) peaks at 1,254 MiB
+against 685 MiB with the system allocator, and Moldova at 2,792 against
+2,509 MiB, while running faster (Madagascar 1.4 s against 3.0 s). The floor comes from transparent huge pages on
+mimalloc's eagerly committed arenas and its 1 s delay before freed pages go
+back to the OS. `MIMALLOC_ALLOW_THP=0 MIMALLOC_PURGE_DELAY=10` in the
+environment removes it (Madagascar 566 MiB, Moldova 1,665 MiB) but gives back
+most of the speed (Madagascar 2.0 s, Moldova 12.4 s against 9.3 s). A build
+with `--no-default-features` uses the system allocator.
+
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
 jobs use this limit to size buffers. `TYLERTOO_AUTO_MEM_LIMIT_BYTES` overrides

@@ -149,6 +149,13 @@ impl std::str::FromStr for Mode {
 /// wide the read-ahead, the compute window and the writer's encodes run
 /// (`MemoryBudget::fit`, #788). It changes **speed and peak memory only**;
 /// output bytes are identical across all profiles and thread counts.
+///
+/// `bounded` keeps main's footprint *for the same allocator*. The CLI's
+/// default mimalloc build adds a fixed floor of about 600 MiB (transparent
+/// huge pages on its eagerly committed arenas, and a 1 s purge delay
+/// before freed pages return to the OS) that shows on small inputs: 685 →
+/// 1,254 MiB peak RSS on Madagascar under `bounded`. A
+/// `--no-default-features` build uses the system allocator (#739, #788).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryProfile {
