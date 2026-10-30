@@ -314,6 +314,7 @@ pub(crate) enum ExportField {
     TileRange,
     ZoomCeiling,
     SpillDir,
+    Profile,
     Metadata,
 }
 
@@ -327,6 +328,7 @@ impl ExportField {
             ExportField::TileRange => "export.tile_range",
             ExportField::ZoomCeiling => "export.zoom_ceiling",
             ExportField::SpillDir => "export.spill_dir",
+            ExportField::Profile => "export.profile",
             ExportField::Metadata => "export.metadata",
         }
     }
@@ -341,6 +343,7 @@ impl ExportField {
             ExportField::TileRange => export.tile_range.is_some(),
             ExportField::ZoomCeiling => export.zoom_ceiling.is_some(),
             ExportField::SpillDir => export.spill_dir.is_some(),
+            ExportField::Profile => export.profile != defaults.profile,
             ExportField::Metadata => export.metadata != defaults.metadata,
         }
     }
