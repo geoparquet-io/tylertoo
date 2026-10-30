@@ -10,7 +10,7 @@ mod untrusted;
 mod writer;
 
 pub use input::RemoteObjectMeta;
-pub use ipc::{IpcFileWriter, IpcStreamReader, IpcStreamWriter};
+pub use ipc::{IpcCompression, IpcFileWriter, IpcStreamReader, IpcStreamWriter};
 pub use untrusted::{
     byte_array_limit, check_byte_array_ceiling, concat_prefix_rows, decode_footer,
     decoded_batch_limit, decoded_input_bytes, input_error, largest_byte_array_column,

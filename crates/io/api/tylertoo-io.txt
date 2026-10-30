@@ -41,6 +41,27 @@ impl core::marker::Unpin for tylertoo_io::Error
 impl core::marker::UnsafeUnpin for tylertoo_io::Error
 impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::Error
 impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::Error
+pub enum tylertoo_io::IpcCompression
+pub tylertoo_io::IpcCompression::Lz4
+pub tylertoo_io::IpcCompression::None
+impl core::clone::Clone for tylertoo_io::IpcCompression
+pub fn tylertoo_io::IpcCompression::clone(&self) -> tylertoo_io::IpcCompression
+impl core::cmp::Eq for tylertoo_io::IpcCompression
+impl core::cmp::PartialEq for tylertoo_io::IpcCompression
+pub fn tylertoo_io::IpcCompression::eq(&self, &tylertoo_io::IpcCompression) -> bool
+impl core::default::Default for tylertoo_io::IpcCompression
+pub fn tylertoo_io::IpcCompression::default() -> tylertoo_io::IpcCompression
+impl core::fmt::Debug for tylertoo_io::IpcCompression
+pub fn tylertoo_io::IpcCompression::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for tylertoo_io::IpcCompression
+impl core::marker::StructuralPartialEq for tylertoo_io::IpcCompression
+impl core::marker::Freeze for tylertoo_io::IpcCompression
+impl core::marker::Send for tylertoo_io::IpcCompression
+impl core::marker::Sync for tylertoo_io::IpcCompression
+impl core::marker::Unpin for tylertoo_io::IpcCompression
+impl core::marker::UnsafeUnpin for tylertoo_io::IpcCompression
+impl core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcCompression
+impl core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcCompression
 pub struct tylertoo_io::BatchWriter<W: core::io::write::Write + core::marker::Send>(_)
 impl<W: core::io::write::Write + core::marker::Send> tylertoo_io::BatchWriter<W>
 pub fn tylertoo_io::BatchWriter<W>::append_key_value_metadata(&mut self, parquet::file::metadata::KeyValue)
@@ -76,25 +97,27 @@ pub type tylertoo_io::IpcStreamReader<R>::Item = core::result::Result<arrow_arra
 pub fn tylertoo_io::IpcStreamReader<R>::next(&mut self) -> core::option::Option<Self::Item>
 impl<R: core::fmt::Debug + alloc::io::read::Read> core::fmt::Debug for tylertoo_io::IpcStreamReader<R>
 pub fn tylertoo_io::IpcStreamReader<R>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<R> core::marker::Freeze for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Freeze
-impl<R> core::marker::Send for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Send
-impl<R> core::marker::Sync for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Sync
-impl<R> core::marker::Unpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::Unpin
-impl<R> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<R>: core::marker::UnsafeUnpin
+impl<R> core::marker::Freeze for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<SpillInput<R>>: core::marker::Freeze
+impl<R> core::marker::Send for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<SpillInput<R>>: core::marker::Send
+impl<R> core::marker::Sync for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<SpillInput<R>>: core::marker::Sync
+impl<R> core::marker::Unpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<SpillInput<R>>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamReader<R> where arrow_ipc::reader::StreamReader<SpillInput<R>>: core::marker::UnsafeUnpin
 impl<R> !core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamReader<R>
 impl<R> !core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamReader<R>
-pub struct tylertoo_io::IpcStreamWriter<W: core::io::write::Write>(_)
+pub struct tylertoo_io::IpcStreamWriter<W: core::io::write::Write>
 impl<W: core::io::write::Write> tylertoo_io::IpcStreamWriter<W>
+pub fn tylertoo_io::IpcStreamWriter<W>::bytes_written(&self) -> u64
 pub fn tylertoo_io::IpcStreamWriter<W>::finish(&mut self) -> core::result::Result<(), arrow_schema::error::ArrowError>
 pub fn tylertoo_io::IpcStreamWriter<W>::try_new(W, &arrow_schema::schema::Schema) -> core::result::Result<Self, arrow_schema::error::ArrowError>
+pub fn tylertoo_io::IpcStreamWriter<W>::try_new_with_compression(W, &arrow_schema::schema::Schema, tylertoo_io::IpcCompression) -> core::result::Result<Self, arrow_schema::error::ArrowError>
 pub fn tylertoo_io::IpcStreamWriter<W>::write(&mut self, &arrow_array::record_batch::RecordBatch) -> core::result::Result<(), arrow_schema::error::ArrowError>
-impl<W> core::marker::Freeze for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Freeze
-impl<W> core::marker::Send for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Send
-impl<W> core::marker::Sync for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Sync
-impl<W> core::marker::Unpin for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::Unpin
-impl<W> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::marker::UnsafeUnpin
-impl<W> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::panic::unwind_safe::RefUnwindSafe
-impl<W> core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamWriter<W> where arrow_ipc::writer::StreamWriter<W>: core::panic::unwind_safe::UnwindSafe
+impl<W> core::marker::Freeze for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::marker::Freeze
+impl<W> core::marker::Send for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::marker::Send
+impl<W> core::marker::Sync for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::marker::Sync
+impl<W> core::marker::Unpin for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::marker::Unpin
+impl<W> core::marker::UnsafeUnpin for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::marker::UnsafeUnpin
+impl<W> core::panic::unwind_safe::RefUnwindSafe for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::panic::unwind_safe::RefUnwindSafe
+impl<W> core::panic::unwind_safe::UnwindSafe for tylertoo_io::IpcStreamWriter<W> where SpillWriter<W>: core::panic::unwind_safe::UnwindSafe
 pub struct tylertoo_io::LargestByteArrayColumn
 pub tylertoo_io::LargestByteArrayColumn::column: alloc::string::String
 pub tylertoo_io::LargestByteArrayColumn::total_bytes: u64

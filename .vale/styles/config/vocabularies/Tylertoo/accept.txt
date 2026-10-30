@@ -131,6 +131,7 @@ keyless
 walkthrough
 [Bb]oolean
 Kleene
+codec
 
 # Possessives of terms used above
 dataset's
