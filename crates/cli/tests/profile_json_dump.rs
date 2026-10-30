@@ -345,6 +345,12 @@ fn check_convert_line(
     check_sink_measurement(value);
     check_pass1_memory_preflight(value);
     check_pass2_windows(value);
+    // #788: `pass0` is the remote staging record; a local input stages
+    // nothing, so it is present and null.
+    assert!(
+        value.get("pass0").is_some_and(serde_json::Value::is_null),
+        "pass0 must be null for a local input: {value}"
+    );
 }
 
 /// #494: `pass2.windows` — how many input batches the pass-2 consumers
