@@ -252,6 +252,15 @@ before pass 1, so both passes read from disk. The record says what it did:
 `null` means a local input, or a staging that stopped on an error no retry
 fixes (the object changed or is unreadable); the run's warnings say which.
 
+Once staging has landed every chunk a pass reads, the pass reads the spill
+with as many reader threads as a local file gets (#544). The log shows the
+`[convert] read: N reader thread(s)` line instead of "remote input not fully
+staged". To check that the spill keeps up, convert a local copy of the
+same file and compare the two records. Each pass's `phase_walls` entry and
+`pass2.windows.mean_window` should match within noise. A remote pass that
+is slower, or a lower `mean_window`, means the readers queue on the spill's
+lock, which a `perf` profile of the run confirms.
+
 ### `peak_rss_mib` vs `rss_sampler` (#571)
 
 `peak_rss_mib` only ever samples RSS **at the five phase boundaries** above
