@@ -19,6 +19,12 @@ dhat-heap = ["tylertoo-core/dhat-heap", "dhat"]
 # clap-markdown dependency) out of production builds. CI enables it to
 # regenerate docs/reference/cli.md and diff-guard the committed copy.
 gen-docs = ["dep:clap-markdown"]
+# mimalloc as the global allocator on every target, not only musl (#739).
+# glibc malloc measured ~45% slower on a 64-core export (#739); musl already
+# uses mimalloc unconditionally (#480) and this feature does not change that.
+# Off by default until the #788 B1 lane's wall-time + peak-RSS measurement
+# decides the default. Ignored under `dhat-heap` (dhat owns the allocator).
+mimalloc = ["dep:mimalloc"]
 
 [[bin]]
 name = "tylertoo"
@@ -42,6 +48,9 @@ dhat = { version = "0.3", optional = true }
 # version steady across CI runs; the exact pin can be relaxed to a caret in a
 # follow-up (the last open box on #412).
 clap-markdown = { version = "=0.1.5", optional = true }
+# Optional global allocator for non-musl targets (#739); see the `mimalloc`
+# feature. The musl table below keeps it unconditional there.
+mimalloc = { version = "0.1", optional = true }
 
 # musl-only global allocator (#480). musl's mallocng fails small allocations
 # under heavy multi-threaded fragmentation long before memory is exhausted;
