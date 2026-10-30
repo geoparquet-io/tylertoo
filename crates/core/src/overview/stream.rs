@@ -1285,12 +1285,7 @@ fn reserve_spill_cache(
         super::level::MemoryProfile::Speed => false,
         super::level::MemoryProfile::Bounded => true,
         super::level::MemoryProfile::Auto => matches!(
-            pipeline::auto_backing(
-                options.mode,
-                buffered_rows,
-                budget.available(),
-                avg_geom_bytes
-            ),
+            pipeline::auto_backing(budget, options.mode, buffered_rows, avg_geom_bytes),
             pipeline::SinkBacking::Spill
         ),
     };

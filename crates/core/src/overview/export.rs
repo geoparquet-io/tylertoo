@@ -1600,7 +1600,7 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
 /// width is the machine's [`std::thread::available_parallelism`], capped by
 /// how many per-partition transients (estimated
 /// `PARTITION_SLOT_TRANSIENT_BYTES` each) fit in
-/// [`MemoryPhase::ExportCollect`]'s share of available RAM (probe shared with the
+/// the export collection phase's share of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
 /// then the container-aware `min(cgroup headroom, /proc/meminfo
 /// MemAvailable)` — see `available_memory_bytes`), floored at
@@ -3784,8 +3784,9 @@ struct LevelPlan {
 // (level, partition, tile) write order.
 //
 // **Memory.** The store's RAM footprint follows the converter's pass-2 sink
-// policy ([`auto_backing`]): small buffered sets stay in RAM; large ones spill
-// member records to one temp file. Under spill backing the in-RAM buckets are
+// policy for the run's profile ([`fill_backing`], #788): `speed` RAM,
+// `bounded` spill, `auto` keeps small buffered sets in RAM and spills large
+// ones' member records to one temp file. Under spill backing the in-RAM buckets are
 // bounded by [`MEMBER_STORE_RAM_BUDGET`] during the fill (largest buckets are
 // flushed first, in whole segments, so spill I/O stays chunky and sequential),
 // and every bucket is flushed at fill end. The drain then holds only one

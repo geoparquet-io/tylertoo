@@ -126,24 +126,20 @@ const PARTITIONING_SPILL_ROWS: usize = 2_000_000;
 
 /// Workload-driven backing choice for [`MemoryProfile::Auto`] (#294).
 ///
-/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds a
-/// fraction of available RAM — a function of `feature_count × level_count ×
+/// Chooses [`SinkBacking::Spill`] when the estimated buffered output exceeds
+/// `memory`'s own [`MemoryProfile::Auto`] allowance, after every reservation
+/// and grant already charged to it — a function of `feature_count × level_count ×
 /// mode` (captured by `buffered_rows` and the per-mode byte estimate), NOT a
 /// mode-only rule. Partitioning additionally keeps its historical absolute
 /// row ceiling, so it spills at least as often as before.
 pub(super) fn auto_backing(
+    memory: &MemoryBudget,
     mode: Mode,
     buffered_rows: usize,
-    available_ram_bytes: Option<u64>,
     avg_geom_bytes: Option<u64>,
 ) -> SinkBacking {
-    let estimate = MemoryBudget::with_available(available_ram_bytes).sink_estimate(
-        mode,
-        buffered_rows,
-        avg_geom_bytes,
-    );
-    let budget = MemoryBudget::with_available(available_ram_bytes).allowance(MemoryProfile::Auto);
-    let ram_gate_spill = estimate > budget;
+    let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
+    let ram_gate_spill = estimate > memory.allowance(MemoryProfile::Auto);
     let abs_gate_spill =
         matches!(mode, Mode::Partitioning) && buffered_rows > PARTITIONING_SPILL_ROWS;
     if ram_gate_spill || abs_gate_spill {
@@ -657,7 +653,7 @@ pub(super) fn resolve_backing(
         }
         MemoryProfile::Auto => {
             let available = memory.available();
-            let backing = auto_backing(mode, buffered_rows, available, avg_geom_bytes);
+            let backing = auto_backing(&memory, mode, buffered_rows, avg_geom_bytes);
             let estimate = memory.sink_estimate(mode, buffered_rows, avg_geom_bytes);
             let budget = memory.allowance(MemoryProfile::Auto);
             let avail_mib = available.map_or_else(
@@ -1908,6 +1904,47 @@ mod backing_tests {
         assert_ne!(limit.source, MemoryLimitSource::CgroupHigh);
     }
 
+    /// ARCH-REVIEW §1: `auto` decides on the run budget's own allowance,
+    /// `0.6 × (limit − reserved) − grants`, once pass 2's read-ahead and
+    /// window are granted. Re-wrapping `available()` in a fresh budget gave
+    /// `0.6 × (limit − reserved − grants)`, 0.4 × grants more, so a sink
+    /// sized between the two stayed in RAM past the allowance the grants
+    /// were fitted to.
+    #[test]
+    fn auto_decides_on_the_charged_budgets_allowance() {
+        use crate::overview::memory::{MemoryPhase, Price, PriceBasis};
+        let mut memory = MemoryBudget::with_available(Some(10 * GIB));
+        let _grant = memory.fit(
+            MemoryProfile::Speed,
+            MemoryPhase::Compute,
+            Price::new(GIB, PriceBasis::Model),
+            2,
+            2,
+        );
+        let allowance = memory.allowance(MemoryProfile::Auto);
+        assert_eq!(allowance, (0.6 * (10 * GIB) as f64) as u64 - 2 * GIB);
+        let rewrapped = (0.6 * memory.available().unwrap() as f64) as u64;
+        // A duplicating sink of unmeasured rows (8 KiB each) between the two.
+        let between = ((allowance + rewrapped) / 2 / 8192) as usize;
+        let estimate = memory.sink_estimate(Mode::Duplicating, between, None);
+        assert!(allowance < estimate && estimate < rewrapped);
+        assert!(matches!(
+            resolve_backing(
+                memory,
+                MemoryProfile::Auto,
+                Mode::Duplicating,
+                between,
+                None
+            ),
+            SinkBacking::Spill
+        ));
+        let under = (allowance / 8192) as usize - 1;
+        assert!(matches!(
+            resolve_backing(memory, MemoryProfile::Auto, Mode::Duplicating, under, None),
+            SinkBacking::Ram
+        ));
+    }
+
     #[test]
     fn explicit_profiles_ignore_workload() {
         // Speed is always RAM, Bounded always Spill — regardless of size/mode.
@@ -1937,7 +1974,12 @@ mod backing_tests {
     fn auto_duplicating_small_stays_in_ram() {
         // A tiny buffered set is safe in RAM on a normal box.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1947,7 +1989,12 @@ mod backing_tests {
         // The #294 fix: a large duplicating buffered set flips to Spill instead
         // of the old unconditional RAM. 10M rows * 8 KiB = 80 GiB > 0.6*54.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 10_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                10_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
     }
@@ -1958,14 +2005,24 @@ mod backing_tests {
         let rows = 5_000_000; // 5M * 8 KiB = 40 GiB estimate
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(4 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(4 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Spill
             ),
             "small box must spill"
         );
         assert!(
             matches!(
-                auto_backing(Mode::Duplicating, rows, Some(256 * GIB), None),
+                auto_backing(
+                    &MemoryBudget::with_available(Some(256 * GIB)),
+                    Mode::Duplicating,
+                    rows,
+                    None
+                ),
                 SinkBacking::Ram
             ),
             "huge box may keep it in RAM"
@@ -1977,11 +2034,21 @@ mod backing_tests {
         // Even with effectively unlimited RAM, partitioning still spills above
         // the historical 2M-row floor (strict superset of pre-#294 behavior).
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 100_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Partitioning,
+                100_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -1990,11 +2057,21 @@ mod backing_tests {
     fn auto_uses_fallback_budget_when_ram_unknown() {
         // Unknown RAM → conservative fixed budget, still spilling huge sets.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 100_000_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                100_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000, None, None),
+            auto_backing(
+                &MemoryBudget::with_available(None),
+                Mode::Duplicating,
+                1_000,
+                None
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2067,11 +2144,21 @@ mod backing_tests {
         // measured tiny-geometry corpus (points/small lines, ~100 B/row →
         // ~4.3 KiB/row → 20 GiB) fits and stays in RAM.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 5_000_000, Some(54 * GIB), Some(100)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(54 * GIB)),
+                Mode::Duplicating,
+                5_000_000,
+                Some(100)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2082,11 +2169,21 @@ mod backing_tests {
         // (8 KiB/row → 7.6 GiB) keeps RAM, but an adm4-like measured average
         // (11 534 B/row → ~27 KiB/row → 25 GiB) correctly flips to Spill.
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                None
+            ),
             SinkBacking::Ram
         ));
         assert!(matches!(
-            auto_backing(Mode::Duplicating, 1_000_000, Some(25 * GIB), Some(11_534)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(25 * GIB)),
+                Mode::Duplicating,
+                1_000_000,
+                Some(11_534)
+            ),
             SinkBacking::Spill
         ));
     }
@@ -2098,11 +2195,21 @@ mod backing_tests {
         // (983 B/row → ~8 KiB/row → 7.5 GiB) fits and stays in RAM. Below the
         // 2M-row ceiling, so only the RAM gate is in play.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), None),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                None
+            ),
             SinkBacking::Spill
         ));
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 1_000_000, Some(20 * GIB), Some(983)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(20 * GIB)),
+                Mode::Partitioning,
+                1_000_000,
+                Some(983)
+            ),
             SinkBacking::Ram
         ));
     }
@@ -2112,7 +2219,12 @@ mod backing_tests {
         // The historical 2M-row partitioning floor holds even when measurement
         // says the geometries are tiny.
         assert!(matches!(
-            auto_backing(Mode::Partitioning, 3_000_000, Some(10_000 * GIB), Some(8)),
+            auto_backing(
+                &MemoryBudget::with_available(Some(10_000 * GIB)),
+                Mode::Partitioning,
+                3_000_000,
+                Some(8)
+            ),
             SinkBacking::Spill
         ));
     }
