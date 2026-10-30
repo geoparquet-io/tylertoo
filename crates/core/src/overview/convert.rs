@@ -560,7 +560,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     pub profile: MemoryProfile,
     /// Number of Arrow read batches allowed in flight through the streaming
     /// pass-2 pipeline at once. Pass 2 splits it in half (#494): one half is
@@ -601,7 +601,7 @@ pub struct ConvertOptions {
         value_parser = super::config::cli::parse_read_workers,
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for a quarter of the cores, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Reader threads for both passes, or `auto` for half the cores in the first pass and a quarter in the second, up to 4. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#read-concurrency>", long_help = None))]
     pub read_workers: usize,
     /// Enable point clustering (plan Q4; opt-in per spec §11 Q4). Duplicating
     /// mode only. When enabled, each level's point cell-winners absorb the
@@ -993,6 +993,19 @@ pub fn resolve_read_workers(requested: usize) -> usize {
 /// read through the same ordered reader, but their consumers' CPU demand
 /// differs, so the auto count is resolved per pass. An explicit value applies
 /// to both.
+///
+/// Pass 2 keeps the quarter rule. Pass 1's consumer (decode and key
+/// extraction) is light, so its read is the bottleneck. It takes HALF the
+/// cores, at least 2 when there are 2, clamped to `READ_WORKERS_MAX`. Swept
+/// with `taskset` (`.788/PROFILE-LOG.md`, z0-8, 2 runs each), pass 1 times:
+///
+/// | cores | readers | Moldova | NZ parcels |
+/// | --- | --- | --- | --- |
+/// | 2 | 1 → 2 | 0.66 → 0.63 s | 3.0 → 2.8 s |
+/// | 4 | 1 → 2 | 0.66 → 0.36 s | 2.3 → 1.5 s |
+/// | 8 | 2 → 4 | 0.36 → 0.23 s | 1.3-1.5 → 1.0-1.2 s |
+///
+/// Pass 2 was flat or faster at the same counts.
 pub(super) fn resolve_pass_read_workers(pass: ReadPass, requested: usize) -> usize {
     resolve_read_workers_with_cores(
         pass,
@@ -1012,8 +1025,8 @@ pub(super) fn resolve_read_workers_with_cores(
         return requested;
     }
     match pass {
-        // #723: both passes still take pass 2's quarter rule.
-        ReadPass::Scan | ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Scan => (cores / 2).max(cores.min(2)).clamp(1, READ_WORKERS_MAX),
+        ReadPass::Build => (cores / 4).clamp(1, READ_WORKERS_MAX),
     }
 }
 
@@ -3971,73 +3984,6 @@ impl BboxQuery {
 /// [`crate::covering::RowGroupBounds::intersects`]).
 pub(super) fn bboxes_intersect(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
-}
-
-/// Row-group encode concurrency for the overview writer (#296), derived from
-/// the memory profile. The writer holds `O(concurrency × row_group)` extra
-/// memory, so `bounded` caps it while still overlapping several row groups;
-/// `speed`/`auto` use the full Rayon pool (row groups within a level bound the
-/// effective parallelism anyway). Never zero.
-pub(super) fn encode_concurrency_for(profile: MemoryProfile) -> usize {
-    /// Cap on in-flight row-group encodes under the `bounded` profile, keeping
-    /// the writer's extra memory to a few row groups while still breaking the
-    /// single-threaded ceiling.
-    const BOUNDED_ENCODE_CONCURRENCY_CAP: usize = 4;
-
-    let threads = rayon::current_num_threads().max(1);
-    match profile {
-        MemoryProfile::Bounded => threads.min(BOUNDED_ENCODE_CONCURRENCY_CAP),
-        MemoryProfile::Speed | MemoryProfile::Auto => threads,
-    }
-}
-
-/// #545: the `bounded` drain's encode concurrency.
-#[cfg(test)]
-mod encode_concurrency_tests {
-    use super::*;
-    use crate::overview::memory::MemoryBudget;
-
-    /// Under `bounded` the drain encodes at most 4 row groups at once whatever
-    /// the budget. Profiled (`.788/PROFILE-LOG.md`, 64 threads, glibc): the
-    /// drain is 38% of pass 2's wall on Moldova and 39% on NZ parcels under
-    /// `bounded`, against 14% under `auto` (full pool) on the same Moldova
-    /// output, while the drain thread itself holds 1.1% of the CPU samples:
-    /// it waits on the capped encodes. #545's own A/B kept 4 as the floor and
-    /// asked for the cap to come from the memory probe instead.
-    ///
-    /// The closure is the phase-1 stand-in for the budget-aware owner: today's
-    /// rule reads neither the budget nor the row-group size.
-    #[test]
-    #[ignore = "#545: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
-    fn bounded_encode_concurrency_comes_from_the_budget() {
-        let resolve = |budget: MemoryBudget, threads: usize, row_group_bytes: u64| {
-            let _unused_on_main = (budget, row_group_bytes);
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| encode_concurrency_for(MemoryProfile::Bounded))
-        };
-        let row_group = 64 << 20;
-        // Ample memory: the pool, not the constant, is the limit.
-        assert_eq!(
-            resolve(MemoryBudget::with_available(Some(64 << 30)), 16, row_group),
-            16
-        );
-        // Tight memory: never below #545's measured floor of 4 ...
-        assert_eq!(
-            resolve(MemoryBudget::with_available(Some(256 << 20)), 16, row_group),
-            4
-        );
-        // ... and between the two, what the budget affords.
-        let mid = resolve(MemoryBudget::with_available(Some(4 << 30)), 16, row_group);
-        assert!((4..16).contains(&mid), "4 GiB, 64 MiB row groups: {mid}");
-        // Never more than the pool.
-        assert_eq!(
-            resolve(MemoryBudget::with_available(Some(64 << 30)), 2, row_group),
-            2
-        );
-    }
 }
 
 /// Row groups of the input whose bbox statistics intersect any of `boxes`
@@ -10849,9 +10795,16 @@ mod tests {
             assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
         }
         let source = ConvertSource::resolve_path(tin.path()).unwrap();
-        let msg = super::super::auto_zoom::estimate_with(&source, 0, 16, None, None)
-            .unwrap_err()
-            .to_string();
+        let msg = super::super::auto_zoom::estimate_with(
+            &source,
+            0,
+            16,
+            None,
+            None,
+            MemoryProfile::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(msg.contains(&tin.path().display().to_string()), "{msg}");
     }
 
@@ -12342,7 +12295,6 @@ mod tests {
     /// took pass 1 from 0.72-0.75 s to 0.45-0.48 s while pass 2 stayed flat,
     /// yet auto gives both passes `4 / 4 = 1` reader.
     #[test]
-    #[ignore = "#723: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
     fn pass1_and_pass2_auto_reader_counts_resolve_independently() {
         use super::super::read::ReadPass;
         let auto = |pass, cores| resolve_read_workers_with_cores(pass, READ_WORKERS_AUTO, cores);
