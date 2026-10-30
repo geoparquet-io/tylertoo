@@ -178,3 +178,80 @@ fn dense_capped_tile_encode_peak_live_bytes_is_bounded() {
         "dense capped tile encode peak: {peak} bytes, budget {ENCODE_BUDGET}; output {bytes} bytes"
     );
 }
+/// Exceeds the memo's admission size, so a memo hit cannot hide a fit recheck.
+fn fit_payload() -> TileMvt {
+    TileMvt {
+        source_ids: Vec::new(),
+        source_losses: Vec::new(),
+        gzip_cache: test_gzip_cache(),
+        data: (0..8192)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>()
+            .into(),
+        features: 1,
+        unencodable: 0,
+        quantized: 0,
+        oversized: true,
+        valve: ValveTally::default(),
+    }
+}
+
+#[test]
+fn tile_fit_reuses_only_unchanged_bytes_and_rechecks_active_limits() {
+    let mut mvt = fit_payload();
+    let opts = ExportOptions {
+        tile_size_limit: Some(16_384),
+        compressed_tile_size_limit: Some(1024),
+        ..Default::default()
+    };
+    let (first, initial_calls) = gzip_counter::measure(|| tile_fit(&mut mvt, &opts).unwrap());
+    assert_eq!(initial_calls, 1);
+    let ((again, tighter, raw_only), repeat_calls) = gzip_counter::measure(|| {
+        let again = tile_fit(&mut mvt, &opts).unwrap();
+        let tighter = tile_fit(
+            &mut mvt,
+            &ExportOptions {
+                tile_size_limit: Some(4096),
+                compressed_tile_size_limit: Some(1),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+        let raw_only = tile_fit(
+            &mut mvt,
+            &ExportOptions {
+                tile_size_limit: Some(4096),
+                compressed_tile_size_limit: None,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+        (again, tighter, raw_only)
+    });
+    assert_eq!(
+        repeat_calls, 0,
+        "unchanged tile bytes never need another gzip"
+    );
+    assert_eq!(first, again);
+    assert!(
+        tighter < 0.5,
+        "the current compressed limit must still apply"
+    );
+    assert_eq!(raw_only, 0.5, "the current raw limit must still apply");
+
+    mvt.data[0] ^= 1;
+    assert!(
+        mvt.gzip.is_none(),
+        "an in-place edit invalidates gzip immediately"
+    );
+    let (_, mutation_calls) = gzip_counter::measure(|| tile_fit(&mut mvt, &opts).unwrap());
+    assert_eq!(mutation_calls, 1, "changed bytes must be compressed");
+    let decoded = compression::decompress(mvt.gzip.as_ref().unwrap(), Compression::Gzip).unwrap();
+    assert_eq!(decoded.as_slice(), mvt.data.as_slice());
+
+    let (_, missing_calls) = gzip_counter::measure(|| tile_fit(&mut fit_payload(), &opts).unwrap());
+    assert_eq!(
+        missing_calls, 1,
+        "a missing cache uses the normal compression path"
+    );
+}

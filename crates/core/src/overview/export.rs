@@ -150,6 +150,8 @@ use super::stream::{
 use super::writer::LEVEL_COLUMN;
 
 mod coalesce_valve;
+mod tile_data;
+use tile_data::TileData;
 
 mod coverage_fill;
 use coalesce_valve::RowGapCursor;
@@ -7064,12 +7066,9 @@ fn encode_members(
             }
             let hash = TileHasher::hash(&mvt.data);
             let raw_len = mvt.data.len();
-            let compressed = match mvt.gzip {
-                Some(gz) => gz,
-                None => match mvt.gzip_cache.compress(&mvt.data) {
-                    Ok(c) => c,
-                    Err(e) => return Some(Err(ExportError::from(e))),
-                },
+            let compressed = match mvt.data.into_gzip(&mvt.gzip_cache) {
+                Ok(gzip) => gzip,
+                Err(e) => return Some(Err(ExportError::from(e))),
             };
             Some(Ok(EncodedTile {
                 x,
@@ -7108,12 +7107,9 @@ struct TileMvt {
     gzip_cache: Arc<TileGzipCache>,
     source_ids: Vec<u64>,
     source_losses: Vec<(u64, crate::diagnostics::SourceLossCause)>,
-    /// Raw (uncompressed) MVT bytes.
-    data: Vec<u8>,
-    /// The gzip bytes of `data`, when the valve already compressed it to
-    /// check [`ExportOptions::compressed_tile_size_limit`] (#745), so
-    /// [`encode_members`] need not compress it again.
-    gzip: Option<Vec<u8>>,
+    /// Raw bytes and the gzip of exactly those bytes. Mutable access to the
+    /// raw buffer invalidates gzip before exposing the buffer.
+    data: TileData,
     /// MVT features actually written to the layer. A `GeometryCollection`
     /// member contributes one per geometry kind it holds (#431).
     features: usize,
@@ -7128,6 +7124,15 @@ struct TileMvt {
     oversized: bool,
     /// What the size valve did to the tile (#745).
     valve: ValveTally,
+}
+
+// A read-only cached-gzip view for fill's existing cost observer. All raw
+// mutation goes through TileData's invalidating mutable view.
+impl std::ops::Deref for TileMvt {
+    type Target = TileData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 /// What the size valve did to one tile (#745), for the report.
@@ -7449,16 +7454,17 @@ fn is_point_like<M: TileFeature>(members: &[M]) -> bool {
 /// The share of a tile that fits its size limits: the smallest
 /// `limit / size` over the limits in force, so `>= 1.0` fits (infinite with
 /// no limit). Compresses the tile only when a compressed limit is set, and
-/// keeps the bytes for the writer.
+/// keeps the bytes for the writer. Reuses gzip only while the raw data is
+/// unchanged; `TileData` invalidates it on every mutable raw-buffer access.
+/// Both currently active limits are recomputed even on a cache hit.
 fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError> {
     let mut fit = f64::INFINITY;
     if let Some(limit) = opts.tile_size_limit.filter(|&l| l > 0) {
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
     }
     if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
-        let gz = mvt.gzip_cache.compress(&mvt.data)?;
+        let gz = mvt.data.gzipped(&mvt.gzip_cache)?;
         fit = fit.min(limit as f64 / gz.len() as f64);
-        mvt.gzip = Some(gz);
     }
     Ok(fit)
 }
@@ -7889,8 +7895,7 @@ fn build_mvt_with<M: TileFeature>(
         gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
-        data: layer.build(),
-        gzip: None,
+        data: layer.build().into(),
         features,
         unencodable,
         quantized,
@@ -11561,6 +11566,7 @@ mod tests {
             &crate::diagnostics::Diagnostics::default(),
         )
         .data
+        .into_raw()
     }
 
     /// #750: the fill may take a quarter of a tile's size limit (a compressed
@@ -14290,7 +14296,8 @@ mod tests {
             &[],
             &crate::diagnostics::Diagnostics::default(),
         )
-        .data;
+        .data
+        .into_raw();
         assert_eq!(
             tiles[0].data, expected,
             "contained feature must bypass the clip (geometry emitted as-is)"
