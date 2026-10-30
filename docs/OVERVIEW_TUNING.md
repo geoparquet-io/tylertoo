@@ -1807,6 +1807,7 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
@@ -1849,6 +1850,30 @@ When the spill's footer-priced size fits the allowance, pass 2 reserves it
 before any grant. When it does not fit, nothing is reserved, because the
 cache cannot hold it and reserving it would only starve the grants.
 `TYLERTOO_PROFILE_JSON` records the decision under `pass2.spill_reservation`.
+
+Release binaries use the mimalloc allocator, which is faster than the
+system allocator but can keep freed memory mapped, so a run's RSS can sit
+above its live heap. That gap is allocator retention, not a leak. `--profile bounded`
+remains the setting for memory-constrained machines.
+
+`bounded` uses LZ4 framing for its private IPC spill streams; `auto` and
+`speed` keep raw IPC, including an `auto` downgrade to disk. The IO facade
+caps LZ4 blocks at 64 KiB and releases codec scratch between writes. This
+bounds active scratch independently of input size and avoids a per-level
+idle workspace floor, while preserving the original
+Arrow batch boundaries on drain. Saved-plan files keep their existing format.
+
+The benchmark lane measured the earlier Arrow-buffer LZ4 variant on Moldova
+verbatim forced spill at 0.25× disk bytes and 0.81× peak RSS, with 1.052× total
+wall time when uncapped. For Mato Grosso bounded under a 4 GiB memory cap,
+pass 2 fell from 91 to 52 seconds median (0.58×), total wall time was 0.83×,
+and RSS and output were unchanged. That capped result uses two noisy rounds;
+these wall figures describe the earlier body codec, not the fixed-block
+stream framing. With transient framing, live heap is neutral and measured
+RSS is within run-to-run noise, not proven at-or-below raw; the isolated
+benchmark lane checks the bounded RSS envelope before merge.
+Disk preflight sums conservative raw components and assumes
+no compression savings. `pass2.sink.spill_codec` records the selected codec.
 
 ### Automatic memory estimate
 

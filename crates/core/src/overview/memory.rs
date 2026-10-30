@@ -57,6 +57,19 @@ const PYTHON_LOSS_SHARE: f64 = 0.10;
 /// #545's A/B kept 4 as the point below which the drain serializes.
 const ENCODE_FLOOR: usize = 4;
 
+/// Fraction of the probed memory export's waves, level stores and tile
+/// encodes may hold (#303, #311, #788 E1), as export's own budget always
+/// was (`EXPORT_WAVE_RAM_FRACTION`): below the allowance, because the waves
+/// sit on top of export state no estimate models (scan accumulators, decode
+/// buffers, the writer's directory).
+const EXPORT_FRACTION: f64 = 0.5;
+
+/// [`EXPORT_FRACTION`] as a share of the allowance, which is itself
+/// [`ALLOWANCE_FRACTION`] of the probed figure: with nothing granted, the
+/// export phases afford exactly half of the probed memory, the slots
+/// export always sized its waves to.
+const EXPORT_SHARE: f64 = EXPORT_FRACTION / ALLOWANCE_FRACTION;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemoryPhase {
     EagerInput,
@@ -74,22 +87,10 @@ pub(super) enum MemoryPhase {
     /// spilling pass 2 reads its spill back through (#716).
     Spill,
     /// Export's tile collection (track E1).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#788: track E1 grants export collection under it")
-    )]
     ExportCollect,
     /// Export's concurrent tile encodes (track E1).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#788: track E1 grants export encodes under it")
-    )]
     ExportEncode,
     /// Coverage fill (track F).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#788: track F grants coverage fill under it")
-    )]
     Fill,
 }
 
@@ -142,14 +143,13 @@ impl MemoryPhase {
             Self::Read => READ_SHARE,
             Self::Compute => COMPUTE_SHARE,
             Self::Encode => ENCODE_SHARE,
+            Self::ExportCollect | Self::ExportEncode => EXPORT_SHARE,
             Self::EagerInput
             | Self::Scan
             | Self::Assign
             | Self::Stage
             | Self::Write
             | Self::Spill
-            | Self::ExportCollect
-            | Self::ExportEncode
             | Self::Fill => 1.0,
         }
     }
@@ -159,10 +159,6 @@ impl MemoryPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PriceBasis {
     /// Measured on data this run already holds (a built batch, a sample).
-    #[expect(
-        dead_code,
-        reason = "#788: measured prices arrive with C1's sink and E1's export"
-    )]
     Measured,
     /// Read from the parquet footers before any page is decoded.
     Footer,
@@ -324,7 +320,10 @@ impl MemoryBudget {
         match profile {
             MemoryProfile::Speed => usize::MAX,
             MemoryProfile::Auto | MemoryProfile::Bounded => {
-                let ceiling = (self.remaining() as f64 * phase.share()) as u64;
+                // Rounded up: a share that is exactly a whole number of
+                // units (export's half of a round probed figure) must not
+                // lose one to the allowance's own rounding down.
+                let ceiling = (self.remaining() as f64 * phase.share()).ceil() as u64;
                 usize::try_from(ceiling / price.bytes.max(1))
                     .unwrap_or(usize::MAX)
                     .max(1)
