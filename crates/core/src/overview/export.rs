@@ -3705,9 +3705,14 @@ struct LevelPlan {
 /// file's segments chunky.
 const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
 
-/// How a [`MemberStore`] holds its members: in RAM, or spilled with
-/// `ram_budget` bytes of not-yet-flushed buckets, of which up to `resident`
-/// stay in RAM after the fill instead of spilling.
+/// Whole spill segments per bucket the member store's fill buffer holds
+/// once its members are measured: two, so flushing the largest bucket down
+/// to half the buffer writes at least about one full segment.
+const STORE_BUFFER_SEGMENTS: usize = 2;
+
+/// How a [`MemberStore`] holds its members: in RAM, or spilled with a fill
+/// buffer of at most `ram_budget` bytes of not-yet-flushed buckets, plus up
+/// to `resident` bytes that stay in RAM after the fill instead of spilling.
 #[derive(Debug, Clone, Copy)]
 struct StoreBacking {
     backing: SinkBacking,
@@ -3777,11 +3782,7 @@ fn level_read_backing(
         }
     } else {
         let resident = usize::try_from(level.bytes()).unwrap_or(usize::MAX);
-        StoreBacking {
-            ram_budget: read.ram_budget.saturating_add(resident),
-            resident,
-            ..spill
-        }
+        StoreBacking { resident, ..spill }
     };
     (backing, vec![wave, level])
 }
@@ -4248,14 +4249,23 @@ struct MemberStore {
     buffered_bytes: usize,
     /// Present under spill backing only.
     spill: Option<MemberSpill>,
-    /// The in-RAM ceiling for not-yet-flushed buckets under spill backing:
-    /// the bytes of the run's [`MemoryPhase::ExportCollect`] grant priced at
-    /// [`MEMBER_STORE_RAM_BUDGET`].
-    ram_budget: usize,
+    /// The in-RAM ceiling for not-yet-flushed buckets under spill backing.
+    /// It starts at the run's [`MemoryPhase::ExportCollect`] grant (a model
+    /// price, [`MEMBER_STORE_RAM_BUDGET`]) and, once the first
+    /// [`SPILL_SEGMENT_MEMBERS`] members are measured, narrows to
+    /// [`STORE_BUFFER_SEGMENTS`] segments per bucket at their measured mean
+    /// size: enough for every flush to write whole segments.
+    buffer: usize,
     /// Bytes of buckets the fill leaves in RAM instead of spilling them
     /// (#740): a multi-wave level's grant beyond the fill buffer. Zero for
     /// the export-wide store, whose drain holds one wave at a time.
     resident: usize,
+    /// Members pushed so far and their estimated bytes: the measurement
+    /// [`Self::buffer`] is priced from.
+    pushed_members: usize,
+    pushed_bytes: usize,
+    /// `[level][wave]` buckets in all.
+    bucket_count: usize,
     /// Profiling only (#535): cumulative time spent in [`Self::flush_bucket`]
     /// (serialize + write of spill segments). Read by the fill to charge it
     /// to `spill_write` rather than to the routing that triggered it.
@@ -4280,6 +4290,7 @@ impl MemberStore {
             .map(|&w| (0..w).map(|_| Vec::new()).collect())
             .collect();
         let bucket_bytes = shape.iter().map(|&w| vec![0usize; w]).collect();
+        let bucket_count = shape.iter().sum();
         let spill = match backing {
             SinkBacking::Ram => None,
             SinkBacking::Spill => {
@@ -4303,10 +4314,18 @@ impl MemberStore {
             bucket_bytes,
             buffered_bytes: 0,
             spill,
-            ram_budget,
+            buffer: ram_budget,
             resident: 0,
+            pushed_members: 0,
+            pushed_bytes: 0,
+            bucket_count,
             flush_time: Duration::ZERO,
         })
+    }
+
+    /// The fill's in-RAM ceiling: the buffer plus the resident grant.
+    fn ram_budget(&self) -> usize {
+        self.buffer.saturating_add(self.resident)
     }
 
     /// Bytes written to the spill file so far.
@@ -4319,11 +4338,21 @@ impl MemberStore {
         self.buckets[level][wave].push(m);
         self.bucket_bytes[level][wave] += est;
         self.buffered_bytes += est;
-        if self.spill.is_some() && self.buffered_bytes > self.ram_budget {
-            // Flush at most half of the fill buffer at a time, so a store
-            // with a large resident grant spills only what does not fit.
-            let headroom = (self.ram_budget / 2).min(MEMBER_STORE_RAM_BUDGET / 2);
-            self.flush_largest_until(self.ram_budget - headroom)?;
+        self.pushed_members += 1;
+        self.pushed_bytes += est;
+        if self.pushed_members == SPILL_SEGMENT_MEMBERS {
+            // A measured price: the members this store already holds.
+            let per_member = self.pushed_bytes / self.pushed_members;
+            let need = self
+                .bucket_count
+                .saturating_mul(STORE_BUFFER_SEGMENTS * SPILL_SEGMENT_MEMBERS)
+                .saturating_mul(per_member);
+            self.buffer = self.buffer.min(need);
+        }
+        if self.spill.is_some() && self.buffered_bytes > self.ram_budget() {
+            // Flush half of the fill buffer at a time, so a store with a
+            // resident grant spills only what does not fit.
+            self.flush_largest_until(self.ram_budget() - self.buffer / 2)?;
         }
         Ok(())
     }
@@ -5403,12 +5432,13 @@ fn fill_level_store(
     }
     log::debug!(
         "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
-         collect={:.2}s ({:?}, resident {} MiB, spilled {} MiB)",
+         collect={:.2}s ({:?}, buffer {} MiB, resident {} MiB, spilled {} MiB)",
         ctx.zoom,
         plan.partitions.len(),
         plan.partitions.len().div_ceil(plan.wave.max(1)),
         t_collect.elapsed().as_secs_f64(),
         backing.backing,
+        store.buffer >> 20,
         backing.resident >> 20,
         store.spilled_bytes() >> 20,
     );
@@ -15311,6 +15341,52 @@ mod tests {
     /// into segments that are encoded and decoded in parallel; the wave comes
     /// back whole, in push order, at its exact length, and still sharing one
     /// name handle per property name across every segment.
+    /// The member store's fill buffer is priced from the members it has
+    /// measured, not the 128 MiB model: once one segment's worth is pushed,
+    /// it narrows to two whole segments per bucket at their mean size, and
+    /// the store keeps spilling in whole segments and reading back in order.
+    #[test]
+    fn member_store_buffer_is_priced_from_measured_members() {
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10, 10, 10]),
+            wave: 1,
+        }];
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+        let member = |seq: u64| Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            props: Arc::new(Vec::new()),
+            id: None,
+            gap: GAP_NONE,
+            band: 0,
+        };
+        let per_member = member_bytes_estimate(&member(0));
+        let n = 20 * SPILL_SEGMENT_MEMBERS;
+        for seq in 0..n as u64 {
+            store.push(0, (seq % 3) as usize, member(seq)).unwrap();
+            if seq + 1 == SPILL_SEGMENT_MEMBERS as u64 {
+                assert_eq!(
+                    store.buffer,
+                    3 * STORE_BUFFER_SEGMENTS * SPILL_SEGMENT_MEMBERS * per_member,
+                    "two segments for each of the three buckets"
+                );
+            }
+        }
+        assert!(store.buffer < MEMBER_STORE_RAM_BUDGET);
+        assert!(store.spilled_bytes() > 0, "a full buffer must spill");
+        store.finish_fill().unwrap();
+        let mut seen = 0;
+        for wave in 0..3 {
+            let w = store.take_wave(0, wave).unwrap();
+            assert!(w.iter().all(|m| m.seq % 3 == wave as u64));
+            seen += w.len();
+        }
+        assert_eq!(seen, n);
+    }
+
     #[test]
     fn member_store_parallel_segments_roundtrip_in_order() {
         let plans = vec![LevelPlan {
@@ -15340,9 +15416,8 @@ mod tests {
                 .unwrap();
         }
         store.finish_fill().unwrap();
-        assert_eq!(
-            store.spill.as_ref().unwrap().segments[0][0].len(),
-            3,
+        assert!(
+            store.spill.as_ref().unwrap().segments[0][0].len() >= 3,
             "the bucket must span several segments"
         );
         let w = store.take_wave(0, 0).unwrap();
