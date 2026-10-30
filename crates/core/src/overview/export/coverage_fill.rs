@@ -115,6 +115,8 @@ pub(super) mod cost_probe {
     #[derive(Clone, Copy, Debug, Default)]
     pub(crate) struct Counts {
         pub(crate) bucket_peak: usize,
+        pub(crate) seed_windows: usize,
+        pub(crate) pyramid_wave_tiles: usize,
         pub(crate) map_peak: usize,
         pub(crate) live_peak: usize,
         pub(crate) box_comparisons: usize,
@@ -1123,7 +1125,9 @@ pub(super) fn assign_hosts<'a>(
 /// [`build_fill_map`] asks of the export's memory budget under
 /// [`MemoryPhase::Fill`](crate::overview::memory::MemoryPhase), and the
 /// least it can run on.
-pub(super) const WORKSPACE_WANT_BYTES: usize = 256 << 20;
+// Room for concurrent tile jobs and the snapping/lifting reserved during
+// ordered commit. MemoryBudget::fit may grant less; bounded uses the floor.
+pub(super) const WORKSPACE_WANT_BYTES: usize = 32 * WORKSPACE_FLOOR_BYTES;
 /// See [`WORKSPACE_WANT_BYTES`].
 pub(super) const WORKSPACE_FLOOR_BYTES: usize = 32 << 20;
 
@@ -1504,27 +1508,37 @@ impl SpillBuckets {
         Ok(())
     }
 
+    #[cfg(test)]
     fn pop_first(
         &mut self,
         reserved: usize,
     ) -> Result<Option<(u64, Vec<Shape>, CreditCells)>, super::ExportError> {
+        let Some((key, path)) = self.tiles.pop_first() else {
+            return Ok(None);
+        };
+        let (shapes, cells) = Self::read_run(
+            &path,
+            reserved.saturating_add(self.tiles.len().saturating_mul(512)),
+            self.budget,
+        )?;
+        Ok(Some((key, shapes, cells)))
+    }
+
+    fn read_run(
+        path: &std::path::Path,
+        reserved: usize,
+        budget: usize,
+    ) -> Result<(Vec<Shape>, CreditCells), super::ExportError> {
         use std::io::Read;
         fn word(r: &mut impl Read) -> std::io::Result<u64> {
             let mut b = [0; 8];
             r.read_exact(&mut b)?;
             Ok(u64::from_le_bytes(b))
         }
-        let Some((key, path)) = self.tiles.pop_first() else {
-            return Ok(None);
-        };
-        let mut r = std::io::BufReader::new(std::fs::File::open(&path)?);
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         let mut shapes = Vec::new();
         let mut cells = CreditCells::new();
-        let mut price = self
-            .tiles
-            .len()
-            .saturating_mul(512)
-            .saturating_add(reserved);
+        let mut price = reserved;
         loop {
             // Read the first byte separately: only a frame boundary can be EOF.
             let mut first = [0; 1];
@@ -1539,14 +1553,14 @@ impl SpillBuckets {
             for _ in 0..u64::from_le_bytes(count) {
                 let rings = word(&mut r)? as usize;
                 price = price.saturating_add(48 + rings.saturating_mul(24));
-                require_fill_bytes(price.saturating_add(cells.capacity_bytes()), self.budget)?;
+                require_fill_bytes(price.saturating_add(cells.capacity_bytes()), budget)?;
                 let mut shape = Vec::with_capacity(rings);
                 for _ in 0..rings {
                     let points = word(&mut r)? as usize;
                     // Retain this tile's input; union_within_workspace grants
                     // overlay scratch one component at a time, not per tile.
                     price = price.saturating_add(points.saturating_mul(16));
-                    require_fill_bytes(price.saturating_add(cells.capacity_bytes()), self.budget)?;
+                    require_fill_bytes(price.saturating_add(cells.capacity_bytes()), budget)?;
                     let mut ring = Vec::with_capacity(points);
                     let mut buffer = [0u8; 8192];
                     let mut remaining = points;
@@ -1592,15 +1606,84 @@ impl SpillBuckets {
                         price
                             .saturating_add(cells.capacity_bytes())
                             .saturating_add(cells.next_growth_bound()),
-                        self.budget,
+                        budget,
                     )?;
                     add_credit(&mut cells, credit, FILL_SIMPLIFY_PX);
                 }
                 remaining -= count as u64;
             }
         }
-        Ok(Some((key, shapes, cells)))
+        Ok((shapes, cells))
     }
+}
+
+/// One independent pyramid tile. Its workspace is a share of the original
+/// Fill grant; retained indexes and other wave outputs are charged separately.
+fn pyramid_tile(
+    path: &std::path::Path,
+    seed: bool,
+    timers: &super::ExportTimers,
+    budget: usize,
+    reserved: usize,
+) -> Result<Vec<Shape>, super::ExportError> {
+    let (shapes, cells) = SpillBuckets::read_run(path, 0, budget)?;
+    #[cfg(test)]
+    {
+        let input_bytes = shape_capacity_bytes(&shapes) + cells.capacity_bytes();
+        cost_probe::update(|c| {
+            c.bucket_peak = c.bucket_peak.max(input_bytes);
+            c.live_peak = c.live_peak.max(input_bytes + reserved);
+        });
+    }
+    #[cfg(not(test))]
+    let _ = reserved;
+    if seed {
+        fill_from_cells_timed(shapes, cells, timers, budget)
+    } else {
+        debug_assert!(cells.is_empty());
+        fill_for_tile_timed(shapes, timers, budget)
+    }
+}
+
+fn pyramid_lanes(available: usize) -> usize {
+    (available / WORKSPACE_FLOOR_BYTES)
+        .saturating_sub(2)
+        .max(1)
+        .min(rayon::current_num_threads())
+}
+
+fn pyramid_wave(
+    jobs: &[(u64, tempfile::TempPath)],
+    seed: bool,
+    timers: &super::ExportTimers,
+    available: usize,
+    reserved: usize,
+) -> Result<Option<Vec<Vec<Shape>>>, super::ExportError> {
+    use rayon::prelude::*;
+    let parallel = if jobs.len() > 1 {
+        let share = available / (jobs.len() + 2);
+        let result: Result<Vec<_>, super::ExportError> = jobs
+            .par_iter()
+            .map(|(_, path)| pyramid_tile(path, seed, timers, share, reserved))
+            .collect();
+        match result {
+            Ok(fills) => Some(fills),
+            // A tile may fit the whole grant but not a parallel
+            // share. Drop every wave output and retry serially from
+            // the unchanged runs; a true oversized tile still errors.
+            Err(super::ExportError::BudgetExceeded { .. }) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    #[cfg(test)]
+    cost_probe::update(|c| {
+        c.pyramid_wave_tiles = c
+            .pyramid_wave_tiles
+            .max(parallel.as_ref().map_or(1, Vec::len));
+    });
+    Ok(parallel)
 }
 
 /// One seed batch: every polygon clipped into its tiles at `seed_zoom`,
@@ -1625,6 +1708,8 @@ fn seed_batch(
     // The whole batch is the fill's seed time; its decode is not the
     // export's own `decode` stage.
     let _seed = super::ExportTimers::scope(&timers.fill_seed);
+    #[cfg(test)]
+    cost_probe::update(|c| c.seed_windows += 1);
     let schema = batch.schema();
     let geom_idx = super::batch_geometry_index(batch, geometry)?;
     let geoms = super::decode_batch_geometries(
@@ -1788,9 +1873,15 @@ pub(super) fn build_fill_map(
             for batch in rx.iter() {
                 // Bound the parallel clip/simplify results as well as the
                 // retained runs. Slicing preserves Arrow and feature order.
-                for offset in (0..batch.num_rows()).step_by(128) {
+                // The 32 MiB floor keeps the original 128-row window. A
+                // larger grant amortizes Rayon dispatch and run opens; the
+                // same byte guards still check the materialized capacities.
+                let rows = 128usize
+                    .saturating_mul((workspace / WORKSPACE_FLOOR_BYTES).max(1))
+                    .min(super::EXPORT_BATCH_SIZE);
+                for offset in (0..batch.num_rows()).step_by(rows) {
                     seed_batch(
-                        &batch.slice(offset, (batch.num_rows() - offset).min(128)),
+                        &batch.slice(offset, (batch.num_rows() - offset).min(rows)),
                         FillSeed {
                             geometry,
                             crs,
@@ -1822,83 +1913,101 @@ pub(super) fn build_fill_map(
         let mut snapped = ZoomBuilder::new(opts)?;
         let mut tile_count = 0usize;
         let mut area = 0.0;
-        while let Some((key, shapes, cells)) = buckets.pop_first(
-            parents
-                .tiles
-                .len()
-                .saturating_mul(512)
-                .saturating_add(map.resident_bytes())
-                .saturating_add(snapped.resident_bytes()),
-        )? {
-            #[cfg(test)]
-            let input_bytes = shape_capacity_bytes(&shapes) + cells.capacity_bytes();
-            #[cfg(test)]
-            cost_probe::update(|c| {
-                c.bucket_peak = c.bucket_peak.max(input_bytes);
-                c.live_peak = c
-                    .live_peak
-                    .max(input_bytes + map.resident_bytes() + snapped.resident_bytes());
-            });
-            let reserved = map.resident_bytes()
+        while !buckets.tiles.is_empty() {
+            let fixed = map.resident_bytes()
                 + snapped.resident_bytes()
                 + (buckets.tiles.len() + parents.tiles.len()) * 512;
-            let tile_workspace = workspace.saturating_sub(reserved);
-            let fill = if zoom == seed_zoom {
-                fill_from_cells_timed(shapes, cells, timers, tile_workspace)?
-            } else {
-                debug_assert!(cells.is_empty());
-                fill_for_tile_timed(shapes, timers, tile_workspace)?
-            };
-            let fills = [(key, fill)];
-            let fill = &fills[0].1;
-            #[cfg(test)]
-            note_capacity(
-                "unioned",
-                &SeedBuckets::new(),
-                &fills,
-                map.resident_bytes() + snapped.resident_bytes(),
-            );
-            if !fill.is_empty() {
-                let polys = to_tile_polygons(fill, scale);
-                if !polys.is_empty() {
-                    snapped.append(
-                        key,
-                        &polys,
-                        map.resident_bytes()
-                            + (buckets.tiles.len() + parents.tiles.len()) * 512
-                            + shape_capacity_bytes(fill),
-                        workspace,
+            let available = workspace.saturating_sub(fixed);
+            // Each concurrent tile gets at least the floor. Reserve two
+            // additional shares for snapping/lifting during ordered commit,
+            // while the other wave outputs are still resident. Bounded's
+            // floor-sized grant keeps its original serial heap envelope.
+            let lanes = pyramid_lanes(available);
+            let jobs: Vec<_> = (0..lanes)
+                .filter_map(|_| buckets.tiles.pop_first())
+                .collect();
+            let parallel = pyramid_wave(&jobs, zoom == seed_zoom, timers, available, fixed)?;
+            let mut held = parallel.as_ref().map_or(0, |fills| {
+                fills.iter().map(shape_capacity_bytes).sum::<usize>()
+            });
+            let mut parallel = parallel.map(Vec::into_iter);
+            let job_count = jobs.len();
+            // Indexed collection and ordered commit preserve every tile,
+            // shape and parent-run frame order, including f64 credit sums.
+            for (job, (key, path)) in jobs.into_iter().enumerate() {
+                let path_bytes = (job_count - job) * 512;
+                let reserved = map.resident_bytes()
+                    + snapped.resident_bytes()
+                    + (buckets.tiles.len() + parents.tiles.len()) * 512
+                    + path_bytes;
+                let fill = if let Some(fills) = &mut parallel {
+                    let fill = fills.next().expect("one result per pyramid job");
+                    held -= shape_capacity_bytes(&fill);
+                    fill
+                } else {
+                    pyramid_tile(
+                        &path,
+                        zoom == seed_zoom,
+                        timers,
+                        workspace.saturating_sub(reserved),
+                        reserved,
+                    )?
+                };
+                let fills = [(key, fill)];
+                let fill = &fills[0].1;
+                #[cfg(test)]
+                note_capacity(
+                    "unioned",
+                    &SeedBuckets::new(),
+                    &fills,
+                    map.resident_bytes() + snapped.resident_bytes() + held + path_bytes,
+                );
+                if !fill.is_empty() {
+                    let polys = to_tile_polygons(fill, scale);
+                    if !polys.is_empty() {
+                        snapped.append(
+                            key,
+                            &polys,
+                            map.resident_bytes()
+                                + (buckets.tiles.len() + parents.tiles.len()) * 512
+                                + shape_capacity_bytes(fill)
+                                + held
+                                + path_bytes,
+                            workspace,
+                        )?;
+                    }
+                }
+                #[cfg(test)]
+                note_capacity(
+                    "snapped",
+                    &SeedBuckets::new(),
+                    &fills,
+                    map.resident_bytes() + snapped.resident_bytes() + held + path_bytes,
+                );
+                tile_count += 1;
+                area += fill.iter().map(|s| net_area(s)).sum::<f64>();
+                if zoom > min_zoom {
+                    vertices += fill.iter().flatten().map(Vec::len).sum::<usize>();
+                    let (x, y) = super::key_to_xy(key, zoom);
+                    let parent = crate::pmtiles_writer::tile_id(zoom - 1, x / 2, y / 2);
+                    let mut lifted = Vec::new();
+                    lift_into_parent(fill, x & 1, y & 1, &mut lifted);
+                    parents.append(
+                        parent,
+                        &lifted,
+                        &[],
+                        buckets
+                            .tiles
+                            .len()
+                            .saturating_mul(512)
+                            .saturating_add(shape_capacity_bytes(&fills[0].1))
+                            .saturating_add(shape_capacity_bytes(&lifted))
+                            .saturating_add(map.resident_bytes())
+                            .saturating_add(snapped.resident_bytes())
+                            .saturating_add(held)
+                            .saturating_add(path_bytes),
                     )?;
                 }
-            }
-            #[cfg(test)]
-            note_capacity(
-                "snapped",
-                &SeedBuckets::new(),
-                &fills,
-                map.resident_bytes() + snapped.resident_bytes(),
-            );
-            tile_count += 1;
-            area += fill.iter().map(|s| net_area(s)).sum::<f64>();
-            if zoom > min_zoom {
-                vertices += fill.iter().flatten().map(Vec::len).sum::<usize>();
-                let (x, y) = super::key_to_xy(key, zoom);
-                let parent = crate::pmtiles_writer::tile_id(zoom - 1, x / 2, y / 2);
-                let mut lifted = Vec::new();
-                lift_into_parent(fill, x & 1, y & 1, &mut lifted);
-                parents.append(
-                    parent,
-                    &lifted,
-                    &[],
-                    buckets
-                        .tiles
-                        .len()
-                        .saturating_mul(512)
-                        .saturating_add(shape_capacity_bytes(&fills[0].1))
-                        .saturating_add(shape_capacity_bytes(&lifted))
-                        .saturating_add(map.resident_bytes())
-                        .saturating_add(snapped.resident_bytes()),
-                )?;
             }
         }
         log::debug!(
@@ -2007,8 +2116,7 @@ mod tests {
     /// The production grant may be larger; 32 MiB is not its cap.
     /// These capacity observations are a lower bound on peak live heap:
     /// exceeding them proves the budget is exceeded without an RSS threshold.
-    #[test]
-    fn phase1_fill_prepass_respects_live_byte_budget() {
+    fn fixture_fill_counts(profile: crate::overview::level::MemoryProfile) -> cost_probe::Counts {
         use crate::overview::convert::{convert_to_overviews, ConvertOptions, LevelPlan};
         let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/realdata/ftw-moldova-z10.parquet");
@@ -2027,23 +2135,77 @@ mod tests {
         )
         .expect("convert the fixed Moldova fixture");
         cost_probe::take();
-        super::super::export_pmtiles(
+        super::super::export_pmtiles_run(
             overview,
             dir.path().join("out.pmtiles"),
             &super::super::ExportOptions {
                 coverage_fill: true,
-                profile: crate::overview::level::MemoryProfile::Bounded,
+                profile,
                 ..Default::default()
+            },
+            super::super::DEFAULT_PARTITION_TARGET,
+            &super::super::Pass2Knobs {
+                force_legacy_pass2: false,
+                backing_override: None,
+                concurrent_levels: true,
+                checkpoint_interval: super::super::CHECKPOINT_INTERVAL,
+                fail_level: None,
+                memory_limit: None,
+                // Pin the grant; this work counter must not depend on the
+                // host's available RAM or another test's memory pressure.
+                budget_available: Some(4 << 30),
             },
         )
         .expect("export with fill");
-        let counts = cost_probe::take();
+        cost_probe::take()
+    }
+
+    #[test]
+    fn phase1_fill_prepass_respects_live_byte_budget() {
+        let counts = fixture_fill_counts(crate::overview::level::MemoryProfile::Bounded);
         eprintln!("prepass retained capacity: {counts:?}");
         assert!(counts.bucket_peak > 0 && counts.map_peak > 0);
         assert!(
             counts.live_peak <= 32 * 1024 * 1024,
             "32 MiB workspace exceeded (map nodes and union scratch excluded): {counts:?}"
         );
+    }
+
+    /// A large Fill grant must buy tile concurrency and amortize seed
+    /// dispatch, rather than retain the floor's serial/small-window shape.
+    #[test]
+    fn phase5_auto_fill_uses_granted_parallelism() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let counts = fixture_fill_counts(crate::overview::level::MemoryProfile::Auto);
+            assert!(counts.pyramid_wave_tiles >= 2, "serial pyramid: {counts:?}");
+            assert!(counts.seed_windows <= 4, "tiny seed dispatches: {counts:?}");
+        });
+    }
+
+    #[test]
+    fn pyramid_wave_share_overflow_keeps_runs_for_serial_retry() {
+        let opts = super::super::ExportOptions::default();
+        let mut runs = SpillBuckets::new(&opts, WORKSPACE_FLOOR_BYTES);
+        for key in 1..=2 {
+            runs.append(key, &[square(10.0, 10.0, 100.0)], &[], 0)
+                .unwrap();
+        }
+        let jobs: Vec<_> = runs.tiles.into_iter().collect();
+        let timers = super::super::ExportTimers::default();
+        // A deliberately tiny share fails before consuming either run.
+        assert!(pyramid_wave(&jobs, true, &timers, 512, 0)
+            .unwrap()
+            .is_none());
+        for (_, path) in jobs {
+            assert_eq!(
+                pyramid_tile(&path, true, &timers, WORKSPACE_FLOOR_BYTES, 0).unwrap(),
+                fill_from(vec![square(10.0, 10.0, 100.0)], Vec::new()),
+            );
+        }
     }
 
     /// #767: east-west strips share x but have disjoint y ranges. Pin the
