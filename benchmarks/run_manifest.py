@@ -584,7 +584,7 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
     with log.open("w") as logf:
         proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.PIPE, text=True,  # noqa: S603
                                 env=env, start_new_session=True)
-        outcome = {"cap": None, "peak_poll_kib": 0, "scratch_peak": 0, "watch_peak": 0}
+        outcome = {"cap": None, "peak_poll_kib": 0, "scratch_peak": 0, "watch_peak": 0, "cgroup": None}
         watch_dir = scratch / caps["watch"] if caps.get("watch") else None
 
         def watch() -> None:
@@ -596,6 +596,8 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
                     outcome["scratch_peak"] = max(outcome["scratch_peak"], dir_bytes(scratch))
                 if watch_dir:  # a cell's own watched subdirectory, every tick
                     outcome["watch_peak"] = max(outcome["watch_peak"], dir_bytes(watch_dir))
+                if caps.get("memory_max"):  # the scope's own counters, gone once it exits
+                    outcome["cgroup"] = scope_memory(proc.pid) or outcome["cgroup"]
                 tick += 1
                 elapsed = time.monotonic() - t0
                 reason = ("RSS_CAP" if rss > cap_kib else "TIMEOUT" if elapsed > wall_s
@@ -640,8 +642,25 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
         "context_cores": round(context, 2) if context is not None else None,
         "scratch_peak_mib": round(outcome["scratch_peak"] / (1 << 20)),
         "watch_peak_mib": round(outcome["watch_peak"] / (1 << 20), 1) if watch_dir else None,
+        "cgroup_memory": outcome["cgroup"],
         "stderr_tail": stderr[-2500:] if status != "ok" else None,
     }
+
+
+def scope_memory(pid: int) -> dict | None:
+    """memory.events and memory.peak of the transient scope `pid` runs in
+    (None until systemd-run has moved it into a `run-*.scope`)."""
+    try:
+        path = Path("/proc", str(pid), "cgroup").read_text().strip().split("::", 1)[1]
+        if not path.endswith(".scope"):
+            return None
+        cg = Path("/sys/fs/cgroup") / path.lstrip("/")
+        events = dict(ln.split() for ln in (cg / "memory.events").read_text().splitlines())
+        peak = (cg / "memory.peak").read_text().strip() if (cg / "memory.peak").exists() else None
+    except (OSError, IndexError, ValueError):
+        return None
+    return {"scope": path, "events": {k: int(v) for k, v in events.items()},
+            "peak_mib": round(int(peak) / (1 << 20), 1) if peak else None}
 
 
 def output_digest(out_dir: Path, output: str) -> dict:
@@ -725,7 +744,7 @@ class Runner:
         if self.args.dry_run:
             return 1
         n = self.args.pairs or cell["pairs"] or MIN_PAIRS
-        if n < MIN_PAIRS and not cell["heavy"]:
+        if n < MIN_PAIRS and not cell["heavy"] and not self.args.few_pairs:
             raise ManifestError(f"pairs={n}: a timing run needs at least {MIN_PAIRS}")
         return n
 
@@ -825,7 +844,7 @@ class Runner:
             shutil.rmtree(out)
         (out / "tmp").mkdir(parents=True)
         if cell.get("watch"):  # e.g. a --spill-dir, which must exist beforehand
-            (out / cell["watch"]).mkdir(parents=True)
+            (out / cell["watch"]).mkdir(parents=True, exist_ok=True)
         prof = cdir / f"{tag}.profile.jsonl"
         prof.unlink(missing_ok=True)
         argv = [b["path"], *build_argv(cell, {**subs, "out": str(out)})]
@@ -1035,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--pairs", type=int, help=f"rounds per cell (at least {MIN_PAIRS})")
     run.add_argument("--warmup", type=int, help="untimed runs of the first binary before a cell's rounds "
                      "(manifest default)")
+    run.add_argument("--few-pairs", action="store_true",
+                     help=f"allow --pairs below {MIN_PAIRS} on a light cell (a short, asked-for check)")
     run.add_argument("--dry-run", action="store_true", help="one round per cell; not a baseline")
     run.add_argument("--force", action="store_true", help="rerun cells that already have results")
     run.add_argument("--load-max", type=float, help="load gate threshold (manifest default)")

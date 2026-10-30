@@ -369,6 +369,8 @@ output = "out.pmtiles"
 zoom = [0, 13]
 flags = ["--profile", "bounded"]
 memory_max = "4G"
+# Spill and the intermediate overview land in $TMPDIR ({out}/tmp): watched.
+watch = "tmp"
 
 # Resume: replay a saved convert plan, skipping pass 1 and the assignment.
 [cells.resume]
