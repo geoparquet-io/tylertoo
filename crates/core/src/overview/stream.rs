@@ -69,7 +69,7 @@ use super::procmem::{
 };
 #[cfg(test)]
 use super::read::read_in_order;
-use super::read::{footer_row_bytes, grant_read_ahead, ReadFlow, ReadPass, ReadTuning};
+use super::read::{footer_price, grant_read_ahead, FooterPrice, ReadFlow, ReadPass, ReadTuning};
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
@@ -118,8 +118,8 @@ struct Pass2Inputs<'a> {
     out_schema: &'a Schema,
     num_rows: usize,
     geom_bytes: u64,
-    /// Footer bytes per input row over every column ([`footer_row_bytes`]).
-    row_bytes: Option<u64>,
+    /// What the footers say pass 2 decodes ([`footer_price`]).
+    footer: Option<FooterPrice>,
 }
 
 struct AssignmentInputs<'a> {
@@ -1109,6 +1109,126 @@ fn build_level_ctxs<'a>(
 /// directly — never buffered or spilled).
 type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 
+/// Spilled bytes per Arrow byte the spill writer puts on disk: the spill
+/// codec's ratio. Owned by the spill (track C1, #715: LZ4 under `bounded`);
+/// 1.0 is today's uncompressed Arrow IPC until the sink exposes its own.
+fn spill_bytes_per_arrow_byte() -> f64 {
+    1.0
+}
+
+/// What [`reserve_spill_cache`] sizes the spill from.
+struct SpillPlan<'a> {
+    emitted: &'a [EmitLevel],
+    finest: usize,
+    row_bytes: Option<u64>,
+    avg_geom_bytes: Option<u64>,
+}
+
+/// What [`reserve_spill_cache`] reserved, and why (`TYLERTOO_PROFILE_JSON`
+/// `pass2.spill_reservation`).
+#[derive(Clone, Copy, Debug, Default)]
+struct SpillReservation {
+    /// The spill's footer-priced size; 0 when it was not priced.
+    estimate_bytes: u64,
+    reserved_bytes: u64,
+    reason: &'static str,
+}
+
+/// Reserve the spill's page cache before any pass-2 grant (#716), when that
+/// can help.
+///
+/// Under a cgroup limit the kernel charges page cache to the same limit as
+/// the heap, and a spilling pass 2 writes every buffered level to disk and
+/// reads it all back in the drain. When the spill fits the allowance, it is
+/// reserved first, priced per buffered row at the footers' decoded row (an
+/// Arrow IPC row is its Arrow bytes) times the codec's ratio, and the
+/// read-ahead, window and encodes size against what is left.
+///
+/// When it does not fit, nothing is reserved: the cache cannot hold it
+/// anyway, and reserving it all only starves the grants. Measured
+/// (`.788/PROFILE-LOG.md`): Mato Grosso `tiles --profile bounded` under a 4
+/// GiB `MemoryMax`, 5.3 GB of spill, priced 23.4 GB. Reserving it dropped
+/// every grant to its floor (window 1), and pass 2 took 101.6-111.3 s
+/// against 64-126 s on main. Without a cgroup limit page cache is not
+/// charged to the budget, and a run that keeps its levels in RAM has no
+/// spill.
+fn reserve_spill_cache(
+    budget: &mut MemoryBudget,
+    options: &ConvertOptions,
+    plan: SpillPlan<'_>,
+) -> SpillReservation {
+    let skip = |reason| SpillReservation {
+        reason,
+        ..SpillReservation::default()
+    };
+    let Some(limit) = budget.limit else {
+        return skip("no memory limit");
+    };
+    if !matches!(
+        limit.source,
+        pipeline::MemoryLimitSource::CgroupMax | pipeline::MemoryLimitSource::CgroupHigh
+    ) {
+        return skip("page cache is not charged to this limit");
+    }
+    let SpillPlan {
+        emitted,
+        finest,
+        row_bytes,
+        avg_geom_bytes,
+    } = plan;
+    // The levels pass 2 buffers: all but a finest level it streams (the same
+    // rule `run_pass2_levels` reads off the level contexts).
+    let streams_last = matches!(options.mode, Mode::Partitioning)
+        || emitted.last().is_some_and(|e| e.orig as usize == finest);
+    let buffered = if streams_last {
+        emitted.len().saturating_sub(1)
+    } else {
+        emitted.len()
+    };
+    let buffered_rows: usize = emitted[..buffered].iter().map(|e| e.hint).sum();
+    let spills = match options.profile {
+        super::level::MemoryProfile::Speed => false,
+        super::level::MemoryProfile::Bounded => true,
+        super::level::MemoryProfile::Auto => matches!(
+            pipeline::auto_backing(
+                options.mode,
+                buffered_rows,
+                budget.available(),
+                avg_geom_bytes
+            ),
+            pipeline::SinkBacking::Spill
+        ),
+    };
+    if !spills || buffered_rows == 0 {
+        return skip("nothing spills");
+    }
+    let arrow_bytes = row_bytes.map_or_else(
+        || budget.sink_estimate(options.mode, buffered_rows, avg_geom_bytes),
+        |row| (buffered_rows as u64).saturating_mul(row),
+    );
+    let estimate_bytes = (arrow_bytes as f64 * spill_bytes_per_arrow_byte()) as u64;
+    let reservation = if estimate_bytes <= budget.remaining() {
+        SpillReservation {
+            estimate_bytes,
+            reserved_bytes: budget.reserve_up_to(MemoryPhase::Spill, estimate_bytes),
+            reason: "fits the allowance",
+        }
+    } else {
+        SpillReservation {
+            estimate_bytes,
+            reserved_bytes: 0,
+            reason: "exceeds the allowance",
+        }
+    };
+    log::info!(
+        "[convert] spill page cache: {} of {estimate_bytes} B reserved under the {} ({buffered_rows} buffered row(s)): {}",
+        reservation.reserved_bytes,
+        limit.source.describe(),
+        reservation.reason,
+    );
+    reservation
+}
+
 /// What one pass-2 read holds from the run's budget (#716): its read-ahead
 /// and its compute window, granted in that order so the window sizes against
 /// what the read-ahead left. Released once the read is done, so the next
@@ -1142,7 +1262,7 @@ fn grant_pass2_read(
     let read = grant_read_ahead(budget, read_tuning, channel);
     let price = budget.window_price(
         read_tuning.batch_size.max(1),
-        read_tuning.row_bytes,
+        read_tuning.footer.map(|f| f.row_bytes),
         fanout,
         levels,
         read_tuning.avg_geom_bytes,
@@ -1184,7 +1304,7 @@ fn run_pass2_levels(
         out_schema,
         num_rows,
         geom_bytes,
-        row_bytes,
+        footer,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
@@ -1200,7 +1320,7 @@ fn run_pass2_levels(
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Build, options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
-        row_bytes,
+        footer,
         profile: options.profile,
     };
     // Output rows per input row across `levels`, from the plan's per-level
@@ -1760,7 +1880,7 @@ fn create_level_writer(
 /// the column writers' pages and the encoded chunks waiting to be appended.
 /// Measured (`.788/PROFILE-LOG.md`, dhat, `bounded` under a 2 GiB budget, 4
 /// encodes): NZ parcels' writer held 54.8 MiB per encode at its peak, 4.8×
-/// a 10,000-row group of [`footer_row_bytes`]; Moldova's 17 MiB, 0.84×.
+/// a 10,000-row group of [`footer_price`]; Moldova's 17 MiB, 0.84×.
 /// Priced at the worse one.
 const ENCODE_COPIES: u64 = 5;
 
@@ -2486,7 +2606,7 @@ fn pass1_read_tuning(
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Scan, options.read_workers),
         avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
-        row_bytes: None,
+        footer: None,
         profile: options.profile,
     }
 }
@@ -3177,11 +3297,12 @@ pub(crate) fn run_stages(
                                                         // #716/#545: footer bytes per input row over every column pass 2 reads;
                                                         // they price the writer's encodes, the read-ahead and the window.
     let mut budget = budget;
-    let row_bytes = footer_row_bytes(
+    let footer = footer_price(
         source,
         selected_row_groups.as_ref(),
         0..descriptor.schema().fields().len(),
     )?;
+    let row_bytes = footer.map(|f| f.row_bytes);
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
@@ -3227,6 +3348,16 @@ pub(crate) fn run_stages(
         diagnostics,
     );
 
+    let spill_reservation = reserve_spill_cache(
+        &mut budget,
+        options,
+        SpillPlan {
+            emitted,
+            finest,
+            row_bytes,
+            avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+        },
+    );
     let LevelWriter {
         mut writer,
         source_schema,
@@ -3306,7 +3437,7 @@ pub(crate) fn run_stages(
             out_schema: &out_schema,
             num_rows,
             geom_bytes,
-            row_bytes,
+            footer,
         },
         strategy,
     )?;
@@ -3368,6 +3499,7 @@ pub(crate) fn run_stages(
             rss_sampler_report,
             in_flight_batches,
             sink_measurement,
+            spill_reservation,
             pass1_memory: preflight_report,
         },
         diagnostics,
@@ -3471,6 +3603,8 @@ struct ProfileJsonContext<'a> {
     /// #626: what a buffered pass-2 row really cost, measured over every
     /// buffered output batch of the pass.
     sink_measurement: pipeline::SinkMeasurement,
+    /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
+    spill_reservation: SpillReservation,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
 }
@@ -3504,6 +3638,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
             rss_sampler_report: ctx.rss_sampler_report,
             in_flight_batches: ctx.in_flight_batches,
             sink_measurement: ctx.sink_measurement,
+            spill_reservation: ctx.spill_reservation,
             pass1_memory: ctx.pass1_memory,
         },
         diagnostics,
@@ -3558,6 +3693,8 @@ struct ProfileJsonInputs<'a> {
     /// #626: the measured per-buffered-row sink cost and the `auto` verdict
     /// that came out of it (`pass2.sink` in the dump).
     sink_measurement: pipeline::SinkMeasurement,
+    /// #716: the spill page-cache reservation (`pass2.spill_reservation`).
+    spill_reservation: SpillReservation,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict
     /// (`pass1_memory_preflight` in the dump).
     pass1_memory: super::convert::Pass1MemoryReport,
@@ -3711,6 +3848,14 @@ fn write_profile_json(
             // Ram→Spill downgrade. `bytes_per_row` is null when nothing was
             // buffered (the Serial path, or a single-level ladder).
             "sink": sink_json(inputs.sink_measurement),
+            // #716: the spill's page cache, reserved from the budget before
+            // any pass-2 grant when a cgroup charges it and the spill fits
+            // the allowance; `reason` says why it was or was not.
+            "spill_reservation": {
+                "estimate_bytes": inputs.spill_reservation.estimate_bytes,
+                "reserved_bytes": inputs.spill_reservation.reserved_bytes,
+                "reason": inputs.spill_reservation.reason,
+            },
             // #494: how many input batches the consumers processed at once.
             // `batches` sums both pass-2 reads (the buffered levels and the
             // streamed finest level); `max_window` stuck at 1 means the
@@ -5392,7 +5537,7 @@ fn run_pass1_with_chunk_rows(
     let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
     let mut read_tuning = pass1_read_tuning(*ctx.budget, options, geom_bytes, selected_rows);
     // #716: pass 1's batches carry only its projection; price them by it.
-    read_tuning.row_bytes = footer_row_bytes(source, row_groups, cols.iter().copied())?;
+    read_tuning.footer = footer_price(source, row_groups, cols.iter().copied())?;
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -7041,7 +7186,7 @@ mod tests {
                 batch_size: READ_BATCH_SIZE,
                 workers: 4,
                 avg_geom_bytes: None,
-                row_bytes: None,
+                footer: None,
                 profile: MemoryProfile::Auto,
             },
         );
@@ -8466,7 +8611,7 @@ mod tests {
             batch_size: 8, // 50 read batches for the producer to push
             workers: 1,
             avg_geom_bytes: None,
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Speed,
         };
         match write_level_streaming(
@@ -8609,7 +8754,7 @@ mod tests {
                 batch_size: 1,
                 workers,
                 avg_geom_bytes: None,
-                row_bytes: None,
+                footer: None,
                 profile: MemoryProfile::Speed,
             },
             |batch, offset, _| {
@@ -9496,5 +9641,65 @@ mod tests {
                 assert_eq!(got, want, "mask {mask:?}");
             }
         }
+    }
+
+    /// #716: the spill's page cache is reserved before the pass-2 grants only
+    /// under a cgroup limit, only when the run spills, and only when the
+    /// footer-priced spill fits the allowance; otherwise nothing is reserved
+    /// and the reason is recorded.
+    #[test]
+    fn the_spill_cache_is_reserved_only_when_it_fits_a_cgroup_allowance() {
+        use super::super::pipeline::{MemoryLimit, MemoryLimitSource};
+        let levels: Vec<EmitLevel> = (0..3u8)
+            .map(|i| EmitLevel {
+                orig: i,
+                gsd: 1000.0 / f64::from(i + 1),
+                zoom: Some(i),
+                hint: 1_000,
+            })
+            .collect();
+        let bounded = ConvertOptions {
+            profile: MemoryProfile::Bounded,
+            ..ConvertOptions::default()
+        };
+        let reserve = |bytes: u64, source, options: &ConvertOptions, row: u64| {
+            let mut budget = MemoryBudget::from_limit(Some(MemoryLimit { bytes, source }));
+            let r = reserve_spill_cache(
+                &mut budget,
+                options,
+                SpillPlan {
+                    emitted: &levels,
+                    finest: 2,
+                    row_bytes: Some(row),
+                    avg_geom_bytes: None,
+                },
+            );
+            (r, budget.remaining())
+        };
+        // Two buffered levels (the finest streams) of 1,000 rows at 100 B:
+        // 200,000 B, which fits 0.6 × 1 MB.
+        let (fits, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 100);
+        assert_eq!(
+            (fits.estimate_bytes, fits.reserved_bytes, fits.reason),
+            (200_000, 200_000, "fits the allowance")
+        );
+        assert_eq!(left, 480_000);
+        // A spill past the allowance reserves nothing: the cache cannot hold
+        // it, and reserving it would only starve the grants.
+        let (big, left) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &bounded, 1_000);
+        assert_eq!(
+            (big.reserved_bytes, big.reason),
+            (0, "exceeds the allowance")
+        );
+        assert_eq!(left, 600_000);
+        // Page cache is not charged to MemAvailable, and `speed` never spills.
+        let (free, _) = reserve(1_000_000, MemoryLimitSource::MemAvailable, &bounded, 100);
+        assert_eq!(free.reserved_bytes, 0);
+        let speed = ConvertOptions {
+            profile: MemoryProfile::Speed,
+            ..ConvertOptions::default()
+        };
+        let (none, _) = reserve(1_000_000, MemoryLimitSource::CgroupMax, &speed, 100);
+        assert_eq!((none.reserved_bytes, none.reason), (0, "nothing spills"));
     }
 }

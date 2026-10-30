@@ -56,8 +56,8 @@ pub(super) enum MemoryPhase {
     Encode,
     /// The pass-2 output sink (it takes [`MemoryBudget::remaining`]).
     Write,
-    /// Spill queues (track C1).
-    #[expect(dead_code, reason = "#788: track C1 grants the spill queues under it")]
+    /// Spill queues (track C1), and under a cgroup limit the page cache a
+    /// spilling pass 2 reads its spill back through (#716).
     Spill,
     /// Export's tile collection (track E1).
     #[expect(dead_code, reason = "#788: track E1 grants export collection under it")]
@@ -378,6 +378,17 @@ impl MemoryBudget {
     /// Data that must be resident (the retained input stays resident across
     /// every later phase): charge it all or fail. Charged before any
     /// allowance is calculated from this budget.
+    /// Reserve up to `bytes` for `phase`, as much as is available, and never
+    /// fail: a working set the run is better off holding than not (the
+    /// spill's page cache under a cgroup limit). Nothing when unprobed.
+    /// Returns what was reserved.
+    pub(super) fn reserve_up_to(&mut self, phase: MemoryPhase, bytes: u64) -> u64 {
+        let taken = self.available().map_or(0, |available| available.min(bytes));
+        let slot = &mut self.reserved[phase as usize];
+        *slot = slot.saturating_add(taken);
+        taken
+    }
+
     pub(super) fn reserve(&mut self, phase: MemoryPhase, bytes: u64) -> Result<(), ConvertError> {
         self.require(phase, bytes)?;
         let slot = &mut self.reserved[phase as usize];
@@ -557,6 +568,23 @@ mod tests {
         budget.release(speed);
         budget.release(grant);
         assert_eq!(budget.remaining(), 6_000);
+    }
+
+    /// A soft reservation takes what is there, never fails, and shrinks
+    /// every later grant.
+    #[test]
+    fn reserve_up_to_takes_what_is_available() {
+        let mut budget = MemoryBudget::with_available(Some(10_000));
+        assert_eq!(budget.reserve_up_to(MemoryPhase::Spill, 4_000), 4_000);
+        assert_eq!(budget.remaining(), 3_600);
+        assert_eq!(budget.reserve_up_to(MemoryPhase::Spill, u64::MAX), 6_000);
+        assert_eq!((budget.available(), budget.remaining()), (Some(0), 0));
+        let floor = budget.fit(MemoryPhase::Read, Price::model(10), 8, 2);
+        assert_eq!(floor.units, 2, "grants fall to their floors");
+        assert_eq!(
+            MemoryBudget::with_available(None).reserve_up_to(MemoryPhase::Spill, 9),
+            0
+        );
     }
 
     #[test]

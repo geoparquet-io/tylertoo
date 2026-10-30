@@ -1820,9 +1820,17 @@ with the memory the run may use (#716, #545). On a machine with about 90 GB
 available, Moldova (632k polygons, z0-14) encodes 64 row groups at once
 instead of 4. Its pass 2 then peaks at about 3.9 GiB instead of 2.0 GiB
 (mimalloc) and runs about 1.3× faster. Under a 2 GiB limit the same grants
-shrink: NZ parcels (4.3M polygons) gets 5 encodes, 2 readers and a window of
-1 batch. To hold `bounded` down, set a smaller limit with
+shrink: NZ parcels (4.3M polygons) gets 5 encodes and a window of 1 batch. To hold `bounded` down, set a smaller limit with
 `TYLERTOO_AUTO_MEM_LIMIT_BYTES` or a cgroup memory limit.
+
+Each read worker is also charged for the row group its reader decodes (the
+largest selected row group at the footers' decoded row size), so inputs with
+large row groups get fewer readers under a tight limit. Under a cgroup limit
+the kernel charges the spill's page cache to the same limit. When the
+spill's footer-priced size fits the allowance, pass 2 reserves it before any
+grant. When it does not fit, nothing is reserved, because the cache cannot
+hold it and reserving it would only starve the grants.
+`TYLERTOO_PROFILE_JSON` records the decision under `pass2.spill_reservation`.
 
 ### Automatic memory estimate
 

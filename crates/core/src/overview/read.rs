@@ -31,10 +31,10 @@ pub(super) struct ReadTuning {
     /// (#717), used only to size the read-ahead against the memory budget.
     /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
     pub(super) avg_geom_bytes: Option<u64>,
-    /// Footer bytes per input row over the columns this read decodes
-    /// ([`footer_row_bytes`]): what prices a read batch. `None` falls back to
+    /// What the footers say this read decodes ([`footer_price`]): what
+    /// prices a read batch and a reader's own row group. `None` falls back to
     /// the per-row model floored at a whole decoded batch.
-    pub(super) row_bytes: Option<u64>,
+    pub(super) footer: Option<FooterPrice>,
     /// The run's requested memory profile. `Bounded` means the caller asked
     /// for memory over speed, so a worker's read-ahead queue is capped lower
     /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
@@ -109,8 +109,8 @@ struct ReadShape {
 fn read_batch_price(tuning: ReadTuning) -> Price {
     let batch_size = tuning.batch_size.max(1) as u64;
     let limit = tylertoo_io::decoded_batch_limit();
-    match tuning.row_bytes {
-        Some(row) => Price::new(
+    match tuning.footer {
+        Some(FooterPrice { row_bytes: row, .. }) => Price::new(
             row.saturating_mul(batch_size).clamp(1, limit.max(1)),
             PriceBasis::Footer,
         ),
@@ -124,8 +124,27 @@ fn read_batch_price(tuning: ReadTuning) -> Price {
     }
 }
 
+/// What one reader holds besides its queue, in read batches (#716): the
+/// largest row group it decodes, at the footers' decoded row. Measured
+/// (`.788/PROFILE-LOG.md`, dhat): NZ parcels' pass-1 readers held about 49
+/// MiB each inside the parquet reader under 4 workers, unpriced until then.
+fn reader_batches(tuning: ReadTuning) -> usize {
+    let Some(footer) = tuning.footer else {
+        return 0;
+    };
+    let price = read_batch_price(tuning).bytes.max(1);
+    usize::try_from(
+        footer
+            .row_bytes
+            .saturating_mul(footer.group_rows)
+            .div_ceil(price),
+    )
+    .unwrap_or(usize::MAX)
+}
+
 /// Charge `budget` for the read-ahead `tuning` will hold (#716): every
-/// worker's queue at its resolved depth, plus the `channel` batches queued
+/// worker's queue at its resolved depth and its reader's row group, plus the
+/// `channel` batches queued
 /// between the read and its consumer. `tuning.budget` must be the state
 /// `budget` was in before this call, so [`read_in_order`] resolves the same
 /// shape from it.
@@ -137,7 +156,7 @@ pub(super) fn grant_read_ahead(
     let shape = resolve_read_shape(tuning);
     let batches = shape
         .workers
-        .saturating_mul(shape.depth)
+        .saturating_mul(shape.depth.saturating_add(reader_batches(tuning)))
         .saturating_add(channel);
     budget.fit(
         MemoryPhase::Read,
@@ -155,16 +174,27 @@ pub(super) fn grant_read_ahead(
 /// byte-array chunks without the statistic) 1.9×. Priced at the worse one.
 const DECODED_PER_FOOTER_BYTE: u64 = 2;
 
+/// What the footers say a read decodes (#716).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FooterPrice {
+    /// Decoded bytes per row over the read's columns.
+    pub(super) row_bytes: u64,
+    /// Rows in the largest selected row group: what one reader decodes at
+    /// once.
+    pub(super) group_rows: u64,
+}
+
 /// Decoded bytes per row over `columns` of the selected row groups, from the
 /// footers: each column's uncompressed size, or its unencoded byte-array
 /// size when larger ([`ConvertSource::selected_column_bytes`]), times
 /// [`DECODED_PER_FOOTER_BYTE`], plus 8 bytes per column for the offsets and
-/// validity a decoded column adds. `None` without rows.
-pub(super) fn footer_row_bytes(
+/// validity a decoded column adds; and the largest selected row group's
+/// rows. `None` without rows.
+pub(super) fn footer_price(
     source: &ConvertSource,
     row_groups: Option<&RowGroupSelection>,
     columns: impl IntoIterator<Item = usize>,
-) -> Result<Option<u64>, ConvertError> {
+) -> Result<Option<FooterPrice>, ConvertError> {
     let rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
     if rows == 0 {
         return Ok(None);
@@ -175,13 +205,27 @@ pub(super) fn footer_row_bytes(
         bytes = bytes.saturating_add(source.selected_column_bytes(row_groups, column)?);
         count += 1;
     }
-    Ok(Some(
-        bytes
+    let counts = source.part_row_group_row_counts()?;
+    let group_rows = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(part, groups)| {
+            let picked: Vec<usize> = row_groups
+                .and_then(|s| s.parts().get(part))
+                .map_or_else(|| (0..groups.len()).collect(), Clone::clone);
+            picked.into_iter().filter_map(|g| groups.get(g).copied())
+        })
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64;
+    Ok(Some(FooterPrice {
+        row_bytes: bytes
             .div_ceil(rows)
             .saturating_mul(DECODED_PER_FOOTER_BYTE)
             .saturating_add(count.saturating_mul(8))
             .max(1),
-    ))
+        group_rows,
+    }))
 }
 
 /// Size the parallel read against the memory budget.
@@ -205,6 +249,7 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let affordable = tuning
         .budget
         .affordable(MemoryPhase::Read, read_batch_price(tuning));
+    let reader = reader_batches(tuning);
     let max_depth = match tuning.profile {
         MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
         MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
@@ -216,11 +261,15 @@ fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     // decrementing loop this was O(workers) — unbounded, since an explicit
     // `--read-workers` is the caller's number, and `--read-workers
     // 18446744073709551615` hung the process before it read a byte.
+    // Each worker also holds its reader's own row group (`reader`, in
+    // batches), so the floor it must afford is that plus the minimum queue.
     let workers = tuning
         .workers
         .max(1)
-        .min((affordable / READ_AHEAD_MIN_BATCHES).max(1));
-    let depth = (affordable / workers).clamp(READ_AHEAD_MIN_BATCHES, max_depth);
+        .min((affordable / (READ_AHEAD_MIN_BATCHES + reader)).max(1));
+    let depth = (affordable / workers)
+        .saturating_sub(reader)
+        .clamp(READ_AHEAD_MIN_BATCHES, max_depth);
     ReadShape {
         workers,
         depth,
@@ -820,7 +869,7 @@ mod read_tests {
                 // Tiny rows: the read-ahead sizing must not silently collapse
                 // the worker count in these fixtures.
                 avg_geom_bytes: Some(8),
-                row_bytes: None,
+                footer: None,
                 profile: MemoryProfile::Auto,
             },
             |batch, offset, _dur| {
@@ -866,7 +915,7 @@ mod read_tests {
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Auto,
         });
         let segments = plan_segments(&source, None, shape).unwrap();
@@ -920,7 +969,7 @@ mod read_tests {
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Auto,
         };
         let shape = resolve_read_shape(tuning);
@@ -982,7 +1031,7 @@ mod read_tests {
             batch_size: 96,
             workers: 4,
             avg_geom_bytes: Some(8),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Auto,
         };
         assert!(
@@ -1001,7 +1050,7 @@ mod read_tests {
                     batch_size: 96,
                     workers,
                     avg_geom_bytes: Some(8),
-                    row_bytes: None,
+                    footer: None,
                     profile: MemoryProfile::Auto,
                 },
                 |batch, offset, _dur| {
@@ -1124,7 +1173,7 @@ mod read_tests {
                     batch_size: 64,
                     workers: 4,
                     avg_geom_bytes: Some(8),
-                    row_bytes: None,
+                    footer: None,
                     profile: MemoryProfile::Auto,
                 },
                 |_batch, _offset, _dur| {
@@ -1155,7 +1204,7 @@ mod read_tests {
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(64),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Auto,
         });
         assert!(shape.workers >= 1 && shape.workers <= 4);
@@ -1179,7 +1228,7 @@ mod read_tests {
             // 512 MiB per row: nothing is affordable.
             workers: 4,
             avg_geom_bytes: Some(512 * 1024 * 1024),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Auto,
         });
         assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
@@ -1193,7 +1242,7 @@ mod read_tests {
             batch_size: 100,
             workers: 8,
             avg_geom_bytes: Some(8),
-            row_bytes: None,
+            footer: None,
             profile: MemoryProfile::Bounded,
         });
         assert_eq!(
@@ -1213,13 +1262,19 @@ mod read_tests {
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(400),
-            row_bytes: Some(1_000),
+            footer: Some(FooterPrice {
+                row_bytes: 1_000,
+                group_rows: 0,
+            }),
             profile: MemoryProfile::Bounded,
         };
         let price = read_batch_price(tuning);
         assert_eq!((price.bytes, price.basis), (8_192_000, PriceBasis::Footer));
         let huge = read_batch_price(ReadTuning {
-            row_bytes: Some(u64::MAX),
+            footer: Some(FooterPrice {
+                row_bytes: u64::MAX,
+                group_rows: 0,
+            }),
             ..tuning
         });
         assert_eq!(huge.bytes, tylertoo_io::decoded_batch_limit());
@@ -1234,10 +1289,54 @@ mod read_tests {
         assert_eq!(resolve_read_shape(tuning), shape);
         // Without footer bytes, the model floored at a whole decoded batch.
         let model = read_batch_price(ReadTuning {
-            row_bytes: None,
+            footer: None,
             ..tuning
         });
         assert_eq!(model.basis, PriceBasis::Model);
         assert!(model.bytes >= tylertoo_io::decoded_batch_limit());
+    }
+
+    /// #716: each read worker is also charged the row group its reader
+    /// decodes, so a large-row-group input under a tight allowance gets fewer
+    /// workers, and the grant covers every worker's row group.
+    #[test]
+    fn each_read_worker_is_charged_its_readers_row_group() {
+        let small = ReadTuning {
+            budget: MemoryBudget::with_available(Some(2 << 30)),
+            batch_size: 8192,
+            workers: 4,
+            avg_geom_bytes: Some(400),
+            footer: Some(FooterPrice {
+                row_bytes: 1_000,
+                group_rows: 8192,
+            }),
+            profile: MemoryProfile::Bounded,
+        };
+        // 0.10 × 0.6 × 2 GiB is 15 batches of 8,192,000 B: a one-batch row
+        // group leaves 3 workers of 4 + 1, as unpriced (15 / 4).
+        assert_eq!(reader_batches(small), 1);
+        assert_eq!(resolve_read_shape(small).workers, 3);
+        // A 65,536-row group is 8 batches per reader: one worker fits.
+        let large = ReadTuning {
+            footer: Some(FooterPrice {
+                row_bytes: 1_000,
+                group_rows: 65_536,
+            }),
+            ..small
+        };
+        assert_eq!(reader_batches(large), 8);
+        let shape = resolve_read_shape(large);
+        assert_eq!(shape.workers, 1);
+        let mut budget = large.budget;
+        let grant = grant_read_ahead(&mut budget, large, 3);
+        assert_eq!(grant.units, shape.workers * (shape.depth + 8) + 3);
+        // Without footers there is nothing to price a reader with.
+        assert_eq!(
+            reader_batches(ReadTuning {
+                footer: None,
+                ..small
+            }),
+            0
+        );
     }
 }
