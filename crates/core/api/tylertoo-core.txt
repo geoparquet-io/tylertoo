@@ -2230,6 +2230,10 @@ pub mod tylertoo_core::overview::export
 #[non_exhaustive] pub enum tylertoo_core::overview::export::ExportError
 pub tylertoo_core::overview::export::ExportError::Accounting(tylertoo_core::diagnostics::AccountingError)
 pub tylertoo_core::overview::export::ExportError::Arrow(arrow_schema::error::ArrowError)
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::available: u64
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::needed: u64
+pub tylertoo_core::overview::export::ExportError::BudgetExceeded::phase: &'static str
 pub tylertoo_core::overview::export::ExportError::Config(tylertoo_core::overview::config::ConfigError)
 pub tylertoo_core::overview::export::ExportError::Core(tylertoo_core::Error)
 pub tylertoo_core::overview::export::ExportError::CoveringProperty

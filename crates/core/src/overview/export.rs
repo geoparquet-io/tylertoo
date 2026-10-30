@@ -808,6 +808,17 @@ pub enum ExportError {
     /// Opening or reading the overview file failed.
     #[error("overview reader error: {0}")]
     Reader(#[from] ReaderError),
+    /// An export phase's required resident state exceeds its memory grant.
+    /// The display text retains the historical budget diagnostic.
+    #[error("io error: {phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.")]
+    BudgetExceeded {
+        /// Export phase that cannot fit.
+        phase: &'static str,
+        /// Required resident bytes.
+        needed: u64,
+        /// Granted workspace bytes.
+        available: u64,
+    },
     /// I/O error (writing the PMTiles archive).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -7190,7 +7201,7 @@ struct FillTally {
     polygons: usize,
     /// Their vertices, holes included.
     vertices: usize,
-    /// Fill polygons left out to stay within [`fill_budget`], or to leave
+    /// Fill polygons left out to stay within [`fill_tile_bytes`], or to leave
     /// the tile's own features their room ([`with_fill`]).
     shed: usize,
 }
@@ -7208,7 +7219,7 @@ fn fill_features(
     if members.is_empty() || polys.is_empty() {
         return (Vec::new(), FillTally::default());
     }
-    let (kept, shed) = coverage_fill::within_budget(polys, fill_budget(opts));
+    let (kept, shed) = coverage_fill::within_budget(polys, fill_tile_bytes(opts));
     let polys: Vec<&coverage_fill::FillPolygon> = kept.into_iter().map(|i| &polys[i]).collect();
     let polys = polys.as_slice();
     let tally = FillTally {
@@ -7259,13 +7270,14 @@ fn fill_features(
     (feats, tally)
 }
 
-/// About how many bytes a tile's #750 fill may take: a quarter of its size
-/// limit, with a compressed limit read as about twice that many raw bytes.
+/// Tile-byte allowance for a tile's #750 fill: a quarter of its size limit,
+/// with a compressed limit read as about twice that many raw bytes. This is
+/// separate from the memory workspace granted under `MemoryPhase::Fill`.
 /// Unlimited without a limit. At half the limit the size valve ran up to
 /// ten passes per dense tile squeezing the tile's own features into the
 /// rest, each pass re-encoding the whole tile; at a quarter, coverage on FTW
 /// Moldova was the same and the export 27% faster.
-fn fill_budget(opts: &ExportOptions) -> usize {
+fn fill_tile_bytes(opts: &ExportOptions) -> usize {
     let raw = opts.tile_size_limit.filter(|&l| l > 0);
     let gz = opts
         .compressed_tile_size_limit
@@ -11603,25 +11615,25 @@ mod tests {
     /// limit read as twice that many raw bytes), so the size valve does not
     /// have to squeeze the tile's own features into half of it.
     #[test]
-    fn the_fill_budget_is_a_quarter_of_the_limit() {
+    fn the_fill_tile_bytes_are_a_quarter_of_the_limit() {
         let raw = ExportOptions {
             tile_size_limit: Some(1000),
             compressed_tile_size_limit: None,
             ..ExportOptions::default()
         };
-        assert_eq!(fill_budget(&raw), 250);
+        assert_eq!(fill_tile_bytes(&raw), 250);
         let gz = ExportOptions {
             tile_size_limit: None,
             compressed_tile_size_limit: Some(1000),
             ..ExportOptions::default()
         };
-        assert_eq!(fill_budget(&gz), 500);
+        assert_eq!(fill_tile_bytes(&gz), 500);
         let none = ExportOptions {
             tile_size_limit: None,
             compressed_tile_size_limit: None,
             ..ExportOptions::default()
         };
-        assert_eq!(fill_budget(&none), usize::MAX);
+        assert_eq!(fill_tile_bytes(&none), usize::MAX);
     }
 
     /// #750: fill features are drawn but not counted as tile features, so the
