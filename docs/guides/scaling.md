@@ -40,13 +40,18 @@ tens of GiB at a billion rows. See [sizing the coarse job's memory](#sizing-the-
 
 ### Memory profiles
 
-Pass 2 buffers each output level before writing it:
+Pass 2 buffers each output level before writing it. The profile sets where
+those rows wait and how much every other phase may hold: the read-ahead, the
+batches processed at once, and the row groups the writer encodes at once.
 
-| `--profile` | Buffer storage |
-| --- | --- |
-| `speed` | RAM |
-| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files |
-| `auto` (default) | Estimates memory from feature and level counts and spills above a fraction of available RAM. Measures buffered rows and switches to spilling mid-pass if they outgrow it |
+| `--profile` | Output buffers | Everything else |
+| --- | --- | --- |
+| `speed` | RAM | No limit: every knob at its maximum |
+| `bounded` | Temporary Arrow Inter-Process Communication (IPC) files | Fixed caps that the allowance can only shrink: at most 4 readers, 16 batches each, 4 encodes. The smallest footprint |
+| `auto` (default) | RAM when the estimate fits 60% of available RAM, otherwise spill. Measures buffered rows and switches to spilling mid-pass if they outgrow it | Sized to fit the same 60%, priced from the Parquet footers |
+
+`auto` is its own shape, not a switch between the other two: on a large
+machine it holds more than `bounded` and less than `speed`.
 
 tylertoo reads cgroup v2 `memory.max` and `memory.high` or the cgroup v1 limit,
 subtracting memory the cgroup cannot reclaim. Slurm, Docker, and Kubernetes
@@ -67,17 +72,19 @@ is tmpfs and uses RAM charged to the same cgroup. Point `TMPDIR` or
   do not overlap.
 - **`--read-workers N|auto`** sets each pass's reader threads. `auto` uses a
   quarter of the cores, at most 4. tylertoo honors an explicit value up to
-  twice the core count. Remote inputs always use one reader, even when staged
+  twice the core count, as far as the profile's memory allows; `bounded`
+  reads with at most 4. Remote inputs always use one reader, even when staged
   to disk: concurrent readers would evict each other's shared chunk cache.
 
 Resident batches include those in flight, each worker's read-ahead queue,
-and, under `bounded`, up to three per level in spill writers. Read-ahead gets
-10% of available RAM, so smaller machines get fewer workers. `bounded`
-halves each queue. The estimate allows about 4 KiB per row plus twice its
-geometry bytes, which both passes take from the Parquet footer. Unlike the
-pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row, so
-it cannot correct itself. Wide schemas with
-large strings can exceed it.
+and, when spilling, up to three per level in spill writers. Under `auto` and
+`bounded`, read-ahead gets 10% of the allowance, so smaller machines get
+fewer workers; `bounded` also caps each queue at 16 batches, half of
+`auto`'s. `speed` reads with every requested worker at the full depth. A decoded row is priced at twice its
+uncompressed bytes in the Parquet footer plus 8 bytes per column, and each
+worker is also charged for the largest row group its reader decodes. Unlike
+the pass-2 buffers, tylertoo sizes the read-ahead before a pass reads a row,
+so it cannot correct itself. Wide schemas with large strings can exceed it.
 Measure memory use if headroom is tight, or use `--read-workers 1`.
 
 ### Spill files

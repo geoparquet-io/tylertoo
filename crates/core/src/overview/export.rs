@@ -556,7 +556,7 @@ pub struct ExportOptions {
         value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
         help_heading = "Memory & performance"
     ))]
-    #[cfg_attr(feature = "cli", arg(help = "Memory profile for writing levels: `speed` buffers in RAM, `bounded` spills to disk, and `auto` picks per run. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub profile: MemoryProfile,
     /// Top-level `name`, `description` and `attribution` written to the
@@ -1275,10 +1275,16 @@ fn export_budget() -> MemoryBudget {
     MemoryBudget::with_available(available_memory_bytes())
 }
 
+/// The profile export's wave widths are sized under, whatever the run's
+/// (#788): the waves, the level-group cap and the hopeless-tile check are
+/// #311's and #665's OOM guards, which every profile kept on main. Only the
+/// level store, its buffer and the gzip cache follow the run's profile.
+const WAVE_PROFILE: MemoryProfile = MemoryProfile::Auto;
+
 /// The bytes [`MemoryPhase::ExportCollect`] may hold under `budget`, for
 /// the decision logs.
 fn export_collect_bytes(budget: &MemoryBudget) -> u64 {
-    budget.affordable(MemoryPhase::ExportCollect, Price::model(1)) as u64
+    budget.affordable(WAVE_PROFILE, MemoryPhase::ExportCollect, Price::model(1)) as u64
 }
 
 /// Flat fallback estimate of one wave slot's transient memory cost, used **only
@@ -1358,6 +1364,7 @@ fn memory_safe_wave(budget: &MemoryBudget) -> usize {
         return PARTITION_WAVE_FALLBACK_MAX;
     }
     budget.affordable(
+        WAVE_PROFILE,
         MemoryPhase::ExportCollect,
         Price::model(PARTITION_SLOT_TRANSIENT_BYTES),
     )
@@ -1415,6 +1422,7 @@ fn memory_safe_level_wave(
     // bytes from the footer, inflated by [`member_resident_bytes`].
     let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
     ceiling.min(budget.affordable(
+        WAVE_PROFILE,
         MemoryPhase::ExportCollect,
         Price::new(per_slot, PriceBasis::Footer),
     ))
@@ -1451,6 +1459,7 @@ fn level_group_member_cap(
         return wave_cap;
     };
     wave_cap.min(budget.affordable(
+        WAVE_PROFILE,
         MemoryPhase::ExportCollect,
         Price::new(per_member, PriceBasis::Footer),
     ))
@@ -2276,6 +2285,7 @@ fn export_pmtiles_validated(
     // The not-yet-flushed buffer of whichever member store runs: the
     // export-wide one (#235), or one multi-wave level's at a time (#740).
     let store_grant = budget.fit(
+        options.profile,
         MemoryPhase::ExportCollect,
         Price::model(MEMBER_STORE_RAM_BUDGET as u64),
         1,
@@ -2287,6 +2297,7 @@ fn export_pmtiles_validated(
     // repeats were measured to need. A tighter budget gets fewer slices,
     // down to one.
     let gzip_grant = budget.fit(
+        options.profile,
         MemoryPhase::ExportEncode,
         Price::new(
             crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES as u64,
@@ -2345,6 +2356,7 @@ fn export_pmtiles_validated(
         forced: knobs.backing_override,
         ram_budget: store_ram,
         member_bytes,
+        profile: options.profile,
     });
     #[cfg(test)]
     let work = Mutex::new(ExportWorkTally::default());
@@ -3750,6 +3762,10 @@ struct LevelRead {
     /// Resident bytes of one member (a footer price, see
     /// [`member_resident_bytes`]), when known.
     member_bytes: Option<u64>,
+    /// The run's memory profile: `bounded` grants the wave only and
+    /// spills the level, `speed` keeps the whole level in RAM, `auto` keeps
+    /// what the budget affords.
+    profile: MemoryProfile,
 }
 
 /// Choose a multi-wave level's store backing under `budget` (#740): RAM
@@ -3787,13 +3803,20 @@ fn level_read_backing(
     // The wave the drain holds while it encodes, which the wave width was
     // sized to fit; the level's members share what is left.
     let wave = budget.fit(
+        read.profile,
         MemoryPhase::ExportCollect,
         price,
         wave_members,
         wave_members,
     );
-    let affordable = budget.affordable(MemoryPhase::ExportCollect, price);
-    let level = budget.fit(MemoryPhase::ExportCollect, price, level_members, 0);
+    let affordable = budget.affordable(read.profile, MemoryPhase::ExportCollect, price);
+    let level = budget.fit(
+        read.profile,
+        MemoryPhase::ExportCollect,
+        price,
+        level_members,
+        0,
+    );
     log::debug!(
         "[profile]     z{} level store grants: wave {} MiB ({wave_members} members), \
          level {} of {} MiB wanted ({level_members} members at {per_member} B), \
@@ -10431,6 +10454,57 @@ mod tests {
             tight.work.level_spill_bytes.values().any(|&b| b > 0),
             "a level the budget cannot hold must spill: {:?}",
             tight.work.level_spill_bytes
+        );
+    }
+
+    /// The level store follows the run's memory profile (#788): `bounded`
+    /// holds main's shape, spilling every multi-wave level however roomy
+    /// the budget; `speed` keeps every level in RAM however tight; the
+    /// archive is the same bytes under all three.
+    #[test]
+    fn level_store_backing_follows_the_memory_profile() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let run = |profile: MemoryProfile, budget_available: Option<u64>| {
+            let opts = ExportOptions {
+                layer_name: "ref".to_string(),
+                partition_wave: 1,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    budget_available,
+                    ..knobs(false, None, false)
+                },
+            )
+            .unwrap();
+            (
+                std::fs::read(out.path()).unwrap(),
+                run.work.level_spill_bytes,
+            )
+        };
+        let (auto, auto_spill) = run(MemoryProfile::Auto, Some(100 << 30));
+        assert!(
+            !auto_spill.is_empty() && auto_spill.values().all(|&b| b == 0),
+            "auto with room keeps every level in RAM: {auto_spill:?}"
+        );
+        let (bounded, bounded_spill) = run(MemoryProfile::Bounded, Some(100 << 30));
+        assert_eq!(bounded, auto, "bounded changed the archive");
+        assert!(
+            bounded_spill.values().all(|&b| b > 0),
+            "bounded must spill every multi-wave level: {bounded_spill:?}"
+        );
+        let (speed, speed_spill) = run(MemoryProfile::Speed, Some(1 << 20));
+        assert_eq!(speed, auto, "speed changed the archive");
+        assert!(
+            speed_spill.values().all(|&b| b == 0),
+            "speed must keep every level in RAM: {speed_spill:?}"
         );
     }
 
