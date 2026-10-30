@@ -103,10 +103,18 @@ fn duplicate_tile_is_never_gzipped_twice_across_waves() {
 /// #711: a capped tile must not first materialize an unbounded protobuf layer.
 /// Inputs belong to the collector and are allocated before profiling: this
 /// budget covers only transient allocation inside the per-tile encode owner.
-/// Run in nextest (one process per test) with `--features dhat-heap`.
+/// dhat's heap stats are process-global, so the budget is asserted only under
+/// nextest's process-per-test mode; plain `cargo test` runs other tests as
+/// threads in this process, their allocations land in the peak, and it skips.
 #[cfg(feature = "dhat-heap")]
 #[test]
 fn dense_capped_tile_encode_peak_live_bytes_is_bounded() {
+    if std::env::var_os("NEXTEST_EXECUTION_MODE").as_deref()
+        != Some(std::ffi::OsStr::new("process-per-test"))
+    {
+        eprintln!("skipped: the dhat peak is only valid with one test per process (nextest)");
+        return;
+    }
     const ROWS: usize = 100_000;
     const RAW_CAP: usize = 64 * 1024;
     const ENCODE_BUDGET: usize = 16 * 1024 * 1024;
