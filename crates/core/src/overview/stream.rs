@@ -51,16 +51,16 @@ use super::convert::{
     append_coalesced_count_field, append_point_count_field, apply_cluster_columns,
     apply_coalesced_count, build_generalization, build_level_batch, build_level_coalesce_table,
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_table_merged,
-    count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
-    extract_sort_keys, fill_level_bytes, mixed_geometry_field, overture_road_ranking,
-    record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
-    resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
-    validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
-    CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
-    PlanLevelReport, PlanReport, SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
+    count_vertices, extract_class_ranks, extract_numeric_values, extract_sort_keys,
+    fill_level_bytes, mixed_geometry_field, overture_road_ranking, record_coalesce_merged,
+    record_level_outcome, resolve_pass_read_workers, resolve_reserved_column_collisions,
+    scan_feature_traits, validate_cluster_schema, validate_coalesce_schema,
+    warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking, CoalesceTable, ConvertError,
+    ConvertOptions, ConvertReport, GroupInterner, LevelReport, PlanLevelReport, PlanReport,
+    SkippedLevelReport, KNOWN_ROAD_CLASSES, ROAD_VOCAB_MIN_DISTINCT,
 };
 use super::level::{Crs, EntryZoomProvenance, Mode, RankingProvenance};
-use super::memory::{MemoryBudget, MemoryPhase};
+use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::{for_each_window, scoped_pipe, split_in_flight, WindowStats};
 use super::pipeline;
 use super::plan_state::{ConvertPlan, Fingerprint, PlanTotals, SelectionRule};
@@ -69,7 +69,7 @@ use super::procmem::{
 };
 #[cfg(test)]
 use super::read::read_in_order;
-use super::read::{ReadFlow, ReadPass, ReadTuning};
+use super::read::{footer_row_bytes, grant_read_ahead, ReadFlow, ReadPass, ReadTuning};
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
@@ -118,6 +118,8 @@ struct Pass2Inputs<'a> {
     out_schema: &'a Schema,
     num_rows: usize,
     geom_bytes: u64,
+    /// Footer bytes per input row over every column ([`footer_row_bytes`]).
+    row_bytes: Option<u64>,
 }
 
 struct AssignmentInputs<'a> {
@@ -150,6 +152,8 @@ pub(super) struct StreamRead<'a> {
     pub(super) source: &'a dyn BatchSource,
     pub(super) read_tuning: ReadTuning,
     pub(super) in_flight: usize,
+    /// The compute window granted from the run's budget ([`grant_pass2_read`]).
+    pub(super) window: usize,
     pub(super) row_groups: Option<&'a RowGroupSelection>,
 }
 
@@ -772,7 +776,6 @@ fn build_writer_options_with_ceiling(
     writer_opts.full_column_stats = options.full_column_stats;
     writer_opts.source_is_subset = options.shard.is_some();
     writer_opts.cogp_compat_key = options.cogp_compat_key;
-    writer_opts.encode_concurrency = encode_concurrency_for(options.profile);
     writer_opts.generalization = Some(build_generalization(
         emitted_gsds,
         crs,
@@ -1106,6 +1109,58 @@ fn build_level_ctxs<'a>(
 /// directly — never buffered or spilled).
 type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 
+/// What one pass-2 read holds from the run's budget (#716): its read-ahead
+/// and its compute window, granted in that order so the window sizes against
+/// what the read-ahead left. Released once the read is done, so the next
+/// read (the streamed finest level) is sized against the same budget.
+struct Pass2Grants {
+    read: Grant,
+    window: Grant,
+}
+
+impl Pass2Grants {
+    fn release(self, budget: &mut MemoryBudget) {
+        budget.release(self.window);
+        budget.release(self.read);
+    }
+}
+
+/// Grant one pass-2 read (#716): the read-ahead `read_tuning` resolves
+/// (every reader's queue plus the channel to the consumer), then a window of
+/// up to `in_flight`'s compute half, each batch priced as the input batch
+/// plus the `fanout` output rows per input row it builds across `levels`.
+/// `read_tuning.budget` must be `budget` as it stands; the read layer
+/// re-resolves the same shape from it.
+fn grant_pass2_read(
+    budget: &mut MemoryBudget,
+    read_tuning: ReadTuning,
+    in_flight: usize,
+    fanout: f64,
+    levels: usize,
+) -> Pass2Grants {
+    let (channel, want) = split_in_flight(in_flight);
+    let read = grant_read_ahead(budget, read_tuning, channel);
+    let price = budget.window_price(
+        read_tuning.batch_size.max(1),
+        read_tuning.row_bytes,
+        fanout,
+        levels,
+        read_tuning.avg_geom_bytes,
+    );
+    let window = budget.compute_window(read_tuning.profile, want, price);
+    log::info!(
+        "[convert] pass 2 grants: read-ahead {} batch(es) x {} B ({:?}), window {} x {} B ({:?}), {} B left",
+        read.units,
+        read.unit_bytes,
+        read.phase,
+        window.units,
+        window.unit_bytes,
+        price.basis,
+        budget.remaining(),
+    );
+    Pass2Grants { read, window }
+}
+
 /// Run pass 2 over every emitted level and return each level's [`LevelStat`],
 /// in level order, plus the pipelined engine's aggregated
 /// [`pipeline::Pass2EngineResult::timers`] stage split ([profile] /
@@ -1114,7 +1169,7 @@ type LevelStat = (LevelWriteOutcome, usize, usize, u64);
 /// The outcome distinguishes a written level from one the writer skipped
 /// because every candidate collapsed during simplification (#211).
 fn run_pass2_levels(
-    budget: MemoryBudget,
+    mut budget: MemoryBudget,
     writer: &mut OverviewWriter<File>,
     ctxs: &[LevelStreamCtx<'_>],
     hints: &[usize],
@@ -1129,6 +1184,7 @@ fn run_pass2_levels(
         out_schema,
         num_rows,
         geom_bytes,
+        row_bytes,
     } = inputs;
     let n = ctxs.len();
     // #626: filled in by the buffered engine. Stays at its default for the
@@ -1144,8 +1200,12 @@ fn run_pass2_levels(
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Build, options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
+        row_bytes,
         profile: options.profile,
     };
+    // Output rows per input row across `levels`, from the plan's per-level
+    // winner counts: what one window batch fans out to (#716).
+    let fanout = |levels: &[usize]| levels.iter().sum::<usize>() as f64 / num_rows.max(1) as f64;
     let (level_stats, engine_timers): (Vec<LevelStat>, Pass2Timers) = match strategy {
         // Reference: one in-order re-read per level (pre-#213 behavior).
         #[cfg(test)]
@@ -1153,7 +1213,14 @@ fn run_pass2_levels(
             ctxs.iter()
                 .enumerate()
                 .map(|(i, ctx)| {
-                    write_level_streaming(
+                    let grants = grant_pass2_read(
+                        &mut budget,
+                        read_tuning,
+                        in_flight_batches,
+                        fanout(&hints[i..=i]),
+                        1,
+                    );
+                    let level = write_level_streaming(
                         writer,
                         i,
                         hints[i],
@@ -1161,15 +1228,18 @@ fn run_pass2_levels(
                             source,
                             read_tuning,
                             in_flight: in_flight_batches,
+                            window: grants.window.units,
                             row_groups: selected_row_groups,
                         },
                         ctx,
-                    )
-                    // Serial is a reference/test path (pre-#213 behavior, no
-                    // buffered engine); it never feeds `TYLERTOO_PROFILE_JSON`
-                    // in production, so its per-level timers are discarded
-                    // rather than accumulated.
-                    .map(|(o, r, v, _timers)| (o, r, v, 0u64))
+                    );
+                    grants.release(&mut budget);
+                    level
+                        // Serial is a reference/test path (pre-#213 behavior, no
+                        // buffered engine); it never feeds `TYLERTOO_PROFILE_JSON`
+                        // in production, so its per-level timers are discarded
+                        // rather than accumulated.
+                        .map(|(o, r, v, _timers)| (o, r, v, 0u64))
                 })
                 .collect::<Result<_, _>>()?,
             Pass2Timers::default(),
@@ -1206,6 +1276,13 @@ fn run_pass2_levels(
                 }
             );
             let (mut stats, engine_timers) = if buffered > 0 {
+                let grants = grant_pass2_read(
+                    &mut budget,
+                    read_tuning,
+                    in_flight_batches,
+                    fanout(&hints[..buffered]),
+                    buffered,
+                );
                 let result = pipeline::run_pass2_buffered(
                     writer,
                     &ctxs[..buffered],
@@ -1215,6 +1292,7 @@ fn run_pass2_levels(
                         read_tuning,
                         row_groups: selected_row_groups,
                         in_flight: in_flight_batches,
+                        window: grants.window.units,
                     },
                     BufferOptions {
                         profile: options.profile,
@@ -1222,14 +1300,23 @@ fn run_pass2_levels(
                         out_schema,
                         spill_dir: options.spill_dir.as_deref(),
                     },
-                )?;
+                );
+                grants.release(&mut budget);
+                let result = result?;
                 sink_measurement = result.sink;
                 (result.levels, result.timers)
             } else {
                 (Vec::new(), Pass2Timers::default())
             };
             if stream_last {
-                let (o, r, v, finest_timers) = write_level_streaming(
+                let grants = grant_pass2_read(
+                    &mut budget,
+                    read_tuning,
+                    in_flight_batches,
+                    fanout(&hints[n - 1..]),
+                    1,
+                );
+                let finest = write_level_streaming(
                     writer,
                     n - 1,
                     hints[n - 1],
@@ -1237,10 +1324,13 @@ fn run_pass2_levels(
                         source,
                         read_tuning,
                         in_flight: in_flight_batches,
+                        window: grants.window.units,
                         row_groups: selected_row_groups,
                     },
                     &ctxs[n - 1],
-                )?;
+                );
+                grants.release(&mut budget);
+                let (o, r, v, finest_timers) = finest?;
                 // #517 S1: the finest level's own stage timers never otherwise
                 // reach `engine_timers` (`run_pass2_buffered` only covers
                 // levels `0..n-1`) — fold them in so `pass2.stage_secs` in the
@@ -1463,6 +1553,8 @@ fn apply_level_ceiling(
 /// Footer provenance only pass 2's setup knows, recorded when the writer is
 /// created (#541 review).
 struct FooterFacts {
+    /// How the ranking was chosen (`Generalization::ranking`).
+    ranking_provenance: RankingProvenance,
     /// Whether any chain at any planned non-canonical level joined two or
     /// more segments (`CoalescingProvenance::merged`).
     coalesce_merged: bool,
@@ -1592,8 +1684,8 @@ fn create_level_writer(
     output_path: &Path,
     descriptor: &ResolvedSchema,
     emitted: &[EmitLevel],
-    ranking_provenance: RankingProvenance,
     options: &ConvertOptions,
+    (budget, row_bytes): (&mut MemoryBudget, Option<u64>),
     facts: FooterFacts,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<LevelWriter, ConvertError> {
@@ -1619,7 +1711,7 @@ fn create_level_writer(
         &emitted_gsds,
         &level_row_counts,
         descriptor,
-        ranking_provenance,
+        facts.ranking_provenance,
         options,
         diagnostics,
     )?;
@@ -1634,6 +1726,18 @@ fn create_level_writer(
     let effective_max_row_group_size = (writer_opts.max_row_group_size
         != options.max_row_group_size)
         .then_some(writer_opts.max_row_group_size);
+    let encodes = budget.encode_concurrency(
+        options.profile,
+        rayon::current_num_threads(),
+        encode_price(&writer_opts, &level_row_counts, row_bytes),
+    );
+    log::info!(
+        "[convert] writer: {} concurrent row-group encode(s) x {} B, {} B left",
+        encodes.units,
+        encodes.unit_bytes,
+        budget.remaining(),
+    );
+    writer_opts.encode_concurrency = encodes.units;
 
     let writer = OverviewWriter::create(output_path, &out_schema, writer_opts)?;
 
@@ -1649,6 +1753,61 @@ fn create_level_writer(
         non_geom_cols,
         effective_max_row_group_size,
     })
+}
+
+/// Decoded copies of its row group one in-flight writer encode holds (#545):
+/// the Arrow rows the writer slices off, the WKB chunks it builds from them,
+/// the column writers' pages and the encoded chunks waiting to be appended.
+/// Measured (`.788/PROFILE-LOG.md`, dhat, `bounded` under a 2 GiB budget, 4
+/// encodes): NZ parcels' writer held 54.8 MiB per encode at its peak, 4.8×
+/// a 10,000-row group of [`footer_row_bytes`]; Moldova's 17 MiB, 0.84×.
+/// Priced at the worse one.
+const ENCODE_COPIES: u64 = 5;
+
+/// What one in-flight row-group encode holds (#545): [`ENCODE_COPIES`] of
+/// the level's largest row group. Row-group sizes follow
+/// the writer's own per-level split ([`super::writer::projected_row_groups`]);
+/// a row is priced at the footers' bytes per input row (an upper bound for
+/// a simplified level), or at [`MemoryBudget::estimate`]'s sink row without
+/// them.
+fn encode_price(
+    writer_opts: &OverviewWriterOptions,
+    level_row_counts: &[usize],
+    row_bytes: Option<u64>,
+) -> Price {
+    let finest_zoom = writer_opts.levels.last().and_then(|l| l.zoom);
+    let largest = writer_opts
+        .levels
+        .iter()
+        .zip(level_row_counts)
+        .map(|(level, &rows)| {
+            let groups = super::writer::projected_row_groups(
+                &[rows],
+                writer_opts.max_row_group_size,
+                writer_opts.row_group_size_policy,
+                &[level.zoom],
+                finest_zoom,
+            );
+            rows.div_ceil(groups.max(1))
+        })
+        .max()
+        .unwrap_or(0)
+        .max(1) as u64;
+    match row_bytes {
+        Some(row) => Price::new(
+            largest
+                .saturating_mul(row)
+                .saturating_mul(ENCODE_COPIES)
+                .max(1),
+            PriceBasis::Footer,
+        ),
+        None => Price::model(
+            MemoryBudget::with_available(None)
+                .estimate(MemoryPhase::Write, largest, None)
+                .saturating_mul(ENCODE_COPIES)
+                .max(1),
+        ),
+    }
 }
 
 /// The winner tables: which level each row belongs to, and how many rows each
@@ -2327,6 +2486,7 @@ fn pass1_read_tuning(
         batch_size: options.read_batch_size.max(1),
         workers: resolve_pass_read_workers(ReadPass::Scan, options.read_workers),
         avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
+        row_bytes: None,
         profile: options.profile,
     }
 }
@@ -3014,6 +3174,14 @@ pub(crate) fn run_stages(
         kind_counts: _,
     } = plan;
     rss.enter_phase("pre-pass2 (winner tables freed)"); // #571
+                                                        // #716/#545: footer bytes per input row over every column pass 2 reads;
+                                                        // they price the writer's encodes, the read-ahead and the window.
+    let mut budget = budget;
+    let row_bytes = footer_row_bytes(
+        source,
+        selected_row_groups.as_ref(),
+        0..descriptor.schema().fields().len(),
+    )?;
 
     // Planned levels with no winners are omitted (§7.3, #211 auto-clamp);
     // record them for the report + warning.
@@ -3070,9 +3238,10 @@ pub(crate) fn run_stages(
         output_path,
         &descriptor,
         emitted,
-        ranking_provenance,
         options,
+        (&mut budget, row_bytes),
         FooterFacts {
+            ranking_provenance,
             coalesce_merged,
             zoom_ceiling: truncated_at,
             entry_zoom,
@@ -3137,6 +3306,7 @@ pub(crate) fn run_stages(
             out_schema: &out_schema,
             num_rows,
             geom_bytes,
+            row_bytes,
         },
         strategy,
     )?;
@@ -5220,7 +5390,9 @@ fn run_pass1_with_chunk_rows(
     // prices pass 1's own read-ahead.
     let geom_bytes = source.selected_column_bytes(row_groups, geom_idx)?;
     let selected_rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
-    let read_tuning = pass1_read_tuning(*ctx.budget, options, geom_bytes, selected_rows);
+    let mut read_tuning = pass1_read_tuning(*ctx.budget, options, geom_bytes, selected_rows);
+    // #716: pass 1's batches carry only its projection; price them by it.
+    read_tuning.row_bytes = footer_row_bytes(source, row_groups, cols.iter().copied())?;
 
     let t_pass1_fn = Instant::now();
     let pass1_timers = Pass1Timers::default();
@@ -5774,6 +5946,7 @@ fn write_level_streaming(
         source,
         read_tuning,
         in_flight,
+        window,
         row_groups,
     } = inputs;
     let rows = Cell::new(0usize);
@@ -5827,14 +6000,7 @@ fn write_level_streaming(
     // the producer threads: a `&Pass2Timers` is `Copy`, so the closures copy
     // the borrow and leave `level_timers` owned here for the post-scope read
     // and the return value below.
-    let (read_depth, window) = split_in_flight(in_flight);
-    let window = { read_tuning.budget }.compute_window(
-        read_tuning.profile,
-        window,
-        read_tuning.batch_size,
-        1,
-        read_tuning.avg_geom_bytes,
-    );
+    let (read_depth, _) = split_in_flight(in_flight);
     let outcome = scoped_pipe(
         window.min(STREAMED_OUTPUT_DEPTH),
         // Producer: read + process, in order, until EOF or the writer
@@ -6875,6 +7041,7 @@ mod tests {
                 batch_size: READ_BATCH_SIZE,
                 workers: 4,
                 avg_geom_bytes: None,
+                row_bytes: None,
                 profile: MemoryProfile::Auto,
             },
         );
@@ -8299,6 +8466,7 @@ mod tests {
             batch_size: 8, // 50 read batches for the producer to push
             workers: 1,
             avg_geom_bytes: None,
+            row_bytes: None,
             profile: MemoryProfile::Speed,
         };
         match write_level_streaming(
@@ -8309,6 +8477,7 @@ mod tests {
                 source: &source,
                 read_tuning: tuning,
                 in_flight: 1,
+                window: 1,
                 row_groups: None,
             },
             &ctx,
@@ -8440,6 +8609,7 @@ mod tests {
                 batch_size: 1,
                 workers,
                 avg_geom_bytes: None,
+                row_bytes: None,
                 profile: MemoryProfile::Speed,
             },
             |batch, offset, _| {

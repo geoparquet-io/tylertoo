@@ -14,7 +14,7 @@ use crossbeam_channel::Sender;
 
 use super::convert::ConvertError;
 use super::level::MemoryProfile;
-use super::memory::{MemoryBudget, MemoryPhase, Price};
+use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use crate::input_set::{ConvertSource, ReadPlan, ReadSegment, RowGroupSelection};
 
 /// What the caller wants from [`read_in_order`], and what it knows about the
@@ -31,6 +31,10 @@ pub(super) struct ReadTuning {
     /// (#717), used only to size the read-ahead against the memory budget.
     /// `None` falls back to [`READ_ROW_BYTES_FALLBACK`].
     pub(super) avg_geom_bytes: Option<u64>,
+    /// Footer bytes per input row over the columns this read decodes
+    /// ([`footer_row_bytes`]): what prices a read batch. `None` falls back to
+    /// the per-row model floored at a whole decoded batch.
+    pub(super) row_bytes: Option<u64>,
     /// The run's requested memory profile. `Bounded` means the caller asked
     /// for memory over speed, so a worker's read-ahead queue is capped lower
     /// (see [`READ_AHEAD_BOUNDED_MAX_BATCHES`]).
@@ -88,6 +92,98 @@ struct ReadShape {
     segment_target_rows: usize,
 }
 
+/// What one resident read batch costs (#716).
+///
+/// From the footers when [`ReadTuning::row_bytes`] is known
+/// ([`footer_row_bytes`]), and never past [`tylertoo_io::decoded_batch_limit`],
+/// the most the reader builds into one batch. Measured
+/// (`.788/PROFILE-LOG.md`, dhat): Moldova's 8,192-row batches hold 7.6 MiB
+/// live, priced at 17 MiB this way where the model below charged 64 MiB.
+///
+/// Without footer bytes, the per-row model floored at a whole decoded batch.
+/// The model's fixed non-geometry term is not decoration: the geometry weight
+/// covers ONLY the geometry column, and a read batch carries every projected
+/// column — pricing a row at `2 × avg_geom` alone under-charged wide schemas
+/// by 17-232×, which is how a bounded run at DEFAULTS once modelled 21 MiB of
+/// read-ahead and held +370 MiB.
+fn read_batch_price(tuning: ReadTuning) -> Price {
+    let batch_size = tuning.batch_size.max(1) as u64;
+    let limit = tylertoo_io::decoded_batch_limit();
+    match tuning.row_bytes {
+        Some(row) => Price::new(
+            row.saturating_mul(batch_size).clamp(1, limit.max(1)),
+            PriceBasis::Footer,
+        ),
+        None => Price::model(
+            tuning
+                .budget
+                .estimate(MemoryPhase::Read, batch_size, tuning.avg_geom_bytes)
+                .max(limit)
+                .max(1),
+        ),
+    }
+}
+
+/// Charge `budget` for the read-ahead `tuning` will hold (#716): every
+/// worker's queue at its resolved depth, plus the `channel` batches queued
+/// between the read and its consumer. `tuning.budget` must be the state
+/// `budget` was in before this call, so [`read_in_order`] resolves the same
+/// shape from it.
+pub(super) fn grant_read_ahead(
+    budget: &mut MemoryBudget,
+    tuning: ReadTuning,
+    channel: usize,
+) -> Grant {
+    let shape = resolve_read_shape(tuning);
+    let batches = shape
+        .workers
+        .saturating_mul(shape.depth)
+        .saturating_add(channel);
+    budget.fit(
+        MemoryPhase::Read,
+        read_batch_price(tuning),
+        batches,
+        batches,
+    )
+}
+
+/// Decoded bytes per footer byte (#716). A footer's uncompressed size is
+/// AFTER dictionary and RLE encoding, so a dictionary string column decodes
+/// past it unless the footer also records its unencoded byte-array size,
+/// which pyarrow-written files do not. Measured (`.788/PROFILE-LOG.md`,
+/// dhat): Moldova's batches hold 0.96× their footer bytes, NZ parcels' (801
+/// byte-array chunks without the statistic) 1.9×. Priced at the worse one.
+const DECODED_PER_FOOTER_BYTE: u64 = 2;
+
+/// Decoded bytes per row over `columns` of the selected row groups, from the
+/// footers: each column's uncompressed size, or its unencoded byte-array
+/// size when larger ([`ConvertSource::selected_column_bytes`]), times
+/// [`DECODED_PER_FOOTER_BYTE`], plus 8 bytes per column for the offsets and
+/// validity a decoded column adds. `None` without rows.
+pub(super) fn footer_row_bytes(
+    source: &ConvertSource,
+    row_groups: Option<&RowGroupSelection>,
+    columns: impl IntoIterator<Item = usize>,
+) -> Result<Option<u64>, ConvertError> {
+    let rows = u64::try_from(source.selected_row_count(row_groups)?).unwrap_or(0);
+    if rows == 0 {
+        return Ok(None);
+    }
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    for column in columns {
+        bytes = bytes.saturating_add(source.selected_column_bytes(row_groups, column)?);
+        count += 1;
+    }
+    Ok(Some(
+        bytes
+            .div_ceil(rows)
+            .saturating_mul(DECODED_PER_FOOTER_BYTE)
+            .saturating_add(count.saturating_mul(8))
+            .max(1),
+    ))
+}
+
 /// Size the parallel read against the memory budget.
 ///
 /// The load-bearing relationship is `segment_target_rows <= (depth - 1) *
@@ -104,35 +200,11 @@ struct ReadShape {
 /// can hold [`READ_AHEAD_MIN_BATCHES`], and the depth is what is left over.
 fn resolve_read_shape(tuning: ReadTuning) -> ReadShape {
     let batch_size = tuning.batch_size.max(1);
-    // Per-row cost of a RESIDENT decoded batch, priced exactly like the sink's
-    // measured-path model (`MemoryBudget::estimate`): a fixed non-geometry
-    // term plus the measured encoded geometry, doubled.
-    //
-    // the non-geometry row allowance is not decoration. The weight covers ONLY the
-    // geometry column, and a read batch carries every projected column — a
-    // 58-column schema's properties, offsets, dictionaries and validity
-    // buffers dwarf a small geometry. Pricing a row at `2 × avg_geom` alone
-    // under-charged wide schemas by 17-232× against
-    // `get_array_memory_size()`, which is how a bounded run at DEFAULTS could
-    // model 21 MiB of read-ahead and resident +370 MiB.
-    //
-    // #626 note: the sink's own non-geometry term is now MEASURED, so the two
-    // models no longer share a constant. That is deliberate — the read-ahead
-    // is sized before a single batch exists, so this one stays a proxy.
-    let per_batch = tuning
-        .budget
-        .estimate(MemoryPhase::Read, batch_size as u64, tuning.avg_geom_bytes)
-        // Property widths and dictionary repetition can fill the owner's
-        // entire decoded batch even when geometries and row counts are tiny.
-        .max(tylertoo_io::decoded_batch_limit())
-        .max(1);
-    // The read-ahead's share of the allowance (`memory::READ_SHARE`). A model
-    // bound, not a measured guarantee: it bounds `workers × depth ×
-    // per_batch`, so a schema whose columns cost more per row than the model
-    // assumes is priced too cheaply. See the per-row note above.
+    // The read-ahead's share of the allowance (`memory::READ_SHARE`), in
+    // batches of `read_batch_price`. It bounds `workers × depth × price`.
     let affordable = tuning
         .budget
-        .affordable(MemoryPhase::Read, Price::model(per_batch));
+        .affordable(MemoryPhase::Read, read_batch_price(tuning));
     let max_depth = match tuning.profile {
         MemoryProfile::Bounded => READ_AHEAD_BOUNDED_MAX_BATCHES,
         MemoryProfile::Auto | MemoryProfile::Speed => READ_AHEAD_MAX_BATCHES,
@@ -748,6 +820,7 @@ mod read_tests {
                 // Tiny rows: the read-ahead sizing must not silently collapse
                 // the worker count in these fixtures.
                 avg_geom_bytes: Some(8),
+                row_bytes: None,
                 profile: MemoryProfile::Auto,
             },
             |batch, offset, _dur| {
@@ -793,6 +866,7 @@ mod read_tests {
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
+            row_bytes: None,
             profile: MemoryProfile::Auto,
         });
         let segments = plan_segments(&source, None, shape).unwrap();
@@ -846,6 +920,7 @@ mod read_tests {
             batch_size: 128,
             workers: 4,
             avg_geom_bytes: Some(8),
+            row_bytes: None,
             profile: MemoryProfile::Auto,
         };
         let shape = resolve_read_shape(tuning);
@@ -907,6 +982,7 @@ mod read_tests {
             batch_size: 96,
             workers: 4,
             avg_geom_bytes: Some(8),
+            row_bytes: None,
             profile: MemoryProfile::Auto,
         };
         assert!(
@@ -925,6 +1001,7 @@ mod read_tests {
                     batch_size: 96,
                     workers,
                     avg_geom_bytes: Some(8),
+                    row_bytes: None,
                     profile: MemoryProfile::Auto,
                 },
                 |batch, offset, _dur| {
@@ -1047,6 +1124,7 @@ mod read_tests {
                     batch_size: 64,
                     workers: 4,
                     avg_geom_bytes: Some(8),
+                    row_bytes: None,
                     profile: MemoryProfile::Auto,
                 },
                 |_batch, _offset, _dur| {
@@ -1077,6 +1155,7 @@ mod read_tests {
             batch_size: 8192,
             workers: 4,
             avg_geom_bytes: Some(64),
+            row_bytes: None,
             profile: MemoryProfile::Auto,
         });
         assert!(shape.workers >= 1 && shape.workers <= 4);
@@ -1100,6 +1179,7 @@ mod read_tests {
             // 512 MiB per row: nothing is affordable.
             workers: 4,
             avg_geom_bytes: Some(512 * 1024 * 1024),
+            row_bytes: None,
             profile: MemoryProfile::Auto,
         });
         assert_eq!(shape.workers, 1, "an unaffordable read-ahead drops workers");
@@ -1113,11 +1193,51 @@ mod read_tests {
             batch_size: 100,
             workers: 8,
             avg_geom_bytes: Some(8),
+            row_bytes: None,
             profile: MemoryProfile::Bounded,
         });
         assert_eq!(
             shape.workers, 1,
             "tiny geometries do not price wide or dictionary-expanded properties"
         );
+    }
+
+    /// #716: footer bytes price a read batch at what it decodes to, capped at
+    /// the reader's largest batch, and granting the read-ahead charges every
+    /// queued batch to the run's budget, so the window sized after it sees
+    /// what is left.
+    #[test]
+    fn the_read_ahead_is_priced_from_the_footers_and_charged() {
+        let tuning = ReadTuning {
+            budget: MemoryBudget::with_available(Some(2 << 30)),
+            batch_size: 8192,
+            workers: 4,
+            avg_geom_bytes: Some(400),
+            row_bytes: Some(1_000),
+            profile: MemoryProfile::Bounded,
+        };
+        let price = read_batch_price(tuning);
+        assert_eq!((price.bytes, price.basis), (8_192_000, PriceBasis::Footer));
+        let huge = read_batch_price(ReadTuning {
+            row_bytes: Some(u64::MAX),
+            ..tuning
+        });
+        assert_eq!(huge.bytes, tylertoo_io::decoded_batch_limit());
+
+        let mut budget = tuning.budget;
+        let before = budget.remaining();
+        let shape = resolve_read_shape(tuning);
+        let grant = grant_read_ahead(&mut budget, tuning, 3);
+        assert_eq!(grant.units, shape.workers * shape.depth + 3);
+        assert_eq!(budget.remaining(), before - grant.bytes());
+        // The read layer resolves the same shape from the pre-grant snapshot.
+        assert_eq!(resolve_read_shape(tuning), shape);
+        // Without footer bytes, the model floored at a whole decoded batch.
+        let model = read_batch_price(ReadTuning {
+            row_bytes: None,
+            ..tuning
+        });
+        assert_eq!(model.basis, PriceBasis::Model);
+        assert!(model.bytes >= tylertoo_io::decoded_batch_limit());
     }
 }

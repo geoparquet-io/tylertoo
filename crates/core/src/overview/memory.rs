@@ -33,6 +33,15 @@ const READ_SHARE: f64 = 0.10;
 /// Share of the allowance the pass-2 compute window may hold (#716).
 const COMPUTE_SHARE: f64 = 0.10;
 
+/// Share of the allowance the writer's concurrent row-group encodes may hold
+/// (#545). They are resident beside the sink they drain, so they take a
+/// quarter and leave the rest to it.
+const ENCODE_SHARE: f64 = 0.25;
+
+/// Fewest row groups a non-`speed` writer encodes at once, pool permitting:
+/// #545's A/B kept 4 as the point below which the drain serializes.
+const ENCODE_FLOOR: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MemoryPhase {
     EagerInput,
@@ -44,7 +53,6 @@ pub(super) enum MemoryPhase {
     Read,
     Compute,
     /// The drain's concurrent row-group encodes (#545).
-    #[expect(dead_code, reason = "#788 C2 step 2 grants the drain encodes under it")]
     Encode,
     /// The pass-2 output sink (it takes [`MemoryBudget::remaining`]).
     Write,
@@ -88,11 +96,11 @@ impl MemoryPhase {
         match self {
             Self::Read => READ_SHARE,
             Self::Compute => COMPUTE_SHARE,
+            Self::Encode => ENCODE_SHARE,
             Self::EagerInput
             | Self::Scan
             | Self::Assign
             | Self::Stage
-            | Self::Encode
             | Self::Write
             | Self::Spill
             | Self::ExportCollect
@@ -108,14 +116,10 @@ pub(super) enum PriceBasis {
     /// Measured on data this run already holds (a built batch, a sample).
     #[expect(
         dead_code,
-        reason = "#788: measured prices arrive with C1's sink and C2 step 2"
+        reason = "#788: measured prices arrive with C1's sink and E1's export"
     )]
     Measured,
     /// Read from the parquet footers before any page is decoded.
-    #[expect(
-        dead_code,
-        reason = "#788 C2 step 2 prices the read-ahead from the footers"
-    )]
     Footer,
     /// A per-row model ([`MemoryBudget::estimate`]), not a measurement.
     Model,
@@ -289,36 +293,74 @@ impl MemoryBudget {
         grant
     }
     /// Return a grant once what it priced is no longer resident.
-    #[expect(dead_code, reason = "#788 C2 step 2 releases the pass-2 grants")]
     pub(super) fn release(&mut self, grant: Grant) {
         let slot = &mut self.granted[grant.phase as usize];
         *slot = slot.saturating_sub(grant.bytes());
     }
-    /// The pass-2 compute window (#494, #716): up to `requested` input
-    /// batches, each priced across every level it fans out to, fitted into
-    /// the window's share and charged. `speed` takes what it asked for.
+    /// The price of one pass-2 window batch (#716): the input batch plus
+    /// what it fans out to across the levels being built, `fanout` output
+    /// rows per input row (the plan's per-level winner counts over the input
+    /// rows). From the footers' bytes per row when known; an output row is
+    /// priced as a whole input row, an upper bound, since every level copies
+    /// the properties and only simplifies the geometry. Without footer bytes,
+    /// the per-row model at every level, as before.
+    pub(super) fn window_price(
+        &self,
+        batch_rows: usize,
+        row_bytes: Option<u64>,
+        fanout: f64,
+        levels: usize,
+        geometry: Option<u64>,
+    ) -> Price {
+        match row_bytes {
+            Some(row) => {
+                let rows = batch_rows as f64 * (1.0 + fanout.max(0.0));
+                Price::new(((rows * row as f64) as u64).max(1), PriceBasis::Footer)
+            }
+            None => Price::model(
+                self.estimate(MemoryPhase::Compute, batch_rows as u64, geometry)
+                    .saturating_mul(levels.max(1) as u64)
+                    .max(1),
+            ),
+        }
+    }
+    /// The pass-2 compute window (#494, #716): up to `requested` batches of
+    /// `price`, fitted into the window's share and charged. `speed` takes
+    /// what it asked for, still charged so later phases see it.
     pub(super) fn compute_window(
         &mut self,
         profile: MemoryProfile,
         requested: usize,
-        batch_rows: usize,
-        levels: usize,
-        geometry: Option<u64>,
-    ) -> usize {
-        if matches!(profile, MemoryProfile::Speed) {
-            return requested.max(1);
+        price: Price,
+    ) -> Grant {
+        let requested = requested.max(1);
+        match profile {
+            MemoryProfile::Speed => self.fit(MemoryPhase::Compute, price, requested, requested),
+            MemoryProfile::Auto | MemoryProfile::Bounded => {
+                self.fit(MemoryPhase::Compute, price, requested, 1)
+            }
         }
-        let per_batch = self
-            .estimate(MemoryPhase::Compute, batch_rows as u64, geometry)
-            .saturating_mul(levels.max(1) as u64)
-            .max(1);
-        self.fit(
-            MemoryPhase::Compute,
-            Price::model(per_batch),
-            requested.max(1),
-            1,
-        )
-        .units
+    }
+    /// Row groups the writer may encode at once (#296, #545): as many as the
+    /// pool has threads, if the encode share affords that many of `price`
+    /// (one row group held as Arrow plus its encoded chunks); never fewer
+    /// than [`ENCODE_FLOOR`] (#545's measured floor) or more than the pool.
+    /// `speed` takes the pool. The grant stays charged for the run: the
+    /// writer encodes until it finishes.
+    pub(super) fn encode_concurrency(
+        &mut self,
+        profile: MemoryProfile,
+        threads: usize,
+        price: Price,
+    ) -> Grant {
+        let threads = threads.max(1);
+        let floor = threads.min(ENCODE_FLOOR);
+        match profile {
+            MemoryProfile::Speed => self.fit(MemoryPhase::Encode, price, threads, threads),
+            MemoryProfile::Auto | MemoryProfile::Bounded => {
+                self.fit(MemoryPhase::Encode, price, threads, floor)
+            }
+        }
     }
     pub(super) fn require(&self, phase: MemoryPhase, needed: u64) -> Result<(), ConvertError> {
         if let Some(available) = self.available() {
@@ -380,21 +422,17 @@ mod tests {
         assert_eq!(budget.available(), Some(400));
     }
 
-    /// The phase-1 stand-in for a reserving grant: `&mut` so the call site
-    /// stays the same once choosing a window charges the budget.
+    /// A window of `requested` batches priced by the per-row model.
     fn grant_window(
         budget: &mut MemoryBudget,
         requested: usize,
         batch_rows: usize,
         levels: usize,
     ) -> usize {
-        budget.compute_window(
-            MemoryProfile::Bounded,
-            requested,
-            batch_rows,
-            levels,
-            Some(600),
-        )
+        let price = budget.window_price(batch_rows, None, 0.0, levels, Some(600));
+        budget
+            .compute_window(MemoryProfile::Bounded, requested, price)
+            .units
     }
 
     /// #716: the pass-2 compute window is resident at the same time as the
@@ -463,6 +501,62 @@ mod tests {
         budget.reserve(MemoryPhase::EagerInput, u64::MAX).unwrap();
         assert_eq!(budget.remaining(), FALLBACK_ALLOWANCE_BYTES);
         assert_eq!(budget.available(), None);
+    }
+
+    /// #545: the writer's encode concurrency comes from the budget, not a
+    /// fixed cap. On main, `bounded` encoded at most 4 row groups at once
+    /// whatever the budget. Profiled (`.788/PROFILE-LOG.md`, 64 threads,
+    /// glibc): the drain is 38% of pass 2's wall on Moldova and 39% on NZ
+    /// parcels under `bounded`, against 14% under `auto` (full pool) on the
+    /// same Moldova output, while the drain thread itself holds 1.1% of the
+    /// CPU samples: it waits on the capped encodes. #545's own A/B kept 4 as
+    /// the floor and asked for the cap to come from the memory probe instead.
+    #[test]
+    fn bounded_encode_concurrency_comes_from_the_budget() {
+        let resolve = |mut budget: MemoryBudget, threads: usize, row_group_bytes: u64| {
+            budget
+                .encode_concurrency(
+                    MemoryProfile::Bounded,
+                    threads,
+                    Price::new(row_group_bytes, PriceBasis::Footer),
+                )
+                .units
+        };
+        let row_group = 64 << 20;
+        // Ample memory: the pool, not the constant, is the limit.
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(64 << 30)), 16, row_group),
+            16
+        );
+        // Tight memory: never below #545's measured floor of 4 ...
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(256 << 20)), 16, row_group),
+            4
+        );
+        // ... and between the two, what the budget affords.
+        let mid = resolve(MemoryBudget::with_available(Some(4 << 30)), 16, row_group);
+        assert!((4..16).contains(&mid), "4 GiB, 64 MiB row groups: {mid}");
+        // Never more than the pool.
+        assert_eq!(
+            resolve(MemoryBudget::with_available(Some(64 << 30)), 2, row_group),
+            2
+        );
+    }
+
+    /// The encodes are charged for the run, so the pass-2 read sizes against
+    /// what they left; `speed` takes the pool and is still charged.
+    #[test]
+    fn encode_grants_charge_the_budget_and_speed_takes_the_pool() {
+        let mut budget = MemoryBudget::with_available(Some(10_000));
+        let grant = budget.encode_concurrency(MemoryProfile::Auto, 8, Price::model(100));
+        // 6,000 × 25% = 1,500 → 15 affordable, capped at the pool.
+        assert_eq!(grant.units, 8);
+        assert_eq!(budget.remaining(), 6_000 - 800);
+        let speed = budget.encode_concurrency(MemoryProfile::Speed, 3, Price::model(1 << 40));
+        assert_eq!(speed.units, 3);
+        budget.release(speed);
+        budget.release(grant);
+        assert_eq!(budget.remaining(), 6_000);
     }
 
     #[test]

@@ -1811,6 +1811,19 @@ across all cores. The profile decides where output rows wait before writing.
 - **`auto`** spills when the estimated buffered output exceeds 0.6 of
   available RAM and keeps rows in RAM otherwise.
 
+`bounded` means "within the run's allowance", not "as little as possible".
+The allowance is 60% of available memory, or of `TYLERTOO_AUTO_MEM_LIMIT_BYTES`
+or the cgroup limit when set. Pass 2's read-ahead, its compute window and the
+writer's concurrent row-group encodes are each granted a share of that
+allowance, priced from the Parquet footers, so `bounded`'s footprint grows
+with the memory the run may use (#716, #545). On a machine with about 90 GB
+available, Moldova (632k polygons, z0-14) encodes 64 row groups at once
+instead of 4. Its pass 2 then peaks at about 3.9 GiB instead of 2.0 GiB
+(mimalloc) and runs about 1.3× faster. Under a 2 GiB limit the same grants
+shrink: NZ parcels (4.3M polygons) gets 5 encodes, 2 readers and a window of
+1 batch. To hold `bounded` down, set a smaller limit with
+`TYLERTOO_AUTO_MEM_LIMIT_BYTES` or a cgroup memory limit.
+
 ### Automatic memory estimate
 
 `auto` estimates `buffered rows × per-row cost` from the average

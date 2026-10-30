@@ -1133,6 +1133,7 @@ pub(super) fn run_pass2_buffered(
         read_tuning,
         row_groups: selected_row_groups,
         in_flight,
+        window,
     } = read;
     let BufferOptions {
         profile,
@@ -1168,14 +1169,9 @@ pub(super) fn run_pass2_buffered(
     // #494: `in_flight` is shared between the read-ahead channel and the
     // consumer's compute window, so the resident input stays about what one
     // channel of depth `in_flight` held before the window existed.
-    let (read_depth, window) = split_in_flight(in_flight);
-    let window = { read_tuning.budget }.compute_window(
-        profile,
-        window,
-        read_tuning.batch_size,
-        num_levels,
-        read_tuning.avg_geom_bytes,
-    );
+    // The window was granted from the run's budget after the read-ahead
+    // (`stream::grant_pass2_read`, #716).
+    let (read_depth, _) = split_in_flight(in_flight);
     scoped_pipe(
         read_depth,
         // Producer: the input, in read order, over the per-part bbox-selected
