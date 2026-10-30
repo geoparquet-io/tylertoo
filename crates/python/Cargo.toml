@@ -16,6 +16,18 @@ publish = false
 name = "tylertoo"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# mimalloc as the extension's global allocator on non-musl targets (#739,
+# #788). Off by default on glibc (manylinux) until a wheel benchmark decides;
+# musl targets (musllinux) always get it, below. Only the extension's own
+# Rust allocations go through it: the interpreter's allocator is untouched,
+# and every Rust allocation is freed by Rust (data reaches Python as copies).
+mimalloc = ["dep:mimalloc"]
+# dhat owns the global allocator (installed in tylertoo-core), so mimalloc is
+# compiled out under it; rustc allows only one in the crate graph.
+dhat-heap = ["tylertoo-core/dhat-heap"]
+
 [dependencies]
 tylertoo-core = { workspace = true, features = ["remote"] }
 # abi3-py39: build against CPython's stable ABI so a single wheel per
@@ -30,6 +42,13 @@ pythonize = "0.29"
 serde = { workspace = true }
 # Flat keyword values are normalized by core syntax adapters.
 serde_json = "1"
+mimalloc = { version = "0.1", optional = true }
+
+# musllinux wheels: musl's mallocng fails small allocations under
+# multi-threaded fragmentation (#480), the failure the musl CLI binary avoids
+# with mimalloc. The wheel runs the same pipeline, so it gets the same fix.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
 
 [lints]
 workspace = true

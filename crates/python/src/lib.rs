@@ -7,6 +7,22 @@
 //! `build.rs` generates runtime signatures from core defaults, and stubtest
 //! checks the full typed signatures against that runtime surface.
 
+/// Global allocator for the extension's own Rust allocations (#739, #788).
+///
+/// Unconditional on musl (musllinux wheels), for #480's reason: musl's
+/// `mallocng` fails small allocations under heavy multi-threaded
+/// fragmentation. Elsewhere it is the `mimalloc` Cargo feature, off by
+/// default. Python's allocator is untouched: a Rust `#[global_allocator]`
+/// serves only this module's Rust code, and nothing allocated here is freed
+/// by the interpreter (results cross into Python as copies). Excluded under
+/// `dhat-heap`, whose allocator tylertoo-core installs.
+#[cfg(all(
+    any(target_env = "musl", feature = "mimalloc"),
+    not(feature = "dhat-heap")
+))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use pyo3::exceptions::{PyMemoryError, PyRuntimeError, PyTypeError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};

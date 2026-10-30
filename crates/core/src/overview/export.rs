@@ -131,7 +131,8 @@ use crate::TilesetMetadata;
 
 use super::coalesce::COALESCED_COUNT_COLUMN;
 use super::convert::{human_bytes, skip_memory_preflight_from_env, SKIP_MEMORY_PREFLIGHT_ENV};
-use super::level::{zoom_for_gsd, Crs, Mode, OverviewsMeta};
+use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
+use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
     auto_backing, available_memory_bytes, probe_oom_memory_limit, MemoryLimit, MemoryLimitSource,
@@ -155,7 +156,7 @@ struct PartitionBudget {
     ceiling_wave: usize,
     auto_wave: bool,
     member_bytes: Option<u64>,
-    available_ram: Option<u64>,
+    budget: MemoryBudget,
     fit_limit: Option<MemoryLimit>,
 }
 
@@ -541,6 +542,23 @@ pub struct ExportOptions {
     #[cfg_attr(feature = "cli", arg(help = "Directory for the export's spill file, used when buffered tiles exceed the memory budget. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#spill-files>", long_help = None))]
     #[cfg_attr(feature = "cli", arg(group = "export_only"))]
     pub spill_dir: Option<PathBuf>,
+    /// Memory profile for the export (#788), the same values as
+    /// [`ConvertOptions::profile`](super::convert::ConvertOptions::profile):
+    /// `bounded` keeps export within its historical footprint, `auto` sizes
+    /// to the machine's free memory, `speed` sets no limit. `tiles` passes
+    /// its own `--profile` through. Changes speed and peak memory only;
+    /// output is byte-identical across profiles. Default
+    /// [`MemoryProfile::Auto`].
+    #[serde(with = "super::config::spelled")]
+    #[cfg_attr(feature = "cli", arg(
+        long,
+        default_value = ExportOptions::default().profile.as_str(),
+        value_parser = super::config::cli::spelled::<MemoryProfile>(&["auto", "speed", "bounded"]),
+        help_heading = "Memory & performance"
+    ))]
+    #[cfg_attr(feature = "cli", arg(help = "Memory profile: `speed` holds everything in RAM, `bounded` spills to disk and holds the least, and `auto` sizes every buffer to the machine and spills when it must. See <https://geoparquet-io.github.io/tylertoo/guides/scaling/#memory-profiles>", long_help = None))]
+    #[cfg_attr(feature = "cli", arg(group = "export_only"))]
+    pub profile: MemoryProfile,
     /// Top-level `name`, `description` and `attribution` written to the
     /// archive metadata (tippecanoe's `-n` / `-N` / `-A`).
     ///
@@ -570,6 +588,7 @@ impl Default for ExportOptions {
             zoom_ceiling: None,
             feature_id: None,
             spill_dir: None,
+            profile: MemoryProfile::Auto,
             metadata: TilesetMetadata::default(),
         }
     }
@@ -1244,15 +1263,29 @@ pub const PARTITION_WAVE_MIN: usize = 6;
 /// widens past it on `auto`. Explicit values are never clamped by it.
 pub const PARTITION_WAVE_FALLBACK_MAX: usize = 16;
 
-/// Fraction of *available* system RAM the resident wave transient may claim
-/// in the auto preflight (#303).
-///
-/// Deliberately lower than the convert-side `AUTO_RAM_FRACTION` (0.6): the
-/// wave transient sits *on top of* export baseline state the estimate does
-/// not model (scan accumulators, decode buffers, PMTiles writer directory),
-/// so the budget leaves headroom for that baseline. Bias is toward not
-/// `OOMing` — a too-narrow wave only costs wall clock.
-const EXPORT_WAVE_RAM_FRACTION: f64 = 0.5;
+/// The run's memory budget, as export probes it (#788): the cached
+/// container-aware figure every `auto` decision shares. Export's waves and
+/// encodes are granted [`MemoryPhase::ExportCollect`]'s and
+/// [`MemoryPhase::ExportEncode`]'s share of it, half of the probed figure,
+/// below the allowance because the waves sit on top of export state no
+/// estimate models (scan accumulators, decode buffers, the writer's
+/// directory). Bias is toward not `OOMing`: a too-narrow wave only costs
+/// wall clock.
+fn export_budget() -> MemoryBudget {
+    MemoryBudget::with_available(available_memory_bytes())
+}
+
+/// The profile export's wave widths are sized under, whatever the run's
+/// (#788): the waves, the level-group cap and the hopeless-tile check are
+/// #311's and #665's OOM guards, which every profile kept on main. Only the
+/// level store, its buffer and the gzip cache follow the run's profile.
+const WAVE_PROFILE: MemoryProfile = MemoryProfile::Auto;
+
+/// The bytes [`MemoryPhase::ExportCollect`] may hold under `budget`, for
+/// the decision logs.
+fn export_collect_bytes(budget: &MemoryBudget) -> u64 {
+    budget.affordable(WAVE_PROFILE, MemoryPhase::ExportCollect, Price::model(1)) as u64
+}
 
 /// Flat fallback estimate of one wave slot's transient memory cost, used **only
 /// by the upfront ceiling** [`memory_safe_wave`] and when the data-aware
@@ -1322,18 +1355,19 @@ fn member_resident_bytes(mean_stored_bytes: u64, properties: usize) -> u64 {
 }
 
 /// The widest wave the memory budget allows: how many
-/// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots fit in
-/// [`EXPORT_WAVE_RAM_FRACTION`] of available RAM, or
+/// [`PARTITION_SLOT_TRANSIENT_BYTES`] slots [`MemoryPhase::ExportCollect`]
+/// can afford (a model price: a flat calibration), or
 /// [`PARTITION_WAVE_FALLBACK_MAX`] when RAM is unknown (the portable,
 /// deterministic #293 behaviour where no probe exists).
-fn memory_safe_wave(available_ram_bytes: Option<u64>) -> usize {
-    match available_ram_bytes {
-        Some(ram) => {
-            let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-            (budget / PARTITION_SLOT_TRANSIENT_BYTES) as usize
-        }
-        None => PARTITION_WAVE_FALLBACK_MAX,
+fn memory_safe_wave(budget: &MemoryBudget) -> usize {
+    if budget.limit.is_none() {
+        return PARTITION_WAVE_FALLBACK_MAX;
     }
+    budget.affordable(
+        WAVE_PROFILE,
+        MemoryPhase::ExportCollect,
+        Price::model(PARTITION_SLOT_TRANSIENT_BYTES),
+    )
 }
 
 /// The auto partition-wave decision (#303): pure so it is unit-testable
@@ -1344,10 +1378,8 @@ fn memory_safe_wave(available_ram_bytes: Option<u64>) -> usize {
 /// memory-safe wave keeps the transient inside the RAM budget, and the floor
 /// preserves the historical width-6 baseline (its worst-case transient is
 /// small and known-safe, and narrower waves only lose throughput).
-fn auto_partition_wave(cores: usize, available_ram_bytes: Option<u64>) -> usize {
-    cores
-        .min(memory_safe_wave(available_ram_bytes))
-        .max(PARTITION_WAVE_MIN)
+fn auto_partition_wave(cores: usize, budget: &MemoryBudget) -> usize {
+    cores.min(memory_safe_wave(budget)).max(PARTITION_WAVE_MIN)
 }
 
 /// The memory-safe wave width for a **single level** (#311), the fix for the
@@ -1375,10 +1407,9 @@ fn memory_safe_level_wave(
     ceiling: usize,
     partitions: &[Partition],
     member_bytes: Option<u64>,
-    available_ram_bytes: Option<u64>,
+    budget: &MemoryBudget,
 ) -> usize {
-    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
-    else {
+    let (Some(per_member), Some(_)) = (member_bytes.filter(|&b| b > 0), budget.limit) else {
         return ceiling;
     };
     let max_members = partitions.iter().map(|p| p.members).max().unwrap_or(0);
@@ -1387,10 +1418,14 @@ fn memory_safe_level_wave(
     }
     // Saturating throughout: an absurd member count or byte size clamps the
     // per-slot estimate to "definitely serial" (wave 1) rather than overflowing.
+    // A footer price: `per_member` is the finest level's mean stored row
+    // bytes from the footer, inflated by [`member_resident_bytes`].
     let per_slot = (max_members as u64).saturating_mul(per_member).max(1);
-    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-    let safe = (budget / per_slot).max(1) as usize;
-    ceiling.min(safe)
+    ceiling.min(budget.affordable(
+        WAVE_PROFILE,
+        MemoryPhase::ExportCollect,
+        Price::new(per_slot, PriceBasis::Footer),
+    ))
 }
 
 /// The most members one concurrent level group (#647) may hold at once.
@@ -1399,8 +1434,8 @@ fn memory_safe_level_wave(
 /// the ceiling width, each partition at the planned target, is
 /// `ceiling × partition_target` members, so a group's collected members
 /// stay within what the serial loop already budgets for. When the member
-/// size and RAM are both known, the cap also narrows to the members that fit
-/// in the [`EXPORT_WAVE_RAM_FRACTION`] budget at `member_bytes` each (see
+/// size and RAM are both known, the cap also narrows to the members
+/// [`MemoryPhase::ExportCollect`] can afford at `member_bytes` each (see
 /// [`member_resident_bytes`]), the same estimate [`memory_safe_level_wave`]
 /// uses.
 ///
@@ -1414,15 +1449,20 @@ fn level_group_member_cap(
     ceiling_wave: usize,
     partition_target: usize,
     member_bytes: Option<u64>,
-    available_ram_bytes: Option<u64>,
+    budget: Option<&MemoryBudget>,
 ) -> usize {
     let wave_cap = ceiling_wave.saturating_mul(partition_target);
-    let (Some(per_member), Some(ram)) = (member_bytes.filter(|&b| b > 0), available_ram_bytes)
-    else {
+    let (Some(per_member), Some(budget)) = (
+        member_bytes.filter(|&b| b > 0),
+        budget.filter(|b| b.limit.is_some()),
+    ) else {
         return wave_cap;
     };
-    let budget = ((ram as f64) * EXPORT_WAVE_RAM_FRACTION) as u64;
-    wave_cap.min(usize::try_from(budget / per_member).unwrap_or(usize::MAX))
+    wave_cap.min(budget.affordable(
+        WAVE_PROFILE,
+        MemoryPhase::ExportCollect,
+        Price::new(per_member, PriceBasis::Footer),
+    ))
 }
 
 /// The error for a level whose densest tile cannot fit in `limit` even when
@@ -1442,7 +1482,7 @@ fn level_group_member_cap(
 /// of large polygons, each far smaller than its row. Such a partition is left
 /// to the wave guard, as before #665.
 ///
-/// The threshold is the whole figure, not the [`EXPORT_WAVE_RAM_FRACTION`]
+/// The threshold is the whole figure, not [`MemoryPhase::ExportCollect`]'s
 /// the wave budget uses: this refuses only what cannot fit serially. First of
 /// equally dense tiles, so the message is deterministic.
 fn densest_tile_over_limit(
@@ -1574,7 +1614,7 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
 /// width is the machine's [`std::thread::available_parallelism`], capped by
 /// how many per-partition transients (estimated
 /// `PARTITION_SLOT_TRANSIENT_BYTES` each) fit in
-/// `EXPORT_WAVE_RAM_FRACTION` of available RAM (probe shared with the
+/// [`MemoryPhase::ExportCollect`]'s share of available RAM (probe shared with the
 /// convert-side `--profile auto`: `TYLERTOO_AUTO_MEM_LIMIT_BYTES` override,
 /// then the container-aware `min(cgroup headroom, /proc/meminfo
 /// MemAvailable)` — see `available_memory_bytes`), floored at
@@ -1590,11 +1630,16 @@ fn plan_level_groups(plans: &[LevelPlan], member_cap: usize) -> Vec<std::ops::Ra
 /// byte-identical archive (pinned by `export_wave_width_is_byte_invariant` and
 /// the partition-invariance / frozen-hash tests).
 pub fn resolve_partition_wave(requested: usize) -> usize {
+    resolve_partition_wave_under(requested, &export_budget())
+}
+
+/// [`resolve_partition_wave`] under the run's `budget`.
+fn resolve_partition_wave_under(requested: usize, budget: &MemoryBudget) -> usize {
     if requested == PARTITION_WAVE_AUTO {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(PARTITION_WAVE_MIN);
-        auto_partition_wave(cores, available_memory_bytes())
+        auto_partition_wave(cores, budget)
     } else {
         requested
     }
@@ -1606,21 +1651,20 @@ pub fn resolve_partition_wave(requested: usize) -> usize {
 /// available RAM) once at export start, so both export core utilization
 /// (#293) and the preflight decision (#303) are observable — mirrors the
 /// `[convert] pass2 auto` decision log line.
-fn resolve_and_log_partition_wave(requested: usize) -> usize {
-    let wave = resolve_partition_wave(requested);
+fn resolve_and_log_partition_wave(requested: usize, budget: &MemoryBudget) -> usize {
+    let wave = resolve_partition_wave_under(requested, budget);
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
     if requested == PARTITION_WAVE_AUTO {
-        let available = available_memory_bytes();
-        let avail_str = available.map_or_else(
+        let avail_str = budget.available().map_or_else(
             || "unknown".to_string(),
             |b| format!("{} MiB", b / (1024 * 1024)),
         );
         log::info!(
             "[export] partition wave: {wave} partition(s) per band read \
              (auto: {cores} core(s), memory-safe cap {}, avail {avail_str})",
-            memory_safe_wave(available),
+            memory_safe_wave(budget),
         );
     } else {
         log::info!(
@@ -1815,7 +1859,7 @@ fn plan_levels(
         ceiling_wave,
         auto_wave,
         member_bytes,
-        available_ram,
+        budget,
         fit_limit,
     } = inputs;
     let plans = scans
@@ -1833,13 +1877,10 @@ fn plan_levels(
             // THIS level's densest planned partition so a dense finest zoom
             // does not OOM the whole run. Explicit waves are honoured verbatim.
             let wave = if auto_wave {
-                let w =
-                    memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, available_ram);
+                let w = memory_safe_level_wave(ceiling_wave, &partitions, member_bytes, &budget);
                 if w < ceiling_wave {
                     let densest = partitions.iter().map(|p| p.members).max().unwrap_or(0);
-                    let budget_mib = available_ram
-                        .map(|r| ((r as f64 * EXPORT_WAVE_RAM_FRACTION) as u64) / (1024 * 1024))
-                        .unwrap_or(0);
+                    let budget_mib = export_collect_bytes(&budget) / (1024 * 1024);
                     log::info!(
                         "[export] level {}/{num_levels} z{zoom}: wave {ceiling_wave} → {w} \
                          (densest partition {densest} members × ~{} B/member resident, \
@@ -1922,6 +1963,7 @@ fn export_pmtiles_impl(
             checkpoint_interval: CHECKPOINT_INTERVAL,
             fail_level: None,
             memory_limit: None,
+            budget_available: None,
         },
     )
     .map(|run| run.report)
@@ -1945,6 +1987,9 @@ struct Pass2Knobs {
     /// The memory figure for the #665 dense-tile refusal. `None` probes
     /// ([`probe_oom_memory_limit`]); tests inject one.
     memory_limit: Option<MemoryLimit>,
+    /// The probed figure the run's [`MemoryBudget`] starts from. `None`
+    /// probes ([`export_budget`]); tests inject one.
+    budget_available: Option<u64>,
 }
 
 /// What [`export_pmtiles_run`] returns: the report, plus the level schedule
@@ -1960,6 +2005,9 @@ struct Pass2Run {
     /// Whether the levels read from the single-read member store (#235).
     #[cfg(test)]
     single_read: bool,
+    /// The export's work counts (#788).
+    #[cfg(test)]
+    work: ExportWorkTally,
 }
 
 fn export_pmtiles_run(
@@ -1970,7 +2018,17 @@ fn export_pmtiles_run(
     knobs: &Pass2Knobs,
 ) -> Result<Pass2Run, ExportError> {
     let validated = options.validate()?;
-    export_pmtiles_validated(input_path, output_path, &validated, partition_target, knobs)
+    let mut budget = knobs
+        .budget_available
+        .map_or_else(export_budget, |b| MemoryBudget::with_available(Some(b)));
+    export_pmtiles_validated(
+        input_path,
+        output_path,
+        &validated,
+        partition_target,
+        knobs,
+        &mut budget,
+    )
 }
 
 #[expect(
@@ -1983,6 +2041,7 @@ fn export_pmtiles_validated(
     config: &super::config::ValidatedConfig<'_, ExportOptions>,
     partition_target: usize,
     knobs: &Pass2Knobs,
+    budget: &mut MemoryBudget,
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
@@ -2076,13 +2135,12 @@ fn export_pmtiles_validated(
     // own densest partition (#311) — see the per-level `memory_safe_level_wave`
     // below. An explicit `--partition-wave N` is honoured verbatim and never
     // narrowed (the caller opted into the memory cost).
-    let ceiling_wave = resolve_and_log_partition_wave(options.partition_wave);
+    let ceiling_wave = resolve_and_log_partition_wave(options.partition_wave, budget);
     let auto_wave = options.partition_wave == PARTITION_WAVE_AUTO;
     // Data-aware per-member size signal for the #311 guard: the finest level's
-    // mean uncompressed row bytes, read once from the Parquet metadata. Probe
-    // RAM once too so every level sizes against the same budget.
+    // mean uncompressed row bytes, read once from the Parquet metadata. Every
+    // level sizes against the run's one `budget`.
     let mean_member_bytes = reader.finest_level_mean_row_bytes();
-    let available_ram = available_memory_bytes();
 
     let ResolvedColumns {
         published,
@@ -2191,7 +2249,7 @@ fn export_pmtiles_validated(
             ceiling_wave,
             auto_wave,
             member_bytes,
-            available_ram,
+            budget: *budget,
             fit_limit: knobs.memory_limit.or_else(probe_oom_memory_limit),
         },
     )?;
@@ -2207,10 +2265,54 @@ fn export_pmtiles_validated(
     // sinks. Duplicating bands are self-contained — the per-level wave read
     // already touches each row group for exactly one level — so the legacy
     // path is kept there (and as the tests' byte-identity oracle).
+    // #647: consecutive small levels run as one concurrent group. On `auto`
+    // the cap sizes from the same RAM budget as the #311 per-level guard.
+    // An explicit wave sizes the cap from its width alone, as #311 does.
+    // `concurrent_levels: false` (cap 0) is the serial test oracle. Sized
+    // before the store's grant below, like every other plan decision.
+    let group_cap = level_group_member_cap(
+        ceiling_wave,
+        partition_target,
+        member_bytes.filter(|_| auto_wave),
+        auto_wave.then_some(&*budget),
+    );
+    let group_cap = if knobs.concurrent_levels {
+        group_cap
+    } else {
+        0
+    };
     let single_read = matches!(reader.mode(), Mode::Partitioning) && !knobs.force_legacy_pass2;
+    // The not-yet-flushed buffer of whichever member store runs: the
+    // export-wide one (#235), or one multi-wave level's at a time (#740).
+    let store_grant = budget.fit(
+        options.profile,
+        MemoryPhase::ExportCollect,
+        Price::model(MEMBER_STORE_RAM_BUDGET as u64),
+        1,
+        1,
+    );
+    let store_ram = usize::try_from(store_grant.bytes()).unwrap_or(usize::MAX);
+    // #733: the tile-gzip cache's payload, granted once before any tile is
+    // encoded, in slices of one shard's share of the 8 MiB the Madagascar
+    // repeats were measured to need. A tighter budget gets fewer slices,
+    // down to one.
+    let gzip_grant = budget.fit(
+        options.profile,
+        MemoryPhase::ExportEncode,
+        Price::new(
+            crate::compression::tile_gzip::PAYLOAD_SLICE_BYTES as u64,
+            PriceBasis::Measured,
+        ),
+        crate::compression::tile_gzip::PAYLOAD_SLICES,
+        // Main's cache under every profile: bounded keeps main's caps.
+        crate::compression::tile_gzip::PAYLOAD_SLICES,
+    );
+    crate::compression::tile_gzip::configure_payload_cap(
+        usize::try_from(gzip_grant.bytes()).unwrap_or(usize::MAX),
+    );
     let mut store = if single_read {
         let backing = knobs.backing_override.unwrap_or_else(|| {
-            auto_fill_backing(&scans, num_levels, available_ram, mean_member_bytes)
+            auto_fill_backing(&scans, num_levels, budget.available(), mean_member_bytes)
         });
         // #571: entered only when the fill runs, so a duplicating-mode export
         // (no fill) has no `fill` entry in `phase_peaks_mib`.
@@ -2226,7 +2328,11 @@ fn export_pmtiles_validated(
                 feature_id: feature_id.as_ref(),
                 timers: &progress.profile.timers,
             },
-            backing,
+            StoreBacking {
+                backing,
+                ram_budget: store_ram,
+                resident: 0,
+            },
             diagnostics,
         )?;
         progress.end_fill(t_fill);
@@ -2240,21 +2346,21 @@ fn export_pmtiles_validated(
     progress.enter_phase("levels");
 
     let t_levels = Instant::now();
-    // #647: consecutive small levels run as one concurrent group. On `auto`
-    // the cap sizes from the same RAM budget as the #311 per-level guard.
-    // An explicit wave sizes the cap from its width alone, as #311 does.
-    // `concurrent_levels: false` (cap 0) is the serial test oracle.
-    let group_cap = level_group_member_cap(
-        ceiling_wave,
-        partition_target,
-        member_bytes.filter(|_| auto_wave),
-        available_ram.filter(|_| auto_wave),
-    );
-    let group_cap = if knobs.concurrent_levels {
-        group_cap
-    } else {
-        0
-    };
+    // #740: without the export-wide store, a level split into several waves
+    // reads its band once into a one-level store instead of once per wave.
+    // The store holds every wave of the level (up to 5.7 waves' members on
+    // NZ z14) where the wave sizing budgets for one, so its backing is the
+    // budget's: in RAM when the level fits, otherwise spilling what the
+    // grant does not cover ([`level_read_backing`]). The forced legacy read
+    // keeps the per-wave reads (the tests' oracle).
+    let level_read = (store.is_none() && !knobs.force_legacy_pass2).then_some(LevelRead {
+        forced: knobs.backing_override,
+        ram_budget: store_ram,
+        member_bytes,
+        profile: options.profile,
+    });
+    #[cfg(test)]
+    let work = Mutex::new(ExportWorkTally::default());
     let levels: Vec<ExportLevelCtx<'_>> = plans
         .iter()
         .enumerate()
@@ -2270,12 +2376,18 @@ fn export_pmtiles_validated(
             options,
             start,
             fills: None,
+            level_read,
+            #[cfg(test)]
+            work: &work,
         })
         .collect();
     let level_groups = plan_level_groups(&plans, group_cap);
     zooms.extend(export_level_groups(
         &mut writer,
-        store.as_mut(),
+        LevelMemory {
+            store: store.as_mut(),
+            budget: &mut *budget,
+        },
         &levels,
         &level_groups,
         &CheckpointCtx {
@@ -2286,6 +2398,8 @@ fn export_pmtiles_validated(
         diagnostics,
     )?);
 
+    budget.release(store_grant);
+    budget.release(gzip_grant);
     progress.profile.walls.levels = t_levels.elapsed().as_secs_f64();
     progress.enter_phase("finalize");
 
@@ -2313,6 +2427,8 @@ fn export_pmtiles_validated(
         diagnostics,
     );
 
+    #[cfg(test)]
+    let work = work.lock().unwrap_or_else(PoisonError::into_inner).clone();
     Ok(Pass2Run {
         report: ExportReport::from_zooms(
             mode,
@@ -2328,6 +2444,8 @@ fn export_pmtiles_validated(
         checkpoint_zooms: progress.checkpoint_zooms,
         #[cfg(test)]
         single_read,
+        #[cfg(test)]
+        work,
     })
 }
 
@@ -2751,6 +2869,13 @@ struct ExportLevelCtx<'a> {
     start: Instant,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// How a level of several waves reads its band when no export-wide
+    /// member store is filled: once, into a one-level [`MemberStore`]
+    /// (#740), or, `None`, once per wave.
+    level_read: Option<LevelRead>,
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
 }
 
 impl<'a> ExportLevelCtx<'a> {
@@ -2766,6 +2891,8 @@ impl<'a> ExportLevelCtx<'a> {
             feature_id: self.feature_id,
             timers,
             fills: self.fills,
+            #[cfg(test)]
+            work: self.work,
         }
     }
 }
@@ -2781,6 +2908,7 @@ fn export_level(
     writer: &mut StreamingPmtilesWriter,
     mut store: Option<&mut MemberStore>,
     level: &ExportLevelCtx<'_>,
+    budget: &mut MemoryBudget,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<ZoomReport, ExportError> {
@@ -2804,10 +2932,23 @@ fn export_level(
     // stuck, so emit a throttled wave counter. If it advances the level is
     // slow; if it freezes the level is stuck — diagnosable in minutes.
     let mut last_wave_log = Instant::now();
+    let (mut level_store, level_grants) = match level.level_read {
+        Some(read) if store.is_none() && total_waves > 1 => {
+            let (backing, grants) = level_read_backing(read, plan, budget);
+            (
+                Some(fill_level_store(&ctx, plan, backing, diagnostics)?),
+                grants,
+            )
+        }
+        _ => (None, Vec::new()),
+    };
     for (wave_idx, wave) in partitions.chunks(partition_wave).enumerate() {
-        let results: Vec<Vec<EncodedTile>> = match store.as_deref_mut() {
-            Some(s) => encode_wave_from_store(s, &ctx, wave_idx, wave, diagnostics)?,
-            None => process_wave(&ctx, wave, diagnostics)?,
+        let results: Vec<Vec<EncodedTile>> = match (level_store.as_mut(), store.as_deref_mut()) {
+            (Some(s), _) => encode_wave_from_store(s, 0, &ctx, wave_idx, wave, diagnostics)?,
+            (None, Some(s)) => {
+                encode_wave_from_store(s, level_idx, &ctx, wave_idx, wave, diagnostics)?
+            }
+            (None, None) => process_wave(&ctx, wave, diagnostics)?,
         };
         write_encoded_tiles(writer, zoom, &results, &mut tally, timers)?;
 
@@ -2822,6 +2963,9 @@ fn export_level(
             );
             last_wave_log = Instant::now();
         }
+    }
+    for grant in level_grants {
+        budget.release(grant);
     }
     Ok(finish_level(
         level,
@@ -2840,6 +2984,7 @@ fn export_level(
 /// reads but does not emit (#771 option 1).
 fn build_fills_if_asked(
     levels: &[ExportLevelCtx<'_>],
+    budget: &mut MemoryBudget,
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Option<coverage_fill::FillMap>, ExportError> {
@@ -2865,7 +3010,27 @@ fn build_fills_if_asked(
         );
         return Ok(None);
     }
-    coverage_fill::build_fill_map(last, first.plan.zoom, timers, diagnostics).map(Some)
+    // #788: the builder's workspace, from the export-wide ledger, returned
+    // once the map is built; the map itself is held per zoom from then on.
+    let grant = budget.fit(
+        options.profile,
+        MemoryPhase::Fill,
+        Price::new(1, PriceBasis::Measured),
+        coverage_fill::WORKSPACE_WANT_BYTES,
+        coverage_fill::WORKSPACE_FLOOR_BYTES,
+    );
+    let built =
+        coverage_fill::build_fill_map(last, first.plan.zoom, grant.bytes(), timers, diagnostics);
+    budget.release(grant);
+    built.map(Some)
+}
+
+/// The memory the levels draw on: the export-wide member store (#235), when
+/// one was filled, and the run's budget, which grants a multi-wave level's
+/// own store (#740).
+struct LevelMemory<'s> {
+    store: Option<&'s mut MemberStore>,
+    budget: &'s mut MemoryBudget,
 }
 
 /// Export every level, one [`plan_level_groups`] group at a time. Each level
@@ -2873,27 +3038,38 @@ fn build_fills_if_asked(
 /// written, inside a group too (#647).
 fn export_level_groups(
     writer: &mut StreamingPmtilesWriter,
-    mut store: Option<&mut MemberStore>,
+    mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
     groups: &[std::ops::Range<usize>],
     ckpt: &CheckpointCtx<'_>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<ZoomReport>, ExportError> {
-    let fills = build_fills_if_asked(levels, &progress.profile.timers, diagnostics)?;
-    let levels: Vec<ExportLevelCtx<'_>> = levels
-        .iter()
-        .map(|l| ExportLevelCtx {
-            fills: fills.as_ref(),
-            ..*l
-        })
-        .collect();
+    let LevelMemory { mut store, budget } = mem;
+    let mut fills = build_fills_if_asked(levels, budget, &progress.profile.timers, diagnostics)?;
     let mut zooms = Vec::with_capacity(levels.len());
     for group in groups {
+        // #788: each level owns its zoom's fill, taken out of the map as
+        // its group starts and dropped when the group is written.
+        let group_fills: Vec<Option<coverage_fill::FillMap>> = levels[group.clone()]
+            .iter()
+            .map(|l| fills.as_mut().and_then(|f| f.take_zoom(l.plan.zoom)))
+            .collect();
+        let group_levels: Vec<ExportLevelCtx<'_>> = levels[group.clone()]
+            .iter()
+            .zip(&group_fills)
+            .map(|(l, fill)| ExportLevelCtx {
+                fills: fill.as_ref(),
+                ..*l
+            })
+            .collect();
         zooms.extend(export_level_group(
             writer,
-            store.as_deref_mut(),
-            &levels[group.clone()],
+            LevelMemory {
+                store: store.as_deref_mut(),
+                budget: &mut *budget,
+            },
+            &group_levels,
             ckpt,
             progress.fail_level,
             progress,
@@ -2945,16 +3121,17 @@ fn injected_fault(
 /// written and, when due, checkpointed.
 fn export_level_group(
     writer: &mut StreamingPmtilesWriter,
-    mut store: Option<&mut MemberStore>,
+    mem: LevelMemory<'_>,
     levels: &[ExportLevelCtx<'_>],
     ckpt: &CheckpointCtx<'_>,
     fail_level: Option<usize>,
     progress: &mut ExportProgress,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<ZoomReport>, ExportError> {
+    let LevelMemory { mut store, budget } = mem;
     if let [level] = levels {
         injected_fault(level, fail_level)?;
-        let report = export_level(writer, store, level, progress, diagnostics)?;
+        let report = export_level(writer, store, level, budget, progress, diagnostics)?;
         checkpoint_if_due(writer, ckpt, checkpoint_zoom_after_level(level), progress)?;
         return Ok(vec![report]);
     }
@@ -3407,16 +3584,92 @@ struct LevelScan {
 struct Partition {
     key_lo: u64,
     key_hi: u64,
-    /// Union of the partition's tile bounds plus a one-tile margin, used to
-    /// prune row groups on the partition's read pass. Pruning is conservative:
-    /// a feature assigned to a tile in this partition has a bbox intersecting
-    /// that tile's bounds, hence intersecting this rectangle.
-    bbox: TileBounds,
+    /// The partition's tile bounds plus a one-tile margin, used to prune row
+    /// groups on the partition's read pass. Pruning is conservative: a
+    /// feature assigned to a tile in this partition has a bbox intersecting
+    /// that tile's bounds, hence intersecting this region.
+    bbox: PruneRegion,
     /// Summed member count (for balancing).
     members: usize,
 }
 
+/// The region a read prunes row groups to: the union of tile bounds west
+/// of the prime meridian and the union east of it, kept apart. A partition
+/// whose tiles sit on both sides of the antimeridian (the Chatham Islands
+/// and the NZ mainland, adjacent in tile order) is then two narrow
+/// rectangles, where one union rectangle spans every longitude and selects
+/// every row group at those latitudes. Splitting at the prime meridian
+/// instead of at ±180 handles both: a region across the prime meridian is
+/// two rectangles that meet, covering what its union did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PruneRegion {
+    west: Option<TileBounds>,
+    east: Option<TileBounds>,
+}
+
+impl PruneRegion {
+    fn of(bounds: TileBounds) -> Self {
+        let mut region = PruneRegion {
+            west: None,
+            east: None,
+        };
+        region.add(&bounds);
+        region
+    }
+    /// Add one tile's bounds to the side it lies on. A tile lies on one
+    /// side at every zoom but 0, whose one tile goes east.
+    fn add(&mut self, bounds: &TileBounds) {
+        let side = if bounds.lng_max <= 0.0 {
+            &mut self.west
+        } else {
+            &mut self.east
+        };
+        match side {
+            Some(b) => b.expand(bounds),
+            None => *side = Some(*bounds),
+        }
+    }
+    fn expand(&mut self, other: &PruneRegion) {
+        for b in other.rects() {
+            self.add(&b);
+        }
+    }
+    /// Grow each rectangle by `margin` degrees on every side.
+    fn grow(&mut self, margin: f64) {
+        for b in [&mut self.west, &mut self.east].into_iter().flatten() {
+            *b = TileBounds::new(
+                b.lng_min - margin,
+                b.lat_min - margin,
+                b.lng_max + margin,
+                b.lat_max + margin,
+            );
+        }
+    }
+    fn rects(&self) -> impl Iterator<Item = TileBounds> {
+        self.west.into_iter().chain(self.east)
+    }
+}
+
 /// Shared per-level context for partition processing.
+/// Deterministic work counts the #788 export tests pin (test builds only):
+/// what the duplicating-mode wave collect does, independent of timing.
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+struct ExportWorkTally {
+    /// Rows the wave reads delivered, per level index, summed over every
+    /// wave of the level (#740). A level whose band is read once has exactly
+    /// its band's row count here; each wave that re-reads row groups another
+    /// wave already read adds them again.
+    band_rows_read: BTreeMap<usize, u64>,
+    /// Rows whose per-row collect work (geometry decode, property
+    /// materialization and member routing in [`collect_wave_members`]) ran
+    /// on the wave's consumer thread, outside the Rayon pool, so that no
+    /// other core could share it (#740).
+    serial_collect_rows: u64,
+    /// Bytes each multi-wave level's one-level member store spilled (#740).
+    level_spill_bytes: BTreeMap<usize, u64>,
+}
+
 struct LevelCtx<'a> {
     reader: &'a OverviewReader,
     level_idx: usize,
@@ -3432,6 +3685,9 @@ struct LevelCtx<'a> {
     timers: &'a ExportTimers,
     /// The #750 coverage fill, when asked for.
     fills: Option<&'a coverage_fill::FillMap>,
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
 }
 
 /// The per-export constants the single-read fan-out reads for every batch:
@@ -3499,6 +3755,117 @@ struct LevelPlan {
 /// regardless of input size, while flushes stay large enough to keep the spill
 /// file's segments chunky.
 const MEMBER_STORE_RAM_BUDGET: usize = 128 * 1024 * 1024;
+
+/// Whole spill segments per bucket the member store's fill buffer holds
+/// once its members are measured: two, so flushing the largest bucket down
+/// to half the buffer writes at least about one full segment.
+const STORE_BUFFER_SEGMENTS: usize = 2;
+
+/// How a [`MemberStore`] holds its members: in RAM, or spilled with a fill
+/// buffer of at most `ram_budget` bytes of not-yet-flushed buckets, plus up
+/// to `resident` bytes that stay in RAM after the fill instead of spilling.
+#[derive(Debug, Clone, Copy)]
+struct StoreBacking {
+    backing: SinkBacking,
+    ram_budget: usize,
+    resident: usize,
+}
+
+/// How a level of several waves reads its band when no export-wide member
+/// store is filled (#740): once, into a one-level [`MemberStore`].
+#[derive(Debug, Clone, Copy)]
+struct LevelRead {
+    /// A backing the caller forced (tests), or `None` for the budget's
+    /// choice ([`level_read_backing`]).
+    forced: Option<SinkBacking>,
+    /// The fill buffer of a spilling store: the run's store grant.
+    ram_budget: usize,
+    /// Resident bytes of one member (a footer price, see
+    /// [`member_resident_bytes`]), when known.
+    member_bytes: Option<u64>,
+    /// The run's memory profile: `bounded` grants the wave only and
+    /// spills the level, `speed` keeps the whole level in RAM, `auto` keeps
+    /// what the budget affords.
+    profile: MemoryProfile,
+}
+
+/// Choose a multi-wave level's store backing under `budget` (#740): RAM
+/// when the level's planned members fit [`MemoryPhase::ExportCollect`]
+/// after the drain's widest wave, otherwise spill, keeping as many bytes
+/// resident as the grant covers and spilling only the remainder. Members
+/// are priced at the footer's per-member bytes. Spills whole when RAM or
+/// the member size is unknown. Returns the grants the level holds until
+/// its last wave is written.
+fn level_read_backing(
+    read: LevelRead,
+    plan: &LevelPlan,
+    budget: &mut MemoryBudget,
+) -> (StoreBacking, Vec<Grant>) {
+    let spill = StoreBacking {
+        backing: SinkBacking::Spill,
+        ram_budget: read.ram_budget,
+        resident: 0,
+    };
+    if let Some(backing) = read.forced {
+        return (StoreBacking { backing, ..spill }, Vec::new());
+    }
+    let (Some(per_member), Some(_)) = (read.member_bytes.filter(|&b| b > 0), budget.limit) else {
+        return (spill, Vec::new());
+    };
+    let price = Price::new(per_member, PriceBasis::Footer);
+    let members = |ps: &[Partition]| ps.iter().map(|p| p.members).sum::<usize>();
+    let level_members = members(&plan.partitions);
+    let wave_members = plan
+        .partitions
+        .chunks(plan.wave.max(1))
+        .map(members)
+        .max()
+        .unwrap_or(0);
+    // The wave the drain holds while it encodes, which the wave width was
+    // sized to fit; the level's members share what is left.
+    let wave = budget.fit(
+        read.profile,
+        MemoryPhase::ExportCollect,
+        price,
+        wave_members,
+        wave_members,
+    );
+    let affordable = budget.affordable(read.profile, MemoryPhase::ExportCollect, price);
+    let level = budget.fit(
+        read.profile,
+        MemoryPhase::ExportCollect,
+        price,
+        level_members,
+        0,
+    );
+    let affordable = if affordable == usize::MAX {
+        "unlimited".to_string()
+    } else {
+        format!(
+            "{} MiB",
+            (affordable as u64).saturating_mul(per_member) >> 20
+        )
+    };
+    log::debug!(
+        "[profile]     z{} level store grants: wave {} MiB ({wave_members} members), \
+         level {} of {} MiB wanted ({level_members} members at {per_member} B), \
+         {affordable} was affordable",
+        plan.zoom,
+        wave.bytes() >> 20,
+        level.bytes() >> 20,
+        (level_members as u64).saturating_mul(per_member) >> 20,
+    );
+    let backing = if level.units >= level_members {
+        StoreBacking {
+            backing: SinkBacking::Ram,
+            ..spill
+        }
+    } else {
+        let resident = usize::try_from(level.bytes()).unwrap_or(usize::MAX);
+        StoreBacking { resident, ..spill }
+    };
+    (backing, vec![wave, level])
+}
 
 /// Bounded-channel depth between the band reader thread and the clip/route
 /// consumer of the single-read fill — the read/compute overlap and
@@ -3808,6 +4175,36 @@ fn decode_geometry(cur: &mut SpillCursor<'_>) -> Result<Geometry<f64>, ExportErr
 struct SpillNames(HashSet<Arc<str>>);
 
 impl SpillNames {
+    /// Fold a segment's own name table into this one: a name this table
+    /// already holds replaces the segment's handle in `members`, and a new
+    /// one is adopted as is.
+    fn fold(&mut self, local: SpillNames, members: &mut [Member]) {
+        let remap: Vec<(Arc<str>, Arc<str>)> = local
+            .0
+            .into_iter()
+            .filter_map(|name| match self.0.get(&*name) {
+                Some(shared) => Some((name, Arc::clone(shared))),
+                None => {
+                    self.0.insert(name);
+                    None
+                }
+            })
+            .collect();
+        if remap.is_empty() {
+            return;
+        }
+        members.par_iter_mut().for_each(|m| {
+            // Freshly decoded, so the props are not shared yet.
+            if let Some(props) = Arc::get_mut(&mut m.props) {
+                for (name, _) in props.iter_mut() {
+                    if let Some((_, shared)) = remap.iter().find(|(l, _)| Arc::ptr_eq(l, name)) {
+                        *name = Arc::clone(shared);
+                    }
+                }
+            }
+        });
+    }
+
     fn intern(&mut self, name: &str) -> Arc<str> {
         if let Some(shared) = self.0.get(name) {
             return Arc::clone(shared);
@@ -3816,6 +4213,22 @@ impl SpillNames {
         self.0.insert(Arc::clone(&shared));
         shared
     }
+}
+
+/// Decode one spill segment, interning its property names in a table of its
+/// own.
+fn decode_segment(buf: &[u8]) -> Result<(Vec<Member>, SpillNames), ExportError> {
+    let mut names = SpillNames::default();
+    let mut cur = SpillCursor::new(buf);
+    let n = cur.u64()? as usize;
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        members.push(decode_member(&mut cur, &mut names)?);
+    }
+    if !cur.is_empty() {
+        return Err(spill_corrupt());
+    }
+    Ok((members, names))
 }
 
 fn decode_member(cur: &mut SpillCursor<'_>, names: &mut SpillNames) -> Result<Member, ExportError> {
@@ -3874,16 +4287,35 @@ fn member_bytes_estimate(m: &Member) -> usize {
 }
 
 /// The single spill file behind a [`MemberStore`]: bucket flushes append
-/// length-indexed segments; `segments[level][wave]` records each segment's
-/// `(offset, len)` in append order.
+/// length-indexed segments; `segments[level][wave]` records each segment in
+/// append order.
 struct MemberSpill {
     writer: BufWriter<File>,
     read: File,
     /// Keeps the anonymous temp file alive (unlinked on drop).
     _temp: NamedTempFile,
     offset: u64,
-    segments: Vec<Vec<Vec<(u64, u64)>>>,
+    segments: Vec<Vec<Vec<SpillSegment>>>,
 }
+
+/// One spill segment: `members` records at `(offset, len)` in the file.
+#[derive(Clone, Copy)]
+struct SpillSegment {
+    offset: u64,
+    len: u64,
+    members: usize,
+}
+
+/// Members per spill segment. A flush encodes, and `take_wave` decodes, its
+/// segments in parallel (#740), so a bucket is cut into many: under spill a
+/// multi-wave level's whole band passes through here, and serially the
+/// encode and decode were 37 core-seconds on the consumer thread of an NZ
+/// parcels export.
+const SPILL_SEGMENT_MEMBERS: usize = 4096;
+
+/// Raw segment bytes [`MemberStore::take_wave`] reads ahead of its parallel
+/// decode: a bound on the read buffer next to the wave's decoded members.
+const SPILL_READ_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Per-(level, wave) buffered tile members for the partitioning single-read
 /// pass 2 (#235), with RAM or spill backing. See the section comment above for
@@ -3897,6 +4329,23 @@ struct MemberStore {
     buffered_bytes: usize,
     /// Present under spill backing only.
     spill: Option<MemberSpill>,
+    /// The in-RAM ceiling for not-yet-flushed buckets under spill backing.
+    /// It starts at the run's [`MemoryPhase::ExportCollect`] grant (a model
+    /// price, [`MEMBER_STORE_RAM_BUDGET`]) and, once the first
+    /// [`SPILL_SEGMENT_MEMBERS`] members are measured, narrows to
+    /// [`STORE_BUFFER_SEGMENTS`] segments per bucket at their measured mean
+    /// size: enough for every flush to write whole segments.
+    buffer: usize,
+    /// Bytes of buckets the fill leaves in RAM instead of spilling them
+    /// (#740): a multi-wave level's grant beyond the fill buffer. Zero for
+    /// the export-wide store, whose drain holds one wave at a time.
+    resident: usize,
+    /// Members pushed so far and their estimated bytes: the measurement
+    /// [`Self::buffer`] is priced from.
+    pushed_members: usize,
+    pushed_bytes: usize,
+    /// `[level][wave]` buckets in all.
+    bucket_count: usize,
     /// Profiling only (#535): cumulative time spent in [`Self::flush_bucket`]
     /// (serialize + write of spill segments). Read by the fill to charge it
     /// to `spill_write` rather than to the routing that triggered it.
@@ -3909,6 +4358,7 @@ impl MemberStore {
     fn new(
         plans: &[LevelPlan],
         backing: SinkBacking,
+        ram_budget: usize,
         spill_dir: Option<&Path>,
     ) -> Result<Self, ExportError> {
         let shape: Vec<usize> = plans
@@ -3920,6 +4370,7 @@ impl MemberStore {
             .map(|&w| (0..w).map(|_| Vec::new()).collect())
             .collect();
         let bucket_bytes = shape.iter().map(|&w| vec![0usize; w]).collect();
+        let bucket_count = shape.iter().sum();
         let spill = match backing {
             SinkBacking::Ram => None,
             SinkBacking::Spill => {
@@ -3943,8 +4394,23 @@ impl MemberStore {
             bucket_bytes,
             buffered_bytes: 0,
             spill,
+            buffer: ram_budget,
+            resident: 0,
+            pushed_members: 0,
+            pushed_bytes: 0,
+            bucket_count,
             flush_time: Duration::ZERO,
         })
+    }
+
+    /// The fill's in-RAM ceiling: the buffer plus the resident grant.
+    fn ram_budget(&self) -> usize {
+        self.buffer.saturating_add(self.resident)
+    }
+
+    /// Bytes written to the spill file so far.
+    fn spilled_bytes(&self) -> u64 {
+        self.spill.as_ref().map_or(0, |s| s.offset)
     }
 
     fn push(&mut self, level: usize, wave: usize, m: Member) -> Result<(), ExportError> {
@@ -3952,8 +4418,21 @@ impl MemberStore {
         self.buckets[level][wave].push(m);
         self.bucket_bytes[level][wave] += est;
         self.buffered_bytes += est;
-        if self.spill.is_some() && self.buffered_bytes > MEMBER_STORE_RAM_BUDGET {
-            self.flush_largest_until(MEMBER_STORE_RAM_BUDGET / 2)?;
+        self.pushed_members += 1;
+        self.pushed_bytes += est;
+        if self.pushed_members == SPILL_SEGMENT_MEMBERS {
+            // A measured price: the members this store already holds.
+            let per_member = self.pushed_bytes / self.pushed_members;
+            let need = self
+                .bucket_count
+                .saturating_mul(STORE_BUFFER_SEGMENTS * SPILL_SEGMENT_MEMBERS)
+                .saturating_mul(per_member);
+            self.buffer = self.buffer.min(need);
+        }
+        if self.spill.is_some() && self.buffered_bytes > self.ram_budget() {
+            // Flush half of the fill buffer at a time, so a store with a
+            // resident grant spills only what does not fit.
+            self.flush_largest_until(self.ram_budget() - self.buffer / 2)?;
         }
         Ok(())
     }
@@ -3993,28 +4472,54 @@ impl MemberStore {
             .spill
             .as_mut()
             .expect("flush_bucket requires spill backing");
-        let mut buf = Vec::with_capacity(bytes + 16);
-        put_u64(&mut buf, members.len() as u64);
-        for m in &members {
-            encode_member(&mut buf, m);
+        // A few segments per pool thread at a time, at most 16, so the
+        // encoded bytes held before their write stay a small, bounded
+        // transient next to the bucket (dhat: encoding a whole bucket into
+        // one buffer was half of a Moldova export's peak live heap).
+        let group = SPILL_SEGMENT_MEMBERS * rayon::current_num_threads().clamp(1, 16);
+        for members in members.chunks(group) {
+            let encoded: Vec<(Vec<u8>, usize)> = members
+                .par_chunks(SPILL_SEGMENT_MEMBERS)
+                .map(|chunk| {
+                    let mut buf = Vec::new();
+                    put_u64(&mut buf, chunk.len() as u64);
+                    for m in chunk {
+                        encode_member(&mut buf, m);
+                    }
+                    (buf, chunk.len())
+                })
+                .collect();
+            for (buf, n) in encoded {
+                spill.writer.write_all(&buf)?;
+                spill.segments[level][wave].push(SpillSegment {
+                    offset: spill.offset,
+                    len: buf.len() as u64,
+                    members: n,
+                });
+                spill.offset += buf.len() as u64;
+            }
         }
-        spill.writer.write_all(&buf)?;
-        spill.segments[level][wave].push((spill.offset, buf.len() as u64));
-        spill.offset += buf.len() as u64;
+        members.into_par_iter().for_each(drop);
         self.flush_time += t_flush.elapsed();
         Ok(())
     }
 
-    /// Finish the fill phase. Under spill backing every remaining bucket is
-    /// flushed (the store was chosen *because* the buffered set is large; the
-    /// tail is negligible and this keeps the drain's RAM at one wave) and the
-    /// writer is flushed so `take_wave` reads observe every segment.
+    /// Finish the fill phase. Under spill backing the buckets above the
+    /// store's resident grant are flushed, the largest first, and with no
+    /// grant every bucket is (the store was chosen *because* the buffered
+    /// set is large; the tail is negligible and this keeps the drain's RAM
+    /// at one wave). The writer is then flushed so `take_wave` reads observe
+    /// every segment.
     fn finish_fill(&mut self) -> Result<(), ExportError> {
         use std::io::Write;
         if self.spill.is_some() {
-            for li in 0..self.buckets.len() {
-                for wi in 0..self.buckets[li].len() {
-                    self.flush_bucket(li, wi)?;
+            if self.resident > 0 {
+                self.flush_largest_until(self.resident)?;
+            } else {
+                for li in 0..self.buckets.len() {
+                    for wi in 0..self.buckets[li].len() {
+                        self.flush_bucket(li, wi)?;
+                    }
                 }
             }
             let t_flush = Instant::now();
@@ -4031,26 +4536,49 @@ impl MemberStore {
     /// Take one wave's members out of the store: spill segments (in append
     /// order) followed by any in-RAM remainder. Member order is irrelevant to
     /// the output — `encode_members` sorts by the unique `(key, seq)`.
+    ///
+    /// Segments are read in groups of about [`SPILL_READ_GROUP_BYTES`] and
+    /// each group's segments decoded in parallel (#740), each with its own
+    /// name table; the tables are then folded into one, so the wave shares
+    /// one `Arc<str>` per property name as a serial decode did (#461).
     fn take_wave(&mut self, level: usize, wave: usize) -> Result<Vec<Member>, ExportError> {
         use std::io::{Read, Seek, SeekFrom};
         let mut out = Vec::new();
         if let Some(spill) = self.spill.as_mut() {
+            let segments = std::mem::take(&mut spill.segments[level][wave]);
+            out.reserve_exact(
+                segments.iter().map(|s| s.members).sum::<usize>() + self.buckets[level][wave].len(),
+            );
             let mut names = SpillNames::default();
-            for &(off, len) in &spill.segments[level][wave] {
-                spill.read.seek(SeekFrom::Start(off))?;
-                let mut buf = vec![0u8; len as usize];
-                spill.read.read_exact(&mut buf)?;
-                let mut cur = SpillCursor::new(&buf);
-                let n = cur.u64()? as usize;
-                out.reserve(n);
-                for _ in 0..n {
-                    out.push(decode_member(&mut cur, &mut names)?);
+            let mut rest = segments.as_slice();
+            while !rest.is_empty() {
+                let mut group_bytes = 0u64;
+                let take = rest
+                    .iter()
+                    .take_while(|s| {
+                        let first = group_bytes == 0;
+                        group_bytes += s.len;
+                        first || group_bytes <= SPILL_READ_GROUP_BYTES
+                    })
+                    .count();
+                let (group, tail) = rest.split_at(take);
+                rest = tail;
+                let mut bufs = Vec::with_capacity(group.len());
+                for seg in group {
+                    spill.read.seek(SeekFrom::Start(seg.offset))?;
+                    let mut buf = vec![0u8; seg.len as usize];
+                    spill.read.read_exact(&mut buf)?;
+                    bufs.push(buf);
                 }
-                if !cur.is_empty() {
-                    return Err(spill_corrupt());
+                let decoded: Vec<(Vec<Member>, SpillNames)> = bufs
+                    .into_par_iter()
+                    .map(|buf| decode_segment(&buf))
+                    .collect::<Result<_, _>>()?;
+                for (mut members, local) in decoded {
+                    names.fold(local, &mut members);
+                    out.append(&mut members);
                 }
             }
-            spill.segments[level][wave] = Vec::new();
         }
         let bytes = std::mem::take(&mut self.bucket_bytes[level][wave]);
         self.buffered_bytes -= bytes;
@@ -4067,13 +4595,18 @@ impl MemberStore {
 fn fill_member_store(
     reader: &OverviewReader,
     ctx: &FanoutCtx<'_>,
-    backing: SinkBacking,
+    backing: StoreBacking,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<MemberStore, ExportError> {
     let timers = ctx.timers;
     let plans = ctx.plans;
     let num_levels = plans.len();
-    let mut store = MemberStore::new(plans, backing, ctx.opts.spill_dir.as_deref())?;
+    let mut store = MemberStore::new(
+        plans,
+        backing.backing,
+        backing.ram_budget,
+        ctx.opts.spill_dir.as_deref(),
+    )?;
     let t_fill = Instant::now();
     let mut seq = 0u64;
     // #745: every band is read whole and in order, so the rows arrive in
@@ -4287,13 +4820,14 @@ fn route_fanout_rows(
 /// order.
 fn encode_wave_from_store(
     store: &mut MemberStore,
+    store_level: usize,
     ctx: &LevelCtx<'_>,
     wave_idx: usize,
     wave: &[Partition],
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     let members = ExportTimers::time(&ctx.timers.spill_read, || {
-        store.take_wave(ctx.level_idx, wave_idx)
+        store.take_wave(store_level, wave_idx)
     })?;
     encode_buckets(
         bucket_members(members, wave),
@@ -4822,14 +5356,14 @@ fn plan_partitions(
         match cur.as_mut() {
             Some(p) => {
                 p.key_hi = key;
-                p.bbox.expand(&tb);
+                p.bbox.add(&tb);
                 p.members += count;
             }
             None => {
                 cur = Some(Partition {
                     key_lo: key,
                     key_hi: key,
-                    bbox: tb,
+                    bbox: PruneRegion::of(tb),
                     members: count,
                 });
             }
@@ -4843,12 +5377,7 @@ fn plan_partitions(
     // row-group bbox statistics; over-inclusion only reads an extra row group.
     let margin = 360.0 / 2f64.powi(zoom as i32);
     for p in &mut out {
-        p.bbox = TileBounds::new(
-            p.bbox.lng_min - margin,
-            p.bbox.lat_min - margin,
-            p.bbox.lng_max + margin,
-            p.bbox.lat_max + margin,
-        );
+        p.bbox.grow(margin);
     }
     out
 }
@@ -4925,24 +5454,110 @@ fn collect_wave(
     wave: &[Partition],
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<CollectedWave, ExportError> {
+    let t_collect = Instant::now();
+    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
+    let rows_read = collect_into(ctx, wave, &mut buckets, diagnostics)?;
+    Ok(CollectedWave {
+        buckets,
+        rows_read,
+        collect_secs: t_collect.elapsed().as_secs_f64(),
+    })
+}
+
+/// A level of several waves, read once (#740): its whole band, pruned to all
+/// of its partitions, clipped and routed into a one-level [`MemberStore`]
+/// (level index 0) that the wave loop drains one wave at a time.
+///
+/// PERF (#740): each wave used to read its band again, pruned to the wave's
+/// partitions. Row-group bboxes overlap several waves' partitions, so the
+/// finest level read its band 2.5-3.4 times on NZ parcels (z14, 6 waves)
+/// and 2.4-2.5 times on Moldova at width 8, decoding and clipping every
+/// re-read row again. Holding the read's members in RAM instead would keep
+/// up to 5.6 waves resident (measured on NZ z14) against the wave sizing's
+/// one, so the store spills unless told otherwise.
+///
+/// Byte-identical to the per-wave reads: a member's clipped geometry does
+/// not depend on the key window it was clipped in, `seq` is the same global
+/// source row, the gap is measured within the row group, and
+/// `encode_members` sorts by `(key, seq)`.
+fn fill_level_store(
+    ctx: &LevelCtx<'_>,
+    plan: &LevelPlan,
+    backing: StoreBacking,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<MemberStore, ExportError> {
+    let t_collect = Instant::now();
+    let mut store = MemberStore::new(
+        std::slice::from_ref(plan),
+        backing.backing,
+        backing.ram_budget,
+        ctx.opts.spill_dir.as_deref(),
+    )?;
+    store.resident = backing.resident;
+    let rows_read = collect_into(
+        ctx,
+        &plan.partitions,
+        &mut LevelStoreSink {
+            store: &mut store,
+            wave: plan.wave,
+        },
+        diagnostics,
+    )?;
+    store.finish_fill()?;
+    super::stream::add_nanos(&ctx.timers.spill_write, store.flush_time);
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        *work.level_spill_bytes.entry(ctx.level_idx).or_default() += store.spilled_bytes();
+    }
+    log::debug!(
+        "[profile]     z{} level read ({} partitions, {} waves): rows_read={rows_read} \
+         collect={:.2}s ({:?}, buffer {} MiB, resident {} MiB, spilled {} MiB)",
+        ctx.zoom,
+        plan.partitions.len(),
+        plan.partitions.len().div_ceil(plan.wave.max(1)),
+        t_collect.elapsed().as_secs_f64(),
+        backing.backing,
+        store.buffer >> 20,
+        backing.resident >> 20,
+        store.spilled_bytes() >> 20,
+    );
+    Ok(store)
+}
+
+/// Read the band once, pruned to `wave`'s partitions, and clip and route
+/// their members into `sink`. Returns the rows read.
+fn collect_into(
+    ctx: &LevelCtx<'_>,
+    wave: &[Partition],
+    sink: &mut dyn MemberSink,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<u64, ExportError> {
     debug_assert!(!wave.is_empty(), "wave must be non-empty");
 
     // Row-group pruning is only valid when the file's coordinates (and thus its
     // row-group bbox statistics) are lon/lat. For 3857 files the stats are in
     // meters; skip pruning (correct, just unpruned). Prune to the *union* of the
-    // wave's partition bboxes, and of that union shifted ±360°: the export
+    // wave's partition regions (each side of the prime meridian on its own,
+    // see [`PruneRegion`]), and of that union shifted ±360°: the export
     // draws a feature stored one world width away at its wrapped position
     // (#342, `wrap_shifts`), so its row group's stats sit there, not over the
     // wave's tiles.
     let bboxes = match ctx.crs {
         Crs::Epsg4326 => {
-            let mut b = wave[0].bbox;
+            let mut region = wave[0].bbox;
             for p in &wave[1..] {
-                b.expand(&p.bbox);
+                region.expand(&p.bbox);
             }
             Some(
-                [0.0, -360.0, 360.0]
-                    .map(|shift| [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]),
+                region
+                    .rects()
+                    .flat_map(|b| {
+                        [0.0, -360.0, 360.0].map(|shift| {
+                            [b.lng_min + shift, b.lat_min, b.lng_max + shift, b.lat_max]
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             )
         }
         Crs::Epsg3857 => None,
@@ -4952,8 +5567,6 @@ fn collect_wave(
     // `collect_wave_members` charges its own `decode`/`clip`.
     let timers = ctx.timers;
 
-    let t_collect = Instant::now();
-    let mut buckets: Vec<Vec<Member>> = (0..wave.len()).map(|_| Vec::new()).collect();
     // PERF (#535): the read runs on its own thread, one batch ahead of the
     // clip, instead of alternating with it on this one. The read is
     // single-threaded by nature (one Parquet reader, sequential row groups)
@@ -4973,14 +5586,13 @@ fn collect_wave(
     // where each one starts and which band it belongs to.
     let selected = ctx
         .reader
-        .selected_row_groups_any(ctx.level_idx, bboxes.as_ref().map(|b| b.as_slice()))?;
+        .selected_row_groups_any(ctx.level_idx, bboxes.as_deref())?;
     let mut rows = WaveRows {
         read: 0,
         gaps: RowGapCursor::new(ctx.reader.row_group_bands(&selected))
             .measuring(valve_merges(ctx.opts)),
         locator: ctx.reader.row_locator(&selected),
     };
-    let buckets_ref = &mut buckets;
     let rows_ref = &mut rows;
     scoped_pipe(
         WAVE_READ_IN_FLIGHT,
@@ -4988,7 +5600,7 @@ fn collect_wave(
             let mut batch_reader = ExportTimers::time(&timers.band_read, || {
                 ctx.reader.read_level_any_bbox_batched(
                     ctx.level_idx,
-                    bboxes.as_ref().map(|b| b.as_slice()),
+                    bboxes.as_deref(),
                     EXPORT_BATCH_SIZE,
                 )
             })?;
@@ -5003,16 +5615,17 @@ fn collect_wave(
         },
         |rx: Receiver<RecordBatch>| -> Result<(), ExportError> {
             for batch in rx.iter() {
-                collect_wave_members(ctx, wave, &batch, rows_ref, buckets_ref, diagnostics)?;
+                collect_wave_members(ctx, wave, &batch, rows_ref, sink, diagnostics)?;
             }
             Ok(())
         },
     )?;
-    Ok(CollectedWave {
-        buckets,
-        rows_read: rows.read,
-        collect_secs: t_collect.elapsed().as_secs_f64(),
-    })
+    #[cfg(test)]
+    {
+        let mut work = ctx.work.lock().unwrap_or_else(PoisonError::into_inner);
+        *work.band_rows_read.entry(ctx.level_idx).or_default() += rows.read;
+    }
+    Ok(rows.read)
 }
 
 /// The wave partition owning `key`. The wave's partitions are contiguous,
@@ -5031,10 +5644,40 @@ fn route_partition(wave: &[Partition], key: u64) -> usize {
     idx
 }
 
+/// Rows per parallel chunk of a batch's per-row collect work (#740): one
+/// chunk per pool thread, but at least [`MIN_COLLECT_CHUNK_ROWS`] rows, so the
+/// per-chunk setup (column slices, buckets) stays small next to the rows. The
+/// chunking never shows in the output: every chunk's results are put back in
+/// row order.
+fn collect_chunk_rows(rows: usize) -> usize {
+    rows.div_ceil(rayon::current_num_threads())
+        .max(MIN_COLLECT_CHUNK_ROWS)
+        .min(rows.max(1))
+}
+
+/// The smallest [`collect_chunk_rows`] chunk of a batch larger than it. One
+/// row under test, so the small test batches still split into chunks at
+/// nonzero offsets and every byte-identity test covers the merge.
+const MIN_COLLECT_CHUNK_ROWS: usize = if cfg!(test) { 1 } else { 128 };
+
+/// The row ranges [`collect_chunk_rows`] splits a batch of `rows` into, in
+/// row order.
+fn collect_chunks(rows: usize) -> impl IndexedParallelIterator<Item = std::ops::Range<usize>> {
+    let chunk = collect_chunk_rows(rows);
+    (0..rows.div_ceil(chunk))
+        .into_par_iter()
+        .map(move |i| i * chunk..((i + 1) * chunk).min(rows))
+}
+
 /// Decode a batch's geometry column to `geo::Geometry` (geoarrow, no WKB
 /// round trip), reprojecting EPSG:3857 input to lon/lat — shared by both
-/// pass-2 paths. #535: charged to `decode`, the serial decode as one window
-/// and the reprojection per geometry inside its `par_iter` (core-seconds).
+/// pass-2 paths. #535: charged to `decode`, per chunk (core-seconds).
+///
+/// PERF (#740): the decode runs over row chunks in the pool. It used to be
+/// one serial pass on the wave's consumer thread, about 28% of that
+/// thread's time on a 64-core Moldova export, while the pool waited for it.
+/// Each chunk decodes a zero-copy slice of the column, and the chunks are
+/// concatenated in row order, so the result is the serial one.
 fn decode_batch_geometries(
     batch: &RecordBatch,
     schema: &Schema,
@@ -5043,30 +5686,46 @@ fn decode_batch_geometries(
     timers: &ExportTimers,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<Vec<Geometry<f64>>, ExportError> {
-    let mut geoms: Vec<Geometry<f64>> = Vec::with_capacity(batch.num_rows());
-    ExportTimers::time(&timers.decode, || -> Result<(), ExportError> {
-        let geom_field = schema.field(geom_idx).clone();
-        let garr: Arc<dyn GeoArrowArray> =
-            from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
-                .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
-        let mut rows = Vec::with_capacity(batch.num_rows());
-        crate::batch_processor::extract_geometries_opt_from_array(
-            garr.as_ref(),
-            &mut rows,
-            diagnostics,
-        )?;
-        geoms.extend(rows.into_iter().map(|row| {
-            row.unwrap_or_else(|| Geometry::GeometryCollection(geo::GeometryCollection::default()))
-        }));
-        Ok(())
-    })?;
-    if matches!(crs, Crs::Epsg3857) {
-        geoms = geoms
-            .par_iter()
-            .map(|g| ExportTimers::time(&timers.decode, || reproject_3857_to_4326(g)))
-            .collect();
-    }
-    Ok(geoms)
+    let geom_field = schema.field(geom_idx).clone();
+    let garr: Arc<dyn GeoArrowArray> =
+        from_arrow_array(batch.column(geom_idx).as_ref(), &geom_field)
+            .map_err(|e| crate::Error::GeoParquetRead(format!("geometry decode: {e}")))?;
+    let chunks: Vec<Vec<Geometry<f64>>> = collect_chunks(batch.num_rows())
+        .map(|range| {
+            ExportTimers::time(&timers.decode, || {
+                decode_geometry_chunk(garr.as_ref(), range, crs, diagnostics)
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+/// One chunk of [`decode_batch_geometries`]: rows `range` of `garr`.
+fn decode_geometry_chunk(
+    garr: &dyn GeoArrowArray,
+    range: std::ops::Range<usize>,
+    crs: Crs,
+    diagnostics: &crate::diagnostics::Diagnostics,
+) -> Result<Vec<Geometry<f64>>, ExportError> {
+    let slice = garr.slice(range.start, range.len());
+    let mut rows = Vec::with_capacity(range.len());
+    crate::batch_processor::extract_geometries_opt_from_array(
+        slice.as_ref(),
+        &mut rows,
+        diagnostics,
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let g = row.unwrap_or_else(|| {
+                Geometry::GeometryCollection(geo::GeometryCollection::default())
+            });
+            match crs {
+                Crs::Epsg3857 => reproject_3857_to_4326(&g),
+                Crs::Epsg4326 => g,
+            }
+        })
+        .collect())
 }
 
 /// Decode one record batch and append its members to the wave's per-partition
@@ -5075,15 +5734,21 @@ fn decode_batch_geometries(
 /// attach shared per-feature properties in band order. `rows` restores the
 /// original overview addresses after pruning, keeping identity stable between
 /// waves while preserving the relative within-tile feature order.
+///
+/// PERF (#740): property extraction, member materialization and routing run
+/// over row chunks in the pool ([`collect_member_chunk`]); only appending
+/// each chunk's buckets, in chunk order, stays on this thread. On a 64-core
+/// Moldova export this thread used to do all of it serially while about 8
+/// cores were busy. The chunks are merged in row order, so every bucket
+/// holds the same members in the same order as the serial loop gave.
 fn collect_wave_members(
     ctx: &LevelCtx<'_>,
     wave: &[Partition],
     batch: &RecordBatch,
     rows: &mut WaveRows,
-    buckets: &mut [Vec<Member>],
+    sink: &mut dyn MemberSink,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Result<(), ExportError> {
-    debug_assert_eq!(buckets.len(), wave.len());
     let key_lo = wave[0].key_lo;
     let key_hi = wave[wave.len() - 1].key_hi;
     let timers = ctx.timers;
@@ -5094,43 +5759,172 @@ fn collect_wave_members(
     let row_gaps = ExportTimers::time(&timers.decode, || rows.gaps.batch(&geoms));
 
     // Parallel per-feature clip (H3(c) lever 2), over the wave's whole key
-    // range. #535: `clip` is timed per geometry inside the closure.
-    let row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
-        .par_iter()
+    // range. #535: `clip` is timed per geometry inside the closure. Each
+    // decoded geometry is consumed, so it is freed in the pool too (#740).
+    let mut row_members: Vec<Vec<(u64, Geometry<f64>)>> = geoms
+        .into_par_iter()
         .map(|g| {
             ExportTimers::time(&timers.clip, || {
-                feature_tile_members(g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
+                feature_tile_members(&g, ctx.zoom, ctx.opts, key_lo, key_hi, diagnostics)
             })
         })
         .collect();
-    drop(geoms);
-    // #535: the rest of this batch (property extraction + routing) is `decode`.
-    let _decode = ExportTimers::scope(&timers.decode);
 
-    // Extract property columns once per batch; materialize per-feature props
-    // only for rows that produced members.
-    let mut attrs =
-        AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id).extract(batch);
-    for (row, items) in row_members.into_iter().enumerate() {
-        let source_row = rows.locator.global_row(rows.read as usize).ok_or_else(|| {
-            crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
+    // Property extraction and member routing, per chunk in the pool. #535:
+    // `decode`, timed per chunk and around the merge below.
+    let attrs = AttrColumns::new(&schema, geom_idx, ctx.published, ctx.feature_id);
+    let chunk_rows = collect_chunk_rows(batch.num_rows());
+    let chunk = ChunkInput {
+        #[cfg(test)]
+        work: ctx.work,
+        wave,
+        batch,
+        attrs: &attrs,
+        row_gaps: &row_gaps,
+        locator: &rows.locator,
+        first_read: rows.read as usize,
+    };
+    let chunks: Vec<Result<ChunkMembers, ExportError>> = row_members
+        .par_chunks_mut(chunk_rows)
+        .enumerate()
+        .map(|(i, items)| {
+            ExportTimers::time(&timers.decode, || {
+                collect_member_chunk(&chunk, i * chunk_rows, items)
+            })
+        })
+        .collect();
+    drop(row_members);
+
+    for chunk in chunks {
+        let ChunkMembers {
+            buckets: chunk_buckets,
+            losses,
+        } = chunk?;
+        // Recorded here, in row order, as the serial loop recorded them.
+        ExportTimers::time(&timers.decode, || {
+            losses.into_iter().try_for_each(|(source_row, id)| {
+                diagnostics.source_member_loss(
+                    source_row,
+                    id,
+                    ctx.zoom,
+                    crate::diagnostics::SourceLossCause::ClipDropped,
+                )
+            })
         })?;
-        let (props, id) = attrs.row(row)?;
+        // Not `decode`: a spilling sink charges its own writes to
+        // `spill_write`.
+        for (partition, members) in chunk_buckets.into_iter().enumerate() {
+            if !members.is_empty() {
+                sink.append(partition, members)?;
+            }
+        }
+    }
+    rows.read += batch.num_rows() as u64;
+    Ok(())
+}
+
+/// Where [`collect_wave_members`] puts a read's members: one call per
+/// partition (an index into the partitions being read) and row chunk, in row
+/// order. The per-wave read collects into one bucket per partition; a
+/// multi-wave level's single read (#740) into a [`MemberStore`], whose waves
+/// the drain then takes, or replays from spill, one at a time.
+trait MemberSink {
+    fn append(&mut self, partition: usize, members: Vec<Member>) -> Result<(), ExportError>;
+}
+
+impl MemberSink for Vec<Vec<Member>> {
+    fn append(&mut self, partition: usize, mut members: Vec<Member>) -> Result<(), ExportError> {
+        let bucket = &mut self[partition];
+        if bucket.is_empty() {
+            *bucket = members;
+        } else {
+            bucket.append(&mut members);
+        }
+        Ok(())
+    }
+}
+
+/// A one-level [`MemberStore`] as a [`MemberSink`] over all of the level's
+/// partitions: a partition's members go to its wave's bucket.
+struct LevelStoreSink<'a> {
+    store: &'a mut MemberStore,
+    /// The level's wave width, in partitions.
+    wave: usize,
+}
+
+impl MemberSink for LevelStoreSink<'_> {
+    fn append(&mut self, partition: usize, members: Vec<Member>) -> Result<(), ExportError> {
+        let wave = partition / self.wave.max(1);
+        members
+            .into_iter()
+            .try_for_each(|m| self.store.push(0, wave, m))
+    }
+}
+
+/// What every chunk of one batch's [`collect_member_chunk`] reads.
+struct ChunkInput<'a> {
+    /// The export's test-only work counts (#788).
+    #[cfg(test)]
+    work: &'a Mutex<ExportWorkTally>,
+    wave: &'a [Partition],
+    batch: &'a RecordBatch,
+    attrs: &'a AttrColumns<'a>,
+    /// Every row's `(gap, band)`, from the wave's [`RowGapCursor`].
+    row_gaps: &'a [(u64, u16)],
+    locator: &'a crate::input_set::StreamRowLocator,
+    /// The wave's read position at the batch's first row.
+    first_read: usize,
+}
+
+/// One chunk's members, bucketed per wave partition, and the
+/// `(source row, feature id)` of each of its rows that carries a
+/// `--feature-id`, in row order.
+struct ChunkMembers {
+    buckets: Vec<Vec<Member>>,
+    losses: Vec<(u64, u64)>,
+}
+
+/// Materialize the members of the rows `first..first + items.len()` of a
+/// batch: each row's properties (once per row, shared via `Arc`) attached to
+/// each of its clipped `(key, geometry)` items, routed to the item's wave
+/// partition. Takes the items out of `items`.
+fn collect_member_chunk(
+    input: &ChunkInput<'_>,
+    first: usize,
+    items: &mut [Vec<(u64, Geometry<f64>)>],
+) -> Result<ChunkMembers, ExportError> {
+    #[cfg(test)]
+    if rayon::current_thread_index().is_none() {
+        input
+            .work
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serial_collect_rows += items.len() as u64;
+    }
+    let columns = input.batch.slice(first, items.len());
+    let mut attrs = input.attrs.extract(&columns);
+    let mut out = ChunkMembers {
+        buckets: (0..input.wave.len()).map(|_| Vec::new()).collect(),
+        losses: Vec::new(),
+    };
+    for (i, items) in items.iter_mut().enumerate() {
+        let row = first + i;
+        let source_row = input
+            .locator
+            .global_row(input.first_read + row)
+            .ok_or_else(|| {
+                crate::Error::GeoParquetRead("export read exceeded its selected row domain".into())
+            })?;
+        let (props, id) = attrs.row(i)?;
         if let Some(id) = id {
-            diagnostics.source_member_loss(
-                source_row,
-                id,
-                ctx.zoom,
-                crate::diagnostics::SourceLossCause::ClipDropped,
-            )?;
+            out.losses.push((source_row, id));
         }
         if items.is_empty() {
-            rows.read += 1;
             continue;
         }
-        let (gap, band) = row_gaps[row];
-        for (key, geom) in items {
-            buckets[route_partition(wave, key)].push(Member {
+        let (gap, band) = input.row_gaps[row];
+        for (key, geom) in std::mem::take(items) {
+            out.buckets[route_partition(input.wave, key)].push(Member {
                 key,
                 seq: source_row,
                 geom,
@@ -5140,9 +5934,8 @@ fn collect_wave_members(
                 band,
             });
         }
-        rows.read += 1;
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Clip (or fast-path pass through) one feature into every tile it intersects
@@ -6181,14 +6974,19 @@ fn encode_members(
             let _encode = ExportTimers::scope(&timers.encode);
             let (x, y) = key_to_xy(g[0].key, zoom);
             let tb = TileCoord::new(x, y, zoom).bounds();
-            let (fill, mut fill_tally) = fills
-                .and_then(|f| {
-                    let polys = f.get(g[0].key)?;
-                    Some(ExportTimers::time(&timers.fill_encode, || {
-                        fill_features(polys, g, &tb, opts, diagnostics)
-                    }))
+            // #788: the tile's fill is owned for the encode and dropped once
+            // its fill commands are built; a spilled fill's read can fail.
+            let fill = fills.map(|f| {
+                ExportTimers::time(&timers.fill_encode, || {
+                    f.get(g[0].key).map(|polys| {
+                        polys.map(|polys| fill_features(&polys, g, &tb, opts, diagnostics))
+                    })
                 })
-                .unwrap_or_default();
+            });
+            let (fill, mut fill_tally) = match fill.transpose() {
+                Ok(fill) => fill.flatten().unwrap_or_default(),
+                Err(error) => return Some(Err(error)),
+            };
             let mvt = encode_tile(g, &tb, opts, &fill, &mut fill_tally, diagnostics);
             if opts.feature_id.is_some() {
                 use crate::diagnostics::SourceLossCause;
@@ -8164,6 +8962,21 @@ fn json_property_column(col: &dyn Array) -> Vec<Option<PropertyValue>> {
         .collect()
 }
 
+/// A list or map column's value offsets rebased to its first row, and the
+/// span of its child values its rows address. A sliced column (#740's
+/// per-chunk extraction) keeps its whole child array, so resolving only the
+/// span keeps a chunk's work proportional to its own rows.
+fn rebased_offsets<O: arrow_array::OffsetSizeTrait>(
+    offsets: &[O],
+) -> (Vec<usize>, std::ops::Range<usize>) {
+    let first = offsets.first().map_or(0, |o| o.as_usize());
+    let last = offsets.last().map_or(first, |o| o.as_usize());
+    (
+        offsets.iter().map(|o| o.as_usize() - first).collect(),
+        first..last,
+    )
+}
+
 /// One nested Arrow array, ready to be written row by row as JSON.
 enum JsonNode {
     /// A scalar leaf, already extracted for the whole array. An unsupported
@@ -8210,18 +9023,24 @@ impl JsonNode {
             }
             DataType::List(_) => {
                 let a = col.as_list::<i32>();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::List {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             DataType::LargeList(_) => {
                 let a = col.as_list::<i64>();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::List {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             DataType::FixedSizeList(_, _) => {
@@ -8235,16 +9054,21 @@ impl JsonNode {
             }
             DataType::Map(_, _) => {
                 let a = col.as_map();
+                let (offsets, span) = rebased_offsets(a.value_offsets());
                 JsonNode::Map {
-                    offsets: a.value_offsets().iter().map(|&o| o as usize).collect(),
+                    offsets,
                     array: arrow_array::make_array(col.to_data()),
                     // Decided once from the key TYPE, not from the values:
                     // every row of the batch (and every batch of the column)
                     // then takes the same shape, and a key type with no
                     // rendering (binary) cannot masquerade as strings.
                     string_keys: is_string_type(a.keys().data_type()),
-                    keys: Box::new(JsonNode::resolve(a.keys().as_ref())),
-                    values: Box::new(JsonNode::resolve(a.values().as_ref())),
+                    keys: Box::new(JsonNode::resolve(
+                        a.keys().slice(span.start, span.len()).as_ref(),
+                    )),
+                    values: Box::new(JsonNode::resolve(
+                        a.values().slice(span.start, span.len()).as_ref(),
+                    )),
                 }
             }
             // Unwrapped HERE, not through the leaf's own dictionary arm: a
@@ -8931,28 +9755,56 @@ mod tests {
         const GIB: u64 = 1024 * MIB;
         // Plenty of RAM: cores drive the width — including past the old fixed
         // 16 cap (the whole point of #303).
-        assert_eq!(auto_partition_wave(64, Some(256 * GIB)), 64);
-        assert_eq!(auto_partition_wave(24, Some(256 * GIB)), 24);
+        assert_eq!(
+            auto_partition_wave(64, &MemoryBudget::with_available(Some(256 * GIB))),
+            64
+        );
+        assert_eq!(
+            auto_partition_wave(24, &MemoryBudget::with_available(Some(256 * GIB))),
+            24
+        );
         // The #293 target box (16 cores / 54 GiB) resolves exactly as before.
-        assert_eq!(auto_partition_wave(16, Some(54 * GIB)), 16);
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(54 * GIB))),
+            16
+        );
         // Tight RAM caps below the core count:
         // 4 GiB avail → 2 GiB wave budget → 32 slots of 64 MiB.
-        assert_eq!(auto_partition_wave(64, Some(4 * GIB)), 32);
+        let avail = |bytes: u64| MemoryBudget::with_available(Some(bytes));
+        assert_eq!(auto_partition_wave(64, &avail(4 * GIB)), 32);
         // 2 GiB avail → 1 GiB budget → 16 slots.
-        assert_eq!(auto_partition_wave(64, Some(2 * GIB)), 16);
+        assert_eq!(auto_partition_wave(64, &avail(2 * GIB)), 16);
         // 1 GiB avail → 512 MiB budget → 8 slots.
-        assert_eq!(auto_partition_wave(64, Some(GIB)), 8);
+        assert_eq!(auto_partition_wave(64, &avail(GIB)), 8);
         // Very tight RAM floors at MIN, never below (historical width; its
         // worst-case transient is small and known-safe).
-        assert_eq!(auto_partition_wave(16, Some(256 * MIB)), PARTITION_WAVE_MIN);
-        assert_eq!(auto_partition_wave(16, Some(0)), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(256 * MIB))),
+            PARTITION_WAVE_MIN
+        );
+        assert_eq!(
+            auto_partition_wave(16, &MemoryBudget::with_available(Some(0))),
+            PARTITION_WAVE_MIN
+        );
         // Small boxes keep the floor regardless of RAM.
-        assert_eq!(auto_partition_wave(2, Some(256 * GIB)), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(2, &MemoryBudget::with_available(Some(256 * GIB))),
+            PARTITION_WAVE_MIN
+        );
         // RAM unknown (non-Linux, unreadable /proc/meminfo): fall back to the
         // #293 fixed cap — portable and deterministic where no probe exists.
-        assert_eq!(auto_partition_wave(64, None), PARTITION_WAVE_FALLBACK_MAX);
-        assert_eq!(auto_partition_wave(8, None), 8);
-        assert_eq!(auto_partition_wave(2, None), PARTITION_WAVE_MIN);
+        assert_eq!(
+            auto_partition_wave(64, &MemoryBudget::with_available(None)),
+            PARTITION_WAVE_FALLBACK_MAX
+        );
+        assert_eq!(
+            auto_partition_wave(8, &MemoryBudget::with_available(None)),
+            8
+        );
+        assert_eq!(
+            auto_partition_wave(2, &MemoryBudget::with_available(None)),
+            PARTITION_WAVE_MIN
+        );
     }
 
     /// Build a partition list from raw member counts (bbox/keys are irrelevant
@@ -8964,7 +9816,7 @@ mod tests {
             .map(|(i, &m)| Partition {
                 key_lo: i as u64,
                 key_hi: i as u64,
-                bbox: TileBounds::new(0.0, 0.0, 0.0, 0.0),
+                bbox: PruneRegion::of(TileBounds::new(0.0, 0.0, 0.0, 0.0)),
                 members: m,
             })
             .collect()
@@ -8984,7 +9836,12 @@ mod tests {
         let sparse_bytes = Some(member_resident_bytes(512, 0));
         let dense_bytes = Some(member_resident_bytes(600, 0));
         assert_eq!(
-            memory_safe_level_wave(16, &sparse, sparse_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &sparse,
+                sparse_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "a sparse level must not narrow below the ceiling"
         );
@@ -8995,7 +9852,12 @@ mod tests {
         // Brazil case that OOM'd at wave 16, now capped to a safe 3.
         let dense = partitions_with_members(&[6_500_000, 100, 200]);
         assert_eq!(
-            memory_safe_level_wave(16, &dense, dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             3,
         );
 
@@ -9005,14 +9867,24 @@ mod tests {
         // guard bypasses the throughput floor rather than OOM.
         let extreme = partitions_with_members(&[60_000_000, 100]);
         assert_eq!(
-            memory_safe_level_wave(16, &extreme, dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &extreme,
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             1,
         );
 
         // The clamp is one-directional: a roomy budget never widens past the
         // ceiling the caller already chose.
         assert_eq!(
-            memory_safe_level_wave(4, &sparse, sparse_bytes, Some(256 * GIB)),
+            memory_safe_level_wave(
+                4,
+                &sparse,
+                sparse_bytes,
+                &MemoryBudget::with_available(Some(256 * GIB))
+            ),
             4,
         );
 
@@ -9020,24 +9892,42 @@ mod tests {
         // level), unmeasurable RAM, or an empty partition list all return the
         // ceiling verbatim.
         assert_eq!(
-            memory_safe_level_wave(16, &dense, None, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                None,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "unknown member size falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &dense, Some(0), Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &dense,
+                Some(0),
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "a degenerate zero member size falls back to the ceiling"
         );
         // Even when RAM is tiny: zero is unknown, not one byte per member.
-        assert_eq!(memory_safe_level_wave(16, &dense, Some(0), Some(8)), 16);
         assert_eq!(
-            memory_safe_level_wave(16, &dense, dense_bytes, None),
+            memory_safe_level_wave(16, &dense, Some(0), &MemoryBudget::with_available(Some(8))),
+            16
+        );
+        assert_eq!(
+            memory_safe_level_wave(16, &dense, dense_bytes, &MemoryBudget::with_available(None)),
             16,
             "unprobeable RAM falls back to the ceiling"
         );
         assert_eq!(
-            memory_safe_level_wave(16, &[], dense_bytes, Some(54 * GIB)),
+            memory_safe_level_wave(
+                16,
+                &[],
+                dense_bytes,
+                &MemoryBudget::with_available(Some(54 * GIB))
+            ),
             16,
             "an empty level falls back to the ceiling"
         );
@@ -9339,7 +10229,7 @@ mod tests {
             .unwrap_or(PARTITION_WAVE_MIN);
         assert_eq!(
             auto,
-            auto_partition_wave(cores, available_memory_bytes()),
+            auto_partition_wave(cores, &export_budget()),
             "auto must equal the preflight decision on this box's cores + RAM"
         );
         // Explicit values pass through verbatim, including above any auto cap.
@@ -9440,7 +10330,12 @@ mod tests {
         const GIB: u64 = 1024 * MIB;
         // Unknown member size or RAM: the wave-shaped cap alone.
         assert_eq!(
-            level_group_member_cap(6, 32_768, None, Some(GIB)),
+            level_group_member_cap(
+                6,
+                32_768,
+                None,
+                Some(&MemoryBudget::with_available(Some(GIB)))
+            ),
             6 * 32_768
         );
         assert_eq!(
@@ -9449,17 +10344,32 @@ mod tests {
         );
         // A member size of 0 is unknown too, not a free member.
         assert_eq!(
-            level_group_member_cap(6, 32_768, Some(0), Some(0)),
+            level_group_member_cap(
+                6,
+                32_768,
+                Some(0),
+                Some(&MemoryBudget::with_available(Some(0)))
+            ),
             6 * 32_768
         );
         // Roomy RAM never widens past the wave-shaped cap.
         assert_eq!(
-            level_group_member_cap(6, 32_768, Some(100), Some(256 * GIB)),
+            level_group_member_cap(
+                6,
+                32_768,
+                Some(100),
+                Some(&MemoryBudget::with_available(Some(256 * GIB)))
+            ),
             6 * 32_768
         );
         // Tight RAM narrows it: 1 GiB × 0.5 / 2000 B resident = 268_435.
         assert_eq!(
-            level_group_member_cap(16, 32_768, Some(2000), Some(GIB)),
+            level_group_member_cap(
+                16,
+                32_768,
+                Some(2000),
+                Some(&MemoryBudget::with_available(Some(GIB)))
+            ),
             (GIB / 2 / 2000) as usize
         );
     }
@@ -9486,7 +10396,277 @@ mod tests {
             checkpoint_interval: Duration::ZERO,
             fail_level: None,
             memory_limit: None,
+            budget_available: None,
         }
+    }
+
+    /// Run the duplicating-mode wave path of [`equivalence_fixture`] with one
+    /// tile per partition and one partition per wave, so each multi-tile
+    /// level takes several waves (#740's shape: more partitions than the wave
+    /// is wide), on the production path. Returns the run and the per-level
+    /// band row counts.
+    fn multi_wave_duplicating_run() -> (Pass2Run, BTreeMap<usize, u64>) {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let run = export_pmtiles_run(
+            input.path(),
+            out.path(),
+            &opts,
+            1,
+            &knobs(false, None, false),
+        )
+        .unwrap();
+        let band_rows = run
+            .report
+            .zooms
+            .iter()
+            .map(|z| (z.level, z.level_feature_count as u64))
+            .collect();
+        (run, band_rows)
+    }
+
+    /// #740 (read amplification): a duplicating-mode level split into several
+    /// waves must read its band's rows once, not once per wave. On
+    /// `origin/main` every wave re-reads each row group its bbox touches, so
+    /// a level of `W` waves over one row group reads its band `W` times
+    /// (measured 1.2-2.5x per finest level on NZ parcels and FTW Moldova).
+    #[test]
+    fn multi_wave_level_reads_each_band_row_once() {
+        let (run, band_rows) = multi_wave_duplicating_run();
+        // One tile per partition and one partition per wave: a level of
+        // several tiles takes several waves.
+        assert!(
+            run.report.zooms.iter().any(|z| z.tile_count > 1),
+            "the fixture must give some level several waves"
+        );
+        assert_eq!(
+            run.work.band_rows_read, band_rows,
+            "rows read per level (left) vs the level's band rows (right)"
+        );
+    }
+
+    /// #740: a multi-wave duplicating level's single read, into a one-level
+    /// member store under either backing, writes the same archive and report
+    /// as the per-wave reads, with narrow waves so levels take several.
+    #[test]
+    fn multi_wave_level_single_read_matches_per_wave_reads() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        for (target, wave) in [(1usize, 1usize), (1, 3), (DEFAULT_PARTITION_TARGET, 1)] {
+            let opts = ExportOptions {
+                layer_name: "ref".to_string(),
+                partition_wave: wave,
+                ..Default::default()
+            };
+            let run = |force_legacy: bool, backing: Option<SinkBacking>| {
+                let out = tempfile::NamedTempFile::new().unwrap();
+                let run = export_pmtiles_run(
+                    input.path(),
+                    out.path(),
+                    &opts,
+                    target,
+                    &knobs(force_legacy, backing, false),
+                )
+                .unwrap();
+                (std::fs::read(out.path()).unwrap(), run)
+            };
+            let (legacy_bytes, legacy) = run(true, None);
+            for backing in [SinkBacking::Ram, SinkBacking::Spill] {
+                let (bytes, single) = run(false, Some(backing));
+                assert_eq!(
+                    bytes, legacy_bytes,
+                    "single read ({backing:?}, target {target}, wave {wave}) diverges"
+                );
+                assert_eq!(single.report.zooms, legacy.report.zooms);
+                assert_eq!(single.report.total_tiles, legacy.report.total_tiles);
+                if target == 1 && wave < 3 {
+                    assert_ne!(
+                        single.work.band_rows_read, legacy.work.band_rows_read,
+                        "the per-wave oracle must re-read for this to test anything"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #740: a multi-wave level's one-level store keeps the level in RAM
+    /// when the run's budget affords it, spilling nothing, and spills what
+    /// the budget cannot hold. Both write the per-wave reads' archive.
+    #[test]
+    fn multi_wave_level_store_spills_only_what_the_budget_cannot_hold() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let run = |force_legacy: bool, budget_available: Option<u64>| {
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    budget_available,
+                    ..knobs(force_legacy, None, false)
+                },
+            )
+            .unwrap();
+            (std::fs::read(out.path()).unwrap(), run)
+        };
+        let (legacy, _) = run(true, None);
+
+        let (bytes, roomy) = run(false, Some(100 << 30));
+        assert_eq!(bytes, legacy, "the in-RAM level store diverges");
+        assert!(
+            !roomy.work.level_spill_bytes.is_empty(),
+            "the fixture must give some level several waves"
+        );
+        assert!(
+            roomy.work.level_spill_bytes.values().all(|&b| b == 0),
+            "a level the budget affords spilled: {:?}",
+            roomy.work.level_spill_bytes
+        );
+
+        let (bytes, tight) = run(false, Some(1 << 20));
+        assert_eq!(bytes, legacy, "the spilling level store diverges");
+        assert!(
+            tight.work.level_spill_bytes.values().any(|&b| b > 0),
+            "a level the budget cannot hold must spill: {:?}",
+            tight.work.level_spill_bytes
+        );
+    }
+
+    /// The level store follows the run's memory profile (#788): `bounded`
+    /// holds main's shape, spilling every multi-wave level however roomy
+    /// the budget; `speed` keeps every level in RAM however tight; the
+    /// archive is the same bytes under all three.
+    #[test]
+    fn level_store_backing_follows_the_memory_profile() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        equivalence_fixture(input.path());
+        let run = |profile: MemoryProfile, budget_available: Option<u64>| {
+            let opts = ExportOptions {
+                layer_name: "ref".to_string(),
+                partition_wave: 1,
+                profile,
+                ..Default::default()
+            };
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let run = export_pmtiles_run(
+                input.path(),
+                out.path(),
+                &opts,
+                1,
+                &Pass2Knobs {
+                    budget_available,
+                    ..knobs(false, None, false)
+                },
+            )
+            .unwrap();
+            (
+                std::fs::read(out.path()).unwrap(),
+                run.work.level_spill_bytes,
+            )
+        };
+        let (auto, auto_spill) = run(MemoryProfile::Auto, Some(100 << 30));
+        assert!(
+            !auto_spill.is_empty() && auto_spill.values().all(|&b| b == 0),
+            "auto with room keeps every level in RAM: {auto_spill:?}"
+        );
+        let (bounded, bounded_spill) = run(MemoryProfile::Bounded, Some(100 << 30));
+        assert_eq!(bounded, auto, "bounded changed the archive");
+        assert!(
+            bounded_spill.values().all(|&b| b > 0),
+            "bounded must spill every multi-wave level: {bounded_spill:?}"
+        );
+        let (speed, speed_spill) = run(MemoryProfile::Speed, Some(1 << 20));
+        assert_eq!(speed, auto, "speed changed the archive");
+        assert!(
+            speed_spill.values().all(|&b| b == 0),
+            "speed must keep every level in RAM: {speed_spill:?}"
+        );
+    }
+
+    /// A partition whose tiles sit on both sides of the antimeridian (the
+    /// Chatham Islands at -176.5 and the NZ mainland at 174.8) must prune its
+    /// read to those two regions, not to a union spanning every longitude
+    /// that also selects the row group at 140 in between. One row per row group, so
+    /// rows read count the row groups each wave selects.
+    #[test]
+    fn antimeridian_partition_prunes_to_both_sides_only() {
+        let chatham = Geometry::Point(Point::new(-176.5, -43.9));
+        let mainland = Geometry::Point(Point::new(174.8, -41.3));
+        let between = Geometry::Point(Point::new(140.0, -42.0));
+        let rows = vec![chatham, mainland, between];
+        let input = tempfile::NamedTempFile::new().unwrap();
+        write_mode_fixture(
+            input.path(),
+            &[
+                (vec![0, 1, 2], rows.clone()),
+                (vec![0, 1, 2], rows.clone()),
+                (vec![0, 1, 2], rows),
+            ],
+            Mode::Duplicating,
+            1,
+        );
+        // The fixture's levels are z2, z4 and z6.
+        let (level, zoom) = (2, 6);
+        let key = |x: f64, y: f64| {
+            let t = crate::tile::lng_lat_to_tile(x, y, zoom);
+            tile_key(t.x, t.y, zoom)
+        };
+        let (c, m, b) = (key(-176.5, -43.9), key(174.8, -41.3), key(140.0, -42.0));
+        assert!(
+            !(c.min(m)..=c.max(m)).contains(&b),
+            "the fixture needs Chatham and the mainland adjacent in tile order"
+        );
+        // A target of two members puts Chatham and the mainland in one
+        // partition and the row in between in another.
+        let opts = ExportOptions {
+            layer_name: "ref".to_string(),
+            partition_wave: 1,
+            ..Default::default()
+        };
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let legacy = export_pmtiles_run(
+            input.path(),
+            out.path(),
+            &opts,
+            2,
+            &knobs(true, None, false),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.work.band_rows_read.get(&level),
+            Some(&3),
+            "z{zoom}: each of the level's three row groups is read once, by the wave over its tiles"
+        );
+    }
+
+    /// #740 (parallelism): the per-row collect work (geometry decode,
+    /// property materialization, member routing) must not run serially on
+    /// the wave's consumer thread, outside the Rayon pool. On `origin/main`
+    /// all of it does: only the clip is parallel, and the profiled collect
+    /// keeps about 8 of 64 cores busy (moldova z0-14, 8.5 busy cores while
+    /// the consumer is in `collect_wave`, the consumer itself busy 70% of
+    /// that wall).
+    #[test]
+    fn wave_collect_does_no_per_row_work_on_the_consumer_thread() {
+        let (run, band_rows) = multi_wave_duplicating_run();
+        assert!(band_rows.values().sum::<u64>() > 0);
+        assert_eq!(
+            run.work.serial_collect_rows, 0,
+            "rows whose collect work ran serially on the consumer thread"
+        );
     }
 
     /// #647: running a group of levels concurrently is scheduling only. Every
@@ -12977,6 +14157,72 @@ mod tests {
         );
     }
 
+    /// #740: the collect extracts properties per row chunk, from zero-copy
+    /// slices of the batch's columns. A slice of a nested column must render
+    /// exactly the rows the whole column renders there, for every nested
+    /// kind: a list or map slice keeps its whole child array, which the
+    /// rendering rebases onto the slice.
+    #[test]
+    fn sliced_nested_columns_render_like_the_whole_column() {
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Int32Builder, LargeListBuilder, ListBuilder, MapBuilder,
+            StringBuilder,
+        };
+        use arrow_array::StructArray;
+
+        let mut list = ListBuilder::new(Int32Builder::new());
+        let mut large = LargeListBuilder::new(StringBuilder::new());
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        let mut fixed = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        for row in 0..7i32 {
+            if row % 3 == 1 {
+                list.append_null();
+                large.append_null();
+                map.append(false).unwrap();
+            } else {
+                for v in 0..row {
+                    list.values().append_value(row * 10 + v);
+                    large.values().append_value(format!("r{row}v{v}"));
+                    map.keys().append_value(format!("k{v}"));
+                    map.values().append_value(v);
+                }
+                list.append(true);
+                large.append(true);
+                map.append(true).unwrap();
+            }
+            fixed.values().append_value(row);
+            fixed.values().append_value(-row);
+            fixed.append(row % 2 == 0);
+        }
+        let list: ArrayRef = Arc::new(list.finish());
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("l", list.data_type().clone(), true)),
+            Arc::clone(&list),
+        )]);
+        let columns: Vec<ArrayRef> = vec![
+            list,
+            Arc::new(large.finish()),
+            Arc::new(map.finish()),
+            Arc::new(fixed.finish()),
+            Arc::new(nested),
+        ];
+        for column in &columns {
+            let whole = extract_property_column(column.as_ref());
+            assert!(whole.iter().any(Option::is_some));
+            for offset in 0..column.len() {
+                for len in 0..=column.len() - offset {
+                    assert_eq!(
+                        extract_property_column(column.slice(offset, len).as_ref()),
+                        whole[offset..offset + len],
+                        "{:?} rows {offset}..{}",
+                        column.data_type(),
+                        offset + len
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn export_feature_counts_and_level_absent_from_props() {
         // Two features far apart so at a coarse zoom each lands in its own tile.
@@ -14198,7 +15444,13 @@ mod tests {
             partitions: partitions_with_members(&[10]),
             wave: 1,
         }];
-        let store = MemberStore::new(&plans, SinkBacking::Spill, Some(dir.path())).unwrap();
+        let store = MemberStore::new(
+            &plans,
+            SinkBacking::Spill,
+            MEMBER_STORE_RAM_BUDGET,
+            Some(dir.path()),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
@@ -14223,7 +15475,8 @@ mod tests {
             partitions: partitions_with_members(&[10, 10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |key: u64, seq: u64| Member {
             key,
             seq,
@@ -14286,7 +15539,8 @@ mod tests {
             partitions: partitions_with_members(&[10]),
             wave: 1,
         }];
-        let mut store = MemberStore::new(&plans, SinkBacking::Spill, None).unwrap();
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
         let mk = |seq: u64, props: Vec<(Arc<str>, PropertyValue)>| Member {
             key: 0,
             seq,
@@ -14322,6 +15576,101 @@ mod tests {
         assert!(Arc::ptr_eq(&w[2].props[0].0, name), "second segment");
         assert!(Arc::ptr_eq(&w[2].props[1].0, rank), "second segment");
         assert_eq!(w[2].props[0].1, PropertyValue::String("f2".into()));
+    }
+
+    /// #740: a flushed bucket larger than [`SPILL_SEGMENT_MEMBERS`] is cut
+    /// into segments that are encoded and decoded in parallel; the wave comes
+    /// back whole, in push order, at its exact length, and still sharing one
+    /// name handle per property name across every segment.
+    /// The member store's fill buffer is priced from the members it has
+    /// measured, not the 128 MiB model: once one segment's worth is pushed,
+    /// it narrows to two whole segments per bucket at their mean size, and
+    /// the store keeps spilling in whole segments and reading back in order.
+    #[test]
+    fn member_store_buffer_is_priced_from_measured_members() {
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10, 10, 10]),
+            wave: 1,
+        }];
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+        let member = |seq: u64| Member {
+            key: 0,
+            seq,
+            geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+            props: Arc::new(Vec::new()),
+            id: None,
+            gap: GAP_NONE,
+            band: 0,
+        };
+        let per_member = member_bytes_estimate(&member(0));
+        let n = 20 * SPILL_SEGMENT_MEMBERS;
+        for seq in 0..n as u64 {
+            store.push(0, (seq % 3) as usize, member(seq)).unwrap();
+            if seq + 1 == SPILL_SEGMENT_MEMBERS as u64 {
+                assert_eq!(
+                    store.buffer,
+                    3 * STORE_BUFFER_SEGMENTS * SPILL_SEGMENT_MEMBERS * per_member,
+                    "two segments for each of the three buckets"
+                );
+            }
+        }
+        assert!(store.buffer < MEMBER_STORE_RAM_BUDGET);
+        assert!(store.spilled_bytes() > 0, "a full buffer must spill");
+        store.finish_fill().unwrap();
+        let mut seen = 0;
+        for wave in 0..3 {
+            let w = store.take_wave(0, wave).unwrap();
+            assert!(w.iter().all(|m| m.seq % 3 == wave as u64));
+            seen += w.len();
+        }
+        assert_eq!(seen, n);
+    }
+
+    #[test]
+    fn member_store_parallel_segments_roundtrip_in_order() {
+        let plans = vec![LevelPlan {
+            zoom: 4,
+            partitions: partitions_with_members(&[10]),
+            wave: 1,
+        }];
+        let mut store =
+            MemberStore::new(&plans, SinkBacking::Spill, MEMBER_STORE_RAM_BUDGET, None).unwrap();
+        let n = 2 * SPILL_SEGMENT_MEMBERS + 5;
+        for seq in 0..n as u64 {
+            let name: Arc<str> = format!("p{}", seq % 3).into();
+            store
+                .push(
+                    0,
+                    0,
+                    Member {
+                        key: 0,
+                        seq,
+                        geom: Geometry::Point(Point::new(seq as f64, 0.0)),
+                        props: Arc::new(vec![(name, PropertyValue::UInt(seq))]),
+                        id: None,
+                        gap: GAP_NONE,
+                        band: 0,
+                    },
+                )
+                .unwrap();
+        }
+        store.finish_fill().unwrap();
+        assert!(
+            store.spill.as_ref().unwrap().segments[0][0].len() >= 3,
+            "the bucket must span several segments"
+        );
+        let w = store.take_wave(0, 0).unwrap();
+        assert_eq!((w.len(), w.capacity()), (n, n));
+        assert!(w
+            .iter()
+            .enumerate()
+            .all(|(i, m)| m.seq == i as u64 && m.props[0].1 == PropertyValue::UInt(i as u64)));
+        for m in &w[3..] {
+            let first = &w[(m.seq % 3) as usize].props[0].0;
+            assert!(Arc::ptr_eq(&m.props[0].0, first), "seq {}", m.seq);
+        }
     }
 
     /// Rich 3-level **partitioning** fixture for the #235 byte-equality tests:
