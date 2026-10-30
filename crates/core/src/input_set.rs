@@ -159,6 +159,11 @@ impl StagingPlan {
             .map(crate::input::PartStaging::bytes_to_stage)
             .fold(0, u64::saturating_add)
     }
+
+    /// No part has anything left to fetch.
+    fn is_staged(&self) -> bool {
+        self.parts.iter().all(|p| p.request_count() == 0)
+    }
 }
 
 /// Per-part row-group selection.
@@ -1089,6 +1094,31 @@ impl ConvertSource {
     ) -> Result<crate::input::StagingReport, InputError> {
         let staging = self.staging_plan_for(plan.row_groups, plan.projection)?;
         self.stage(&staging)
+    }
+
+    /// Whether a read of `row_groups` (`None` = all) and `projection` (as in
+    /// a [`ReadPlan`]) is served without the network: every part is local,
+    /// or every chunk the read touches is already in its part's disk spill
+    /// (staged by pass 0, #286/#788). Such a read takes no network locks and
+    /// no request latency, so it can run on parallel readers like a local
+    /// one (#544). `false` when a footer cannot be read, or when the spill
+    /// is disabled (it then holds nothing).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the #544 parallel-read gate in overview/read.rs (track C2) calls it"
+        )
+    )]
+    pub(crate) fn reads_locally(
+        &self,
+        row_groups: Option<&RowGroupSelection>,
+        projection: Option<&[usize]>,
+    ) -> bool {
+        !self.is_remote()
+            || self
+                .staging_plan_for(row_groups, projection)
+                .is_ok_and(|plan| plan.is_staged())
     }
 
     /// Compose a projection over this source's (possibly restricted) schema
@@ -3269,6 +3299,43 @@ mod staging_counter_tests {
             0,
             "local parts never stage"
         );
+    }
+
+    /// #544's gate: a remote read counts as local only once every chunk it
+    /// touches is in the spill. Staging a projection makes reads of that
+    /// projection (or a narrower one, or fewer row groups) local, not a
+    /// read of a column it skipped; a local source always reads locally.
+    #[test]
+    fn reads_locally_once_every_chunk_the_read_touches_is_staged() {
+        let bytes = three_column_parquet(1000, 5);
+        let src =
+            ConvertSource::single(crate::input::test_memory_source(bytes.clone(), "s.parquet"));
+        let rg1 = RowGroupSelection::from_parts(vec![vec![1]]);
+        assert!(!src.reads_locally(None, None), "nothing staged yet");
+
+        src.stage_read(&ReadPlan {
+            batch_size: 1024,
+            projection: Some(&[0, 2]),
+            row_groups: None,
+        })
+        .unwrap();
+        assert!(src.reads_locally(None, Some(&[0, 2])));
+        assert!(src.reads_locally(None, Some(&[2])));
+        assert!(src.reads_locally(Some(&rg1), Some(&[0])));
+        assert!(!src.reads_locally(None, None), "column b was not staged");
+        assert!(!src.reads_locally(Some(&rg1), Some(&[1])));
+
+        // And `reads_locally` is footer-only: it fetches nothing itself.
+        let (requests, _, _) = counted(&src, || {
+            src.reads_locally(None, None);
+        });
+        assert_eq!(requests, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+        let local = ConvertSource::resolve(path.to_str().unwrap()).unwrap();
+        assert!(local.reads_locally(None, None));
     }
 
     /// #400 + #290: a coalescing window merges byte-adjacent kept chunks

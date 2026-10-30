@@ -816,6 +816,7 @@ pub enum tylertoo_core::input_set::ConvertSource
 pub tylertoo_core::input_set::ConvertSource::Multi(tylertoo_core::input_set::MultiSource)
 pub tylertoo_core::input_set::ConvertSource::Single(tylertoo_core::input_set::SingleSource)
 impl tylertoo_core::input_set::ConvertSource
+pub fn tylertoo_core::input_set::ConvertSource::bytes_to_stage(&self, core::option::Option<&tylertoo_core::input_set::RowGroupSelection>) -> core::result::Result<u64, tylertoo_core::input::InputError>
 pub fn tylertoo_core::input_set::ConvertSource::column_projection(&self) -> core::option::Option<&[usize]>
 pub fn tylertoo_core::input_set::ConvertSource::display_name(&self) -> alloc::string::String
 pub fn tylertoo_core::input_set::ConvertSource::fetch_stats(&self) -> core::option::Option<tylertoo_core::input::FetchStats>

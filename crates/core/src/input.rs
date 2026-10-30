@@ -475,6 +475,7 @@ impl InputSource {
                 let remote = r.plan_staging(selected, roots)?;
                 Ok(PartStaging {
                     bytes_to_stage: remote.bytes_to_stage(),
+                    requests: remote.request_count(),
                     remote,
                 })
             }
@@ -541,6 +542,7 @@ pub(crate) struct StagingReport {
 #[derive(Debug, Default)]
 pub(crate) struct PartStaging {
     bytes_to_stage: u64,
+    requests: usize,
     #[cfg(feature = "remote")]
     remote: remote::PartPlan,
 }
@@ -553,6 +555,12 @@ impl PartStaging {
     /// chunk or a pruned row group is never fetched, whatever the window).
     pub(crate) fn bytes_to_stage(&self) -> u64 {
         self.bytes_to_stage
+    }
+
+    /// Range requests the plan would make: 0 when every chunk it covers is
+    /// already in the part's disk spill (or the part is local).
+    pub(crate) fn request_count(&self) -> usize {
+        self.requests
     }
 }
 
@@ -1993,6 +2001,11 @@ pub(crate) mod remote {
         /// See [`super::PartStaging::bytes_to_stage`].
         pub(crate) fn bytes_to_stage(&self) -> u64 {
             self.bytes_to_stage
+        }
+
+        /// See [`super::PartStaging::request_count`].
+        pub(crate) fn request_count(&self) -> usize {
+            self.requests.len()
         }
     }
 

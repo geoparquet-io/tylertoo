@@ -196,25 +196,29 @@ pub(crate) enum Pass2Strategy {
 /// request is retried as its row groups, and what still fails is read by the
 /// passes over the reader's lazy network path (the same bytes, uncoalesced),
 /// so staging never regresses correctness.
+///
+/// Returns the `pass0` record of the profile dump: `None` for local input,
+/// or when staging stopped on an error (the warning says which).
 fn stage_input_pass0(
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
     row_groups_read: usize,
     diagnostics: &crate::diagnostics::Diagnostics,
-) {
+) -> Option<Pass0Record> {
     if !source.is_remote() {
-        return;
+        return None;
     }
     let t_stage = Instant::now();
-    let staged = source
-        .staging_plan(selected_row_groups)
-        .and_then(|plan| source.stage(&plan));
+    let staged = source.staging_plan(selected_row_groups).and_then(|plan| {
+        let report = source.stage(&plan)?;
+        Ok((plan.bytes_to_stage(), report))
+    });
     match staged {
-        Ok(report) => {
+        Ok((bytes_to_stage, report)) => {
+            let stage_secs = t_stage.elapsed().as_secs_f64();
             log::info!(
                 "[convert] staged {row_groups_read} selected row group(s) to local \
-                 disk in {:.1}s ({} request(s), {} B, up to {} in flight)",
-                t_stage.elapsed().as_secs_f64(),
+                 disk in {stage_secs:.1}s ({} request(s), {} B, up to {} in flight)",
                 report.requests,
                 report.bytes_fetched,
                 report.max_in_flight
@@ -228,12 +232,47 @@ fn stage_input_pass0(
                     report.first_error.as_deref().unwrap_or("unknown error")
                 ));
             }
+            Some(Pass0Record {
+                stage_secs,
+                bytes_to_stage,
+                report,
+            })
         }
-        Err(e) => diagnostics.warn(format!(
-            "[convert] input staging failed ({e}); passes will read over the \
-             network (uncoalesced)"
-        )),
+        Err(e) => {
+            diagnostics.warn(format!(
+                "[convert] input staging failed ({e}); passes will read over the \
+                 network (uncoalesced)"
+            ));
+            None
+        }
     }
+}
+
+/// What pass 0 did (#788): the `pass0` record of the `TYLERTOO_PROFILE_JSON`
+/// dump.
+#[derive(Debug, Clone)]
+struct Pass0Record {
+    /// Wall seconds from planning to the last landed request.
+    stage_secs: f64,
+    /// The plan's projected footprint ([`ConvertSource::bytes_to_stage`]).
+    bytes_to_stage: u64,
+    report: crate::input::StagingReport,
+}
+
+/// The `pass0` object of the dump; `null` for local input, or when staging
+/// stopped on an error.
+fn pass0_json(record: Option<&Pass0Record>) -> serde_json::Value {
+    record.map_or(serde_json::Value::Null, |r| {
+        serde_json::json!({
+            "stage_secs": r.stage_secs,
+            "requests": r.report.requests,
+            "bytes_to_stage": r.bytes_to_stage,
+            "bytes_fetched": r.report.bytes_fetched,
+            "max_in_flight": r.report.max_in_flight,
+            "failed_requests": r.report.failed_requests,
+            "unstaged_bytes": r.report.unstaged_bytes,
+        })
+    })
 }
 
 /// Resolve an in-flight depth (auto-sizing from available cores when the
@@ -2120,6 +2159,9 @@ struct Preflight {
     /// The #543 pass-1 memory verdict this preflight reached, carried to the
     /// `TYLERTOO_PROFILE_JSON` dump (#626 item 4).
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// What pass 0 staged (#788), for the dump's `pass0` record; filled by
+    /// `run_front_half` after the preflight.
+    pass0: Option<Pass0Record>,
 }
 
 fn preflight(
@@ -2272,14 +2314,8 @@ fn preflight_with_memory_limit(
         diagnostics,
     );
 
-    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
-    // passes below read from the spill, not the network.
-    stage_input_pass0(
-        source,
-        selected_row_groups.as_ref(),
-        row_groups_read,
-        diagnostics,
-    );
+    // (Pass 0, staging, runs right after this preflight, in
+    // `run_front_half`, inside its own `pass0 staging` RSS phase.)
 
     // (Reserved-column collisions, #288, were resolved above, before the
     // row-group selection: any input column named `level` / `point_count` /
@@ -2316,6 +2352,7 @@ fn preflight_with_memory_limit(
         row_groups_read,
         crs_assumed_wgs84,
         pass1_memory,
+        pass0: None,
     })
 }
 
@@ -2445,6 +2482,20 @@ fn run_front_half(
         return Err(ConvertError::RankingConflict);
     }
     let mut preflight = preflight(source, options, diagnostics)?;
+    // Pass 0 (#286/#287): stage the selected row groups to local disk so both
+    // passes below read from the spill, not the network. Its own RSS phase
+    // for a remote input (#788); the in-memory load below is still
+    // "preflight", as before.
+    if source.is_remote() {
+        rss.enter_phase("pass0 staging");
+        preflight.pass0 = stage_input_pass0(
+            source,
+            preflight.selected_row_groups.as_ref(),
+            preflight.row_groups_read,
+            diagnostics,
+        );
+        rss.enter_phase("preflight");
+    }
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
@@ -3012,6 +3063,7 @@ pub(crate) fn run_stages(
         row_groups_read,
         crs_assumed_wgs84,
         pass1_memory: preflight_report,
+        pass0,
     } = preflight;
     let options = &resolved_options;
     let PlanState {
@@ -3224,6 +3276,7 @@ pub(crate) fn run_stages(
             in_flight_batches,
             sink_measurement,
             pass1_memory: preflight_report,
+            pass0,
         },
         diagnostics,
     );
@@ -3328,6 +3381,8 @@ struct ProfileJsonContext<'a> {
     sink_measurement: pipeline::SinkMeasurement,
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict.
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// #788: what pass 0 staged; `None` for local input.
+    pass0: Option<Pass0Record>,
 }
 
 /// Turn a [`ProfileJsonContext`] into [`ProfileJsonInputs`] and hand it to
@@ -3360,6 +3415,7 @@ fn emit_profile_json(ctx: ProfileJsonContext<'_>, diagnostics: &crate::diagnosti
             in_flight_batches: ctx.in_flight_batches,
             sink_measurement: ctx.sink_measurement,
             pass1_memory: ctx.pass1_memory,
+            pass0: ctx.pass0,
         },
         diagnostics,
     );
@@ -3416,6 +3472,9 @@ struct ProfileJsonInputs<'a> {
     /// #543 + #626 item 4: the pass-1 memory preflight's verdict
     /// (`pass1_memory_preflight` in the dump).
     pass1_memory: super::convert::Pass1MemoryReport,
+    /// #788: what pass 0 staged (`pass0` in the dump; `null` for local
+    /// input).
+    pass0: Option<Pass0Record>,
 }
 
 /// Validate `TYLERTOO_PROFILE_JSON` at option-validation time (#517 S2), if
@@ -3584,6 +3643,7 @@ fn write_profile_json(
         // #543 + #626: the pre-scan pass-1 memory verdict. A run that was
         // warned here and then OOM-killed leaves the warning in the record.
         "pass1_memory_preflight": pass1_memory_json(inputs.pass1_memory),
+        "pass0": pass0_json(inputs.pass0.as_ref()),
         "levels": levels_json,
         "peak_rss_mib": inputs.peak_rss_mib,
         "rss_sampler": rss_sampler_json(&inputs.rss_sampler_report),
