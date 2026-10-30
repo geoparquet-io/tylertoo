@@ -53,7 +53,7 @@ use super::convert::{
     build_source_schema, class_ranking_provenance, coalesce_effective, coalesce_table_merged,
     count_vertices, encode_concurrency_for, extract_class_ranks, extract_numeric_values,
     extract_sort_keys, fill_level_bytes, mixed_geometry_field, overture_road_ranking,
-    record_coalesce_merged, record_level_outcome, resolve_read_workers,
+    record_coalesce_merged, record_level_outcome, resolve_pass_read_workers,
     resolve_reserved_column_collisions, scan_feature_traits, validate_cluster_schema,
     validate_coalesce_schema, warn_plan_skipped_levels, BboxQuery, BboxTallies, ClassRanking,
     CoalesceTable, ConvertError, ConvertOptions, ConvertReport, GroupInterner, LevelReport,
@@ -69,7 +69,7 @@ use super::procmem::{
 };
 #[cfg(test)]
 use super::read::read_in_order;
-use super::read::{ReadFlow, ReadTuning};
+use super::read::{ReadFlow, ReadPass, ReadTuning};
 #[cfg(test)]
 use super::simplify::CollapseMode;
 use super::simplify::{
@@ -1142,7 +1142,7 @@ fn run_pass2_levels(
     let read_tuning = ReadTuning {
         budget,
         batch_size: options.read_batch_size.max(1),
-        workers: resolve_read_workers(options.read_workers),
+        workers: resolve_pass_read_workers(ReadPass::Build, options.read_workers),
         avg_geom_bytes: (num_rows > 0).then(|| geom_bytes / num_rows as u64),
         profile: options.profile,
     };
@@ -2331,7 +2331,7 @@ fn pass1_read_tuning(
     ReadTuning {
         budget,
         batch_size: options.read_batch_size.max(1),
-        workers: resolve_read_workers(options.read_workers),
+        workers: resolve_pass_read_workers(ReadPass::Scan, options.read_workers),
         avg_geom_bytes: (rows > 0).then(|| geom_bytes / rows),
         profile: options.profile,
     }

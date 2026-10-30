@@ -174,6 +174,50 @@ mod tests {
         assert_eq!(budget.available(), Some(400));
     }
 
+    /// The phase-1 stand-in for a reserving grant: `&mut` so the call site
+    /// stays the same once choosing a window charges the budget.
+    fn grant_window(
+        budget: &mut MemoryBudget,
+        requested: usize,
+        batch_rows: usize,
+        levels: usize,
+    ) -> usize {
+        budget.compute_window(
+            MemoryProfile::Bounded,
+            requested,
+            batch_rows,
+            levels,
+            Some(600),
+        )
+    }
+
+    /// #716: the pass-2 compute window is resident at the same time as the
+    /// read-ahead, the drain's encodes and the sink, so choosing it has to
+    /// charge the run's budget; every phase sized after it must see what is
+    /// left. On main each of those phases takes its own slice of the same
+    /// allowance and nothing sums them. Profiled (`.788/PROFILE-LOG.md`):
+    /// Moldova `--profile bounded`, window 8 against window 1: +230 MiB live
+    /// heap (dhat, 8 threads) and +421 MiB anonymous RSS (64 threads); NZ
+    /// parcels under a 2 GiB budget peaked at 1,472 MiB anonymous against a
+    /// 1,229 MiB allowance.
+    #[test]
+    #[ignore = "#716: fails on origin/main by design (#788 C2 phase 1); the fix un-ignores it"]
+    fn the_compute_window_is_reserved_from_the_run_budget() {
+        let available = 16u64 << 30;
+        let mut budget = MemoryBudget::with_available(Some(available));
+        let window = grant_window(&mut budget, 8, 8192, 15);
+        assert!(window >= 1);
+        assert!(
+            budget.available() < Some(available),
+            "a window of {window} batch(es) was granted without charging the budget"
+        );
+        assert!(
+            budget.allowance(MemoryProfile::Bounded)
+                < MemoryBudget::with_available(Some(available)).allowance(MemoryProfile::Bounded),
+            "phases sized after the window must price against what it left"
+        );
+    }
+
     #[test]
     fn memory_estimates_saturate_and_unknown_limits_do_not_reject() {
         let budget = MemoryBudget::with_available(None);

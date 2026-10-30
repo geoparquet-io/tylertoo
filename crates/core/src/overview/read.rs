@@ -37,6 +37,17 @@ pub(super) struct ReadTuning {
     pub(super) profile: MemoryProfile,
 }
 
+/// Which pass is reading. Both read through [`read_in_order`], but they feed
+/// consumers with different CPU demand, so the reader count is resolved per
+/// pass (#723, `convert::resolve_pass_read_workers`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadPass {
+    /// Pass 1's scan: a light per-batch decode and key extraction.
+    Scan,
+    /// Pass 2's level build: per-batch simplification across every level.
+    Build,
+}
+
 /// Whether [`read_in_order`]'s consumer wants more batches.
 pub(super) enum ReadFlow {
     Continue,
