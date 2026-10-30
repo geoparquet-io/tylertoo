@@ -197,21 +197,43 @@ pub(crate) enum Pass2Strategy {
 /// passes over the reader's lazy network path (the same bytes, uncoalesced),
 /// so staging never regresses correctness.
 ///
+/// The requests in flight hold their bytes in memory until they land, so
+/// they are granted from the run's `budget` (#788, [`MemoryPhase::Stage`]):
+/// up to the concurrency ceiling (or what `TYLERTOO_STAGING_MEM_BUDGET_BYTES`
+/// fits) of the plan's largest request, never fewer than one, and released
+/// when staging ends.
+///
 /// Returns the `pass0` record of the profile dump: `None` for local input,
 /// or when staging stopped on an error (the warning says which).
 fn stage_input_pass0(
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
     row_groups_read: usize,
+    budget: &mut MemoryBudget,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> Option<Pass0Record> {
+    use super::memory::{Price, PriceBasis};
     if !source.is_remote() {
         return None;
     }
     let t_stage = Instant::now();
     let staged = source.staging_plan(selected_row_groups).and_then(|plan| {
-        let report = source.stage(&plan)?;
-        Ok((plan.bytes_to_stage(), report))
+        let largest = plan.largest_request().max(1);
+        let (ceiling, budget_override) = crate::input::staging_want();
+        let want = budget_override.map_or(ceiling, |bytes| {
+            usize::try_from(bytes / largest)
+                .unwrap_or(usize::MAX)
+                .clamp(1, ceiling.max(1))
+        });
+        let grant = budget.fit(
+            MemoryPhase::Stage,
+            Price::new(largest, PriceBasis::Footer),
+            want,
+            1,
+        );
+        let report = source.stage_within(&plan, Some(grant.bytes()));
+        budget.release(grant);
+        Ok((plan.bytes_to_stage(), report?))
     });
     match staged {
         Ok((bytes_to_stage, report)) => {
@@ -2486,6 +2508,7 @@ fn run_front_half(
             source,
             preflight.selected_row_groups.as_ref(),
             preflight.row_groups_read,
+            &mut preflight.budget,
             diagnostics,
         );
         rss.enter_phase("preflight");
@@ -6477,6 +6500,57 @@ mod tests {
         feats.iter().collect()
     }
     use super::*;
+
+    /// #788: pass 0's requests in flight are granted from the run's memory
+    /// budget and released when staging ends. A budget that affords one of
+    /// the plan's largest requests stages one at a time; a roomy one reaches
+    /// the concurrency ceiling.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn staging_in_flight_is_granted_from_the_run_memory_budget() {
+        use crate::input::probe_store::ProbeStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rg.parquet");
+        let n = 400;
+        let geoms: Vec<Option<geo::Geometry<f64>>> = (0..n)
+            .map(|i| Some(geo::Geometry::Point(geo::Point::new(i as f64 * 0.001, 0.0))))
+            .collect();
+        let values: Vec<f64> = (0..n).map(f64::from).collect();
+        super::super::testutil::write_input_with_f64_row_groups(
+            &path,
+            &geoms,
+            "v",
+            &values,
+            Some(50),
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let diagnostics = crate::diagnostics::Diagnostics::silent();
+        let run = |budget: &mut MemoryBudget| {
+            let store = ProbeStore::new(
+                &[("rg.parquet", bytes.clone())],
+                std::time::Duration::from_millis(50),
+            );
+            let source = ConvertSource::single(store.source("rg.parquet"));
+            let largest = source.staging_plan(None).unwrap().largest_request();
+            let record = stage_input_pass0(&source, None, 8, budget, &diagnostics).unwrap();
+            assert_eq!(record.report.requests, 8, "one request per row group");
+            (largest, record.report.max_in_flight)
+        };
+
+        let mut roomy = MemoryBudget::with_available(Some(1 << 40));
+        let before = roomy.remaining();
+        let (_, in_flight) = run(&mut roomy);
+        assert_eq!(in_flight, 8, "a roomy budget reaches the ceiling");
+        assert_eq!(roomy.remaining(), before, "the grant is released");
+
+        let (largest, _) = run(&mut MemoryBudget::with_available(Some(1 << 40)));
+        let mut tight = MemoryBudget::with_available(Some(largest));
+        let (_, in_flight) = run(&mut tight);
+        assert_eq!(
+            in_flight, 1,
+            "a budget that fits one request stages one at a time"
+        );
+    }
 
     use geo::{LineString, Point, Polygon};
 

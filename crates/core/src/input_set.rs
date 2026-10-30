@@ -160,6 +160,16 @@ impl StagingPlan {
             .fold(0, u64::saturating_add)
     }
 
+    /// Bytes of the largest request across every part (0 when nothing is
+    /// left to fetch).
+    pub(crate) fn largest_request(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(crate::input::PartStaging::largest_request)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// No part has anything left to fetch.
     fn is_staged(&self) -> bool {
         self.parts.iter().all(|p| p.request_count() == 0)
@@ -1075,8 +1085,19 @@ impl ConvertSource {
         &self,
         plan: &StagingPlan,
     ) -> Result<crate::input::StagingReport, InputError> {
+        self.stage_within(plan, None)
+    }
+
+    /// [`Self::stage`] with the admission's byte budget set by the caller
+    /// (the run's memory-budget grant, #788) instead of the staging
+    /// tunables'.
+    pub(crate) fn stage_within(
+        &self,
+        plan: &StagingPlan,
+        budget: Option<u64>,
+    ) -> Result<crate::input::StagingReport, InputError> {
         let parts: Vec<_> = self.parts().iter().zip(&plan.parts).collect();
-        crate::input::stage_parts(&parts)
+        crate::input::stage_parts(&parts, budget)
     }
 
     /// Stage the chunks one read plan will read (its row groups, its

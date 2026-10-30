@@ -442,7 +442,7 @@ impl InputSource {
     /// to the spill fails.
     pub fn stage_row_groups(&self, selected: Option<&[usize]>) -> Result<(), InputError> {
         let plan = self.plan_staging(selected, None)?;
-        stage_parts(&[(self, &plan)]).map(|_| ())
+        stage_parts(&[(self, &plan)], None).map(|_| ())
     }
 
     /// This part's share of a pass-0 staging plan (#788): the column chunks
@@ -476,6 +476,7 @@ impl InputSource {
                 Ok(PartStaging {
                     bytes_to_stage: remote.bytes_to_stage(),
                     requests: remote.request_count(),
+                    largest_request: remote.largest_request(),
                     remote,
                 })
             }
@@ -499,10 +500,11 @@ impl InputSource {
 )]
 pub(crate) fn stage_parts(
     parts: &[(&InputSource, &PartStaging)],
+    budget: Option<u64>,
 ) -> Result<StagingReport, InputError> {
     #[cfg(not(feature = "remote"))]
     {
-        let _ = parts;
+        let _ = (parts, budget);
         Ok(StagingReport::default())
     }
     #[cfg(feature = "remote")]
@@ -514,7 +516,7 @@ pub(crate) fn stage_parts(
                 InputSource::Local(_) => None,
             })
             .collect();
-        remote::stage_parts(&remote)
+        remote::stage_parts(&remote, budget)
     }
 }
 
@@ -543,6 +545,7 @@ pub(crate) struct StagingReport {
 pub(crate) struct PartStaging {
     bytes_to_stage: u64,
     requests: usize,
+    largest_request: u64,
     #[cfg(feature = "remote")]
     remote: remote::PartPlan,
 }
@@ -562,6 +565,22 @@ impl PartStaging {
     pub(crate) fn request_count(&self) -> usize {
         self.requests
     }
+
+    /// Bytes of the plan's largest request: what one request in flight
+    /// holds in memory until it lands.
+    pub(crate) fn largest_request(&self) -> u64 {
+        self.largest_request
+    }
+}
+
+/// How many staging requests a run wants in flight, and the byte budget
+/// `TYLERTOO_STAGING_MEM_BUDGET_BYTES` sets when it is set. The run's memory
+/// budget grants the staging admission from these (#788).
+pub(crate) fn staging_want() -> (usize, Option<u64>) {
+    #[cfg(feature = "remote")]
+    return remote::staging_want();
+    #[cfg(not(feature = "remote"))]
+    (1, None)
 }
 
 /// Sum of the compressed byte sizes of the selected input row groups.
@@ -2007,6 +2026,15 @@ pub(crate) mod remote {
         pub(crate) fn request_count(&self) -> usize {
             self.requests.len()
         }
+
+        /// See [`super::PartStaging::largest_request`].
+        pub(crate) fn largest_request(&self) -> u64 {
+            self.requests
+                .iter()
+                .map(|r| r.span.end - r.span.start)
+                .max()
+                .unwrap_or(0)
+        }
     }
 
     /// Merge adjacent row-group spans into fewer, larger requests (#290
@@ -2068,10 +2096,33 @@ pub(crate) mod remote {
     /// in flight (so a request larger than the budget still runs, alone).
     /// This replaces the per-part `budget / largest span` concurrency, under
     /// which one large span throttled every other span of its part.
+    /// `budget` (granted by the run's memory budget, #788) replaces the
+    /// tunables' byte budget for the admission; `None` keeps it.
     pub(crate) fn stage_parts(
         parts: &[(&RemoteSource, &PartPlan)],
+        budget: Option<u64>,
     ) -> Result<super::StagingReport, InputError> {
-        stage_parts_with(parts, staging_tunables::effective())
+        let tunables = staging_tunables::effective();
+        match budget {
+            Some(mem_budget) => stage_parts_with(
+                parts,
+                &staging_tunables::StagingTunables {
+                    mem_budget,
+                    ..*tunables
+                },
+            ),
+            None => stage_parts_with(parts, tunables),
+        }
+    }
+
+    /// See [`super::staging_want`].
+    pub(crate) fn staging_want() -> (usize, Option<u64>) {
+        let tunables = staging_tunables::effective();
+        let budget_set = std::env::var_os(staging_tunables::MEM_BUDGET_VAR).is_some();
+        (
+            tunables.max_concurrency,
+            budget_set.then_some(tunables.mem_budget),
+        )
     }
 
     /// An error retrying cannot fix: the object changed under the footer

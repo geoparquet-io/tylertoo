@@ -38,8 +38,7 @@ pub(super) enum MemoryPhase {
     EagerInput,
     Scan,
     Assign,
-    /// Remote staging: `STAGE_MEM_BUDGET`, `CHUNK_CACHE_MAX_BYTES` (track R).
-    #[expect(dead_code, reason = "#788: track R grants remote staging under it")]
+    /// Remote staging's requests in flight (pass 0, track R).
     Stage,
     Read,
     Compute,
@@ -112,10 +111,6 @@ pub(super) enum PriceBasis {
     )]
     Measured,
     /// Read from the parquet footers before any page is decoded.
-    #[expect(
-        dead_code,
-        reason = "#788 C2 step 2 prices the read-ahead from the footers"
-    )]
     Footer,
     /// A per-row model ([`MemoryBudget::estimate`]), not a measurement.
     Model,
@@ -289,7 +284,6 @@ impl MemoryBudget {
         grant
     }
     /// Return a grant once what it priced is no longer resident.
-    #[expect(dead_code, reason = "#788 C2 step 2 releases the pass-2 grants")]
     pub(super) fn release(&mut self, grant: Grant) {
         let slot = &mut self.granted[grant.phase as usize];
         *slot = slot.saturating_sub(grant.bytes());
