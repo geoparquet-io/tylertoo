@@ -40,7 +40,9 @@ Standard library only. What one `run` does, cell by cell:
             the disk has less than `min_free_gb` free.
   resume    every run writes <results>/<cell>/<binary>-r<i>.json; a rerun
             skips runs whose file exists, and cells whose summary.json
-            exists, unless --force.
+            exists, unless --force. A resume whose binaries differ from
+            the saved binaries.json (hash, allocator, --bin-env, CPU count)
+            is refused, so one median never mixes two builds.
   report    results.jsonl (one line per run) and report.md (median and
             spread per cell and binary) in <results>.
 
@@ -48,7 +50,9 @@ The load gate: the 1-minute load average must be under --load-max (3). Our
 own previous run holds that average up for minutes after it exits, so within
 LOAD_OWN_S of a run of ours the gate instead samples /proc/stat for
 GATE_SAMPLE_S: fewer than --load-max busy cores while nothing of ours runs
-means the host is quiet. Every wait is logged. On a host where the other
+means the host is quiet. Every wait is logged. A run that starts after the
+gate gave up (load_wait_s) is recorded with gate TIMED_OUT and reported as
+status GATE_TIMED_OUT, outside the medians. On a host where the other
 work is pinned away from a CPU set (`taskset -c 0-31 ... --gate-cpus 0-31`),
 the gate is instead busy cores on that set only, and each run records the
 CPU others used on that set (`foreign_cores`) and on the rest (`context_cores`).
@@ -425,6 +429,24 @@ def parse_bin(spec: str) -> dict:
     return {"label": label, "path": str(p), "allocator": found, "sha256": sha256_file(p)}
 
 
+BUILD_KEYS = ("label", "sha256", "allocator", "env", "affinity_cpus")
+
+
+def check_resume(saved: Path, bins: list[dict]) -> None:
+    """Refuse to resume a run whose saved binaries (`binaries.json`) differ
+    from these in hash, allocator, per-binary environment or CPU count: the
+    saved results would be reported under the new build, and a partial
+    resume would mix two builds in one median."""
+    if not saved.exists():
+        return
+    old = [{k: b.get(k) for k in BUILD_KEYS} for b in json.loads(saved.read_text())]
+    new = [{k: b.get(k) for k in BUILD_KEYS} for b in bins]
+    if old != new:
+        raise ManifestError(f"{saved.parent} holds results of other binaries or settings "
+                            f"(saved {old}, given {new}); resume with the same --bin and "
+                            "--bin-env, or start a new --name")
+
+
 def scope_prefix(memory_max: str) -> list[str]:
     """A transient systemd scope with a hard memory cap and no swap."""
     props = ["-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0"]
@@ -726,6 +748,7 @@ class Runner:
                          defaults.get("load_wait_s", 3600), self.results / "gate.log",
                          enforce=not args.no_gate, cpus=self.cpus, disk=self.disk,
                          disk_write_max=args.disk_write_max)
+        check_resume(self.results / "binaries.json", self.bins)
         (self.results / "binaries.json").write_text(json.dumps(self.bins, indent=2))
 
     def cells(self) -> list[str]:
@@ -937,15 +960,25 @@ def phase_wall(run: dict, name: str) -> float | None:
     return ((run.get("profile", {}).get("convert") or {}).get("phase_walls") or {}).get(name)
 
 
+def run_status(run: dict) -> str:
+    """The run's status, or `GATE_TIMED_OUT` for a run that finished but
+    started after the load gate gave up waiting for a quiet host: its
+    timing was taken under load, so it stays out of the medians."""
+    if run["status"] == "ok" and (run.get("gate") or {}).get("gate") == "TIMED_OUT":
+        return "GATE_TIMED_OUT"
+    return run["status"]
+
+
 def summarize(runs: list[dict], bins: list[dict]) -> dict:
-    """Per binary: wall, CPU, peak RSS and phase totals over its ok runs."""
+    """Per binary: wall, CPU, peak RSS and phase totals over its ok runs
+    (a run whose gate timed out is not ok, see `run_status`)."""
     out = {}
     for b in bins:
         mine = [r for r in runs if r["binary"] == b["label"]]
-        ok = [r for r in mine if r["status"] == "ok"]
+        ok = [r for r in mine if run_status(r) == "ok"]
         out[b["label"]] = {
             "allocator": b["allocator"],
-            "statuses": sorted({r["status"] for r in mine}),
+            "statuses": sorted({run_status(r) for r in mine}),
             "wall_s": spread([r["wall_s"] for r in ok]),
             "cpu_s": spread([r["cpu_s"] for r in ok if r["cpu_s"] is not None]),
             "peak_rss_mib": spread([r["peak_rss_kib"] / 1024 for r in ok if r["peak_rss_kib"]]),

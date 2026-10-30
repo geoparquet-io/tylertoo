@@ -2290,7 +2290,7 @@ mod tests {
     #[test]
     fn fill_workspace_budget_error_is_not_io() {
         let error = require_fill_bytes(33, 32).unwrap_err();
-        assert_eq!(error.to_string(), "io error: coverage fill needs 33 bytes but only 32 bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.");
+        assert_eq!(error.to_string(), "io error: coverage fill needs 33 bytes but only 32 bytes are available; use a bigger machine or reduce the input with --bbox/--filter.");
         assert!(matches!(
             error,
             super::super::ExportError::BudgetExceeded {

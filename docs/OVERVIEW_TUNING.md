@@ -138,7 +138,11 @@ that area under its own features.
   features at all is not written, fill or not (#766).
 - The export holds the finest level's geometry in memory while it builds
   the fill, outside the RAM budget the export plans for: about 1.7 GB more
-  on 4.3M NZ parcels, growing with the input (#764).
+  on 4.3M NZ parcels, growing with the input (#764). Its working space
+  comes out of that budget: when the largest fill tile cannot fit what is
+  left, the export stops with `coverage fill needs N bytes`.
+  `TYLERTOO_SKIP_MEMORY_PREFLIGHT` does not cover this check; drop
+  `--coverage-fill`, use a bigger machine, or reduce the input.
 - In a sharded build the coarse job (`tiles --shard coarse`, or
   `export-pmtiles --zoom-ceiling`) builds the fill from the finest level and
   draws it at the zooms it owns, the same fill a single-job build draws

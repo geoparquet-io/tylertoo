@@ -2041,7 +2041,9 @@ pub enum ConvertError {
         ceiling: usize,
     },
     /// A phase's required resident state exceeds the available memory.
-    #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.")]
+    /// Only the pass-1 scan's is the preflight that
+    /// `TYLERTOO_SKIP_MEMORY_PREFLIGHT` downgrades, so only it names that.
+    #[error("{phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.{}", skip_preflight_hint(phase))]
     BudgetExceeded {
         /// Pipeline stage that cannot fit.
         phase: &'static str,
@@ -4959,6 +4961,17 @@ fn pass1_memory_warn_message(
         limit.source.describe(),
         recommended_total_gib(rows),
     )
+}
+
+/// The escape hatch [`ConvertError::BudgetExceeded`] names: the pass-1
+/// scan's floor is the one budget check [`SKIP_MEMORY_PREFLIGHT_ENV`]
+/// downgrades ([`preflight_pass1_memory`]); every other phase's has none.
+fn skip_preflight_hint(phase: &str) -> &'static str {
+    if phase == super::memory::MemoryPhase::Scan.name() {
+        " Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway."
+    } else {
+        ""
+    }
 }
 
 /// The message body of [`ConvertError::BudgetExceeded`].
