@@ -428,7 +428,10 @@ args = ["{input}", "{out}/ov.parquet"]
 output = "ov.parquet"
 zoom = [7, 13]
 flags = ["--verbatim", "--profile", "bounded", "--spill-dir", "{out}/spill"]
-env = { TYLERTOO_AUTO_MEM_LIMIT_BYTES = "1048576" }
+# C1's exact command (788-C1 .788/BENCH-715.md): 8 rayon threads, and the ipc
+# debug log, which carries each spill stream's encoded bytes. The codec binary
+# takes its selector per binary: --bin-env lz4:TYLERTOO_SPILL_IPC_COMPRESSION=lz4.
+env = { TYLERTOO_AUTO_MEM_LIMIT_BYTES = "1048576", RAYON_NUM_THREADS = "8", RUST_LOG = "info,tylertoo_io::ipc=debug" }
 watch = "spill"
 heavy = true
 

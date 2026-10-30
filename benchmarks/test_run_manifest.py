@@ -220,3 +220,24 @@ def test_report_splits_three_binaries_against_first_and_previous(tmp_path):
     rm.write_report(tmp_path)
     row = next(ln for ln in (tmp_path / "report.md").read_text().splitlines() if "| head |" in ln)
     assert "| 0.600 | 0.750 |" in row
+
+
+def test_device_of_the_worktree_has_a_write_counter():
+    dev = rm.block_device(HERE)
+    assert rm.sectors_written(dev) >= 0
+
+
+def test_report_lists_pass2_writer_finish_spill_and_disk(tmp_path):
+    bins = [{"label": n, "allocator": "glibc", "sha256": "0" * 64} for n in ("raw", "lz4")]
+    (tmp_path / "binaries.json").write_text(json.dumps(bins))
+    cdir = tmp_path / "spill-codec"
+    cdir.mkdir()
+    for name, p2 in [("raw", 9.0), ("lz4", 7.0)]:
+        rec = {"binary": name, "status": "ok", "wall_s": p2 + 1, "cpu_s": 1.0, "peak_rss_kib": 1024,
+               "foreign_cores": 0.0, "output": {"sha256": "aa", "bytes": 5},
+               "watch_peak_mib": 100.0, "device_write_mib": 50.0, "gate": {"disk_write_mbps": 3.5},
+               "profile": {"convert": {"phase_walls": {"pass2": p2, "writer_finish": 0.5, "total": p2 + 1}}}}
+        (cdir / f"{name}-r0.json").write_text(json.dumps(rec))
+    rm.write_report(tmp_path)
+    row = [ln for ln in (tmp_path / "report.md").read_text().splitlines() if ln.startswith("| spill-codec | lz4")][-1]
+    assert row == "| spill-codec | lz4 | 7.00 | 0.50 | 100.00 | 3.50 | 50.00 |"

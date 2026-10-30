@@ -305,16 +305,41 @@ def all_cpus() -> frozenset[int]:
                      if ln.startswith("cpu") and ln[3].isdigit())
 
 
+def block_device(path: Path) -> str:
+    """The /proc/diskstats name of the block device holding `path`."""
+    dev = os.stat(path).st_dev
+    want = (os.major(dev), os.minor(dev))
+    for line in Path("/proc/diskstats").read_text().splitlines():
+        f = line.split()
+        if (int(f[0]), int(f[1])) == want:
+            return f[2]
+    raise ManifestError(f"no /proc/diskstats entry for {path} ({want[0]}:{want[1]})")
+
+
+def sectors_written(device: str) -> int:
+    """512-byte sectors written to `device` since boot (/proc/diskstats)."""
+    for line in Path("/proc/diskstats").read_text().splitlines():
+        f = line.split()
+        if f[2] == device:
+            return int(f[9])
+    raise ManifestError(f"no /proc/diskstats entry {device}")
+
+
 class Gate:
     """Wait for a quiet host before each run (see the module docstring)."""
 
-    def __init__(self, load_max: float, wait_s: float, log: Path, enforce: bool = True,
-                 cpus: frozenset[int] | None = None) -> None:
+    def __init__(self, load_max: float, wait_s: float, log: Path, enforce: bool = True,  # noqa: PLR0913
+                 cpus: frozenset[int] | None = None, disk: str | None = None,
+                 disk_write_max: float | None = None) -> None:
         """Gate below `load_max`, waiting at most `wait_s`, logging to `log`;
         with `enforce` off it only records what it saw (dry runs). With
         `cpus` (an isolated CPU set the runs are pinned to) the gate is
         busy cores on that set only, below `load_max`; the load average and
-        the other CPUs are recorded as context."""
+        the other CPUs are recorded as context. With `disk_write_max` the
+        write rate to block device `disk` over the same sample (MB/s) must
+        also be below it; with `disk` alone the rate is only recorded."""
+        self.disk = disk
+        self.disk_write_max = disk_write_max
         self.enforce = enforce
         self.cpus = cpus
         self.others = all_cpus() - cpus if cpus else None
@@ -330,6 +355,7 @@ class Gate:
             load = loadavg1()
             own_recent = time.monotonic() - self.last_own_end < LOAD_OWN_S
             context = {}
+            w0, tw = (sectors_written(self.disk), time.monotonic()) if self.disk else (0, 0.0)
             if self.cpus:
                 b0, b0o = cpu_busy_jiffies(self.cpus)[0], cpu_busy_jiffies(self.others)[0]
                 time.sleep(GATE_SAMPLE_S)
@@ -340,6 +366,11 @@ class Gate:
             else:
                 busy = busy_cores(GATE_SAMPLE_S)
                 quiet = busy < self.load_max and (load < self.load_max or own_recent)
+            if self.disk:
+                rate = (sectors_written(self.disk) - w0) * 512 / 1e6 / (time.monotonic() - tw)
+                context["disk_write_mbps"] = round(rate, 1)
+                if self.disk_write_max is not None:
+                    quiet = quiet and rate < self.disk_write_max
             waited = time.monotonic() - t0
             if quiet or waited > self.wait_s or not self.enforce:
                 verdict = "quiet" if quiet else "NOT_ENFORCED" if not self.enforce else "TIMED_OUT"
@@ -650,6 +681,14 @@ class Runner:
         labels = [b["label"] for b in self.bins]
         if len(set(labels)) != len(labels):
             raise ManifestError("--bin labels must be distinct")
+        for b in self.bins:
+            b["env"] = {}
+        for spec in args.bin_env:
+            label, _, kv = spec.partition(":")
+            key, eq, val = kv.partition("=")
+            if label not in labels or not key or not eq:
+                raise ManifestError(f"--bin-env {spec!r}: want label:KEY=VALUE for a --bin label")
+            next(b for b in self.bins if b["label"] == label)["env"][key] = val
         defaults = manifest.get("defaults", {})
         self.cpus = parse_cpus(args.gate_cpus) if args.gate_cpus else None
         affinity = frozenset(os.sched_getaffinity(0))
@@ -658,9 +697,12 @@ class Runner:
                                 f"{sorted(affinity)}; start it under `taskset -c {args.gate_cpus}`")
         for b in self.bins:
             b["affinity_cpus"] = len(affinity)
+        self.bench_out.mkdir(parents=True, exist_ok=True)
+        self.disk = block_device(self.bench_out)
         self.gate = Gate(args.load_max or defaults.get("load_max", 3.0),
                          defaults.get("load_wait_s", 3600), self.results / "gate.log",
-                         enforce=not args.no_gate, cpus=self.cpus)
+                         enforce=not args.no_gate, cpus=self.cpus, disk=self.disk,
+                         disk_write_max=args.disk_write_max)
         (self.results / "binaries.json").write_text(json.dumps(self.bins, indent=2))
 
     def cells(self) -> list[str]:
@@ -755,7 +797,8 @@ class Runner:
         argv = [base["path"], *build_argv(cell["setup"], {**subs, "setup": str(sdir), "out": str(sdir)})]
         print(f"setup {name}: {' '.join(argv)}", flush=True)
         t0 = time.monotonic()
-        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()}, "TMPDIR": str(sdir / "tmp")}
+        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()}, **base["env"],
+               "TMPDIR": str(sdir / "tmp")}
         res = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)  # noqa: S603
         (self.results / name / "setup.log").write_text(
             " ".join(argv) + "\n" + res.stdout + "\n--- stderr ---\n" + res.stderr)
@@ -786,16 +829,20 @@ class Runner:
         prof = cdir / f"{tag}.profile.jsonl"
         prof.unlink(missing_ok=True)
         argv = [b["path"], *build_argv(cell, {**subs, "out": str(out)})]
-        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()},
+        env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()}, **b["env"],
                "TYLERTOO_PROFILE_JSON": str(prof), "TMPDIR": str(out / "tmp")}
         require_disk(self.bench_out, self.min_free_gb)
         gate = self.gate.wait()
         if server:
             server.get("/__reset")
         print(f"{'warm' if warmup else 'run '}  {name} {tag}: {' '.join(argv[1:])}", flush=True)
+        w0 = sectors_written(self.disk)
         try:
             res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], cell, env,
                              cdir / f"{tag}.log", out, self.cpus)
+            # Everything written to the device during the run, ours and others'
+            # (our part still in the page cache at exit is not counted).
+            res["device_write_mib"] = round((sectors_written(self.disk) - w0) * 512 / (1 << 20), 1)
             output = output_digest(out, cell["output"])
         finally:
             # Only the result row, the profile JSONL and the log survive a run.
@@ -806,7 +853,7 @@ class Runner:
         rec = {
             "run": self.args.name, "cell": name, "binary": label, "round": r, "warmup": warmup,
             "allocator": b["allocator"], "allocator_expected": cell["allocator"],
-            "binary_sha256": b["sha256"], "argv": argv, "dry_run": self.args.dry_run,
+            "binary_sha256": b["sha256"], "binary_env": b["env"], "argv": argv, "dry_run": self.args.dry_run,
             "started": time.strftime("%FT%T"), "gate": gate, **res,
             "load1_after": loadavg1(),
             "output": output,
@@ -862,6 +909,11 @@ def phase_total(run: dict, phase: str) -> float | None:
     return walls.get("total")
 
 
+def phase_wall(run: dict, name: str) -> float | None:
+    """One convert `phase_walls` entry (pass1, assign, pass2, writer_finish)."""
+    return ((run.get("profile", {}).get("convert") or {}).get("phase_walls") or {}).get(name)
+
+
 def summarize(runs: list[dict], bins: list[dict]) -> dict:
     """Per binary: wall, CPU, peak RSS and phase totals over its ok runs."""
     out = {}
@@ -877,6 +929,11 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
             "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
             "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),
             "true_peak_mib": spread([v for r in ok if (v := true_peak(r)) is not None]),
+            "pass2_s": spread([v for r in ok if (v := phase_wall(r, "pass2")) is not None]),
+            "writer_finish_s": spread([v for r in ok if (v := phase_wall(r, "writer_finish")) is not None]),
+            "gate_disk_mbps": spread([r["gate"]["disk_write_mbps"] for r in mine
+                                      if r.get("gate", {}).get("disk_write_mbps") is not None]),
+            "device_write_mib": spread([r["device_write_mib"] for r in ok if r.get("device_write_mib") is not None]),
             "watch_peak_mib": spread([r["watch_peak_mib"] for r in ok if r.get("watch_peak_mib") is not None]),
             "foreign_cores_max": max((r["foreign_cores"] for r in mine), default=None),
             "context_cores": spread([r["context_cores"] for r in mine if r.get("context_cores") is not None]),
@@ -937,6 +994,21 @@ def write_report(results: Path) -> None:
                 f"| {ratio(i, 0, 'peak_rss_mib')} | {ratio(i, prev, 'peak_rss_mib')} "
                 f"| {s['foreign_cores_max']} | {fmt(s['context_cores'])} "
                 f"| {same} {s['output_bytes'][0] if s['output_bytes'] else ''} |")
+    lines += ["", "Convert phases, spill and disk: `spill peak` is the cell's watched directory "
+              "(e.g. --spill-dir) sampled every 0.2 s; `gate disk` is the device write rate (MB/s, "
+              "everyone's) in the 3 s before each run; `device written` is everything written to "
+              "the device during a run.", "",
+              "| cell | binary | pass 2 s | writer_finish s | spill peak MiB | gate disk MB/s "
+              "| device written MiB |", "|---|---|---:|---:|---:|---:|---:|"]
+    for cdir in sorted(p for p in results.iterdir() if p.is_dir()):
+        runs = load_runs(cdir)
+        if not runs:
+            continue
+        for b, s in zip(bins, summarize(runs, bins).values(), strict=True):
+            if s["statuses"] and (s["pass2_s"]["n"] or s["watch_peak_mib"]["n"]):
+                lines.append(f"| {cdir.name} | {b['label']} | {fmt(s['pass2_s'])} "
+                             f"| {fmt(s['writer_finish_s'])} | {fmt(s['watch_peak_mib'])} "
+                             f"| {fmt(s['gate_disk_mbps'])} | {fmt(s['device_write_mib'])} |")
     (results / "report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -969,6 +1041,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--gate-cpus", help="an isolated CPU set the run is pinned to (taskset -c): "
                      "gate on busy cores there (< --load-max) instead of the load average, "
                      "and count foreign CPU there only")
+    run.add_argument("--bin-env", action="append", default=[], metavar="LABEL:KEY=VALUE",
+                     help="an environment variable for one --bin only (e.g. a codec selector)")
+    run.add_argument("--disk-write-max", type=float, metavar="MBPS",
+                     help="also gate on the write rate to the --bench-out device (MB/s over the "
+                     "gate sample); the rate is recorded either way")
     run.add_argument("--no-gate", action="store_true",
                      help="record the load but never wait (dry runs on a busy host)")
     run.add_argument("--bench-out", default=str(ROOT / ".bench-out"), help="scratch for outputs, emptied per run")
