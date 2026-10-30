@@ -1807,7 +1807,7 @@ processed at once, and how many row groups the writer encodes at once.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `--profile speed\|bounded\|auto` | `auto` | How much memory the run may hold |
-| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export |
+| `export-pmtiles --profile speed\|bounded\|auto` | `auto` | The same choice for a two-step export; `tiles` passes its `--profile` to the export. Export's member store, level stores and wave width follow it as below |
 | `--in-flight-batches N\|auto` | cores, clamped to 4–16 | More batches = more overlap and memory |
 | `--read-workers N\|auto` | pass 1 cores/2, pass 2 cores/4, at most 4 | More readers in each pass = more throughput and resident batches |
 
@@ -1833,6 +1833,13 @@ processed at once, and how many row groups the writer encodes at once.
   their estimate fits and spill when it does not, and a run that starts in
   RAM keeps measuring and switches to spilling mid-pass if it outgrows the
   allowance.
+
+Export applies the same rule. `speed` keeps every level's tile members in
+RAM and sizes the partition wave from the cores alone; `bounded` spills them
+and keeps the wave caps export always had; `auto` keeps them in RAM when they
+fit the allowance and narrows the wave to fit it. Under every profile, export
+still refuses a tile that alone needs more than the machine's memory
+([Export waves](guides/scaling.md#export-waves)).
 
 `auto` is a third shape, not a switch between the other two: on a large
 machine it holds more than `bounded` and less than `speed`. On a machine
