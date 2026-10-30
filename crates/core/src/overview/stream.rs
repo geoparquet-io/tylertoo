@@ -187,13 +187,15 @@ pub(crate) enum Pass2Strategy {
 /// Pass 0 (#286/#287): stage the selected row groups to local disk up front so
 /// the two passes below read from the spill, not the network.
 ///
-/// A row group's column chunks are a contiguous span, so each is fetched as ONE
-/// coalesced range request (several in flight per part) and spilled. This
-/// removes the per-column-chunk serial re-fetch (#287) and the cold pass-2
-/// re-fetch of the property columns pass 1's projection skips (#286).
-/// Best-effort and no-op for local input: a staging error is logged and the
-/// passes fall back to the reader's lazy network path (the same bytes, just
-/// uncoalesced), so staging never regresses correctness.
+/// One plan (#788) covers every part: the selected row groups' chunks of the
+/// columns the conversion reads, fetched as range requests that are in
+/// flight across parts at once, and sliced into the spill. This removes the
+/// per-column-chunk serial re-fetch (#287) and the cold pass-2 re-fetch of
+/// the property columns pass 1's projection skips (#286), and fetches no
+/// excluded column (#400). Best-effort and no-op for local input: a failed
+/// request is retried as its row groups, and what still fails is read by the
+/// passes over the reader's lazy network path (the same bytes, uncoalesced),
+/// so staging never regresses correctness.
 fn stage_input_pass0(
     source: &ConvertSource,
     selected_row_groups: Option<&RowGroupSelection>,
@@ -204,12 +206,29 @@ fn stage_input_pass0(
         return;
     }
     let t_stage = Instant::now();
-    match source.stage_selected(selected_row_groups) {
-        Ok(()) => log::info!(
-            "[convert] staged {row_groups_read} selected row group(s) to local \
-             disk in {:.1}s",
-            t_stage.elapsed().as_secs_f64()
-        ),
+    let staged = source
+        .staging_plan(selected_row_groups)
+        .and_then(|plan| source.stage(&plan));
+    match staged {
+        Ok(report) => {
+            log::info!(
+                "[convert] staged {row_groups_read} selected row group(s) to local \
+                 disk in {:.1}s ({} request(s), {} B, up to {} in flight)",
+                t_stage.elapsed().as_secs_f64(),
+                report.requests,
+                report.bytes_fetched,
+                report.max_in_flight
+            );
+            if report.failed_requests > 0 {
+                diagnostics.warn(format!(
+                    "[convert] input staging left {} B in {} request(s) unstaged ({}); \
+                     the passes read those chunks over the network",
+                    report.unstaged_bytes,
+                    report.failed_requests,
+                    report.first_error.as_deref().unwrap_or("unknown error")
+                ));
+            }
+        }
         Err(e) => diagnostics.warn(format!(
             "[convert] input staging failed ({e}); passes will read over the \
              network (uncoalesced)"
