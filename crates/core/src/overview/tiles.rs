@@ -824,17 +824,24 @@ fn convert_to_pmtiles_validated(
             }
         };
 
-    // #314 free-space preflight: the intermediate is at least input-sized,
-    // so warn up front when the chosen volume looks too small. Logged here
+    // Shared disk-footprint preflight: sum staging, pass-2 spill and the
+    // intermediate on each destination volume. Warn before execution. Logged here
     // and carried in the report; a caller that must surface it before the
     // run (#709: Python's `UserWarning`) calls `intermediate_space_preflight`.
-    let space_warning = intermediate_space_preflight(input, output, options, CLI_REMEDIES);
+    let diagnostics = crate::diagnostics::Diagnostics::default();
+    let source = input.source().map_err(TilesError::Convert)?;
+    let space_warning = super::disk::DiskFootprint::conversion(
+        &source,
+        None,
+        &convert_options,
+        Some(&overview_path),
+    )
+    .ok()
+    .and_then(|footprint| footprint.warning(CLI_REMEDIES));
     if let Some(msg) = &space_warning {
         log::warn!("{msg}");
     }
 
-    let diagnostics = crate::diagnostics::Diagnostics::default();
-    let source = input.source().map_err(TilesError::Convert)?;
     let convert_report = match super::convert::convert_to_overviews_source_diagnostics(
         &source,
         &overview_path,
@@ -1020,7 +1027,7 @@ fn intermediate_dir(options: &TilesOptions, output: &Path) -> PathBuf {
 }
 
 /// The CLI's names for the #314 remedies, which the facade's log uses.
-const CLI_REMEDIES: SpaceRemedies = SpaceRemedies {
+pub(super) const CLI_REMEDIES: SpaceRemedies = SpaceRemedies {
     spill_dir: "--spill-dir",
     keep_overview: "--keep-overview",
 };
@@ -1036,14 +1043,16 @@ pub struct SpaceRemedies<'a> {
     pub keep_overview: &'a str,
 }
 
-/// The #314 intermediate free-space preflight on its own (#709).
+/// The shared conversion disk-footprint preflight on its own (#709).
 ///
 /// The warning [`convert_to_pmtiles`] logs, for a caller that must surface
 /// it before the run, as Python's `UserWarning` does, in its own spelling
-/// of the remedies. Probes the volume that will hold the intermediate.
+/// of the remedies. Includes staging, raw pass-2 spill and the intermediate,
+/// grouped by destination volume. The facade keeps this compatibility entry
+/// point so Python can warn before releasing the GIL.
 ///
 /// `None` when the volume fits, or when either side of the comparison is
-/// unknowable (a remote input, an exotic filesystem) rather than crying
+/// unknowable (an unreadable footer or an exotic filesystem) rather than crying
 /// wolf.
 pub fn intermediate_space_preflight(
     input: &TilesInput,
@@ -1051,10 +1060,16 @@ pub fn intermediate_space_preflight(
     options: &TilesOptions,
     remedies: SpaceRemedies<'_>,
 ) -> Option<String> {
+    let source = input.source().ok()?;
     let dir = intermediate_dir(options, output);
-    let estimated = estimate_local_input_bytes(input)?;
-    let available = super::convert::probe_available_space(&dir)?;
-    intermediate_space_warning(estimated, available, &dir, remedies)
+    super::disk::DiskFootprint::conversion(
+        &source,
+        None,
+        &options.convert,
+        Some(&dir.join("overview.parquet")),
+    )
+    .ok()?
+    .warning(remedies)
 }
 
 fn resolve_intermediate_dir(
@@ -1073,90 +1088,6 @@ fn resolve_intermediate_dir(
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
-}
-
-/// Lower-bound estimate of the intermediate overview's size for the #314
-/// free-space preflight: the local input bytes. A duplicating overview
-/// embeds the finest level verbatim on top of the coarse levels, so it is
-/// at least input-sized. Local file → its size; local directory → the sum
-/// of its `.parquet` files, recursively, through the same listing the
-/// convert itself reads ([`crate::input_set::list_parquet_files`] — a
-/// hive-partitioned set is estimated by what will actually be read, not by
-/// its empty top level); manifest → the sum of the entries that resolve as
-/// local files. Remote/glob shapes return `None` (the preflight stays quiet
-/// rather than guessing).
-fn estimate_local_input_bytes(input: &TilesInput) -> Option<u64> {
-    fn file_len(p: &Path) -> Option<u64> {
-        std::fs::metadata(p)
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-    }
-    match input {
-        TilesInput::Path(p) => {
-            let meta = std::fs::metadata(p).ok()?;
-            if meta.is_file() {
-                return Some(meta.len());
-            }
-            if !meta.is_dir() {
-                return None;
-            }
-            let sum: u64 = crate::input_set::list_parquet_files(p)
-                .ok()?
-                .iter()
-                .filter_map(|f| file_len(f))
-                .fold(0u64, u64::saturating_add);
-            (sum > 0).then_some(sum)
-        }
-        TilesInput::Manifest(m) => {
-            let text = std::fs::read_to_string(m).ok()?;
-            let sum: u64 = crate::input_set::manifest_entries(&text)
-                .iter()
-                .filter_map(|(_, entry)| file_len(Path::new(entry)))
-                .fold(0u64, u64::saturating_add);
-            (sum > 0).then_some(sum)
-        }
-    }
-}
-
-/// #314 preflight safety margin, matching the remote-spill preflight
-/// (#272): warn when free space is below the estimate plus 1/20th (5%).
-const INTERMEDIATE_MARGIN_DENOM: u64 = 20;
-
-/// #314 free-space preflight decision + message (pure, unit-testable).
-/// Returns the warning to emit when the estimated intermediate overview
-/// (a lower bound — the local input bytes) plus a 5% margin exceeds
-/// `available_bytes` on the volume holding `dir`, or `None` when it fits
-/// (or the estimate is unknown/zero).
-fn intermediate_space_warning(
-    estimated_bytes: u64,
-    available_bytes: u64,
-    dir: &Path,
-    remedies: SpaceRemedies<'_>,
-) -> Option<String> {
-    if estimated_bytes == 0 {
-        return None;
-    }
-    // Saturating, like the #272 spill preflight's math (#686): an absurd
-    // estimate must degrade to "warn", never to an overflow panic.
-    let need = estimated_bytes.saturating_add(estimated_bytes / INTERMEDIATE_MARGIN_DENOM);
-    if available_bytes >= need {
-        return None;
-    }
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    Some(format!(
-        "the intermediate overview `tiles` materializes (≥ ~{:.1} GiB — a \
-         duplicating overview is at least as large as the input, whose local \
-         size is the estimate) may not fit: {} has {:.1} GiB free ({:.1} GiB \
-         short, including a 5% margin). Point {} (or {}) at a roomier volume, \
-         or free up space first.",
-        gib(estimated_bytes),
-        dir.display(),
-        gib(available_bytes),
-        gib(need.saturating_sub(available_bytes)),
-        remedies.spill_dir,
-        remedies.keep_overview,
-    ))
 }
 
 #[cfg(test)]
@@ -1838,81 +1769,6 @@ mod tests {
         assert_eq!(
             resolve_intermediate_dir(None, None, Path::new("tiles.pmtiles")),
             std::env::temp_dir()
-        );
-    }
-
-    /// #314 free-space preflight: quiet when the estimated intermediate
-    /// (plus the 5% margin) fits, a warning naming the directory, the
-    /// shortfall, and the `--spill-dir` escape hatch when it does not.
-    #[test]
-    fn intermediate_space_warning_thresholds() {
-        let dir = Path::new("/some/volume");
-        let gib = 1024u64 * 1024 * 1024;
-
-        // Fits comfortably: no warning.
-        assert!(intermediate_space_warning(10 * gib, 11 * gib, dir, CLI_REMEDIES).is_none());
-        // Exactly the estimate + 5% margin still fits.
-        let est = 20 * gib;
-        assert!(intermediate_space_warning(est, est + est / 20, dir, CLI_REMEDIES).is_none());
-        // One byte short of the margin: warn, naming dir and remedies.
-        let msg = intermediate_space_warning(est, est + est / 20 - 1, dir, CLI_REMEDIES)
-            .expect("shortfall must warn");
-        assert!(msg.contains("/some/volume"), "names the directory: {msg}");
-        assert!(msg.contains("--spill-dir"), "names the remedy: {msg}");
-        assert!(msg.contains("--keep-overview"), "names the remedy: {msg}");
-        // #709: the remedies in the caller's spelling (Python's kwargs).
-        let py = SpaceRemedies {
-            spill_dir: "spill_dir",
-            keep_overview: "keep_overview",
-        };
-        let msg = intermediate_space_warning(est, 0, dir, py).expect("shortfall must warn");
-        assert!(msg.contains("Point spill_dir (or keep_overview)"), "{msg}");
-        assert!(!msg.contains("--"), "no CLI spelling: {msg}");
-        // Zero estimate (unknown/empty input): never warns.
-        assert!(intermediate_space_warning(0, 0, dir, CLI_REMEDIES).is_none());
-    }
-
-    /// The intermediate size estimate is the local input bytes: file size
-    /// for a file, the sum of top-level .parquet sizes for a directory,
-    /// the sum of existing local manifest entries for a manifest.
-    #[test]
-    fn estimate_local_input_bytes_shapes() {
-        let dir = tempfile::tempdir().unwrap();
-        let f1 = dir.path().join("a.parquet");
-        let f2 = dir.path().join("b.parquet");
-        std::fs::write(&f1, vec![0u8; 100]).unwrap();
-        std::fs::write(&f2, vec![0u8; 50]).unwrap();
-        std::fs::write(dir.path().join("ignored.txt"), vec![0u8; 999]).unwrap();
-
-        // Single file.
-        assert_eq!(
-            estimate_local_input_bytes(&TilesInput::Path(f1.clone())),
-            Some(100)
-        );
-        // Directory: only .parquet entries count.
-        assert_eq!(
-            estimate_local_input_bytes(&TilesInput::Path(dir.path().to_path_buf())),
-            Some(150)
-        );
-        // Nonexistent / remote-looking path: quiet None.
-        assert_eq!(
-            estimate_local_input_bytes(&TilesInput::Path(PathBuf::from("s3://bucket/x.parquet"))),
-            None
-        );
-        // Manifest: sum of existing local entries; comments/blanks skipped.
-        let manifest = dir.path().join("m.txt");
-        std::fs::write(
-            &manifest,
-            format!(
-                "# comment\n{}\n\n{}\ns3://bucket/remote.parquet\n",
-                f1.display(),
-                f2.display()
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            estimate_local_input_bytes(&TilesInput::Manifest(manifest)),
-            Some(150)
         );
     }
 

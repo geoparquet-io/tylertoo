@@ -19,6 +19,7 @@ pub mod cluster;
 pub mod coalesce;
 pub mod config;
 pub mod convert;
+mod disk;
 pub mod export;
 pub mod filter;
 #[cfg(test)]

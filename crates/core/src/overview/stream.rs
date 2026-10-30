@@ -2107,6 +2107,7 @@ fn preflight(
     source: &ConvertSource,
     options: &ConvertOptions,
     diagnostics: &crate::diagnostics::Diagnostics,
+    overview: Option<&Path>,
 ) -> Result<Preflight, ConvertError> {
     // Probe once for this conversion; every phase borrows the resulting budget.
     preflight_with_memory_limit(
@@ -2115,6 +2116,7 @@ fn preflight(
         MemoryBudget::probe().limit,
         super::convert::skip_memory_preflight_from_env(),
         diagnostics,
+        overview,
     )
 }
 
@@ -2126,6 +2128,7 @@ fn preflight_with_memory_limit(
     memory_limit: Option<super::pipeline::MemoryLimit>,
     skip_memory_preflight: bool,
     diagnostics: &crate::diagnostics::Diagnostics,
+    overview: Option<&Path>,
 ) -> Result<Preflight, ConvertError> {
     diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
     diagnostics.set_python_loss_budget(
@@ -2240,18 +2243,16 @@ fn preflight_with_memory_limit(
     // #267: nudge toward --bbox / download-first for a large whole-file remote
     // convert (quiet for local inputs and effective bbox extracts).
     super::convert::warn_full_file_remote(source, row_groups_read, row_groups_total, diagnostics);
-    // #272: preflight the spill volume. The disk spill (#219) grows to ≈ the
-    // selected input bytes — known exactly here, the first moment after
-    // row-group selection (summed per part for a multi source) — so compare
-    // it against the free space where the spill will live and warn up front
-    // (naming the dir and the shortfall) instead of silently degrading to
-    // network re-fetch mid-convert.
-    super::convert::warn_spill_space(
+    if let Some(message) = super::disk::DiskFootprint::conversion(
         source,
-        source.selected_input_bytes(selected_row_groups.as_ref())?,
-        options.spill_dir.as_deref(),
-        diagnostics,
-    );
+        selected_row_groups.as_ref(),
+        options,
+        overview,
+    )?
+    .warning(super::tiles::CLI_REMEDIES)
+    {
+        diagnostics.warn(message);
+    }
 
     // Pass 0 (#286/#287): stage the selected row groups to local disk so both
     // passes below read from the spill, not the network.
@@ -2307,7 +2308,7 @@ pub(super) fn memory_source_for_test(
     limit: u64,
 ) -> Result<(MemorySource, usize), ConvertError> {
     let diagnostics = crate::diagnostics::Diagnostics::silent();
-    let pre = preflight(source, options, &diagnostics)?;
+    let pre = preflight(source, options, &diagnostics, None)?;
     let memory = MemorySource::load(
         source,
         pre.selected_row_groups.as_ref(),
@@ -2419,13 +2420,14 @@ fn run_front_half(
     prebuild_chain_tables: bool,
     rss: &mut RssTracker,
     diagnostics: &crate::diagnostics::Diagnostics,
+    overview: Option<&Path>,
 ) -> Result<FrontHalf, ConvertError> {
     // A numeric sort key and a categorical class ranking would both drive
     // `AssignFeature::sort_key` (Q1); refused before the input is opened.
     if options.sort_key.is_some() && options.class_ranking.is_some() {
         return Err(ConvertError::RankingConflict);
     }
-    let mut preflight = preflight(source, options, diagnostics)?;
+    let mut preflight = preflight(source, options, diagnostics, overview)?;
     // The PREFLIGHT-RESOLVED options from here on (auto-detected ranking,
     // profile-derived knobs): what pass 1, the assignment and the plan's
     // fingerprint all see.
@@ -2491,7 +2493,7 @@ pub(crate) fn write_plan_streaming(
         preflight,
         plan,
         memory: _,
-    } = run_front_half(source, options, false, &mut rss, diagnostics)?;
+    } = run_front_half(source, options, false, &mut rss, diagnostics, None)?;
     let options = &preflight.options;
     let path = options
         .save_plan
@@ -2975,7 +2977,14 @@ pub(crate) fn run_stages(
         preflight,
         plan,
         memory,
-    } = run_front_half(source, options, true, &mut rss, diagnostics)?;
+    } = run_front_half(
+        source,
+        options,
+        true,
+        &mut rss,
+        diagnostics,
+        Some(output_path),
+    )?;
     let reader: &dyn BatchSource = memory.as_ref().map_or(source as &dyn BatchSource, |m| m);
     let Preflight {
         descriptor,
@@ -6537,6 +6546,7 @@ mod tests {
             hard_limit(1 << 40),
             false,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .expect("10 rows must fit a 1 TiB mocked limit");
 
@@ -6550,6 +6560,7 @@ mod tests {
             hard_limit(1),
             false,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         ) {
             Err(
                 err @ ConvertError::BudgetExceeded {
@@ -6578,6 +6589,7 @@ mod tests {
             hard_limit(1),
             true,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .expect("the skip hatch must downgrade the hard error");
 
@@ -6593,6 +6605,7 @@ mod tests {
             hard_limit(1),
             false,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .expect("a --bbox extract must never hard-error on an upper-bound row count");
     }
@@ -6623,6 +6636,7 @@ mod tests {
             &source,
             &options,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .expect("10 rows fit any real box");
         assert_eq!(
@@ -6648,6 +6662,7 @@ mod tests {
             hard_limit(1),
             false,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .expect("a --plan replay must skip the pass-1 memory preflight entirely");
     }
@@ -6655,7 +6670,7 @@ mod tests {
     fn run_pass1_for_test(path: &Path, options: &ConvertOptions, chunk_rows: usize) -> Pass1Output {
         let source = ConvertSource::resolve_path(path).unwrap();
         let diagnostics = crate::diagnostics::Diagnostics::default();
-        let pre = preflight(&source, options, &diagnostics).unwrap();
+        let pre = preflight(&source, options, &diagnostics, None).unwrap();
         scan_fixture(&source, &pre, chunk_rows, &diagnostics).unwrap()
     }
 
@@ -7870,6 +7885,7 @@ mod tests {
             &source,
             &options,
             &crate::diagnostics::Diagnostics::default(),
+            None,
         )
         .unwrap();
         let res = scan_fixture(
