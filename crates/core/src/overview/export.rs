@@ -137,8 +137,8 @@ use super::level::{zoom_for_gsd, Crs, MemoryProfile, Mode, OverviewsMeta};
 use super::memory::{Grant, MemoryBudget, MemoryPhase, Price, PriceBasis};
 use super::pipe::scoped_pipe;
 use super::pipeline::{
-    available_memory_bytes, probe_oom_memory_limit, resolve_backing, MemoryLimit,
-    MemoryLimitSource, SinkBacking,
+    available_memory_bytes, probe_oom_memory_limit, sink_backing, MemoryLimit, MemoryLimitSource,
+    SinkBacking,
 };
 use super::properties::PropertySelection;
 use super::reader::{OverviewReader, ReaderError};
@@ -2056,8 +2056,7 @@ fn export_pmtiles_validated(
 ) -> Result<Pass2Run, ExportError> {
     let diagnostics = &crate::diagnostics::Diagnostics::default();
     super::pipeline::memory_diagnostic(diagnostics);
-    diagnostics
-        .set_python_loss_budget(super::memory::MemoryBudget::probe().python_loss_allowance());
+    diagnostics.set_python_loss_budget(budget.python_loss_allowance());
     let options = config.options();
     diagnostics.set_accounting_spill_dir(options.spill_dir.as_deref());
     // #535 step 1 / #517 S2: probe `TYLERTOO_PROFILE_JSON` writability loudly,
@@ -2631,7 +2630,7 @@ struct CheckpointCtx<'a> {
 
 /// The #235 single-read fill's member-store backing when the caller did not
 /// force one: the profile's choice, by the rule convert's sinks use
-/// ([`resolve_backing`]): `speed` RAM, `bounded` spill, `auto` the
+/// ([`sink_backing`]): `speed` RAM, `bounded` spill, `auto` the
 /// RAM-vs-spill estimate over every level's buffered members (#788).
 fn fill_backing(
     scans: &[LevelScan],
@@ -2641,8 +2640,8 @@ fn fill_backing(
     mean_member_bytes: Option<u64>,
 ) -> SinkBacking {
     let buffered_rows: usize = scans.iter().map(|s| s.feature_count).sum();
-    let b = resolve_backing(
-        *budget,
+    let b = sink_backing(
+        budget,
         profile,
         Mode::Partitioning,
         buffered_rows,
