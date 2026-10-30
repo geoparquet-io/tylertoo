@@ -824,11 +824,16 @@ pub fn convert_to_pmtiles_observed(
     observer: &mut dyn TilesObserver,
 ) -> Result<TilesOutcome, TilesError> {
     let config = options.validate()?;
-    convert_to_pmtiles_validated(input, output, &config, observer)
+    convert_to_pmtiles_validated(input, || input.source(), output, &config, observer)
 }
 
-fn convert_to_pmtiles_validated(
+/// The facade over `open`'s source (the test seam: [`TilesInput::source`]
+/// in production, an in-memory remote in tests). `FnOnce`: the input is
+/// opened exactly once, so the `auto` estimate's staged sample is still in
+/// the source the conversion reads (#788).
+pub(super) fn convert_to_pmtiles_validated(
     input: &TilesInput,
+    open: impl FnOnce() -> Result<ConvertSource, ConvertError>,
     output: &Path,
     config: &super::config::ValidatedConfig<'_, TilesOptions>,
     observer: &mut dyn TilesObserver,
@@ -856,7 +861,7 @@ fn convert_to_pmtiles_validated(
     // The input is opened once: the shard binding, the `auto` estimate and
     // the conversion all read this source. Before the declared zoom range
     // below, which needs the resolved finest zoom.
-    let source = input.source().map_err(TilesError::Convert)?;
+    let source = open().map_err(TilesError::Convert)?;
     let convert_options = resolve_on_source(&source, options.shard.as_ref(), convert_options)?;
 
     // The declared zoom range (#380): only a zoom plan has one. `None` for a
@@ -913,7 +918,6 @@ fn convert_to_pmtiles_validated(
     // and carried in the report; a caller that must surface it before the
     // run (#709: Python's `UserWarning`) calls `intermediate_space_preflight`.
     let diagnostics = crate::diagnostics::Diagnostics::default();
-    let source = input.source().map_err(TilesError::Convert)?;
     let space_warning = super::disk::DiskFootprint::conversion(
         &source,
         None,

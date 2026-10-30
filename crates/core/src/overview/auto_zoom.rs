@@ -1141,7 +1141,13 @@ mod tests {
             "the conversion resolved auto to the estimate's zoom"
         );
 
-        let mut ranges = remote.parts()[0].fetched_ranges().unwrap();
+        assert_each_range_fetched_once(&remote.parts()[0]);
+    }
+
+    /// No byte range of `part` crossed the network twice.
+    #[cfg(feature = "remote")]
+    fn assert_each_range_fetched_once(part: &crate::input::InputSource) {
+        let mut ranges = part.fetched_ranges().unwrap();
         ranges.sort_by_key(|r| r.start);
         for pair in ranges.windows(2) {
             assert!(
@@ -1151,6 +1157,42 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    /// #788: the same through the `tiles` facade (the CLI's `tiles` and
+    /// Python's `convert`), which opens the input once for the estimate and
+    /// the conversion both.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn an_auto_tiles_run_fetches_each_chunk_once() {
+        use super::super::tiles::{convert_to_pmtiles_validated, TilesInput, TilesOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = covered_row_groups(&dir);
+        let part =
+            crate::input::test_memory_source(std::fs::read(&path).unwrap(), "groups.parquet");
+        let options = TilesOptions {
+            convert: ConvertOptions {
+                levels: LevelPlan::ZoomRange {
+                    min_zoom: 0,
+                    max_zoom: MaxZoom::Auto.plan_zoom(),
+                },
+                auto_max_zoom: true,
+                ..Default::default()
+            },
+            ..TilesOptions::default()
+        };
+        let config = options.validate().unwrap();
+        // A path that does not exist: the facade reads only the source
+        // `open` hands it, so a second open of the input fails the run.
+        convert_to_pmtiles_validated(
+            &TilesInput::Path(dir.path().join("opened-only-through-open.parquet")),
+            || Ok(ConvertSource::single(part.clone())),
+            &dir.path().join("out.pmtiles"),
+            &config,
+            &mut (),
+        )
+        .unwrap();
+        assert_each_range_fetched_once(&part);
     }
 
     /// #788: a remote sample stages its columns before reading them. The
