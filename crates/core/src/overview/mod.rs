@@ -29,6 +29,7 @@ mod memory;
 mod pipe;
 mod pipeline;
 mod plan_state;
+mod read;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use plan_state::fuzz_convert_plan;
