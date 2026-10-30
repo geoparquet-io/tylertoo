@@ -1884,6 +1884,39 @@ mod tests {
         }
     }
 
+    /// #788: one memory profile governs both halves of a `tiles` run: the
+    /// export runs under the convert's profile, not its own default.
+    #[test]
+    fn the_export_runs_under_the_converts_memory_profile() {
+        let logging = crate::test_log::install();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.parquet");
+        let geoms: Vec<Option<Geometry<f64>>> = vec![
+            Some(Geometry::Point(Point::new(0.5, 0.5))),
+            Some(Geometry::Point(Point::new(10.0, 20.0))),
+        ];
+        write_input(&input, &geoms, true, None);
+        let mut options = zoomed_options(0, 4);
+        options.convert.profile = crate::overview::level::MemoryProfile::Bounded;
+        assert_ne!(options.export.profile, options.convert.profile);
+        crate::test_log::take_thread_lines();
+        convert_to_pmtiles(
+            &TilesInput::Path(input),
+            &dir.path().join("out.pmtiles"),
+            &options,
+        )
+        .unwrap();
+        if logging {
+            let lines = crate::test_log::take_thread_lines();
+            assert!(
+                lines.iter().any(
+                    |l| l.starts_with("[export] partition wave") && l.contains("under bounded")
+                ),
+                "{lines:#?}"
+            );
+        }
+    }
+
     /// A bound shard plan refuses a zoom-range build whose finest zoom is
     /// coarser than the plan's pivot; without a plan there is nothing to check.
     #[test]
