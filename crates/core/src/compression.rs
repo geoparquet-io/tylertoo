@@ -302,6 +302,8 @@ fn decompress_zstd(data: &[u8], max_out: u64) -> io::Result<Vec<u8>> {
 
 /// Compress data with gzip.
 fn compress_gzip(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    gzip_counter::note();
     use flate2::write::GzEncoder;
     use flate2::Compression as GzCompression;
 
@@ -335,6 +337,10 @@ fn compress_zstd(data: &[u8], _: ()) -> io::Result<Vec<u8>> {
     // Use compression level 3 (default) - good balance of speed and ratio
     zstd::encode_all(data, 3)
 }
+
+#[cfg(test)]
+#[path = "compression/gzip_counter.rs"]
+pub(crate) mod gzip_counter;
 
 #[cfg(test)]
 mod tests {

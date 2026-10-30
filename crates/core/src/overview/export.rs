@@ -6268,6 +6268,10 @@ fn encode_members(
         .collect()
 }
 
+#[cfg(test)]
+#[path = "export/encode_cost_tests.rs"]
+mod encode_cost_tests;
+
 /// `true` when `bbox` lies entirely within `tb` expanded by `buffer` on every
 /// side. Clipping such a feature to the buffered tile is a geometric no-op, so
 /// the clip can be skipped (and `BooleanOps` ring normalization avoided).
