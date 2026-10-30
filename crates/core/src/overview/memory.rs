@@ -510,6 +510,12 @@ mod tests {
                 phase: name, needed: 101, available: 100
             } if name == phase.name())
             );
+            // Only the pass-1 scan's floor has the preflight escape hatch.
+            assert_eq!(
+                error.to_string().contains("TYLERTOO_SKIP_MEMORY_PREFLIGHT"),
+                matches!(phase, MemoryPhase::Scan),
+                "{error}"
+            );
             budget.require(phase, 100).unwrap();
         }
     }

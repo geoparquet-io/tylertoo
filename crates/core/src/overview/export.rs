@@ -817,8 +817,10 @@ pub enum ExportError {
     #[error("overview reader error: {0}")]
     Reader(#[from] ReaderError),
     /// An export phase's required resident state exceeds its memory grant.
-    /// The display text retains the historical budget diagnostic.
-    #[error("io error: {phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter. Set TYLERTOO_SKIP_MEMORY_PREFLIGHT=1 to attempt the scan anyway.")]
+    /// The display text retains the historical budget diagnostic, without
+    /// the preflight escape hatch: `TYLERTOO_SKIP_MEMORY_PREFLIGHT` covers
+    /// the up-front checks only, never this one.
+    #[error("io error: {phase} needs {needed} bytes but only {available} bytes are available; use a bigger machine or reduce the input with --bbox/--filter.")]
     BudgetExceeded {
         /// Export phase that cannot fit.
         phase: &'static str,
