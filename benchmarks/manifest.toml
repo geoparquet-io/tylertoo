@@ -18,6 +18,10 @@
 
 [defaults]
 pairs = 3
+# Untimed runs of the first binary before a cell's rounds, so the first timed
+# run does not read its input cold (w1-convert: a cold first run took 9.9 s
+# in pass 1 against 0.9 s warm).
+warmup = 1
 allocator = "glibc"
 wall_s = 1800
 # Peak RSS cap per run: the box is shared (123 GiB), so a runaway run is
@@ -411,6 +415,23 @@ args = ["{input}", "{out}/out.pmtiles"]
 output = "out.pmtiles"
 allocator = "any"
 
+# #715: the spill codec. Moldova verbatim z7-13 with spill forced, track C1's
+# workload: a 1 MiB auto memory limit, --profile bounded and an explicit
+# spill directory, whose size is sampled every 0.2 s (`watch`). Compares two
+# builds of the spill writer, so it runs only when named.
+[cells.spill-codec]
+label = "Spill codec: FTW Moldova verbatim z7-13, spill forced"
+tickets = [715]
+input = "moldova"
+command = "overview"
+args = ["{input}", "{out}/ov.parquet"]
+output = "ov.parquet"
+zoom = [7, 13]
+flags = ["--verbatim", "--profile", "bounded", "--spill-dir", "{out}/spill"]
+env = { TYLERTOO_AUTO_MEM_LIMIT_BYTES = "1048576" }
+watch = "spill"
+heavy = true
+
 # #734: the convert/export split at the scale #535 measured. Hours, not
 # minutes: one round unless the lead asks for more.
 [cells.brazil-55m]
@@ -438,3 +459,4 @@ window1 = ["points", "points-dense", "lines", "polygons", "polygons-mt", "wide-p
            "verbatim", "coverage-fill", "remote-multipart", "memory-capped", "resume",
            "export-moldova", "export-mt", "export-nz"]
 export-ab = ["export-moldova", "export-nz"]
+spill-codec = ["spill-codec"]

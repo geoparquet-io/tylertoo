@@ -24,7 +24,10 @@ Standard library only. What one `run` does, cell by cell:
   rounds    `pairs` rounds (manifest, at least 3 unless --dry-run); each
             round runs every binary once, and the order flips every round
             (A B, B A, A B...) so drift on the host cancels. One --bin is a
-            baseline: the same rounds, one binary.
+            baseline: the same rounds, one binary. Before them, `warmup`
+            untimed runs of the first binary (manifest default 1) bring the
+            inputs into the page cache; they are kept under <cell>/warmup/
+            and never summarized.
   each run  waits for a quiet host (load gate below), runs the command under
             `/usr/bin/time -v` with a fresh TYLERTOO_PROFILE_JSON, records
             wall, CPU, peak RSS, the profile lines, output size and sha256,
@@ -99,7 +102,7 @@ class ManifestError(ValueError):
 CELL_KEYS = {
     "label", "tickets", "input", "inputs", "command", "args", "zoom", "flags",
     "output", "setup", "pairs", "allocator", "wall_s", "rss_gib", "memory_max",
-    "serve", "env", "heavy", "notes", "scratch_gib",
+    "serve", "env", "heavy", "notes", "scratch_gib", "watch", "warmup",
 }
 INPUT_KEYS = {"file", "path", "url", "sha256", "bytes", "rows", "geometry", "notes"}
 
@@ -132,7 +135,7 @@ def load_manifest(path: Path = MANIFEST) -> dict:
         for i in names:
             if i not in inputs:
                 raise ManifestError(f"cell {name}: unknown input {i}")
-        for key in ("pairs", "allocator", "wall_s", "rss_gib", "scratch_gib"):
+        for key in ("pairs", "allocator", "wall_s", "rss_gib", "scratch_gib", "warmup"):
             cell.setdefault(key, defaults.get(key))
         cell.setdefault("flags", [])
         cell.setdefault("env", {})
@@ -550,7 +553,8 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
     with log.open("w") as logf:
         proc = subprocess.Popen(argv, stdout=logf, stderr=subprocess.PIPE, text=True,  # noqa: S603
                                 env=env, start_new_session=True)
-        outcome = {"cap": None, "peak_poll_kib": 0, "scratch_peak": 0}
+        outcome = {"cap": None, "peak_poll_kib": 0, "scratch_peak": 0, "watch_peak": 0}
+        watch_dir = scratch / caps["watch"] if caps.get("watch") else None
 
         def watch() -> None:
             tick = 0
@@ -559,6 +563,8 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
                 outcome["peak_poll_kib"] = max(outcome["peak_poll_kib"], rss)
                 if tick % 10 == 0:  # the scratch walk every ~2 s
                     outcome["scratch_peak"] = max(outcome["scratch_peak"], dir_bytes(scratch))
+                if watch_dir:  # a cell's own watched subdirectory, every tick
+                    outcome["watch_peak"] = max(outcome["watch_peak"], dir_bytes(watch_dir))
                 tick += 1
                 elapsed = time.monotonic() - t0
                 reason = ("RSS_CAP" if rss > cap_kib else "TIMEOUT" if elapsed > wall_s
@@ -602,6 +608,7 @@ def run_capped(argv: list[str], caps: dict, env: dict, log: Path, scratch: Path,
         "foreign_cores": round(foreign, 2),
         "context_cores": round(context, 2) if context is not None else None,
         "scratch_peak_mib": round(outcome["scratch_peak"] / (1 << 20)),
+        "watch_peak_mib": round(outcome["watch_peak"] / (1 << 20), 1) if watch_dir else None,
         "stderr_tail": stderr[-2500:] if status != "ok" else None,
     }
 
@@ -709,6 +716,14 @@ class Runner:
                 subs["setup"] = str(self.setup(name, cell, subs, scratch / "setup"))
             prefix = scope_prefix(cell["memory_max"]) if "memory_max" in cell else []
             labels = [b["label"] for b in self.bins]
+            todo = [(r, lb) for r in range(self.pairs(cell)) for lb in round_order(labels, r)
+                    if not (cdir / f"{lb}-r{r}.json").exists()]
+            warmups = self.args.warmup if self.args.warmup is not None else (cell["warmup"] or 0)
+            if todo:
+                # Untimed runs of the first binary bring the inputs into the page
+                # cache, so round 0's first binary does not pay a cold read alone.
+                for w in range(warmups):
+                    self.run_one(name, cell, w, labels[0], subs, prefix, server, warmup=True)
             for r in range(self.pairs(cell)):
                 for label in round_order(labels, r):
                     self.run_one(name, cell, r, label, subs, prefix, server)
@@ -751,19 +766,24 @@ class Runner:
               f"{dir_bytes(sdir) >> 20} MiB", flush=True)
         return sdir
 
-    def run_one(self, name: str, cell: dict, r: int, label: str, subs: dict,
-                prefix: list[str], server: Server | None) -> None:
-        """One timed run of one binary; writes <cell>/<label>-r<r>.json."""
-        cdir = self.results / name
-        rec_path = cdir / f"{label}-r{r}.json"
+    def run_one(self, name: str, cell: dict, r: int, label: str, subs: dict,  # noqa: PLR0913
+                prefix: list[str], server: Server | None, warmup: bool = False) -> None:
+        """One timed run of one binary; writes <cell>/<label>-r<r>.json, or
+        <cell>/warmup/<label>-w<r>.json for an untimed warm-up (never summarized)."""
+        cdir = self.results / name / "warmup" if warmup else self.results / name
+        cdir.mkdir(exist_ok=True)
+        tag = f"{label}-w{r}" if warmup else f"{label}-r{r}"
+        rec_path = cdir / f"{tag}.json"
         if rec_path.exists():
             return
         b = next(x for x in self.bins if x["label"] == label)
-        out = self.bench_out / self.args.name / name / f"{label}-r{r}"
+        out = self.bench_out / self.args.name / name / tag
         if out.exists():
             shutil.rmtree(out)
         (out / "tmp").mkdir(parents=True)
-        prof = cdir / f"{label}-r{r}.profile.jsonl"
+        if cell.get("watch"):  # e.g. a --spill-dir, which must exist beforehand
+            (out / cell["watch"]).mkdir(parents=True)
+        prof = cdir / f"{tag}.profile.jsonl"
         prof.unlink(missing_ok=True)
         argv = [b["path"], *build_argv(cell, {**subs, "out": str(out)})]
         env = {**os.environ, **{k: str(v) for k, v in cell["env"].items()},
@@ -772,10 +792,10 @@ class Runner:
         gate = self.gate.wait()
         if server:
             server.get("/__reset")
-        print(f"run   {name} {label} r{r}: {' '.join(argv[1:])}", flush=True)
+        print(f"{'warm' if warmup else 'run '}  {name} {tag}: {' '.join(argv[1:])}", flush=True)
         try:
             res = run_capped([*prefix, "/usr/bin/time", "-v", *argv], cell, env,
-                             cdir / f"{label}-r{r}.log", out, self.cpus)
+                             cdir / f"{tag}.log", out, self.cpus)
             output = output_digest(out, cell["output"])
         finally:
             # Only the result row, the profile JSONL and the log survive a run.
@@ -784,7 +804,7 @@ class Runner:
         if "memory_max" in cell and res["status"] == "KILLED":
             res["status"] = "OOM"
         rec = {
-            "run": self.args.name, "cell": name, "binary": label, "round": r,
+            "run": self.args.name, "cell": name, "binary": label, "round": r, "warmup": warmup,
             "allocator": b["allocator"], "allocator_expected": cell["allocator"],
             "binary_sha256": b["sha256"], "argv": argv, "dry_run": self.args.dry_run,
             "started": time.strftime("%FT%T"), "gate": gate, **res,
@@ -796,8 +816,9 @@ class Runner:
         }
         subprocess.run(["sync"], check=False)
         rec_path.write_text(json.dumps(rec, indent=2))
-        with (self.results / "results.jsonl").open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+        if not warmup:
+            with (self.results / "results.jsonl").open("a") as f:
+                f.write(json.dumps(rec) + "\n")
         rss = (rec["peak_rss_kib"] or 0) / 1024
         print(f"      {res['status']} wall {res['wall_s']:.2f}s cpu {res['cpu_s']}s "
               f"rss {rss:.0f} MiB foreign {res['foreign_cores']} cores", flush=True)
@@ -856,6 +877,7 @@ def summarize(runs: list[dict], bins: list[dict]) -> dict:
             "convert_s": spread([v for r in ok if (v := phase_total(r, "convert")) is not None]),
             "export_s": spread([v for r in ok if (v := phase_total(r, "export")) is not None]),
             "true_peak_mib": spread([v for r in ok if (v := true_peak(r)) is not None]),
+            "watch_peak_mib": spread([r["watch_peak_mib"] for r in ok if r.get("watch_peak_mib") is not None]),
             "foreign_cores_max": max((r["foreign_cores"] for r in mine), default=None),
             "context_cores": spread([r["context_cores"] for r in mine if r.get("context_cores") is not None]),
             "outputs": sorted({r["output"]["sha256"] or "-" for r in ok}),
@@ -933,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cells", help="comma-separated cells (default: every cell not marked heavy)")
     run.add_argument("--set", help="a [sets] entry of the manifest")
     run.add_argument("--pairs", type=int, help=f"rounds per cell (at least {MIN_PAIRS})")
+    run.add_argument("--warmup", type=int, help="untimed runs of the first binary before a cell's rounds "
+                     "(manifest default)")
     run.add_argument("--dry-run", action="store_true", help="one round per cell; not a baseline")
     run.add_argument("--force", action="store_true", help="rerun cells that already have results")
     run.add_argument("--load-max", type=float, help="load gate threshold (manifest default)")

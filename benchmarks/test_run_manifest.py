@@ -189,3 +189,19 @@ def test_busy_jiffies_of_a_cpu_set_add_up():
     part_busy, part_total = rm.cpu_busy_jiffies(half)
     assert 0 < part_total < whole_total
     assert part_busy <= whole_busy
+
+
+def test_spill_codec_cell_watches_its_spill_dir(manifest):
+    cell = manifest["cells"]["spill-codec"]
+    argv = rm.build_argv(cell, {"input": "IN", "out": "OUT"})
+    assert argv[argv.index("--spill-dir") + 1] == f"OUT/{cell['watch']}"
+    assert cell["env"]["TYLERTOO_AUTO_MEM_LIMIT_BYTES"] == "1048576"
+
+
+def test_warmup_records_stay_out_of_the_summary(tmp_path):
+    cdir = tmp_path / "cell"
+    (cdir / "warmup").mkdir(parents=True)
+    rec = {"binary": "a", "status": "ok", "wall_s": 9.0}
+    (cdir / "warmup" / "a-w0.json").write_text(json.dumps(rec))
+    (cdir / "a-r0.json").write_text(json.dumps({**rec, "wall_s": 1.0}))
+    assert [r["wall_s"] for r in rm.load_runs(cdir)] == [1.0]
