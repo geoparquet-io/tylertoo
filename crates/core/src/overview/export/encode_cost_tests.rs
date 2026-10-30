@@ -14,8 +14,13 @@ fn point_member(x: u32, seq: u64) -> Member {
     }
 }
 
-fn encode(members: Vec<Member>, opts: &ExportOptions) -> Vec<EncodedTile> {
+fn encode(
+    gzip_cache: &Arc<TileGzipCache>,
+    members: Vec<Member>,
+    opts: &ExportOptions,
+) -> Vec<EncodedTile> {
     encode_members(
+        gzip_cache,
         members,
         1,
         opts,
@@ -33,7 +38,8 @@ fn first_pass_tile_gzipped_at_most_once() {
             size_valve: valve,
             ..Default::default()
         };
-        let (tiles, calls) = gzip_counter::measure(|| encode(vec![point_member(0, 0)], &opts));
+        let (tiles, calls) =
+            gzip_counter::measure(|| encode(&test_gzip_cache(), vec![point_member(0, 0)], &opts));
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].valve.passes, 1);
         assert!(calls <= 1, "first-pass tile: {calls} gzip calls");
@@ -62,7 +68,11 @@ fn write_tiles(tiles: &[EncodedTile]) -> (u64, u64) {
 fn duplicate_tile_is_never_gzipped_twice_same_wave() {
     let opts = ExportOptions::default();
     let ((tiles, stats), calls) = gzip_counter::measure(|| {
-        let tiles = encode(vec![point_member(0, 0), point_member(1, 1)], &opts);
+        let tiles = encode(
+            &test_gzip_cache(),
+            vec![point_member(0, 0), point_member(1, 1)],
+            &opts,
+        );
         let stats = write_tiles(&tiles);
         (tiles, stats)
     });
@@ -77,10 +87,11 @@ fn duplicate_tile_is_never_gzipped_twice_same_wave() {
 
 #[test]
 fn duplicate_tile_is_never_gzipped_twice_across_waves() {
+    let gzip_cache = test_gzip_cache();
     let opts = ExportOptions::default();
     let ((tiles, stats), calls) = gzip_counter::measure(|| {
-        let mut tiles = encode(vec![point_member(0, 0)], &opts);
-        tiles.extend(encode(vec![point_member(1, 1)], &opts));
+        let mut tiles = encode(&gzip_cache, vec![point_member(0, 0)], &opts);
+        tiles.extend(encode(&gzip_cache, vec![point_member(1, 1)], &opts));
         let stats = write_tiles(&tiles);
         (tiles, stats)
     });
@@ -140,6 +151,7 @@ fn dense_capped_tile_encode_peak_live_bytes_is_bounded() {
             ..Default::default()
         };
         let mvt = encode_tile(
+            &test_gzip_cache(),
             &members,
             &TileCoord::new(0, 0, 1).bounds(),
             &opts,

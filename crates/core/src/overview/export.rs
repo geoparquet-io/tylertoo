@@ -119,7 +119,9 @@ use tempfile::NamedTempFile;
 
 use crate::batch_processor::extract_geometries_from_array;
 use crate::clip::{clip_geometry_simple, geometry_is_simple};
-use crate::compression::{self, Compression};
+#[cfg(test)]
+use crate::compression;
+use crate::compression::{Compression, TileGzipCache};
 use crate::dedup::TileHasher;
 use crate::mvt::{EncodedFeatureGeometry, PropertyValue};
 #[cfg(test)]
@@ -2307,9 +2309,9 @@ fn export_pmtiles_validated(
         // Main's cache under every profile: bounded keeps main's caps.
         crate::compression::tile_gzip::PAYLOAD_SLICES,
     );
-    crate::compression::tile_gzip::configure_payload_cap(
+    let gzip_cache = Arc::new(TileGzipCache::new(
         usize::try_from(gzip_grant.bytes()).unwrap_or(usize::MAX),
-    );
+    ));
     let mut store = if single_read {
         let backing = knobs.backing_override.unwrap_or_else(|| {
             auto_fill_backing(&scans, num_levels, budget.available(), mean_member_bytes)
@@ -2374,6 +2376,7 @@ fn export_pmtiles_validated(
             published: &published,
             feature_id: feature_id.as_ref(),
             options,
+            gzip_cache: &gzip_cache,
             start,
             fills: None,
             level_read,
@@ -2865,6 +2868,7 @@ struct ExportLevelCtx<'a> {
     /// The resolved `--feature-id` column (#443), if any.
     feature_id: Option<&'a ResolvedFeatureId>,
     options: &'a ExportOptions,
+    gzip_cache: &'a Arc<TileGzipCache>,
     /// Start of the whole export, for the elapsed-time progress lines.
     start: Instant,
     /// The #750 coverage fill, when asked for.
@@ -2887,6 +2891,7 @@ impl<'a> ExportLevelCtx<'a> {
             crs: self.crs,
             zoom: self.plan.zoom,
             opts: self.options,
+            gzip_cache: self.gzip_cache,
             published: self.published,
             feature_id: self.feature_id,
             timers,
@@ -3163,6 +3168,7 @@ fn export_level_group(
             scope.spawn(move |_| {
                 let t_encode = Instant::now();
                 let tiles = encode_buckets(
+                    level.gzip_cache,
                     buckets,
                     level.plan.zoom,
                     level.options,
@@ -3676,6 +3682,7 @@ struct LevelCtx<'a> {
     crs: Crs,
     zoom: u8,
     opts: &'a ExportOptions,
+    gzip_cache: &'a Arc<TileGzipCache>,
     /// MVT key per schema column (#359); identity unless the file records a
     /// reserved-column rename whose source name is free again.
     published: &'a PublishedNames,
@@ -4830,6 +4837,7 @@ fn encode_wave_from_store(
         store.take_wave(store_level, wave_idx)
     })?;
     encode_buckets(
+        ctx.gzip_cache,
         bucket_members(members, wave),
         ctx.zoom,
         ctx.opts,
@@ -4852,6 +4860,7 @@ fn bucket_members(members: Vec<Member>, wave: &[Partition]) -> Vec<Vec<Member>> 
 /// Encode a wave's partition buckets in parallel. The tiles come back in
 /// ascending partition order.
 fn encode_buckets(
+    gzip_cache: &Arc<TileGzipCache>,
     buckets: Vec<Vec<Member>>,
     zoom: u8,
     opts: &ExportOptions,
@@ -4861,7 +4870,7 @@ fn encode_buckets(
 ) -> Result<Vec<Vec<EncodedTile>>, ExportError> {
     buckets
         .into_par_iter()
-        .map(|members| encode_members(members, zoom, opts, fills, timers, diagnostics))
+        .map(|members| encode_members(gzip_cache, members, zoom, opts, fills, timers, diagnostics))
         .collect::<Result<_, _>>()
 }
 
@@ -5411,6 +5420,7 @@ fn process_wave(
 
     let t_encode = Instant::now();
     let tiles = encode_buckets(
+        ctx.gzip_cache,
         buckets,
         ctx.zoom,
         ctx.opts,
@@ -6950,6 +6960,7 @@ fn sort_members_for_encode(members: &mut [Member], order: &FeatureOrder) {
 }
 
 fn encode_members(
+    gzip_cache: &Arc<TileGzipCache>,
     mut members: Vec<Member>,
     zoom: u8,
     opts: &ExportOptions,
@@ -6987,7 +6998,15 @@ fn encode_members(
                 Ok(fill) => fill.flatten().unwrap_or_default(),
                 Err(error) => return Some(Err(error)),
             };
-            let mvt = encode_tile(g, &tb, opts, &fill, &mut fill_tally, diagnostics);
+            let mvt = encode_tile(
+                gzip_cache,
+                g,
+                &tb,
+                opts,
+                &fill,
+                &mut fill_tally,
+                diagnostics,
+            );
             if opts.feature_id.is_some() {
                 use crate::diagnostics::SourceLossCause;
                 let cause = if mvt.valve.dropped > 0 {
@@ -7047,7 +7066,7 @@ fn encode_members(
             let raw_len = mvt.data.len();
             let compressed = match mvt.gzip {
                 Some(gz) => gz,
-                None => match compression::compress_tile_gzip(&mvt.data) {
+                None => match mvt.gzip_cache.compress(&mvt.data) {
                     Ok(c) => c,
                     Err(e) => return Some(Err(ExportError::from(e))),
                 },
@@ -7086,6 +7105,7 @@ fn bbox_within_buffered(bbox: &TileBounds, tb: &TileBounds, buffer: f64) -> bool
 
 /// One tile's MVT bytes plus the encode tallies the report needs.
 struct TileMvt {
+    gzip_cache: Arc<TileGzipCache>,
     source_ids: Vec<u64>,
     source_losses: Vec<(u64, crate::diagnostics::SourceLossCause)>,
     /// Raw (uncompressed) MVT bytes.
@@ -7313,6 +7333,7 @@ impl<T: TileFeature + ?Sized> TileFeature for &T {
 /// it never makes the valve merge or drop a real feature. `fill_tally`
 /// counts what of the fill is drawn and shed.
 fn encode_tile(
+    gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
     tb: &TileBounds,
     opts: &ExportOptions,
@@ -7321,9 +7342,9 @@ fn encode_tile(
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
     if opts.size_valve == SizeValve::Merge && !is_point_like(members) {
-        return merge_to_fit(members, tb, opts, fill, fill_tally, diagnostics);
+        return merge_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics);
     }
-    drop_to_fit(members, tb, opts, fill, fill_tally, diagnostics)
+    drop_to_fit(gzip_cache, members, tb, opts, fill, fill_tally, diagnostics)
 }
 
 /// Encodes [`with_fill`] may take to fit a #750 fill into a tile's slack
@@ -7435,7 +7456,7 @@ fn tile_fit(mvt: &mut TileMvt, opts: &ExportOptions) -> Result<f64, ExportError>
         fit = fit.min(limit as f64 / mvt.data.len() as f64);
     }
     if let Some(limit) = opts.compressed_tile_size_limit.filter(|&l| l > 0) {
-        let gz = compression::compress_tile_gzip(&mvt.data)?;
+        let gz = mvt.gzip_cache.compress(&mvt.data)?;
         fit = fit.min(limit as f64 / gz.len() as f64);
         mvt.gzip = Some(gz);
     }
@@ -7456,6 +7477,7 @@ const MAX_DROP_PASSES: u32 = 8;
 /// 1,286 tiles on the FTW Moldova benchmark). The first pass is unchanged,
 /// so a tile that fit after one pass is byte-identical to before.
 fn drop_to_fit(
+    gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
     tb: &TileBounds,
     opts: &ExportOptions,
@@ -7463,7 +7485,7 @@ fn drop_to_fit(
     fill_tally: &mut FillTally,
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
-    let mut full = build_mvt(members, tb, opts, &[], diagnostics);
+    let mut full = build_mvt(gzip_cache, members, tb, opts, &[], diagnostics);
     let mut fit = tile_fit(&mut full, opts).unwrap_or(f64::INFINITY);
     if fit >= 1.0 || members.len() <= 1 {
         // One encode, as the merge valve counts a tile that fits at once.
@@ -7475,7 +7497,7 @@ fn drop_to_fit(
             ..full
         };
         return with_fill(fitted, opts, fill, fill_tally, |f| {
-            build_mvt(members, tb, opts, f, diagnostics)
+            build_mvt(gzip_cache, members, tb, opts, f, diagnostics)
         });
     }
     let mut keep = members.len();
@@ -7484,7 +7506,7 @@ fn drop_to_fit(
         passes += 1;
         keep = ((keep as f64 * fit).floor() as usize).clamp(1, keep.saturating_sub(1).max(1));
         let kept = shed_to_fit(members, keep, opts);
-        let mut shed = build_mvt(&kept, tb, opts, &[], diagnostics);
+        let mut shed = build_mvt(gzip_cache, &kept, tb, opts, &[], diagnostics);
         fit = tile_fit(&mut shed, opts).unwrap_or(f64::INFINITY);
         if fit >= 1.0 || keep <= 1 || passes >= MAX_DROP_PASSES {
             log::warn!(
@@ -7508,7 +7530,7 @@ fn drop_to_fit(
                 ..shed
             };
             return with_fill(fitted, opts, fill, fill_tally, |f| {
-                build_mvt(&kept, tb, opts, f, diagnostics)
+                build_mvt(gzip_cache, &kept, tb, opts, f, diagnostics)
             });
         }
     }
@@ -7543,6 +7565,7 @@ fn stalled(prev_fit: f64, fit: f64) -> bool {
 /// with only merged features left, it is written over its limit, with a
 /// warning.
 fn merge_to_fit(
+    gzip_cache: &Arc<TileGzipCache>,
     members: &[Member],
     tb: &TileBounds,
     opts: &ExportOptions,
@@ -7577,7 +7600,7 @@ fn merge_to_fit(
         // tile with no mergeable gaps, on its way to the drop fallback) has
         // nothing to reuse.
         if pass == 1 || feats.iter().all(|m| m.members.len() < 2) {
-            return build_mvt(feats, tb, opts, fill, diagnostics);
+            return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         }
         let cached = quantized.get_or_insert_with(|| {
             crate::mvt::QuantizedPolygons::new(
@@ -7587,11 +7610,11 @@ fn merge_to_fit(
             )
         });
         let Some(q) = cached.as_mut() else {
-            return build_mvt(feats, tb, opts, fill, diagnostics);
+            return build_mvt(gzip_cache, feats, tb, opts, fill, diagnostics);
         };
         q.next_pass();
         let q = &*q;
-        build_mvt_with(feats, opts, fill, |m| {
+        build_mvt_with(gzip_cache, feats, opts, fill, |m| {
             q.encode(&m.members, diagnostics).unwrap_or_else(|| {
                 EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent, diagnostics)
             })
@@ -7788,13 +7811,14 @@ fn encode_in_parallel<M: TileFeature>(members: &[M]) -> bool {
 /// key/value tables and the bytes identical to the serial loop. A smaller
 /// tile encodes and interns each member in turn, with no buffer.
 fn build_mvt<M: TileFeature>(
+    gzip_cache: &Arc<TileGzipCache>,
     members: &[M],
     tb: &TileBounds,
     opts: &ExportOptions,
     fill: &[&FillFeature],
     diagnostics: &crate::diagnostics::Diagnostics,
 ) -> TileMvt {
-    build_mvt_with(members, opts, fill, |m| {
+    build_mvt_with(gzip_cache, members, opts, fill, |m| {
         EncodedFeatureGeometry::encode(m.geometry(), tb, opts.extent, diagnostics)
     })
 }
@@ -7803,6 +7827,7 @@ fn build_mvt<M: TileFeature>(
 /// return what [`EncodedFeatureGeometry::encode`] would (#758: the merge
 /// valve's cached encode).
 fn build_mvt_with<M: TileFeature>(
+    gzip_cache: &Arc<TileGzipCache>,
     members: &[M],
     opts: &ExportOptions,
     fill: &[&FillFeature],
@@ -7861,6 +7886,7 @@ fn build_mvt_with<M: TileFeature>(
     let unencodable = layer.dropped_features();
     let quantized = layer.quantized_features();
     TileMvt {
+        gzip_cache: Arc::clone(gzip_cache),
         source_ids,
         source_losses,
         data: layer.build(),
@@ -7885,6 +7911,11 @@ fn build_mvt_with<M: TileFeature>(
 /// Arrow schema on this path), stripping the named property out of the
 /// member's tags exactly as the production Arrow path does -- so this
 /// exercises the same "moved, not copied" contract with the same error types.
+#[cfg(test)]
+fn test_gzip_cache() -> Arc<TileGzipCache> {
+    Arc::new(TileGzipCache::new(8 * 1024 * 1024))
+}
+
 #[cfg(test)]
 fn encode_level_tiles(
     features: &[Feature],
@@ -7937,6 +7968,7 @@ fn encode_level_tiles(
     // exercise MVT *encoding*, so decompress each tile back to raw MVT bytes;
     // the assertions in the tests below operate on the uncompressed payload.
     let mut tiles = encode_members(
+        &test_gzip_cache(),
         members,
         zoom,
         opts,
@@ -10999,6 +11031,7 @@ mod tests {
             let serial_bytes = tile.build().encode_to_vec();
 
             let built = build_mvt(
+                &test_gzip_cache(),
                 tile_members,
                 &tb,
                 &opts,
@@ -11520,6 +11553,7 @@ mod tests {
             band: 0,
         };
         build_mvt(
+            &test_gzip_cache(),
             std::slice::from_ref(&m),
             &tb,
             opts,
@@ -11562,6 +11596,7 @@ mod tests {
         let tb = TileCoord::new(512, 300, 10).bounds();
         let fill = [fill_square(7, 0, 0, 100)];
         let mvt = build_mvt::<Member>(
+            &test_gzip_cache(),
             &[],
             &tb,
             &ExportOptions::default(),
@@ -11635,6 +11670,7 @@ mod tests {
     fn the_fill_only_takes_the_slack_its_features_leave() {
         let (tb, members, fill) = crowded_tile();
         let bare = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions::default(),
@@ -11644,6 +11680,7 @@ mod tests {
         );
         let all: Vec<&FillFeature> = fill.iter().collect();
         let full = build_mvt(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions::default(),
@@ -11660,6 +11697,7 @@ mod tests {
             };
             let mut tally = FillTally::default();
             let mvt = encode_tile(
+                &test_gzip_cache(),
                 &members,
                 &tb,
                 &opts,
@@ -11685,6 +11723,7 @@ mod tests {
     fn fill_that_never_fits_still_counts_its_encodes() {
         let (tb, members, fill) = crowded_tile();
         let bare = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions::default(),
@@ -11699,6 +11738,7 @@ mod tests {
         };
         let mut tally = FillTally::default();
         let mvt = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &opts,
@@ -11717,6 +11757,7 @@ mod tests {
     fn the_fill_does_not_change_what_the_valve_keeps() {
         let (tb, members, fill) = crowded_tile();
         let bare_size = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &ExportOptions::default(),
@@ -11734,6 +11775,7 @@ mod tests {
                 ..ExportOptions::default()
             };
             let without = encode_tile(
+                &test_gzip_cache(),
                 &members,
                 &tb,
                 &opts,
@@ -11742,6 +11784,7 @@ mod tests {
                 &crate::diagnostics::Diagnostics::default(),
             );
             let with = encode_tile(
+                &test_gzip_cache(),
                 &members,
                 &tb,
                 &opts,
@@ -14240,6 +14283,7 @@ mod tests {
             band: 0,
         };
         let expected = build_mvt(
+            &test_gzip_cache(),
             &[&member],
             &tc.bounds(),
             &opts,
@@ -14643,6 +14687,7 @@ mod tests {
             }
         }
         let tiles = encode_members(
+            &test_gzip_cache(),
             members,
             10,
             &opts,
@@ -15181,6 +15226,7 @@ mod tests {
             ..Default::default()
         };
         let mvt = encode_tile(
+            &test_gzip_cache(),
             &members,
             &tb,
             &opts,
@@ -17582,6 +17628,7 @@ mod diagnostic_row_alignment {
             .collect();
         assert_eq!(members[0].source_row(), 0);
         let tiles = encode_members(
+            &test_gzip_cache(),
             members,
             0,
             &ExportOptions {
